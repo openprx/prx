@@ -198,7 +198,7 @@ mod tests {
         assert!(schema["properties"]["command"].is_object());
         assert!(schema["required"]
             .as_array()
-            .unwrap()
+            .expect("schema required field should be an array")
             .contains(&json!("command")));
         assert!(schema["properties"]["approved"].is_object());
     }
@@ -209,7 +209,7 @@ mod tests {
         let result = tool
             .execute(json!({"command": "echo hello"}))
             .await
-            .unwrap();
+            .expect("echo command execution should succeed");
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
         assert!(result.error.is_none());
@@ -218,7 +218,10 @@ mod tests {
     #[tokio::test]
     async fn shell_blocks_disallowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
-        let result = tool.execute(json!({"command": "rm -rf /"})).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "rm -rf /"}))
+            .await
+            .expect("disallowed command execution should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
         assert!(error.contains("not allowed") || error.contains("high-risk"));
@@ -227,9 +230,16 @@ mod tests {
     #[tokio::test]
     async fn shell_blocks_readonly() {
         let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime());
-        let result = tool.execute(json!({"command": "ls"})).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "ls"}))
+            .await
+            .expect("readonly command execution should return a result");
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result
+            .error
+            .as_ref()
+            .expect("error field should be present for blocked command")
+            .contains("not allowed"));
     }
 
     #[tokio::test]
@@ -253,7 +263,7 @@ mod tests {
         let result = tool
             .execute(json!({"command": "ls /nonexistent_dir_xyz"}))
             .await
-            .unwrap();
+            .expect("command with nonexistent path should return a result");
         assert!(!result.success);
     }
 
@@ -296,7 +306,10 @@ mod tests {
         let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
 
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
-        let result = tool.execute(json!({"command": "env"})).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command execution should succeed");
         assert!(result.success);
         assert!(
             !result.output.contains("sk-test-secret-12345"),
@@ -315,7 +328,7 @@ mod tests {
         let result = tool
             .execute(json!({"command": "echo $HOME"}))
             .await
-            .unwrap();
+            .expect("echo HOME command should succeed");
         assert!(result.success);
         assert!(
             !result.output.trim().is_empty(),
@@ -325,7 +338,7 @@ mod tests {
         let result = tool
             .execute(json!({"command": "echo $PATH"}))
             .await
-            .unwrap();
+            .expect("echo PATH command should succeed");
         assert!(result.success);
         assert!(
             !result.output.trim().is_empty(),
@@ -346,7 +359,7 @@ mod tests {
         let denied = tool
             .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
             .await
-            .unwrap();
+            .expect("unapproved command should return a result");
         assert!(!denied.success);
         assert!(denied
             .error
@@ -360,9 +373,71 @@ mod tests {
                 "approved": true
             }))
             .await
-            .unwrap();
+            .expect("approved command execution should succeed");
         assert!(allowed.success);
 
-        let _ = std::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test"));
+        let _ =
+            tokio::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test")).await;
+    }
+
+    // ── §5.2 Shell timeout enforcement tests ─────────────────
+
+    #[test]
+    fn shell_timeout_constant_is_reasonable() {
+        assert_eq!(SHELL_TIMEOUT_SECS, 60, "shell timeout must be 60 seconds");
+    }
+
+    #[test]
+    fn shell_output_limit_is_1mb() {
+        assert_eq!(
+            MAX_OUTPUT_BYTES, 1_048_576,
+            "max output must be 1 MB to prevent OOM"
+        );
+    }
+
+    // ── §5.3 Non-UTF8 binary output tests ────────────────────
+
+    #[test]
+    fn shell_safe_env_vars_excludes_secrets() {
+        for var in SAFE_ENV_VARS {
+            let lower = var.to_lowercase();
+            assert!(
+                !lower.contains("key") && !lower.contains("secret") && !lower.contains("token"),
+                "SAFE_ENV_VARS must not include sensitive variable: {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_safe_env_vars_includes_essentials() {
+        assert!(
+            SAFE_ENV_VARS.contains(&"PATH"),
+            "PATH must be in safe env vars"
+        );
+        assert!(
+            SAFE_ENV_VARS.contains(&"HOME"),
+            "HOME must be in safe env vars"
+        );
+        assert!(
+            SAFE_ENV_VARS.contains(&"TERM"),
+            "TERM must be in safe env vars"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_rate_limited() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            max_actions_per_hour: 0,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let result = tool
+            .execute(json!({"command": "echo test"}))
+            .await
+            .expect("rate-limited command should return a result");
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit"));
     }
 }

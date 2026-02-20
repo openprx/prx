@@ -2,14 +2,19 @@ pub mod schema;
 
 #[allow(unused_imports)]
 pub use schema::{
+    apply_runtime_proxy_to_builder, build_runtime_proxy_client,
+    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
     AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
-    ChannelsConfig, ComposioConfig, Config, CostConfig, DelegateAgentConfig, DiscordConfig,
-    DockerRuntimeConfig, GatewayConfig, HardwareConfig, HardwareTransport, HeartbeatConfig,
-    HttpRequestConfig, IMessageConfig, IdentityConfig, LarkConfig, MatrixConfig, McpConfig,
-    McpServerConfig, McpTransport, MemoryConfig, ModelRouteConfig, ObservabilityConfig,
-    PeripheralBoardConfig, PeripheralsConfig, ReliabilityConfig, ResourceLimitsConfig,
-    RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
-    SlackConfig, TelegramConfig, TunnelConfig, WebhookConfig,
+    ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig, CronConfig,
+    DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EmbeddingRouteConfig, GatewayConfig,
+    HardwareConfig, HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
+    IdentityConfig, LarkConfig, MatrixConfig, McpConfig, McpServerConfig, McpTransport,
+    MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig,
+    PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
+    ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
+    SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig, SlackConfig, StorageConfig,
+    StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig, TunnelConfig,
+    WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]
@@ -30,6 +35,10 @@ mod tests {
         let telegram = TelegramConfig {
             bot_token: "token".into(),
             allowed_users: vec!["alice".into()],
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
         };
 
         let discord = DiscordConfig {
@@ -37,6 +46,7 @@ mod tests {
             guild_id: Some("123".into()),
             allowed_users: vec![],
             listen_to_bots: false,
+            mention_only: false,
         };
 
         let lark = LarkConfig {
@@ -46,10 +56,20 @@ mod tests {
             verification_token: None,
             allowed_users: vec![],
             use_feishu: false,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+        };
+
+        let nextcloud_talk = NextcloudTalkConfig {
+            base_url: "https://cloud.example.com".into(),
+            app_token: "app-token".into(),
+            webhook_secret: None,
+            allowed_users: vec!["*".into()],
         };
 
         assert_eq!(telegram.allowed_users.len(), 1);
         assert_eq!(discord.guild_id.as_deref(), Some("123"));
-        assert_eq!(lark.app_id, "app-id");
+        assert!(!lark.use_feishu);
+        assert_eq!(nextcloud_talk.allowed_users, vec!["*"]);
     }
 }

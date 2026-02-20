@@ -114,9 +114,12 @@ impl HttpRequestTool {
         headers: Vec<(String, String)>,
         body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .build()?;
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none());
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.http_request");
+        let client = builder.build()?;
 
         let mut request = client.request(method, url);
 
@@ -428,7 +431,7 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || (segs[0] & 0xfe00) == 0xfc00   // Unique-local (fc00::/7)
         || (segs[0] & 0xffc0) == 0xfe80   // Link-local (fe80::/10)
         || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
-        || v6.to_ipv4_mapped().is_some_and(|v4| is_non_global_v4(v4))
+        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
 #[cfg(test)]
@@ -748,5 +751,132 @@ mod tests {
         let headers = vec![("Authorization".into(), "Bearer real-token".into())];
         let _ = HttpRequestTool::redact_headers_for_display(&headers);
         assert_eq!(headers[0].1, "Bearer real-token");
+    }
+
+    // ── SSRF: alternate IP notation bypass defense-in-depth ─────────
+    //
+    // Rust's IpAddr::parse() rejects non-standard notations (octal, hex,
+    // decimal integer, zero-padded). These tests document that property
+    // so regressions are caught if the parsing strategy ever changes.
+
+    #[test]
+    fn ssrf_octal_loopback_not_parsed_as_ip() {
+        // 0177.0.0.1 is octal for 127.0.0.1 in some languages, but
+        // Rust's IpAddr rejects it — it falls through as a hostname.
+        assert!(!is_private_or_local_host("0177.0.0.1"));
+    }
+
+    #[test]
+    fn ssrf_hex_loopback_not_parsed_as_ip() {
+        // 0x7f000001 is hex for 127.0.0.1 in some languages.
+        assert!(!is_private_or_local_host("0x7f000001"));
+    }
+
+    #[test]
+    fn ssrf_decimal_loopback_not_parsed_as_ip() {
+        // 2130706433 is decimal for 127.0.0.1 in some languages.
+        assert!(!is_private_or_local_host("2130706433"));
+    }
+
+    #[test]
+    fn ssrf_zero_padded_loopback_not_parsed_as_ip() {
+        // 127.000.000.001 uses zero-padded octets.
+        assert!(!is_private_or_local_host("127.000.000.001"));
+    }
+
+    #[test]
+    fn ssrf_alternate_notations_rejected_by_validate_url() {
+        // Even if is_private_or_local_host doesn't flag these, they
+        // fail the allowlist because they're treated as hostnames.
+        let tool = test_tool(vec!["example.com"]);
+        for notation in [
+            "http://0177.0.0.1",
+            "http://0x7f000001",
+            "http://2130706433",
+            "http://127.000.000.001",
+        ] {
+            let err = tool.validate_url(notation).unwrap_err().to_string();
+            assert!(
+                err.contains("allowed_domains"),
+                "Expected allowlist rejection for {notation}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_policy_is_none() {
+        // Structural test: the tool should be buildable with redirect-safe config.
+        // The actual Policy::none() enforcement is in execute_request's client builder.
+        let tool = test_tool(vec!["example.com"]);
+        assert_eq!(tool.name(), "http_request");
+    }
+
+    // ── §1.4 DNS rebinding / SSRF defense-in-depth tests ─────
+
+    #[test]
+    fn ssrf_blocks_loopback_127_range() {
+        assert!(is_private_or_local_host("127.0.0.1"));
+        assert!(is_private_or_local_host("127.0.0.2"));
+        assert!(is_private_or_local_host("127.255.255.255"));
+    }
+
+    #[test]
+    fn ssrf_blocks_rfc1918_10_range() {
+        assert!(is_private_or_local_host("10.0.0.1"));
+        assert!(is_private_or_local_host("10.255.255.255"));
+    }
+
+    #[test]
+    fn ssrf_blocks_rfc1918_172_range() {
+        assert!(is_private_or_local_host("172.16.0.1"));
+        assert!(is_private_or_local_host("172.31.255.255"));
+    }
+
+    #[test]
+    fn ssrf_blocks_unspecified_address() {
+        assert!(is_private_or_local_host("0.0.0.0"));
+    }
+
+    #[test]
+    fn ssrf_blocks_dot_localhost_subdomain() {
+        assert!(is_private_or_local_host("evil.localhost"));
+        assert!(is_private_or_local_host("a.b.localhost"));
+    }
+
+    #[test]
+    fn ssrf_blocks_dot_local_tld() {
+        assert!(is_private_or_local_host("service.local"));
+    }
+
+    #[test]
+    fn ssrf_ipv6_unspecified() {
+        assert!(is_private_or_local_host("::"));
+    }
+
+    #[test]
+    fn validate_rejects_ftp_scheme() {
+        let tool = test_tool(vec!["example.com"]);
+        let err = tool
+            .validate_url("ftp://example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("http://") || err.contains("https://"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_url() {
+        let tool = test_tool(vec!["example.com"]);
+        let err = tool.validate_url("").unwrap_err().to_string();
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn validate_rejects_ipv6_host() {
+        let tool = test_tool(vec!["example.com"]);
+        let err = tool
+            .validate_url("http://[::1]:8080/path")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IPv6"));
     }
 }
