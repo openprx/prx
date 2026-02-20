@@ -7,7 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-use crate::channels::{Channel, WhatsAppChannel};
+use crate::channels::{Channel, SignalChannel, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
@@ -43,6 +43,10 @@ fn webhook_memory_key() -> String {
 
 fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("whatsapp_{}_{}", msg.sender, msg.id)
+}
+
+fn signal_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("signal_{}_{}", msg.sender, msg.id)
 }
 
 /// How often the rate limiter sweeps stale IP entries from its map.
@@ -181,6 +185,7 @@ pub struct AppState {
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
+    pub signal: Option<Arc<SignalChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
 }
@@ -237,6 +242,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 wa.allowed_numbers.clone(),
             ))
         });
+    let signal_channel: Option<Arc<SignalChannel>> = config
+        .channels_config
+        .signal
+        .as_ref()
+        .map(|sg| Arc::new(SignalChannel::new(sg.clone())));
 
     // WhatsApp app secret for webhook signature verification
     // Priority: environment variable > config file
@@ -298,6 +308,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
+    if signal_channel.is_some() {
+        println!("  POST /signal    — Signal receive webhook/relay");
+    }
     println!("  GET  /health    — health check");
     if let Some(code) = pairing.pairing_code() {
         println!();
@@ -330,6 +343,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         rate_limiter,
         idempotency_store,
         whatsapp: whatsapp_channel,
+        signal: signal_channel,
         whatsapp_app_secret,
     };
 
@@ -340,6 +354,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/signal", post(handle_signal_message))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -686,6 +701,92 @@ async fn handle_whatsapp_message(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /signal — incoming signal-cli receive events (single or batched)
+async fn handle_signal_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref signal) = state.signal else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Signal not configured"})),
+        );
+    };
+
+    if !signal.accepts_gateway_ingress() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Signal gateway ingress disabled by config"})),
+        );
+    }
+
+    if let Some(secret) = signal.webhook_secret() {
+        let provided = headers
+            .get("X-Signal-Secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !constant_time_eq(secret, provided) {
+            tracing::warn!("Signal webhook rejected: invalid X-Signal-Secret");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    let messages = signal.parse_webhook_payload(&payload);
+    if messages.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    for msg in &messages {
+        tracing::info!(
+            "Signal message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        if state.auto_save {
+            let key = signal_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation)
+                .await;
+        }
+
+        match state
+            .provider
+            .simple_chat(&msg.content, &state.model, state.temperature)
+            .await
+        {
+            Ok(response) => {
+                if let Err(err) = signal.send(&response, &msg.sender).await {
+                    tracing::error!("Failed to send Signal reply: {err}");
+                }
+            }
+            Err(err) => {
+                tracing::error!("LLM error for Signal message: {err:#}");
+                let _ = signal
+                    .send(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.sender,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,6 +1066,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
+            signal: None,
             whatsapp_app_secret: None,
         };
 
@@ -1013,6 +1115,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
+            signal: None,
             whatsapp_app_secret: None,
         };
 

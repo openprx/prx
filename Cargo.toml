@@ -68,6 +68,8 @@ landlock = { version = "0.4", optional = true }
 
 # Async traits
 async-trait = "0.1"
+# MCP client (stdio + streamable HTTP)
+rmcp = { version = "0.14", features = ["client", "server", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 
 # Memory / persistence
 rusqlite = { version = "0.38", features = ["bundled"] }

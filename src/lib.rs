@@ -49,6 +49,7 @@ pub mod gateway;
 pub mod hardware;
 pub mod health;
 pub mod heartbeat;
+pub mod hooks;
 pub mod identity;
 pub mod integrations;
 pub mod memory;

@@ -6,6 +6,7 @@ pub mod imessage;
 pub mod irc;
 pub mod lark;
 pub mod matrix;
+pub mod signal;
 pub mod slack;
 pub mod telegram;
 pub mod traits;
@@ -19,6 +20,7 @@ pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 pub use lark::LarkChannel;
 pub use matrix::MatrixChannel;
+pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::Channel;
@@ -26,6 +28,7 @@ pub use whatsapp::WhatsAppChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::config::Config;
+use crate::hooks::HookManager;
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
@@ -59,6 +62,7 @@ struct ChannelRuntimeContext {
     memory: Arc<dyn Memory>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: Arc<dyn Observer>,
+    hooks: Arc<HookManager>,
     system_prompt: Arc<String>,
     model: Arc<String>,
     temperature: f64,
@@ -191,6 +195,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             &mut history,
             ctx.tools_registry.as_ref(),
             ctx.observer.as_ref(),
+            ctx.hooks.as_ref(),
             "channel-runtime",
             ctx.model.as_str(),
             ctx.temperature,
@@ -634,6 +639,10 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
+    if let Some(ref sg) = config.channels_config.signal {
+        channels.push(("Signal", Arc::new(SignalChannel::new(sg.clone()))));
+    }
+
     if let Some(ref im) = config.channels_config.imessage {
         channels.push((
             "iMessage",
@@ -773,6 +782,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
+    let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -919,6 +929,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
+    if let Some(ref sg) = config.channels_config.signal {
+        channels.push(Arc::new(SignalChannel::new(sg.clone())));
+    }
+
     if let Some(ref im) = config.channels_config.imessage {
         channels.push(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())));
     }
@@ -1044,6 +1058,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
         observer,
+        hooks,
         system_prompt: Arc::new(system_prompt),
         model: Arc::new(model.clone()),
         temperature,
@@ -1230,6 +1245,7 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -1320,6 +1336,7 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,

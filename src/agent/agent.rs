@@ -4,12 +4,13 @@ use crate::agent::dispatcher::{
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
+use crate::hooks::{payload_error, HookEvent, HookManager};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
-use crate::tools::{self, Tool, ToolSpec};
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::io::Write as IoWrite;
@@ -19,9 +20,9 @@ use std::time::Instant;
 pub struct Agent {
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
-    tool_specs: Vec<ToolSpec>,
     memory: Arc<dyn Memory>,
     observer: Arc<dyn Observer>,
+    hooks: Arc<HookManager>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
     memory_loader: Box<dyn MemoryLoader>,
@@ -40,6 +41,7 @@ pub struct AgentBuilder {
     tools: Option<Vec<Box<dyn Tool>>>,
     memory: Option<Arc<dyn Memory>>,
     observer: Option<Arc<dyn Observer>>,
+    hooks: Option<Arc<HookManager>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_loader: Option<Box<dyn MemoryLoader>>,
@@ -59,6 +61,7 @@ impl AgentBuilder {
             tools: None,
             memory: None,
             observer: None,
+            hooks: None,
             prompt_builder: None,
             tool_dispatcher: None,
             memory_loader: None,
@@ -89,6 +92,11 @@ impl AgentBuilder {
 
     pub fn observer(mut self, observer: Arc<dyn Observer>) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    pub fn hooks(mut self, hooks: Arc<HookManager>) -> Self {
+        self.hooks = Some(hooks);
         self
     }
 
@@ -146,20 +154,25 @@ impl AgentBuilder {
         let tools = self
             .tools
             .ok_or_else(|| anyhow::anyhow!("tools are required"))?;
-        let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
+        let workspace_dir = self
+            .workspace_dir
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let hooks = self
+            .hooks
+            .unwrap_or_else(|| Arc::new(HookManager::new(workspace_dir.clone())));
 
         Ok(Agent {
             provider: self
                 .provider
                 .ok_or_else(|| anyhow::anyhow!("provider is required"))?,
             tools,
-            tool_specs,
             memory: self
                 .memory
                 .ok_or_else(|| anyhow::anyhow!("memory is required"))?,
             observer: self
                 .observer
                 .ok_or_else(|| anyhow::anyhow!("observer is required"))?,
+            hooks,
             prompt_builder: self
                 .prompt_builder
                 .unwrap_or_else(SystemPromptBuilder::with_defaults),
@@ -174,9 +187,7 @@ impl AgentBuilder {
                 .model_name
                 .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
             temperature: self.temperature.unwrap_or(0.7),
-            workspace_dir: self
-                .workspace_dir
-                .unwrap_or_else(|| std::path::PathBuf::from(".")),
+            workspace_dir,
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
@@ -268,6 +279,7 @@ impl Agent {
             .tools(tools)
             .memory(memory)
             .observer(observer)
+            .hooks(Arc::new(HookManager::new(config.workspace_dir.clone())))
             .tool_dispatcher(tool_dispatcher)
             .memory_loader(Box::new(DefaultMemoryLoader::default()))
             .prompt_builder(SystemPromptBuilder::with_defaults())
@@ -323,10 +335,31 @@ impl Agent {
 
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
+        self.hooks
+            .emit(
+                HookEvent::ToolCallStart,
+                serde_json::json!({
+                    "tool": call.name,
+                    "arguments": call.arguments,
+                }),
+            )
+            .await;
 
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-            match tool.execute(call.arguments.clone()).await {
+        let result = if let Some(tool) = self.tools.iter().find(|t| t.supports_name(&call.name)) {
+            match tool.execute_named(&call.name, call.arguments.clone()).await {
                 Ok(r) => {
+                    self.hooks
+                        .emit(
+                            HookEvent::ToolCall,
+                            serde_json::json!({
+                                "tool": call.name,
+                                "duration_ms": start.elapsed().as_millis(),
+                                "success": r.success,
+                                "error": r.error,
+                                "output": r.output,
+                            }),
+                        )
+                        .await;
                     self.observer.record_event(&ObserverEvent::ToolCall {
                         tool: call.name.clone(),
                         duration: start.elapsed(),
@@ -339,16 +372,24 @@ impl Agent {
                     }
                 }
                 Err(e) => {
+                    let message = format!("Error executing {}: {e}", call.name);
+                    self.hooks
+                        .emit(HookEvent::Error, payload_error("tool", &message))
+                        .await;
                     self.observer.record_event(&ObserverEvent::ToolCall {
                         tool: call.name.clone(),
                         duration: start.elapsed(),
                         success: false,
                     });
-                    format!("Error executing {}: {e}", call.name)
+                    message
                 }
             }
         } else {
-            format!("Unknown tool: {}", call.name)
+            let message = format!("Unknown tool: {}", call.name);
+            self.hooks
+                .emit(HookEvent::Error, payload_error("tool", &message))
+                .await;
+            message
         };
 
         ToolExecutionResult {
@@ -408,13 +449,31 @@ impl Agent {
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            for tool in &self.tools {
+                let _ = tool.refresh().await;
+            }
+            self.hooks
+                .emit(
+                    HookEvent::LlmRequest,
+                    serde_json::json!({
+                        "provider": "configured",
+                        "model": self.model_name,
+                        "messages_count": messages.len(),
+                    }),
+                )
+                .await;
+            let dynamic_tool_specs = self
+                .tools
+                .iter()
+                .flat_map(|tool| tool.specs())
+                .collect::<Vec<_>>();
             let response = match self
                 .provider
                 .chat(
                     ChatRequest {
                         messages: &messages,
                         tools: if self.tool_dispatcher.should_send_tool_specs() {
-                            Some(&self.tool_specs)
+                            Some(&dynamic_tool_specs)
                         } else {
                             None
                         },
@@ -425,8 +484,23 @@ impl Agent {
                 .await
             {
                 Ok(resp) => resp,
-                Err(err) => return Err(err),
+                Err(err) => {
+                    self.hooks
+                        .emit(HookEvent::Error, payload_error("llm", &err.to_string()))
+                        .await;
+                    return Err(err);
+                }
             };
+            self.hooks
+                .emit(
+                    HookEvent::LlmResponse,
+                    serde_json::json!({
+                        "provider": "configured",
+                        "model": self.model_name,
+                        "success": true,
+                    }),
+                )
+                .await;
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
@@ -449,6 +523,15 @@ impl Agent {
                         .store("assistant_resp", &summary, MemoryCategory::Daily)
                         .await;
                 }
+                self.hooks
+                    .emit(
+                        HookEvent::TurnComplete,
+                        serde_json::json!({
+                            "mode": "agent",
+                            "response_chars": final_text.chars().count(),
+                        }),
+                    )
+                    .await;
 
                 return Ok(final_text);
             }
@@ -545,6 +628,16 @@ pub async fn run(
         provider: provider_name,
         model: model_name,
     });
+    agent
+        .hooks
+        .emit(
+            HookEvent::AgentStart,
+            serde_json::json!({
+                "provider": effective_config.default_provider,
+                "model": effective_config.default_model,
+            }),
+        )
+        .await;
 
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
@@ -557,6 +650,15 @@ pub async fn run(
         duration: start.elapsed(),
         tokens_used: None,
     });
+    agent
+        .hooks
+        .emit(
+            HookEvent::AgentEnd,
+            serde_json::json!({
+                "duration_ms": start.elapsed().as_millis(),
+            }),
+        )
+        .await;
 
     Ok(())
 }

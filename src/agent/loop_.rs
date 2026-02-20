@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::hooks::{payload_error, HookEvent, HookManager};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, Provider, ToolCall};
@@ -183,7 +184,10 @@ fn build_hardware_context(
 
 /// Find a tool by name in the registry.
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
-    tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+    tools
+        .iter()
+        .find(|t| t.supports_name(name))
+        .map(|t| t.as_ref())
 }
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
@@ -424,6 +428,7 @@ pub(crate) async fn agent_turn(
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
+    hooks: &HookManager,
     provider_name: &str,
     model: &str,
     temperature: f64,
@@ -434,6 +439,7 @@ pub(crate) async fn agent_turn(
         history,
         tools_registry,
         observer,
+        hooks,
         provider_name,
         model,
         temperature,
@@ -449,12 +455,36 @@ pub(crate) async fn run_tool_call_loop(
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
+    hooks: &HookManager,
     provider_name: &str,
     model: &str,
     temperature: f64,
     silent: bool,
 ) -> Result<String> {
     for _iteration in 0..MAX_TOOL_ITERATIONS {
+        for tool in tools_registry {
+            if let Err(err) = tool.refresh().await {
+                let message = format!("refresh failed for tool {}: {err}", tool.name());
+                observer.record_event(&ObserverEvent::Error {
+                    component: "tool-refresh".to_string(),
+                    message: message.clone(),
+                });
+                hooks
+                    .emit(HookEvent::Error, payload_error("tool-refresh", &message))
+                    .await;
+            }
+        }
+
+        hooks
+            .emit(
+                HookEvent::LlmRequest,
+                serde_json::json!({
+                    "provider": provider_name,
+                    "model": model,
+                    "messages_count": history.len(),
+                }),
+            )
+            .await;
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
@@ -467,23 +497,53 @@ pub(crate) async fn run_tool_call_loop(
             .await
         {
             Ok(resp) => {
+                let duration = llm_started_at.elapsed();
+                hooks
+                    .emit(
+                        HookEvent::LlmResponse,
+                        serde_json::json!({
+                            "provider": provider_name,
+                            "model": model,
+                            "duration_ms": duration.as_millis(),
+                            "success": true,
+                            "error_message": serde_json::Value::Null,
+                        }),
+                    )
+                    .await;
                 observer.record_event(&ObserverEvent::LlmResponse {
                     provider: provider_name.to_string(),
                     model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
+                    duration,
                     success: true,
                     error_message: None,
                 });
                 resp
             }
             Err(e) => {
+                let duration = llm_started_at.elapsed();
+                let error_message = crate::providers::sanitize_api_error(&e.to_string());
+                hooks
+                    .emit(
+                        HookEvent::LlmResponse,
+                        serde_json::json!({
+                            "provider": provider_name,
+                            "model": model,
+                            "duration_ms": duration.as_millis(),
+                            "success": false,
+                            "error_message": error_message,
+                        }),
+                    )
+                    .await;
                 observer.record_event(&ObserverEvent::LlmResponse {
                     provider: provider_name.to_string(),
                     model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
+                    duration,
                     success: false,
-                    error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                    error_message: Some(error_message.clone()),
                 });
+                hooks
+                    .emit(HookEvent::Error, payload_error("llm", &error_message))
+                    .await;
                 return Err(e);
             }
         };
@@ -513,16 +573,40 @@ pub(crate) async fn run_tool_call_loop(
         // Execute each tool call and build results
         let mut tool_results = String::new();
         for call in &tool_calls {
+            hooks
+                .emit(
+                    HookEvent::ToolCallStart,
+                    serde_json::json!({
+                        "tool": call.name,
+                        "arguments": call.arguments,
+                    }),
+                )
+                .await;
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
             });
             let start = Instant::now();
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
-                match tool.execute(call.arguments.clone()).await {
+                match tool.execute_named(&call.name, call.arguments.clone()).await {
                     Ok(r) => {
+                        let duration = start.elapsed();
+                        let output = r.output.clone();
+                        let error = r.error.clone();
+                        hooks
+                            .emit(
+                                HookEvent::ToolCall,
+                                serde_json::json!({
+                                    "tool": call.name,
+                                    "duration_ms": duration.as_millis(),
+                                    "success": r.success,
+                                    "error": error,
+                                    "output": output,
+                                }),
+                            )
+                            .await;
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: call.name.clone(),
-                            duration: start.elapsed(),
+                            duration,
                             success: r.success,
                         });
                         if r.success {
@@ -532,16 +616,36 @@ pub(crate) async fn run_tool_call_loop(
                         }
                     }
                     Err(e) => {
+                        let duration = start.elapsed();
+                        let message = format!("Error executing {}: {e}", call.name);
+                        hooks
+                            .emit(
+                                HookEvent::ToolCall,
+                                serde_json::json!({
+                                    "tool": call.name,
+                                    "duration_ms": duration.as_millis(),
+                                    "success": false,
+                                    "error": message,
+                                }),
+                            )
+                            .await;
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: call.name.clone(),
-                            duration: start.elapsed(),
+                            duration,
                             success: false,
                         });
-                        format!("Error executing {}: {e}", call.name)
+                        hooks
+                            .emit(HookEvent::Error, payload_error("tool", &message))
+                            .await;
+                        message
                     }
                 }
             } else {
-                format!("Unknown tool: {}", call.name)
+                let message = format!("Unknown tool: {}", call.name);
+                hooks
+                    .emit(HookEvent::Error, payload_error("tool", &message))
+                    .await;
+                message
             };
 
             let _ = writeln!(
@@ -577,13 +681,13 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
-        let _ = writeln!(
-            instructions,
-            "**{}**: {}\nParameters: `{}`\n",
-            tool.name(),
-            tool.description(),
-            tool.parameters_schema()
-        );
+        for spec in tool.specs() {
+            let _ = writeln!(
+                instructions,
+                "**{}**: {}\nParameters: `{}`\n",
+                spec.name, spec.description, spec.parameters
+            );
+        }
     }
 
     instructions
@@ -601,6 +705,7 @@ pub async fn run(
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
+    let hooks = HookManager::new(config.workspace_dir.clone());
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -677,6 +782,15 @@ pub async fn run(
         provider: provider_name.to_string(),
         model: model_name.to_string(),
     });
+    hooks
+        .emit(
+            HookEvent::AgentStart,
+            serde_json::json!({
+                "provider": provider_name,
+                "model": model_name,
+            }),
+        )
+        .await;
 
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
     let hardware_rag: Option<crate::rag::HardwareRag> = config
@@ -839,6 +953,7 @@ pub async fn run(
             &mut history,
             &tools_registry,
             observer.as_ref(),
+            &hooks,
             provider_name,
             model_name,
             temperature,
@@ -847,6 +962,15 @@ pub async fn run(
         .await?;
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
+        hooks
+            .emit(
+                HookEvent::TurnComplete,
+                serde_json::json!({
+                    "mode": "single",
+                    "response_chars": response.chars().count(),
+                }),
+            )
+            .await;
 
         // Auto-save assistant response to daily log
         if config.memory.auto_save {
@@ -901,6 +1025,7 @@ pub async fn run(
                 &mut history,
                 &tools_registry,
                 observer.as_ref(),
+                &hooks,
                 provider_name,
                 model_name,
                 temperature,
@@ -911,11 +1036,26 @@ pub async fn run(
                 Ok(resp) => resp,
                 Err(e) => {
                     eprintln!("\nError: {e}\n");
+                    hooks
+                        .emit(
+                            HookEvent::Error,
+                            payload_error("agent-turn", &e.to_string()),
+                        )
+                        .await;
                     continue;
                 }
             };
             println!("\n{response}\n");
             observer.record_event(&ObserverEvent::TurnComplete);
+            hooks
+                .emit(
+                    HookEvent::TurnComplete,
+                    serde_json::json!({
+                        "mode": "interactive",
+                        "response_chars": response.chars().count(),
+                    }),
+                )
+                .await;
 
             // Auto-compaction before hard trimming to preserve long-context signal.
             if let Ok(compacted) =
@@ -946,6 +1086,15 @@ pub async fn run(
         duration,
         tokens_used: None,
     });
+    hooks
+        .emit(
+            HookEvent::AgentEnd,
+            serde_json::json!({
+                "duration_ms": duration.as_millis(),
+                "tokens_used": serde_json::Value::Null,
+            }),
+        )
+        .await;
 
     Ok(())
 }
@@ -955,6 +1104,7 @@ pub async fn run(
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
+    let hooks = HookManager::new(config.workspace_dir.clone());
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -1097,17 +1247,28 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ChatMessage::user(&enriched),
     ];
 
-    agent_turn(
+    let response = agent_turn(
         provider.as_ref(),
         &mut history,
         &tools_registry,
         observer.as_ref(),
+        &hooks,
         provider_name,
         &model_name,
         config.default_temperature,
         true,
     )
-    .await
+    .await?;
+    hooks
+        .emit(
+            HookEvent::TurnComplete,
+            serde_json::json!({
+                "mode": "channel",
+                "response_chars": response.chars().count(),
+            }),
+        )
+        .await;
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -1263,7 +1424,11 @@ I will now call the tool with this payload:
 
         let (text, calls) = parse_tool_calls(response);
         assert!(text.contains("Sure, creating the file now."));
-        assert_eq!(calls.len(), 0, "Raw JSON without wrappers should not be parsed");
+        assert_eq!(
+            calls.len(),
+            0,
+            "Raw JSON without wrappers should not be parsed"
+        );
     }
 
     #[test]
