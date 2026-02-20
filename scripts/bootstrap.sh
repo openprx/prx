@@ -28,6 +28,9 @@ Options:
   --docker                   Run bootstrap in Docker and launch onboarding inside the container
   --install-system-deps      Install build dependencies (Linux/macOS)
   --install-rust             Install Rust via rustup if missing
+  --prefer-prebuilt          Try latest release binary first; fallback to source build on miss
+  --prebuilt-only            Install only from latest release binary (no source build fallback)
+  --force-source-build       Disable prebuilt flow and always build from source
   --onboard                  Run onboarding after install
   --interactive-onboard      Run interactive onboarding (implies --onboard)
   --api-key <key>            API key for non-interactive onboarding
@@ -41,6 +44,8 @@ Examples:
   ./bootstrap.sh
   ./bootstrap.sh --docker
   ./bootstrap.sh --install-system-deps --install-rust
+  ./bootstrap.sh --prefer-prebuilt
+  ./bootstrap.sh --prebuilt-only
   ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
   ./bootstrap.sh --interactive-onboard
 
@@ -53,11 +58,162 @@ Environment:
   ZEROCLAW_API_KEY           Used when --api-key is not provided
   ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
   ZEROCLAW_MODEL             Used when --model is not provided
+  ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
+  ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
 USAGE
 }
 
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+get_total_memory_mb() {
+  case "$(uname -s)" in
+    Linux)
+      if [[ -r /proc/meminfo ]]; then
+        awk '/MemTotal:/ {printf "%d\n", $2 / 1024}' /proc/meminfo
+      fi
+      ;;
+    Darwin)
+      if have_cmd sysctl; then
+        local bytes
+        bytes="$(sysctl -n hw.memsize 2>/dev/null || true)"
+        if [[ "$bytes" =~ ^[0-9]+$ ]]; then
+          echo $((bytes / 1024 / 1024))
+        fi
+      fi
+      ;;
+  esac
+}
+
+get_available_disk_mb() {
+  local path="${1:-.}"
+  local free_kb
+  free_kb="$(df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [[ "$free_kb" =~ ^[0-9]+$ ]]; then
+    echo $((free_kb / 1024))
+  fi
+}
+
+detect_release_target() {
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+
+  case "$os:$arch" in
+    Linux:x86_64)
+      echo "x86_64-unknown-linux-gnu"
+      ;;
+    Linux:aarch64|Linux:arm64)
+      echo "aarch64-unknown-linux-gnu"
+      ;;
+    Linux:armv7l|Linux:armv6l)
+      echo "armv7-unknown-linux-gnueabihf"
+      ;;
+    Darwin:x86_64)
+      echo "x86_64-apple-darwin"
+      ;;
+    Darwin:arm64|Darwin:aarch64)
+      echo "aarch64-apple-darwin"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+should_attempt_prebuilt_for_resources() {
+  local workspace="${1:-.}"
+  local min_ram_mb min_disk_mb total_ram_mb free_disk_mb low_resource
+
+  min_ram_mb="${ZEROCLAW_BOOTSTRAP_MIN_RAM_MB:-2048}"
+  min_disk_mb="${ZEROCLAW_BOOTSTRAP_MIN_DISK_MB:-6144}"
+  total_ram_mb="$(get_total_memory_mb || true)"
+  free_disk_mb="$(get_available_disk_mb "$workspace" || true)"
+  low_resource=false
+
+  if [[ "$total_ram_mb" =~ ^[0-9]+$ && "$total_ram_mb" -lt "$min_ram_mb" ]]; then
+    low_resource=true
+  fi
+  if [[ "$free_disk_mb" =~ ^[0-9]+$ && "$free_disk_mb" -lt "$min_disk_mb" ]]; then
+    low_resource=true
+  fi
+
+  if [[ "$low_resource" == true ]]; then
+    warn "Source build preflight indicates constrained resources."
+    if [[ "$total_ram_mb" =~ ^[0-9]+$ ]]; then
+      warn "Detected RAM: ${total_ram_mb}MB (recommended >= ${min_ram_mb}MB for local source builds)."
+    else
+      warn "Unable to detect total RAM automatically."
+    fi
+    if [[ "$free_disk_mb" =~ ^[0-9]+$ ]]; then
+      warn "Detected free disk: ${free_disk_mb}MB (recommended >= ${min_disk_mb}MB)."
+    else
+      warn "Unable to detect free disk space automatically."
+    fi
+    return 0
+  fi
+
+  return 1
+}
+
+install_prebuilt_binary() {
+  local target archive_url temp_dir archive_path extracted_bin install_dir
+
+  if ! have_cmd curl; then
+    warn "curl is required for pre-built binary installation."
+    return 1
+  fi
+  if ! have_cmd tar; then
+    warn "tar is required for pre-built binary installation."
+    return 1
+  fi
+
+  target="$(detect_release_target || true)"
+  if [[ -z "$target" ]]; then
+    warn "No pre-built binary target mapping for $(uname -s)/$(uname -m)."
+    return 1
+  fi
+
+  archive_url="https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-${target}.tar.gz"
+  temp_dir="$(mktemp -d -t zeroclaw-prebuilt-XXXXXX)"
+  archive_path="$temp_dir/zeroclaw-${target}.tar.gz"
+
+  info "Attempting pre-built binary install for target: $target"
+  if ! curl -fsSL "$archive_url" -o "$archive_path"; then
+    warn "Could not download release asset: $archive_url"
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  if ! tar -xzf "$archive_path" -C "$temp_dir"; then
+    warn "Failed to extract pre-built archive."
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  extracted_bin="$temp_dir/zeroclaw"
+  if [[ ! -x "$extracted_bin" ]]; then
+    extracted_bin="$(find "$temp_dir" -maxdepth 2 -type f -name zeroclaw -perm -u+x | head -n 1 || true)"
+  fi
+  if [[ -z "$extracted_bin" || ! -x "$extracted_bin" ]]; then
+    warn "Archive did not contain an executable zeroclaw binary."
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  install_dir="$HOME/.cargo/bin"
+  mkdir -p "$install_dir"
+  install -m 0755 "$extracted_bin" "$install_dir/zeroclaw"
+  rm -rf "$temp_dir"
+
+  info "Installed pre-built binary to $install_dir/zeroclaw"
+  if [[ ":$PATH:" != *":$install_dir:"* ]]; then
+    warn "$install_dir is not in PATH for this shell."
+    warn "Run: export PATH=\"$install_dir:\$PATH\""
+  fi
+
+  return 0
 }
 
 run_privileged() {
@@ -221,10 +377,14 @@ REPO_URL="https://github.com/zeroclaw-labs/zeroclaw.git"
 DOCKER_MODE=false
 INSTALL_SYSTEM_DEPS=false
 INSTALL_RUST=false
+PREFER_PREBUILT=false
+PREBUILT_ONLY=false
+FORCE_SOURCE_BUILD=false
 RUN_ONBOARD=false
 INTERACTIVE_ONBOARD=false
 SKIP_BUILD=false
 SKIP_INSTALL=false
+PREBUILT_INSTALLED=false
 API_KEY="${ZEROCLAW_API_KEY:-}"
 PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
 MODEL="${ZEROCLAW_MODEL:-}"
@@ -241,6 +401,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --install-rust)
       INSTALL_RUST=true
+      shift
+      ;;
+    --prefer-prebuilt)
+      PREFER_PREBUILT=true
+      shift
+      ;;
+    --prebuilt-only)
+      PREBUILT_ONLY=true
+      shift
+      ;;
+    --force-source-build)
+      FORCE_SOURCE_BUILD=true
       shift
       ;;
     --onboard)
@@ -314,16 +486,6 @@ else
   fi
 fi
 
-if [[ "$DOCKER_MODE" == false ]] && ! have_cmd cargo; then
-  error "cargo is not installed."
-  cat <<'MSG' >&2
-Install Rust first: https://rustup.rs/
-or re-run with:
-  ./bootstrap.sh --install-rust
-MSG
-  exit 1
-fi
-
 WORK_DIR="$ROOT_DIR"
 TEMP_CLONE=false
 TEMP_DIR=""
@@ -364,6 +526,15 @@ echo "    workspace: $WORK_DIR"
 
 cd "$WORK_DIR"
 
+if [[ "$FORCE_SOURCE_BUILD" == true ]]; then
+  PREFER_PREBUILT=false
+  PREBUILT_ONLY=false
+fi
+
+if [[ "$PREBUILT_ONLY" == true ]]; then
+  PREFER_PREBUILT=true
+fi
+
 if [[ "$DOCKER_MODE" == true ]]; then
   ensure_docker_ready
   if [[ "$RUN_ONBOARD" == false ]]; then
@@ -389,6 +560,39 @@ DONE
   exit 0
 fi
 
+if [[ "$FORCE_SOURCE_BUILD" == false ]]; then
+  if [[ "$PREFER_PREBUILT" == false && "$PREBUILT_ONLY" == false ]]; then
+    if should_attempt_prebuilt_for_resources "$WORK_DIR"; then
+      info "Attempting pre-built binary first due to resource preflight."
+      PREFER_PREBUILT=true
+    fi
+  fi
+
+  if [[ "$PREFER_PREBUILT" == true ]]; then
+    if install_prebuilt_binary; then
+      PREBUILT_INSTALLED=true
+      SKIP_BUILD=true
+      SKIP_INSTALL=true
+    elif [[ "$PREBUILT_ONLY" == true ]]; then
+      error "Pre-built-only mode requested, but no compatible release asset is available."
+      error "Try again later, or run with --force-source-build on a machine with enough RAM/disk."
+      exit 1
+    else
+      warn "Pre-built install unavailable; falling back to source build."
+    fi
+  fi
+fi
+
+if [[ "$PREBUILT_INSTALLED" == false && ( "$SKIP_BUILD" == false || "$SKIP_INSTALL" == false ) ]] && ! have_cmd cargo; then
+  error "cargo is not installed."
+  cat <<'MSG' >&2
+Install Rust first: https://rustup.rs/
+or re-run with:
+  ./bootstrap.sh --install-rust
+MSG
+  exit 1
+fi
+
 if [[ "$SKIP_BUILD" == false ]]; then
   info "Building release binary"
   cargo build --release --locked
@@ -406,6 +610,8 @@ fi
 ZEROCLAW_BIN=""
 if have_cmd zeroclaw; then
   ZEROCLAW_BIN="zeroclaw"
+elif [[ -x "$HOME/.cargo/bin/zeroclaw" ]]; then
+  ZEROCLAW_BIN="$HOME/.cargo/bin/zeroclaw"
 elif [[ -x "$WORK_DIR/target/release/zeroclaw" ]]; then
   ZEROCLAW_BIN="$WORK_DIR/target/release/zeroclaw"
 fi
