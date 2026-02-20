@@ -50,6 +50,7 @@ mod gateway;
 mod hardware;
 mod health;
 mod heartbeat;
+mod hooks;
 mod identity;
 mod integrations;
 mod memory;

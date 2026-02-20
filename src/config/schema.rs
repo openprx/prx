@@ -63,6 +63,9 @@ pub struct Config {
     pub composio: ComposioConfig,
 
     #[serde(default)]
+    pub mcp: McpConfig,
+
+    #[serde(default)]
     pub secrets: SecretsConfig,
 
     #[serde(default)]
@@ -557,6 +560,107 @@ impl Default for ComposioConfig {
             enabled: false,
             api_key: None,
             entity_id: default_entity_id(),
+        }
+    }
+}
+
+// ── MCP (Model Context Protocol) ─────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfig {
+    /// Enable MCP client integration
+    #[serde(default)]
+    pub enabled: bool,
+    /// Named MCP server definitions
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerConfig>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            servers: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    Stdio,
+    Http,
+}
+
+impl Default for McpTransport {
+    fn default() -> Self {
+        Self::Stdio
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// Per-server enable switch
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Transport type: stdio or http
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// Command for stdio mode
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Command args for stdio mode
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// URL for HTTP mode (streamable HTTP endpoint)
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Environment variables for stdio mode
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Startup timeout in milliseconds
+    #[serde(default = "default_mcp_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    /// Request timeout in milliseconds
+    #[serde(default = "default_mcp_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    /// Prefix used in tool naming and routing
+    #[serde(default = "default_mcp_tool_name_prefix")]
+    pub tool_name_prefix: String,
+    /// Optional allow-list of exposed tools (empty = all)
+    #[serde(default)]
+    pub allow_tools: Vec<String>,
+    /// Optional deny-list of exposed tools
+    #[serde(default)]
+    pub deny_tools: Vec<String>,
+}
+
+fn default_mcp_startup_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_mcp_request_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_mcp_tool_name_prefix() -> String {
+    "mcp".into()
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            transport: McpTransport::Stdio,
+            command: None,
+            args: Vec::new(),
+            url: None,
+            env: HashMap::new(),
+            startup_timeout_ms: default_mcp_startup_timeout_ms(),
+            request_timeout_ms: default_mcp_request_timeout_ms(),
+            tool_name_prefix: default_mcp_tool_name_prefix(),
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
         }
     }
 }
@@ -1246,6 +1350,7 @@ pub struct ChannelsConfig {
     pub telegram: Option<TelegramConfig>,
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
+    pub signal: Option<SignalConfig>,
     pub webhook: Option<WebhookConfig>,
     pub imessage: Option<IMessageConfig>,
     pub matrix: Option<MatrixConfig>,
@@ -1263,6 +1368,7 @@ impl Default for ChannelsConfig {
             telegram: None,
             discord: None,
             slack: None,
+            signal: None,
             webhook: None,
             imessage: None,
             matrix: None,
@@ -1300,6 +1406,162 @@ pub struct SlackConfig {
     pub channel_id: Option<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalConfig {
+    #[serde(default = "default_signal_base_url")]
+    pub base_url: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
+    #[serde(default)]
+    pub group_allowed_senders: Vec<String>,
+    #[serde(default = "default_signal_dm_policy")]
+    pub dm_policy: String,
+    #[serde(default = "default_signal_group_policy")]
+    pub group_policy: String,
+    #[serde(default = "default_signal_ingress_mode")]
+    pub ingress_mode: String,
+    #[serde(default = "default_true")]
+    pub auto_start: bool,
+    #[serde(default = "default_signal_cli_path")]
+    pub cli_path: String,
+    #[serde(default = "default_signal_http_host")]
+    pub http_host: String,
+    #[serde(default = "default_signal_http_port")]
+    pub http_port: u16,
+    #[serde(default = "default_signal_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    #[serde(default = "default_signal_receive_mode")]
+    pub receive_mode: String,
+    #[serde(default)]
+    pub ignore_attachments: bool,
+    #[serde(default)]
+    pub ignore_stories: bool,
+    #[serde(default)]
+    pub send_read_receipts: bool,
+    #[serde(default = "default_signal_media_max_mb")]
+    pub media_max_mb: u32,
+    #[serde(default = "default_signal_text_chunk_limit")]
+    pub text_chunk_limit: usize,
+    #[serde(default = "default_signal_chunk_mode")]
+    pub chunk_mode: String,
+    #[serde(default = "default_signal_reaction_notifications")]
+    pub reaction_notifications: String,
+    #[serde(default)]
+    pub reaction_allowlist: Vec<String>,
+    #[serde(default)]
+    pub require_mention_in_groups: bool,
+    #[serde(default)]
+    pub mention_patterns: Vec<String>,
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+    #[serde(default = "default_signal_dedupe_window_secs")]
+    pub dedupe_window_secs: u64,
+    #[serde(default = "default_signal_history_limit")]
+    pub history_limit: usize,
+    #[serde(default = "default_signal_dm_history_limit")]
+    pub dm_history_limit: usize,
+}
+
+fn default_signal_base_url() -> String {
+    "http://127.0.0.1:8080".into()
+}
+
+fn default_signal_dm_policy() -> String {
+    "pairing".into()
+}
+
+fn default_signal_group_policy() -> String {
+    "allowlist".into()
+}
+
+fn default_signal_ingress_mode() -> String {
+    "direct_sse".into()
+}
+
+fn default_signal_cli_path() -> String {
+    "signal-cli".into()
+}
+
+fn default_signal_http_host() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_signal_http_port() -> u16 {
+    8080
+}
+
+fn default_signal_startup_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_signal_receive_mode() -> String {
+    "on-start".into()
+}
+
+fn default_signal_media_max_mb() -> u32 {
+    8
+}
+
+fn default_signal_text_chunk_limit() -> usize {
+    4000
+}
+
+fn default_signal_chunk_mode() -> String {
+    "length".into()
+}
+
+fn default_signal_reaction_notifications() -> String {
+    "own".into()
+}
+
+fn default_signal_dedupe_window_secs() -> u64 {
+    120
+}
+
+fn default_signal_history_limit() -> usize {
+    6
+}
+
+fn default_signal_dm_history_limit() -> usize {
+    6
+}
+
+impl Default for SignalConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_signal_base_url(),
+            account: None,
+            allowed_senders: Vec::new(),
+            group_allowed_senders: Vec::new(),
+            dm_policy: default_signal_dm_policy(),
+            group_policy: default_signal_group_policy(),
+            ingress_mode: default_signal_ingress_mode(),
+            auto_start: default_true(),
+            cli_path: default_signal_cli_path(),
+            http_host: default_signal_http_host(),
+            http_port: default_signal_http_port(),
+            startup_timeout_ms: default_signal_startup_timeout_ms(),
+            receive_mode: default_signal_receive_mode(),
+            ignore_attachments: false,
+            ignore_stories: false,
+            send_read_receipts: false,
+            media_max_mb: default_signal_media_max_mb(),
+            text_chunk_limit: default_signal_text_chunk_limit(),
+            chunk_mode: default_signal_chunk_mode(),
+            reaction_notifications: default_signal_reaction_notifications(),
+            reaction_allowlist: Vec::new(),
+            require_mention_in_groups: false,
+            mention_patterns: Vec::new(),
+            webhook_secret: None,
+            dedupe_window_secs: default_signal_dedupe_window_secs(),
+            history_limit: default_signal_history_limit(),
+            dm_history_limit: default_signal_dm_history_limit(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1584,6 +1846,7 @@ impl Default for Config {
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
+            mcp: McpConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -1927,6 +2190,7 @@ mod tests {
                 }),
                 discord: None,
                 slack: None,
+                signal: None,
                 webhook: None,
                 imessage: None,
                 matrix: None,
@@ -1940,6 +2204,7 @@ mod tests {
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
+            mcp: McpConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -2047,6 +2312,7 @@ tool_dispatcher = "xml"
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
+            mcp: McpConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -2212,6 +2478,7 @@ tool_dispatcher = "xml"
             telegram: None,
             discord: None,
             slack: None,
+            signal: None,
             webhook: None,
             imessage: Some(IMessageConfig {
                 allowed_contacts: vec!["+1".into()],
@@ -2373,6 +2640,7 @@ channel_id = "C123"
             telegram: None,
             discord: None,
             slack: None,
+            signal: None,
             webhook: None,
             imessage: None,
             matrix: None,

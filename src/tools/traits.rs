@@ -1,3 +1,4 @@
+use anyhow::bail;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +33,16 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Optional pre-turn refresh hook for tools with dynamic capabilities.
+    async fn refresh(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Whether this tool handles the provided public tool name.
+    fn supports_name(&self, name: &str) -> bool {
+        self.name() == name
+    }
+
     /// Get the full spec for LLM registration
     fn spec(&self) -> ToolSpec {
         ToolSpec {
@@ -39,6 +50,23 @@ pub trait Tool: Send + Sync {
             description: self.description().to_string(),
             parameters: self.parameters_schema(),
         }
+    }
+
+    /// Optional multi-spec export for dynamic tools.
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![self.spec()]
+    }
+
+    /// Execute by public tool name. Default maps to `execute`.
+    async fn execute_named(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        if !self.supports_name(name) {
+            bail!("Tool '{}' does not handle name '{}'", self.name(), name);
+        }
+        self.execute(args).await
     }
 }
 

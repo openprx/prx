@@ -82,7 +82,7 @@ impl XmlToolDispatcher {
     }
 
     pub fn tool_specs(tools: &[Box<dyn Tool>]) -> Vec<ToolSpec> {
-        tools.iter().map(|tool| tool.spec()).collect()
+        tools.iter().flat_map(|tool| tool.specs()).collect()
     }
 }
 
