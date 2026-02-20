@@ -71,7 +71,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
-    {
+    if config.cron.enabled {
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
@@ -82,6 +82,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 async move { crate::cron::scheduler::run(cfg).await }
             },
         ));
+    } else {
+        crate::health::mark_component_ok("scheduler");
+        tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
     println!("🧠 ZeroClaw daemon started");
@@ -206,13 +209,42 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    config.channels_config.telegram.is_some()
-        || config.channels_config.discord.is_some()
-        || config.channels_config.slack.is_some()
-        || config.channels_config.imessage.is_some()
-        || config.channels_config.matrix.is_some()
-        || config.channels_config.whatsapp.is_some()
-        || config.channels_config.email.is_some()
+    let crate::config::ChannelsConfig {
+        cli: _,     // `cli` is used only when running the CLI manually
+        webhook: _, // Managed by the gateway
+        telegram,
+        discord,
+        slack,
+        mattermost,
+        imessage,
+        matrix,
+        signal,
+        whatsapp,
+        email,
+        irc,
+        lark,
+        dingtalk,
+        linq,
+        nextcloud_talk,
+        qq,
+        ..
+    } = &config.channels_config;
+
+    telegram.is_some()
+        || discord.is_some()
+        || slack.is_some()
+        || mattermost.is_some()
+        || imessage.is_some()
+        || matrix.is_some()
+        || signal.is_some()
+        || whatsapp.is_some()
+        || email.is_some()
+        || irc.is_some()
+        || lark.is_some()
+        || dingtalk.is_some()
+        || linq.is_some()
+        || nextcloud_talk.is_some()
+        || qq.is_some()
 }
 
 #[cfg(test)]
@@ -289,6 +321,58 @@ mod tests {
         config.channels_config.telegram = Some(crate::config::TelegramConfig {
             bot_token: "token".into(),
             allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn detects_dingtalk_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.dingtalk = Some(crate::config::schema::DingTalkConfig {
+            client_id: "client_id".into(),
+            client_secret: "client_secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn detects_mattermost_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
+            url: "https://mattermost.example.com".into(),
+            bot_token: "token".into(),
+            channel_id: Some("channel-id".into()),
+            allowed_users: vec!["*".into()],
+            thread_replies: Some(true),
+            mention_only: Some(false),
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn detects_qq_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.qq = Some(crate::config::schema::QQConfig {
+            app_id: "app-id".into(),
+            app_secret: "app-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn detects_nextcloud_talk_as_supervised_channel() {
+        let mut config = Config::default();
+        config.channels_config.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
+            base_url: "https://cloud.example.com".into(),
+            app_token: "app-token".into(),
+            webhook_secret: None,
+            allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));
     }
