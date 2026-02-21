@@ -10,6 +10,10 @@ const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
+const OPENCLAW_SKILLS_REPO_URL: &str = "https://github.com/openclaw/openclaw";
+const OPENCLAW_SKILLS_SYNC_MARKER: &str = ".zeroclaw-openclaw-skills-sync";
+const OPENCLAW_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
+
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
@@ -71,7 +75,7 @@ fn default_version() -> String {
 
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    load_skills_with_open_skills_config(workspace_dir, None, None)
+    load_skills_with_open_skills_config(workspace_dir, None, None, None, None)
 }
 
 /// Load skills using runtime config values (preferred at runtime).
@@ -80,6 +84,8 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
+        Some(config.skills.openclaw_skills_enabled),
+        config.skills.openclaw_skills_dir.as_deref(),
     )
 }
 
@@ -87,15 +93,28 @@ fn load_skills_with_open_skills_config(
     workspace_dir: &Path,
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
+    config_openclaw_skills_enabled: Option<bool>,
+    config_openclaw_skills_dir: Option<&str>,
 ) -> Vec<Skill> {
     let mut skills = Vec::new();
 
+    // 1. Open skills (community)
     if let Some(open_skills_dir) =
         ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
     {
         skills.extend(load_open_skills(&open_skills_dir));
     }
 
+    // 2. OpenClaw skills — clone/pull from GitHub, load `skills/` subdir in lazy mode
+    if let Some(repo_dir) =
+        ensure_openclaw_skills_repo(config_openclaw_skills_enabled, config_openclaw_skills_dir)
+    {
+        let skills_subdir = repo_dir.join("skills");
+        tracing::info!("Loading OpenClaw skills from: {}", skills_subdir.display());
+        skills.extend(load_openclaw_skills_from_dir(&skills_subdir));
+    }
+
+    // 3. Workspace skills (highest priority)
     skills.extend(load_workspace_skills(workspace_dir));
     skills
 }
@@ -419,6 +438,262 @@ fn extract_description(content: &str) -> String {
         .to_string()
 }
 
+/// Resolve the local clone directory for the openclaw-skills repo.
+/// Priority: env var → config value → `~/.zeroclaw/openclaw-skills/`
+fn resolve_openclaw_skills_dir(config_openclaw_skills_dir: Option<&str>) -> Option<PathBuf> {
+    let parse_dir = |raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
+    };
+
+    // 1. Env var override
+    if let Some(env_dir) = std::env::var("ZEROCLAW_OPENCLAW_SKILLS_DIR")
+        .ok()
+        .as_deref()
+        .and_then(parse_dir)
+    {
+        return Some(env_dir);
+    }
+
+    // 2. Config value
+    if let Some(config_dir) = config_openclaw_skills_dir.and_then(parse_dir) {
+        return Some(config_dir);
+    }
+
+    // 3. Default: ~/.zeroclaw/openclaw-skills/
+    UserDirs::new().map(|dirs| dirs.home_dir().join(".zeroclaw/openclaw-skills"))
+}
+
+/// Ensure the openclaw-skills GitHub repo is cloned/up-to-date; returns the repo dir.
+/// Returns `None` if disabled or if git operations fail.
+fn ensure_openclaw_skills_repo(
+    config_openclaw_skills_enabled: Option<bool>,
+    config_openclaw_skills_dir: Option<&str>,
+) -> Option<PathBuf> {
+    // Check enabled flag (env var takes priority over config)
+    let enabled = {
+        let env_override = std::env::var("ZEROCLAW_OPENCLAW_SKILLS_ENABLED").ok();
+        if let Some(raw) = env_override.as_deref() {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => config_openclaw_skills_enabled.unwrap_or(false),
+            }
+        } else {
+            config_openclaw_skills_enabled.unwrap_or(false)
+        }
+    };
+
+    if !enabled {
+        return None;
+    }
+
+    let repo_dir = resolve_openclaw_skills_dir(config_openclaw_skills_dir)?;
+
+    if !repo_dir.exists() {
+        if !clone_openclaw_skills_repo(&repo_dir) {
+            return None;
+        }
+        let _ = mark_openclaw_skills_synced(&repo_dir);
+        return Some(repo_dir);
+    }
+
+    if should_sync_openclaw_skills(&repo_dir) {
+        if pull_openclaw_skills_repo(&repo_dir) {
+            let _ = mark_openclaw_skills_synced(&repo_dir);
+        } else {
+            tracing::warn!(
+                "openclaw-skills update failed; using local copy from {}",
+                repo_dir.display()
+            );
+        }
+    }
+
+    Some(repo_dir)
+}
+
+/// Sparse-clone the OpenClaw repository, checking out only the `skills/` directory.
+fn clone_openclaw_skills_repo(repo_dir: &Path) -> bool {
+    if let Some(parent) = repo_dir.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                "failed to create openclaw-skills parent directory {}: {err}",
+                parent.display()
+            );
+            return false;
+        }
+    }
+
+    let output = Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--sparse",
+            OPENCLAW_SKILLS_REPO_URL,
+        ])
+        .arg(repo_dir)
+        .output();
+
+    match output {
+        Ok(result) if result.status.success() => {
+            // Configure sparse checkout to include only skills/
+            let sparse = Command::new("git")
+                .arg("-C")
+                .arg(repo_dir)
+                .args(["sparse-checkout", "set", "skills"])
+                .output();
+            match sparse {
+                Ok(r) if r.status.success() => {
+                    tracing::info!("initialized openclaw-skills at {}", repo_dir.display());
+                }
+                Ok(r) => {
+                    let stderr = String::from_utf8_lossy(&r.stderr);
+                    tracing::warn!("sparse-checkout set failed ({stderr}); full clone will be used");
+                }
+                Err(err) => {
+                    tracing::warn!("failed to run git sparse-checkout for openclaw-skills: {err}");
+                }
+            }
+            true
+        }
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!("failed to clone openclaw skills: {stderr}");
+            false
+        }
+        Err(err) => {
+            tracing::warn!("failed to run git clone for openclaw skills: {err}");
+            false
+        }
+    }
+}
+
+fn pull_openclaw_skills_repo(repo_dir: &Path) -> bool {
+    // Skip pull for non-git directories (e.g. user-provided local path).
+    if !repo_dir.join(".git").exists() {
+        return true;
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["pull", "--ff-only"])
+        .output();
+
+    match output {
+        Ok(result) if result.status.success() => true,
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!("failed to pull openclaw-skills updates: {stderr}");
+            false
+        }
+        Err(err) => {
+            tracing::warn!("failed to run git pull for openclaw-skills: {err}");
+            false
+        }
+    }
+}
+
+fn should_sync_openclaw_skills(repo_dir: &Path) -> bool {
+    let marker = repo_dir.join(OPENCLAW_SKILLS_SYNC_MARKER);
+    let Ok(metadata) = std::fs::metadata(marker) else {
+        return true;
+    };
+    let Ok(modified_at) = metadata.modified() else {
+        return true;
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified_at) else {
+        return true;
+    };
+    age >= Duration::from_secs(OPENCLAW_SKILLS_SYNC_INTERVAL_SECS)
+}
+
+fn mark_openclaw_skills_synced(repo_dir: &Path) -> Result<()> {
+    std::fs::write(repo_dir.join(OPENCLAW_SKILLS_SYNC_MARKER), b"synced")?;
+    Ok(())
+}
+
+/// Parse YAML frontmatter from an OpenClaw SKILL.md file.
+/// Returns `(name, description)` if both fields are found.
+fn parse_openclaw_frontmatter(content: &str) -> Option<(String, String)> {
+    if !content.starts_with("---") {
+        return None;
+    }
+    let rest = &content[3..];
+    let end = rest.find("\n---")?;
+    let yaml_block = &rest[..end];
+
+    let mut name = None;
+    let mut description = None;
+    for line in yaml_block.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("name:") {
+            name = Some(val.trim().trim_matches('"').to_string());
+        } else if let Some(val) = line.strip_prefix("description:") {
+            description = Some(val.trim().trim_matches('"').to_string());
+        }
+    }
+
+    Some((name?, description?))
+}
+
+/// Load OpenClaw skills from a directory in LAZY mode (name + description + location only).
+/// No prompt content is injected; the agent reads the SKILL.md on demand.
+fn load_openclaw_skills_from_dir(skills_dir: &Path) -> Vec<Skill> {
+    if !skills_dir.exists() {
+        return Vec::new();
+    }
+    let mut skills = Vec::new();
+    let Ok(entries) = std::fs::read_dir(skills_dir) else {
+        return skills;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let md_path = path.join("SKILL.md");
+        if !md_path.exists() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&md_path) else {
+            continue;
+        };
+
+        let (name, description) = if let Some((n, d)) = parse_openclaw_frontmatter(&content) {
+            (n, d)
+        } else {
+            // Fallback: use directory name and first non-heading line
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let desc = extract_description(&content);
+            (name, desc)
+        };
+
+        skills.push(Skill {
+            name,
+            description,
+            version: "openclaw".to_string(),
+            author: Some("openclaw".to_string()),
+            tags: vec!["openclaw".to_string()],
+            tools: Vec::new(),
+            prompts: Vec::new(), // EMPTY — lazy mode: no content injected
+            location: Some(md_path),
+        });
+    }
+    skills
+}
+
 fn append_xml_escaped(out: &mut String, text: &str) {
     for ch in text.chars() {
         match ch {
@@ -455,8 +730,8 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
 
     let mut prompt = String::from(
         "## Available Skills\n\n\
-         Skill instructions and tool metadata are preloaded below.\n\
-         Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
+         Skills are listed below. Some have preloaded instructions; others are lazy-loaded.\n\
+         For skills without <instructions>, read the SKILL.md at <location> when the skill is needed.\n\n\
          <available_skills>\n",
     );
 
@@ -1237,6 +1512,197 @@ description = "Bare minimum"
         let skills = load_skills_with_config(&workspace_dir, &config);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "http_request");
+    }
+
+    // ── OpenClaw skills ──────────────────────────────────────────────────────
+
+    // --- frontmatter parser ---
+
+    #[test]
+    fn parse_openclaw_frontmatter_returns_name_and_description() {
+        let content = "---\nname: weather\ndescription: \"Get current weather info\"\nmetadata: {}\n---\n# Weather Skill\n...";
+        let result = parse_openclaw_frontmatter(content);
+        assert_eq!(
+            result,
+            Some(("weather".to_string(), "Get current weather info".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_openclaw_frontmatter_no_leading_dashes_returns_none() {
+        let content = "# No frontmatter here\nJust markdown.";
+        assert!(parse_openclaw_frontmatter(content).is_none());
+    }
+
+    #[test]
+    fn parse_openclaw_frontmatter_missing_name_returns_none() {
+        let content = "---\ndescription: \"Only description\"\n---\n# Skill";
+        assert!(parse_openclaw_frontmatter(content).is_none());
+    }
+
+    #[test]
+    fn parse_openclaw_frontmatter_missing_description_returns_none() {
+        let content = "---\nname: only-name\n---\n# Skill";
+        assert!(parse_openclaw_frontmatter(content).is_none());
+    }
+
+    // --- load_openclaw_skills_from_dir ---
+
+    #[test]
+    fn load_openclaw_skills_from_dir_lazy_mode_no_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("my-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: \"A test skill\"\n---\n# My Skill\nDoes stuff.\n",
+        )
+        .unwrap();
+
+        let skills = load_openclaw_skills_from_dir(dir.path());
+        assert_eq!(skills.len(), 1);
+        let skill = &skills[0];
+        assert_eq!(skill.name, "my-skill");
+        assert_eq!(skill.description, "A test skill");
+        assert_eq!(skill.version, "openclaw");
+        assert_eq!(skill.author.as_deref(), Some("openclaw"));
+        assert!(skill.prompts.is_empty(), "lazy mode: prompts must be empty");
+        assert!(skill.location.is_some());
+    }
+
+    #[test]
+    fn load_openclaw_skills_from_dir_fallback_when_no_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("fallback-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Fallback Skill\nThis has no frontmatter.\n",
+        )
+        .unwrap();
+
+        let skills = load_openclaw_skills_from_dir(dir.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "fallback-skill");
+        assert!(!skills[0].description.is_empty());
+    }
+
+    #[test]
+    fn load_openclaw_skills_from_dir_empty_for_nonexistent_dir() {
+        let skills = load_openclaw_skills_from_dir(Path::new("/nonexistent/path/skills"));
+        assert!(skills.is_empty());
+    }
+
+    // --- resolve_openclaw_skills_dir ---
+
+    #[test]
+    fn resolve_openclaw_skills_dir_prefers_env_then_config_then_default() {
+        // Temporarily clear env so we can test the logic in isolation.
+        let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
+
+        // Config value used when env is absent.
+        let result = resolve_openclaw_skills_dir(Some("/tmp/my-openclaw-skills"));
+        assert_eq!(result, Some(PathBuf::from("/tmp/my-openclaw-skills")));
+
+        // Default path when nothing is set.
+        let result = resolve_openclaw_skills_dir(None);
+        // Must end with ".zeroclaw/openclaw-skills"
+        assert!(
+            result
+                .as_ref()
+                .map(|p| p.ends_with(".zeroclaw/openclaw-skills"))
+                .unwrap_or(false),
+            "default path should end with .zeroclaw/openclaw-skills, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_openclaw_skills_dir_env_takes_priority_over_config() {
+        let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
+        std::env::set_var("ZEROCLAW_OPENCLAW_SKILLS_DIR", "/tmp/env-openclaw");
+
+        let result = resolve_openclaw_skills_dir(Some("/tmp/config-openclaw"));
+        assert_eq!(result, Some(PathBuf::from("/tmp/env-openclaw")));
+    }
+
+    // --- ensure_openclaw_skills_repo (disabled) ---
+
+    #[test]
+    fn openclaw_skills_not_loaded_when_disabled_via_config() {
+        let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
+
+        // Disabled in config — should return None without touching filesystem/network.
+        let result = ensure_openclaw_skills_repo(Some(false), None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn openclaw_skills_not_loaded_when_disabled_via_env() {
+        let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
+        std::env::set_var("ZEROCLAW_OPENCLAW_SKILLS_ENABLED", "false");
+
+        // Even if config says enabled, env override wins.
+        let result = ensure_openclaw_skills_repo(Some(true), None);
+        assert!(result.is_none());
+    }
+
+    // --- integration: load_skills_with_config respects openclaw_skills_enabled ---
+
+    #[test]
+    fn openclaw_skills_disabled_returns_only_workspace_skills() {
+        let _env_enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
+        let _env_dir_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = dir.path().join("workspace");
+        fs::create_dir_all(workspace_dir.join("skills")).unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.openclaw_skills_enabled = false;
+
+        // Empty workspace → no skills returned.
+        let skills = load_skills_with_config(&workspace_dir, &config);
+        assert_eq!(skills.len(), 0);
+    }
+
+    #[test]
+    fn openclaw_skills_loads_from_local_dir_via_config() {
+        let _env_enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
+        let _env_dir_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
+        let _open_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_ENABLED");
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = dir.path().join("workspace");
+        fs::create_dir_all(workspace_dir.join("skills")).unwrap();
+
+        // Simulate a local clone that already has a skills/ subdir.
+        let repo_dir = dir.path().join("openclaw-clone");
+        let skills_subdir = repo_dir.join("skills").join("my-oc-skill");
+        fs::create_dir_all(&skills_subdir).unwrap();
+        fs::write(
+            skills_subdir.join("SKILL.md"),
+            "---\nname: my-oc-skill\ndescription: \"OpenClaw test skill\"\n---\n# My OC Skill\n",
+        )
+        .unwrap();
+        // Create the sync marker so ensure_openclaw_skills_repo won't try to pull.
+        fs::write(
+            repo_dir.join(OPENCLAW_SKILLS_SYNC_MARKER),
+            b"synced",
+        )
+        .unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.openclaw_skills_enabled = true;
+        config.skills.openclaw_skills_dir =
+            Some(repo_dir.to_string_lossy().to_string());
+
+        let skills = load_skills_with_config(&workspace_dir, &config);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "my-oc-skill");
+        assert_eq!(skills[0].description, "OpenClaw test skill");
+        assert!(skills[0].prompts.is_empty(), "must be lazy (no prompts)");
     }
 }
 
