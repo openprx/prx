@@ -28,6 +28,7 @@ pub mod mattermost;
 pub mod nextcloud_talk;
 pub mod qq;
 pub mod signal;
+pub mod signal_native;
 pub mod slack;
 pub mod telegram;
 pub mod traits;
@@ -51,6 +52,7 @@ pub use mattermost::MattermostChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
+pub use signal_native::SignalNativeChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
@@ -2301,7 +2303,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         channels.push((
             "Signal",
             Arc::new(SignalChannel::new(
-                sg.http_url.clone(),
+                sg.effective_http_url(),
                 sg.account.clone(),
                 sg.group_id.clone(),
                 sg.allowed_from.clone(),
@@ -2345,7 +2347,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         channels.push((
             "Signal",
             Arc::new(SignalChannel::new(
-                sig.http_url.clone(),
+                sig.effective_http_url(),
                 sig.account.clone(),
                 sig.group_id.clone(),
                 sig.allowed_from.clone(),
@@ -2760,15 +2762,36 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref sig) = config.channels_config.signal {
-        channels.push(Arc::new(SignalChannel::new(
-            sig.http_url.clone(),
-            sig.account.clone(),
-            sig.group_id.clone(),
-            sig.allowed_from.clone(),
-            sig.ignore_attachments,
-            sig.ignore_stories,
-            config.media.clone(),
-        )));
+        let signal_channel: Arc<dyn Channel + Send + Sync> = if sig.is_native_mode() {
+            tracing::info!(
+                "Signal: native mode — will spawn signal-cli daemon on port {}",
+                sig.daemon_http_port.unwrap_or(8686)
+            );
+            Arc::new(SignalNativeChannel::new(
+                sig.cli_path
+                    .clone()
+                    .unwrap_or_else(|| "signal-cli".to_string()),
+                sig.account.clone(),
+                sig.data_dir.clone(),
+                sig.daemon_http_port.unwrap_or(8686),
+                sig.group_id.clone(),
+                sig.allowed_from.clone(),
+                sig.ignore_attachments,
+                sig.ignore_stories,
+                config.media.clone(),
+            ))
+        } else {
+            Arc::new(SignalChannel::new(
+                sig.effective_http_url(),
+                sig.account.clone(),
+                sig.group_id.clone(),
+                sig.allowed_from.clone(),
+                sig.ignore_attachments,
+                sig.ignore_stories,
+                config.media.clone(),
+            ))
+        };
+        channels.push(signal_channel);
     }
 
     if let Some(ref wa) = config.channels_config.whatsapp {
@@ -2877,9 +2900,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     // Register message_send tool backed by Signal (or first channel) for proactive messaging.
+    // Always use SignalChannel (HTTP) pointing to the effective URL (local daemon in native mode,
+    // external daemon in rest mode).  The daemon must be running by the time this tool is invoked.
     if let Some(ref sig) = config.channels_config.signal {
         let sig_chan = Arc::new(SignalChannel::new(
-            sig.http_url.clone(),
+            sig.effective_http_url(),
             sig.account.clone(),
             sig.group_id.clone(),
             sig.allowed_from.clone(),
