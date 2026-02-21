@@ -76,6 +76,7 @@ impl SignalNativeChannel {
             ignore_stories,
             media_config,
             true, // is_native: use JSON-RPC API, not Docker REST API
+            data_dir.clone(),
         );
         Self {
             cli_path,

@@ -55,6 +55,8 @@ pub struct SignalChannel {
     /// When true, use native signal-cli daemon JSON-RPC API (`/api/v1/rpc`)
     /// instead of the Docker signal-cli-rest-api REST endpoints.
     is_native: bool,
+    /// signal-cli data directory (native mode). Used to resolve attachment paths.
+    data_dir: Option<String>,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -107,7 +109,7 @@ impl SignalChannel {
         ignore_stories: bool,
         media_config: crate::config::MediaConfig,
     ) -> Self {
-        Self::new_with_mode(http_url, account, group_id, allowed_from, ignore_attachments, ignore_stories, media_config, false)
+        Self::new_with_mode(http_url, account, group_id, allowed_from, ignore_attachments, ignore_stories, media_config, false, None)
     }
 
     /// Like [`new`] but allows specifying native daemon mode.
@@ -120,6 +122,7 @@ impl SignalChannel {
         ignore_stories: bool,
         media_config: crate::config::MediaConfig,
         is_native: bool,
+        data_dir: Option<String>,
     ) -> Self {
         let http_url = http_url.trim_end_matches('/').to_string();
         Self {
@@ -131,6 +134,7 @@ impl SignalChannel {
             ignore_stories,
             media_config,
             is_native,
+            data_dir,
         }
     }
 
@@ -336,14 +340,21 @@ impl SignalChannel {
 
         // ── Native mode: read local file directly ────────────────────────────
         if self.is_native {
-            // signal-cli stores downloaded attachments on disk and provides
-            // the path in the `file` (or `storedFilename`) field.
+            // signal-cli stores downloaded attachments in {data_dir}/attachments/{id}
+            // The SSE event provides the `id` field which is the filename.
             let file_path = att
                 .get("file")
                 .or_else(|| att.get("storedFilename"))
-                .and_then(|v| v.as_str())?;
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    // Construct path from data_dir + attachments/ + id
+                    let id = att.get("id").and_then(|v| v.as_str())?;
+                    let dir = self.data_dir.as_deref()?;
+                    Some(format!("{}/attachments/{}", dir, id))
+                })?;
 
-            let path = std::path::PathBuf::from(file_path);
+            let path = std::path::PathBuf::from(&file_path);
             if !path.exists() {
                 tracing::warn!("Signal native: attachment file not found: {file_path}");
                 return None;
