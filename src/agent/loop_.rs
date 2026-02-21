@@ -23,6 +23,16 @@ use uuid::Uuid;
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
 
+/// Context for scope-based tool access control.
+/// When present, `run_tool_call_loop` will check each tool call against
+/// the security policy's scope rules before execution.
+pub(crate) struct ScopeContext<'a> {
+    pub policy: &'a SecurityPolicy,
+    pub sender: &'a str,
+    pub channel: &'a str,
+    pub chat_type: &'a str,
+}
+
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
@@ -967,6 +977,7 @@ pub(crate) async fn agent_turn(
         max_tool_iterations,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1045,22 +1056,60 @@ async fn execute_tools_parallel(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    scope_ctx: Option<&ScopeContext<'_>>,
 ) -> Result<Vec<String>> {
-    let futures: Vec<_> = tool_calls
+    // Build per-call classification: blocked (scope-denied) vs executable.
+    // Blocked calls get a synthetic error result; others run concurrently.
+    enum CallKind<F> {
+        Blocked(String),
+        Run(F),
+    }
+
+    let classified: Vec<CallKind<_>> = tool_calls
         .iter()
         .map(|call| {
-            execute_one_tool(
+            if let Some(ctx) = scope_ctx {
+                if !ctx
+                    .policy
+                    .is_tool_allowed(&call.name, ctx.sender, ctx.channel, ctx.chat_type)
+                {
+                    return CallKind::Blocked(format!(
+                        "Error: Tool '{}' is not permitted for this user/channel context.",
+                        call.name
+                    ));
+                }
+            }
+            CallKind::Run(execute_one_tool(
                 &call.name,
                 call.arguments.clone(),
                 tools_registry,
                 observer,
                 cancellation_token,
-            )
+            ))
         })
         .collect();
 
-    let results = futures::future::join_all(futures).await;
-    results.into_iter().collect()
+    // Collect futures (keeping original indices for result reconstruction).
+    let mut futures_idx: Vec<usize> = Vec::new();
+    let mut futures_list = Vec::new();
+    let mut pre_results: Vec<Option<String>> = (0..classified.len()).map(|_| None).collect();
+
+    for (i, kind) in classified.into_iter().enumerate() {
+        match kind {
+            CallKind::Blocked(msg) => pre_results[i] = Some(msg),
+            CallKind::Run(fut) => {
+                futures_idx.push(i);
+                futures_list.push(fut);
+            }
+        }
+    }
+
+    let completed = futures::future::join_all(futures_list).await;
+    for (idx, result) in futures_idx.into_iter().zip(completed.into_iter()) {
+        pre_results[idx] = Some(result?);
+    }
+
+    Ok(pre_results.into_iter().map(|r| r.unwrap_or_default()).collect())
 }
 
 async fn execute_tools_sequential(
@@ -1070,10 +1119,25 @@ async fn execute_tools_sequential(
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     cancellation_token: Option<&CancellationToken>,
+    scope_ctx: Option<&ScopeContext<'_>>,
 ) -> Result<Vec<String>> {
     let mut individual_results: Vec<String> = Vec::with_capacity(tool_calls.len());
 
     for call in tool_calls {
+        // Scope-based access control: check before approval and execution.
+        if let Some(ctx) = scope_ctx {
+            if !ctx
+                .policy
+                .is_tool_allowed(&call.name, ctx.sender, ctx.channel, ctx.chat_type)
+            {
+                individual_results.push(format!(
+                    "Error: Tool '{}' is not permitted for this user/channel context.",
+                    call.name
+                ));
+                continue;
+            }
+        }
+
         if let Some(mgr) = approval {
             if mgr.needs_approval(&call.name) {
                 let request = ApprovalRequest {
@@ -1124,6 +1188,9 @@ async fn execute_tools_sequential(
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
+///
+/// Pass `scope_ctx` to enable per-user/channel/chat_type tool access control.
+/// When `None`, no scope-based restriction is applied.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_call_loop(
     provider: &dyn Provider,
@@ -1141,6 +1208,7 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    scope_ctx: Option<&ScopeContext<'_>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -1384,6 +1452,7 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                scope_ctx,
             )
             .await?
         } else {
@@ -1394,6 +1463,7 @@ pub(crate) async fn run_tool_call_loop(
                 approval,
                 channel_name,
                 cancellation_token.as_ref(),
+                scope_ctx,
             )
             .await?
         };
@@ -1787,6 +1857,7 @@ pub async fn run(
             config.agent.max_tool_iterations,
             None,
             None,
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -1923,6 +1994,7 @@ pub async fn run(
                 "cli",
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                None,
                 None,
                 None,
             )
@@ -2421,6 +2493,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
+            &crate::hooks::HookManager::new(std::env::temp_dir()),
             "mock-provider",
             "mock-model",
             0.0,
@@ -2431,6 +2504,7 @@ mod tests {
             3,
             None,
             None,
+            None,  // no scope context
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -2465,6 +2539,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
+            &crate::hooks::HookManager::new(std::env::temp_dir()),
             "mock-provider",
             "mock-model",
             0.0,
@@ -2475,6 +2550,7 @@ mod tests {
             3,
             None,
             None,
+            None,  // no scope context
         )
         .await
         .expect_err("oversized payload must fail");
@@ -2503,6 +2579,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
+            &crate::hooks::HookManager::new(std::env::temp_dir()),
             "mock-provider",
             "mock-model",
             0.0,
@@ -2513,6 +2590,7 @@ mod tests {
             3,
             None,
             None,
+            None,  // no scope context
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -2623,6 +2701,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
+            &crate::hooks::HookManager::new(std::env::temp_dir()),
             "mock-provider",
             "mock-model",
             0.0,
@@ -2633,6 +2712,7 @@ mod tests {
             4,
             None,
             None,
+            None,  // no scope context
         )
         .await
         .expect("parallel execution should complete");

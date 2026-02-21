@@ -412,6 +412,7 @@ impl DelegateTool {
                 agent_config.max_iterations,
                 None,
                 None,
+                None, // no scope context for delegated tasks
             ),
         )
         .await;
