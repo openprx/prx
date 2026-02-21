@@ -43,6 +43,12 @@ pub trait Tool: Send + Sync {
         self.name() == name
     }
 
+    /// Optional: set the active message recipient for tools that send messages.
+    /// Called before each message processing turn.
+    async fn set_active_recipient(&self, _recipient: &str) {
+        // default: no-op
+    }
+
     /// Get the full spec for LLM registration
     fn spec(&self) -> ToolSpec {
         ToolSpec {
