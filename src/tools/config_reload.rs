@@ -256,7 +256,12 @@ mod tests {
 
     #[tokio::test]
     async fn missing_config_path_returns_error() {
-        let cfg = Config::default(); // config_path is empty PathBuf by default
+        // Config::default() sets config_path to ~/.zeroclaw/config.toml, so we
+        // must explicitly clear it to test the "not set" error path.
+        let cfg = Config {
+            config_path: std::path::PathBuf::new(),
+            ..Config::default()
+        };
         let tool = make_tool_with_config(cfg);
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(!result.success);
