@@ -7,14 +7,19 @@
 //! - On completion, sends the result back through the channel automatically
 
 use super::traits::{Tool, ToolResult};
+use crate::agent::loop_::run_tool_call_loop;
 use crate::channels::traits::{Channel, SendMessage};
-use crate::providers::Provider;
+use crate::config::MultimodalConfig;
+use crate::hooks::HookManager;
+use crate::observability::NoopObserver;
+use crate::providers::{ChatMessage, Provider};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -59,6 +64,14 @@ pub struct SessionsSpawnTool {
     default_recipient: Arc<RwLock<Option<String>>>,
     /// Registry of active sub-agent runs.
     active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
+    /// Shared tool registry for sub-agent tool call loops.
+    /// Set post-construction via `tools_handle().set(...)` to resolve the chicken-and-egg
+    /// problem (sessions_spawn is part of tools_registry, but needs it to run sub-agents).
+    tools: Arc<OnceLock<Arc<Vec<Box<dyn Tool>>>>>,
+    /// Workspace dir for HookManager inside sub-agent loops.
+    workspace_dir: PathBuf,
+    /// Multimodal config for sub-agent tool call loops.
+    multimodal_config: MultimodalConfig,
 }
 
 impl SessionsSpawnTool {
@@ -70,6 +83,8 @@ impl SessionsSpawnTool {
         model: impl Into<String>,
         temperature: f64,
         security: Arc<SecurityPolicy>,
+        workspace_dir: PathBuf,
+        multimodal_config: MultimodalConfig,
     ) -> Self {
         Self {
             channel,
@@ -80,6 +95,9 @@ impl SessionsSpawnTool {
             security,
             default_recipient: Arc::new(RwLock::new(None)),
             active_runs: Arc::new(RwLock::new(Vec::new())),
+            tools: Arc::new(OnceLock::new()),
+            workspace_dir,
+            multimodal_config,
         }
     }
 
@@ -87,6 +105,12 @@ impl SessionsSpawnTool {
     /// update it before each agent turn without replacing the tool registration.
     pub fn default_recipient_handle(&self) -> Arc<RwLock<Option<String>>> {
         self.default_recipient.clone()
+    }
+
+    /// Return a handle to the tools OnceLock so callers can set the registry
+    /// post-construction (resolves the chicken-and-egg registration problem).
+    pub fn tools_handle(&self) -> Arc<OnceLock<Arc<Vec<Box<dyn Tool>>>>> {
+        self.tools.clone()
     }
 
     /// Convenience: update the default recipient from the current message's reply_target.
@@ -212,18 +236,31 @@ impl Tool for SessionsSpawnTool {
         // Clone everything the spawned task needs
         let channel = self.channel.clone();
         let provider = self.provider.clone();
+        let provider_name = self.provider_name.clone();
         let model = model_override.unwrap_or_else(|| self.model.clone());
         let temperature = self.temperature;
         let active_runs = self.active_runs.clone();
         let rid = run_id.clone();
         let task_owned = task.to_string();
+        let tools = self.tools.get().cloned();
+        let workspace_dir = self.workspace_dir.clone();
+        let multimodal_config = self.multimodal_config.clone();
 
         // Spawn async task (fire-and-forget)
         tokio::spawn(async move {
             tracing::info!(run_id = %rid, "Sub-agent task starting");
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
-                run_sub_agent(&task_owned, provider.as_ref(), &model, temperature),
+                run_sub_agent(
+                    &task_owned,
+                    provider.as_ref(),
+                    &provider_name,
+                    &model,
+                    temperature,
+                    tools.as_deref(),
+                    &workspace_dir,
+                    &multimodal_config,
+                ),
             )
             .await;
             tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
@@ -281,35 +318,74 @@ impl Tool for SessionsSpawnTool {
     }
 }
 
+/// Maximum tool-call iterations for a sub-agent run.
+const SUB_AGENT_MAX_ITERATIONS: usize = 15;
+
 /// Run an isolated sub-agent loop for the given task.
 ///
-/// Performs a single-turn completion against the provider using a
-/// sub-agent system prompt. The result is the raw text from the LLM.
+/// When a tool registry is provided (via the OnceLock), runs a full agentic
+/// tool-call loop (up to `SUB_AGENT_MAX_ITERATIONS`). Sessions_spawn itself
+/// is included in the tool set — recursion is bounded by the per-run timeout.
 ///
-/// This is intentionally simple: the key value of `sessions_spawn` is the
-/// *async fire-and-forget with auto-announce* pattern, not necessarily deep
-/// agentic iteration. Tool-enabled sub-agents can be achieved via the
-/// `delegate` tool or a future enhancement here.
+/// Falls back to a single-turn completion when no tools are registered.
 async fn run_sub_agent(
     task: &str,
     provider: &dyn Provider,
+    provider_name: &str,
     model: &str,
     temperature: f64,
+    tools: Option<&Vec<Box<dyn Tool>>>,
+    workspace_dir: &std::path::Path,
+    multimodal_config: &MultimodalConfig,
 ) -> anyhow::Result<String> {
     const SYSTEM_PROMPT: &str = "\
 You are a sub-agent handling a specific delegated task. \
 Complete the task thoroughly and report results concisely. \
 Focus only on the assigned task; do not ask clarifying questions.";
 
-    let response = provider
-        .chat_with_system(Some(SYSTEM_PROMPT), task, model, temperature)
+    if let Some(tools_registry) = tools {
+        // Agentic loop with tool support
+        let mut history = vec![
+            ChatMessage::system(SYSTEM_PROMPT),
+            ChatMessage::user(task),
+        ];
+        let observer = NoopObserver;
+        let hooks = HookManager::new(workspace_dir.to_path_buf());
+
+        let response = run_tool_call_loop(
+            provider,
+            &mut history,
+            tools_registry.as_slice(),
+            &observer,
+            &hooks,
+            provider_name,
+            model,
+            temperature,
+            true,  // silent — no streaming output
+            None,  // no approval manager
+            "sessions_spawn",
+            multimodal_config,
+            SUB_AGENT_MAX_ITERATIONS,
+            None, // no cancellation token
+            None, // no streaming sender
+        )
         .await?;
 
-    if response.trim().is_empty() {
-        return Ok("[Sub-agent produced no output]".to_string());
-    }
+        if response.trim().is_empty() {
+            return Ok("[Sub-agent produced no output]".to_string());
+        }
+        Ok(response)
+    } else {
+        // Fallback: single-turn completion (no tools registered yet)
+        let response = provider
+            .chat_with_system(Some(SYSTEM_PROMPT), task, model, temperature)
+            .await?;
 
-    Ok(response)
+        if response.trim().is_empty() {
+            return Ok("[Sub-agent produced no output]".to_string());
+        }
+        Ok(response)
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +499,8 @@ mod tests {
             "test-model",
             0.7,
             test_security(),
+            std::path::PathBuf::from("/tmp"),
+            crate::config::MultimodalConfig::default(),
         )
     }
 
