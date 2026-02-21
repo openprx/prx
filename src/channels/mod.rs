@@ -2562,7 +2562,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    // Keep as mutable Vec so we can append channel-aware tools (e.g. sessions_spawn)
+    // before wrapping in Arc below.
+    let mut tools_list = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -2575,7 +2577,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
 
@@ -2633,6 +2635,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
         ));
     }
+    tool_descs.push((
+        "sessions_spawn",
+        "Spawn an async sub-agent to handle a task in isolation. Returns immediately with a run ID. \
+         The sub-agent announces its result when complete. Use for long-running or parallel tasks \
+         that should not block the main conversation.",
+    ));
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -2650,7 +2658,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         native_tools,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
+        system_prompt.push_str(&build_tool_instructions(&tools_list));
     }
 
     if !skills.is_empty() {
@@ -2846,6 +2854,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
         println!("No channels configured. Run `zeroclaw onboard` to set up channels.");
         return Ok(());
     }
+
+    // Register sessions_spawn tool backed by the first available channel.
+    // This enables fire-and-forget sub-agent spawning with auto-announce on completion.
+    if let Some(first_channel) = channels.first().cloned() {
+        tools_list.push(Box::new(tools::SessionsSpawnTool::new(
+            first_channel,
+            Arc::clone(&provider),
+            &provider_name,
+            &model,
+            temperature,
+            security.clone(),
+        )));
+    }
+
+    // Wrap the tool list in Arc now that all channel-aware tools have been appended.
+    let tools_registry = Arc::new(tools_list);
 
     println!("🦀 ZeroClaw Channel Server");
     println!("  🤖 Model:    {model}");
