@@ -257,12 +257,33 @@ pub fn all_tools_with_runtime(
 
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
-        tool_arcs.push(Arc::new(WebSearchTool::new(
-            root_config.web_search.provider.clone(),
-            root_config.web_search.brave_api_key.clone(),
-            root_config.web_search.max_results,
-            root_config.web_search.timeout_secs,
-        )));
+        let provider = root_config.web_search.provider.trim().to_ascii_lowercase();
+        let brave_key = root_config
+            .web_search
+            .brave_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+
+        let should_register = match provider.as_str() {
+            "duckduckgo" | "ddg" => true,
+            "brave" => brave_key.is_some(),
+            _ => true,
+        };
+
+        if should_register {
+            tool_arcs.push(Arc::new(WebSearchTool::new(
+                root_config.web_search.provider.clone(),
+                root_config.web_search.brave_api_key.clone(),
+                root_config.web_search.max_results,
+                root_config.web_search.timeout_secs,
+            )));
+        } else {
+            tracing::warn!(
+                "web_search enabled but provider '{}' missing required brave_api_key; tool not registered",
+                root_config.web_search.provider
+            );
+        }
     }
 
     // Vision tools are always available

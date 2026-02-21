@@ -27,6 +27,8 @@ struct DiscoveredToolMeta {
 struct RuntimeState {
     effective_config: McpConfig,
     mcp_json_mtime: Option<SystemTime>,
+    /// Whether initial tool discovery has been performed at least once.
+    initialized: bool,
     discovered_tools: HashMap<String, HashMap<String, DiscoveredToolMeta>>, // server -> tool -> meta
 }
 
@@ -87,6 +89,7 @@ impl McpTool {
         let state = RuntimeState {
             effective_config: base_config.clone(),
             mcp_json_mtime: None,
+            initialized: false,
             discovered_tools: HashMap::new(),
         };
 
@@ -365,6 +368,13 @@ impl McpTool {
                 anyhow::anyhow!("MCP server '{server_name}' uses stdio but command is missing")
             })?;
 
+        tracing::debug!(
+            server = server_name,
+            tool = tool_name,
+            args = ?arguments,
+            "MCP call_stdio: invoking tool"
+        );
+
         let mut cmd = Command::new(command);
         cmd.args(&server.args);
         if !server.env.is_empty() {
@@ -395,12 +405,21 @@ impl McpTool {
         .await
         .map_err(|_| {
             anyhow::anyhow!("MCP call timed out after {} ms", server.request_timeout_ms)
-        })??;
+        })?;
 
         let _ = client.cancel().await;
 
-        let value = serde_json::to_value(result)?;
-        Ok(Self::extract_call_success_and_output(&value))
+        match result {
+            Ok(r) => {
+                let value = serde_json::to_value(r)?;
+                tracing::debug!(server = server_name, tool = tool_name, result = %value, "MCP call_stdio: result");
+                Ok(Self::extract_call_success_and_output(&value))
+            }
+            Err(e) => {
+                tracing::warn!(server = server_name, tool = tool_name, error = %e, "MCP call_stdio: error");
+                Err(e.into())
+            }
+        }
     }
 
     async fn call_http(
@@ -451,9 +470,16 @@ impl McpTool {
 
     async fn refresh_runtime_state(&self) {
         let file_mtime = Self::file_mtime(&self.mcp_json_path).ok().flatten();
-        let current_mtime = self.state.read().mcp_json_mtime;
+        let (current_mtime, initialized) = {
+            let state = self.state.read();
+            (state.mcp_json_mtime, state.initialized)
+        };
 
-        if file_mtime == current_mtime {
+        // Skip if already initialized and config file hasn't changed.
+        // Note: `None == None` when there is no mcp.json — we must NOT skip on the
+        // very first call (before `initialized` is set to true), otherwise tools are
+        // never discovered when the user relies purely on config.toml.
+        if initialized && file_mtime == current_mtime {
             return;
         }
 
@@ -476,6 +502,7 @@ impl McpTool {
         state.effective_config = new_config;
         state.discovered_tools = discovered;
         state.mcp_json_mtime = file_mtime;
+        state.initialized = true;
     }
 
     fn refresh_state_from_file_only(&self) {
