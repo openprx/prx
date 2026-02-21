@@ -2855,6 +2855,28 @@ pub async fn start_channels(config: Config) -> Result<()> {
         return Ok(());
     }
 
+    // Register message_send tool backed by Signal (or first channel) for proactive messaging.
+    if let Some(ref sig) = config.channels_config.signal {
+        let sig_chan = Arc::new(SignalChannel::new(
+            sig.http_url.clone(),
+            sig.account.clone(),
+            sig.group_id.clone(),
+            sig.allowed_from.clone(),
+            sig.ignore_attachments,
+            sig.ignore_stories,
+            config.media.clone(),
+        ));
+        tools_list.push(Box::new(tools::MessageSendTool::new_signal(
+            sig_chan,
+            security.clone(),
+        )));
+    } else if let Some(first_channel) = channels.first().cloned() {
+        tools_list.push(Box::new(tools::MessageSendTool::new(
+            first_channel,
+            security.clone(),
+        )));
+    }
+
     // Register sessions_spawn tool backed by the first available channel.
     // This enables fire-and-forget sub-agent spawning with auto-announce on completion.
     if let Some(first_channel) = channels.first().cloned() {
