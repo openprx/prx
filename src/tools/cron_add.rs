@@ -54,25 +54,66 @@ impl Tool for CronAddTool {
     }
 
     fn description(&self) -> &str {
-        "Create a scheduled cron job (shell or agent) with cron/at/every schedules"
+        "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
+         Supports payload.kind='agentTurn' (isolated LLM run with tools) or 'systemEvent' \
+         (text injection to main session). Use delivery.mode='announce' with delivery.channel='signal' \
+         and delivery.to=<recipient> to announce results to a channel."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string" },
+                "name": {
+                    "type": "string",
+                    "description": "Human-readable job name"
+                },
                 "schedule": {
                     "type": "object",
-                    "description": "Schedule object: {kind:'cron',expr,tz?} | {kind:'at',at} | {kind:'every',every_ms}"
+                    "description": "Schedule: {kind:'at',at:'ISO-8601'} | {kind:'every',every_ms:30000} | {kind:'cron',expr:'0 9 * * *',tz?:'America/New_York'}"
                 },
-                "job_type": { "type": "string", "enum": ["shell", "agent"] },
-                "command": { "type": "string" },
-                "prompt": { "type": "string" },
-                "session_target": { "type": "string", "enum": ["isolated", "main"] },
-                "model": { "type": "string" },
-                "delivery": { "type": "object" },
-                "delete_after_run": { "type": "boolean" },
+                "payload": {
+                    "type": "object",
+                    "description": "Payload config: {kind:'agentTurn',message:'task prompt'} runs isolated LLM; {kind:'systemEvent',text:'message text'} sends a plain message. Shorthand for job_type+prompt.",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["agentTurn", "systemEvent"] },
+                        "message": { "type": "string", "description": "Task for agentTurn" },
+                        "text": { "type": "string", "description": "Text for systemEvent" }
+                    }
+                },
+                "job_type": {
+                    "type": "string",
+                    "enum": ["shell", "agent"],
+                    "description": "Legacy: use 'payload' instead. 'agent' runs an LLM turn."
+                },
+                "command": {
+                    "type": "string",
+                    "description": "Shell command for job_type='shell'"
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "LLM prompt for job_type='agent'. Overridden by payload.message."
+                },
+                "session_target": {
+                    "type": "string",
+                    "enum": ["isolated", "main"],
+                    "description": "isolated=new context (default), main=inject into main session"
+                },
+                "model": { "type": "string", "description": "Override model for agent jobs" },
+                "delivery": {
+                    "type": "object",
+                    "description": "Delivery config: {mode:'announce',channel:'signal',to:'<phone|uuid|group:ID>'} or {mode:'none'}",
+                    "properties": {
+                        "mode": { "type": "string", "enum": ["none", "announce"] },
+                        "channel": { "type": "string", "enum": ["signal", "telegram", "discord", "slack", "mattermost"] },
+                        "to": { "type": "string", "description": "Recipient: E.164 phone, UUID, or group:<groupId>" },
+                        "best_effort": { "type": "boolean", "default": true }
+                    }
+                },
+                "delete_after_run": {
+                    "type": "boolean",
+                    "description": "Auto-delete one-shot jobs after success (default true for 'at' schedule)"
+                },
                 "approved": {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
@@ -117,21 +158,43 @@ impl Tool for CronAddTool {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
 
-        let job_type = match args.get("job_type").and_then(serde_json::Value::as_str) {
-            Some("agent") => JobType::Agent,
-            Some("shell") => JobType::Shell,
-            Some(other) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Invalid job_type: {other}")),
-                });
+        // Support OpenClaw-compatible payload.kind API as an alias for job_type + prompt/command.
+        // payload.kind='agentTurn' → agent job (isolated)
+        // payload.kind='systemEvent' → agent job (main session, sends text directly)
+        let payload = args.get("payload");
+        let payload_kind = payload
+            .and_then(|p| p.get("kind"))
+            .and_then(serde_json::Value::as_str);
+
+        // If payload.kind is set, it overrides job_type
+        let job_type = if let Some(kind) = payload_kind {
+            match kind {
+                "agentTurn" | "systemEvent" => JobType::Agent,
+                other => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Invalid payload.kind: {other}. Use 'agentTurn' or 'systemEvent'")),
+                    });
+                }
             }
-            None => {
-                if args.get("prompt").is_some() {
-                    JobType::Agent
-                } else {
-                    JobType::Shell
+        } else {
+            match args.get("job_type").and_then(serde_json::Value::as_str) {
+                Some("agent") => JobType::Agent,
+                Some("shell") => JobType::Shell,
+                Some(other) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Invalid job_type: {other}")),
+                    });
+                }
+                None => {
+                    if args.get("prompt").is_some() {
+                        JobType::Agent
+                    } else {
+                        JobType::Shell
+                    }
                 }
             }
         };
@@ -174,29 +237,48 @@ impl Tool for CronAddTool {
                 cron::add_shell_job(&self.config, name, schedule, command)
             }
             JobType::Agent => {
-                let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
-                    Some(prompt) if !prompt.trim().is_empty() => prompt,
-                    _ => {
+                // Resolve prompt: payload.message > payload.text > prompt field
+                let prompt_str = payload
+                    .and_then(|p| p.get("message").or_else(|| p.get("text")))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        args.get("prompt")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|s| !s.trim().is_empty())
+                    });
+
+                let prompt = match prompt_str {
+                    Some(p) => p,
+                    None => {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some("Missing 'prompt' for agent job".to_string()),
+                            error: Some(
+                                "Missing prompt for agent job. Use payload.message, payload.text, or the 'prompt' field."
+                                    .to_string(),
+                            ),
                         });
                     }
                 };
 
-                let session_target = match args.get("session_target") {
-                    Some(v) => match serde_json::from_value::<SessionTarget>(v.clone()) {
-                        Ok(target) => target,
-                        Err(e) => {
-                            return Ok(ToolResult {
-                                success: false,
-                                output: String::new(),
-                                error: Some(format!("Invalid session_target: {e}")),
-                            });
-                        }
-                    },
-                    None => SessionTarget::Isolated,
+                // payload.kind='systemEvent' → main session; 'agentTurn' or no payload → isolated
+                let session_target = if payload_kind == Some("systemEvent") {
+                    SessionTarget::Main
+                } else {
+                    match args.get("session_target") {
+                        Some(v) => match serde_json::from_value::<SessionTarget>(v.clone()) {
+                            Ok(target) => target,
+                            Err(e) => {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(format!("Invalid session_target: {e}")),
+                                });
+                            }
+                        },
+                        None => SessionTarget::Isolated,
+                    }
                 };
 
                 let model = args

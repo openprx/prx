@@ -453,6 +453,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
+    // Register config_reload tool backed by the shared config state.
+    tools_list.push(Box::new(tools::ConfigReloadTool::new(Arc::clone(
+        &config_state,
+    ))));
+
     let tools_registry = Arc::new(tools_list);
 
     // Inject the tools registry into sessions_spawn so sub-agents can use tools.
@@ -654,6 +659,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        .route("/config/reload", post(handle_config_reload))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -683,6 +689,37 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
+}
+
+/// POST /config/reload — hot-reload configuration from config.toml.
+async fn handle_config_reload(State(state): State<AppState>) -> impl IntoResponse {
+    let tool = tools::ConfigReloadTool::new(Arc::clone(&state.config));
+    match tool.execute(serde_json::json!({})).await {
+        Ok(result) if result.success => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "message": result.output,
+            })),
+        )
+            .into_response(),
+        Ok(result) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": result.error.unwrap_or_else(|| "Unknown error".into()),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": e.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// Prometheus content type for text exposition format.
