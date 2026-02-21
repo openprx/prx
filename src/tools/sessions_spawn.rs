@@ -41,6 +41,8 @@ pub struct SubAgentRun {
     pub task: String,
     pub started_at: DateTime<Utc>,
     pub status: SubAgentStatus,
+    /// Handle to abort the spawned tokio task (supports kill action).
+    pub abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 /// Tool that spawns an asynchronous sub-agent to handle a task in isolation.
@@ -131,9 +133,10 @@ impl Tool for SessionsSpawnTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn an async sub-agent to handle a task in isolation. Returns immediately with a run ID. \
-         The sub-agent will announce its result back to the current conversation when complete. \
-         Use for long-running or parallel tasks that should not block the main conversation."
+        "Manage async sub-agents. Actions: \
+         'spawn' (default) — launch a sub-agent for a task and return a run_id; \
+         'list' — show all active/completed sub-agent runs; \
+         'kill' — abort a running sub-agent by run_id."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -141,10 +144,20 @@ impl Tool for SessionsSpawnTool {
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["spawn", "list", "kill"],
+                    "default": "spawn",
+                    "description": "Action to perform: spawn a new sub-agent, list all runs, or kill a run by ID."
+                },
                 "task": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Task description for the sub-agent to complete"
+                    "description": "Task description for the sub-agent to complete. Required for 'spawn' action."
+                },
+                "run_id": {
+                    "type": "string",
+                    "description": "Run ID to kill. Required for 'kill' action."
                 },
                 "model": {
                     "type": "string",
@@ -162,7 +175,7 @@ impl Tool for SessionsSpawnTool {
                                     Defaults to the current conversation sender."
                 }
             },
-            "required": ["task"]
+            "required": []
         })
     }
 
@@ -171,6 +184,26 @@ impl Tool for SessionsSpawnTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("spawn");
+
+        match action {
+            "list" => return self.execute_list().await,
+            "kill" => {
+                let run_id = args
+                    .get("run_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter for kill action"))?;
+                return self.execute_kill(run_id).await;
+            }
+            _ => {} // fall through to spawn
+        }
+
+        // --- spawn action ---
         let task = args
             .get("task")
             .and_then(|v| v.as_str())
@@ -222,7 +255,7 @@ impl Tool for SessionsSpawnTool {
             None => self.default_recipient.read().await.clone(),
         };
 
-        // Register the run
+        // Register the run (abort_handle set after spawn)
         {
             let mut runs = self.active_runs.write().await;
             runs.push(SubAgentRun {
@@ -230,6 +263,7 @@ impl Tool for SessionsSpawnTool {
                 task: task.to_string(),
                 started_at: Utc::now(),
                 status: SubAgentStatus::Running,
+                abort_handle: None,
             });
         }
 
@@ -246,8 +280,8 @@ impl Tool for SessionsSpawnTool {
         let workspace_dir = self.workspace_dir.clone();
         let multimodal_config = self.multimodal_config.clone();
 
-        // Spawn async task (fire-and-forget)
-        tokio::spawn(async move {
+        // Spawn async task (fire-and-forget); capture handle to support kill
+        let jh = tokio::spawn(async move {
             tracing::info!(run_id = %rid, "Sub-agent task starting");
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
@@ -308,6 +342,14 @@ impl Tool for SessionsSpawnTool {
             }
         });
 
+        // Store the abort handle so kill action can cancel this run
+        {
+            let mut runs = self.active_runs.write().await;
+            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+                run.abort_handle = Some(jh.abort_handle());
+            }
+        }
+
         Ok(ToolResult {
             success: true,
             output: format!(
@@ -315,6 +357,80 @@ impl Tool for SessionsSpawnTool {
             ),
             error: None,
         })
+    }
+
+}
+
+impl SessionsSpawnTool {
+    /// List all tracked sub-agent runs.
+    async fn execute_list(&self) -> anyhow::Result<ToolResult> {
+        let runs = self.active_runs.read().await;
+        if runs.is_empty() {
+            return Ok(ToolResult {
+                success: true,
+                output: "No sub-agent runs tracked.".into(),
+                error: None,
+            });
+        }
+
+        let lines: Vec<String> = runs
+            .iter()
+            .map(|r| {
+                let status = match &r.status {
+                    SubAgentStatus::Running => "🔄 running".to_string(),
+                    SubAgentStatus::Completed(msg) => {
+                        let preview = msg.chars().take(60).collect::<String>();
+                        let ellipsis = if msg.len() > 60 { "…" } else { "" };
+                        format!("✅ completed: {preview}{ellipsis}")
+                    }
+                    SubAgentStatus::Failed(e) => format!("❌ failed: {e}"),
+                };
+                let age = (Utc::now() - r.started_at).num_seconds();
+                format!("• `{}` [{age}s ago] {status}\n  task: {}", r.id, r.task)
+            })
+            .collect();
+
+        Ok(ToolResult {
+            success: true,
+            output: format!("Sub-agent runs ({} total):\n\n{}", runs.len(), lines.join("\n\n")),
+            error: None,
+        })
+    }
+
+    /// Kill a running sub-agent by its run ID.
+    async fn execute_kill(&self, run_id: &str) -> anyhow::Result<ToolResult> {
+        let mut runs = self.active_runs.write().await;
+        if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+            match &run.status {
+                SubAgentStatus::Running => {
+                    if let Some(ref ah) = run.abort_handle {
+                        ah.abort();
+                    }
+                    run.status = SubAgentStatus::Failed("killed by user".into());
+                    Ok(ToolResult {
+                        success: true,
+                        output: format!("Sub-agent `{run_id}` has been killed."),
+                        error: None,
+                    })
+                }
+                SubAgentStatus::Completed(_) => Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Run `{run_id}` already completed.")),
+                }),
+                SubAgentStatus::Failed(e) => Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Run `{run_id}` already failed: {e}")),
+                }),
+            }
+        } else {
+            Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("No run found with ID `{run_id}`.")),
+            })
+        }
     }
 }
 
@@ -527,9 +643,12 @@ mod tests {
             }),
         );
         let schema = tool.parameters_schema();
+        // All params are optional at schema level; runtime validates per action
         let required = schema["required"].as_array().unwrap();
-        assert!(required.contains(&json!("task")));
+        assert!(required.is_empty(), "Required should be empty (validated at runtime)");
+        assert!(schema["properties"]["action"].is_object());
         assert!(schema["properties"]["task"].is_object());
+        assert!(schema["properties"]["run_id"].is_object());
         assert!(schema["properties"]["model"].is_object());
         assert!(schema["properties"]["timeout_seconds"].is_object());
         assert!(schema["properties"]["recipient"].is_object());

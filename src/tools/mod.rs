@@ -18,6 +18,7 @@
 pub mod browser;
 pub mod browser_open;
 pub mod composio;
+pub mod config_reload;
 pub mod cron_add;
 pub mod message_send;
 pub mod cron_list;
@@ -52,6 +53,7 @@ pub mod web_search_tool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
+pub use config_reload::ConfigReloadTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
 pub use cron_remove::CronRemoveTool;
