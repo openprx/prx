@@ -164,11 +164,69 @@ fn apply_compaction_summary(
     history.splice(start..compact_end, std::iter::once(summary_msg));
 }
 
+/// Extract key facts from messages about to be compacted and store them in memory.
+/// This prevents permanent loss of important context during auto-compaction.
+/// Failures are soft — compaction must not be blocked by a flush error.
+async fn pre_compaction_flush(
+    messages_to_compact: &[ChatMessage],
+    mem: &dyn Memory,
+    provider: &dyn Provider,
+    model: &str,
+) -> anyhow::Result<()> {
+    // Build a transcript of user/assistant turns only
+    let transcript: String = messages_to_compact
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .map(|m| {
+            let snippet = &m.content[..m.content.len().min(500)];
+            format!("[{}]: {}", m.role, snippet)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if transcript.trim().is_empty() {
+        return Ok(());
+    }
+
+    let extract_prompt = format!(
+        "Extract key facts, decisions, preferences, and unresolved tasks from this conversation. \
+         Output as a concise bullet list (max 8 items). Only include durable information worth \
+         remembering long-term. If nothing is worth remembering, output 'NONE'.\n\n{transcript}"
+    );
+
+    let extraction = provider
+        .chat_with_system(
+            Some("You extract key facts from conversations for long-term memory storage."),
+            &extract_prompt,
+            model,
+            0.0,
+        )
+        .await;
+
+    if let Ok(text) = extraction {
+        let text = text.trim().to_string();
+        if !text.is_empty() && text.to_uppercase() != "NONE" {
+            let date = chrono::Local::now().format("%Y-%m-%d_%H-%M");
+            let key = format!("compaction_flush_{date}");
+            mem.store(&key, &text, MemoryCategory::Conversation, None)
+                .await?;
+            tracing::info!(
+                chars = text.len(),
+                key = %key,
+                "Pre-compaction flush: key facts saved to memory"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn auto_compact_history(
     history: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
     model: &str,
     max_history: usize,
+    mem: &dyn Memory,
 ) -> Result<bool> {
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -190,6 +248,12 @@ async fn auto_compact_history(
 
     let compact_end = start + compact_count;
     let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
+
+    // Pre-compaction flush: extract and persist key facts before they are lost.
+    pre_compaction_flush(&to_compact, mem, provider, model)
+        .await
+        .ok(); // soft failure — never block compaction
+
     let transcript = build_compaction_transcript(&to_compact);
 
     let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
@@ -1902,6 +1966,7 @@ pub async fn run(
                 provider.as_ref(),
                 model_name,
                 config.agent.max_history_messages,
+                mem.as_ref(),
             )
             .await
             {
