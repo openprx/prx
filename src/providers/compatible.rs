@@ -1299,7 +1299,17 @@ impl Provider for OpenAiCompatibleProvider {
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
+            tracing::warn!(
+                provider = %self.name,
+                http_status = %status,
+                error_preview = %&sanitized[..sanitized.len().min(300)],
+                "OpenAiCompatibleProvider.chat() got non-200 response"
+            );
+
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
+                tracing::warn!(
+                    "is_native_tool_schema_unsupported triggered — falling back to prompt-guided XML tools"
+                );
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
@@ -1330,7 +1340,10 @@ impl Provider for OpenAiCompatibleProvider {
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
-        let native_response: ApiChatResponse = response.json().await?;
+        let response_bytes = response.bytes().await?;
+        let response_str = String::from_utf8_lossy(&response_bytes);
+        let native_response: ApiChatResponse = serde_json::from_slice(&response_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to parse response: {e}\nBody: {response_str}"))?;
         let message = native_response
             .choices
             .into_iter()
@@ -1613,7 +1626,7 @@ mod tests {
             make_provider("MiniMax", "https://api.minimaxi.com/v1", None),
             make_provider("Groq", "https://api.groq.com/openai", None),
             make_provider("Mistral", "https://api.mistral.ai", None),
-            make_provider("xAI", "https://api.x.ai", None),
+            make_provider("xAI", "https://api.x.ai/v1", None),
             make_provider("Astrai", "https://as-trai.com/v1", None),
         ];
 

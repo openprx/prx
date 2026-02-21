@@ -242,6 +242,29 @@ async fn persist_job_result(
         return success;
     }
 
+    if !success && should_disable_after_deterministic_failure(job, output) {
+        let _ = record_last_run(config, &job.id, finished_at, false, output);
+        if let Err(e) = update_job(
+            config,
+            &job.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        ) {
+            tracing::warn!(
+                "Failed to disable deterministically failing cron job '{}': {e}",
+                job.id
+            );
+        } else {
+            tracing::warn!(
+                "Disabled cron job '{}' after deterministic configuration failure",
+                job.id
+            );
+        }
+        return false;
+    }
+
     if let Err(e) = reschedule_after_run(config, job, success, output) {
         tracing::warn!("Failed to persist scheduler run result: {e}");
     }
@@ -251,6 +274,29 @@ async fn persist_job_result(
 
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
     job.delete_after_run && matches!(job.schedule, Schedule::At { .. })
+}
+
+fn should_disable_after_deterministic_failure(job: &CronJob, output: &str) -> bool {
+    if !matches!(job.job_type, JobType::Agent) {
+        return false;
+    }
+
+    let normalized = output.to_ascii_lowercase();
+    let deterministic_markers = [
+        "unknown provider",
+        "requires a url",
+        "requires a valid url",
+        "requires an http:// or https:// url",
+        "model not found",
+        "model unavailable",
+        "no api key",
+        "missing api key",
+        "api key is required",
+    ];
+
+    deterministic_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
 }
 
 fn warn_if_high_frequency_agent_job(job: &CronJob) {
