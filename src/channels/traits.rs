@@ -120,6 +120,67 @@ pub trait Channel: Send + Sync {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Shared outgoing-media helpers (used by all channel implementations)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Extract media markers from outgoing message text.
+///
+/// The LLM may embed markers such as `[IMAGE:/tmp/foo.png]`, `[VOICE:/tmp/bar.m4a]`,
+/// `[AUDIO:…]`, `[VIDEO:…]`, or `[DOCUMENT:…]` in its response. This function
+/// strips them out and returns both the cleaned text and the list of
+/// `(marker_type, file_path)` pairs so each channel can attach the files.
+///
+/// # Example
+/// ```
+/// use zeroclaw::channels::traits::extract_outgoing_media;
+/// let (text, media) = extract_outgoing_media("Here you go [IMAGE:/tmp/cat.png] enjoy!");
+/// assert_eq!(text, "Here you go  enjoy!");
+/// assert_eq!(media, vec![("IMAGE".to_string(), "/tmp/cat.png".to_string())]);
+/// ```
+pub fn extract_outgoing_media(text: &str) -> (String, Vec<(String, String)>) {
+    let re = regex::Regex::new(r"\[(IMAGE|DOCUMENT|AUDIO|VOICE|VIDEO):([^\]]+)\]").unwrap();
+    let mut media = Vec::new();
+    let clean = re
+        .replace_all(text, |caps: &regex::Captures| {
+            media.push((caps[1].to_string(), caps[2].to_string()));
+            String::new()
+        })
+        .trim()
+        .to_string();
+    (clean, media)
+}
+
+/// Guess an image MIME type from a file path extension.
+pub fn guess_mime_from_path(path: &str) -> &'static str {
+    if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if path.ends_with(".png") {
+        "image/png"
+    } else if path.ends_with(".webp") {
+        "image/webp"
+    } else if path.ends_with(".gif") {
+        "image/gif"
+    } else {
+        "image/jpeg"
+    }
+}
+
+/// Guess an audio MIME type from a file path extension.
+pub fn guess_audio_mime(path: &str) -> &'static str {
+    if path.ends_with(".m4a") {
+        "audio/mp4"
+    } else if path.ends_with(".mp3") {
+        "audio/mpeg"
+    } else if path.ends_with(".ogg") || path.ends_with(".oga") {
+        "audio/ogg"
+    } else if path.ends_with(".wav") {
+        "audio/wav"
+    } else {
+        "audio/mpeg"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
