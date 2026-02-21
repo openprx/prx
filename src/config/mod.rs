@@ -15,6 +15,7 @@ pub use schema::{
     ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
     SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig, SlackConfig, StorageConfig,
     StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig, TunnelConfig,
+    ScopeConfig, ScopeRule,
     WebSearchConfig, WebhookConfig,
 };
 

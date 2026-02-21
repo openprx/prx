@@ -90,6 +90,10 @@ pub struct SecurityPolicy {
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
     pub tracker: ActionTracker,
+    /// Scope-based per-user/channel/chat_type tool access rules.
+    pub scope_rules: Vec<crate::config::ScopeRule>,
+    /// Default action when no scope rule matches: true = allow, false = deny.
+    pub scope_default_allow: bool,
 }
 
 impl Default for SecurityPolicy {
@@ -140,6 +144,8 @@ impl Default for SecurityPolicy {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             tracker: ActionTracker::new(),
+            scope_rules: Vec::new(),
+            scope_default_allow: true,
         }
     }
 }
@@ -803,8 +809,76 @@ impl SecurityPolicy {
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
             tracker: ActionTracker::new(),
+            scope_rules: autonomy_config.scopes.rules.clone(),
+            scope_default_allow: autonomy_config.scopes.default.to_lowercase() != "deny",
         }
     }
+
+    /// Check whether a specific tool is allowed for the given request context.
+    ///
+    /// Evaluation order:
+    /// 1. If autonomy is `ReadOnly`, block all write/action tools (all tools considered "action").
+    /// 2. Evaluate scope rules top-to-bottom; use first matching rule.
+    /// 3. Within a matching rule: deny list takes priority, then allow list (empty = all permitted).
+    /// 4. If no rule matches, apply `scope_default_allow`.
+    ///
+    /// A rule matches when ALL specified criteria match the provided context.
+    /// A criterion is skipped (treated as matching) when not specified in the rule.
+    pub fn is_tool_allowed(
+        &self,
+        tool_name: &str,
+        sender: &str,
+        channel: &str,
+        chat_type: &str,
+    ) -> bool {
+        // ReadOnly blocks all tools unconditionally via can_act(); scope check is layered on top.
+        // We don't double-block here — let can_act() handle ReadOnly separately.
+
+        // Walk rules in order; return on first match.
+        for rule in &self.scope_rules {
+            if !rule_matches(rule, sender, channel, chat_type) {
+                continue;
+            }
+            // Rule matched — apply deny first, then allow.
+            if rule.tools_deny.iter().any(|d| d == tool_name || d == "*") {
+                return false;
+            }
+            if rule.tools_allow.is_empty() {
+                // No allow-list restriction; this rule permits everything not denied.
+                return true;
+            }
+            return rule.tools_allow.iter().any(|a| a == tool_name || a == "*");
+        }
+
+        // No rule matched — use default.
+        self.scope_default_allow
+    }
+}
+
+/// Check whether a scope rule's criteria match the given request context.
+/// A criterion is skipped (matches anything) when not specified (`None`).
+fn rule_matches(
+    rule: &crate::config::ScopeRule,
+    sender: &str,
+    channel: &str,
+    chat_type: &str,
+) -> bool {
+    if let Some(ref user_pattern) = rule.user {
+        if user_pattern != "*" && user_pattern != sender {
+            return false;
+        }
+    }
+    if let Some(ref ch_pattern) = rule.channel {
+        if ch_pattern != "*" && ch_pattern != channel {
+            return false;
+        }
+    }
+    if let Some(ref ct_pattern) = rule.chat_type {
+        if ct_pattern != "*" && ct_pattern != chat_type {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]

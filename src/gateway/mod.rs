@@ -895,6 +895,7 @@ async fn run_gateway_chat_with_multimodal(
         max_tool_iterations,
         None,  // no cancellation token
         None,  // no streaming delta sender
+        None,  // no scope context for webhooks
     )
     .await
 }
@@ -1549,6 +1550,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
+            signal: None,
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
@@ -1596,6 +1598,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
+            signal: None,
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
@@ -2015,6 +2018,8 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: true,
+            tools_registry: Arc::new(vec![]),
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
@@ -2096,6 +2101,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
+            signal: None,
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
@@ -2142,6 +2148,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
+            signal: None,
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,

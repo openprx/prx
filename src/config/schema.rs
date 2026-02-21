@@ -1884,6 +1884,68 @@ impl Default for ObservabilityConfig {
 
 // ── Autonomy / Security ──────────────────────────────────────────
 
+/// A single scope rule for tool access control.
+///
+/// Rules are evaluated top-to-bottom; the first matching rule wins.
+/// Deny always takes priority over allow within a rule.
+/// A rule matches when ALL specified criteria match (logical AND).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ScopeRule {
+    /// Match by sender identity: UUID (e.g. "uuid:xxx"), phone number, or "*" for any sender.
+    pub user: Option<String>,
+    /// Match by channel name: "signal", "telegram", "discord", etc.
+    pub channel: Option<String>,
+    /// Match by chat type: "direct", "group", or "*" for any type.
+    pub chat_type: Option<String>,
+    /// Tool whitelist: only these tools are allowed (empty = all tools permitted).
+    #[serde(default)]
+    pub tools_allow: Vec<String>,
+    /// Tool blacklist: these tools are denied regardless of allow list.
+    #[serde(default)]
+    pub tools_deny: Vec<String>,
+}
+
+fn default_scope_action() -> String {
+    "allow".to_string()
+}
+
+/// Scope-based tool access control configuration (`[autonomy.scopes]`).
+///
+/// Controls which tools are available per-user, per-channel, and per-chat-type.
+///
+/// Example config:
+/// ```toml
+/// [autonomy.scopes]
+/// default = "allow"
+///
+/// [[autonomy.scopes.rules]]
+/// channel = "signal"
+/// chat_type = "group"
+/// tools_deny = ["shell", "file_write"]
+///
+/// [[autonomy.scopes.rules]]
+/// user = "uuid:untrusted-user-uuid"
+/// tools_allow = ["memory_recall"]   # whitelist-only
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScopeConfig {
+    /// Default action when no rule matches: "allow" (default) or "deny".
+    #[serde(default = "default_scope_action")]
+    pub default: String,
+    /// Ordered list of scope rules evaluated top-to-bottom.
+    #[serde(default)]
+    pub rules: Vec<ScopeRule>,
+}
+
+impl Default for ScopeConfig {
+    fn default() -> Self {
+        Self {
+            default: default_scope_action(),
+            rules: Vec::new(),
+        }
+    }
+}
+
 /// Autonomy and security policy configuration (`[autonomy]` section).
 ///
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
@@ -1918,6 +1980,10 @@ pub struct AutonomyConfig {
     /// Tools that always require interactive approval, even after "Always".
     #[serde(default = "default_always_ask")]
     pub always_ask: Vec<String>,
+
+    /// Scope-based tool access control: per-user/channel/chat-type allow/deny rules.
+    #[serde(default)]
+    pub scopes: ScopeConfig,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -1973,6 +2039,7 @@ impl Default for AutonomyConfig {
             block_high_risk_commands: true,
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
+            scopes: ScopeConfig::default(),
         }
     }
 }
@@ -4079,6 +4146,7 @@ default_temperature = 0.7
                 block_high_risk_commands: true,
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],
+                scopes: ScopeConfig::default(),
             },
             runtime: RuntimeConfig {
                 kind: "docker".into(),

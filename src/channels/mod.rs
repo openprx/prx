@@ -58,7 +58,7 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, ScopeContext};
 use crate::config::Config;
 use crate::hooks::HookManager;
 use crate::identity;
@@ -212,6 +212,8 @@ struct ChannelRuntimeContext {
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
     multimodal: crate::config::MultimodalConfig,
+    /// Security policy used for scope-based tool access control.
+    security: Arc<crate::security::SecurityPolicy>,
 }
 
 #[derive(Clone)]
@@ -1466,6 +1468,20 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+
+    // Derive chat_type from reply_target: "group" if the reply target is a group, else "direct".
+    let chat_type = if msg.reply_target.starts_with("group:") {
+        "group"
+    } else {
+        "direct"
+    };
+    let scope_ctx = ScopeContext {
+        policy: &ctx.security,
+        sender: &msg.sender,
+        channel: &msg.channel,
+        chat_type,
+    };
+
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -1486,6 +1502,7 @@ async fn process_channel_message(
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx,
+                Some(&scope_ctx),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -3005,6 +3022,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
+        security: Arc::clone(&security),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3163,6 +3181,7 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("system".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -3177,6 +3196,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -3628,6 +3648,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -3668,6 +3689,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -3685,6 +3707,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -3725,6 +3748,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -3742,6 +3766,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -3791,6 +3816,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
@@ -3808,6 +3834,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -3878,6 +3905,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
@@ -3895,6 +3923,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -3947,6 +3976,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
@@ -3964,6 +3994,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -4028,6 +4059,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("startup-model".to_string()),
             temperature: 0.0,
@@ -4048,6 +4080,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -4100,6 +4133,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -4117,6 +4151,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -4158,6 +4193,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -4175,6 +4211,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -4345,6 +4382,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4406,6 +4444,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -4423,6 +4462,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4496,6 +4536,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -4513,6 +4554,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4568,6 +4610,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -4585,6 +4628,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -5029,6 +5073,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -5046,6 +5091,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -5112,6 +5158,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(RecallMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -5129,6 +5176,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -5195,6 +5243,7 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -5212,6 +5261,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(

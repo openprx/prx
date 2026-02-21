@@ -5,6 +5,8 @@
 //! - Spawns a tokio task that runs an isolated agent loop
 //! - Returns immediately with a run ID
 //! - On completion, sends the result back through the channel automatically
+//! - `history` action: view the conversation log of any sub-agent run
+//! - `steer` action: inject a message into a running sub-agent's context
 
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
@@ -21,6 +23,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Default timeout for sub-agent runs (10 minutes).
@@ -34,6 +37,14 @@ pub enum SubAgentStatus {
     Failed(String),
 }
 
+/// A single entry in the sub-agent's conversation history.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub role: String,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// Metadata for a spawned sub-agent run.
 #[derive(Debug, Clone)]
 pub struct SubAgentRun {
@@ -43,6 +54,10 @@ pub struct SubAgentRun {
     pub status: SubAgentStatus,
     /// Handle to abort the spawned tokio task (supports kill action).
     pub abort_handle: Option<tokio::task::AbortHandle>,
+    /// Accumulated conversation history from the sub-agent's execution.
+    pub history: Arc<RwLock<Vec<HistoryEntry>>>,
+    /// Channel to inject steering messages into the running sub-agent.
+    pub steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// Tool that spawns an asynchronous sub-agent to handle a task in isolation.
@@ -136,7 +151,9 @@ impl Tool for SessionsSpawnTool {
         "Manage async sub-agents. Actions: \
          'spawn' (default) — launch a sub-agent for a task and return a run_id; \
          'list' — show all active/completed sub-agent runs; \
-         'kill' — abort a running sub-agent by run_id."
+         'kill' — abort a running sub-agent by run_id; \
+         'history' — view the conversation log of a sub-agent run; \
+         'steer' — inject a message into a running sub-agent to redirect it."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -146,9 +163,9 @@ impl Tool for SessionsSpawnTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "list", "kill"],
+                    "enum": ["spawn", "list", "kill", "history", "steer"],
                     "default": "spawn",
-                    "description": "Action to perform: spawn a new sub-agent, list all runs, or kill a run by ID."
+                    "description": "Action to perform: spawn a new sub-agent, list all runs, kill a run, view history, or steer a running sub-agent."
                 },
                 "task": {
                     "type": "string",
@@ -157,7 +174,11 @@ impl Tool for SessionsSpawnTool {
                 },
                 "run_id": {
                     "type": "string",
-                    "description": "Run ID to kill. Required for 'kill' action."
+                    "description": "Run ID for kill/history/steer actions."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Message to inject into the running sub-agent. Required for 'steer' action."
                 },
                 "model": {
                     "type": "string",
@@ -199,6 +220,36 @@ impl Tool for SessionsSpawnTool {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter for kill action"))?;
                 return self.execute_kill(run_id).await;
+            }
+            "history" => {
+                let run_id = args
+                    .get("run_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Missing 'run_id' parameter for history action")
+                    })?;
+                return self.execute_history(run_id).await;
+            }
+            "steer" => {
+                let run_id = args
+                    .get("run_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Missing 'run_id' parameter for steer action")
+                    })?;
+                let message = args
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Missing 'message' parameter for steer action")
+                    })?;
+                return self.execute_steer(run_id, message).await;
             }
             _ => {} // fall through to spawn
         }
@@ -255,6 +306,10 @@ impl Tool for SessionsSpawnTool {
             None => self.default_recipient.read().await.clone(),
         };
 
+        // Create shared history and steer channel for this run
+        let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(Vec::new()));
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
         // Register the run (abort_handle set after spawn)
         {
             let mut runs = self.active_runs.write().await;
@@ -264,6 +319,8 @@ impl Tool for SessionsSpawnTool {
                 started_at: Utc::now(),
                 status: SubAgentStatus::Running,
                 abort_handle: None,
+                history: history_arc.clone(),
+                steer_tx: Some(steer_tx),
             });
         }
 
@@ -285,15 +342,17 @@ impl Tool for SessionsSpawnTool {
             tracing::info!(run_id = %rid, "Sub-agent task starting");
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
-                run_sub_agent(
+                run_sub_agent_task(
                     &task_owned,
-                    provider.as_ref(),
+                    provider,
                     &provider_name,
                     &model,
                     temperature,
-                    tools.as_deref(),
+                    tools,
                     &workspace_dir,
                     &multimodal_config,
+                    steer_rx,
+                    history_arc,
                 ),
             )
             .await;
@@ -306,9 +365,7 @@ impl Tool for SessionsSpawnTool {
                     (SubAgentStatus::Failed(e.to_string()), msg)
                 }
                 Err(_) => {
-                    let msg = format!(
-                        "Sub-agent timed out after {timeout_secs}s"
-                    );
+                    let msg = format!("Sub-agent timed out after {timeout_secs}s");
                     (SubAgentStatus::Failed("timeout".into()), msg)
                 }
             };
@@ -318,23 +375,18 @@ impl Tool for SessionsSpawnTool {
                 let mut runs = active_runs.write().await;
                 if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
                     run.status = status;
+                    run.steer_tx = None; // drop sender — no more steering possible
                 }
             }
 
             // Announce result back to channel if we have a recipient
             if let Some(target) = recipient {
-                let announce = format!(
-                    "🤖 Sub-agent `{rid}` completed:\n\n{result_text}"
-                );
+                let announce = format!("🤖 Sub-agent `{rid}` completed:\n\n{result_text}");
                 let msg = SendMessage::new(&announce, &target);
                 if let Err(e) = channel.send(&msg).await {
-                    tracing::error!(
-                        run_id = %rid,
-                        "Failed to announce sub-agent result: {e}"
-                    );
+                    tracing::error!(run_id = %rid, "Failed to announce sub-agent result: {e}");
                 }
             } else {
-                // No channel to announce to; log as warning
                 tracing::warn!(
                     run_id = %rid,
                     "Sub-agent completed but no recipient configured for announcement"
@@ -358,7 +410,6 @@ impl Tool for SessionsSpawnTool {
             error: None,
         })
     }
-
 }
 
 impl SessionsSpawnTool {
@@ -432,75 +483,266 @@ impl SessionsSpawnTool {
             })
         }
     }
+
+    /// Return the conversation history of a sub-agent run.
+    async fn execute_history(&self, run_id: &str) -> anyhow::Result<ToolResult> {
+        let runs = self.active_runs.read().await;
+        let Some(run) = runs.iter().find(|r| r.id == run_id) else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("No run found with ID `{run_id}`.")),
+            });
+        };
+
+        let entries = run.history.read().await;
+        if entries.is_empty() {
+            let status = match &run.status {
+                SubAgentStatus::Running => "still running, no history captured yet",
+                SubAgentStatus::Completed(_) => "completed but history is empty",
+                SubAgentStatus::Failed(_) => "failed, history may be incomplete",
+            };
+            return Ok(ToolResult {
+                success: true,
+                output: format!("No history entries for run `{run_id}` ({status})."),
+                error: None,
+            });
+        }
+
+        let lines: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                let ts = e.timestamp.format("%H:%M:%S").to_string();
+                let preview: String = e.content.chars().take(200).collect();
+                let ellipsis = if e.content.len() > 200 { "…" } else { "" };
+                format!("[{ts}] **{}**: {}{}", e.role, preview, ellipsis)
+            })
+            .collect();
+
+        Ok(ToolResult {
+            success: true,
+            output: format!(
+                "Conversation history for sub-agent `{run_id}` ({} entries):\n\n{}",
+                entries.len(),
+                lines.join("\n\n")
+            ),
+            error: None,
+        })
+    }
+
+    /// Inject a steering message into a running sub-agent.
+    async fn execute_steer(&self, run_id: &str, message: &str) -> anyhow::Result<ToolResult> {
+        let runs = self.active_runs.read().await;
+        let Some(run) = runs.iter().find(|r| r.id == run_id) else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("No run found with ID `{run_id}`.")),
+            });
+        };
+
+        match &run.status {
+            SubAgentStatus::Running => {
+                if let Some(ref tx) = run.steer_tx {
+                    tx.send(message.to_string()).map_err(|_| {
+                        anyhow::anyhow!("Sub-agent steer channel closed unexpectedly")
+                    })?;
+                    Ok(ToolResult {
+                        success: true,
+                        output: format!(
+                            "Steering message sent to sub-agent `{run_id}`. \
+                             The agent will incorporate it at the next opportunity."
+                        ),
+                        error: None,
+                    })
+                } else {
+                    Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Run `{run_id}` is running but has no steer channel (legacy run)."
+                        )),
+                    })
+                }
+            }
+            SubAgentStatus::Completed(_) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Run `{run_id}` already completed; cannot steer.")),
+            }),
+            SubAgentStatus::Failed(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Run `{run_id}` already failed ({e}); cannot steer.")),
+            }),
+        }
+    }
 }
 
-/// Maximum tool-call iterations for a sub-agent run.
+/// Maximum tool-call iterations for a sub-agent run (per steering segment).
 const SUB_AGENT_MAX_ITERATIONS: usize = 15;
 
-/// Run an isolated sub-agent loop for the given task.
+/// Convert a slice of `ChatMessage` to `HistoryEntry` values.
+/// Each entry is timestamped with the current wall-clock time (approximate).
+fn chat_messages_to_history(messages: &[ChatMessage]) -> Vec<HistoryEntry> {
+    let now = Utc::now();
+    messages
+        .iter()
+        .map(|m| HistoryEntry {
+            role: m.role.clone(),
+            content: m.content.clone(),
+            timestamp: now,
+        })
+        .collect()
+}
+
+/// Run an isolated sub-agent loop with steering and history support.
 ///
-/// When a tool registry is provided (via the OnceLock), runs a full agentic
-/// tool-call loop (up to `SUB_AGENT_MAX_ITERATIONS`). Sessions_spawn itself
-/// is included in the tool set — recursion is bounded by the per-run timeout.
+/// Supports:
+/// - Agentic tool-call loop (when a tool registry is available)
+/// - Steering: injected messages are added to the conversation and the loop restarts
+/// - History: `history_out` is updated after each significant state change
 ///
 /// Falls back to a single-turn completion when no tools are registered.
-async fn run_sub_agent(
+async fn run_sub_agent_task(
     task: &str,
-    provider: &dyn Provider,
+    provider: Arc<dyn Provider>,
     provider_name: &str,
     model: &str,
     temperature: f64,
-    tools: Option<&Vec<Box<dyn Tool>>>,
+    tools: Option<Arc<Vec<Box<dyn Tool>>>>,
     workspace_dir: &std::path::Path,
     multimodal_config: &MultimodalConfig,
+    mut steer_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    history_out: Arc<RwLock<Vec<HistoryEntry>>>,
 ) -> anyhow::Result<String> {
     const SYSTEM_PROMPT: &str = "\
 You are a sub-agent handling a specific delegated task. \
 Complete the task thoroughly and report results concisely. \
 Focus only on the assigned task; do not ask clarifying questions.";
 
-    if let Some(tools_registry) = tools {
-        // Agentic loop with tool support
-        let mut history = vec![
-            ChatMessage::system(SYSTEM_PROMPT),
-            ChatMessage::user(task),
-        ];
-        let observer = NoopObserver;
-        let hooks = HookManager::new(workspace_dir.to_path_buf());
-
-        let response = run_tool_call_loop(
-            provider,
-            &mut history,
-            tools_registry.as_slice(),
-            &observer,
-            &hooks,
-            provider_name,
-            model,
-            temperature,
-            true,  // silent — no streaming output
-            None,  // no approval manager
-            "sessions_spawn",
-            multimodal_config,
-            SUB_AGENT_MAX_ITERATIONS,
-            None, // no cancellation token
-            None, // no streaming sender
-        )
-        .await?;
-
-        if response.trim().is_empty() {
-            return Ok("[Sub-agent produced no output]".to_string());
-        }
-        Ok(response)
-    } else {
-        // Fallback: single-turn completion (no tools registered yet)
+    // --- No-tools fallback: single-turn completion ---
+    let Some(tools_registry) = tools else {
         let response = provider
             .chat_with_system(Some(SYSTEM_PROMPT), task, model, temperature)
             .await?;
+        let history = vec![
+            HistoryEntry {
+                role: "user".into(),
+                content: task.to_string(),
+                timestamp: Utc::now(),
+            },
+            HistoryEntry {
+                role: "assistant".into(),
+                content: response.clone(),
+                timestamp: Utc::now(),
+            },
+        ];
+        *history_out.write().await = history;
+        return Ok(if response.trim().is_empty() {
+            "[Sub-agent produced no output]".to_string()
+        } else {
+            response
+        });
+    };
 
-        if response.trim().is_empty() {
-            return Ok("[Sub-agent produced no output]".to_string());
+    // --- Agentic loop with steering support ---
+    let mut history: Vec<ChatMessage> = vec![
+        ChatMessage::system(SYSTEM_PROMPT),
+        ChatMessage::user(task),
+    ];
+
+    loop {
+        let cancel_token = CancellationToken::new();
+
+        // Clone everything needed for the inner spawned task.
+        // We move `history` into the task and get it back after completion.
+        let mut h = history;
+        let p = provider.clone();
+        let pn = provider_name.to_string();
+        let m = model.to_string();
+        let t = temperature;
+        let tr = tools_registry.clone();
+        let wd = workspace_dir.to_path_buf();
+        let mc = multimodal_config.clone();
+        let ct = cancel_token.clone();
+
+        let mut loop_handle = tokio::spawn(async move {
+            let observer = NoopObserver;
+            let hooks = HookManager::new(wd);
+            let result = run_tool_call_loop(
+                p.as_ref(),
+                &mut h,
+                tr.as_slice(),
+                &observer,
+                &hooks,
+                &pn,
+                &m,
+                t,
+                true,  // silent — no streaming output
+                None,  // no approval manager
+                "sessions_spawn",
+                &mc,
+                SUB_AGENT_MAX_ITERATIONS,
+                Some(ct),
+                None, // no streaming sender
+                None, // no scope context for spawned sessions
+            )
+            .await;
+            (h, result)
+        });
+
+        // Race: loop completion vs steering message
+        tokio::select! {
+            loop_result = &mut loop_handle => {
+                // Inner loop finished (naturally or via error)
+                let (returned_history, result) = loop_result?;
+                history = returned_history;
+                // Write final history to shared store
+                *history_out.write().await = chat_messages_to_history(&history);
+                return match result {
+                    Ok(text) => Ok(if text.trim().is_empty() {
+                        "[Sub-agent produced no output]".to_string()
+                    } else {
+                        text
+                    }),
+                    Err(e) => Err(e),
+                };
+            },
+            steer_opt = steer_rx.recv() => {
+                match steer_opt {
+                    Some(steer_msg) => {
+                        // Cancel the running inner loop
+                        cancel_token.cancel();
+                        // Wait for the task to acknowledge cancellation and return history
+                        let (returned_history, _cancelled_result) = loop_handle.await?;
+                        history = returned_history;
+                        // Inject the steering message as a user turn
+                        tracing::info!("Sub-agent steering: injecting message");
+                        history.push(ChatMessage::user(format!(
+                            "[Steering instruction from operator] {steer_msg}"
+                        )));
+                        // Update shared history so callers can see the injected message
+                        *history_out.write().await = chat_messages_to_history(&history);
+                        // Loop continues — will re-enter with updated history
+                    }
+                    None => {
+                        // Steer channel closed — no more steering; wait for natural completion
+                        let (returned_history, result) = loop_handle.await?;
+                        history = returned_history;
+                        *history_out.write().await = chat_messages_to_history(&history);
+                        return match result {
+                            Ok(text) => Ok(if text.trim().is_empty() {
+                                "[Sub-agent produced no output]".to_string()
+                            } else {
+                                text
+                            }),
+                            Err(e) => Err(e),
+                        };
+                    }
+                }
+            }
         }
-        Ok(response)
     }
 }
 
@@ -510,7 +752,6 @@ mod tests {
     use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
     use crate::security::SecurityPolicy;
     use anyhow::anyhow;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -631,10 +872,12 @@ mod tests {
         );
         assert_eq!(tool.name(), "sessions_spawn");
         assert!(!tool.description().is_empty());
+        assert!(tool.description().contains("history"));
+        assert!(tool.description().contains("steer"));
     }
 
     #[test]
-    fn schema_has_required_task() {
+    fn schema_has_required_fields() {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(
             Arc::new(ch),
@@ -649,9 +892,15 @@ mod tests {
         assert!(schema["properties"]["action"].is_object());
         assert!(schema["properties"]["task"].is_object());
         assert!(schema["properties"]["run_id"].is_object());
+        assert!(schema["properties"]["message"].is_object());
         assert!(schema["properties"]["model"].is_object());
         assert!(schema["properties"]["timeout_seconds"].is_object());
         assert!(schema["properties"]["recipient"].is_object());
+        // Verify enum includes history and steer
+        let enum_vals = schema["properties"]["action"]["enum"].as_array().unwrap();
+        let enum_strs: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
+        assert!(enum_strs.contains(&"history"));
+        assert!(enum_strs.contains(&"steer"));
     }
 
     #[tokio::test]
@@ -823,5 +1072,109 @@ mod tests {
 
         let val = tool.default_recipient.read().await.clone();
         assert_eq!(val.as_deref(), Some("via-handle"));
+    }
+
+    #[tokio::test]
+    async fn history_action_returns_no_run_error() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "ok".into(),
+            }),
+        );
+        let result = tool
+            .execute(json!({"action": "history", "run_id": "nonexistent"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("No run found"));
+    }
+
+    #[tokio::test]
+    async fn history_action_requires_run_id() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "ok".into(),
+            }),
+        );
+        let result = tool
+            .execute(json!({"action": "history"}))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn steer_action_requires_message() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "ok".into(),
+            }),
+        );
+        let result = tool
+            .execute(json!({"action": "steer", "run_id": "xxx"}))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn steer_action_returns_no_run_error() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "ok".into(),
+            }),
+        );
+        let result = tool
+            .execute(json!({"action": "steer", "run_id": "nonexistent", "message": "pivot!"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("No run found"));
+    }
+
+    #[tokio::test]
+    async fn history_populated_after_no_tools_run() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "finished work".into(),
+            }),
+        );
+
+        // Spawn without tool registry (no tools set)
+        let spawn_result = tool
+            .execute(json!({"task": "Do a thing"}))
+            .await
+            .unwrap();
+        assert!(spawn_result.success);
+        let run_id = spawn_result
+            .output
+            .split("run_id: ")
+            .nth(1)
+            .unwrap()
+            .split(')')
+            .next()
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Wait for task to complete
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Check history
+        let hist_result = tool
+            .execute(json!({"action": "history", "run_id": run_id}))
+            .await
+            .unwrap();
+        assert!(hist_result.success);
+        assert!(hist_result.output.contains("user"));
+        assert!(hist_result.output.contains("assistant"));
     }
 }
