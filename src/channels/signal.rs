@@ -1,11 +1,33 @@
-use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+use crate::channels::traits::{
+    extract_outgoing_media, guess_audio_mime, guess_mime_from_path, Channel, ChannelMessage,
+    SendMessage,
+};
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// Map a MIME type to a simple file extension for temp files.
+fn mime_to_extension(mime: &str) -> &str {
+    // Strip codec parameters (e.g. "audio/ogg; codecs=opus" → "audio/ogg")
+    let base = mime.split(';').next().unwrap_or(mime).trim();
+    match base {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "audio/ogg" => "ogg",
+        "audio/mpeg" => "mp3",
+        "audio/mp4" | "audio/aac" => "m4a",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        _ => "bin",
+    }
+}
 
 const GROUP_TARGET_PREFIX: &str = "group:";
 
@@ -269,6 +291,102 @@ impl SignalChannel {
         })
     }
 
+    /// Download a single Signal attachment via the REST API and return an
+    /// inline marker string (`[IMAGE:path]`, `<media:audio ...>`, etc.)
+    /// ready to append to the message content.
+    async fn download_attachment_as_marker(&self, att: &serde_json::Value) -> Option<String> {
+        let id = att.get("id").and_then(|v| v.as_str())?;
+        let content_type = att
+            .get("contentType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("application/octet-stream");
+        let filename = att
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("attachment");
+
+        // Download via signal-cli-rest-api: GET /v1/attachments/{id}
+        let url = format!("{}/v1/attachments/{}", self.http_url, id);
+        let response = self
+            .http_client()
+            .get(&url)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .ok()?;
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                "Signal: failed to download attachment {id}: {}",
+                response.status()
+            );
+            return None;
+        }
+
+        let bytes = response.bytes().await.ok()?;
+        let ext = mime_to_extension(content_type);
+        let temp_path = format!("/tmp/zeroclaw-att-{id}.{ext}");
+        std::fs::write(&temp_path, &bytes).ok()?;
+
+        tracing::info!(
+            "Signal: downloaded attachment {id} ({} bytes) → {}",
+            bytes.len(),
+            temp_path
+        );
+
+        let marker = if content_type.starts_with("image/") {
+            format!("[IMAGE:{temp_path}]")
+        } else if content_type.starts_with("audio/") {
+            format!(
+                "<media:audio path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
+            )
+        } else if content_type.starts_with("video/") {
+            format!(
+                "<media:video path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
+            )
+        } else {
+            format!(
+                "<media:file path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
+            )
+        };
+
+        Some(marker)
+    }
+
+    /// Enrich a `ChannelMessage` with `[IMAGE:...]` or `<media:...>` markers
+    /// by downloading any attachments from the original envelope.
+    /// Returns the message unchanged when `ignore_attachments` is set.
+    async fn maybe_enrich_with_attachments(
+        &self,
+        mut msg: ChannelMessage,
+        envelope: &Envelope,
+    ) -> ChannelMessage {
+        if self.ignore_attachments {
+            return msg;
+        }
+
+        let Some(data_msg) = envelope.data_message.as_ref() else {
+            return msg;
+        };
+
+        let Some(raw_attachments) = data_msg.attachments.as_ref() else {
+            return msg;
+        };
+
+        if raw_attachments.is_empty() {
+            return msg;
+        }
+
+        for att in raw_attachments {
+            if let Some(marker) = self.download_attachment_as_marker(att).await {
+                msg.content.push('\n');
+                msg.content.push_str(&marker);
+            }
+        }
+
+        msg
+    }
+
     /// Poll-based listener for signal-cli-rest-api `/v1/receive/{account}`.
     async fn listen_polling(
         &self,
@@ -301,6 +419,8 @@ impl SignalChannel {
                         for sse in &envelopes {
                             if let Some(ref envelope) = sse.envelope {
                                 if let Some(msg) = self.process_envelope(envelope) {
+                                    let msg =
+                                        self.maybe_enrich_with_attachments(msg, envelope).await;
                                     if tx.send(msg).await.is_err() {
                                         return Ok(());
                                     }
@@ -404,6 +524,9 @@ impl SignalChannel {
                                 Ok(sse) => {
                                     if let Some(ref envelope) = sse.envelope {
                                         if let Some(msg) = self.process_envelope(envelope) {
+                                            let msg = self
+                                                .maybe_enrich_with_attachments(msg, envelope)
+                                                .await;
                                             if tx.send(msg).await.is_err() {
                                                 return Ok(());
                                             }
@@ -429,6 +552,7 @@ impl SignalChannel {
                 if let Ok(sse) = serde_json::from_str::<SseEnvelope>(&current_data) {
                     if let Some(ref envelope) = sse.envelope {
                         if let Some(msg) = self.process_envelope(envelope) {
+                            let msg = self.maybe_enrich_with_attachments(msg, envelope).await;
                             let _ = tx.send(msg).await;
                         }
                     }
@@ -448,20 +572,53 @@ impl Channel for SignalChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // Parse any media markers embedded in the message content
+        let (clean_text, media_items) = extract_outgoing_media(&message.content);
+
+        // Build base64 attachments from media markers
+        let mut base64_attachments: Vec<String> = Vec::new();
+        for (kind, path) in &media_items {
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    let mime: &str = match kind.as_str() {
+                        "IMAGE" => guess_mime_from_path(path),
+                        "VOICE" | "AUDIO" => guess_audio_mime(path),
+                        "VIDEO" => "video/mp4",
+                        _ => "application/octet-stream",
+                    };
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    base64_attachments.push(format!("data:{mime};base64,{b64}"));
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read attachment {path}: {e}");
+                }
+            }
+        }
+
         // Try REST API first (/v2/send), fall back to JSON-RPC
         let rest_url = format!("{}/v2/send", self.http_url);
-        let body = match Self::parse_recipient_target(&message.recipient) {
+        let mut body = match Self::parse_recipient_target(&message.recipient) {
             RecipientTarget::Direct(number) => serde_json::json!({
                 "number": &self.account,
                 "recipients": [number],
-                "message": &message.content,
             }),
             RecipientTarget::Group(group_id) => serde_json::json!({
                 "number": &self.account,
                 "recipients": [format!("{GROUP_TARGET_PREFIX}{group_id}")],
-                "message": &message.content,
             }),
         };
+
+        // Only include message field if there's text to send
+        if !clean_text.is_empty() {
+            body["message"] = serde_json::Value::String(clean_text.clone());
+        } else if base64_attachments.is_empty() {
+            // No text and no attachments — fall back to original content
+            body["message"] = serde_json::Value::String(message.content.clone());
+        }
+
+        if !base64_attachments.is_empty() {
+            body["base64_attachments"] = serde_json::json!(base64_attachments);
+        }
 
         let resp = self
             .http_client()
@@ -474,21 +631,55 @@ impl Channel for SignalChannel {
 
         match resp {
             Ok(r) if r.status().is_success() || r.status().as_u16() == 201 => return Ok(()),
-            _ => {
-                // Fall back to JSON-RPC
-                let params = match Self::parse_recipient_target(&message.recipient) {
-                    RecipientTarget::Direct(number) => serde_json::json!({
-                        "recipient": [number],
-                        "message": &message.content,
-                        "account": &self.account,
-                    }),
-                    RecipientTarget::Group(group_id) => serde_json::json!({
-                        "groupId": group_id,
-                        "message": &message.content,
-                        "account": &self.account,
-                    }),
-                };
-                self.rpc_request("send", params).await?;
+            Ok(r) => {
+                let status = r.status();
+                let body_text = r.text().await.unwrap_or_default();
+                tracing::warn!("Signal REST send failed: {status} - {body_text}");
+                // Fallback to JSON-RPC for text-only messages
+                if base64_attachments.is_empty() {
+                    let text_content = if clean_text.is_empty() {
+                        &message.content
+                    } else {
+                        &clean_text
+                    };
+                    let params = match Self::parse_recipient_target(&message.recipient) {
+                        RecipientTarget::Direct(number) => serde_json::json!({
+                            "recipient": [number],
+                            "message": text_content,
+                            "account": &self.account,
+                        }),
+                        RecipientTarget::Group(group_id) => serde_json::json!({
+                            "groupId": group_id,
+                            "message": text_content,
+                            "account": &self.account,
+                        }),
+                    };
+                    self.rpc_request("send", params).await?;
+                }
+            }
+            Err(e) => {
+                // Network error — try JSON-RPC fallback for text-only
+                tracing::warn!("Signal REST send error: {e}");
+                if base64_attachments.is_empty() {
+                    let text_content = if clean_text.is_empty() {
+                        &message.content
+                    } else {
+                        &clean_text
+                    };
+                    let params = match Self::parse_recipient_target(&message.recipient) {
+                        RecipientTarget::Direct(number) => serde_json::json!({
+                            "recipient": [number],
+                            "message": text_content,
+                            "account": &self.account,
+                        }),
+                        RecipientTarget::Group(group_id) => serde_json::json!({
+                            "groupId": group_id,
+                            "message": text_content,
+                            "account": &self.account,
+                        }),
+                    };
+                    self.rpc_request("send", params).await?;
+                }
             }
         }
         Ok(())
