@@ -2286,6 +2286,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 sg.allowed_from.clone(),
                 sg.ignore_attachments,
                 sg.ignore_stories,
+                config.media.clone(),
             )),
         ));
     }
@@ -2329,6 +2330,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 sig.allowed_from.clone(),
                 sig.ignore_attachments,
                 sig.ignore_stories,
+                config.media.clone(),
             )),
         ));
     }
@@ -2736,6 +2738,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             sig.allowed_from.clone(),
             sig.ignore_attachments,
             sig.ignore_stories,
+            config.media.clone(),
         )));
     }
 

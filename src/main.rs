@@ -66,6 +66,7 @@ mod heartbeat;
 mod hooks;
 mod identity;
 mod integrations;
+mod media;
 mod memory;
 mod migration;
 mod multimodal;
