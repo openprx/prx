@@ -268,37 +268,73 @@ impl SignalChannel {
             thread_ts: None,
         })
     }
-}
 
-#[async_trait]
-impl Channel for SignalChannel {
-    fn name(&self) -> &str {
-        "signal"
+    /// Poll-based listener for signal-cli-rest-api `/v1/receive/{account}`.
+    async fn listen_polling(
+        &self,
+        poll_url: &str,
+        tx: mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        let poll_interval = Duration::from_secs(2);
+        let mut retry_delay_secs = 2u64;
+        let max_delay_secs = 60u64;
+
+        loop {
+            let resp = self
+                .http_client()
+                .get(poll_url)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    retry_delay_secs = 2;
+                    let text = r.text().await.unwrap_or_default();
+                    if text.is_empty() || text == "[]" {
+                        tokio::time::sleep(poll_interval).await;
+                        continue;
+                    }
+
+                    // REST API returns an array of envelopes
+                    if let Ok(envelopes) = serde_json::from_str::<Vec<SseEnvelope>>(&text) {
+                        for sse in &envelopes {
+                            if let Some(ref envelope) = sse.envelope {
+                                if let Some(msg) = self.process_envelope(envelope) {
+                                    if tx.send(msg).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::debug!("Signal poll parse skip: {text}");
+                    }
+                }
+                Ok(r) => {
+                    let status = r.status();
+                    tracing::warn!("Signal poll returned {status}, retrying...");
+                    tokio::time::sleep(Duration::from_secs(retry_delay_secs)).await;
+                    retry_delay_secs = (retry_delay_secs * 2).min(max_delay_secs);
+                }
+                Err(e) => {
+                    tracing::warn!("Signal poll error: {e}, retrying...");
+                    tokio::time::sleep(Duration::from_secs(retry_delay_secs)).await;
+                    retry_delay_secs = (retry_delay_secs * 2).min(max_delay_secs);
+                }
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let params = match Self::parse_recipient_target(&message.recipient) {
-            RecipientTarget::Direct(number) => serde_json::json!({
-                "recipient": [number],
-                "message": &message.content,
-                "account": &self.account,
-            }),
-            RecipientTarget::Group(group_id) => serde_json::json!({
-                "groupId": group_id,
-                "message": &message.content,
-                "account": &self.account,
-            }),
-        };
-
-        self.rpc_request("send", params).await?;
-        Ok(())
-    }
-
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        let mut url = reqwest::Url::parse(&format!("{}/api/v1/events", self.http_url))?;
-        url.query_pairs_mut().append_pair("account", &self.account);
-
-        tracing::info!("Signal channel listening via SSE on {}...", self.http_url);
+    /// SSE-based listener for signal-cli daemon `/api/v1/events`.
+    async fn listen_sse(
+        &self,
+        sse_url: &str,
+        tx: mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        let url = reqwest::Url::parse(sse_url)?;
 
         let mut retry_delay_secs = 2u64;
         let max_delay_secs = 60u64;
@@ -358,13 +394,11 @@ impl Channel for SignalChannel {
                     let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
                     buffer = buffer[newline_pos + 1..].to_string();
 
-                    // Skip SSE comments (keepalive)
                     if line.starts_with(':') {
                         continue;
                     }
 
                     if line.is_empty() {
-                        // Empty line = event boundary, dispatch accumulated data
                         if !current_data.is_empty() {
                             match serde_json::from_str::<SseEnvelope>(&current_data) {
                                 Ok(sse) => {
@@ -388,21 +422,15 @@ impl Channel for SignalChannel {
                         }
                         current_data.push_str(data.trim_start());
                     }
-                    // Ignore "event:", "id:", "retry:" lines
                 }
             }
 
             if !current_data.is_empty() {
-                match serde_json::from_str::<SseEnvelope>(&current_data) {
-                    Ok(sse) => {
-                        if let Some(ref envelope) = sse.envelope {
-                            if let Some(msg) = self.process_envelope(envelope) {
-                                let _ = tx.send(msg).await;
-                            }
+                if let Ok(sse) = serde_json::from_str::<SseEnvelope>(&current_data) {
+                    if let Some(ref envelope) = sse.envelope {
+                        if let Some(msg) = self.process_envelope(envelope) {
+                            let _ = tx.send(msg).await;
                         }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Signal SSE trailing parse skip: {e}");
                     }
                 }
             }
@@ -411,7 +439,89 @@ impl Channel for SignalChannel {
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         }
     }
+}
 
+#[async_trait]
+impl Channel for SignalChannel {
+    fn name(&self) -> &str {
+        "signal"
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // Try REST API first (/v2/send), fall back to JSON-RPC
+        let rest_url = format!("{}/v2/send", self.http_url);
+        let body = match Self::parse_recipient_target(&message.recipient) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "number": &self.account,
+                "recipients": [number],
+                "message": &message.content,
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "number": &self.account,
+                "recipients": [format!("{GROUP_TARGET_PREFIX}{group_id}")],
+                "message": &message.content,
+            }),
+        };
+
+        let resp = self
+            .http_client()
+            .post(&rest_url)
+            .timeout(Duration::from_secs(30))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() || r.status().as_u16() == 201 => return Ok(()),
+            _ => {
+                // Fall back to JSON-RPC
+                let params = match Self::parse_recipient_target(&message.recipient) {
+                    RecipientTarget::Direct(number) => serde_json::json!({
+                        "recipient": [number],
+                        "message": &message.content,
+                        "account": &self.account,
+                    }),
+                    RecipientTarget::Group(group_id) => serde_json::json!({
+                        "groupId": group_id,
+                        "message": &message.content,
+                        "account": &self.account,
+                    }),
+                };
+                self.rpc_request("send", params).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        // Use polling via signal-cli-rest-api `/v1/receive/{account}` endpoint.
+        // Falls back to SSE `/api/v1/events` if the REST API is not available.
+        let poll_url = format!("{}/v1/receive/{}", self.http_url, self.account);
+        let sse_url_str = format!("{}/api/v1/events?account={}", self.http_url, self.account);
+
+        // Probe: try REST API first
+        let use_polling = {
+            let probe = self
+                .http_client()
+                .get(&format!("{}/v1/about", self.http_url))
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await;
+            probe.is_ok_and(|r| r.status().is_success())
+        };
+
+        if use_polling {
+            tracing::info!(
+                "Signal channel using REST polling on {}...",
+                self.http_url
+            );
+            self.listen_polling(&poll_url, tx).await
+        } else {
+            tracing::info!("Signal channel using SSE on {}...", self.http_url);
+            self.listen_sse(&sse_url_str, tx).await
+        }
+    }
     async fn health_check(&self) -> bool {
         let url = format!("{}/api/v1/check", self.http_url);
         let Ok(resp) = self
