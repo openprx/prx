@@ -559,36 +559,41 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block subshell/expansion operators — these allow hiding arbitrary
-        // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
-        if command.contains('`')
-            || command.contains("$(")
-            || command.contains("${")
-            || command.contains("<(")
-            || command.contains(">(")
-        {
-            return false;
+        // In full autonomy mode, allow subshell/expansion and redirections
+        if self.autonomy != AutonomyLevel::Full {
+            // Block subshell/expansion operators — these allow hiding arbitrary
+            // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
+            if command.contains('`')
+                || command.contains("$(")
+                || command.contains("${")
+                || command.contains("<(")
+                || command.contains(">(")
+            {
+                return false;
+            }
+
+            // Block output redirections (`>`, `>>`) — they can write to arbitrary paths.
+            // Ignore quoted literals, e.g. `echo "a>b"`.
+            if contains_unquoted_char(command, '>') {
+                return false;
+            }
         }
 
-        // Block output redirections (`>`, `>>`) — they can write to arbitrary paths.
-        // Ignore quoted literals, e.g. `echo "a>b"`.
-        if contains_unquoted_char(command, '>') {
-            return false;
-        }
+        if self.autonomy != AutonomyLevel::Full {
+            // Block `tee` — it can write to arbitrary files, bypassing the
+            // redirect check above (e.g. `echo secret | tee /etc/crontab`)
+            if command
+                .split_whitespace()
+                .any(|w| w == "tee" || w.ends_with("/tee"))
+            {
+                return false;
+            }
 
-        // Block `tee` — it can write to arbitrary files, bypassing the
-        // redirect check above (e.g. `echo secret | tee /etc/crontab`)
-        if command
-            .split_whitespace()
-            .any(|w| w == "tee" || w.ends_with("/tee"))
-        {
-            return false;
-        }
-
-        // Block background command chaining (`&`), which can hide extra
-        // sub-commands and outlive timeout expectations. Keep `&&` allowed.
-        if contains_unquoted_single_ampersand(command) {
-            return false;
+            // Block background command chaining (`&`), which can hide extra
+            // sub-commands and outlive timeout expectations. Keep `&&` allowed.
+            if contains_unquoted_single_ampersand(command) {
+                return false;
+            }
         }
 
         // Split on unquoted command separators and validate each sub-command.
@@ -605,10 +610,14 @@ impl SecurityPolicy {
                 continue;
             }
 
-            if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| allowed == base_cmd)
+            // Empty list or ["*"] means all commands are allowed
+            let all_allowed = self.allowed_commands.is_empty()
+                || self.allowed_commands.iter().any(|c| c == "*");
+            if !all_allowed
+                && !self
+                    .allowed_commands
+                    .iter()
+                    .any(|allowed| allowed == base_cmd)
             {
                 return false;
             }
