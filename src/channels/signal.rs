@@ -25,8 +25,124 @@ fn mime_to_extension(mime: &str) -> &str {
         "audio/mp4" | "audio/aac" => "m4a",
         "video/mp4" => "mp4",
         "video/quicktime" => "mov",
+        // Documents
+        "application/pdf" => "pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "pptx",
+        "application/msword" => "doc",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.ms-powerpoint" => "ppt",
+        "application/rtf" | "text/rtf" => "rtf",
+        "application/epub+zip" => "epub",
+        "text/plain" => "txt",
+        "text/csv" => "csv",
+        "text/html" => "html",
+        "text/xml" | "application/xml" => "xml",
+        "application/json" => "json",
+        "application/toml" => "toml",
+        "text/markdown" => "md",
         _ => "bin",
     }
+}
+
+/// Run an external command and return its stdout as a string (if successful and non-empty).
+async fn run_command(cmd: &str, args: &[&str]) -> Option<String> {
+    let output = tokio::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .await
+        .ok()?;
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        if text.trim().is_empty() { None } else { Some(text) }
+    } else {
+        tracing::debug!(
+            "run_command {cmd} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        None
+    }
+}
+
+/// Return true if the file should be treated as plain text (read directly).
+fn is_text_file(content_type: &str, ext: &str) -> bool {
+    content_type.starts_with("text/") || matches!(ext,
+        "txt" | "csv" | "json" | "xml" | "yaml" | "yml" | "toml" | "md" | "html" |
+        "log" | "ini" | "conf" | "cfg" | "env" |
+        "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "cpp" | "h" | "sh" | "sql" |
+        "vue" | "svelte" | "jsx" | "tsx" | "rb" | "php" | "swift" | "kt" | "cs" | "r"
+    )
+}
+
+/// Extract readable text from a document file.
+/// Returns None if extraction failed or file type is not supported.
+async fn extract_document_text(path: &str, content_type: &str, filename: &str) -> Option<String> {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Plain text files — read directly
+    if is_text_file(content_type, &ext) {
+        return std::fs::read_to_string(path).ok();
+    }
+
+    // PDF → pdftotext
+    if ext == "pdf" || content_type == "application/pdf" {
+        return run_command("pdftotext", &[path, "-"]).await;
+    }
+
+    // XLSX / XLS → openpyxl or xlsx2csv
+    if ext == "xlsx" || ext == "xls"
+        || content_type.contains("spreadsheet")
+        || content_type.contains("ms-excel")
+    {
+        let script = format!(
+            "import openpyxl; wb=openpyxl.load_workbook('{}', read_only=True, data_only=True); \
+            [print('\\n=== ' + ws.title + ' ===\\n' + '\\n'.join('\\t'.join(str(c.value or '') for c in row) for row in ws.iter_rows())) for ws in wb.worksheets]",
+            path.replace('\'', "\\'")
+        );
+        if let Some(t) = run_command("python3", &["-c", &script]).await { return Some(t); }
+        return run_command("xlsx2csv", &[path]).await;
+    }
+
+    // DOCX → python-docx or pandoc
+    if ext == "docx" || content_type.contains("wordprocessingml") {
+        let script = format!(
+            "from docx import Document; d=Document('{}'); \
+            print('\\n'.join(p.text for p in d.paragraphs if p.text.strip()))",
+            path.replace('\'', "\\'")
+        );
+        if let Some(t) = run_command("python3", &["-c", &script]).await { return Some(t); }
+        return run_command("pandoc", &["-t", "plain", path]).await;
+    }
+
+    // PPTX → python-pptx or pandoc
+    if ext == "pptx" || content_type.contains("presentationml") {
+        let script = format!(
+            "from pptx import Presentation; prs=Presentation('{}'); \
+            [print(shape.text) for slide in prs.slides for shape in slide.shapes if hasattr(shape, 'text') and shape.text.strip()]",
+            path.replace('\'', "\\'")
+        );
+        if let Some(t) = run_command("python3", &["-c", &script]).await { return Some(t); }
+        return run_command("pandoc", &["-t", "plain", path]).await;
+    }
+
+    // RTF → unrtf or pandoc
+    if ext == "rtf" || content_type.contains("rtf") {
+        if let Some(t) = run_command("unrtf", &["--text", path]).await { return Some(t); }
+        return run_command("pandoc", &["-t", "plain", path]).await;
+    }
+
+    // EPUB → pandoc
+    if ext == "epub" || content_type == "application/epub+zip" {
+        return run_command("pandoc", &["-t", "plain", path]).await;
+    }
+
+    // Fallback: try pandoc for anything else (DOC, ODT, etc.)
+    run_command("pandoc", &["-t", "plain", path]).await
 }
 
 const GROUP_TARGET_PREFIX: &str = "group:";
@@ -452,7 +568,21 @@ impl SignalChannel {
             ));
         }
 
-        // Other file types
+        // Documents: attempt text extraction
+        if let Some(text) = extract_document_text(temp_path, content_type, filename).await {
+            let truncated = if text.len() > 8000 {
+                format!(
+                    "{}...\n[truncated, {} total chars]",
+                    &text[..8000],
+                    text.len()
+                )
+            } else {
+                text
+            };
+            return Some(format!("[Document: {filename}]\n{truncated}\n[/Document]"));
+        }
+
+        // Unrecognised file types: pass as media marker
         Some(format!(
             "<media:file path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
         ))
