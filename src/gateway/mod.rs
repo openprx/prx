@@ -429,23 +429,36 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Register sessions_spawn tool backed by Signal (if configured) so the LLM can
     // fire off async sub-agent tasks that announce their results when complete.
-    if let Some(ref sc) = signal_channel {
+    // Keep the OnceLock handle so we can inject the full tools_registry post-wrap.
+    let spawn_tools_handle = if let Some(ref sc) = signal_channel {
         let provider_name = config
             .default_provider
             .as_deref()
             .unwrap_or("openrouter")
             .to_string();
-        tools_list.push(Box::new(tools::SessionsSpawnTool::new(
+        let spawn_tool = tools::SessionsSpawnTool::new(
             sc.clone() as Arc<dyn Channel>,
             Arc::clone(&provider),
             provider_name,
             model.clone(),
             temperature,
             security.clone(),
-        )));
-    }
+            config.workspace_dir.clone(),
+            config.multimodal.clone(),
+        );
+        let handle = spawn_tool.tools_handle();
+        tools_list.push(Box::new(spawn_tool));
+        Some(handle)
+    } else {
+        None
+    };
 
     let tools_registry = Arc::new(tools_list);
+
+    // Inject the tools registry into sessions_spawn so sub-agents can use tools.
+    if let Some(handle) = spawn_tools_handle {
+        handle.set(Arc::clone(&tools_registry)).ok();
+    }
 
     // WhatsApp app secret for webhook signature verification
     // Priority: environment variable > config file

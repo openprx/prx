@@ -608,7 +608,7 @@ enum DoctorCommands {
 }
 
 #[derive(Subcommand, Debug)]
-enum ChannelCommands {
+pub(crate) enum ChannelCommands {
     /// List configured channels
     List,
     /// Start all configured channels (Telegram, Discord, Slack)

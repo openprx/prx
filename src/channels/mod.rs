@@ -53,9 +53,7 @@ pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
-pub use traits::{
-    extract_outgoing_media, guess_audio_mime, guess_mime_from_path, Channel, SendMessage,
-};
+pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
@@ -2159,7 +2157,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     Ok(false)
 }
 
-pub async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
+pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
         crate::ChannelCommands::Start => {
             anyhow::bail!("Start must be handled in main.rs (requires async runtime)")
@@ -2885,19 +2883,33 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     // Register sessions_spawn tool backed by the first available channel.
     // This enables fire-and-forget sub-agent spawning with auto-announce on completion.
-    if let Some(first_channel) = channels.first().cloned() {
-        tools_list.push(Box::new(tools::SessionsSpawnTool::new(
+    // We keep a handle to the OnceLock so we can inject the full tools_registry
+    // after it's wrapped in Arc (resolves the chicken-and-egg registration problem).
+    let spawn_tools_handle = if let Some(first_channel) = channels.first().cloned() {
+        let spawn_tool = tools::SessionsSpawnTool::new(
             first_channel,
             Arc::clone(&provider),
             &provider_name,
             &model,
             temperature,
             security.clone(),
-        )));
-    }
+            config.workspace_dir.clone(),
+            config.multimodal.clone(),
+        );
+        let handle = spawn_tool.tools_handle();
+        tools_list.push(Box::new(spawn_tool));
+        Some(handle)
+    } else {
+        None
+    };
 
     // Wrap the tool list in Arc now that all channel-aware tools have been appended.
     let tools_registry = Arc::new(tools_list);
+
+    // Inject the tools registry into sessions_spawn so sub-agents can use tools.
+    if let Some(handle) = spawn_tools_handle {
+        handle.set(Arc::clone(&tools_registry)).ok();
+    }
 
     println!("🦀 ZeroClaw Channel Server");
     println!("  🤖 Model:    {model}");
