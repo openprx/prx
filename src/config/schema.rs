@@ -2684,9 +2684,28 @@ pub struct MatrixConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SignalConfig {
     /// Base URL for the signal-cli HTTP daemon (e.g. "http://127.0.0.1:8686").
+    /// In "native" mode this is ignored; the daemon is spawned on `daemon_http_port`.
+    #[serde(default = "default_signal_http_url")]
     pub http_url: String,
     /// E.164 phone number of the signal-cli account (e.g. "+1234567890").
     pub account: String,
+    /// Channel mode: "native" (spawn signal-cli daemon locally) or "rest" (external daemon/Docker).
+    /// Default: "rest" for backward compatibility.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Path to signal-cli binary. Only used in native mode. Default: "signal-cli" (PATH lookup).
+    #[serde(default)]
+    pub cli_path: Option<String>,
+    /// signal-cli data directory. Only used in native mode.
+    /// Default: $HOME/.local/share/signal-cli (signal-cli's standard XDG location).
+    #[serde(default)]
+    pub data_dir: Option<String>,
+    /// Local HTTP port for the spawned signal-cli daemon. Only used in native mode. Default: 8686.
+    #[serde(default)]
+    pub daemon_http_port: Option<u16>,
+    /// Deprecated: ignored. Accepted for backward compatibility with older config files.
+    #[serde(default)]
+    pub daemon_mode: Option<bool>,
     /// Optional group ID to filter messages.
     /// - `None` or omitted: accept all messages (DMs and groups)
     /// - `"dm"`: only accept direct messages
@@ -2702,6 +2721,29 @@ pub struct SignalConfig {
     /// Skip incoming story messages.
     #[serde(default)]
     pub ignore_stories: bool,
+}
+
+fn default_signal_http_url() -> String {
+    "http://localhost:8080".to_string()
+}
+
+impl SignalConfig {
+    /// Returns the effective HTTP URL for the signal-cli daemon.
+    /// In native mode, uses the local daemon port (ignoring `http_url`).
+    /// In rest mode, returns `http_url` as-is.
+    pub fn effective_http_url(&self) -> String {
+        if self.mode.as_deref() == Some("native") {
+            let port = self.daemon_http_port.unwrap_or(8686);
+            format!("http://127.0.0.1:{port}")
+        } else {
+            self.http_url.clone()
+        }
+    }
+
+    /// Returns true if native mode is configured.
+    pub fn is_native_mode(&self) -> bool {
+        self.mode.as_deref() == Some("native")
+    }
 }
 
 /// WhatsApp channel configuration (Cloud API or Web mode).
