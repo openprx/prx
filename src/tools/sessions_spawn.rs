@@ -142,6 +142,10 @@ impl Tool for SessionsSpawnTool {
         })
     }
 
+    async fn set_active_recipient(&self, recipient: &str) {
+        *self.default_recipient.write().await = Some(recipient.to_string());
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let task = args
             .get("task")
@@ -216,11 +220,13 @@ impl Tool for SessionsSpawnTool {
 
         // Spawn async task (fire-and-forget)
         tokio::spawn(async move {
+            tracing::info!(run_id = %rid, "Sub-agent task starting");
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
                 run_sub_agent(&task_owned, provider.as_ref(), &model, temperature),
             )
             .await;
+            tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
 
             let (status, result_text) = match result {
                 Ok(Ok(text)) => (SubAgentStatus::Completed(text.clone()), text),

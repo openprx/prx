@@ -119,6 +119,10 @@ impl Tool for MessageSendTool {
         })
     }
 
+    async fn set_active_recipient(&self, recipient: &str) {
+        *self.default_recipient.write().await = Some(recipient.to_string());
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // Security guard: autonomy check
         if !self.security.can_act() {

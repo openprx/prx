@@ -1349,6 +1349,12 @@ async fn process_channel_message(
     }
 
     println!("  ⏳ Processing message...");
+
+    // Set active recipient on tools that support proactive messaging (message_send, sessions_spawn).
+    for tool in ctx.tools_registry.iter() {
+        tool.set_active_recipient(&msg.reply_target).await;
+    }
+
     let started_at = Instant::now();
 
     let had_prior_history = ctx
