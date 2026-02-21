@@ -2903,14 +2903,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Always use SignalChannel (HTTP) pointing to the effective URL (local daemon in native mode,
     // external daemon in rest mode).  The daemon must be running by the time this tool is invoked.
     if let Some(ref sig) = config.channels_config.signal {
-        let sig_chan = Arc::new(SignalChannel::new(
-            sig.effective_http_url(),
+        let is_native = sig.is_native_mode();
+        let effective_url = sig.effective_http_url();
+        tracing::info!(
+            "message_send tool: is_native={is_native} url={effective_url} mode={:?}",
+            sig.mode
+        );
+        let sig_chan = Arc::new(SignalChannel::new_with_mode(
+            effective_url,
             sig.account.clone(),
             sig.group_id.clone(),
             sig.allowed_from.clone(),
             sig.ignore_attachments,
             sig.ignore_stories,
             config.media.clone(),
+            is_native,
+            sig.data_dir.clone(),
         ));
         tools_list.push(Box::new(tools::MessageSendTool::new_signal(
             sig_chan,

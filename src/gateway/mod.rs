@@ -406,14 +406,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .signal
         .as_ref()
         .map(|sg| {
-            Arc::new(SignalChannel::new(
-                sg.http_url.clone(),
+            Arc::new(SignalChannel::new_with_mode(
+                sg.effective_http_url(),
                 sg.account.clone(),
                 sg.group_id.clone(),
                 sg.allowed_from.clone(),
                 sg.ignore_attachments,
                 sg.ignore_stories,
                 signal_media_config.clone(),
+                sg.is_native_mode(),
+                sg.data_dir.clone(),
             ))
         });
 

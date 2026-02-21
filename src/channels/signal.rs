@@ -363,9 +363,14 @@ impl SignalChannel {
             let bytes = std::fs::read(&path).ok()?;
             // Copy to a temp path with a proper extension so media pipelines
             // can identify the format by filename.
-            let ext = mime_to_extension(content_type);
             let id = att.get("id").and_then(|v| v.as_str()).unwrap_or("0");
-            let temp_path = format!("/tmp/zeroclaw-att-{id}.{ext}");
+            // Avoid double extension: if id already has the right extension, use it as-is
+            let ext = mime_to_extension(content_type);
+            let temp_path = if id.ends_with(&format!(".{ext}")) {
+                format!("/tmp/zeroclaw-att-{id}")
+            } else {
+                format!("/tmp/zeroclaw-att-{id}.{ext}")
+            };
             std::fs::write(&temp_path, &bytes).ok()?;
 
             tracing::info!(
@@ -741,6 +746,7 @@ impl Channel for SignalChannel {
         let text_content = if clean_text.is_empty() { &message.content } else { &clean_text };
 
         // ── Native mode: JSON-RPC send ────────────────────────────────────────
+        tracing::info!("Signal send: is_native={} http_url={}", self.is_native, self.http_url);
         if self.is_native {
             // In native mode, attachments are referenced as `file://` paths.
             let file_attachments: Vec<String> = media_items
