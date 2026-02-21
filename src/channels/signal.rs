@@ -52,6 +52,9 @@ pub struct SignalChannel {
     ignore_stories: bool,
     /// Media understanding config for audio STT and video frame extraction.
     media_config: crate::config::MediaConfig,
+    /// When true, use native signal-cli daemon JSON-RPC API (`/api/v1/rpc`)
+    /// instead of the Docker signal-cli-rest-api REST endpoints.
+    is_native: bool,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -104,6 +107,20 @@ impl SignalChannel {
         ignore_stories: bool,
         media_config: crate::config::MediaConfig,
     ) -> Self {
+        Self::new_with_mode(http_url, account, group_id, allowed_from, ignore_attachments, ignore_stories, media_config, false)
+    }
+
+    /// Like [`new`] but allows specifying native daemon mode.
+    pub fn new_with_mode(
+        http_url: String,
+        account: String,
+        group_id: Option<String>,
+        allowed_from: Vec<String>,
+        ignore_attachments: bool,
+        ignore_stories: bool,
+        media_config: crate::config::MediaConfig,
+        is_native: bool,
+    ) -> Self {
         let http_url = http_url.trim_end_matches('/').to_string();
         Self {
             http_url,
@@ -113,6 +130,7 @@ impl SignalChannel {
             ignore_attachments,
             ignore_stories,
             media_config,
+            is_native,
         }
     }
 
@@ -295,11 +313,13 @@ impl SignalChannel {
         })
     }
 
-    /// Download a single Signal attachment via the REST API and return an
-    /// inline marker string (`[IMAGE:path]`, `<media:audio ...>`, etc.)
-    /// ready to append to the message content.
+    /// Download a single Signal attachment and return an inline marker string
+    /// (`[IMAGE:path]`, `<media:audio ...>`, etc.) ready to append to message content.
+    ///
+    /// In native mode: reads the local file path from the `file` field in the
+    /// attachment JSON (signal-cli downloads attachments to its data directory).
+    /// In REST mode: downloads via `GET /v1/attachments/{id}`.
     async fn download_attachment_as_marker(&self, att: &serde_json::Value) -> Option<String> {
-        let id = att.get("id").and_then(|v| v.as_str())?;
         let content_type = att
             .get("contentType")
             .and_then(|v| v.as_str())
@@ -309,7 +329,39 @@ impl SignalChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("attachment");
 
-        // Download via signal-cli-rest-api: GET /v1/attachments/{id}
+        // ── Native mode: read local file directly ────────────────────────────
+        if self.is_native {
+            // signal-cli stores downloaded attachments on disk and provides
+            // the path in the `file` (or `storedFilename`) field.
+            let file_path = att
+                .get("file")
+                .or_else(|| att.get("storedFilename"))
+                .and_then(|v| v.as_str())?;
+
+            let path = std::path::PathBuf::from(file_path);
+            if !path.exists() {
+                tracing::warn!("Signal native: attachment file not found: {file_path}");
+                return None;
+            }
+
+            let bytes = std::fs::read(&path).ok()?;
+            // Copy to a temp path with a proper extension so media pipelines
+            // can identify the format by filename.
+            let ext = mime_to_extension(content_type);
+            let id = att.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+            let temp_path = format!("/tmp/zeroclaw-att-{id}.{ext}");
+            std::fs::write(&temp_path, &bytes).ok()?;
+
+            tracing::info!(
+                "Signal native: attachment {file_path} ({} bytes) → {temp_path}",
+                bytes.len()
+            );
+
+            return Self::make_attachment_marker(&temp_path, content_type, filename, &self.media_config).await;
+        }
+
+        // ── REST mode: download via signal-cli-rest-api ───────────────────────
+        let id = att.get("id").and_then(|v| v.as_str())?;
         let url = format!("{}/v1/attachments/{}", self.http_url, id);
         let response = self
             .http_client()
@@ -338,6 +390,16 @@ impl SignalChannel {
             temp_path
         );
 
+        Self::make_attachment_marker(&temp_path, content_type, filename, &self.media_config).await
+    }
+
+    /// Convert a locally-stored attachment file into the appropriate content marker.
+    async fn make_attachment_marker(
+        temp_path: &str,
+        content_type: &str,
+        filename: &str,
+        media_config: &crate::config::MediaConfig,
+    ) -> Option<String> {
         // Images: keep raw [IMAGE:] marker for the existing multimodal pipeline
         if content_type.starts_with("image/") {
             return Some(format!("[IMAGE:{temp_path}]"));
@@ -346,12 +408,11 @@ impl SignalChannel {
         // Audio: attempt STT transcription via media engine
         if content_type.starts_with("audio/") {
             if let Some(transcription) =
-                crate::media::process_media_attachment(&temp_path, content_type, &self.media_config)
+                crate::media::process_media_attachment(temp_path, content_type, media_config)
                     .await
             {
                 return Some(format!("[Voice message transcription: \"{transcription}\"]"));
             }
-            // Fallback: raw marker so LLM knows audio was present
             return Some(format!(
                 "<media:audio path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
             ));
@@ -360,18 +421,17 @@ impl SignalChannel {
         // Video: attempt frame extraction via media engine
         if content_type.starts_with("video/") {
             if let Some(frames) =
-                crate::media::process_media_attachment(&temp_path, content_type, &self.media_config)
+                crate::media::process_media_attachment(temp_path, content_type, media_config)
                     .await
             {
                 return Some(frames);
             }
-            // Fallback: raw marker
             return Some(format!(
                 "<media:video path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
             ));
         }
 
-        // Other file types: always use raw marker
+        // Other file types
         Some(format!(
             "<media:file path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
         ))
@@ -419,6 +479,27 @@ impl SignalChannel {
         target_author: &str,
         timestamp: u64,
     ) -> anyhow::Result<()> {
+        // ── Native mode: JSON-RPC sendReaction ───────────────────────────────
+        if self.is_native {
+            let params = match Self::parse_recipient_target(recipient) {
+                RecipientTarget::Direct(number) => serde_json::json!({
+                    "recipient": [number],
+                    "emoji": emoji,
+                    "targetAuthor": target_author,
+                    "targetTimestamp": timestamp,
+                }),
+                RecipientTarget::Group(group_id) => serde_json::json!({
+                    "groupId": group_id,
+                    "emoji": emoji,
+                    "targetAuthor": target_author,
+                    "targetTimestamp": timestamp,
+                }),
+            };
+            self.rpc_request("sendReaction", params).await?;
+            return Ok(());
+        }
+
+        // ── REST mode: PUT /v1/reactions/{account} ────────────────────────────
         let url = format!("{}/v1/reactions/{}", self.http_url, self.account);
 
         let body = match Self::parse_recipient_target(recipient) {
@@ -641,7 +722,49 @@ impl Channel for SignalChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Parse any media markers embedded in the message content
         let (clean_text, media_items) = extract_outgoing_media(&message.content);
+        let text_content = if clean_text.is_empty() { &message.content } else { &clean_text };
 
+        // ── Native mode: JSON-RPC send ────────────────────────────────────────
+        if self.is_native {
+            // In native mode, attachments are referenced as `file://` paths.
+            let file_attachments: Vec<String> = media_items
+                .iter()
+                .filter_map(|(_kind, path)| {
+                    if std::path::Path::new(path).exists() {
+                        Some(format!("file://{path}"))
+                    } else {
+                        tracing::warn!("Signal native: attachment file missing: {path}");
+                        None
+                    }
+                })
+                .collect();
+
+            let mut params = match Self::parse_recipient_target(&message.recipient) {
+                RecipientTarget::Direct(number) => serde_json::json!({
+                    "recipient": [number],
+                    "message": text_content,
+                }),
+                RecipientTarget::Group(group_id) => serde_json::json!({
+                    "groupId": group_id,
+                    "message": text_content,
+                }),
+            };
+
+            if !file_attachments.is_empty() {
+                params["attachment"] = serde_json::json!(file_attachments);
+            }
+
+            // Quote/reply support
+            if let (Some(ts), Some(author)) = (&message.reply_to_timestamp, &message.reply_to_author) {
+                params["quoteTimestamp"] = serde_json::json!(ts);
+                params["quoteAuthor"] = serde_json::json!(author);
+            }
+
+            self.rpc_request("send", params).await?;
+            return Ok(());
+        }
+
+        // ── REST mode: POST /v2/send ──────────────────────────────────────────
         // Build base64 attachments from media markers
         let mut base64_attachments: Vec<String> = Vec::new();
         for (kind, path) in &media_items {
@@ -662,7 +785,6 @@ impl Channel for SignalChannel {
             }
         }
 
-        // Try REST API first (/v2/send), fall back to JSON-RPC
         let rest_url = format!("{}/v2/send", self.http_url);
         let mut body = match Self::parse_recipient_target(&message.recipient) {
             RecipientTarget::Direct(number) => serde_json::json!({
@@ -679,7 +801,6 @@ impl Channel for SignalChannel {
         if !clean_text.is_empty() {
             body["message"] = serde_json::Value::String(clean_text.clone());
         } else if base64_attachments.is_empty() {
-            // No text and no attachments — fall back to original content
             body["message"] = serde_json::Value::String(message.content.clone());
         }
 
@@ -688,9 +809,7 @@ impl Channel for SignalChannel {
         }
 
         // Add quote/reply fields if reply context is present
-        if let (Some(ts), Some(author)) =
-            (&message.reply_to_timestamp, &message.reply_to_author)
-        {
+        if let (Some(ts), Some(author)) = (&message.reply_to_timestamp, &message.reply_to_author) {
             body["quote_timestamp"] = serde_json::json!(ts);
             body["quote_author"] = serde_json::json!(author);
         }
@@ -712,11 +831,6 @@ impl Channel for SignalChannel {
                 tracing::warn!("Signal REST send failed: {status} - {body_text}");
                 // Fallback to JSON-RPC for text-only messages
                 if base64_attachments.is_empty() {
-                    let text_content = if clean_text.is_empty() {
-                        &message.content
-                    } else {
-                        &clean_text
-                    };
                     let params = match Self::parse_recipient_target(&message.recipient) {
                         RecipientTarget::Direct(number) => serde_json::json!({
                             "recipient": [number],
@@ -733,14 +847,8 @@ impl Channel for SignalChannel {
                 }
             }
             Err(e) => {
-                // Network error — try JSON-RPC fallback for text-only
                 tracing::warn!("Signal REST send error: {e}");
                 if base64_attachments.is_empty() {
-                    let text_content = if clean_text.is_empty() {
-                        &message.content
-                    } else {
-                        &clean_text
-                    };
                     let params = match Self::parse_recipient_target(&message.recipient) {
                         RecipientTarget::Direct(number) => serde_json::json!({
                             "recipient": [number],
@@ -761,12 +869,17 @@ impl Channel for SignalChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        // Use polling via signal-cli-rest-api `/v1/receive/{account}` endpoint.
-        // Falls back to SSE `/api/v1/events` if the REST API is not available.
+        // Native daemon mode: always use SSE — no REST polling endpoint available.
+        if self.is_native {
+            let sse_url = format!("{}/api/v1/events", self.http_url);
+            tracing::info!("Signal native: listening via SSE on {sse_url}");
+            return self.listen_sse(&sse_url, tx).await;
+        }
+
+        // REST mode: probe for signal-cli-rest-api, fall back to SSE.
         let poll_url = format!("{}/v1/receive/{}", self.http_url, self.account);
         let sse_url_str = format!("{}/api/v1/events?account={}", self.http_url, self.account);
 
-        // Probe: try REST API first
         let use_polling = {
             let probe = self
                 .http_client()
