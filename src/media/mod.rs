@@ -228,6 +228,13 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
         markers.push_str(&format!("[IMAGE:{fp}]\n"));
     }
 
+    // Schedule cleanup of temp frames after a delay (gives multimodal pipeline time to read them)
+    let cleanup_dir = output_dir.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        let _ = std::fs::remove_dir_all(&cleanup_dir);
+    });
+
     Some(markers.trim_end().to_string())
 }
 
