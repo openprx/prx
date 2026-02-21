@@ -399,6 +399,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 wa.allowed_numbers.clone(),
             ))
         });
+    let signal_media_config = config.media.clone();
     let signal_channel: Option<Arc<SignalChannel>> = config
         .channels_config
         .signal
@@ -411,6 +412,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 sg.allowed_from.clone(),
                 sg.ignore_attachments,
                 sg.ignore_stories,
+                signal_media_config.clone(),
             ))
         });
 

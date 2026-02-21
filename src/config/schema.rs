@@ -189,6 +189,11 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// Media understanding configuration (`[media]` section).
+    /// Controls audio STT and video frame extraction for incoming attachments.
+    #[serde(default)]
+    pub media: MediaConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -415,6 +420,79 @@ impl Default for MultimodalConfig {
             max_images: default_multimodal_max_images(),
             max_image_size_mb: default_multimodal_max_image_size_mb(),
             allow_remote_fetch: false,
+        }
+    }
+}
+
+// ── Media Understanding ──────────────────────────────────────────
+
+/// Media understanding configuration (`[media]` section).
+///
+/// Controls STT transcription for audio and video frame extraction.
+/// Aligns with OpenClaw's media-understanding architecture.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MediaConfig {
+    /// Audio STT provider: "ollama" | "cli" | "none". Default: "none".
+    #[serde(default = "default_audio_provider")]
+    pub audio_provider: String,
+
+    /// Audio model name (Ollama model or OpenAI model). Default: "whisper".
+    #[serde(default = "default_audio_model")]
+    pub audio_model: String,
+
+    /// Ollama base URL for audio transcription. Default: "http://localhost:11434".
+    #[serde(default = "default_audio_ollama_url")]
+    pub audio_ollama_url: String,
+
+    /// Video provider: "frames" (ffmpeg frame extraction) | "none". Default: "none".
+    #[serde(default = "default_video_provider")]
+    pub video_provider: String,
+
+    /// Maximum video frames to extract per video. Default: 4.
+    #[serde(default = "default_video_max_frames")]
+    pub video_max_frames: usize,
+
+    /// Maximum audio attachment size in MiB. Default: 20.
+    #[serde(default = "default_max_audio_size_mb")]
+    pub max_audio_size_mb: usize,
+
+    /// Maximum video attachment size in MiB. Default: 50.
+    #[serde(default = "default_max_video_size_mb")]
+    pub max_video_size_mb: usize,
+}
+
+fn default_audio_provider() -> String {
+    "none".into()
+}
+fn default_audio_model() -> String {
+    "whisper".into()
+}
+fn default_audio_ollama_url() -> String {
+    "http://localhost:11434".into()
+}
+fn default_video_provider() -> String {
+    "none".into()
+}
+fn default_video_max_frames() -> usize {
+    4
+}
+fn default_max_audio_size_mb() -> usize {
+    20
+}
+fn default_max_video_size_mb() -> usize {
+    50
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            audio_provider: default_audio_provider(),
+            audio_model: default_audio_model(),
+            audio_ollama_url: default_audio_ollama_url(),
+            video_provider: default_video_provider(),
+            video_max_frames: default_video_max_frames(),
+            max_audio_size_mb: default_max_audio_size_mb(),
+            max_video_size_mb: default_max_video_size_mb(),
         }
     }
 }
@@ -2940,6 +3018,7 @@ impl Default for Config {
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
+            media: MediaConfig::default(),
         }
     }
 }
@@ -4045,6 +4124,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            media: MediaConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -4215,6 +4295,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            media: MediaConfig::default(),
         };
 
         config.save().await.unwrap();

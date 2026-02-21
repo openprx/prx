@@ -50,6 +50,8 @@ pub struct SignalChannel {
     allowed_from: Vec<String>,
     ignore_attachments: bool,
     ignore_stories: bool,
+    /// Media understanding config for audio STT and video frame extraction.
+    media_config: crate::config::MediaConfig,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -100,6 +102,7 @@ impl SignalChannel {
         allowed_from: Vec<String>,
         ignore_attachments: bool,
         ignore_stories: bool,
+        media_config: crate::config::MediaConfig,
     ) -> Self {
         let http_url = http_url.trim_end_matches('/').to_string();
         Self {
@@ -109,6 +112,7 @@ impl SignalChannel {
             allowed_from,
             ignore_attachments,
             ignore_stories,
+            media_config,
         }
     }
 
@@ -334,23 +338,43 @@ impl SignalChannel {
             temp_path
         );
 
-        let marker = if content_type.starts_with("image/") {
-            format!("[IMAGE:{temp_path}]")
-        } else if content_type.starts_with("audio/") {
-            format!(
-                "<media:audio path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
-            )
-        } else if content_type.starts_with("video/") {
-            format!(
-                "<media:video path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
-            )
-        } else {
-            format!(
-                "<media:file path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
-            )
-        };
+        // Images: keep raw [IMAGE:] marker for the existing multimodal pipeline
+        if content_type.starts_with("image/") {
+            return Some(format!("[IMAGE:{temp_path}]"));
+        }
 
-        Some(marker)
+        // Audio: attempt STT transcription via media engine
+        if content_type.starts_with("audio/") {
+            if let Some(transcription) =
+                crate::media::process_media_attachment(&temp_path, content_type, &self.media_config)
+                    .await
+            {
+                return Some(format!("[Voice message transcription: \"{transcription}\"]"));
+            }
+            // Fallback: raw marker so LLM knows audio was present
+            return Some(format!(
+                "<media:audio path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
+            ));
+        }
+
+        // Video: attempt frame extraction via media engine
+        if content_type.starts_with("video/") {
+            if let Some(frames) =
+                crate::media::process_media_attachment(&temp_path, content_type, &self.media_config)
+                    .await
+            {
+                return Some(frames);
+            }
+            // Fallback: raw marker
+            return Some(format!(
+                "<media:video path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
+            ));
+        }
+
+        // Other file types: always use raw marker
+        Some(format!(
+            "<media:file path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
+        ))
     }
 
     /// Enrich a `ChannelMessage` with `[IMAGE:...]` or `<media:...>` markers
@@ -812,6 +836,7 @@ mod tests {
             vec!["+1111111111".to_string()],
             false,
             false,
+            crate::config::MediaConfig::default(),
         )
     }
 
@@ -823,6 +848,7 @@ mod tests {
             vec!["*".to_string()],
             true,
             true,
+            crate::config::MediaConfig::default(),
         )
     }
 
@@ -861,6 +887,7 @@ mod tests {
             vec![],
             false,
             false,
+            crate::config::MediaConfig::default(),
         );
         assert_eq!(ch.http_url, "http://127.0.0.1:8686");
     }
@@ -892,6 +919,7 @@ mod tests {
             vec![],
             false,
             false,
+            crate::config::MediaConfig::default(),
         );
         assert!(!ch.is_sender_allowed("+1111111111"));
     }
@@ -1081,6 +1109,7 @@ mod tests {
             vec!["*".to_string()],
             false,
             false,
+            crate::config::MediaConfig::default(),
         );
         let env = Envelope {
             source: Some(uuid.to_string()),
@@ -1114,6 +1143,7 @@ mod tests {
             vec!["*".to_string()],
             false,
             false,
+            crate::config::MediaConfig::default(),
         );
         let env = Envelope {
             source: Some(uuid.to_string()),

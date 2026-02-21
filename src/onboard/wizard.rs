@@ -184,6 +184,7 @@ pub async fn run_wizard() -> Result<Config> {
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
+        media: crate::config::MediaConfig::default(),
     };
 
     println!(
@@ -424,6 +425,7 @@ async fn run_quick_setup_with_home(
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
+        media: crate::config::MediaConfig::default(),
     };
 
     config.save().await?;
