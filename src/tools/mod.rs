@@ -43,6 +43,7 @@ pub mod pushover;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod sessions_spawn;
 pub mod shell;
 pub mod traits;
 pub mod web_search_tool;
@@ -76,6 +77,7 @@ pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+pub use sessions_spawn::SessionsSpawnTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
