@@ -387,6 +387,49 @@ impl SignalChannel {
         msg
     }
 
+    /// Send an emoji reaction to a specific message.
+    pub async fn send_reaction(
+        &self,
+        recipient: &str,
+        emoji: &str,
+        target_author: &str,
+        timestamp: u64,
+    ) -> anyhow::Result<()> {
+        let url = format!("{}/v1/reactions/{}", self.http_url, self.account);
+
+        let body = match Self::parse_recipient_target(recipient) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "recipient": number,
+                "reaction": emoji,
+                "target_author": target_author,
+                "timestamp": timestamp
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "recipient": format!("{GROUP_TARGET_PREFIX}{group_id}"),
+                "reaction": emoji,
+                "target_author": target_author,
+                "timestamp": timestamp
+            }),
+        };
+
+        let resp = self
+            .http_client()
+            .put(&url)
+            .timeout(Duration::from_secs(10))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!("Signal reaction failed: {status} - {body}");
+        }
+
+        Ok(())
+    }
+
     /// Poll-based listener for signal-cli-rest-api `/v1/receive/{account}`.
     async fn listen_polling(
         &self,
@@ -618,6 +661,14 @@ impl Channel for SignalChannel {
 
         if !base64_attachments.is_empty() {
             body["base64_attachments"] = serde_json::json!(base64_attachments);
+        }
+
+        // Add quote/reply fields if reply context is present
+        if let (Some(ts), Some(author)) =
+            (&message.reply_to_timestamp, &message.reply_to_author)
+        {
+            body["quote_timestamp"] = serde_json::json!(ts);
+            body["quote_author"] = serde_json::json!(author);
         }
 
         let resp = self

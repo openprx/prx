@@ -22,6 +22,10 @@ pub struct SendMessage {
     pub subject: Option<String>,
     /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
     pub thread_ts: Option<String>,
+    /// For reply/quote: timestamp of the message being replied to
+    pub reply_to_timestamp: Option<u64>,
+    /// For reply/quote: author of the message being replied to
+    pub reply_to_author: Option<String>,
 }
 
 impl SendMessage {
@@ -32,6 +36,8 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: None,
             thread_ts: None,
+            reply_to_timestamp: None,
+            reply_to_author: None,
         }
     }
 
@@ -46,6 +52,8 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: Some(subject.into()),
             thread_ts: None,
+            reply_to_timestamp: None,
+            reply_to_author: None,
         }
     }
 
