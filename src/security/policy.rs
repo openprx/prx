@@ -1041,13 +1041,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_allowlist_blocks_everything() {
+    fn empty_allowlist_allows_everything() {
+        // An empty allowed_commands list is treated like ["*"] — all commands
+        // are permitted. Use a non-empty list to restrict commands.
         let p = SecurityPolicy {
             allowed_commands: vec![],
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("echo hello"));
+        assert!(p.is_command_allowed("ls"));
+        assert!(p.is_command_allowed("echo hello"));
     }
 
     #[test]

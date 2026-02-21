@@ -564,13 +564,9 @@ impl Agent {
                     )));
                 self.trim_history();
 
-                if self.auto_save {
-                    let summary = truncate_with_ellipsis(&final_text, 100);
-                    let _ = self
-                        .memory
-                        .store("assistant_resp", &summary, MemoryCategory::Daily, None)
-                        .await;
-                }
+                // Note: assistant responses are intentionally NOT auto-saved here.
+                // Only user messages are persisted via auto_save to avoid storing
+                // AI-generated content as if it were factual user input.
                 self.hooks
                     .emit(
                         HookEvent::TurnComplete,

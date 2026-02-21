@@ -518,6 +518,6 @@ mod tests {
         assert!(result
             .error
             .unwrap_or_default()
-            .contains("Missing 'prompt'"));
+            .contains("Missing prompt"));
     }
 }

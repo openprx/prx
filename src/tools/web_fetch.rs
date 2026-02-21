@@ -20,10 +20,15 @@ impl WebFetchTool {
 
     /// Convert HTML to plain readable text by stripping tags and decoding entities.
     fn html_to_text(html: &str) -> String {
-        // Remove script/style blocks (case-insensitive, multiline)
-        let re_script =
-            Regex::new(r"(?si)<(script|style|head)[^>]*>.*?</\1>").unwrap();
+        // Remove script/style/head blocks (case-insensitive, multiline).
+        // Rust's regex crate does not support backreferences, so use three
+        // separate patterns instead of the combined `(?si)<(script|style|head)[^>]*>.*?</\1>`.
+        let re_script = Regex::new(r"(?si)<script[^>]*>.*?</script>").unwrap();
         let text = re_script.replace_all(html, "");
+        let re_style = Regex::new(r"(?si)<style[^>]*>.*?</style>").unwrap();
+        let text = re_style.replace_all(&text, "");
+        let re_head = Regex::new(r"(?si)<head[^>]*>.*?</head>").unwrap();
+        let text = re_head.replace_all(&text, "");
 
         // Replace block-level elements with newlines so paragraphs separate cleanly
         let re_block =
