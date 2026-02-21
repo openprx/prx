@@ -357,6 +357,14 @@ pub struct SkillsConfig {
     /// If unset, defaults to `$HOME/open-skills` when enabled.
     #[serde(default)]
     pub open_skills_dir: Option<String>,
+    /// Enable cloning and loading OpenClaw skills from GitHub (sparse checkout of `skills/` dir).
+    /// Default: `false` (opt-in).
+    #[serde(default)]
+    pub openclaw_skills_enabled: bool,
+    /// Optional path to a local openclaw-skills clone directory.
+    /// If unset, defaults to `$HOME/.zeroclaw/openclaw-skills/` when enabled.
+    #[serde(default)]
+    pub openclaw_skills_dir: Option<String>,
 }
 
 impl Default for SkillsConfig {
@@ -364,6 +372,8 @@ impl Default for SkillsConfig {
         Self {
             open_skills_enabled: false,
             open_skills_dir: None,
+            openclaw_skills_enabled: false,
+            openclaw_skills_dir: None,
         }
     }
 }
@@ -3437,6 +3447,27 @@ impl Config {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 self.skills.open_skills_dir = Some(trimmed.to_string());
+            }
+        }
+
+        // OpenClaw skills opt-in flag: ZEROCLAW_OPENCLAW_SKILLS_ENABLED
+        if let Ok(flag) = std::env::var("ZEROCLAW_OPENCLAW_SKILLS_ENABLED") {
+            if !flag.trim().is_empty() {
+                match flag.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => self.skills.openclaw_skills_enabled = true,
+                    "0" | "false" | "no" | "off" => self.skills.openclaw_skills_enabled = false,
+                    _ => tracing::warn!(
+                        "Ignoring invalid ZEROCLAW_OPENCLAW_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
+                    ),
+                }
+            }
+        }
+
+        // OpenClaw skills directory override: ZEROCLAW_OPENCLAW_SKILLS_DIR
+        if let Ok(path) = std::env::var("ZEROCLAW_OPENCLAW_SKILLS_DIR") {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                self.skills.openclaw_skills_dir = Some(trimmed.to_string());
             }
         }
 
