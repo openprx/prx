@@ -1584,6 +1584,162 @@ mod tests {
         assert!(!p.is_path_allowed("/root/.bashrc"));
     }
 
+    // ── is_tool_allowed / scope rules ────────────────────────
+
+    fn make_scope_policy(
+        rules: Vec<crate::config::ScopeRule>,
+        default_allow: bool,
+    ) -> SecurityPolicy {
+        SecurityPolicy {
+            scope_rules: rules,
+            scope_default_allow: default_allow,
+            ..SecurityPolicy::default()
+        }
+    }
+
+    #[test]
+    fn default_allow_permits_any_tool_when_no_rules() {
+        let p = make_scope_policy(vec![], true);
+        assert!(p.is_tool_allowed("shell", "uuid:alice", "signal", "direct"));
+        assert!(p.is_tool_allowed("file_write", "uuid:bob", "telegram", "group"));
+    }
+
+    #[test]
+    fn default_deny_blocks_any_tool_when_no_rules() {
+        let p = make_scope_policy(vec![], false);
+        assert!(!p.is_tool_allowed("shell", "uuid:alice", "signal", "direct"));
+        assert!(!p.is_tool_allowed("memory_recall", "uuid:bob", "telegram", "group"));
+    }
+
+    #[test]
+    fn deny_list_blocks_specified_tool() {
+        let p = make_scope_policy(
+            vec![crate::config::ScopeRule {
+                user: None,
+                channel: Some("signal".into()),
+                chat_type: Some("group".into()),
+                tools_allow: vec![],
+                tools_deny: vec!["shell".into()],
+            }],
+            true,
+        );
+        // shell blocked in signal groups
+        assert!(!p.is_tool_allowed("shell", "uuid:alice", "signal", "group"));
+        // shell still allowed in direct messages (rule doesn't match)
+        assert!(p.is_tool_allowed("shell", "uuid:alice", "signal", "direct"));
+        // other tools not blocked
+        assert!(p.is_tool_allowed("memory_recall", "uuid:alice", "signal", "group"));
+    }
+
+    #[test]
+    fn allow_list_whitelists_tools() {
+        let p = make_scope_policy(
+            vec![crate::config::ScopeRule {
+                user: Some("uuid:untrusted".into()),
+                channel: None,
+                chat_type: None,
+                tools_allow: vec!["memory_recall".into()],
+                tools_deny: vec![],
+            }],
+            true,
+        );
+        // untrusted user can use memory_recall
+        assert!(p.is_tool_allowed("memory_recall", "uuid:untrusted", "signal", "direct"));
+        // untrusted user cannot use shell (not in allow list)
+        assert!(!p.is_tool_allowed("shell", "uuid:untrusted", "signal", "direct"));
+        // other users still use default (allow)
+        assert!(p.is_tool_allowed("shell", "uuid:trusted", "signal", "direct"));
+    }
+
+    #[test]
+    fn deny_takes_priority_over_allow() {
+        // Both allow and deny list contain "shell" — deny wins.
+        let p = make_scope_policy(
+            vec![crate::config::ScopeRule {
+                user: None,
+                channel: None,
+                chat_type: None,
+                tools_allow: vec!["shell".into(), "memory_recall".into()],
+                tools_deny: vec!["shell".into()],
+            }],
+            true,
+        );
+        assert!(!p.is_tool_allowed("shell", "uuid:alice", "signal", "direct"));
+        assert!(p.is_tool_allowed("memory_recall", "uuid:alice", "signal", "direct"));
+    }
+
+    #[test]
+    fn wildcard_user_matches_any_sender() {
+        let p = make_scope_policy(
+            vec![crate::config::ScopeRule {
+                user: Some("*".into()),
+                channel: None,
+                chat_type: None,
+                tools_allow: vec![],
+                tools_deny: vec!["file_write".into()],
+            }],
+            true,
+        );
+        assert!(!p.is_tool_allowed("file_write", "uuid:anyone", "signal", "direct"));
+        assert!(!p.is_tool_allowed("file_write", "uuid:someoneelse", "telegram", "group"));
+        assert!(p.is_tool_allowed("memory_recall", "uuid:anyone", "signal", "direct"));
+    }
+
+    #[test]
+    fn rules_evaluated_top_to_bottom_first_match_wins() {
+        // Rule 1: deny shell for signal groups
+        // Rule 2: allow all for alice
+        // alice in a signal group: Rule 1 matches first → shell denied
+        let p = make_scope_policy(
+            vec![
+                crate::config::ScopeRule {
+                    user: None,
+                    channel: Some("signal".into()),
+                    chat_type: Some("group".into()),
+                    tools_allow: vec![],
+                    tools_deny: vec!["shell".into()],
+                },
+                crate::config::ScopeRule {
+                    user: Some("uuid:alice".into()),
+                    channel: None,
+                    chat_type: None,
+                    tools_allow: vec![],
+                    tools_deny: vec![],
+                },
+            ],
+            true,
+        );
+        // Rule 1 matches: signal+group → shell denied for alice
+        assert!(!p.is_tool_allowed("shell", "uuid:alice", "signal", "group"));
+        // Rule 1 doesn't match direct → fallthrough to Rule 2 (no restrictions) → allow
+        assert!(p.is_tool_allowed("shell", "uuid:alice", "signal", "direct"));
+    }
+
+    #[test]
+    fn scope_config_from_autonomy_config() {
+        let autonomy = crate::config::AutonomyConfig {
+            scopes: crate::config::ScopeConfig {
+                default: "allow".into(),
+                rules: vec![crate::config::ScopeRule {
+                    user: None,
+                    channel: Some("signal".into()),
+                    chat_type: Some("group".into()),
+                    tools_allow: vec![],
+                    tools_deny: vec!["shell".into()],
+                }],
+            },
+            ..crate::config::AutonomyConfig::default()
+        };
+        let policy = SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
+
+        assert!(policy.scope_default_allow);
+        assert_eq!(policy.scope_rules.len(), 1);
+        // shell blocked in signal groups
+        assert!(!policy.is_tool_allowed("shell", "uuid:alice", "signal", "group"));
+        // shell allowed in direct
+        assert!(policy.is_tool_allowed("shell", "uuid:alice", "signal", "direct"));
+    }
+
     // ── Edge cases: from_config preserves tracker ────────────
 
     #[test]
