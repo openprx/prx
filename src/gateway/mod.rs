@@ -360,7 +360,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    // Build the base tool list (mutable so we can append channel-aware tools below)
+    let mut tools_list = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -373,7 +374,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
     let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
@@ -415,6 +416,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 signal_media_config.clone(),
             ))
         });
+
+    // Register message_send tool backed by Signal when the channel is configured.
+    // For other channels (WhatsApp, Linq, etc.) we register a generic sender without
+    // reaction support so the tool is still available for text/file messages.
+    if let Some(ref sc) = signal_channel {
+        tools_list.push(Box::new(tools::MessageSendTool::new_signal(
+            sc.clone(),
+            security.clone(),
+        )));
+    }
+
+    let tools_registry = Arc::new(tools_list);
 
     // WhatsApp app secret for webhook signature verification
     // Priority: environment variable > config file
@@ -2112,6 +2125,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
+            signal: None,
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
@@ -2168,6 +2182,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
+            signal: None,
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
@@ -2220,6 +2235,7 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
+            signal: None,
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
