@@ -276,7 +276,12 @@ impl SignalChannel {
             }
         }
 
-        let text = data_msg.message.as_deref().filter(|t| !t.is_empty())?;
+        // Allow attachment-only messages (voice, image, video) even without text
+        let has_attachments = data_msg.attachments.as_ref().is_some_and(|a| !a.is_empty());
+        let text = data_msg.message.as_deref().unwrap_or("");
+        if text.is_empty() && !has_attachments {
+            return None;
+        }
         let sender = Self::sender(envelope)?;
 
         if !self.is_sender_allowed(&sender) {
