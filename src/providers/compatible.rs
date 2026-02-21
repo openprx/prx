@@ -896,9 +896,19 @@ impl OpenAiCompatibleProvider {
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        // Detect vision support from model name or base URL
+        let model_lower = self.name.to_lowercase();
+        let base_lower = self.base_url.to_lowercase();
+        let has_vision = model_lower.contains("vision")
+            || model_lower.contains("grok-4")
+            || model_lower.contains("gpt-4o")
+            || model_lower.contains("gpt-4-turbo")
+            || model_lower.contains("gemini")
+            || base_lower.contains("x.ai")
+            || base_lower.contains("xai");
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: true,
-            vision: false,
+            vision: has_vision,
         }
     }
 
