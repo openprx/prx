@@ -1129,6 +1129,12 @@ pub struct WebSearchConfig {
     /// Request timeout in seconds
     #[serde(default = "default_web_search_timeout_secs")]
     pub timeout_secs: u64,
+    /// Enable `web_fetch` tool (fetch and extract readable content from a URL)
+    #[serde(default = "default_web_fetch_enabled")]
+    pub fetch_enabled: bool,
+    /// Maximum characters returned by `web_fetch` (default 10000)
+    #[serde(default = "default_web_fetch_max_chars")]
+    pub fetch_max_chars: usize,
 }
 
 fn default_web_search_provider() -> String {
@@ -1143,6 +1149,14 @@ fn default_web_search_timeout_secs() -> u64 {
     15
 }
 
+fn default_web_fetch_enabled() -> bool {
+    true
+}
+
+fn default_web_fetch_max_chars() -> usize {
+    10_000
+}
+
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
@@ -1151,6 +1165,8 @@ impl Default for WebSearchConfig {
             brave_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
+            fetch_enabled: default_web_fetch_enabled(),
+            fetch_max_chars: default_web_fetch_max_chars(),
         }
     }
 }
