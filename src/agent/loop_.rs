@@ -370,7 +370,13 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     calls
 }
 
-const TOOL_CALL_OPEN_TAGS: [&str; 4] = ["<tool_call>", "<toolcall>", "<tool-call>", "<invoke>"];
+const TOOL_CALL_OPEN_TAGS: [&str; 5] = [
+    "<tool_call>",
+    "<toolcall>",
+    "<tool-call>",
+    "<tool_use>",
+    "<invoke>",
+];
 
 fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
     tags.iter()
@@ -383,6 +389,7 @@ fn matching_tool_call_close_tag(open_tag: &str) -> Option<&'static str> {
         "<tool_call>" => Some("</tool_call>"),
         "<toolcall>" => Some("</toolcall>"),
         "<tool-call>" => Some("</tool-call>"),
+        "<tool_use>" => Some("</tool_use>"),
         "<invoke>" => Some("</invoke>"),
         _ => None,
     }
@@ -607,7 +614,7 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
 // LLM responses may contain tool calls in multiple formats depending on
 // the provider. Parsing follows a priority chain:
 //   1. OpenAI-style JSON with `tool_calls` array (native API)
-//   2. XML tags: <tool_call>, <toolcall>, <tool-call>, <invoke>
+//   2. XML tags: <tool_call>, <toolcall>, <tool-call>, <tool_use>, <invoke>
 //   3. Markdown code blocks with `tool_call` language
 //   4. GLM-style line-based format (e.g. `shell/command>ls`)
 // SECURITY: We never fall back to extracting arbitrary JSON from the
@@ -711,7 +718,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     if calls.is_empty() {
         static MD_TOOL_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(
-                r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</invoke>)",
+                r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</tool_use>|</invoke>)",
             )
             .unwrap()
         });
@@ -1078,7 +1085,7 @@ pub(crate) async fn run_tool_call_loop(
     };
 
     let tool_specs: Vec<crate::tools::ToolSpec> =
-        tools_registry.iter().map(|tool| tool.spec()).collect();
+        tools_registry.iter().flat_map(|tool| tool.specs()).collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
     for _iteration in 0..max_iterations {
