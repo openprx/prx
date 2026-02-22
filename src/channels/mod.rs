@@ -1810,7 +1810,7 @@ fn load_openclaw_bootstrap_files(
 /// is replaced with the AIEOS identity data loaded from file or inline JSON.
 ///
 /// Daily memory files (`memory/*.md`) are NOT injected — they are accessed
-/// on-demand via `memory_recall` / `memory_search` tools.
+/// on-demand via `memory_recall` / `memory_search` / `memory_get` tools.
 pub fn build_system_prompt(
     workspace_dir: &std::path::Path,
     model_name: &str,
@@ -2628,6 +2628,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         (
             "memory_recall",
             "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
+        ),
+        (
+            "memory_search",
+            "Search MEMORY.md and memory/*.md for matching snippets with file path and line number. Use when: locating notes in markdown memory files.",
+        ),
+        (
+            "memory_get",
+            "Read a range of lines from MEMORY.md or memory/*.md. Use when: you already know the memory file/path and need exact content.",
         ),
         (
             "memory_forget",
