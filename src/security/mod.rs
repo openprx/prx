@@ -29,6 +29,7 @@ pub mod firejail;
 pub mod landlock;
 pub mod pairing;
 pub mod policy;
+pub mod policy_pipeline;
 pub mod secrets;
 pub mod traits;
 
@@ -39,6 +40,7 @@ pub use detect::create_sandbox;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
 pub use policy::{AutonomyLevel, SecurityPolicy};
+pub use policy_pipeline::{EvalContext, PolicyDecision, PolicyLayer, PolicyPipeline};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
 #[allow(unused_imports)]
