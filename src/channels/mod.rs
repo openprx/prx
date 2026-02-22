@@ -2675,6 +2675,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
          The sub-agent announces its result when complete. Use for long-running or parallel tasks \
          that should not block the main conversation.",
     ));
+    tool_descs.push((
+        "subagents",
+        "Manage sub-agent runs spawned by sessions_spawn. Actions: list active/recent runs, kill a running run, or steer a running run with a new instruction.",
+    ));
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -2955,8 +2959,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // This enables fire-and-forget sub-agent spawning with auto-announce on completion.
     // We keep a handle to the OnceLock so we can inject the full tools_registry
     // after it's wrapped in Arc (resolves the chicken-and-egg registration problem).
-    // Also extract the active_runs Arc so sessions_list, sessions_send, and
-    // session_status can share the same run registry without duplication.
+    // Also extract the active_runs Arc so sessions_list, sessions_send,
+    // subagents, and session_status can share the same run registry without duplication.
     let spawn_tools_handle = if let Some(first_channel) = channels.first().cloned() {
         let spawn_tool = tools::SessionsSpawnTool::new(
             first_channel,
@@ -2977,6 +2981,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
         // sessions_send: cross-session message injection (OpenClaw alignment)
         tools_list.push(Box::new(tools::SessionsSendTool::new(
+            active_runs.clone(),
+        )));
+        // subagents: OpenClaw-compatible subagent management interface
+        tools_list.push(Box::new(tools::SubagentsTool::new(
             active_runs.clone(),
         )));
         // sessions_history: conversation log viewer (OpenClaw alignment)
