@@ -2,16 +2,19 @@
 //!
 //! Provides a minimal interface for the agent to manage its own gateway:
 //!  - `config.get` — return the current gateway configuration
+//!  - `config.patch` — apply a JSON merge patch to config.toml
 //!  - `status`     — show uptime, model, provider, and channel info
 //!  - `restart`    — trigger a graceful daemon restart via SIGHUP
+//!  - `version`    — return ZeroClaw version info
+//!  - `components` — list active runtime components
 //!
 //! Designed to align with OpenClaw's `gateway` tool interface.
 
 use super::traits::{Tool, ToolResult};
-use crate::config::SharedConfig;
+use crate::config::{Config, SharedConfig};
+use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
-use std::sync::Arc;
 use std::time::Instant;
 
 pub struct GatewayTool {
@@ -22,6 +25,8 @@ pub struct GatewayTool {
     model: String,
     /// Active channel names (e.g. ["signal", "telegram"])
     channels: Vec<String>,
+    /// Number of registered runtime tools, if known
+    tools_count: usize,
     /// Process start time for uptime calculation
     started_at: Instant,
 }
@@ -38,8 +43,14 @@ impl GatewayTool {
             provider_name: provider_name.into(),
             model: model.into(),
             channels,
+            tools_count: 0,
             started_at: Instant::now(),
         }
+    }
+
+    pub fn with_tools_count(mut self, tools_count: usize) -> Self {
+        self.tools_count = tools_count;
+        self
     }
 
     fn format_uptime(elapsed_secs: u64) -> String {
@@ -55,6 +66,92 @@ impl GatewayTool {
             )
         }
     }
+
+    fn merge_json_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+        match patch {
+            serde_json::Value::Object(patch_map) => {
+                if !target.is_object() {
+                    *target = json!({});
+                }
+
+                let Some(target_map) = target.as_object_mut() else {
+                    return;
+                };
+
+                for (key, patch_value) in patch_map {
+                    if patch_value.is_null() {
+                        target_map.remove(key);
+                        continue;
+                    }
+
+                    let target_entry = target_map.entry(key.clone()).or_insert_with(|| json!(null));
+                    Self::merge_json_patch(target_entry, patch_value);
+                }
+            }
+            _ => {
+                *target = patch.clone();
+            }
+        }
+    }
+
+    fn active_providers(&self, cfg: &Config) -> Vec<String> {
+        let mut providers = Vec::new();
+        providers.push(self.provider_name.clone());
+
+        if let Some(default_provider) = cfg
+            .default_provider
+            .as_ref()
+            .map(|provider| provider.trim())
+            .filter(|provider| !provider.is_empty())
+            .map(ToOwned::to_owned)
+        {
+            let already_present = providers
+                .iter()
+                .any(|provider| provider.eq_ignore_ascii_case(&default_provider));
+            if !already_present {
+                providers.push(default_provider);
+            }
+        }
+
+        providers
+    }
+
+    async fn apply_config_patch(&self, patch: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let current = self.config.load_full();
+        let config_path = current.config_path.clone();
+        let raw = tokio::fs::read_to_string(&config_path)
+            .await
+            .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+
+        let raw_toml: toml::Value = toml::from_str(&raw).with_context(|| {
+            format!(
+                "Failed to parse config.toml before patch: {}",
+                config_path.display()
+            )
+        })?;
+        let mut raw_json = serde_json::to_value(raw_toml)
+            .context("Failed to convert config TOML into JSON value")?;
+
+        Self::merge_json_patch(&mut raw_json, patch);
+
+        let mut patched_config: Config =
+            serde_json::from_value(raw_json).context("Patched config is invalid for ZeroClaw")?;
+        patched_config.workspace_dir = current.workspace_dir.clone();
+        patched_config.config_path = current.config_path.clone();
+        patched_config.save().await?;
+
+        let output = json!({
+            "status": "patched",
+            "config_path": config_path.display().to_string(),
+            "reload": "watcher_will_reload_on_file_change"
+        });
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&output)?,
+            error: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -65,7 +162,9 @@ impl Tool for GatewayTool {
 
     fn description(&self) -> &str {
         "Manage the ZeroClaw gateway daemon. \
-         Actions: 'config.get' (read current config), 'status' (uptime/model/channels), \
+         Actions: 'config.get' (read current config), 'config.patch' (merge patch config), \
+         'status' (uptime/model/channels), 'version' (build version), \
+         'components' (active channels/providers/memory/tools), \
          'restart' (send SIGHUP for graceful restart)."
     }
 
@@ -76,8 +175,12 @@ impl Tool for GatewayTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["config.get", "status", "restart"],
+                    "enum": ["config.get", "config.patch", "status", "version", "components", "restart"],
                     "description": "Action to perform."
+                },
+                "patch": {
+                    "type": "object",
+                    "description": "JSON merge patch payload, required for action='config.patch'."
                 }
             },
             "required": ["action"]
@@ -122,6 +225,32 @@ impl Tool for GatewayTool {
                 })
             }
 
+            "config.patch" => {
+                let patch = match args.get("patch") {
+                    Some(value) if value.is_object() => value,
+                    Some(_) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "Invalid 'patch': expected an object for action 'config.patch'"
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                    None => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "Missing 'patch' parameter for action 'config.patch'".to_string(),
+                            ),
+                        });
+                    }
+                };
+                self.apply_config_patch(patch).await
+            }
+
             "status" => {
                 let uptime_secs = self.started_at.elapsed().as_secs();
                 let uptime_str = Self::format_uptime(uptime_secs);
@@ -155,6 +284,38 @@ impl Tool for GatewayTool {
                 Ok(ToolResult {
                     success: true,
                     output,
+                    error: None,
+                })
+            }
+
+            "version" => {
+                let output = json!({
+                    "name": env!("CARGO_PKG_NAME"),
+                    "version": env!("CARGO_PKG_VERSION"),
+                });
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&output)?,
+                    error: None,
+                })
+            }
+
+            "components" => {
+                let channels = self.channels.clone();
+                let providers = self.active_providers(&cfg);
+                let memory_backend = crate::memory::effective_memory_backend_name(
+                    &cfg.memory.backend,
+                    Some(&cfg.storage.provider.config),
+                );
+                let output = json!({
+                    "channels": channels,
+                    "providers": providers,
+                    "memory_backend": memory_backend,
+                    "tools_count": self.tools_count,
+                });
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&output)?,
                     error: None,
                 })
             }
@@ -195,7 +356,7 @@ impl Tool for GatewayTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action '{other}'. Use: config.get, status, restart."
+                    "Unknown action '{other}'. Use: config.get, config.patch, status, version, components, restart."
                 )),
             }),
         }
@@ -220,6 +381,7 @@ mod tests {
             "claude-sonnet-4-6",
             vec!["signal".to_string()],
         )
+        .with_tools_count(12)
     }
 
     #[test]
@@ -290,5 +452,60 @@ mod tests {
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("Missing 'action'"));
+    }
+
+    #[tokio::test]
+    async fn version_returns_package_version() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+        let result = tool.execute(json!({"action": "version"})).await.unwrap();
+        assert!(result.success);
+        let val: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(val["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn components_returns_expected_fields() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+        let result = tool.execute(json!({"action": "components"})).await.unwrap();
+        assert!(result.success);
+        let val: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert!(val["channels"].is_array());
+        assert!(val["providers"].is_array());
+        assert!(val["memory_backend"].is_string());
+        assert_eq!(val["tools_count"].as_u64(), Some(12));
+    }
+
+    #[tokio::test]
+    async fn config_patch_updates_config_file() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: config_path.clone(),
+            ..Config::default()
+        };
+        cfg.save().await.unwrap();
+        let shared = new_shared(cfg.clone());
+        let tool = GatewayTool::new(shared, "anthropic", "claude-sonnet-4-6", vec![]);
+
+        let result = tool
+            .execute(json!({
+                "action": "config.patch",
+                "patch": {
+                    "gateway": {
+                        "port": 3300
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+
+        let contents = tokio::fs::read_to_string(config_path).await.unwrap();
+        let parsed: Config = toml::from_str(&contents).unwrap();
+        assert_eq!(parsed.gateway.port, 3300);
     }
 }
