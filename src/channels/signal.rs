@@ -907,7 +907,7 @@ impl Channel for SignalChannel {
             }
 
             // Quote/reply support
-            if let (Some(ts), Some(author)) = (&message.reply_to_timestamp, &message.reply_to_author) {
+            if let (Some(ts), Some(author)) = (&message.quote_timestamp, &message.quote_author) {
                 params["quoteTimestamp"] = serde_json::json!(ts);
                 params["quoteAuthor"] = serde_json::json!(author);
             }
@@ -961,7 +961,7 @@ impl Channel for SignalChannel {
         }
 
         // Add quote/reply fields if reply context is present
-        if let (Some(ts), Some(author)) = (&message.reply_to_timestamp, &message.reply_to_author) {
+        if let (Some(ts), Some(author)) = (&message.quote_timestamp, &message.quote_author) {
             body["quote_timestamp"] = serde_json::json!(ts);
             body["quote_author"] = serde_json::json!(author);
         }
@@ -1179,8 +1179,8 @@ impl Channel for SignalChannel {
             .map_err(|_| anyhow::anyhow!("thread_id must be a numeric timestamp (ms)"))?;
 
         let mut msg = crate::channels::traits::SendMessage::new(message, channel_id);
-        msg.reply_to_timestamp = Some(ts);
-        msg.reply_to_author = Some(self.account.clone());
+        msg.quote_timestamp = Some(ts);
+        msg.quote_author = Some(self.account.clone());
         self.send(&msg).await
     }
 }

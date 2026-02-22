@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{new_shared, Config, HotReloadManager};
 use anyhow::Result;
 use chrono::Utc;
 use std::future::Future;
@@ -14,6 +14,13 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .reliability
         .channel_max_backoff_secs
         .max(initial_backoff);
+
+    // Activate hot-reload watcher so config.toml changes take effect without restart.
+    let _hot_reload = {
+        let config_path = config.config_path.clone();
+        let shared = new_shared(config.clone());
+        HotReloadManager::spawn(config_path, shared)
+    };
 
     crate::health::mark_component_ok("daemon");
 

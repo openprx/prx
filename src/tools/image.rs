@@ -265,9 +265,7 @@ mod tests {
         fn capabilities(&self) -> crate::providers::ProviderCapabilities {
             crate::providers::ProviderCapabilities {
                 vision: self.has_vision,
-                tool_calling: false,
-                streaming: false,
-                context_window: 4096,
+                native_tool_calling: false,
             }
         }
     }

@@ -2731,6 +2731,24 @@ fn default_signal_http_url() -> String {
     "http://localhost:8080".to_string()
 }
 
+impl Default for SignalConfig {
+    fn default() -> Self {
+        Self {
+            http_url: default_signal_http_url(),
+            account: String::new(),
+            mode: None,
+            cli_path: None,
+            data_dir: None,
+            daemon_http_port: None,
+            daemon_mode: None,
+            group_id: None,
+            allowed_from: Vec::new(),
+            ignore_attachments: false,
+            ignore_stories: false,
+        }
+    }
+}
+
 impl SignalConfig {
     /// Returns the effective HTTP URL for the signal-cli daemon.
     /// In native mode, uses the local daemon port (ignoring `http_url`).
@@ -4776,6 +4794,7 @@ allowed_users = ["@ops:matrix.org"]
             allowed_from: vec!["+1111111111".into()],
             ignore_attachments: true,
             ignore_stories: false,
+            ..Default::default()
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -4796,6 +4815,7 @@ allowed_users = ["@ops:matrix.org"]
             allowed_from: vec!["*".into()],
             ignore_attachments: false,
             ignore_stories: true,
+            ..Default::default()
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();

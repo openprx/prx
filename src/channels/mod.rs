@@ -3308,7 +3308,6 @@ mod tests {
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
