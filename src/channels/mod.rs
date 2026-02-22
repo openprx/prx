@@ -2944,6 +2944,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // This enables fire-and-forget sub-agent spawning with auto-announce on completion.
     // We keep a handle to the OnceLock so we can inject the full tools_registry
     // after it's wrapped in Arc (resolves the chicken-and-egg registration problem).
+    // Also extract the active_runs Arc so sessions_list, sessions_send, and
+    // session_status can share the same run registry without duplication.
     let spawn_tools_handle = if let Some(first_channel) = channels.first().cloned() {
         let spawn_tool = tools::SessionsSpawnTool::new(
             first_channel,
@@ -2956,6 +2958,34 @@ pub async fn start_channels(config: Config) -> Result<()> {
             config.multimodal.clone(),
         );
         let handle = spawn_tool.tools_handle();
+        let active_runs = spawn_tool.active_runs_arc();
+
+        // sessions_list: dedicated listing tool (OpenClaw alignment)
+        tools_list.push(Box::new(tools::SessionsListTool::new(
+            active_runs.clone(),
+        )));
+        // sessions_send: cross-session message injection (OpenClaw alignment)
+        tools_list.push(Box::new(tools::SessionsSendTool::new(
+            active_runs.clone(),
+        )));
+        // session_status: runtime status card (OpenClaw alignment)
+        let channel_names: Vec<String> = channels.iter().map(|c| c.name().to_string()).collect();
+        tools_list.push(Box::new(tools::SessionStatusTool::new(
+            active_runs,
+            &provider_name,
+            &model,
+            channel_names,
+        )));
+
+        // image: vision tool backed by the active provider (OpenClaw alignment)
+        tools_list.push(Box::new(tools::ImageTool::new(
+            Arc::clone(&provider),
+            &model,
+            temperature,
+            security.clone(),
+            config.multimodal.clone(),
+        )));
+
         tools_list.push(Box::new(spawn_tool));
         Some(handle)
     } else {

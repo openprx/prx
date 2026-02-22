@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod agents_list;
 pub mod browser;
 pub mod browser_open;
 pub mod composio;
@@ -34,6 +35,7 @@ pub mod hardware_board_info;
 pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
+pub mod image;
 pub mod image_info;
 pub mod mcp;
 pub mod memory_forget;
@@ -44,6 +46,9 @@ pub mod pushover;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod session_status;
+pub mod sessions_list;
+pub mod sessions_send;
 pub mod sessions_spawn;
 pub mod shell;
 pub mod traits;
@@ -51,6 +56,7 @@ pub mod tts;
 pub mod web_fetch;
 pub mod web_search_tool;
 
+pub use agents_list::AgentsListTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
@@ -69,6 +75,7 @@ pub use hardware_board_info::HardwareBoardInfoTool;
 pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
+pub use image::ImageTool;
 pub use image_info::ImageInfoTool;
 pub use mcp::McpTool;
 pub use memory_forget::MemoryForgetTool;
@@ -81,6 +88,9 @@ pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+pub use session_status::SessionStatusTool;
+pub use sessions_list::SessionsListTool;
+pub use sessions_send::SessionsSendTool;
 pub use sessions_spawn::SessionsSpawnTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
@@ -316,6 +326,16 @@ pub fn all_tools_with_runtime(
                 security.clone(),
             )));
         }
+    }
+
+    // Always register agents_list (shows what agents are available for delegation)
+    if !agents.is_empty() {
+        tool_arcs.push(Arc::new(AgentsListTool::new(
+            agents
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )));
     }
 
     // Add delegation tool when agents are configured

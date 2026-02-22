@@ -139,6 +139,12 @@ impl SessionsSpawnTool {
     pub async fn active_runs_snapshot(&self) -> Vec<SubAgentRun> {
         self.active_runs.read().await.clone()
     }
+
+    /// Return a shared Arc to the active runs registry.
+    /// Used by sessions_list, sessions_send, and session_status to share state.
+    pub fn active_runs_arc(&self) -> Arc<RwLock<Vec<SubAgentRun>>> {
+        self.active_runs.clone()
+    }
 }
 
 #[async_trait]
