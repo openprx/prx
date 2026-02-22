@@ -14,6 +14,61 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
+/// Auto-generate a voice file from text using edge-tts + ffmpeg.
+///
+/// Returns the path to an M4A (AAC) file that can be embedded as `[VOICE:/tmp/…m4a]`.
+/// The caller is responsible for cleaning up the file after sending.
+pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Result<String> {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let mp3_path = format!("/tmp/zeroclaw-tts-{id}.mp3");
+    let m4a_path = format!("/tmp/zeroclaw-tts-{id}.m4a");
+
+    // Sanitise text for embedding inside a JS single-quoted string.
+    let safe_text = text.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', " ").replace('\r', "");
+
+    // 1. Generate MP3 with node-edge-tts
+    let tts_script = format!(
+        r#"const{{EdgeTTS}}=require('node-edge-tts');new EdgeTTS().ttsPromise('{safe_text}','{mp3_path}',{{voice:'{voice}'}}).then(()=>console.log('ok')).catch(e=>{{console.error(String(e));process.exit(1)}})"#
+    );
+
+    // Resolve the global node_modules path so `require('node-edge-tts')` works.
+    let npm_root_out = tokio::process::Command::new("npm")
+        .args(["root", "-g"])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("npm not found: {e}"))?;
+    let node_modules = String::from_utf8_lossy(&npm_root_out.stdout).trim().to_string();
+
+    let tts_out = tokio::process::Command::new("node")
+        .args(["-e", &tts_script])
+        .env("NODE_PATH", &node_modules)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("node not found: {e}"))?;
+
+    if !tts_out.status.success() {
+        let stderr = String::from_utf8_lossy(&tts_out.stderr).to_string();
+        anyhow::bail!("edge-tts failed: {stderr}");
+    }
+
+    // 2. Convert MP3 → M4A (AAC) — Signal displays M4A as a playable voice note.
+    let ffmpeg_out = tokio::process::Command::new("ffmpeg")
+        .args(["-y", "-i", &mp3_path, "-c:a", "aac", "-b:a", "64k", &m4a_path])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("ffmpeg not found: {e}"))?;
+
+    if !ffmpeg_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ffmpeg_out.stderr).to_string();
+        anyhow::bail!("ffmpeg conversion failed: {stderr}");
+    }
+
+    // 3. Clean up the intermediate MP3.
+    let _ = tokio::fs::remove_file(&mp3_path).await;
+
+    Ok(m4a_path)
+}
+
 pub struct MessageSendTool {
     /// Generic channel for text/file/voice messages.
     channel: Arc<dyn Channel>,
@@ -166,7 +221,31 @@ impl Tool for MessageSendTool {
                     }
                 };
 
-                let content = args["message"].as_str().unwrap_or("").to_owned();
+                let raw_content = args["message"].as_str().unwrap_or("").to_owned();
+                let as_voice = args["as_voice"].as_bool().unwrap_or(false);
+
+                // Auto-TTS: when as_voice=true and the message is plain text (no [VOICE:] marker
+                // already embedded), generate a voice file automatically so the LLM only needs
+                // to set as_voice=true rather than orchestrating three separate steps.
+                let content = if as_voice
+                    && !raw_content.is_empty()
+                    && !raw_content.contains("[VOICE:")
+                    && !raw_content.contains("<media:audio")
+                {
+                    let voice = "zh-CN-YunxiNeural";
+                    match auto_generate_voice(&raw_content, voice).await {
+                        Ok(voice_path) => {
+                            tracing::info!("Auto-TTS: generated voice file at {voice_path}");
+                            format!("[VOICE:{voice_path}]")
+                        }
+                        Err(e) => {
+                            tracing::warn!("Auto-TTS failed ({e}), sending as plain text");
+                            raw_content
+                        }
+                    }
+                } else {
+                    raw_content
+                };
 
                 let mut msg = SendMessage::new(content, &recipient);
 

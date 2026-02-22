@@ -2920,13 +2920,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
             is_native,
             sig.data_dir.clone(),
         ));
-        tools_list.push(Box::new(tools::MessageSendTool::new_signal(
-            sig_chan,
+        let msg_send_tool = tools::MessageSendTool::new_signal(sig_chan.clone(), security.clone());
+        let dr_handle = msg_send_tool.default_recipient_handle();
+        tools_list.push(Box::new(msg_send_tool));
+        // Also register standalone tts tool sharing the same channel + recipient slot.
+        tools_list.push(Box::new(tools::TtsTool::new(
+            sig_chan as Arc<dyn Channel>,
+            dr_handle,
             security.clone(),
         )));
     } else if let Some(first_channel) = channels.first().cloned() {
-        tools_list.push(Box::new(tools::MessageSendTool::new(
+        let msg_send_tool = tools::MessageSendTool::new(first_channel.clone(), security.clone());
+        let dr_handle = msg_send_tool.default_recipient_handle();
+        tools_list.push(Box::new(msg_send_tool));
+        tools_list.push(Box::new(tools::TtsTool::new(
             first_channel,
+            dr_handle,
             security.clone(),
         )));
     }
