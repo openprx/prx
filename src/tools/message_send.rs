@@ -70,8 +70,11 @@ pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Resu
 }
 
 pub struct MessageSendTool {
-    /// Generic channel for text/file/voice messages.
-    channel: Arc<dyn Channel>,
+    /// Active channel — updated per-message via `set_active_channel` so that
+    /// replies are always routed back on the same channel the message arrived on
+    /// (e.g., wacli instead of signal for WhatsApp messages).
+    /// Uses a `RwLock` identical to `TtsTool` for the same reason.
+    active_channel: Arc<tokio::sync::RwLock<Arc<dyn Channel>>>,
     /// Optional Signal channel reference for reaction support.
     signal: Option<Arc<SignalChannel>>,
     /// Default recipient used when the LLM omits `target`.
@@ -84,7 +87,7 @@ impl MessageSendTool {
     /// Create a new `MessageSendTool` backed by a generic channel.
     pub fn new(channel: Arc<dyn Channel>, security: Arc<SecurityPolicy>) -> Self {
         Self {
-            channel,
+            active_channel: Arc::new(tokio::sync::RwLock::new(channel)),
             signal: None,
             default_recipient: Arc::new(tokio::sync::RwLock::new(None)),
             security,
@@ -94,7 +97,9 @@ impl MessageSendTool {
     /// Create a new `MessageSendTool` backed by a Signal channel (enables reactions).
     pub fn new_signal(channel: Arc<SignalChannel>, security: Arc<SecurityPolicy>) -> Self {
         Self {
-            channel: channel.clone() as Arc<dyn Channel>,
+            active_channel: Arc::new(tokio::sync::RwLock::new(
+                channel.clone() as Arc<dyn Channel>,
+            )),
             signal: Some(channel),
             default_recipient: Arc::new(tokio::sync::RwLock::new(None)),
             security,
@@ -189,6 +194,10 @@ impl Tool for MessageSendTool {
         *self.default_recipient.write().await = Some(recipient.to_string());
     }
 
+    async fn set_active_channel(&self, channel: Arc<dyn crate::channels::traits::Channel>) {
+        *self.active_channel.write().await = channel;
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // Security guard: autonomy check
         if !self.security.can_act() {
@@ -207,6 +216,10 @@ impl Tool for MessageSendTool {
         }
 
         let action = args["action"].as_str().unwrap_or("send");
+
+        // Resolve the active channel (updated per-message via set_active_channel so that
+        // replies are routed on the same channel the incoming message arrived on).
+        let channel = self.active_channel.read().await.clone();
 
         // Resolve recipient: explicit arg takes priority, then default_recipient
         let default = self.default_recipient.read().await.clone();
@@ -269,7 +282,7 @@ impl Tool for MessageSendTool {
                     msg.quote_author = Some(author.to_owned());
                 }
 
-                match self.channel.send(&msg).await {
+                match channel.send(&msg).await {
                     Ok(()) => {
                         // Delayed cleanup for auto-generated TTS files (Bug 1 fix):
                         // signal-cli may read the file asynchronously after the RPC response,
@@ -404,7 +417,7 @@ impl Tool for MessageSendTool {
                     }
                 };
                 let new_text = args["message"].as_str().unwrap_or("");
-                match self.channel.edit_message(&recipient, &message_id, new_text).await {
+                match channel.edit_message(&recipient, &message_id, new_text).await {
                     Ok(()) => Ok(ToolResult {
                         success: true,
                         output: format!("Message {message_id} edited."),
@@ -440,7 +453,7 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                match self.channel.delete_message(&recipient, &message_id).await {
+                match channel.delete_message(&recipient, &message_id).await {
                     Ok(()) => Ok(ToolResult {
                         success: true,
                         output: format!("Message {message_id} deleted."),
@@ -477,7 +490,7 @@ impl Tool for MessageSendTool {
                     }
                 };
                 let message = args["message"].as_str().unwrap_or("");
-                match self.channel.send_thread_reply(&recipient, &thread_id, message).await {
+                match channel.send_thread_reply(&recipient, &thread_id, message).await {
                     Ok(()) => Ok(ToolResult {
                         success: true,
                         output: format!("Thread reply sent to thread {thread_id}."),
@@ -731,5 +744,36 @@ mod tests {
         assert!(result.success, "Expected success, got: {:?}", result.error);
         let msgs = sent.lock().await;
         assert_eq!(msgs.len(), 1);
+    }
+
+    /// Regression test: verify that set_active_channel routes messages through the new channel
+    /// instead of the original channel. This covers the bug where WhatsApp messages were
+    /// routed through Signal because MessageSendTool used a fixed channel field.
+    #[tokio::test]
+    async fn set_active_channel_routes_to_new_channel() {
+        let (original_ch, original_sent) = DummyChannel::new();
+        let tool = MessageSendTool::new(original_ch, test_security(AutonomyLevel::Full));
+        tool.set_active_recipient("+15551234567").await;
+
+        // First send goes to original channel
+        let _ = tool
+            .execute(json!({ "action": "send", "message": "first" }))
+            .await
+            .unwrap();
+        assert_eq!(original_sent.lock().await.len(), 1, "first send should go to original channel");
+
+        // Simulate wacli message arriving: gateway switches active channel
+        let (new_ch, new_sent) = DummyChannel::new();
+        let new_ch_arc: Arc<dyn crate::channels::traits::Channel> = new_ch;
+        tool.set_active_channel(new_ch_arc).await;
+
+        // Second send should now go to the new channel, not the original
+        let result = tool
+            .execute(json!({ "action": "send", "message": "second" }))
+            .await
+            .unwrap();
+        assert!(result.success, "Expected success on second send: {:?}", result.error);
+        assert_eq!(original_sent.lock().await.len(), 1, "original channel should still have only 1 message");
+        assert_eq!(new_sent.lock().await.len(), 1, "new channel should have received the second message");
     }
 }
