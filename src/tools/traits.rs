@@ -1,6 +1,7 @@
 use anyhow::bail;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Result of a tool execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +47,13 @@ pub trait Tool: Send + Sync {
     /// Optional: set the active message recipient for tools that send messages.
     /// Called before each message processing turn.
     async fn set_active_recipient(&self, _recipient: &str) {
+        // default: no-op
+    }
+
+    /// Optional: set the active channel for tools that send messages.
+    /// Called before each message processing turn so tools route replies to the
+    /// correct channel (e.g., wacli instead of signal when a wacli message arrives).
+    async fn set_active_channel(&self, _channel: Arc<dyn crate::channels::traits::Channel>) {
         // default: no-op
     }
 
