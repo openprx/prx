@@ -31,6 +31,10 @@ pub(crate) struct ScopeContext<'a> {
     pub sender: &'a str,
     pub channel: &'a str,
     pub chat_type: &'a str,
+    /// Optional multi-layer tool policy pipeline (P3-1).
+    /// When set, tool calls are additionally evaluated against the pipeline
+    /// before execution. A denial from the pipeline blocks the tool call.
+    pub policy_pipeline: Option<&'a crate::security::PolicyPipeline>,
 }
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
@@ -1078,6 +1082,21 @@ async fn execute_tools_parallel(
                         call.name
                     ));
                 }
+                // Policy pipeline check (P3-1)
+                if let Some(pipeline) = ctx.policy_pipeline {
+                    let eval_ctx = crate::security::EvalContext {
+                        channel: ctx.channel.to_string(),
+                        chat_type: ctx.chat_type.to_string(),
+                        sender: ctx.sender.to_string(),
+                    };
+                    let decision = pipeline.evaluate(&call.name, &eval_ctx);
+                    if !decision.allowed {
+                        return CallKind::Blocked(format!(
+                            "Error: Tool '{}' blocked by policy pipeline: {}",
+                            call.name, decision.reason
+                        ));
+                    }
+                }
             }
             CallKind::Run(execute_one_tool(
                 &call.name,
@@ -1135,6 +1154,22 @@ async fn execute_tools_sequential(
                     call.name
                 ));
                 continue;
+            }
+            // Policy pipeline check (P3-1)
+            if let Some(pipeline) = ctx.policy_pipeline {
+                let eval_ctx = crate::security::EvalContext {
+                    channel: ctx.channel.to_string(),
+                    chat_type: ctx.chat_type.to_string(),
+                    sender: ctx.sender.to_string(),
+                };
+                let decision = pipeline.evaluate(&call.name, &eval_ctx);
+                if !decision.allowed {
+                    individual_results.push(format!(
+                        "Error: Tool '{}' blocked by policy pipeline: {}",
+                        call.name, decision.reason
+                    ));
+                    continue;
+                }
             }
         }
 
