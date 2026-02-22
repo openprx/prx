@@ -351,6 +351,17 @@ impl WacliChannel {
             .get("chatJid")
             .and_then(|v| v.as_str())
             .unwrap_or(sender);
+        let group_name = payload.get("groupName").and_then(|v| v.as_str());
+        let sender_name = payload
+            .get("pushName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let is_group = chat_jid.contains("@g.us");
+        let sender_display = if sender_name.is_empty() {
+            sender
+        } else {
+            sender_name
+        };
 
         let text = payload
             .get("text")
@@ -381,6 +392,17 @@ impl WacliChannel {
             tracing::debug!("wacli: empty message from {sender}, skipping");
             return;
         }
+
+        let prefix = if is_group {
+            if let Some(name) = group_name {
+                format!("[WhatsApp Group: {name}] {sender_display}: ")
+            } else {
+                format!("[WhatsApp Group] {sender_display}: ")
+            }
+        } else {
+            format!("{sender_display}: ")
+        };
+        let content = format!("{prefix}{content}");
 
         let msg_id = payload
             .get("id")
@@ -414,8 +436,10 @@ impl WacliChannel {
         };
 
         tracing::debug!(
-            "wacli: received message from {} in {}: {}",
+            "wacli: received message from sender_jid={} sender_name=\"{}\" group_name=\"{}\" in {}: {}",
             sender,
+            sender_name,
+            group_name.unwrap_or(""),
             chat_jid,
             &channel_msg.content.chars().take(80).collect::<String>()
         );
