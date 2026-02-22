@@ -1357,8 +1357,13 @@ async fn process_channel_message(
     println!("  ⏳ Processing message...");
 
     // Set active recipient on tools that support proactive messaging (message_send, sessions_spawn).
+    // Also update the active channel so tools like tts route replies back on the correct channel
+    // (e.g., wacli for WhatsApp messages, not always Signal).
     for tool in ctx.tools_registry.iter() {
         tool.set_active_recipient(&msg.reply_target).await;
+        if let Some(ref ch) = target_channel {
+            tool.set_active_channel(Arc::clone(ch)).await;
+        }
     }
 
     let started_at = Instant::now();

@@ -13,7 +13,10 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct TtsTool {
-    channel: Arc<dyn Channel>,
+    /// Active channel — updated per-message via `set_active_channel` so that
+    /// replies are always routed back on the same channel the message arrived on
+    /// (e.g., wacli instead of signal for WhatsApp messages).
+    active_channel: Arc<tokio::sync::RwLock<Arc<dyn Channel>>>,
     default_recipient: Arc<tokio::sync::RwLock<Option<String>>>,
     security: Arc<SecurityPolicy>,
 }
@@ -25,7 +28,7 @@ impl TtsTool {
         security: Arc<SecurityPolicy>,
     ) -> Self {
         Self {
-            channel,
+            active_channel: Arc::new(tokio::sync::RwLock::new(channel)),
             default_recipient,
             security,
         }
@@ -69,6 +72,10 @@ impl Tool for TtsTool {
 
     async fn set_active_recipient(&self, recipient: &str) {
         *self.default_recipient.write().await = Some(recipient.to_string());
+    }
+
+    async fn set_active_channel(&self, channel: Arc<dyn crate::channels::traits::Channel>) {
+        *self.active_channel.write().await = channel;
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -131,13 +138,17 @@ impl Tool for TtsTool {
             }
         };
 
-        tracing::info!("tts: generated {voice_path} for recipient {recipient}");
+        let channel = self.active_channel.read().await.clone();
+        tracing::info!(
+            "tts: generated {voice_path} for recipient {recipient} via channel={}",
+            channel.name()
+        );
 
         // Send via channel using [VOICE:] marker
         let content = format!("[VOICE:{voice_path}]");
         let msg = SendMessage::new(content, &recipient);
 
-        match self.channel.send(&msg).await {
+        match channel.send(&msg).await {
             Ok(()) => {
                 // Delay cleanup to ensure signal-cli has finished reading the file.
                 // signal-cli may process the attachment asynchronously after the RPC returns,
