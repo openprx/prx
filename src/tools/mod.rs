@@ -42,7 +42,9 @@ pub mod image;
 pub mod image_info;
 pub mod mcp;
 pub mod memory_forget;
+pub mod memory_get;
 pub mod memory_recall;
+pub mod memory_search;
 pub mod memory_store;
 pub mod nodes;
 pub mod proxy_config;
@@ -88,7 +90,9 @@ pub use image::ImageTool;
 pub use image_info::ImageInfoTool;
 pub use mcp::McpTool;
 pub use memory_forget::MemoryForgetTool;
+pub use memory_get::MemoryGetTool;
 pub use memory_recall::MemoryRecallTool;
+pub use memory_search::MemorySearchTool;
 pub use memory_store::MemoryStoreTool;
 pub use message_send::MessageSendTool;
 pub use nodes::NodesTool;
@@ -237,6 +241,8 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
+        Arc::new(MemorySearchTool::new(workspace_dir.to_path_buf())),
+        Arc::new(MemoryGetTool::new(workspace_dir.to_path_buf())),
         Arc::new(ScheduleTool::new(security.clone(), Arc::new(arc_swap::ArcSwap::from_pointee(root_config.clone())))),
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
         Arc::new(NodesTool::new(shared_config.clone(), security.clone())),
