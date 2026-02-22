@@ -18,6 +18,7 @@
 pub mod agents_list;
 pub mod browser;
 pub mod browser_open;
+pub mod canvas;
 pub mod composio;
 pub mod config_reload;
 pub mod cron;
@@ -63,6 +64,7 @@ pub mod web_search_tool;
 pub use agents_list::AgentsListTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
+pub use canvas::CanvasTool;
 pub use composio::ComposioTool;
 pub use config_reload::ConfigReloadTool;
 pub use cron::CronTool;
@@ -222,6 +224,7 @@ pub fn all_tools_with_runtime(
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
+        Arc::new(CanvasTool::new(security.clone())),
         Arc::new(CronTool::new(shared_config.clone(), security.clone())),
         Arc::new(CronAddTool::new(shared_config.clone(), security.clone())),
         Arc::new(CronListTool::new(shared_config.clone())),
