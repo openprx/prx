@@ -2504,6 +2504,9 @@ pub struct ChannelsConfig {
     pub signal: Option<SignalConfig>,
     /// WhatsApp channel configuration (Cloud API or Web mode).
     pub whatsapp: Option<WhatsAppConfig>,
+    /// wacli JSON-RPC daemon channel configuration.
+    #[serde(default)]
+    pub wacli: Option<WacliConfig>,
     /// Linq Partner API channel configuration.
     pub linq: Option<LinqConfig>,
     /// Nextcloud Talk bot channel configuration.
@@ -2544,6 +2547,7 @@ impl Default for ChannelsConfig {
             matrix: None,
             signal: None,
             whatsapp: None,
+            wacli: None,
             linq: None,
             nextcloud_talk: None,
             email: None,
@@ -2866,6 +2870,68 @@ impl WhatsAppConfig {
     /// Runtime currently prefers Cloud mode in this case for backward compatibility.
     pub fn is_ambiguous_config(&self) -> bool {
         self.phone_number_id.is_some() && self.session_path.is_some()
+    }
+}
+
+/// wacli JSON-RPC daemon channel configuration.
+///
+/// Connect ZeroClaw to WhatsApp via the `wacli` daemon (JSON-RPC over TCP).
+/// The daemon must be running before ZeroClaw starts.
+///
+/// Example TOML:
+/// ```toml
+/// [channels_config.wacli]
+/// enabled = true
+/// host = "127.0.0.1"
+/// port = 8686
+/// allowed_from = ["*"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WacliConfig {
+    /// Enable the wacli channel.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Host where the wacli daemon listens (default: "127.0.0.1").
+    #[serde(default = "default_wacli_host")]
+    pub host: String,
+    /// Port for the wacli daemon's JSON-RPC TCP listener (default: 8686).
+    #[serde(default = "default_wacli_port")]
+    pub port: u16,
+    /// Sender JID allowlist. Use `["*"]` to accept all senders.
+    /// JIDs look like `1234567890@s.whatsapp.net` for individuals or
+    /// `1234567890-1234567890@g.us` for groups.
+    #[serde(default = "default_wacli_allowed_from")]
+    pub allowed_from: Vec<String>,
+    /// Path to the `wacli` binary (for future auto-start support).
+    #[serde(default)]
+    pub cli_path: Option<String>,
+    /// Path to the wacli store directory (for future auto-start support).
+    #[serde(default)]
+    pub store_dir: Option<String>,
+}
+
+fn default_wacli_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_wacli_port() -> u16 {
+    8686
+}
+
+fn default_wacli_allowed_from() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+impl Default for WacliConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_wacli_host(),
+            port: default_wacli_port(),
+            allowed_from: default_wacli_allowed_from(),
+            cli_path: None,
+            store_dir: None,
+        }
     }
 }
 
@@ -4305,6 +4371,7 @@ default_temperature = 0.7
                 matrix: None,
                 signal: None,
                 whatsapp: None,
+                wacli: None,
                 linq: None,
                 nextcloud_talk: None,
                 email: None,
@@ -4857,6 +4924,7 @@ allowed_users = ["@ops:matrix.org"]
             }),
             signal: None,
             whatsapp: None,
+            wacli: None,
             linq: None,
             nextcloud_talk: None,
             email: None,
@@ -5067,6 +5135,7 @@ channel_id = "C123"
                 pair_code: None,
                 allowed_numbers: vec!["+1".into()],
             }),
+            wacli: None,
             linq: None,
             nextcloud_talk: None,
             email: None,
