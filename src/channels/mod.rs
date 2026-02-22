@@ -2968,10 +2968,21 @@ pub async fn start_channels(config: Config) -> Result<()> {
         tools_list.push(Box::new(tools::SessionsSendTool::new(
             active_runs.clone(),
         )));
+        // sessions_history: conversation log viewer (OpenClaw alignment)
+        tools_list.push(Box::new(tools::SessionsHistoryTool::new(
+            active_runs.clone(),
+        )));
         // session_status: runtime status card (OpenClaw alignment)
         let channel_names: Vec<String> = channels.iter().map(|c| c.name().to_string()).collect();
         tools_list.push(Box::new(tools::SessionStatusTool::new(
-            active_runs,
+            active_runs.clone(),
+            &provider_name,
+            &model,
+            channel_names.clone(),
+        )));
+        // gateway: daemon management (OpenClaw alignment)
+        tools_list.push(Box::new(tools::GatewayTool::new(
+            Arc::new(config.clone()),
             &provider_name,
             &model,
             channel_names,
