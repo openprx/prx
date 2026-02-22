@@ -238,6 +238,7 @@ impl Tool for MessageSendTool {
                 // Auto-TTS: when as_voice=true and the message is plain text (no [VOICE:] marker
                 // already embedded), generate a voice file automatically so the LLM only needs
                 // to set as_voice=true rather than orchestrating three separate steps.
+                let mut auto_tts_path: Option<String> = None;
                 let content = if as_voice
                     && !raw_content.is_empty()
                     && !raw_content.contains("[VOICE:")
@@ -247,6 +248,7 @@ impl Tool for MessageSendTool {
                     match auto_generate_voice(&raw_content, voice).await {
                         Ok(voice_path) => {
                             tracing::info!("Auto-TTS: generated voice file at {voice_path}");
+                            auto_tts_path = Some(voice_path.clone());
                             format!("[VOICE:{voice_path}]")
                         }
                         Err(e) => {
@@ -268,11 +270,26 @@ impl Tool for MessageSendTool {
                 }
 
                 match self.channel.send(&msg).await {
-                    Ok(()) => Ok(ToolResult {
-                        success: true,
-                        output: format!("Message sent to {recipient}"),
-                        error: None,
-                    }),
+                    Ok(()) => {
+                        // Delayed cleanup for auto-generated TTS files (Bug 1 fix):
+                        // signal-cli may read the file asynchronously after the RPC response,
+                        // so we wait 30 s before deleting to avoid "file not found" errors.
+                        if let Some(tts_path) = auto_tts_path {
+                            tokio::spawn(async move {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                                if let Err(e) = tokio::fs::remove_file(&tts_path).await {
+                                    tracing::debug!(
+                                        "auto-tts cleanup: could not remove {tts_path}: {e}"
+                                    );
+                                }
+                            });
+                        }
+                        Ok(ToolResult {
+                            success: true,
+                            output: format!("Message sent to {recipient}"),
+                            error: None,
+                        })
+                    }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),

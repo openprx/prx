@@ -190,4 +190,27 @@ impl Channel for SignalNativeChannel {
     fn supports_draft_updates(&self) -> bool {
         self.inner.supports_draft_updates()
     }
+
+    fn capabilities(&self) -> crate::channels::traits::ChannelCapabilities {
+        self.inner.capabilities()
+    }
+
+    /// Delete a sent message via the inner SignalChannel's remoteDelete implementation.
+    async fn delete_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        self.inner.delete_message(channel_id, message_id).await
+    }
+
+    /// Send a thread reply (degrades to quote reply in Signal) via the inner channel.
+    async fn send_thread_reply(
+        &self,
+        channel_id: &str,
+        thread_id: &str,
+        message: &str,
+    ) -> Result<()> {
+        self.inner.send_thread_reply(channel_id, thread_id, message).await
+    }
 }
