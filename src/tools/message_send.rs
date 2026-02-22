@@ -152,13 +152,13 @@ impl Tool for MessageSendTool {
                     "type": "boolean",
                     "description": "When true, the first [VOICE:] or [AUDIO:] attachment is sent as a voice note (default: false)."
                 },
-                "reply_to_timestamp": {
+                "quote_timestamp": {
                     "type": "integer",
                     "description": "Timestamp (ms) of the message to quote-reply to."
                 },
-                "reply_to_author": {
+                "quote_author": {
                     "type": "string",
-                    "description": "Author identifier of the message being replied to (required when reply_to_timestamp is set)."
+                    "description": "Author identifier of the message being replied to (required when quote_timestamp is set)."
                 },
                 "emoji": {
                     "type": "string",
@@ -260,11 +260,11 @@ impl Tool for MessageSendTool {
 
                 let mut msg = SendMessage::new(content, &recipient);
 
-                if let Some(ts) = args["reply_to_timestamp"].as_u64() {
-                    msg.reply_to_timestamp = Some(ts);
+                if let Some(ts) = args["quote_timestamp"].as_u64() {
+                    msg.quote_timestamp = Some(ts);
                 }
-                if let Some(author) = args["reply_to_author"].as_str() {
-                    msg.reply_to_author = Some(author.to_owned());
+                if let Some(author) = args["quote_author"].as_str() {
+                    msg.quote_author = Some(author.to_owned());
                 }
 
                 match self.channel.send(&msg).await {
@@ -647,7 +647,7 @@ mod tests {
         let tool = MessageSendTool::new(ch, test_security(AutonomyLevel::Full));
 
         let result = tool
-            .execute(json!({ "action": "delete" }))
+            .execute(json!({ "action": "destroy" }))
             .await
             .unwrap();
 

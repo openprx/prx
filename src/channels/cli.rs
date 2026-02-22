@@ -76,8 +76,8 @@ mod tests {
                 recipient: "user".into(),
                 subject: None,
                 thread_ts: None,
-                reply_to_timestamp: None,
-                reply_to_author: None,
+                quote_timestamp: None,
+                quote_author: None,
             })
             .await;
         assert!(result.is_ok());
@@ -92,8 +92,8 @@ mod tests {
                 recipient: String::new(),
                 subject: None,
                 thread_ts: None,
-                reply_to_timestamp: None,
-                reply_to_author: None,
+                quote_timestamp: None,
+                quote_author: None,
             })
             .await;
         assert!(result.is_ok());
