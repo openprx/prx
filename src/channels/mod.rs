@@ -2655,6 +2655,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "pushover",
         "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
     ));
+    tool_descs.push((
+        "nodes",
+        "Manage paired nodes from [nodes] config. Actions: list, status, notify, invoke. Current implementation is config-backed stub.",
+    ));
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",
