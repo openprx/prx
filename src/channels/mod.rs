@@ -32,6 +32,7 @@ pub mod signal_native;
 pub mod slack;
 pub mod telegram;
 pub mod traits;
+pub mod wacli;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
@@ -56,6 +57,7 @@ pub use signal_native::SignalNativeChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
+pub use wacli::WacliChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
@@ -2868,6 +2870,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
             lq.from_phone.clone(),
             lq.allowed_senders.clone(),
         )));
+    }
+
+    if let Some(ref wc) = config.channels_config.wacli {
+        if wc.enabled {
+            channels.push(Arc::new(WacliChannel::with_params(
+                wc.host.clone(),
+                wc.port,
+                wc.allowed_from.clone(),
+            )));
+        } else {
+            tracing::debug!("wacli channel configured but not enabled (set enabled = true to activate)");
+        }
     }
 
     if let Some(ref nc) = config.channels_config.nextcloud_talk {
