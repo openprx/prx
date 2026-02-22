@@ -212,22 +212,26 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    // Wrap Arc<Config> into a SharedConfig (ArcSwap) for tools that support hot-reload.
+    let shared_config: crate::config::SharedConfig =
+        Arc::new(arc_swap::ArcSwap::from(config.clone()));
+
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
-        Arc::new(CronTool::new(config.clone(), security.clone())),
-        Arc::new(CronAddTool::new(config.clone(), security.clone())),
-        Arc::new(CronListTool::new(config.clone())),
-        Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
-        Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
-        Arc::new(CronRunTool::new(config.clone(), security.clone())),
-        Arc::new(CronRunsTool::new(config.clone())),
+        Arc::new(CronTool::new(shared_config.clone(), security.clone())),
+        Arc::new(CronAddTool::new(shared_config.clone(), security.clone())),
+        Arc::new(CronListTool::new(shared_config.clone())),
+        Arc::new(CronRemoveTool::new(shared_config.clone(), security.clone())),
+        Arc::new(CronUpdateTool::new(shared_config.clone(), security.clone())),
+        Arc::new(CronRunTool::new(shared_config.clone(), security.clone())),
+        Arc::new(CronRunsTool::new(shared_config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
-        Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
-        Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
+        Arc::new(ScheduleTool::new(security.clone(), Arc::new(arc_swap::ArcSwap::from_pointee(root_config.clone())))),
+        Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),

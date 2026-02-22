@@ -185,6 +185,7 @@ pub async fn run_wizard() -> Result<Config> {
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
         media: crate::config::MediaConfig::default(),
+        security: crate::config::SecurityConfig::default(),
     };
 
     println!(
@@ -426,6 +427,7 @@ async fn run_quick_setup_with_home(
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
         media: crate::config::MediaConfig::default(),
+        security: crate::config::SecurityConfig::default(),
     };
 
     config.save().await?;

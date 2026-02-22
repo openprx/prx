@@ -1087,6 +1087,102 @@ impl Channel for SignalChannel {
         // auto-expire after ~15s on the client side.
         Ok(())
     }
+
+    // ── P3-2: Extended channel actions ──────────────────────────────────────
+
+    fn capabilities(&self) -> crate::channels::traits::ChannelCapabilities {
+        crate::channels::traits::ChannelCapabilities {
+            edit: false,    // signal-cli does not support editing sent messages
+            delete: true,   // supported via remoteDelete RPC
+            thread: false,  // Signal has no native thread concept; degrades to quote reply
+            react: true,    // supported via sendReaction RPC
+        }
+    }
+
+    /// Delete a sent message via Signal's `remoteDelete` RPC.
+    ///
+    /// `channel_id` is the recipient (E.164 phone, UUID, or `group:<id>`).
+    /// `message_id` is the *timestamp* (in ms) of the message to delete, as a decimal string.
+    async fn delete_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<()> {
+        let ts: u64 = message_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("message_id must be a numeric timestamp (ms)"))?;
+
+        // Native mode: JSON-RPC `remoteDelete`
+        if self.is_native {
+            let params = match Self::parse_recipient_target(channel_id) {
+                RecipientTarget::Direct(number) => serde_json::json!({
+                    "account": &self.account,
+                    "recipient": [number],
+                    "targetTimestamp": ts,
+                }),
+                RecipientTarget::Group(group_id) => serde_json::json!({
+                    "account": &self.account,
+                    "groupId": group_id,
+                    "targetTimestamp": ts,
+                }),
+            };
+            self.rpc_request("remoteDelete", params).await?;
+            return Ok(());
+        }
+
+        // REST mode: DELETE /v1/messages/{account}
+        let url = format!("{}/v1/messages/{}", self.http_url, self.account);
+        let body = match Self::parse_recipient_target(channel_id) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "recipient": number,
+                "timestamp": ts,
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "recipient": format!("{GROUP_TARGET_PREFIX}{group_id}"),
+                "timestamp": ts,
+            }),
+        };
+
+        let resp = self
+            .http_client()
+            .delete(&url)
+            .timeout(Duration::from_secs(10))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Signal remoteDelete failed [{status}]: {text}");
+        }
+        Ok(())
+    }
+
+    /// Send a reply within a "thread".
+    ///
+    /// Signal has no native thread concept. This implementation degrades gracefully
+    /// by sending a quote reply to the `thread_id` timestamp.
+    ///
+    /// `channel_id` is the recipient.
+    /// `thread_id` is the timestamp (ms) of the original message to quote-reply to.
+    /// `message` is the reply text.
+    async fn send_thread_reply(
+        &self,
+        channel_id: &str,
+        thread_id: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        let ts: u64 = thread_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("thread_id must be a numeric timestamp (ms)"))?;
+
+        let mut msg = crate::channels::traits::SendMessage::new(message, channel_id);
+        msg.reply_to_timestamp = Some(ts);
+        msg.reply_to_author = Some(self.account.clone());
+        self.send(&msg).await
+    }
 }
 
 #[cfg(test)]

@@ -216,6 +216,8 @@ struct ChannelRuntimeContext {
     multimodal: crate::config::MultimodalConfig,
     /// Security policy used for scope-based tool access control.
     security: Arc<crate::security::SecurityPolicy>,
+    /// Tool policy pipeline (P3-1): multi-layer allow/deny for tool calls.
+    tool_policy_pipeline: Arc<crate::security::PolicyPipeline>,
 }
 
 #[derive(Clone)]
@@ -1482,6 +1484,7 @@ async fn process_channel_message(
         sender: &msg.sender,
         channel: &msg.channel,
         chat_type,
+        policy_pipeline: Some(&ctx.tool_policy_pipeline),
     };
 
     let llm_result = tokio::select! {
@@ -2982,7 +2985,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
         // gateway: daemon management (OpenClaw alignment)
         tools_list.push(Box::new(tools::GatewayTool::new(
-            Arc::new(config.clone()),
+            Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())),
             &provider_name,
             &model,
             channel_names,
@@ -3106,6 +3109,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
         security: Arc::clone(&security),
+        tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::from_config(&config)),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3280,6 +3284,10 @@ mod tests {
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -3732,6 +3740,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -3791,6 +3800,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -3850,6 +3860,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -3918,6 +3929,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -4007,6 +4019,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -4078,6 +4091,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -4164,6 +4178,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -4235,6 +4250,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -4295,6 +4311,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -4466,6 +4483,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4546,6 +4564,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4638,6 +4657,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4712,6 +4732,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -5175,6 +5196,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -5260,6 +5282,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
@@ -5345,6 +5368,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
         });
 
         process_channel_message(
