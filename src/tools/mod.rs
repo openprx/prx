@@ -43,6 +43,7 @@ pub mod mcp;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod nodes;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schedule;
@@ -87,6 +88,7 @@ pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use message_send::MessageSendTool;
+pub use nodes::NodesTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
@@ -232,6 +234,7 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), Arc::new(arc_swap::ArcSwap::from_pointee(root_config.clone())))),
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
+        Arc::new(NodesTool::new(shared_config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
