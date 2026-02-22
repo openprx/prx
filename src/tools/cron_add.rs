@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::Config;
+use crate::config::SharedConfig;
 use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -7,12 +7,12 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct CronAddTool {
-    config: Arc<Config>,
+    config: SharedConfig,
     security: Arc<SecurityPolicy>,
 }
 
 impl CronAddTool {
-    pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
     }
 
@@ -125,7 +125,8 @@ impl Tool for CronAddTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        let cfg = self.config.load_full();
+        if !cfg.cron.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -234,7 +235,7 @@ impl Tool for CronAddTool {
                     return Ok(blocked);
                 }
 
-                cron::add_shell_job(&self.config, name, schedule, command)
+                cron::add_shell_job(&cfg, name, schedule, command)
             }
             JobType::Agent => {
                 // Resolve prompt: payload.message > payload.text > prompt field
@@ -305,7 +306,7 @@ impl Tool for CronAddTool {
                 }
 
                 cron::add_agent_job(
-                    &self.config,
+                    &cfg,
                     name,
                     schedule,
                     prompt,
@@ -342,11 +343,11 @@ impl Tool for CronAddTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{new_shared, Config};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
-    async fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> SharedConfig {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
@@ -355,7 +356,7 @@ mod tests {
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        Arc::new(config)
+        new_shared(config)
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
@@ -369,7 +370,8 @@ mod tests {
     async fn adds_shell_job() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let tool = CronAddTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool
             .execute(json!({
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
@@ -396,8 +398,9 @@ mod tests {
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        let cfg = Arc::new(config);
-        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let cfg = new_shared(config);
+        let cfg_snap = cfg.load_full();
+        let tool = CronAddTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool
             .execute(json!({
@@ -422,8 +425,9 @@ mod tests {
         };
         config.autonomy.level = AutonomyLevel::ReadOnly;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let cfg = new_shared(config);
+        let cfg_snap = cfg.load_full();
+        let tool = CronAddTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool
             .execute(json!({
@@ -450,8 +454,9 @@ mod tests {
         config.autonomy.allowed_commands = vec!["touch".into()];
         config.autonomy.level = AutonomyLevel::Supervised;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let cfg = new_shared(config);
+        let cfg_snap = cfg.load_full();
+        let tool = CronAddTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let denied = tool
             .execute(json!({
@@ -483,7 +488,8 @@ mod tests {
     async fn rejects_invalid_schedule() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let tool = CronAddTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool
             .execute(json!({
@@ -505,7 +511,8 @@ mod tests {
     async fn agent_job_requires_prompt() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let tool = CronAddTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool
             .execute(json!({

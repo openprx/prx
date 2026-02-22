@@ -273,6 +273,8 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Mutex<Config>>,
+    /// ArcSwap-backed config for hot-reload tools (P1.5 / P3-1).
+    pub shared_config: crate::config::SharedConfig,
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub temperature: f64,
@@ -460,9 +462,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
-    // Register config_reload tool backed by the shared config state.
+    // Register config_reload tool backed by an ArcSwap-wrapped config snapshot.
+    // The gateway still uses `config_state` (Mutex) for internal mutable state;
+    // this separate SharedConfig is solely for the hot-reload tool.
+    let shared_config_for_reload = Arc::new(arc_swap::ArcSwap::from_pointee(config.clone()));
     tools_list.push(Box::new(tools::ConfigReloadTool::new(Arc::clone(
-        &config_state,
+        &shared_config_for_reload,
     ))));
 
     let tools_registry = Arc::new(tools_list);
@@ -634,6 +639,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     let state = AppState {
         config: config_state,
+        shared_config: Arc::clone(&shared_config_for_reload),
         provider,
         model,
         temperature,
@@ -700,7 +706,7 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 
 /// POST /config/reload — hot-reload configuration from config.toml.
 async fn handle_config_reload(State(state): State<AppState>) -> impl IntoResponse {
-    let tool = tools::ConfigReloadTool::new(Arc::clone(&state.config));
+    let tool = tools::ConfigReloadTool::new(Arc::clone(&state.shared_config));
     match tool.execute(serde_json::json!({})).await {
         Ok(result) if result.success => (
             StatusCode::OK,
@@ -1544,6 +1550,7 @@ mod tests {
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -1592,6 +1599,7 @@ mod tests {
         let observer: Arc<dyn crate::observability::Observer> = prom;
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -1957,6 +1965,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2020,6 +2029,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2095,6 +2105,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2142,6 +2153,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2194,6 +2206,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2251,6 +2264,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2304,6 +2318,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,

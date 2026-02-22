@@ -16,7 +16,7 @@
 //!  - status — show cron subsystem status
 
 use super::traits::{Tool, ToolResult};
-use crate::config::Config;
+use crate::config::{Config, SharedConfig};
 use crate::cron::{self, CronJobPatch, JobType, Schedule};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -28,17 +28,17 @@ use std::sync::Arc;
 const MAX_RUN_OUTPUT_CHARS: usize = 500;
 
 pub struct CronTool {
-    config: Arc<Config>,
+    config: SharedConfig,
     security: Arc<SecurityPolicy>,
 }
 
 impl CronTool {
-    pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
     }
 
-    fn check_enabled(&self) -> Option<ToolResult> {
-        if !self.config.cron.enabled {
+    fn check_enabled(&self, cfg: &Config) -> Option<ToolResult> {
+        if !cfg.cron.enabled {
             Some(ToolResult {
                 success: false,
                 output: String::new(),
@@ -49,8 +49,8 @@ impl CronTool {
         }
     }
 
-    fn enforce_mutation(&self, action: &str) -> Option<ToolResult> {
-        if let Some(r) = self.check_enabled() {
+    fn enforce_mutation(&self, action: &str, cfg: &Config) -> Option<ToolResult> {
+        if let Some(r) = self.check_enabled(cfg) {
             return Some(r);
         }
         if !self.security.can_act() {
@@ -170,6 +170,7 @@ impl Tool for CronTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let cfg = self.config.load_full();
         let action = match args.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
             None => {
@@ -184,10 +185,10 @@ impl Tool for CronTool {
         match action {
             // ── Read-only ──────────────────────────────────────────────────────────
             "list" => {
-                if let Some(r) = self.check_enabled() {
+                if let Some(r) = self.check_enabled(&cfg) {
                     return Ok(r);
                 }
-                match cron::list_jobs(&self.config) {
+                match cron::list_jobs(&cfg) {
                     Ok(jobs) => {
                         if jobs.is_empty() {
                             return Ok(ToolResult {
@@ -240,7 +241,7 @@ impl Tool for CronTool {
             }
 
             "get" => {
-                if let Some(r) = self.check_enabled() {
+                if let Some(r) = self.check_enabled(&cfg) {
                     return Ok(r);
                 }
                 let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
@@ -253,7 +254,7 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                match cron::get_job(&self.config, job_id) {
+                match cron::get_job(&cfg, job_id) {
                     Ok(job) => {
                         let detail = json!({
                             "id": job.id,
@@ -280,10 +281,10 @@ impl Tool for CronTool {
             }
 
             "status" => {
-                if let Some(r) = self.check_enabled() {
+                if let Some(r) = self.check_enabled(&cfg) {
                     return Ok(r);
                 }
-                let jobs = cron::list_jobs(&self.config).unwrap_or_default();
+                let jobs = cron::list_jobs(&cfg).unwrap_or_default();
                 let enabled_count = jobs.iter().filter(|j| j.enabled).count();
                 let disabled_count = jobs.len() - enabled_count;
                 Ok(ToolResult {
@@ -302,7 +303,7 @@ impl Tool for CronTool {
             }
 
             "runs" | "history" => {
-                if let Some(r) = self.check_enabled() {
+                if let Some(r) = self.check_enabled(&cfg) {
                     return Ok(r);
                 }
                 let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
@@ -320,7 +321,7 @@ impl Tool for CronTool {
                     .and_then(|v| v.as_u64())
                     .map_or(10, |v| usize::try_from(v).unwrap_or(10));
 
-                match cron::list_runs(&self.config, job_id, limit) {
+                match cron::list_runs(&cfg, job_id, limit) {
                     Ok(runs) => {
                         let views: Vec<RunView> = runs
                             .into_iter()
@@ -352,7 +353,7 @@ impl Tool for CronTool {
 
             // ── Mutating ───────────────────────────────────────────────────────────
             "add" | "schedule" => {
-                if let Some(r) = self.enforce_mutation(action) {
+                if let Some(r) = self.enforce_mutation(action, &cfg) {
                     return Ok(r);
                 }
                 let expression = match args.get("expression").and_then(|v| v.as_str()) {
@@ -386,7 +387,7 @@ impl Tool for CronTool {
                         error: Some(reason),
                     });
                 }
-                match cron::add_job(&self.config, expression, command) {
+                match cron::add_job(&cfg, expression, command) {
                     Ok(job) => Ok(ToolResult {
                         success: true,
                         output: format!(
@@ -407,7 +408,7 @@ impl Tool for CronTool {
             }
 
             "once" => {
-                if let Some(r) = self.enforce_mutation(action) {
+                if let Some(r) = self.enforce_mutation(action, &cfg) {
                     return Ok(r);
                 }
                 let command = match args.get("command").and_then(|v| v.as_str()) {
@@ -436,7 +437,7 @@ impl Tool for CronTool {
                 let run_at = args.get("run_at").and_then(|v| v.as_str());
 
                 match (delay, run_at) {
-                    (Some(d), None) => match cron::add_once(&self.config, d, command) {
+                    (Some(d), None) => match cron::add_once(&cfg, d, command) {
                         Ok(job) => Ok(ToolResult {
                             success: true,
                             output: format!(
@@ -467,7 +468,7 @@ impl Tool for CronTool {
                                     });
                                 }
                             };
-                        match cron::add_once_at(&self.config, run_at_parsed, command) {
+                        match cron::add_once_at(&cfg, run_at_parsed, command) {
                             Ok(job) => Ok(ToolResult {
                                 success: true,
                                 output: format!(
@@ -496,7 +497,7 @@ impl Tool for CronTool {
             }
 
             "remove" | "cancel" => {
-                if let Some(r) = self.enforce_mutation(action) {
+                if let Some(r) = self.enforce_mutation(action, &cfg) {
                     return Ok(r);
                 }
                 let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
@@ -509,7 +510,7 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                match cron::remove_job(&self.config, job_id) {
+                match cron::remove_job(&cfg, job_id) {
                     Ok(()) => Ok(ToolResult {
                         success: true,
                         output: format!("Removed cron job {job_id}"),
@@ -524,7 +525,7 @@ impl Tool for CronTool {
             }
 
             "update" | "patch" => {
-                if let Some(r) = self.enforce_mutation(action) {
+                if let Some(r) = self.enforce_mutation(action, &cfg) {
                     return Ok(r);
                 }
                 let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
@@ -572,7 +573,7 @@ impl Tool for CronTool {
                         });
                     }
                 }
-                match cron::update_job(&self.config, job_id, patch) {
+                match cron::update_job(&cfg, job_id, patch) {
                     Ok(job) => Ok(ToolResult {
                         success: true,
                         output: serde_json::to_string_pretty(&job)?,
@@ -588,7 +589,7 @@ impl Tool for CronTool {
 
             "run" => {
                 // Inline force-run logic (same as CronRunTool)
-                if let Some(r) = self.check_enabled() {
+                if let Some(r) = self.check_enabled(&cfg) {
                     return Ok(r);
                 }
                 let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
@@ -623,7 +624,7 @@ impl Tool for CronTool {
                         ),
                     });
                 }
-                let job = match cron::get_job(&self.config, job_id) {
+                let job = match cron::get_job(&cfg, job_id) {
                     Ok(j) => j,
                     Err(e) => {
                         return Ok(ToolResult {
@@ -653,12 +654,12 @@ impl Tool for CronTool {
                 }
                 let started_at = Utc::now();
                 let (success, output) =
-                    cron::scheduler::execute_job_now(&self.config, &job).await;
+                    cron::scheduler::execute_job_now(&cfg, &job).await;
                 let finished_at = Utc::now();
                 let duration_ms = (finished_at - started_at).num_milliseconds();
                 let status = if success { "ok" } else { "error" };
                 let _ = cron::record_run(
-                    &self.config,
+                    &cfg,
                     &job.id,
                     started_at,
                     finished_at,
@@ -667,7 +668,7 @@ impl Tool for CronTool {
                     duration_ms,
                 );
                 let _ = cron::record_last_run(
-                    &self.config,
+                    &cfg,
                     &job.id,
                     finished_at,
                     success,
@@ -690,7 +691,7 @@ impl Tool for CronTool {
             }
 
             "pause" => {
-                if let Some(r) = self.enforce_mutation(action) {
+                if let Some(r) = self.enforce_mutation(action, &cfg) {
                     return Ok(r);
                 }
                 let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
@@ -703,7 +704,7 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                match cron::pause_job(&self.config, job_id) {
+                match cron::pause_job(&cfg, job_id) {
                     Ok(_) => Ok(ToolResult {
                         success: true,
                         output: format!("Paused job {job_id}"),
@@ -718,7 +719,7 @@ impl Tool for CronTool {
             }
 
             "resume" => {
-                if let Some(r) = self.enforce_mutation(action) {
+                if let Some(r) = self.enforce_mutation(action, &cfg) {
                     return Ok(r);
                 }
                 let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
@@ -731,7 +732,7 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                match cron::resume_job(&self.config, job_id) {
+                match cron::resume_job(&cfg, job_id) {
                     Ok(_) => Ok(ToolResult {
                         success: true,
                         output: format!("Resumed job {job_id}"),
@@ -759,11 +760,11 @@ impl Tool for CronTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{new_shared, Config, SharedConfig};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
-    async fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> SharedConfig {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
@@ -772,7 +773,7 @@ mod tests {
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        Arc::new(config)
+        new_shared(config)
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
@@ -786,7 +787,8 @@ mod tests {
     async fn list_empty() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No scheduled cron jobs"));
@@ -796,7 +798,8 @@ mod tests {
     async fn add_and_list_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let add = tool
             .execute(json!({"action": "add", "expression": "*/5 * * * *", "command": "echo hi"}))
@@ -813,8 +816,9 @@ mod tests {
     async fn status_reports_job_counts() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        cron::add_job(&cfg, "*/5 * * * *", "echo status-test").unwrap();
-        let tool = CronTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        cron::add_job(&cfg_snap, "*/5 * * * *", "echo status-test").unwrap();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool.execute(json!({"action": "status"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("1 total"));
@@ -824,8 +828,9 @@ mod tests {
     async fn get_job_details() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo get-test").unwrap();
-        let tool = CronTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo get-test").unwrap();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool
             .execute(json!({"action": "get", "job_id": job.id}))
             .await
@@ -838,22 +843,24 @@ mod tests {
     async fn remove_job() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo remove-test").unwrap();
-        let tool = CronTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo remove-test").unwrap();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool
             .execute(json!({"action": "remove", "job_id": job.id}))
             .await
             .unwrap();
         assert!(result.success);
-        assert!(cron::list_jobs(&cfg).unwrap().is_empty());
+        assert!(cron::list_jobs(&cfg_snap).unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn update_job_enabled() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo upd-test").unwrap();
-        let tool = CronTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo upd-test").unwrap();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool
             .execute(json!({"action": "update", "job_id": job.id, "patch": {"enabled": false}}))
             .await
@@ -872,8 +879,9 @@ mod tests {
         };
         config.cron.enabled = false;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let tool = CronTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = Arc::new(config.clone());
+        let cfg = new_shared(config);
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("cron is disabled"));
@@ -889,8 +897,9 @@ mod tests {
         };
         config.autonomy.level = AutonomyLevel::ReadOnly;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let tool = CronTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = Arc::new(config.clone());
+        let cfg = new_shared(config);
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool
             .execute(json!({"action": "add", "expression": "*/5 * * * *", "command": "echo x"}))
             .await
@@ -903,7 +912,8 @@ mod tests {
     async fn unknown_action_returns_error() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool
             .execute(json!({"action": "explode"}))
             .await

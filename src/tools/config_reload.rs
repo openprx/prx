@@ -14,23 +14,22 @@
 //!   - `autonomy` / security policy
 
 use super::traits::{Tool, ToolResult};
-use crate::config::Config;
+use crate::config::{Config, SharedConfig};
 use async_trait::async_trait;
-use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::Arc;
 
 /// Tool that hot-reloads the configuration from `config.toml` at runtime.
 ///
-/// Accepts a shared `Arc<Mutex<Config>>` (same as `AppState.config`) and updates
-/// hot-reloadable fields in-place without requiring a daemon restart.
+/// Accepts a [`SharedConfig`] (ArcSwap-backed) and atomically stores the new
+/// config after validation — no Mutex required.
 pub struct ConfigReloadTool {
-    config: Arc<Mutex<Config>>,
+    config: SharedConfig,
 }
 
 impl ConfigReloadTool {
     /// Create a new `ConfigReloadTool` backed by the shared config state.
-    pub fn new(config: Arc<Mutex<Config>>) -> Self {
+    pub fn new(config: SharedConfig) -> Self {
         Self { config }
     }
 }
@@ -58,11 +57,8 @@ impl Tool for ConfigReloadTool {
     }
 
     async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // 1. Read the config path (brief synchronous lock — not held across await)
-        let config_path = {
-            let guard = self.config.lock();
-            guard.config_path.clone()
-        };
+        // 1. Read the config path from the current config (lock-free)
+        let config_path = self.config.load_full().config_path.clone();
 
         if config_path.as_os_str().is_empty() {
             return Ok(ToolResult {
@@ -98,104 +94,99 @@ impl Tool for ConfigReloadTool {
             }
         };
 
-        // 3. Update hot-reloadable fields (brief synchronous lock — not held across await)
+        // 3. Diff hot-reloadable fields and atomically store new config
         let mut changes: Vec<String> = Vec::new();
         {
-            let mut g = self.config.lock();
+            let old = self.config.load_full();
 
             // Temperature
-            if (g.default_temperature - fresh.default_temperature).abs() > 1e-9 {
+            if (old.default_temperature - fresh.default_temperature).abs() > 1e-9 {
                 changes.push(format!(
                     "temperature: {:.2} → {:.2}",
-                    g.default_temperature, fresh.default_temperature
+                    old.default_temperature, fresh.default_temperature
                 ));
-                g.default_temperature = fresh.default_temperature;
             }
 
             // Agent: max_tool_iterations
-            if g.agent.max_tool_iterations != fresh.agent.max_tool_iterations {
+            if old.agent.max_tool_iterations != fresh.agent.max_tool_iterations {
                 changes.push(format!(
                     "agent.max_tool_iterations: {} → {}",
-                    g.agent.max_tool_iterations, fresh.agent.max_tool_iterations
+                    old.agent.max_tool_iterations, fresh.agent.max_tool_iterations
                 ));
-                g.agent.max_tool_iterations = fresh.agent.max_tool_iterations;
             }
 
             // Agent: max_history_messages
-            if g.agent.max_history_messages != fresh.agent.max_history_messages {
+            if old.agent.max_history_messages != fresh.agent.max_history_messages {
                 changes.push(format!(
                     "agent.max_history_messages: {} → {}",
-                    g.agent.max_history_messages, fresh.agent.max_history_messages
+                    old.agent.max_history_messages, fresh.agent.max_history_messages
                 ));
-                g.agent.max_history_messages = fresh.agent.max_history_messages;
             }
 
             // Agent: parallel_tools
-            if g.agent.parallel_tools != fresh.agent.parallel_tools {
+            if old.agent.parallel_tools != fresh.agent.parallel_tools {
                 changes.push(format!(
                     "agent.parallel_tools: {} → {}",
-                    g.agent.parallel_tools, fresh.agent.parallel_tools
+                    old.agent.parallel_tools, fresh.agent.parallel_tools
                 ));
-                g.agent.parallel_tools = fresh.agent.parallel_tools;
             }
 
             // Agent: compact_context
-            if g.agent.compact_context != fresh.agent.compact_context {
+            if old.agent.compact_context != fresh.agent.compact_context {
                 changes.push(format!(
                     "agent.compact_context: {} → {}",
-                    g.agent.compact_context, fresh.agent.compact_context
+                    old.agent.compact_context, fresh.agent.compact_context
                 ));
-                g.agent.compact_context = fresh.agent.compact_context;
             }
 
             // Heartbeat
-            if g.heartbeat.enabled != fresh.heartbeat.enabled {
+            if old.heartbeat.enabled != fresh.heartbeat.enabled {
                 changes.push(format!(
                     "heartbeat.enabled: {} → {}",
-                    g.heartbeat.enabled, fresh.heartbeat.enabled
+                    old.heartbeat.enabled, fresh.heartbeat.enabled
                 ));
-                g.heartbeat.enabled = fresh.heartbeat.enabled;
             }
-            if g.heartbeat.interval_minutes != fresh.heartbeat.interval_minutes {
+            if old.heartbeat.interval_minutes != fresh.heartbeat.interval_minutes {
                 changes.push(format!(
                     "heartbeat.interval_minutes: {} → {}",
-                    g.heartbeat.interval_minutes, fresh.heartbeat.interval_minutes
+                    old.heartbeat.interval_minutes, fresh.heartbeat.interval_minutes
                 ));
-                g.heartbeat.interval_minutes = fresh.heartbeat.interval_minutes;
             }
 
             // Cron
-            if g.cron.enabled != fresh.cron.enabled {
+            if old.cron.enabled != fresh.cron.enabled {
                 changes.push(format!(
                     "cron.enabled: {} → {}",
-                    g.cron.enabled, fresh.cron.enabled
+                    old.cron.enabled, fresh.cron.enabled
                 ));
-                g.cron.enabled = fresh.cron.enabled;
             }
-            if g.cron.max_run_history != fresh.cron.max_run_history {
+            if old.cron.max_run_history != fresh.cron.max_run_history {
                 changes.push(format!(
                     "cron.max_run_history: {} → {}",
-                    g.cron.max_run_history, fresh.cron.max_run_history
+                    old.cron.max_run_history, fresh.cron.max_run_history
                 ));
-                g.cron.max_run_history = fresh.cron.max_run_history;
             }
 
             // Web search
-            if g.web_search.enabled != fresh.web_search.enabled {
+            if old.web_search.enabled != fresh.web_search.enabled {
                 changes.push(format!(
                     "web_search.enabled: {} → {}",
-                    g.web_search.enabled, fresh.web_search.enabled
+                    old.web_search.enabled, fresh.web_search.enabled
                 ));
-                g.web_search.enabled = fresh.web_search.enabled;
             }
-            if g.web_search.max_results != fresh.web_search.max_results {
+            if old.web_search.max_results != fresh.web_search.max_results {
                 changes.push(format!(
                     "web_search.max_results: {} → {}",
-                    g.web_search.max_results, fresh.web_search.max_results
+                    old.web_search.max_results, fresh.web_search.max_results
                 ));
-                g.web_search.max_results = fresh.web_search.max_results;
             }
-        } // lock released here — never held across .await
+
+            // Atomically publish — preserve runtime paths
+            let mut updated = fresh;
+            updated.config_path = old.config_path.clone();
+            updated.workspace_dir = old.workspace_dir.clone();
+            self.config.store(Arc::new(updated));
+        }
 
         let output = if changes.is_empty() {
             format!(
@@ -231,12 +222,10 @@ impl Tool for ConfigReloadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use parking_lot::Mutex;
-    use std::sync::Arc;
+    use crate::config::{new_shared, Config};
 
     fn make_tool_with_config(cfg: Config) -> ConfigReloadTool {
-        ConfigReloadTool::new(Arc::new(Mutex::new(cfg)))
+        ConfigReloadTool::new(new_shared(cfg))
     }
 
     #[test]
@@ -256,8 +245,6 @@ mod tests {
 
     #[tokio::test]
     async fn missing_config_path_returns_error() {
-        // Config::default() sets config_path to ~/.zeroclaw/config.toml, so we
-        // must explicitly clear it to test the "not set" error path.
         let cfg = Config {
             config_path: std::path::PathBuf::new(),
             ..Config::default()
@@ -288,7 +275,7 @@ mod tests {
         cfg.config_path = tmp.path().to_path_buf();
         cfg.default_temperature = 0.7;
 
-        let shared = Arc::new(Mutex::new(cfg));
+        let shared = new_shared(cfg);
         let tool = ConfigReloadTool::new(Arc::clone(&shared));
 
         let result = tool.execute(serde_json::json!({})).await.unwrap();
@@ -299,7 +286,7 @@ mod tests {
             result.output
         );
 
-        let updated = shared.lock();
+        let updated = shared.load_full();
         assert!(
             (updated.default_temperature - 0.3).abs() < 1e-9,
             "Temperature should be 0.3, got {}",

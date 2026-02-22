@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::Config;
+use crate::config::{Config, SharedConfig};
 use crate::cron;
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -11,11 +11,11 @@ use std::sync::Arc;
 /// Tool that lets the agent manage recurring and one-shot scheduled tasks.
 pub struct ScheduleTool {
     security: Arc<SecurityPolicy>,
-    config: Config,
+    config: SharedConfig,
 }
 
 impl ScheduleTool {
-    pub fn new(security: Arc<SecurityPolicy>, config: Config) -> Self {
+    pub fn new(security: Arc<SecurityPolicy>, config: SharedConfig) -> Self {
         Self { security, config }
     }
 }
@@ -137,7 +137,7 @@ impl Tool for ScheduleTool {
 
 impl ScheduleTool {
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
-        if !self.config.cron.enabled {
+        if !self.config.load_full().cron.enabled {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
@@ -169,7 +169,7 @@ impl ScheduleTool {
     }
 
     fn handle_list(&self) -> Result<ToolResult> {
-        let jobs = cron::list_jobs(&self.config)?;
+        let jobs = cron::list_jobs(&self.config.load_full())?;
         if jobs.is_empty() {
             return Ok(ToolResult {
                 success: true,
@@ -212,7 +212,7 @@ impl ScheduleTool {
     }
 
     fn handle_get(&self, id: &str) -> Result<ToolResult> {
-        match cron::get_job(&self.config, id) {
+        match cron::get_job(&self.config.load_full(), id) {
             Ok(job) => {
                 let detail = json!({
                     "id": job.id,
@@ -307,7 +307,7 @@ impl ScheduleTool {
         }
 
         if let Some(value) = expression {
-            let job = cron::add_job(&self.config, value, command)?;
+            let job = cron::add_job(&self.config.load_full(), value, command)?;
             return Ok(ToolResult {
                 success: true,
                 output: format!(
@@ -322,7 +322,7 @@ impl ScheduleTool {
         }
 
         if let Some(value) = delay {
-            let job = cron::add_once(&self.config, value, command)?;
+            let job = cron::add_once(&self.config.load_full(), value, command)?;
             return Ok(ToolResult {
                 success: true,
                 output: format!(
@@ -340,7 +340,7 @@ impl ScheduleTool {
             .map_err(|error| anyhow::anyhow!("Invalid run_at timestamp: {error}"))?
             .with_timezone(&Utc);
 
-        let job = cron::add_once_at(&self.config, run_at_parsed, command)?;
+        let job = cron::add_once_at(&self.config.load_full(), run_at_parsed, command)?;
         Ok(ToolResult {
             success: true,
             output: format!(
@@ -354,7 +354,7 @@ impl ScheduleTool {
     }
 
     fn handle_cancel(&self, id: &str) -> ToolResult {
-        match cron::remove_job(&self.config, id) {
+        match cron::remove_job(&self.config.load_full(), id) {
             Ok(()) => ToolResult {
                 success: true,
                 output: format!("Cancelled job {id}"),
@@ -370,9 +370,9 @@ impl ScheduleTool {
 
     fn handle_pause_resume(&self, id: &str, pause: bool) -> ToolResult {
         let operation = if pause {
-            cron::pause_job(&self.config, id)
+            cron::pause_job(&self.config.load_full(), id)
         } else {
-            cron::resume_job(&self.config, id)
+            cron::resume_job(&self.config.load_full(), id)
         };
 
         match operation {
@@ -400,7 +400,7 @@ mod tests {
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
-    async fn test_setup() -> (TempDir, Config, Arc<SecurityPolicy>) {
+    async fn test_setup() -> (TempDir, SharedConfig, Arc<SecurityPolicy>) {
         let tmp = TempDir::new().unwrap();
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -414,7 +414,7 @@ mod tests {
             &config.autonomy,
             &config.workspace_dir,
         ));
-        (tmp, config, security)
+        (tmp, crate::config::new_shared(config), security)
     }
 
     #[tokio::test]
@@ -531,7 +531,7 @@ mod tests {
             &config.workspace_dir,
         ));
 
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, crate::config::new_shared(config));
 
         let blocked = tool
             .execute(json!({
@@ -572,7 +572,7 @@ mod tests {
             &config.autonomy,
             &config.workspace_dir,
         ));
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, crate::config::new_shared(config));
 
         let create = tool
             .execute(json!({
@@ -606,7 +606,7 @@ mod tests {
             &config.autonomy,
             &config.workspace_dir,
         ));
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, crate::config::new_shared(config));
 
         let result = tool
             .execute(json!({
@@ -640,7 +640,7 @@ mod tests {
             &config.autonomy,
             &config.workspace_dir,
         ));
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, crate::config::new_shared(config));
 
         let denied = tool
             .execute(json!({

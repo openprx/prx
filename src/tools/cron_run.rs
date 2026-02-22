@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::Config;
+use crate::config::SharedConfig;
 use crate::cron::{self, JobType};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -8,12 +8,12 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct CronRunTool {
-    config: Arc<Config>,
+    config: SharedConfig,
     security: Arc<SecurityPolicy>,
 }
 
 impl CronRunTool {
-    pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
     }
 }
@@ -44,7 +44,8 @@ impl Tool for CronRunTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        let cfg = self.config.load_full();
+        if !cfg.cron.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -83,7 +84,7 @@ impl Tool for CronRunTool {
             });
         }
 
-        let job = match cron::get_job(&self.config, job_id) {
+        let job = match cron::get_job(&cfg, job_id) {
             Ok(job) => job,
             Err(e) => {
                 return Ok(ToolResult {
@@ -116,13 +117,13 @@ impl Tool for CronRunTool {
         }
 
         let started_at = Utc::now();
-        let (success, output) = cron::scheduler::execute_job_now(&self.config, &job).await;
+        let (success, output) = cron::scheduler::execute_job_now(&cfg, &job).await;
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
         let status = if success { "ok" } else { "error" };
 
         let _ = cron::record_run(
-            &self.config,
+            &cfg,
             &job.id,
             started_at,
             finished_at,
@@ -130,7 +131,7 @@ impl Tool for CronRunTool {
             Some(&output),
             duration_ms,
         );
-        let _ = cron::record_last_run(&self.config, &job.id, finished_at, success, &output);
+        let _ = cron::record_last_run(&cfg, &job.id, finished_at, success, &output);
 
         Ok(ToolResult {
             success,
@@ -152,11 +153,11 @@ impl Tool for CronRunTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{new_shared, Config};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
-    async fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> SharedConfig {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
@@ -165,7 +166,7 @@ mod tests {
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        Arc::new(config)
+        new_shared(config)
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
@@ -179,13 +180,14 @@ mod tests {
     async fn force_runs_job_and_records_history() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo run-now").unwrap();
+        let tool = CronRunTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(result.success, "{:?}", result.error);
 
-        let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
+        let runs = cron::list_runs(&cfg_snap, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
     }
 
@@ -193,7 +195,8 @@ mod tests {
     async fn errors_for_missing_job() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let tool = CronRunTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool
             .execute(json!({ "job_id": "missing-job-id" }))
@@ -213,9 +216,10 @@ mod tests {
         };
         config.autonomy.level = AutonomyLevel::ReadOnly;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = Arc::new(config.clone());
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo run-now").unwrap();
+        let cfg = new_shared(config);
+        let tool = CronRunTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(!result.success);
@@ -233,9 +237,10 @@ mod tests {
         config.autonomy.level = AutonomyLevel::Supervised;
         config.autonomy.allowed_commands = vec!["touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "touch cron-run-approval").unwrap();
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = Arc::new(config.clone());
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "touch cron-run-approval").unwrap();
+        let cfg = new_shared(config);
+        let tool = CronRunTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let denied = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(!denied.success);
