@@ -1,16 +1,16 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::Config;
+use crate::config::SharedConfig;
 use crate::cron;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
 pub struct CronListTool {
-    config: Arc<Config>,
+    config: SharedConfig,
 }
 
 impl CronListTool {
-    pub fn new(config: Arc<Config>) -> Self {
+    pub fn new(config: SharedConfig) -> Self {
         Self { config }
     }
 }
@@ -34,7 +34,8 @@ impl Tool for CronListTool {
     }
 
     async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        let cfg = self.config.load_full();
+        if !cfg.cron.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -42,7 +43,7 @@ impl Tool for CronListTool {
             });
         }
 
-        match cron::list_jobs(&self.config) {
+        match cron::list_jobs(&cfg) {
             Ok(jobs) => Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string_pretty(&jobs)?,
@@ -60,10 +61,10 @@ impl Tool for CronListTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{new_shared, Config};
     use tempfile::TempDir;
 
-    async fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> SharedConfig {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
@@ -72,7 +73,7 @@ mod tests {
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        Arc::new(config)
+        new_shared(config)
     }
 
     #[tokio::test]
@@ -89,9 +90,13 @@ mod tests {
     #[tokio::test]
     async fn errors_when_cron_disabled() {
         let tmp = TempDir::new().unwrap();
-        let mut cfg = (*test_config(&tmp).await).clone();
-        cfg.cron.enabled = false;
-        let tool = CronListTool::new(Arc::new(cfg));
+        let mut cfg_val = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        cfg_val.cron.enabled = false;
+        let tool = CronListTool::new(new_shared(cfg_val));
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);

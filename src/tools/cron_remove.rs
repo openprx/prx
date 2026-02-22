@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::Config;
+use crate::config::SharedConfig;
 use crate::cron;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -7,12 +7,12 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct CronRemoveTool {
-    config: Arc<Config>,
+    config: SharedConfig,
     security: Arc<SecurityPolicy>,
 }
 
 impl CronRemoveTool {
-    pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
     }
 
@@ -68,7 +68,8 @@ impl Tool for CronRemoveTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        let cfg = self.config.load_full();
+        if !cfg.cron.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -91,7 +92,7 @@ impl Tool for CronRemoveTool {
             return Ok(blocked);
         }
 
-        match cron::remove_job(&self.config, job_id) {
+        match cron::remove_job(&cfg, job_id) {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Removed cron job {job_id}"),
@@ -109,11 +110,11 @@ impl Tool for CronRemoveTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{new_shared, Config};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
-    async fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> SharedConfig {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
@@ -122,7 +123,7 @@ mod tests {
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        Arc::new(config)
+        new_shared(config)
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
@@ -136,19 +137,21 @@ mod tests {
     async fn removes_existing_job() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronRemoveTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronRemoveTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool.execute(json!({"job_id": job.id})).await.unwrap();
         assert!(result.success);
-        assert!(cron::list_jobs(&cfg).unwrap().is_empty());
+        assert!(cron::list_jobs(&cfg_snap).unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn errors_when_job_id_missing() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronRemoveTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let tool = CronRemoveTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
@@ -168,9 +171,10 @@ mod tests {
         };
         config.autonomy.level = AutonomyLevel::ReadOnly;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronRemoveTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = Arc::new(config.clone());
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo ok").unwrap();
+        let cfg = new_shared(config);
+        let tool = CronRemoveTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool.execute(json!({"job_id": job.id})).await.unwrap();
         assert!(!result.success);

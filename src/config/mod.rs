@@ -1,4 +1,7 @@
+pub mod hotreload;
 pub mod schema;
+
+pub use hotreload::{new_shared, HotReloadManager, SharedConfig};
 
 #[allow(unused_imports)]
 pub use schema::{
@@ -15,7 +18,7 @@ pub use schema::{
     ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
     SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig, SlackConfig, StorageConfig,
     StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig, TunnelConfig,
-    ScopeConfig, ScopeRule,
+    ScopeConfig, ScopeRule, ToolPolicyConfig,
     WebSearchConfig, WebhookConfig,
 };
 

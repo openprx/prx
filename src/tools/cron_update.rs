@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::Config;
+use crate::config::SharedConfig;
 use crate::cron::{self, CronJobPatch};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -7,12 +7,12 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub struct CronUpdateTool {
-    config: Arc<Config>,
+    config: SharedConfig,
     security: Arc<SecurityPolicy>,
 }
 
 impl CronUpdateTool {
-    pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
     }
 
@@ -74,7 +74,8 @@ impl Tool for CronUpdateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        let cfg = self.config.load_full();
+        if !cfg.cron.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -133,7 +134,7 @@ impl Tool for CronUpdateTool {
             return Ok(blocked);
         }
 
-        match cron::update_job(&self.config, job_id, patch) {
+        match cron::update_job(&cfg, job_id, patch) {
             Ok(job) => Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string_pretty(&job)?,
@@ -151,11 +152,12 @@ impl Tool for CronUpdateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{new_shared, Config};
     use crate::security::AutonomyLevel;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
-    async fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> SharedConfig {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
@@ -164,7 +166,7 @@ mod tests {
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        Arc::new(config)
+        new_shared(config)
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
@@ -178,8 +180,9 @@ mod tests {
     async fn updates_enabled_flag() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = cfg.load_full();
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool
             .execute(json!({
@@ -205,9 +208,10 @@ mod tests {
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = Arc::new(config.clone());
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo ok").unwrap();
+        let cfg = new_shared(config);
+        let tool = CronUpdateTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool
             .execute(json!({
@@ -230,9 +234,10 @@ mod tests {
         };
         config.autonomy.level = AutonomyLevel::ReadOnly;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = Arc::new(config.clone());
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo ok").unwrap();
+        let cfg = new_shared(config);
+        let tool = CronUpdateTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let result = tool
             .execute(json!({
@@ -256,9 +261,10 @@ mod tests {
         config.autonomy.level = AutonomyLevel::Supervised;
         config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let cfg_snap = Arc::new(config.clone());
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo ok").unwrap();
+        let cfg = new_shared(config);
+        let tool = CronUpdateTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
         let denied = tool
             .execute(json!({

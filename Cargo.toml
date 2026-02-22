@@ -81,6 +81,13 @@ serde-big-array = { version = "0.5", optional = true }
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
+# Lock-free config hot-swap (P1.5)
+arc-swap = "1.8.2"
+
+# File-system watcher + debouncer for config hot-reload (P1.5)
+notify = "8.2.0"
+notify-debouncer-mini = "0.7.0"
+
 # Async traits
 async-trait = "0.1"
 # MCP client (stdio + streamable HTTP)

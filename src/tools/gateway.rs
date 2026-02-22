@@ -8,14 +8,14 @@
 //! Designed to align with OpenClaw's `gateway` tool interface.
 
 use super::traits::{Tool, ToolResult};
-use crate::config::Config;
+use crate::config::SharedConfig;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
 
 pub struct GatewayTool {
-    config: Arc<Config>,
+    config: SharedConfig,
     /// Provider name (e.g. "anthropic", "openrouter")
     provider_name: String,
     /// Current model (e.g. "claude-sonnet-4-6")
@@ -28,7 +28,7 @@ pub struct GatewayTool {
 
 impl GatewayTool {
     pub fn new(
-        config: Arc<Config>,
+        config: SharedConfig,
         provider_name: impl Into<String>,
         model: impl Into<String>,
         channels: Vec<String>,
@@ -96,10 +96,11 @@ impl Tool for GatewayTool {
             }
         };
 
+        let cfg = self.config.load_full();
         match action {
             "config.get" => {
                 // Read the gateway section from config and return it
-                let gw = &self.config.gateway;
+                let gw = &cfg.gateway;
                 let output = json!({
                     "host": gw.host,
                     "port": gw.port,
@@ -112,7 +113,7 @@ impl Tool for GatewayTool {
                     "idempotency_ttl_secs": gw.idempotency_ttl_secs,
                     "idempotency_max_keys": gw.idempotency_max_keys,
                     "paired_tokens_count": gw.paired_tokens.len(),
-                    "config_path": self.config.config_path.display().to_string(),
+                    "config_path": cfg.config_path.display().to_string(),
                 });
                 Ok(ToolResult {
                     success: true,
@@ -129,7 +130,7 @@ impl Tool for GatewayTool {
                 } else {
                     self.channels.join(", ")
                 };
-                let gw = &self.config.gateway;
+                let gw = &cfg.gateway;
                 let output = format!(
                     "🌐 Gateway Status\n\
                      ─────────────────\n\
@@ -204,11 +205,11 @@ impl Tool for GatewayTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{new_shared, Config};
     use tempfile::TempDir;
 
     fn make_tool(tmp: &TempDir) -> GatewayTool {
-        let config = Arc::new(Config {
+        let config = new_shared(Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()

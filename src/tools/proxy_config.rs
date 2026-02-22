@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::{
-    runtime_proxy_config, set_runtime_proxy_config, Config, ProxyConfig, ProxyScope,
+    runtime_proxy_config, set_runtime_proxy_config, Config, ProxyConfig, ProxyScope, SharedConfig,
 };
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
@@ -10,31 +10,32 @@ use std::fs;
 use std::sync::Arc;
 
 pub struct ProxyConfigTool {
-    config: Arc<Config>,
+    config: SharedConfig,
     security: Arc<SecurityPolicy>,
 }
 
 impl ProxyConfigTool {
-    pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
     }
 
     fn load_config_without_env(&self) -> anyhow::Result<Config> {
-        let contents = fs::read_to_string(&self.config.config_path).map_err(|error| {
+        let current = self.config.load_full();
+        let contents = fs::read_to_string(&current.config_path).map_err(|error| {
             anyhow::anyhow!(
                 "Failed to read config file {}: {error}",
-                self.config.config_path.display()
+                current.config_path.display()
             )
         })?;
 
         let mut parsed: Config = toml::from_str(&contents).map_err(|error| {
             anyhow::anyhow!(
                 "Failed to parse config file {}: {error}",
-                self.config.config_path.display()
+                current.config_path.display()
             )
         })?;
-        parsed.config_path = self.config.config_path.clone();
-        parsed.workspace_dir = self.config.workspace_dir.clone();
+        parsed.config_path = current.config_path.clone();
+        parsed.workspace_dir = current.workspace_dir.clone();
         Ok(parsed)
     }
 
@@ -449,14 +450,14 @@ mod tests {
         })
     }
 
-    async fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> SharedConfig {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
         config.save().await.unwrap();
-        Arc::new(config)
+        crate::config::new_shared(config)
     }
 
     #[tokio::test]

@@ -194,6 +194,10 @@ pub struct Config {
     /// Controls audio STT and video frame extraction for incoming attachments.
     #[serde(default)]
     pub media: MediaConfig,
+
+    /// Security configuration: sandboxing, resource limits, audit, tool policy (`[security]`).
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -2922,6 +2926,61 @@ pub struct LarkConfig {
 
 // ── Security Config ─────────────────────────────────────────────────
 
+/// Tool policy configuration (`[security.tool_policy]` section).
+///
+/// Defines multi-layer allow/deny policies for tool execution.
+///
+/// Example:
+/// ```toml
+/// [security.tool_policy]
+/// default = "allow"
+///
+/// [security.tool_policy.groups]
+/// hardware = "deny"
+/// sessions = "allow"
+///
+/// [security.tool_policy.tools]
+/// shell = "supervised"
+/// gateway = "allow"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ToolPolicyConfig {
+    /// Default policy when no more-specific rule matches.
+    /// "allow" (default), "deny", or "supervised".
+    #[serde(default = "default_tool_policy_default")]
+    pub default: String,
+
+    /// Group-level policies: maps group name → policy string.
+    /// Known groups: sessions, automation, ui, hardware.
+    #[serde(default)]
+    pub groups: std::collections::HashMap<String, String>,
+
+    /// Per-tool policies: maps tool name → policy string.
+    #[serde(default)]
+    pub tools: std::collections::HashMap<String, String>,
+}
+
+fn default_tool_policy_default() -> String {
+    "allow".into()
+}
+
+impl ToolPolicyConfig {
+    /// Returns `true` when the global default permits execution.
+    pub fn default_allow(&self) -> bool {
+        !matches!(self.default.trim().to_ascii_lowercase().as_str(), "deny")
+    }
+}
+
+impl Default for ToolPolicyConfig {
+    fn default() -> Self {
+        Self {
+            default: default_tool_policy_default(),
+            groups: std::collections::HashMap::new(),
+            tools: std::collections::HashMap::new(),
+        }
+    }
+}
+
 /// Security configuration for sandboxing, resource limits, and audit logging
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct SecurityConfig {
@@ -2936,6 +2995,10 @@ pub struct SecurityConfig {
     /// Audit logging configuration
     #[serde(default)]
     pub audit: AuditConfig,
+
+    /// Tool policy pipeline configuration (`[security.tool_policy]`).
+    #[serde(default)]
+    pub tool_policy: ToolPolicyConfig,
 }
 
 /// Sandbox configuration for OS-level isolation
@@ -3144,6 +3207,7 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             media: MediaConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -4251,6 +4315,7 @@ default_temperature = 0.7
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             media: MediaConfig::default(),
+            security: SecurityConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -4422,6 +4487,7 @@ tool_dispatcher = "xml"
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             media: MediaConfig::default(),
+            security: SecurityConfig::default(),
         };
 
         config.save().await.unwrap();

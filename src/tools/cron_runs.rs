@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::Config;
+use crate::config::SharedConfig;
 use crate::cron;
 use async_trait::async_trait;
 use serde::Serialize;
@@ -9,11 +9,11 @@ use std::sync::Arc;
 const MAX_RUN_OUTPUT_CHARS: usize = 500;
 
 pub struct CronRunsTool {
-    config: Arc<Config>,
+    config: SharedConfig,
 }
 
 impl CronRunsTool {
-    pub fn new(config: Arc<Config>) -> Self {
+    pub fn new(config: SharedConfig) -> Self {
         Self { config }
     }
 }
@@ -51,7 +51,8 @@ impl Tool for CronRunsTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        let cfg = self.config.load_full();
+        if !cfg.cron.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -75,7 +76,7 @@ impl Tool for CronRunsTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(10, |v| usize::try_from(v).unwrap_or(10));
 
-        match cron::list_runs(&self.config, job_id, limit) {
+        match cron::list_runs(&cfg, job_id, limit) {
             Ok(runs) => {
                 let runs: Vec<RunView> = runs
                     .into_iter()
@@ -117,11 +118,11 @@ fn truncate(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{new_shared, Config};
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
 
-    async fn test_config(tmp: &TempDir) -> Arc<Config> {
+    async fn test_config(tmp: &TempDir) -> SharedConfig {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
@@ -130,19 +131,20 @@ mod tests {
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        Arc::new(config)
+        new_shared(config)
     }
 
     #[tokio::test]
     async fn lists_runs_with_truncation() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let cfg_snap = cfg.load_full();
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo ok").unwrap();
 
         let long_output = "x".repeat(1000);
         let now = Utc::now();
         cron::record_run(
-            &cfg,
+            &cfg_snap,
             &job.id,
             now,
             now + ChronoDuration::milliseconds(1),
@@ -152,7 +154,7 @@ mod tests {
         )
         .unwrap();
 
-        let tool = CronRunsTool::new(cfg.clone());
+        let tool = CronRunsTool::new(Arc::clone(&cfg));
         let result = tool
             .execute(json!({ "job_id": job.id, "limit": 5 }))
             .await
