@@ -20,6 +20,7 @@ pub mod browser;
 pub mod browser_open;
 pub mod composio;
 pub mod config_reload;
+pub mod cron;
 pub mod cron_add;
 pub mod message_send;
 pub mod cron_list;
@@ -28,6 +29,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod gateway;
 pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
@@ -47,6 +49,7 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod session_status;
+pub mod sessions_history;
 pub mod sessions_list;
 pub mod sessions_send;
 pub mod sessions_spawn;
@@ -61,6 +64,7 @@ pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use config_reload::ConfigReloadTool;
+pub use cron::CronTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
 pub use cron_remove::CronRemoveTool;
@@ -68,6 +72,7 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use gateway::GatewayTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
@@ -89,6 +94,7 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use session_status::SessionStatusTool;
+pub use sessions_history::SessionsHistoryTool;
 pub use sessions_list::SessionsListTool;
 pub use sessions_send::SessionsSendTool;
 pub use sessions_spawn::SessionsSpawnTool;
@@ -210,6 +216,7 @@ pub fn all_tools_with_runtime(
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
+        Arc::new(CronTool::new(config.clone(), security.clone())),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
         Arc::new(CronListTool::new(config.clone())),
         Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
