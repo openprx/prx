@@ -2641,6 +2641,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
         ));
     }
+    tool_descs.push((
+        "canvas",
+        "Manage an in-memory canvas session. Actions: present, hide, navigate, eval, snapshot. Current implementation is a stub backend.",
+    ));
     if config.composio.enabled {
         tool_descs.push((
             "composio",
