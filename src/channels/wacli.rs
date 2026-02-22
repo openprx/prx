@@ -356,6 +356,10 @@ impl WacliChannel {
             .get("pushName")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let self_jid = payload
+            .get("selfJid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let is_group = chat_jid.contains("@g.us");
         let sender_display = if sender_name.is_empty() {
             sender
@@ -393,11 +397,16 @@ impl WacliChannel {
             return;
         }
 
+        let self_note = if !self_jid.is_empty() {
+            format!(" (you are {self_jid})")
+        } else {
+            String::new()
+        };
         let prefix = if is_group {
             if let Some(name) = group_name {
-                format!("[WhatsApp Group: {name}] {sender_display}: ")
+                format!("[WhatsApp Group: {name}]{self_note} {sender_display}: ")
             } else {
-                format!("[WhatsApp Group] {sender_display}: ")
+                format!("[WhatsApp Group]{self_note} {sender_display}: ")
             }
         } else {
             format!("{sender_display}: ")
