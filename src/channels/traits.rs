@@ -126,6 +126,76 @@ pub trait Channel: Send + Sync {
     async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
+
+    // ── P3-2: Extended channel actions ──────────────────────────────────────
+
+    /// Report which extended actions this channel supports.
+    /// Defaults to all-false so existing implementations need not change.
+    fn capabilities(&self) -> ChannelCapabilities {
+        ChannelCapabilities::default()
+    }
+
+    /// Edit a previously sent message.
+    ///
+    /// `channel_id` is the conversation/chat identifier.
+    /// `message_id` is the platform-specific message identifier.
+    /// `new_text` is the replacement text.
+    ///
+    /// Returns `Err` if the platform does not support editing or if the edit fails.
+    async fn edit_message(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _new_text: &str,
+    ) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("edit not supported on this channel"))
+    }
+
+    /// Delete (unsend) a previously sent message.
+    ///
+    /// `channel_id` is the conversation/chat identifier.
+    /// `message_id` is the platform-specific message identifier (timestamp for Signal, etc.).
+    ///
+    /// Returns `Err` if the platform does not support deletion or if the delete fails.
+    async fn delete_message(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+    ) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("delete not supported on this channel"))
+    }
+
+    /// Send a reply within a thread.
+    ///
+    /// `channel_id` is the conversation/chat identifier.
+    /// `thread_id` is the platform-specific thread identifier.
+    /// `message` is the reply text.
+    ///
+    /// Channels that do not have a native thread concept should degrade gracefully
+    /// (e.g. Signal can fall back to a quote reply).
+    async fn send_thread_reply(
+        &self,
+        _channel_id: &str,
+        _thread_id: &str,
+        _message: &str,
+    ) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("thread reply not supported on this channel"))
+    }
+}
+
+// ── Channel capabilities ─────────────────────────────────────────────────────
+
+/// Describes which extended messaging actions a channel implementation supports.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelCapabilities {
+    /// Whether the channel supports editing previously sent messages.
+    pub edit: bool,
+    /// Whether the channel supports deleting (unsending) sent messages.
+    pub delete: bool,
+    /// Whether the channel natively supports threaded replies.
+    pub thread: bool,
+    /// Whether the channel supports emoji reactions.
+    pub react: bool,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

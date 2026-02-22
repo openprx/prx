@@ -131,8 +131,11 @@ impl Tool for MessageSendTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["send", "react"],
-                    "description": "Action type: 'send' for text/files/voice, 'react' for emoji reactions"
+                    "enum": ["send", "react", "edit", "delete", "unsend", "thread"],
+                    "description": "Action type: 'send' for text/files/voice, 'react' for emoji reactions, \
+                                    'edit' to edit a sent message (message_id + message), \
+                                    'delete'/'unsend' to delete a sent message (message_id), \
+                                    'thread' to reply in a thread (thread_id + message)"
                 },
                 "target": {
                     "type": "string",
@@ -168,6 +171,14 @@ impl Tool for MessageSendTool {
                 "target_timestamp": {
                     "type": "integer",
                     "description": "For action='react': the timestamp (ms) of the message to react to."
+                },
+                "message_id": {
+                    "type": "string",
+                    "description": "For action='edit'/'delete'/'unsend': the platform-specific message identifier (timestamp in ms for Signal)."
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": "For action='thread': the thread/conversation identifier to reply into."
                 }
             },
             "required": ["action"]
@@ -353,10 +364,122 @@ impl Tool for MessageSendTool {
                 }
             }
 
+            // ── edit ──────────────────────────────────────────────────────────
+            "edit" => {
+                let recipient = match target {
+                    Some(r) if !r.is_empty() => r,
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("Missing 'target' for edit action.".into()),
+                        });
+                    }
+                };
+                let message_id = match args["message_id"].as_str() {
+                    Some(id) if !id.is_empty() => id.to_owned(),
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("Missing 'message_id' for edit action.".into()),
+                        });
+                    }
+                };
+                let new_text = args["message"].as_str().unwrap_or("");
+                match self.channel.edit_message(&recipient, &message_id, new_text).await {
+                    Ok(()) => Ok(ToolResult {
+                        success: true,
+                        output: format!("Message {message_id} edited."),
+                        error: None,
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("edit_message failed: {e}")),
+                    }),
+                }
+            }
+
+            // ── delete / unsend ───────────────────────────────────────────────
+            "delete" | "unsend" => {
+                let recipient = match target {
+                    Some(r) if !r.is_empty() => r,
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("Missing 'target' for delete/unsend action.".into()),
+                        });
+                    }
+                };
+                let message_id = match args["message_id"].as_str() {
+                    Some(id) if !id.is_empty() => id.to_owned(),
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("Missing 'message_id' for delete/unsend action.".into()),
+                        });
+                    }
+                };
+                match self.channel.delete_message(&recipient, &message_id).await {
+                    Ok(()) => Ok(ToolResult {
+                        success: true,
+                        output: format!("Message {message_id} deleted."),
+                        error: None,
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("delete_message failed: {e}")),
+                    }),
+                }
+            }
+
+            // ── thread ────────────────────────────────────────────────────────
+            "thread" => {
+                let recipient = match target {
+                    Some(r) if !r.is_empty() => r,
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("Missing 'target' for thread action.".into()),
+                        });
+                    }
+                };
+                let thread_id = match args["thread_id"].as_str() {
+                    Some(id) if !id.is_empty() => id.to_owned(),
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("Missing 'thread_id' for thread action.".into()),
+                        });
+                    }
+                };
+                let message = args["message"].as_str().unwrap_or("");
+                match self.channel.send_thread_reply(&recipient, &thread_id, message).await {
+                    Ok(()) => Ok(ToolResult {
+                        success: true,
+                        output: format!("Thread reply sent to thread {thread_id}."),
+                        error: None,
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("send_thread_reply failed: {e}")),
+                    }),
+                }
+            }
+
             unknown => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Unknown action '{unknown}'. Use 'send' or 'react'.")),
+                error: Some(format!(
+                    "Unknown action '{unknown}'. Use 'send', 'react', 'edit', 'delete', 'unsend', or 'thread'."
+                )),
             }),
         }
     }
