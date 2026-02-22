@@ -3030,6 +3030,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         None
     };
 
+    // Register config_reload tool (allows AI to manually trigger hot-reload).
+    {
+        let shared_config_for_reload = Arc::new(arc_swap::ArcSwap::from_pointee(config.clone()));
+        tools_list.push(Box::new(tools::ConfigReloadTool::new(
+            shared_config_for_reload,
+        )));
+    }
+
     // Wrap the tool list in Arc now that all channel-aware tools have been appended.
     let tools_registry = Arc::new(tools_list);
 
