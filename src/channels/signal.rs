@@ -427,11 +427,20 @@ impl SignalChannel {
                 .unwrap_or(u64::MAX)
             });
 
+        // Append Signal reaction metadata so the LLM has the information needed
+        // to call message_send(action="react", target_author=..., target_timestamp=...).
+        // Format: [signal-meta sender=<id> ts=<ms>]
+        let content_with_meta = if text.is_empty() {
+            format!("[signal-meta sender={sender} ts={timestamp}]")
+        } else {
+            format!("{text}\n[signal-meta sender={sender} ts={timestamp}]")
+        };
+
         Some(ChannelMessage {
             id: format!("sig_{timestamp}"),
             sender: sender.clone(),
             reply_target: target,
-            content: text.to_string(),
+            content: content_with_meta,
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
@@ -878,12 +887,13 @@ impl Channel for SignalChannel {
         // ── Native mode: JSON-RPC send ────────────────────────────────────────
         tracing::info!("Signal send: is_native={} http_url={}", self.is_native, self.http_url);
         if self.is_native {
-            // In native mode, attachments are referenced as `file://` paths.
+            // In native mode, attachments are referenced as absolute paths.
+            // signal-cli JSON-RPC expects plain absolute paths, not file:// URIs.
             let file_attachments: Vec<String> = media_items
                 .iter()
                 .filter_map(|(_kind, path)| {
                     if std::path::Path::new(path).exists() {
-                        Some(format!("file://{path}"))
+                        Some(path.clone())
                     } else {
                         tracing::warn!("Signal native: attachment file missing: {path}");
                         None
@@ -1487,7 +1497,8 @@ mod tests {
         let msg = ch.process_envelope(&env).unwrap();
         assert_eq!(msg.sender, uuid);
         assert_eq!(msg.reply_target, uuid);
-        assert_eq!(msg.content, "Hello from privacy user");
+        assert!(msg.content.starts_with("Hello from privacy user"), "content: {}", msg.content);
+        assert!(msg.content.contains(&format!("[signal-meta sender={uuid}")), "content: {}", msg.content);
 
         // Verify reply routing: UUID sender in DM should route as Direct
         let target = SignalChannel::parse_recipient_target(&msg.reply_target);
@@ -1546,7 +1557,8 @@ mod tests {
         let ch = make_channel();
         let env = make_envelope(Some("+1111111111"), Some("Hello!"));
         let msg = ch.process_envelope(&env).unwrap();
-        assert_eq!(msg.content, "Hello!");
+        assert!(msg.content.starts_with("Hello!"), "content: {}", msg.content);
+        assert!(msg.content.contains("[signal-meta sender=+1111111111"), "content: {}", msg.content);
         assert_eq!(msg.sender, "+1111111111");
         assert_eq!(msg.channel, "signal");
     }

@@ -139,8 +139,16 @@ impl Tool for TtsTool {
 
         match self.channel.send(&msg).await {
             Ok(()) => {
-                // Clean up voice file after sending
-                let _ = tokio::fs::remove_file(&voice_path).await;
+                // Delay cleanup to ensure signal-cli has finished reading the file.
+                // signal-cli may process the attachment asynchronously after the RPC returns,
+                // so immediate deletion causes a "file not found" error on the daemon side.
+                let path_for_cleanup = voice_path.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                    if let Err(e) = tokio::fs::remove_file(&path_for_cleanup).await {
+                        tracing::debug!("tts cleanup: could not remove {path_for_cleanup}: {e}");
+                    }
+                });
                 Ok(ToolResult {
                     success: true,
                     output: format!("Voice message sent to {recipient}"),
