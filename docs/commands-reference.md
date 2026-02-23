@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 20, 2026**.
+Last verified: **February 23, 2026**.
 
 ## Top-Level Commands
 
@@ -23,6 +23,7 @@ Last verified: **February 20, 2026**.
 | `skills` | List/install/remove skills |
 | `migrate` | Import from external runtimes (currently OpenClaw) |
 | `config` | Export machine-readable config schema |
+| `session-worker` | Internal process-isolated worker entrypoint (IPC; internal use) |
 | `completions` | Generate shell completion scripts to stdout |
 | `hardware` | Discover and introspect USB hardware |
 | `peripheral` | Configure and flash peripherals |
@@ -130,6 +131,30 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 - `zeroclaw config schema`
 
 `config schema` prints a JSON Schema (draft 2020-12) for the full `config.toml` contract to stdout.
+
+### `session-worker` (internal)
+
+- `zeroclaw session-worker [--task <TEXT>] [--workspace <PATH>] [--memory-db <PATH>] [--tools <JSON_ARRAY>] [--timeout <SECONDS>]`
+
+Notes:
+
+- Internal command used by `sessions_spawn mode=process`.
+- Primary manifest input comes from `stdin` as JSON (`WorkerManifest`).
+- CLI flags are override-only and mainly used for controlled debugging.
+- Output is strict JSON on stdout (`WorkerResult`); keep stdout clean when invoking manually.
+
+## Companion Binary: `zeroclaw-node`
+
+Remote node daemon used by the `nodes` tool transport.
+
+- `zeroclaw-node [--config <PATH>] [--bind <ADDR>] [--token <TOKEN>] [--hmac-secret <SECRET>] [--sandbox-root <PATH>] [--exec-timeout-ms <MS>] [--allowed-commands <a,b,c>] [--blocked-commands <a,b,c>] [--max-output-bytes <N>] [--tls-required <true|false>] [--tls-cert <PATH>] [--tls-key <PATH>]`
+
+Notes:
+
+- `--config` accepts a TOML file with either `[server]` or `[nodes.server]`.
+- `--token` (or config `nodes.server.bearer_token`) is required.
+- Default bind is `127.0.0.1:8787`; non-loopback bind requires TLS material when `tls_required = true`.
+- `allowed_commands` is allowlist-first; `blocked_commands` is always enforced.
 
 ### `completions`
 

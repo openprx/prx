@@ -617,8 +617,8 @@ impl SecurityPolicy {
             }
 
             // Empty list or ["*"] means all commands are allowed
-            let all_allowed = self.allowed_commands.is_empty()
-                || self.allowed_commands.iter().any(|c| c == "*");
+            let all_allowed =
+                self.allowed_commands.is_empty() || self.allowed_commands.iter().any(|c| c == "*");
             if !all_allowed
                 && !self
                     .allowed_commands

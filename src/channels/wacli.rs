@@ -22,7 +22,9 @@
 //! sends the JSON-RPC request, reads the response, and closes. This keeps the
 //! implementation simple and avoids shared state for the send path.
 
-use super::traits::{extract_outgoing_media, Channel, ChannelCapabilities, ChannelMessage, SendMessage};
+use super::traits::{
+    extract_outgoing_media, Channel, ChannelCapabilities, ChannelMessage, SendMessage,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -181,7 +183,9 @@ impl WacliChannel {
                 .with_context(|| format!("reading JSON-RPC response for '{method}'"))?;
 
             if n == 0 {
-                anyhow::bail!("wacli daemon closed connection before sending response to '{method}'");
+                anyhow::bail!(
+                    "wacli daemon closed connection before sending response to '{method}'"
+                );
             }
 
             let trimmed = response_line.trim();
@@ -325,7 +329,10 @@ impl WacliChannel {
         };
 
         // Skip messages sent by us.
-        let from_me = payload.get("fromMe").and_then(|v| v.as_bool()).unwrap_or(false);
+        let from_me = payload
+            .get("fromMe")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if from_me {
             return;
         }

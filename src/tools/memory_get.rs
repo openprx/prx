@@ -182,12 +182,7 @@ impl Tool for MemoryGetTool {
             });
         }
 
-        let mut output = format!(
-            "{} lines {}-{}:\n",
-            path,
-            start_idx + 1,
-            end_idx
-        );
+        let mut output = format!("{} lines {}-{}:\n", path, start_idx + 1, end_idx);
 
         for (line_no, line_text) in lines[start_idx..end_idx].iter().enumerate() {
             output.push_str(&format!("{:>6}: {}\n", start_idx + line_no + 1, line_text));
@@ -255,10 +250,7 @@ mod tests {
         write_file(&tmp.path().join("notes.md"), "not allowed\n");
 
         let tool = MemoryGetTool::new(tmp.path().to_path_buf());
-        let result = tool
-            .execute(json!({"path": "notes.md"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"path": "notes.md"})).await.unwrap();
 
         assert!(!result.success);
         assert!(result

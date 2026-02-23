@@ -175,7 +175,9 @@ impl Tool for CronAddTool {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Invalid payload.kind: {other}. Use 'agentTurn' or 'systemEvent'")),
+                        error: Some(format!(
+                            "Invalid payload.kind: {other}. Use 'agentTurn' or 'systemEvent'"
+                        )),
                     });
                 }
             }
@@ -522,9 +524,6 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Missing prompt"));
+        assert!(result.error.unwrap_or_default().contains("Missing prompt"));
     }
 }

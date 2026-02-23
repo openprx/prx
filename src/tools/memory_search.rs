@@ -88,7 +88,10 @@ fn compute_score(line: &str, terms: &[String]) -> f64 {
     }
 
     let haystack = line.to_lowercase();
-    let matched = terms.iter().filter(|term| haystack.contains(term.as_str())).count();
+    let matched = terms
+        .iter()
+        .filter(|term| haystack.contains(term.as_str()))
+        .count();
 
     if matched == 0 {
         0.0

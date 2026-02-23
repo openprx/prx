@@ -554,7 +554,9 @@ fn clone_openclaw_skills_repo(repo_dir: &Path) -> bool {
                 }
                 Ok(r) => {
                     let stderr = String::from_utf8_lossy(&r.stderr);
-                    tracing::warn!("sparse-checkout set failed ({stderr}); full clone will be used");
+                    tracing::warn!(
+                        "sparse-checkout set failed ({stderr}); full clone will be used"
+                    );
                 }
                 Err(err) => {
                     tracing::warn!("failed to run git sparse-checkout for openclaw-skills: {err}");
@@ -1524,7 +1526,10 @@ description = "Bare minimum"
         let result = parse_openclaw_frontmatter(content);
         assert_eq!(
             result,
-            Some(("weather".to_string(), "Get current weather info".to_string()))
+            Some((
+                "weather".to_string(),
+                "Get current weather info".to_string()
+            ))
         );
     }
 
@@ -1686,17 +1691,12 @@ description = "Bare minimum"
         )
         .unwrap();
         // Create the sync marker so ensure_openclaw_skills_repo won't try to pull.
-        fs::write(
-            repo_dir.join(OPENCLAW_SKILLS_SYNC_MARKER),
-            b"synced",
-        )
-        .unwrap();
+        fs::write(repo_dir.join(OPENCLAW_SKILLS_SYNC_MARKER), b"synced").unwrap();
 
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace_dir.clone();
         config.skills.openclaw_skills_enabled = true;
-        config.skills.openclaw_skills_dir =
-            Some(repo_dir.to_string_lossy().to_string());
+        config.skills.openclaw_skills_dir = Some(repo_dir.to_string_lossy().to_string());
 
         let skills = load_skills_with_config(&workspace_dir, &config);
         assert_eq!(skills.len(), 1);

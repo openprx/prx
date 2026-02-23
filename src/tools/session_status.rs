@@ -48,11 +48,7 @@ impl SessionStatusTool {
         } else if elapsed_secs < 3600 {
             format!("{}m {}s", elapsed_secs / 60, elapsed_secs % 60)
         } else {
-            format!(
-                "{}h {}m",
-                elapsed_secs / 3600,
-                (elapsed_secs % 3600) / 60
-            )
+            format!("{}h {}m", elapsed_secs / 3600, (elapsed_secs % 3600) / 60)
         }
     }
 }

@@ -13,13 +13,12 @@ pub use schema::{
     HardwareConfig, HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
     IdentityConfig, LarkConfig, MatrixConfig, McpConfig, McpServerConfig, McpTransport,
     MediaConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
-    ObservabilityConfig,
-    PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
-    ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
-    SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig, SlackConfig, StorageConfig,
-    StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig, TunnelConfig,
-    ScopeConfig, ScopeRule, ToolPolicyConfig,
-    WebSearchConfig, WebhookConfig,
+    NodeServerConfig, NodesConfig, ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig,
+    ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig, RemoteNodeConfig,
+    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
+    ScopeConfig, ScopeRule, SecretsConfig, SecurityConfig, SelfSystemConfig, SessionsSpawnConfig,
+    SkillsConfig, SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection,
+    StreamMode, TelegramConfig, ToolPolicyConfig, TunnelConfig, WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]
