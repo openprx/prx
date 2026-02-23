@@ -267,11 +267,7 @@ pub fn resolve_topic(
     let external_id = extract_external_ref(content);
 
     if let Some(external_id) = external_id.as_deref() {
-        let maybe_topic = if let Some(project) = project.as_deref() {
-            find_topic_by_project_and_external(conn, Some(project), external_id)?
-        } else {
-            find_topic_by_external(conn, external_id)?
-        };
+        let maybe_topic = find_topic_by_project_and_external(conn, project.as_deref(), external_id)?;
 
         if let Some(topic) = maybe_topic {
             let real_id = resolve_alias(conn, &topic.id)?;
@@ -635,6 +631,33 @@ mod tests {
             .unwrap()
             .expect("topic should resolve");
         assert_eq!(resolved, openpr_id);
+    }
+
+    #[test]
+    fn resolve_topic_without_inferred_project_uses_global_sentinel_scope() {
+        let (_tmp, conn) = setup_conn();
+        let global_id = create_topic(
+            &conn,
+            "Global ticket",
+            None,
+            Some("issue#101"),
+            "fp-global-101",
+        )
+        .unwrap();
+        let _project_id = create_topic(
+            &conn,
+            "OpenPR ticket",
+            Some("openpr"),
+            Some("issue#101"),
+            "fp-openpr-101",
+        )
+        .unwrap();
+
+        let principal = base_principal("u-3");
+        let resolved = resolve_topic(&conn, "please help with issue#101 asap", &principal)
+            .unwrap()
+            .expect("topic should resolve");
+        assert_eq!(resolved, global_id);
     }
 
     #[test]

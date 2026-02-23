@@ -14,10 +14,13 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,11 +41,88 @@ struct WebhookState {
     token: Arc<str>,
     db_path: Arc<PathBuf>,
     acl_enabled: bool,
+    rate_limiter: Arc<WebhookRateLimiter>,
+    idempotency_store: Arc<IdempotencyStore>,
 }
 
 #[derive(Debug, Serialize)]
 struct WebhookAck {
     topic_id: String,
+}
+
+const WEBHOOK_RATE_LIMIT_WINDOW_SECS: u64 = 60;
+const WEBHOOK_DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 60;
+const WEBHOOK_IDEMPOTENCY_TTL_SECS: u64 = 300;
+const WEBHOOK_IDEMPOTENCY_MAX_KEYS: usize = 10_000;
+
+#[derive(Debug)]
+struct WebhookRateLimiter {
+    limit_per_window: u32,
+    window: Duration,
+    requests: Mutex<Vec<Instant>>,
+}
+
+impl WebhookRateLimiter {
+    fn new(limit_per_window: u32, window: Duration) -> Self {
+        Self {
+            limit_per_window,
+            window,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn allow(&self) -> bool {
+        if self.limit_per_window == 0 {
+            return true;
+        }
+
+        let now = Instant::now();
+        let cutoff = now.checked_sub(self.window).unwrap_or_else(Instant::now);
+        let mut requests = self.requests.lock().await;
+        requests.retain(|instant| *instant > cutoff);
+        if requests.len() >= self.limit_per_window as usize {
+            return false;
+        }
+        requests.push(now);
+        true
+    }
+}
+
+#[derive(Debug)]
+struct IdempotencyStore {
+    ttl: Duration,
+    max_keys: usize,
+    keys: Mutex<HashMap<String, Instant>>,
+}
+
+impl IdempotencyStore {
+    fn new(ttl: Duration, max_keys: usize) -> Self {
+        Self {
+            ttl,
+            max_keys: max_keys.max(1),
+            keys: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn record_if_new(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut keys = self.keys.lock().await;
+        keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        if keys.contains_key(key) {
+            return false;
+        }
+        if keys.len() >= self.max_keys {
+            let evict_key = keys
+                .iter()
+                .min_by_key(|(_, seen_at)| *seen_at)
+                .map(|(k, _)| k.clone());
+            if let Some(evict_key) = evict_key {
+                keys.remove(&evict_key);
+            }
+        }
+        keys.insert(key.to_string(), now);
+        true
+    }
 }
 
 pub async fn run(bind: &str, token: &str, workspace_dir: &Path, acl_enabled: bool) -> Result<()> {
@@ -65,6 +145,14 @@ pub async fn run(bind: &str, token: &str, workspace_dir: &Path, acl_enabled: boo
         token: Arc::<str>::from(trimmed_token.to_string()),
         db_path: Arc::new(db_path),
         acl_enabled,
+        rate_limiter: Arc::new(WebhookRateLimiter::new(
+            WEBHOOK_DEFAULT_RATE_LIMIT_PER_MINUTE,
+            Duration::from_secs(WEBHOOK_RATE_LIMIT_WINDOW_SECS),
+        )),
+        idempotency_store: Arc::new(IdempotencyStore::new(
+            Duration::from_secs(WEBHOOK_IDEMPOTENCY_TTL_SECS),
+            WEBHOOK_IDEMPOTENCY_MAX_KEYS,
+        )),
     };
 
     run_with_listener(listener, state).await
@@ -89,6 +177,17 @@ async fn handle_webhook_event(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
+    if !state.rate_limiter.allow().await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many webhook requests. Please retry later.",
+                "retry_after": WEBHOOK_RATE_LIMIT_WINDOW_SECS
+            })),
+        )
+            .into_response();
+    }
+
     if !is_authorized(&headers, &state.token) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -108,6 +207,25 @@ async fn handle_webhook_event(
                 .into_response();
         }
     };
+
+    let replay_key = headers
+        .get("X-Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("header:{value}"))
+        .unwrap_or_else(|| format!("event:{}", webhook_replay_fingerprint(&event)));
+    if !state.idempotency_store.record_if_new(&replay_key).await {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "duplicate",
+                "idempotent": true,
+                "message": "Request already processed"
+            })),
+        )
+            .into_response();
+    }
 
     let db_path = (*state.db_path).clone();
     let acl_enabled = state.acl_enabled;
@@ -449,6 +567,20 @@ fn webhook_topic_fingerprint(project: Option<&str>, external_id: &str, title: &s
     format!("{digest:x}")
 }
 
+fn webhook_replay_fingerprint(event: &WebhookEvent) -> String {
+    let payload = format!(
+        "{}:{}:{}:{}:{}:{}",
+        event.source.trim().to_lowercase(),
+        event.event_type.trim().to_lowercase(),
+        event.project.as_deref().unwrap_or("_global").trim().to_lowercase(),
+        event.external_id.trim().to_lowercase(),
+        event.actor.as_deref().unwrap_or_default().trim().to_lowercase(),
+        event.timestamp.trim()
+    );
+    let digest = Sha256::digest(payload.as_bytes());
+    format!("{digest:x}")
+}
+
 fn ensure_memory_schema(db_path: &Path) -> Result<()> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -474,6 +606,37 @@ mod tests {
             token: Arc::<str>::from(token.to_string()),
             db_path: Arc::new(db_path),
             acl_enabled: false,
+            rate_limiter: Arc::new(WebhookRateLimiter::new(
+                WEBHOOK_DEFAULT_RATE_LIMIT_PER_MINUTE,
+                Duration::from_secs(WEBHOOK_RATE_LIMIT_WINDOW_SECS),
+            )),
+            idempotency_store: Arc::new(IdempotencyStore::new(
+                Duration::from_secs(WEBHOOK_IDEMPOTENCY_TTL_SECS),
+                WEBHOOK_IDEMPOTENCY_MAX_KEYS,
+            )),
+        }
+    }
+
+    fn setup_state_with_limits(
+        tmp: &TempDir,
+        token: &str,
+        rate_limit_per_minute: u32,
+        idempotency_max_keys: usize,
+    ) -> WebhookState {
+        let db_path = tmp.path().join("memory").join("brain.db");
+        ensure_memory_schema(&db_path).unwrap();
+        WebhookState {
+            token: Arc::<str>::from(token.to_string()),
+            db_path: Arc::new(db_path),
+            acl_enabled: false,
+            rate_limiter: Arc::new(WebhookRateLimiter::new(
+                rate_limit_per_minute,
+                Duration::from_secs(WEBHOOK_RATE_LIMIT_WINDOW_SECS),
+            )),
+            idempotency_store: Arc::new(IdempotencyStore::new(
+                Duration::from_secs(WEBHOOK_IDEMPOTENCY_TTL_SECS),
+                idempotency_max_keys,
+            )),
         }
     }
 
@@ -681,5 +844,76 @@ mod tests {
 
         handle.abort();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_key_rejects_duplicate_replay() {
+        let tmp = TempDir::new().unwrap();
+        let app = router(setup_state_with_limits(&tmp, "secret", 60, 1024));
+        let body = json!({
+            "source": "custom",
+            "event_type": "issue.created",
+            "external_id": "issue#200",
+            "title": "Idempotent",
+            "content": "same",
+            "timestamp": Utc::now().to_rfc3339()
+        })
+        .to_string();
+
+        let req1 = Request::builder()
+            .method("POST")
+            .uri("/webhook/events")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .header("X-Idempotency-Key", "dup-key")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let resp1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        let req2 = Request::builder()
+            .method("POST")
+            .uri("/webhook/events")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .header("X-Idempotency-Key", "dup-key")
+            .body(Body::from(body))
+            .unwrap();
+        let resp2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let body2 = to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(parsed["status"], "duplicate");
+    }
+
+    #[tokio::test]
+    async fn webhook_rate_limit_rejects_excess_requests() {
+        let tmp = TempDir::new().unwrap();
+        let app = router(setup_state_with_limits(&tmp, "secret", 1, 1024));
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/webhook/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret")
+                .body(Body::from(
+                    json!({
+                        "source": "custom",
+                        "event_type": "issue.created",
+                        "external_id": format!("issue#{}", Uuid::new_v4()),
+                        "title": "rl",
+                        "content": "rl",
+                        "timestamp": Utc::now().to_rfc3339()
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(make_req()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }
