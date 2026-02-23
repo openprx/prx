@@ -999,10 +999,10 @@ async fn execute_one_tool(
         return Ok(format!("Unknown tool: {call_name}"));
     };
 
+    let root = call_arguments
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("tool arguments must be a JSON object"))?;
     if let Some(ctx) = scope_ctx {
-        let root = call_arguments
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("tool arguments must be a JSON object"))?;
         root.insert(
             "_zc_scope".to_string(),
             serde_json::json!({
@@ -1011,6 +1011,17 @@ async fn execute_one_tool(
                 "chat_type": ctx.chat_type,
                 "chat_id": ctx.chat_id,
             }),
+        );
+        root.insert(
+            "_zc_scope_trusted".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    } else {
+        // Never trust user-provided scope payloads when runtime has no trusted scope.
+        root.remove("_zc_scope");
+        root.insert(
+            "_zc_scope_trusted".to_string(),
+            serde_json::Value::Bool(false),
         );
     }
 

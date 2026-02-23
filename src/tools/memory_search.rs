@@ -147,6 +147,14 @@ fn parse_min_score(args: &serde_json::Value) -> f64 {
 }
 
 fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
+    let trusted = args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !trusted {
+        return None;
+    }
+
     let scope = args
         .get("_zc_scope")
         .and_then(serde_json::Value::as_object)?;
@@ -191,6 +199,20 @@ fn fallback_principal(ctx: &MemoryWriteContext) -> Principal {
             .as_deref()
             .map(ChatType::from_str)
             .unwrap_or(ChatType::Dm),
+        acl_enforced: true,
+    }
+}
+
+fn anonymous_principal() -> Principal {
+    Principal {
+        user_id: "anonymous:unknown:unknown".to_string(),
+        role: Role::Anonymous,
+        projects: Vec::new(),
+        visibility_ceiling: Visibility::Private,
+        blocked_patterns: Vec::new(),
+        current_channel: String::new(),
+        current_chat_id: String::new(),
+        current_chat_type: ChatType::Dm,
         acl_enforced: true,
     }
 }
@@ -376,6 +398,8 @@ fn search_topic_rows_with_scope(
     principal: &Principal,
     max_results: usize,
 ) -> anyhow::Result<Vec<MatchRow>> {
+    // Keep topic probing intentionally bounded to the top 3 topic hits.
+    // This caps query fan-out and keeps retrieval deterministic under load.
     let topics = topic::search_topics_fts(conn, query, 3)?;
     if topics.is_empty() {
         return Ok(Vec::new());
@@ -417,7 +441,7 @@ impl Tool for MemorySearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search memories from SQLite with ACL observe/enforce mode, with file fallback for compatibility."
+        "Search memories from SQLite with ACL observe/enforce mode; file fallback is only used when ACL is disabled."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -465,12 +489,29 @@ impl Tool for MemorySearchTool {
 
         let db_path = self.db_path();
         if !db_path.exists() {
+            if self.acl_enabled {
+                return Ok(ToolResult {
+                    success: true,
+                    output: format!("No matches found for query: '{trimmed_query}'"),
+                    error: None,
+                });
+            }
             return self.fallback_search_files(trimmed_query, max_results, min_score);
         }
 
         let conn = match Connection::open(&db_path) {
             Ok(conn) => conn,
             Err(error) => {
+                if self.acl_enabled {
+                    tracing::warn!(
+                        "memory_search sqlite open failed while acl is enabled: {error}"
+                    );
+                    return Ok(ToolResult {
+                        success: true,
+                        output: format!("No matches found for query: '{trimmed_query}'"),
+                        error: None,
+                    });
+                }
                 tracing::warn!("memory_search sqlite open failed, using file fallback: {error}");
                 return self.fallback_search_files(trimmed_query, max_results, min_score);
             }
@@ -480,7 +521,7 @@ impl Tool for MemorySearchTool {
         let principal = if let Some(ref ctx) = scope_ctx {
             resolve_principal(&conn, ctx).unwrap_or_else(|_| fallback_principal(ctx))
         } else {
-            owner_principal()
+            anonymous_principal()
         };
         let (scope_sql, scope_params) = principal.build_sql_scope();
 
@@ -733,7 +774,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = test_tool(&tmp, true);
+        let tool = test_tool(&tmp, false);
         let result = tool
             .execute(json!({"query": "rust", "maxResults": 10, "minScore": 0.1}))
             .await
@@ -757,7 +798,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = test_tool(&tmp, true);
+        let tool = test_tool(&tmp, false);
         let result = tool
             .execute(json!({"query": "alpha beta", "maxResults": 1, "minScore": 1.0}))
             .await
@@ -782,7 +823,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = test_tool(&tmp, true);
+        let tool = test_tool(&tmp, false);
         let result = tool
             .execute(json!({"query": "alpha beta", "max_results": 1, "minScore": 0.1}))
             .await
@@ -798,6 +839,18 @@ mod tests {
         let tool = test_tool(&tmp, true);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn acl_mode_disables_file_fallback() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("MEMORY.md"), "alpha fallback line\n").unwrap();
+
+        let tool = test_tool(&tmp, true);
+        let result = tool.execute(json!({"query": "alpha"})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("No matches found for query"));
     }
 
     #[tokio::test]
@@ -827,6 +880,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "query": "summary",
+                "_zc_scope_trusted": true,
                 "_zc_scope": {
                     "channel": "telegram",
                     "chat_type": "dm",
@@ -879,6 +933,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "query": "acl probe",
+                "_zc_scope_trusted": true,
                 "_zc_scope": {
                     "channel": "telegram",
                     "chat_type": "dm",
@@ -935,6 +990,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "query": "ceiling probe",
+                "_zc_scope_trusted": true,
                 "_zc_scope": {
                     "channel": "telegram",
                     "chat_type": "dm",
@@ -982,6 +1038,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "query": "owner probe",
+                "_zc_scope_trusted": true,
                 "_zc_scope": {
                     "channel": "telegram",
                     "chat_type": "dm",
@@ -993,6 +1050,52 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(result.output.contains("key: owner_k"));
+    }
+
+    #[tokio::test]
+    async fn untrusted_scope_payload_defaults_to_anonymous() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("private_k", "owner probe", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let conn = open_conn(&tmp);
+        conn.execute(
+            "INSERT INTO identity_bindings (id, user_id, channel, channel_account, bound_at, bound_by)
+             VALUES ('b1', 'owner_a', 'telegram', 'sender-owner', ?1, 'system')",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_policies (user_id, role, projects, visibility_ceiling, blocked_patterns, updated_at)
+             VALUES ('owner_a', 'owner', '[]', 'public', '[]', ?1)",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET visibility = 'private', sensitivity = 'normal' WHERE key = 'private_k'",
+            [],
+        )
+        .unwrap();
+
+        let tool = test_tool(&tmp, true);
+        let result = tool
+            .execute(json!({
+                "query": "owner probe",
+                "_zc_scope": {
+                    "channel": "telegram",
+                    "chat_type": "dm",
+                    "chat_id": "chat-1",
+                    "sender": "sender-owner"
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("No matches found for query"));
     }
 
     #[tokio::test]
@@ -1036,6 +1139,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "query": "entry",
+                "_zc_scope_trusted": true,
                 "_zc_scope": {
                     "channel": "telegram",
                     "chat_type": "dm",

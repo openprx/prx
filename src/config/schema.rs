@@ -3995,9 +3995,12 @@ impl Config {
             if self.webhook.bind.trim().is_empty() {
                 anyhow::bail!("webhook.bind must not be empty when webhook.enabled is true");
             }
-            self.webhook.bind.parse::<std::net::SocketAddr>().with_context(|| {
-                format!("invalid webhook.bind socket address: {}", self.webhook.bind)
-            })?;
+            self.webhook
+                .bind
+                .parse::<std::net::SocketAddr>()
+                .with_context(|| {
+                    format!("invalid webhook.bind socket address: {}", self.webhook.bind)
+                })?;
             if self
                 .webhook
                 .token

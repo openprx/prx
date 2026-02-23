@@ -403,7 +403,7 @@ pub fn classify_memory(
 }
 
 pub fn matches_sensitive_patterns(content: &str) -> bool {
-    let normalized = content.to_ascii_lowercase();
+    let normalized = content.nfkc().collect::<String>().to_lowercase();
     let no_space = normalized.replace(' ', "");
 
     SENSITIVE_PATTERNS
@@ -646,6 +646,11 @@ mod tests {
         assert_eq!(classified.visibility, Visibility::Owner);
         assert_eq!(classified.sensitivity, Sensitivity::Normal);
         assert_eq!(classified.risk_signals, Vec::<String>::new());
+    }
+
+    #[test]
+    fn matches_sensitive_patterns_detects_fullwidth_api_key() {
+        assert!(matches_sensitive_patterns("凭证是 ａｐｉ＿ｋｅｙ=abc123"));
     }
 
     #[test]
