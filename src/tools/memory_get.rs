@@ -103,6 +103,10 @@ impl Tool for MemoryGetTool {
                     "type": "string",
                     "description": "Memory key (preferred) or fallback memory file path"
                 },
+                "key": {
+                    "type": "string",
+                    "description": "Alias of path; memory key or fallback file path"
+                },
                 "from": {
                     "type": "integer",
                     "description": "1-based starting line number (default: 1)"
@@ -119,6 +123,7 @@ impl Tool for MemoryGetTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let path = args
             .get("path")
+            .or_else(|| args.get("key"))
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
 
@@ -302,6 +307,21 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn get_accepts_key_alias() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("memory_key", "line1\nline2\n", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = test_tool(&tmp);
+        let result = tool.execute(json!({"key": "memory_key"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("memory_key lines 1-2"));
+    }
+
     #[test]
     fn schema_exposes_openclaw_parameters() {
         let tmp = TempDir::new().unwrap();
@@ -310,6 +330,7 @@ mod tests {
 
         assert_eq!(tool.name(), "memory_get");
         assert!(schema["properties"]["path"].is_object());
+        assert!(schema["properties"]["key"].is_object());
         assert!(schema["properties"]["from"].is_object());
         assert!(schema["properties"]["lines"].is_object());
     }

@@ -384,6 +384,7 @@ Notes:
 |---|---|---|
 | `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `none` |
 | `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded) |
+| `acl_enabled` | `false` | memory ACL feature gate (Phase 0 keeps filtering disabled) |
 | `embedding_provider` | `none` | `none`, `openai`, or custom endpoint |
 | `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` route |
 | `embedding_dimensions` | `1536` | expected vector size for selected embedding model |
