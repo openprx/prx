@@ -2,6 +2,7 @@ use super::embeddings::EmbeddingProvider;
 use super::principal::{
     classify_memory, resolve_principal, ChatType, MemoryWriteContext, Principal, Role, Visibility,
 };
+use super::topic::resolve_topic;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
 use anyhow::Context;
@@ -498,6 +499,7 @@ impl SqliteMemory {
                         .as_deref()
                         .map(ChatType::from_str)
                         .unwrap_or(ChatType::Dm),
+                    acl_enforced: true,
                 };
                 let principal = if ctx.channel.is_some() && ctx.raw_sender.is_some() {
                     resolve_principal(&conn, &ctx).unwrap_or(fallback_principal)
@@ -505,6 +507,13 @@ impl SqliteMemory {
                     fallback_principal
                 };
                 let classified = classify_memory(&ctx, &content, &principal);
+                let topic_id = match resolve_topic(&conn, &content, &principal) {
+                    Ok(topic_id) => topic_id,
+                    Err(error) => {
+                        tracing::warn!("memory topic resolve failed: {error}");
+                        None
+                    }
+                };
                 let risk_json = serde_json::to_string(&classified.risk_signals)?;
                 let sender_id = if ctx.channel.is_some() && ctx.raw_sender.is_some() {
                     Some(principal.user_id)
@@ -517,8 +526,8 @@ impl SqliteMemory {
                     .map(|raw| ChatType::from_str(&raw).as_str().to_string());
 
                 conn.execute(
-                    "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, channel, chat_type, chat_id, sender_id, raw_sender, visibility, sensitivity, risk_signals, policy_version)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                    "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, channel, chat_type, chat_id, sender_id, raw_sender, topic_id, visibility, sensitivity, risk_signals, policy_version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                      ON CONFLICT(key) DO UPDATE SET
                         content = excluded.content,
                         category = excluded.category,
@@ -530,6 +539,7 @@ impl SqliteMemory {
                         chat_id = excluded.chat_id,
                         sender_id = excluded.sender_id,
                         raw_sender = excluded.raw_sender,
+                        topic_id = excluded.topic_id,
                         visibility = excluded.visibility,
                         sensitivity = excluded.sensitivity,
                         risk_signals = excluded.risk_signals,
@@ -548,6 +558,7 @@ impl SqliteMemory {
                         ctx.chat_id,
                         explicit_sender_id,
                         ctx.raw_sender,
+                        topic_id,
                         classified.visibility.as_str(),
                         classified.sensitivity.as_str(),
                         risk_json,
