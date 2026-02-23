@@ -109,6 +109,7 @@ fn compute_score(line: &str, terms: &[String]) -> f64 {
 fn parse_max_results(args: &serde_json::Value) -> usize {
     #[allow(clippy::cast_possible_truncation)]
     args.get("maxResults")
+        .or_else(|| args.get("max_results"))
         .and_then(serde_json::Value::as_u64)
         .map_or(DEFAULT_MAX_RESULTS, |n| n as usize)
         .clamp(1, MAX_RESULTS_LIMIT)
@@ -141,6 +142,10 @@ impl Tool for MemorySearchTool {
                 "maxResults": {
                     "type": "integer",
                     "description": "Maximum snippets to return (default: 5, max: 100)"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Alias of maxResults for compatibility"
                 },
                 "minScore": {
                     "type": "number",
@@ -387,6 +392,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_accepts_snake_case_max_results_alias() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("k1", "alpha beta gamma", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        memory
+            .store("k2", "alpha beta delta", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = test_tool(&tmp);
+        let result = tool
+            .execute(json!({"query": "alpha beta", "max_results": 1, "minScore": 0.1}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("Found 1 matches"));
+    }
+
+    #[tokio::test]
     async fn search_requires_query() {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(&tmp);
@@ -403,6 +431,7 @@ mod tests {
         assert_eq!(tool.name(), "memory_search");
         assert!(schema["properties"]["query"].is_object());
         assert!(schema["properties"]["maxResults"].is_object());
+        assert!(schema["properties"]["max_results"].is_object());
         assert!(schema["properties"]["minScore"].is_object());
     }
 }

@@ -1956,6 +1956,9 @@ pub struct MemoryConfig {
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
     pub auto_save: bool,
+    /// Feature gate for memory ACL enforcement. Phase 0 keeps this disabled.
+    #[serde(default)]
+    pub acl_enabled: bool,
     /// Run memory/session hygiene (archiving + retention cleanup)
     #[serde(default = "default_hygiene_enabled")]
     pub hygiene_enabled: bool,
@@ -2072,6 +2075,7 @@ impl Default for MemoryConfig {
         Self {
             backend: "sqlite".into(),
             auto_save: true,
+            acl_enabled: false,
             hygiene_enabled: default_hygiene_enabled(),
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
@@ -4523,6 +4527,7 @@ default_temperature = 0.7
         let m = MemoryConfig::default();
         assert_eq!(m.backend, "sqlite");
         assert!(m.auto_save);
+        assert!(!m.acl_enabled);
         assert!(m.hygiene_enabled);
         assert_eq!(m.archive_after_days, 7);
         assert_eq!(m.purge_after_days, 30);
@@ -4690,6 +4695,7 @@ default_temperature = 0.7
         assert!(!parsed.heartbeat.enabled);
         assert!(parsed.channels_config.cli);
         assert!(parsed.memory.hygiene_enabled);
+        assert!(!parsed.memory.acl_enabled);
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
