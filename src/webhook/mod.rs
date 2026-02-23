@@ -1,0 +1,611 @@
+use anyhow::{Context, Result};
+use axum::{
+    extract::State,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::post,
+    Json, Router,
+};
+use chrono::Utc;
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebhookEvent {
+    pub source: String,
+    pub event_type: String,
+    pub project: Option<String>,
+    pub external_id: String,
+    pub external_url: Option<String>,
+    pub title: String,
+    pub content: String,
+    pub actor: Option<String>,
+    pub timestamp: String,
+}
+
+#[derive(Clone)]
+struct WebhookState {
+    token: Arc<str>,
+    db_path: Arc<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebhookAck {
+    topic_id: String,
+}
+
+pub async fn run(bind: &str, token: &str, workspace_dir: &Path) -> Result<()> {
+    let trimmed_token = token.trim();
+    if trimmed_token.is_empty() {
+        anyhow::bail!("webhook token must not be empty when webhook is enabled");
+    }
+
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    ensure_memory_schema(&db_path)?;
+
+    let listener = TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("failed to bind webhook server at {bind}"))?;
+    let addr = listener.local_addr()?;
+
+    tracing::info!("Webhook server listening on {}", addr);
+
+    let state = WebhookState {
+        token: Arc::<str>::from(trimmed_token.to_string()),
+        db_path: Arc::new(db_path),
+    };
+
+    run_with_listener(listener, state).await
+}
+
+async fn run_with_listener(listener: TcpListener, state: WebhookState) -> Result<()> {
+    let app = router(state);
+    axum::serve(listener, app)
+        .await
+        .context("webhook server stopped unexpectedly")?;
+    Ok(())
+}
+
+fn router(state: WebhookState) -> Router {
+    Router::new()
+        .route("/webhook/events", post(handle_webhook_event))
+        .with_state(state)
+}
+
+async fn handle_webhook_event(
+    State(state): State<WebhookState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    if !is_authorized(&headers, &state.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Unauthorized" })),
+        )
+            .into_response();
+    }
+
+    let event = match parse_webhook_event(payload) {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::warn!("invalid webhook event payload: {error}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Invalid webhook event" })),
+            )
+                .into_response();
+        }
+    };
+
+    let db_path = (*state.db_path).clone();
+    let saved = tokio::task::spawn_blocking(move || persist_event(&db_path, &event)).await;
+
+    match saved {
+        Ok(Ok(topic_id)) => {
+            (StatusCode::OK, Json(serde_json::json!(WebhookAck { topic_id }))).into_response()
+        }
+        Ok(Err(error)) => {
+            tracing::error!("failed to persist webhook event: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Failed to persist event" })),
+            )
+                .into_response()
+        }
+        Err(join_error) => {
+            tracing::error!("webhook worker panicked: {join_error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Webhook worker failure" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn is_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
+    let Some(raw) = headers.get(AUTHORIZATION) else {
+        return false;
+    };
+
+    let Ok(value) = raw.to_str() else {
+        return false;
+    };
+
+    let Some(token) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+
+    token.trim() == expected_token
+}
+
+fn parse_webhook_event(payload: Value) -> Result<WebhookEvent> {
+    if is_openpr_payload(&payload) {
+        return map_openpr_event(&payload);
+    }
+
+    let mut event: WebhookEvent = serde_json::from_value(payload)
+        .context("payload does not match generic webhook event format")?;
+
+    normalize_event(&mut event);
+    validate_event(&event)?;
+    Ok(event)
+}
+
+fn normalize_event(event: &mut WebhookEvent) {
+    event.source = event.source.trim().to_lowercase();
+    event.event_type = event.event_type.trim().to_lowercase();
+    event.external_id = event.external_id.trim().to_lowercase();
+    event.title = event.title.trim().to_string();
+    event.content = event.content.trim().to_string();
+    if event.timestamp.trim().is_empty() {
+        event.timestamp = Utc::now().to_rfc3339();
+    } else {
+        event.timestamp = event.timestamp.trim().to_string();
+    }
+    event.project = event
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    event.external_url = event
+        .external_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    event.actor = event
+        .actor
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+}
+
+fn validate_event(event: &WebhookEvent) -> Result<()> {
+    if event.source.is_empty()
+        || event.event_type.is_empty()
+        || event.external_id.is_empty()
+        || event.title.is_empty()
+        || event.content.is_empty()
+    {
+        anyhow::bail!("event contains required empty fields");
+    }
+    Ok(())
+}
+
+fn is_openpr_payload(payload: &Value) -> bool {
+    payload.get("workspace_id").is_some()
+        || payload.get("issue_id").is_some()
+        || payload.get("issue_identifier").is_some()
+        || payload.get("comment_id").is_some()
+}
+
+fn map_openpr_event(payload: &Value) -> Result<WebhookEvent> {
+    let source = "openpr".to_string();
+
+    let event_type = first_string(payload, &["event_type", "event", "type", "action"])
+        .map(|value| normalize_openpr_event_type(&value))
+        .unwrap_or_else(|| "issue.updated".to_string());
+
+    let workspace_id = first_string(payload, &["workspace_id", "project", "project_id"]);
+
+    let issue_identifier = first_string(payload, &["issue_identifier", "issue_id"]);
+    let comment_id = first_string(payload, &["comment_id"]);
+
+    let external_id = if let Some(identifier) = issue_identifier {
+        format!("issue#{}", identifier.trim())
+    } else if let Some(identifier) = comment_id {
+        format!("comment#{}", identifier.trim())
+    } else {
+        anyhow::bail!("openpr payload missing issue/comment identifier");
+    };
+
+    let external_url = first_string(
+        payload,
+        &["external_url", "issue_url", "comment_url", "url", "html_url"],
+    );
+
+    let title = first_string(
+        payload,
+        &["title", "issue_title", "comment_title", "subject", "name"],
+    )
+    .unwrap_or_else(|| format!("OpenPR {}", external_id));
+
+    let content = first_string(
+        payload,
+        &["content", "body", "description", "text", "comment", "message"],
+    )
+    .unwrap_or_else(|| title.clone());
+
+    let actor = first_string(payload, &["actor", "operator", "author", "user"]);
+
+    let timestamp = first_string(
+        payload,
+        &["timestamp", "occurred_at", "created_at", "updated_at"],
+    )
+    .unwrap_or_else(|| Utc::now().to_rfc3339());
+
+    let mut event = WebhookEvent {
+        source,
+        event_type,
+        project: workspace_id,
+        external_id,
+        external_url,
+        title,
+        content,
+        actor,
+        timestamp,
+    };
+
+    normalize_event(&mut event);
+    validate_event(&event)?;
+    Ok(event)
+}
+
+fn first_string(payload: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        let Some(value) = payload.get(*key) else {
+            continue;
+        };
+        if let Some(as_str) = value.as_str() {
+            let trimmed = as_str.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+            continue;
+        }
+        if value.is_number() || value.is_boolean() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn normalize_openpr_event_type(raw: &str) -> String {
+    let normalized = raw.trim().to_lowercase().replace('_', ".");
+    if normalized.contains('.') {
+        return normalized;
+    }
+
+    if normalized == "closed" {
+        return "issue.closed".to_string();
+    }
+    if normalized == "reopened" {
+        return "issue.reopened".to_string();
+    }
+    if normalized == "created" {
+        return "issue.created".to_string();
+    }
+
+    format!("issue.{normalized}")
+}
+
+fn persist_event(db_path: &Path, event: &WebhookEvent) -> Result<String> {
+    let mut conn = Connection::open(db_path)
+        .with_context(|| format!("failed to open webhook db {}", db_path.display()))?;
+    let tx = conn.transaction()?;
+
+    let topic_id = match crate::memory::topic::find_topic_by_external(&tx, &event.external_id)? {
+        Some(topic) => topic.id,
+        None => {
+            let fingerprint = webhook_topic_fingerprint(
+                event.project.as_deref(),
+                &event.external_id,
+                &event.title,
+            );
+            crate::memory::topic::create_topic(
+                &tx,
+                &event.title,
+                event.project.as_deref(),
+                Some(&event.external_id),
+                &fingerprint,
+            )?
+        }
+    };
+
+    if let Some(url) = event.external_url.as_deref() {
+        tx.execute(
+            "UPDATE topics
+             SET external_url = COALESCE(external_url, ?1),
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![url, Utc::now().to_rfc3339(), &topic_id],
+        )?;
+    }
+
+    let system_sender = format!("system:{}", event.source);
+    crate::memory::topic::add_participant(&tx, &topic_id, &system_sender, "observer")?;
+
+    let memory_id = Uuid::new_v4().to_string();
+    let memory_key = format!(
+        "webhook:{}:{}:{}",
+        event.source,
+        event.external_id,
+        Uuid::new_v4()
+    );
+    let content = format_event_memory(event);
+
+    tx.execute(
+        "INSERT INTO memories (
+            id, key, content, category, created_at, updated_at,
+            channel, chat_type, sender_id, topic_id,
+            visibility, sensitivity, risk_signals, policy_version
+         )
+         VALUES (?1, ?2, ?3, 'conversation', ?4, ?4, ?5, ?6, ?7, ?8, ?9, 'normal', '[]', 1)",
+        params![
+            &memory_id,
+            &memory_key,
+            &content,
+            &event.timestamp,
+            "webhook",
+            "webhook",
+            &system_sender,
+            &topic_id,
+            "project",
+        ],
+    )?;
+
+    match event.event_type.as_str() {
+        "issue.closed" => crate::memory::topic::update_topic_status(&tx, &topic_id, "resolved")?,
+        "issue.reopened" => crate::memory::topic::update_topic_status(&tx, &topic_id, "open")?,
+        _ => crate::memory::topic::touch_topic(&tx, &topic_id)?,
+    }
+
+    tx.commit()?;
+    Ok(topic_id)
+}
+
+fn format_event_memory(event: &WebhookEvent) -> String {
+    let mut lines = vec![
+        format!("source: {}", event.source),
+        format!("event_type: {}", event.event_type),
+        format!("external_id: {}", event.external_id),
+        format!("title: {}", event.title),
+        format!("content: {}", event.content),
+        format!("timestamp: {}", event.timestamp),
+    ];
+
+    if let Some(project) = &event.project {
+        lines.push(format!("project: {project}"));
+    }
+    if let Some(url) = &event.external_url {
+        lines.push(format!("external_url: {url}"));
+    }
+    if let Some(actor) = &event.actor {
+        lines.push(format!("actor: {actor}"));
+    }
+
+    lines.join("\n")
+}
+
+fn webhook_topic_fingerprint(project: Option<&str>, external_id: &str, title: &str) -> String {
+    let payload = format!(
+        "{}:{}:{}",
+        project.unwrap_or_default().trim().to_lowercase(),
+        external_id.trim().to_lowercase(),
+        title.trim().to_lowercase(),
+    );
+    let digest = Sha256::digest(payload.as_bytes());
+    format!("{digest:x}")
+}
+
+fn ensure_memory_schema(db_path: &Path) -> Result<()> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = crate::memory::SqliteMemory::new_with_path(db_path.to_path_buf())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use std::net::SocketAddr;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    fn setup_state(tmp: &TempDir, token: &str) -> WebhookState {
+        let db_path = tmp.path().join("memory").join("brain.db");
+        ensure_memory_schema(&db_path).unwrap();
+        WebhookState {
+            token: Arc::<str>::from(token.to_string()),
+            db_path: Arc::new(db_path),
+        }
+    }
+
+    #[tokio::test]
+    async fn token_auth_missing_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let app = router(setup_state(&tmp, "secret"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhook/events")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "source": "custom",
+                    "event_type": "issue.created",
+                    "external_id": "issue#1",
+                    "title": "test",
+                    "content": "test",
+                    "timestamp": Utc::now().to_rfc3339()
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_auth_invalid_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let app = router(setup_state(&tmp, "secret"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhook/events")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wrong")
+            .body(Body::from(
+                json!({
+                    "source": "custom",
+                    "event_type": "issue.created",
+                    "external_id": "issue#1",
+                    "title": "test",
+                    "content": "test",
+                    "timestamp": Utc::now().to_rfc3339()
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_auth_valid_accepts_and_persists_topic() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory").join("brain.db");
+        let app = router(setup_state(&tmp, "secret"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhook/events")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .body(Body::from(
+                json!({
+                    "source": "custom",
+                    "event_type": "issue.created",
+                    "project": "openpr",
+                    "external_id": "issue#42",
+                    "external_url": "https://example.com/issues/42",
+                    "title": "Issue 42",
+                    "content": "details",
+                    "actor": "zeroclaw_user",
+                    "timestamp": Utc::now().to_rfc3339()
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let topic_id = parsed
+            .get("topic_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(!topic_id.is_empty());
+
+        let conn = Connection::open(db_path).unwrap();
+        let topic_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM topics WHERE external_id = 'issue#42'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(topic_count, 1);
+
+        let visibility: String = conn
+            .query_row(
+                "SELECT visibility FROM memories WHERE topic_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                params![topic_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visibility, "project");
+    }
+
+    #[test]
+    fn openpr_payload_maps_to_generic_event() {
+        let payload = json!({
+            "workspace_id": "openpr",
+            "issue_identifier": 88,
+            "event_type": "issue.closed",
+            "title": "Close issue",
+            "content": "merged",
+            "actor": "project_bot",
+            "timestamp": "2026-02-23T00:00:00Z"
+        });
+
+        let mapped = parse_webhook_event(payload).unwrap();
+        assert_eq!(mapped.source, "openpr");
+        assert_eq!(mapped.external_id, "issue#88");
+        assert_eq!(mapped.event_type, "issue.closed");
+        assert_eq!(mapped.project.as_deref(), Some("openpr"));
+    }
+
+    #[tokio::test]
+    async fn webhook_server_starts_with_listener() {
+        let tmp = TempDir::new().unwrap();
+        let state = setup_state(&tmp, "secret");
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = tokio::spawn(async move {
+            let _ = run_with_listener(listener, state).await;
+        });
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{addr}/webhook/events"))
+            .bearer_auth("secret")
+            .json(&json!({
+                "source": "custom",
+                "event_type": "issue.created",
+                "external_id": "issue#100",
+                "title": "Boot",
+                "content": "ok",
+                "timestamp": Utc::now().to_rfc3339()
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        handle.abort();
+        let _ = handle.await;
+    }
+}

@@ -155,6 +155,10 @@ pub struct Config {
     #[serde(default)]
     pub gateway: GatewayConfig,
 
+    /// Standalone webhook receiver for external event -> topic synchronization (`[webhook]`).
+    #[serde(default)]
+    pub webhook: MemoryWebhookConfig,
+
     /// Composio managed OAuth tools integration (`[composio]`).
     #[serde(default)]
     pub composio: ComposioConfig,
@@ -1069,6 +1073,33 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryWebhookConfig {
+    /// Enable the standalone webhook receiver.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Socket address for the receiver (e.g. "0.0.0.0:18799").
+    #[serde(default = "default_memory_webhook_bind")]
+    pub bind: String,
+    /// Required bearer token for incoming webhook events.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+fn default_memory_webhook_bind() -> String {
+    "0.0.0.0:18799".to_string()
+}
+
+impl Default for MemoryWebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_memory_webhook_bind(),
+            token: None,
         }
     }
 }
@@ -3560,6 +3591,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            webhook: MemoryWebhookConfig::default(),
             composio: ComposioConfig::default(),
             mcp: McpConfig::default(),
             secrets: SecretsConfig::default(),
@@ -3958,6 +3990,24 @@ impl Config {
         // Gateway
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
+        }
+        if self.webhook.enabled {
+            if self.webhook.bind.trim().is_empty() {
+                anyhow::bail!("webhook.bind must not be empty when webhook.enabled is true");
+            }
+            self.webhook.bind.parse::<std::net::SocketAddr>().with_context(|| {
+                format!("invalid webhook.bind socket address: {}", self.webhook.bind)
+            })?;
+            if self
+                .webhook
+                .token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                anyhow::bail!("webhook.token must be set when webhook.enabled is true");
+            }
         }
 
         // Autonomy
@@ -4684,6 +4734,7 @@ default_temperature = 0.7
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            webhook: MemoryWebhookConfig::default(),
             composio: ComposioConfig::default(),
             mcp: McpConfig::default(),
             secrets: SecretsConfig::default(),
@@ -4889,6 +4940,7 @@ tool_dispatcher = "xml"
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            webhook: MemoryWebhookConfig::default(),
             composio: ComposioConfig::default(),
             mcp: McpConfig::default(),
             secrets: SecretsConfig::default(),
