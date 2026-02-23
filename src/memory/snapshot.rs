@@ -147,7 +147,102 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
             content_hash TEXT PRIMARY KEY,
             embedding    BLOB NOT NULL,
             created_at   TEXT NOT NULL
-        );",
+        );
+
+        CREATE TABLE IF NOT EXISTS identity_bindings (
+            id              TEXT PRIMARY KEY,
+            user_id         TEXT NOT NULL,
+            channel         TEXT NOT NULL,
+            channel_account TEXT NOT NULL,
+            display_name    TEXT,
+            bound_at        TEXT NOT NULL,
+            bound_by        TEXT NOT NULL,
+            UNIQUE(channel, channel_account)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ib_user ON identity_bindings(user_id);
+        CREATE INDEX IF NOT EXISTS idx_ib_channel_account ON identity_bindings(channel, channel_account);
+
+        CREATE TABLE IF NOT EXISTS user_policies (
+            user_id             TEXT PRIMARY KEY,
+            role                TEXT NOT NULL DEFAULT 'guest',
+            projects            TEXT NOT NULL DEFAULT '[]',
+            visibility_ceiling  TEXT NOT NULL DEFAULT 'private',
+            blocked_patterns    TEXT NOT NULL DEFAULT '[]',
+            policy_version      INTEGER NOT NULL DEFAULT 1,
+            updated_at          TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS topics (
+            id              TEXT PRIMARY KEY,
+            title           TEXT NOT NULL,
+            project         TEXT,
+            external_id     TEXT,
+            external_url    TEXT,
+            fingerprint     TEXT,
+            status          TEXT NOT NULL DEFAULT 'open',
+            tags            TEXT DEFAULT '[]',
+            summary         TEXT,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            resolved_at     TEXT,
+            UNIQUE(project, external_id),
+            UNIQUE(fingerprint)
+        );
+        CREATE INDEX IF NOT EXISTS idx_topic_project ON topics(project);
+        CREATE INDEX IF NOT EXISTS idx_topic_status ON topics(status);
+        CREATE INDEX IF NOT EXISTS idx_topic_external ON topics(external_id);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS topics_fts
+            USING fts5(title, summary, tags, content='topics', content_rowid='rowid');
+
+        CREATE TRIGGER IF NOT EXISTS topics_ai AFTER INSERT ON topics BEGIN
+            INSERT INTO topics_fts(rowid, title, summary, tags)
+            VALUES (new.rowid, new.title, new.summary, new.tags);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS topics_ad AFTER DELETE ON topics BEGIN
+            INSERT INTO topics_fts(topics_fts, rowid, title, summary, tags)
+            VALUES ('delete', old.rowid, old.title, old.summary, old.tags);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS topics_au AFTER UPDATE ON topics BEGIN
+            INSERT INTO topics_fts(topics_fts, rowid, title, summary, tags)
+            VALUES ('delete', old.rowid, old.title, old.summary, old.tags);
+            INSERT INTO topics_fts(rowid, title, summary, tags)
+            VALUES (new.rowid, new.title, new.summary, new.tags);
+        END;
+
+        CREATE TABLE IF NOT EXISTS topic_participants (
+            topic_id    TEXT NOT NULL,
+            user_id     TEXT NOT NULL,
+            role        TEXT NOT NULL DEFAULT 'participant',
+            joined_at   TEXT NOT NULL,
+            PRIMARY KEY (topic_id, user_id),
+            FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS topic_aliases (
+            from_topic_id TEXT NOT NULL,
+            to_topic_id   TEXT NOT NULL,
+            reason        TEXT,
+            operator      TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            PRIMARY KEY (from_topic_id),
+            FOREIGN KEY (to_topic_id) REFERENCES topics(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS access_audit_log (
+            id          TEXT PRIMARY KEY,
+            timestamp   TEXT NOT NULL,
+            requester   TEXT NOT NULL,
+            action      TEXT NOT NULL,
+            query       TEXT,
+            memory_id   TEXT,
+            policy_rule TEXT,
+            result      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_time ON access_audit_log(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_requester ON access_audit_log(requester);",
     )?;
 
     let now = Local::now().to_rfc3339();

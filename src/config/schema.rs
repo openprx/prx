@@ -135,6 +135,14 @@ pub struct Config {
     #[serde(default)]
     pub memory: MemoryConfig,
 
+    /// Static identity bindings loaded at startup (`[[identity_bindings]]`).
+    #[serde(default)]
+    pub identity_bindings: Vec<IdentityBindingConfig>,
+
+    /// Static user policy records loaded at startup (`[[user_policies]]`).
+    #[serde(default)]
+    pub user_policies: Vec<UserPolicyConfig>,
+
     /// Persistent storage provider configuration (`[storage]`).
     #[serde(default)]
     pub storage: StorageConfig,
@@ -2099,6 +2107,38 @@ impl Default for MemoryConfig {
     }
 }
 
+/// Startup identity binding entry (`[[identity_bindings]]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IdentityBindingConfig {
+    pub user_id: String,
+    pub channel: String,
+    pub channel_account: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// Startup user policy entry (`[[user_policies]]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UserPolicyConfig {
+    pub user_id: String,
+    #[serde(default = "default_user_policy_role")]
+    pub role: String,
+    #[serde(default)]
+    pub projects: Vec<String>,
+    #[serde(default = "default_user_policy_visibility_ceiling")]
+    pub visibility_ceiling: String,
+    #[serde(default)]
+    pub blocked_patterns: Vec<String>,
+}
+
+fn default_user_policy_role() -> String {
+    "guest".into()
+}
+
+fn default_user_policy_visibility_ceiling() -> String {
+    "private".into()
+}
+
 // ── Observability ─────────────────────────────────────────────────
 
 /// Observability backend configuration (`[observability]` section).
@@ -3515,6 +3555,8 @@ impl Default for Config {
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
+            identity_bindings: Vec::new(),
+            user_policies: Vec::new(),
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
@@ -4637,6 +4679,8 @@ default_temperature = 0.7
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
+            identity_bindings: Vec::new(),
+            user_policies: Vec::new(),
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
@@ -4699,6 +4743,33 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
+    }
+
+    #[test]
+    async fn config_parses_identity_bindings_and_user_policies() {
+        let raw = r#"
+default_temperature = 0.7
+
+[[identity_bindings]]
+user_id = "ak"
+channel = "signal"
+channel_account = "d26c8bda-58c5-4eb4-9997-0b011129fd58"
+
+[[user_policies]]
+user_id = "ak"
+role = "owner"
+projects = []
+visibility_ceiling = "public"
+blocked_patterns = []
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.identity_bindings.len(), 1);
+        assert_eq!(parsed.identity_bindings[0].user_id, "ak");
+        assert_eq!(parsed.identity_bindings[0].channel, "signal");
+        assert_eq!(parsed.user_policies.len(), 1);
+        assert_eq!(parsed.user_policies[0].role, "owner");
+        assert_eq!(parsed.user_policies[0].visibility_ceiling, "public");
     }
 
     #[test]
@@ -4813,6 +4884,8 @@ tool_dispatcher = "xml"
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
+            identity_bindings: Vec::new(),
+            user_policies: Vec::new(),
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),

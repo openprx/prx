@@ -169,6 +169,8 @@ pub async fn run_wizard() -> Result<Config> {
         cron: crate::config::CronConfig::default(),
         channels_config,
         memory: memory_config, // User-selected memory backend
+        identity_bindings: Vec::new(),
+        user_policies: Vec::new(),
         storage: StorageConfig::default(),
         tunnel: tunnel_config,
         gateway: crate::config::GatewayConfig::default(),
@@ -415,6 +417,8 @@ async fn run_quick_setup_with_home(
         cron: crate::config::CronConfig::default(),
         channels_config: ChannelsConfig::default(),
         memory: memory_config,
+        identity_bindings: Vec::new(),
+        user_policies: Vec::new(),
         storage: StorageConfig::default(),
         tunnel: crate::config::TunnelConfig::default(),
         gateway: crate::config::GatewayConfig::default(),

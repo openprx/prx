@@ -66,7 +66,7 @@ use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, ScopeCont
 use crate::config::Config;
 use crate::hooks::HookManager;
 use crate::identity;
-use crate::memory::{self, Memory};
+use crate::memory::{self, Memory, MemoryWriteContext};
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
@@ -1343,13 +1343,26 @@ async fn process_channel_message(
     };
     if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
         let autosave_key = conversation_memory_key(&msg);
+        let inferred_chat_type = if msg.reply_target.starts_with("group:") {
+            "group".to_string()
+        } else {
+            "dm".to_string()
+        };
+        let write_ctx = MemoryWriteContext {
+            channel: Some(msg.channel.clone()),
+            chat_type: Some(inferred_chat_type),
+            chat_id: Some(msg.reply_target.clone()),
+            sender_id: None,
+            raw_sender: Some(msg.sender.clone()),
+        };
         let _ = ctx
             .memory
-            .store(
+            .store_with_context(
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
                 None,
+                Some(&write_ctx),
             )
             .await;
     }

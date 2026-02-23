@@ -6,6 +6,7 @@ pub mod lucid;
 pub mod markdown;
 pub mod none;
 pub mod postgres;
+pub mod principal;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
@@ -21,16 +22,23 @@ pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
+pub use principal::{ChatType, MemoryWriteContext, Principal, Role, Sensitivity, Visibility};
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
 
-use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
+use crate::config::{
+    EmbeddingRouteConfig, IdentityBindingConfig, MemoryConfig, StorageProviderConfig,
+    UserPolicyConfig,
+};
 use anyhow::Context;
+use chrono::Local;
+use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::Arc;
+use uuid::Uuid;
 
 fn create_memory_with_builders<F, G>(
     backend_name: &str,
@@ -169,7 +177,15 @@ pub fn create_memory(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], None, workspace_dir, api_key)
+    create_memory_with_storage_and_routes_with_acl(
+        config,
+        &[],
+        None,
+        workspace_dir,
+        api_key,
+        &[],
+        &[],
+    )
 }
 
 /// Factory: create memory with optional storage-provider override.
@@ -179,7 +195,15 @@ pub fn create_memory_with_storage(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], storage_provider, workspace_dir, api_key)
+    create_memory_with_storage_and_routes_with_acl(
+        config,
+        &[],
+        storage_provider,
+        workspace_dir,
+        api_key,
+        &[],
+        &[],
+    )
 }
 
 /// Factory: create memory with optional storage-provider override and embedding routes.
@@ -189,6 +213,28 @@ pub fn create_memory_with_storage_and_routes(
     storage_provider: Option<&StorageProviderConfig>,
     workspace_dir: &Path,
     api_key: Option<&str>,
+) -> anyhow::Result<Box<dyn Memory>> {
+    create_memory_with_storage_and_routes_with_acl(
+        config,
+        embedding_routes,
+        storage_provider,
+        workspace_dir,
+        api_key,
+        &[],
+        &[],
+    )
+}
+
+/// Factory: create memory with optional storage override, embedding routes,
+/// and startup ACL bootstrap records.
+pub fn create_memory_with_storage_and_routes_with_acl(
+    config: &MemoryConfig,
+    embedding_routes: &[EmbeddingRouteConfig],
+    storage_provider: Option<&StorageProviderConfig>,
+    workspace_dir: &Path,
+    api_key: Option<&str>,
+    identity_bindings: &[IdentityBindingConfig],
+    user_policies: &[UserPolicyConfig],
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = effective_memory_backend_name(&config.backend, storage_provider);
     let backend_kind = classify_memory_backend(&backend_name);
@@ -281,13 +327,89 @@ pub fn create_memory_with_storage_and_routes(
         )
     }
 
-    create_memory_with_builders(
+    let memory = create_memory_with_builders(
         &backend_name,
         workspace_dir,
         || build_sqlite_memory(config, workspace_dir, &resolved_embedding),
         || build_postgres_memory(storage_provider),
         "",
-    )
+    )?;
+
+    if matches!(
+        backend_kind,
+        MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
+    ) {
+        if let Err(error) = upsert_acl_bootstrap(workspace_dir, identity_bindings, user_policies)
+        {
+            tracing::warn!("memory ACL bootstrap upsert skipped: {error}");
+        }
+    }
+
+    Ok(memory)
+}
+
+fn upsert_acl_bootstrap(
+    workspace_dir: &Path,
+    identity_bindings: &[IdentityBindingConfig],
+    user_policies: &[UserPolicyConfig],
+) -> anyhow::Result<()> {
+    if identity_bindings.is_empty() && user_policies.is_empty() {
+        return Ok(());
+    }
+
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+
+    let tx = conn.unchecked_transaction()?;
+    let now = Local::now().to_rfc3339();
+
+    for binding in identity_bindings {
+        tx.execute(
+            "INSERT INTO identity_bindings (id, user_id, channel, channel_account, display_name, bound_at, bound_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'system')
+             ON CONFLICT(channel, channel_account) DO UPDATE SET
+                 user_id = excluded.user_id,
+                 display_name = excluded.display_name,
+                 bound_at = excluded.bound_at,
+                 bound_by = excluded.bound_by",
+            params![
+                Uuid::new_v4().to_string(),
+                binding.user_id,
+                binding.channel,
+                binding.channel_account,
+                binding.display_name,
+                now
+            ],
+        )?;
+    }
+
+    for policy in user_policies {
+        let projects = serde_json::to_string(&policy.projects)?;
+        let blocked_patterns = serde_json::to_string(&policy.blocked_patterns)?;
+        tx.execute(
+            "INSERT INTO user_policies (user_id, role, projects, visibility_ceiling, blocked_patterns, policy_version, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 role = excluded.role,
+                 projects = excluded.projects,
+                 visibility_ceiling = excluded.visibility_ceiling,
+                 blocked_patterns = excluded.blocked_patterns,
+                 policy_version = excluded.policy_version,
+                 updated_at = excluded.updated_at",
+            params![
+                policy.user_id,
+                policy.role,
+                projects,
+                policy.visibility_ceiling,
+                blocked_patterns,
+                now
+            ],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(())
 }
 
 pub fn create_memory_for_migration(
