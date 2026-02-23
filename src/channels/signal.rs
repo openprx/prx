@@ -55,7 +55,11 @@ async fn run_command(cmd: &str, args: &[&str]) -> Option<String> {
         .ok()?;
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).to_string();
-        if text.trim().is_empty() { None } else { Some(text) }
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     } else {
         tracing::debug!(
             "run_command {cmd} failed: {}",
@@ -67,12 +71,45 @@ async fn run_command(cmd: &str, args: &[&str]) -> Option<String> {
 
 /// Return true if the file should be treated as plain text (read directly).
 fn is_text_file(content_type: &str, ext: &str) -> bool {
-    content_type.starts_with("text/") || matches!(ext,
-        "txt" | "csv" | "json" | "xml" | "yaml" | "yml" | "toml" | "md" | "html" |
-        "log" | "ini" | "conf" | "cfg" | "env" |
-        "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "cpp" | "h" | "sh" | "sql" |
-        "vue" | "svelte" | "jsx" | "tsx" | "rb" | "php" | "swift" | "kt" | "cs" | "r"
-    )
+    content_type.starts_with("text/")
+        || matches!(
+            ext,
+            "txt"
+                | "csv"
+                | "json"
+                | "xml"
+                | "yaml"
+                | "yml"
+                | "toml"
+                | "md"
+                | "html"
+                | "log"
+                | "ini"
+                | "conf"
+                | "cfg"
+                | "env"
+                | "rs"
+                | "py"
+                | "js"
+                | "ts"
+                | "go"
+                | "java"
+                | "c"
+                | "cpp"
+                | "h"
+                | "sh"
+                | "sql"
+                | "vue"
+                | "svelte"
+                | "jsx"
+                | "tsx"
+                | "rb"
+                | "php"
+                | "swift"
+                | "kt"
+                | "cs"
+                | "r"
+        )
 }
 
 /// Extract readable text from a document file.
@@ -95,7 +132,8 @@ async fn extract_document_text(path: &str, content_type: &str, filename: &str) -
     }
 
     // XLSX / XLS → openpyxl or xlsx2csv
-    if ext == "xlsx" || ext == "xls"
+    if ext == "xlsx"
+        || ext == "xls"
         || content_type.contains("spreadsheet")
         || content_type.contains("ms-excel")
     {
@@ -104,7 +142,9 @@ async fn extract_document_text(path: &str, content_type: &str, filename: &str) -
             [print('\\n=== ' + ws.title + ' ===\\n' + '\\n'.join('\\t'.join(str(c.value or '') for c in row) for row in ws.iter_rows())) for ws in wb.worksheets]",
             path.replace('\'', "\\'")
         );
-        if let Some(t) = run_command("python3", &["-c", &script]).await { return Some(t); }
+        if let Some(t) = run_command("python3", &["-c", &script]).await {
+            return Some(t);
+        }
         return run_command("xlsx2csv", &[path]).await;
     }
 
@@ -115,7 +155,9 @@ async fn extract_document_text(path: &str, content_type: &str, filename: &str) -
             print('\\n'.join(p.text for p in d.paragraphs if p.text.strip()))",
             path.replace('\'', "\\'")
         );
-        if let Some(t) = run_command("python3", &["-c", &script]).await { return Some(t); }
+        if let Some(t) = run_command("python3", &["-c", &script]).await {
+            return Some(t);
+        }
         return run_command("pandoc", &["-t", "plain", path]).await;
     }
 
@@ -126,13 +168,17 @@ async fn extract_document_text(path: &str, content_type: &str, filename: &str) -
             [print(shape.text) for slide in prs.slides for shape in slide.shapes if hasattr(shape, 'text') and shape.text.strip()]",
             path.replace('\'', "\\'")
         );
-        if let Some(t) = run_command("python3", &["-c", &script]).await { return Some(t); }
+        if let Some(t) = run_command("python3", &["-c", &script]).await {
+            return Some(t);
+        }
         return run_command("pandoc", &["-t", "plain", path]).await;
     }
 
     // RTF → unrtf or pandoc
     if ext == "rtf" || content_type.contains("rtf") {
-        if let Some(t) = run_command("unrtf", &["--text", path]).await { return Some(t); }
+        if let Some(t) = run_command("unrtf", &["--text", path]).await {
+            return Some(t);
+        }
         return run_command("pandoc", &["-t", "plain", path]).await;
     }
 
@@ -225,7 +271,17 @@ impl SignalChannel {
         ignore_stories: bool,
         media_config: crate::config::MediaConfig,
     ) -> Self {
-        Self::new_with_mode(http_url, account, group_id, allowed_from, ignore_attachments, ignore_stories, media_config, false, None)
+        Self::new_with_mode(
+            http_url,
+            account,
+            group_id,
+            allowed_from,
+            ignore_attachments,
+            ignore_stories,
+            media_config,
+            false,
+            None,
+        )
     }
 
     /// Like [`new`] but allows specifying native daemon mode.
@@ -503,7 +559,13 @@ impl SignalChannel {
                 bytes.len()
             );
 
-            return Self::make_attachment_marker(&temp_path, content_type, filename, &self.media_config).await;
+            return Self::make_attachment_marker(
+                &temp_path,
+                content_type,
+                filename,
+                &self.media_config,
+            )
+            .await;
         }
 
         // ── REST mode: download via signal-cli-rest-api ───────────────────────
@@ -554,10 +616,11 @@ impl SignalChannel {
         // Audio: attempt STT transcription via media engine
         if content_type.starts_with("audio/") {
             if let Some(transcription) =
-                crate::media::process_media_attachment(temp_path, content_type, media_config)
-                    .await
+                crate::media::process_media_attachment(temp_path, content_type, media_config).await
             {
-                return Some(format!("[Voice message transcription: \"{transcription}\"]"));
+                return Some(format!(
+                    "[Voice message transcription: \"{transcription}\"]"
+                ));
             }
             return Some(format!(
                 "<media:audio path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
@@ -567,8 +630,7 @@ impl SignalChannel {
         // Video: attempt frame extraction via media engine
         if content_type.starts_with("video/") {
             if let Some(frames) =
-                crate::media::process_media_attachment(temp_path, content_type, media_config)
-                    .await
+                crate::media::process_media_attachment(temp_path, content_type, media_config).await
             {
                 return Some(frames);
             }
@@ -885,7 +947,11 @@ impl Channel for SignalChannel {
         let text_content = &clean_text;
 
         // ── Native mode: JSON-RPC send ────────────────────────────────────────
-        tracing::info!("Signal send: is_native={} http_url={}", self.is_native, self.http_url);
+        tracing::info!(
+            "Signal send: is_native={} http_url={}",
+            self.is_native,
+            self.http_url
+        );
         if self.is_native {
             // In native mode, attachments are referenced as absolute paths.
             // signal-cli JSON-RPC expects plain absolute paths, not file:// URIs.
@@ -1053,10 +1119,7 @@ impl Channel for SignalChannel {
         };
 
         if use_polling {
-            tracing::info!(
-                "Signal channel using REST polling on {}...",
-                self.http_url
-            );
+            tracing::info!("Signal channel using REST polling on {}...", self.http_url);
             self.listen_polling(&poll_url, tx).await
         } else {
             tracing::info!("Signal channel using SSE on {}...", self.http_url);
@@ -1102,10 +1165,10 @@ impl Channel for SignalChannel {
 
     fn capabilities(&self) -> crate::channels::traits::ChannelCapabilities {
         crate::channels::traits::ChannelCapabilities {
-            edit: false,    // signal-cli does not support editing sent messages
-            delete: true,   // supported via remoteDelete RPC
-            thread: false,  // Signal has no native thread concept; degrades to quote reply
-            react: true,    // supported via sendReaction RPC
+            edit: false,   // signal-cli does not support editing sent messages
+            delete: true,  // supported via remoteDelete RPC
+            thread: false, // Signal has no native thread concept; degrades to quote reply
+            react: true,   // supported via sendReaction RPC
         }
     }
 
@@ -1113,11 +1176,7 @@ impl Channel for SignalChannel {
     ///
     /// `channel_id` is the recipient (E.164 phone, UUID, or `group:<id>`).
     /// `message_id` is the *timestamp* (in ms) of the message to delete, as a decimal string.
-    async fn delete_message(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn delete_message(&self, channel_id: &str, message_id: &str) -> anyhow::Result<()> {
         let ts: u64 = message_id
             .parse()
             .map_err(|_| anyhow::anyhow!("message_id must be a numeric timestamp (ms)"))?;
@@ -1497,8 +1556,16 @@ mod tests {
         let msg = ch.process_envelope(&env).unwrap();
         assert_eq!(msg.sender, uuid);
         assert_eq!(msg.reply_target, uuid);
-        assert!(msg.content.starts_with("Hello from privacy user"), "content: {}", msg.content);
-        assert!(msg.content.contains(&format!("[signal-meta sender={uuid}")), "content: {}", msg.content);
+        assert!(
+            msg.content.starts_with("Hello from privacy user"),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(&format!("[signal-meta sender={uuid}")),
+            "content: {}",
+            msg.content
+        );
 
         // Verify reply routing: UUID sender in DM should route as Direct
         let target = SignalChannel::parse_recipient_target(&msg.reply_target);
@@ -1557,8 +1624,16 @@ mod tests {
         let ch = make_channel();
         let env = make_envelope(Some("+1111111111"), Some("Hello!"));
         let msg = ch.process_envelope(&env).unwrap();
-        assert!(msg.content.starts_with("Hello!"), "content: {}", msg.content);
-        assert!(msg.content.contains("[signal-meta sender=+1111111111"), "content: {}", msg.content);
+        assert!(
+            msg.content.starts_with("Hello!"),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("[signal-meta sender=+1111111111"),
+            "content: {}",
+            msg.content
+        );
         assert_eq!(msg.sender, "+1111111111");
         assert_eq!(msg.channel, "signal");
     }

@@ -57,14 +57,8 @@ impl Tool for SessionsListTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let status_filter = args
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("all");
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(20) as usize;
+        let status_filter = args.get("status").and_then(|v| v.as_str()).unwrap_or("all");
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
         let runs = self.active_runs.read().await;
         let filtered: Vec<&SubAgentRun> = runs
@@ -172,10 +166,7 @@ mod tests {
             make_run("run2", SubAgentStatus::Completed("done".into()), "task2"),
         ]));
         let tool = SessionsListTool::new(runs);
-        let result = tool
-            .execute(json!({"status": "running"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"status": "running"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("run1"));
         assert!(!result.output.contains("run2"));

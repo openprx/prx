@@ -551,7 +551,10 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
-                    match provider.chat(request.clone(), current_model, temperature).await {
+                    match provider
+                        .chat(request.clone(), current_model, temperature)
+                        .await
+                    {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(

@@ -121,15 +121,15 @@ impl Tool for WebFetchTool {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent(
-                "Mozilla/5.0 (compatible; ZeroClaw/1.0; +https://zeroclaw.ai)",
-            )
+            .user_agent("Mozilla/5.0 (compatible; ZeroClaw/1.0; +https://zeroclaw.ai)")
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()?;
 
-        let response = client.get(url).send().await.map_err(|e| {
-            anyhow::anyhow!("Failed to fetch {}: {}", url, e)
-        })?;
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch {}: {}", url, e))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -145,7 +145,8 @@ impl Tool for WebFetchTool {
             .to_ascii_lowercase();
 
         let is_html = content_type.contains("html");
-        let is_text = content_type.contains("text") || content_type.contains("json")
+        let is_text = content_type.contains("text")
+            || content_type.contains("json")
             || content_type.contains("xml");
 
         if !is_html && !is_text && !content_type.is_empty() {
@@ -155,9 +156,10 @@ impl Tool for WebFetchTool {
             );
         }
 
-        let body = response.text().await.map_err(|e| {
-            anyhow::anyhow!("Failed to read response body from {}: {}", url, e)
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read response body from {}: {}", url, e))?;
 
         let output = if is_html || body.trim_start().starts_with('<') {
             Self::html_to_text(&body)
@@ -227,7 +229,10 @@ mod tests {
     fn test_html_to_text_decodes_entities() {
         let html = "<p>1 &lt; 2 &amp; 3 &gt; 0 &quot;quoted&quot; it&#39;s</p>";
         let text = WebFetchTool::html_to_text(html);
-        assert!(text.contains("1 < 2 & 3 > 0 \"quoted\" it's"), "got: {text}");
+        assert!(
+            text.contains("1 < 2 & 3 > 0 \"quoted\" it's"),
+            "got: {text}"
+        );
     }
 
     #[test]
@@ -281,9 +286,6 @@ mod tests {
         let tool = WebFetchTool::new(10000, 15);
         let result = tool.execute(json!({"url": "ftp://example.com"})).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("http://") || true); // scheme check
+        assert!(result.unwrap_err().to_string().contains("http://") || true); // scheme check
     }
 }

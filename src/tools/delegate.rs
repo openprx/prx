@@ -521,6 +521,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
             },
         );
         agents.insert(
@@ -535,6 +538,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
             },
         );
         agents
@@ -674,6 +680,9 @@ mod tests {
     fn agentic_config(allowed_tools: Vec<String>, max_iterations: usize) -> DelegateAgentConfig {
         DelegateAgentConfig {
             provider: "openrouter".to_string(),
+            identity_dir: None,
+            memory_scope: None,
+            spawn_enabled: None,
             model: "model-test".to_string(),
             system_prompt: Some("You are agentic.".to_string()),
             api_key: Some("delegate-test-credential".to_string()),
@@ -790,6 +799,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -896,6 +908,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -931,6 +946,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());

@@ -77,7 +77,12 @@ static TOOL_GROUPS: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
     std::sync::LazyLock::new(|| {
         let mut m = HashMap::new();
         // group:sessions
-        for tool in ["sessions_list", "sessions_send", "sessions_history", "sessions_spawn"] {
+        for tool in [
+            "sessions_list",
+            "sessions_send",
+            "sessions_history",
+            "sessions_spawn",
+        ] {
             m.insert(tool, "sessions");
         }
         // group:automation
@@ -89,7 +94,13 @@ static TOOL_GROUPS: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
             m.insert(tool, "ui");
         }
         // group:hardware
-        for tool in ["nodes", "hardware_read", "hardware_write", "hardware_gpio", "hardware_serial"] {
+        for tool in [
+            "nodes",
+            "hardware_read",
+            "hardware_write",
+            "hardware_gpio",
+            "hardware_serial",
+        ] {
             m.insert(tool, "hardware");
         }
         m
@@ -168,10 +179,7 @@ impl PolicyPipeline {
             if let Some(group_policy) = self.config.groups.get(group_name) {
                 let allowed = policy_str_to_bool(group_policy);
                 current_allowed = allowed;
-                reason = format!(
-                    "group:{group_name} policy: {}",
-                    group_policy
-                );
+                reason = format!("group:{group_name} policy: {}", group_policy);
             }
         }
 
@@ -180,10 +188,7 @@ impl PolicyPipeline {
             layers.push(PolicyLayer::Tool);
             let allowed = policy_str_to_bool(tool_policy);
             current_allowed = allowed;
-            reason = format!(
-                "tool-specific policy for '{tool_name}': {}",
-                tool_policy
-            );
+            reason = format!("tool-specific policy for '{tool_name}': {}", tool_policy);
         }
 
         if current_allowed {
@@ -209,7 +214,11 @@ mod tests {
     use crate::config::schema::ToolPolicyConfig;
     use std::collections::HashMap;
 
-    fn make_pipeline(default: &str, groups: HashMap<String, String>, tools: HashMap<String, String>) -> PolicyPipeline {
+    fn make_pipeline(
+        default: &str,
+        groups: HashMap<String, String>,
+        tools: HashMap<String, String>,
+    ) -> PolicyPipeline {
         PolicyPipeline::new(ToolPolicyConfig {
             default: default.to_string(),
             groups,

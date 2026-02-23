@@ -145,12 +145,16 @@ impl SubagentsTool {
             SubAgentStatus::Completed(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Subagent `{run_id}` already completed; cannot steer.")),
+                error: Some(format!(
+                    "Subagent `{run_id}` already completed; cannot steer."
+                )),
             }),
             SubAgentStatus::Failed(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Subagent `{run_id}` already failed ({e}); cannot steer.")),
+                error: Some(format!(
+                    "Subagent `{run_id}` already failed ({e}); cannot steer."
+                )),
             }),
         }
     }
@@ -204,14 +208,19 @@ impl Tool for SubagentsTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("list");
         match action {
             "list" => {
                 let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("all");
                 let limit = args
                     .get("limit")
                     .and_then(|v| v.as_u64())
-                    .map_or(DEFAULT_LIMIT, |v| usize::try_from(v).unwrap_or(DEFAULT_LIMIT));
+                    .map_or(DEFAULT_LIMIT, |v| {
+                        usize::try_from(v).unwrap_or(DEFAULT_LIMIT)
+                    });
                 self.execute_list(status, limit).await
             }
             "kill" => {
@@ -229,13 +238,17 @@ impl Tool for SubagentsTool {
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter for steer action"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Missing 'run_id' parameter for steer action")
+                    })?;
                 let message = args
                     .get("message")
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'message' parameter for steer action"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Missing 'message' parameter for steer action")
+                    })?;
                 self.execute_steer(run_id, message).await
             }
             _ => Ok(ToolResult {

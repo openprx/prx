@@ -154,9 +154,7 @@ mod tests {
     async fn missing_run_id_returns_error() {
         let runs = Arc::new(RwLock::new(Vec::new()));
         let tool = SessionsSendTool::new(runs);
-        let result = tool
-            .execute(json!({"message": "hello"}))
-            .await;
+        let result = tool.execute(json!({"message": "hello"})).await;
         assert!(result.is_err());
     }
 
@@ -164,9 +162,7 @@ mod tests {
     async fn missing_message_returns_error() {
         let runs = Arc::new(RwLock::new(Vec::new()));
         let tool = SessionsSendTool::new(runs);
-        let result = tool
-            .execute(json!({"run_id": "abc"}))
-            .await;
+        let result = tool.execute(json!({"run_id": "abc"})).await;
         assert!(result.is_err());
     }
 

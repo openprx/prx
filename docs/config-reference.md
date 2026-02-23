@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 19, 2026**.
+Last verified: **February 23, 2026**.
 
 Config path resolution at startup:
 
@@ -93,12 +93,16 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `agentic` | `false` | Enable multi-turn tool-call loop mode for the sub-agent |
 | `allowed_tools` | `[]` | Tool allowlist for agentic mode |
 | `max_iterations` | `10` | Max tool-call iterations for agentic mode |
+| `identity_dir` | unset | Optional identity workspace subdirectory for `sessions_spawn agent=<name>` |
+| `memory_scope` | `shared` | `sessions_spawn` memory mode: `shared` or `isolated` (`memory_store` key prefixing) |
+| `spawn_enabled` | `true` | Whether this agent can be selected by `sessions_spawn` |
 
 Notes:
 
 - `agentic = false` preserves existing single prompt→response delegate behavior.
 - `agentic = true` requires at least one matching entry in `allowed_tools`.
 - The `delegate` tool is excluded from sub-agent allowlists to prevent re-entrant delegation loops.
+- `identity_dir`, `memory_scope`, and `spawn_enabled` are used by `sessions_spawn` when you pass `agent = "<name>"`.
 
 ```toml
 [agents.researcher]
@@ -249,6 +253,100 @@ Notes:
 
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`).
+
+## `[nodes]`
+
+Remote node proxy defaults used by the `nodes` tool (`list/status/exec/read/write/cancel`).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable remote node features |
+| `request_timeout_ms` | `15000` | Default RPC timeout for node requests |
+| `retry_max` | `2` | Default retry count for transient RPC failures |
+| `nodes` | `[]` | Remote node list (`[[nodes.nodes]]`) |
+
+`[[nodes.nodes]]` entry keys:
+
+| Key | Default | Purpose |
+|---|---|---|
+| `id` | _required_ | Stable node ID used by `nodes` tool |
+| `endpoint` | _required_ | Node base endpoint, usually `https://...` or loopback `http://...` |
+| `bearer_token` | _required_ | Bearer auth token for `/rpc` |
+| `hmac_secret` | unset | Optional request-signing secret (HMAC-SHA256) |
+| `enabled` | `true` | Whether this node entry is active |
+| `timeout_ms` | unset | Per-node timeout override |
+| `retry_max` | unset | Per-node retry override |
+
+Example:
+
+```toml
+[nodes]
+enabled = true
+request_timeout_ms = 15000
+retry_max = 2
+
+[[nodes.nodes]]
+id = "edge-a"
+endpoint = "https://edge-a.example.com:8787"
+bearer_token = "replace-me"
+hmac_secret = "replace-me-too"
+enabled = true
+timeout_ms = 20000
+retry_max = 3
+```
+
+## `[nodes.server]`
+
+Embedded node daemon defaults (consumed by `zeroclaw-node` and `[nodes].server`).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `listen_addr` | `127.0.0.1:8787` | Bind address for node daemon |
+| `bearer_token` | `""` | Required bearer token (must be set before startup) |
+| `hmac_secret` | unset | Optional HMAC signing key |
+| `sandbox_root` | `.` | Filesystem sandbox root for `read/write/cwd` |
+| `exec_timeout_ms` | `15000` | Default command timeout |
+| `max_output_bytes` | `1048576` | Max captured stdout+stderr bytes per command |
+| `allowed_commands` | `["echo"]` | Command allowlist (first token match) |
+| `blocked_commands` | `[]` | Command denylist (always enforced) |
+| `tls_required` | `true` | Require TLS on non-loopback binds |
+| `tls_cert` | unset | TLS cert path (PEM) |
+| `tls_key` | unset | TLS key path (PEM) |
+
+Minimum safe baseline:
+
+```toml
+[nodes.server]
+listen_addr = "127.0.0.1:8787"
+bearer_token = "replace-with-strong-token"
+sandbox_root = "./node-sandbox"
+allowed_commands = ["echo", "ls", "cat"]
+blocked_commands = ["rm", "sudo"]
+tls_required = true
+```
+
+Migration/rollback note:
+- Legacy aliases remain accepted: `bind -> listen_addr`, `token -> bearer_token`, `command_blacklist -> blocked_commands`.
+- Rollback to previous behavior can be done by removing `[nodes]`/`[nodes.server]` blocks (runtime falls back to defaults and disabled remote nodes).
+
+## `[sessions_spawn]`
+
+Process/task mode defaults for `sessions_spawn` tool.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `default_mode` | `task` | Default execution mode (`task` or `process`) |
+| `worker_workspace_root` | unset | Process-mode worker root (defaults to `<workspace>/workers`) |
+| `cleanup_on_complete` | `true` | Remove worker workspace after process-mode completion |
+
+Example:
+
+```toml
+[sessions_spawn]
+default_mode = "process"
+worker_workspace_root = "workers"
+cleanup_on_complete = true
+```
 
 ## `[gateway]`
 

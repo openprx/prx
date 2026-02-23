@@ -23,16 +23,15 @@ pub mod composio;
 pub mod config_reload;
 pub mod cron;
 pub mod cron_add;
-pub mod message_send;
 pub mod cron_list;
 pub mod cron_remove;
 pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
-pub mod gateway;
 pub mod file_read;
 pub mod file_write;
+pub mod gateway;
 pub mod git_operations;
 pub mod hardware_board_info;
 pub mod hardware_memory_map;
@@ -46,6 +45,7 @@ pub mod memory_get;
 pub mod memory_recall;
 pub mod memory_search;
 pub mod memory_store;
+pub mod message_send;
 pub mod nodes;
 pub mod proxy_config;
 pub mod pushover;
@@ -57,8 +57,8 @@ pub mod sessions_history;
 pub mod sessions_list;
 pub mod sessions_send;
 pub mod sessions_spawn;
-pub mod subagents;
 pub mod shell;
+pub mod subagents;
 pub mod traits;
 pub mod tts;
 pub mod web_fetch;
@@ -78,9 +78,9 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
-pub use gateway::GatewayTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use gateway::GatewayTool;
 pub use git_operations::GitOperationsTool;
 pub use hardware_board_info::HardwareBoardInfoTool;
 pub use hardware_memory_map::HardwareMemoryMapTool;
@@ -107,12 +107,12 @@ pub use sessions_history::SessionsHistoryTool;
 pub use sessions_list::SessionsListTool;
 pub use sessions_send::SessionsSendTool;
 pub use sessions_spawn::SessionsSpawnTool;
-pub use subagents::SubagentsTool;
 pub use shell::ShellTool;
+pub use subagents::SubagentsTool;
 pub use traits::Tool;
-pub use tts::TtsTool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+pub use tts::TtsTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 
@@ -243,8 +243,14 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(MemorySearchTool::new(workspace_dir.to_path_buf())),
         Arc::new(MemoryGetTool::new(workspace_dir.to_path_buf())),
-        Arc::new(ScheduleTool::new(security.clone(), Arc::new(arc_swap::ArcSwap::from_pointee(root_config.clone())))),
-        Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
+        Arc::new(ScheduleTool::new(
+            security.clone(),
+            Arc::new(arc_swap::ArcSwap::from_pointee(root_config.clone())),
+        )),
+        Arc::new(ProxyConfigTool::new(
+            shared_config.clone(),
+            security.clone(),
+        )),
         Arc::new(NodesTool::new(shared_config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(
             security.clone(),
@@ -356,10 +362,7 @@ pub fn all_tools_with_runtime(
     // Always register agents_list (shows what agents are available for delegation)
     if !agents.is_empty() {
         tool_arcs.push(Arc::new(AgentsListTool::new(
-            agents
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            agents.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         )));
     }
 
@@ -618,6 +621,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
             },
         );
 

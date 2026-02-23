@@ -884,7 +884,10 @@ mod tests {
         let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("cron is disabled"));
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("cron is disabled"));
     }
 
     #[tokio::test]
@@ -914,10 +917,7 @@ mod tests {
         let cfg = test_config(&tmp).await;
         let cfg_snap = cfg.load_full();
         let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
-        let result = tool
-            .execute(json!({"action": "explode"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "explode"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("Unknown action"));
     }

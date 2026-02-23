@@ -251,4 +251,3 @@ impl Tool for CanvasTool {
         }
     }
 }
-

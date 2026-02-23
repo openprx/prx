@@ -156,9 +156,9 @@ impl Channel for SignalNativeChannel {
         );
 
         let mut cmd = self.build_command();
-        let _child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn signal-cli at '{}': {e}", self.cli_path))?;
+        let _child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!("Failed to spawn signal-cli at '{}': {e}", self.cli_path)
+        })?;
 
         self.wait_for_ready().await?;
         tracing::info!(
@@ -196,11 +196,7 @@ impl Channel for SignalNativeChannel {
     }
 
     /// Delete a sent message via the inner SignalChannel's remoteDelete implementation.
-    async fn delete_message(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-    ) -> Result<()> {
+    async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         self.inner.delete_message(channel_id, message_id).await
     }
 
@@ -211,6 +207,8 @@ impl Channel for SignalNativeChannel {
         thread_id: &str,
         message: &str,
     ) -> Result<()> {
-        self.inner.send_thread_reply(channel_id, thread_id, message).await
+        self.inner
+            .send_thread_reply(channel_id, thread_id, message)
+            .await
     }
 }

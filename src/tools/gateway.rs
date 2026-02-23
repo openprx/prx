@@ -59,11 +59,7 @@ impl GatewayTool {
         } else if elapsed_secs < 3600 {
             format!("{}m {}s", elapsed_secs / 60, elapsed_secs % 60)
         } else {
-            format!(
-                "{}h {}m",
-                elapsed_secs / 3600,
-                (elapsed_secs % 3600) / 60
-            )
+            format!("{}h {}m", elapsed_secs / 3600, (elapsed_secs % 3600) / 60)
         }
     }
 
@@ -411,10 +407,7 @@ mod tests {
     async fn config_get_returns_gateway_fields() {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
-        let result = tool
-            .execute(json!({"action": "config.get"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "config.get"})).await.unwrap();
         assert!(result.success);
         let val: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert!(val["port"].as_u64().is_some());
@@ -437,10 +430,7 @@ mod tests {
     async fn unknown_action_returns_error() {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
-        let result = tool
-            .execute(json!({"action": "explode"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "explode"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("Unknown action"));
     }
@@ -451,7 +441,10 @@ mod tests {
         let tool = make_tool(&tmp);
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("Missing 'action'"));
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Missing 'action'"));
     }
 
     #[tokio::test]

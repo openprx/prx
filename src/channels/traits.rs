@@ -157,11 +157,7 @@ pub trait Channel: Send + Sync {
     /// `message_id` is the platform-specific message identifier (timestamp for Signal, etc.).
     ///
     /// Returns `Err` if the platform does not support deletion or if the delete fails.
-    async fn delete_message(
-        &self,
-        _channel_id: &str,
-        _message_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn delete_message(&self, _channel_id: &str, _message_id: &str) -> anyhow::Result<()> {
         Err(anyhow::anyhow!("delete not supported on this channel"))
     }
 
@@ -179,7 +175,9 @@ pub trait Channel: Send + Sync {
         _thread_id: &str,
         _message: &str,
     ) -> anyhow::Result<()> {
-        Err(anyhow::anyhow!("thread reply not supported on this channel"))
+        Err(anyhow::anyhow!(
+            "thread reply not supported on this channel"
+        ))
     }
 }
 

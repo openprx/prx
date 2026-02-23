@@ -24,7 +24,11 @@ pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Resu
     let m4a_path = format!("/tmp/zeroclaw-tts-{id}.m4a");
 
     // Sanitise text for embedding inside a JS single-quoted string.
-    let safe_text = text.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', " ").replace('\r', "");
+    let safe_text = text
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', " ")
+        .replace('\r', "");
 
     // 1. Generate MP3 with node-edge-tts
     let tts_script = format!(
@@ -37,7 +41,9 @@ pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Resu
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("npm not found: {e}"))?;
-    let node_modules = String::from_utf8_lossy(&npm_root_out.stdout).trim().to_string();
+    let node_modules = String::from_utf8_lossy(&npm_root_out.stdout)
+        .trim()
+        .to_string();
 
     let tts_out = tokio::process::Command::new("node")
         .args(["-e", &tts_script])
@@ -53,7 +59,9 @@ pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Resu
 
     // 2. Convert MP3 → M4A (AAC) — Signal displays M4A as a playable voice note.
     let ffmpeg_out = tokio::process::Command::new("ffmpeg")
-        .args(["-y", "-i", &mp3_path, "-c:a", "aac", "-b:a", "64k", &m4a_path])
+        .args([
+            "-y", "-i", &mp3_path, "-c:a", "aac", "-b:a", "64k", &m4a_path,
+        ])
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("ffmpeg not found: {e}"))?;
@@ -97,9 +105,7 @@ impl MessageSendTool {
     /// Create a new `MessageSendTool` backed by a Signal channel (enables reactions).
     pub fn new_signal(channel: Arc<SignalChannel>, security: Arc<SecurityPolicy>) -> Self {
         Self {
-            active_channel: Arc::new(tokio::sync::RwLock::new(
-                channel.clone() as Arc<dyn Channel>,
-            )),
+            active_channel: Arc::new(tokio::sync::RwLock::new(channel.clone() as Arc<dyn Channel>)),
             signal: Some(channel),
             default_recipient: Arc::new(tokio::sync::RwLock::new(None)),
             security,
@@ -223,10 +229,7 @@ impl Tool for MessageSendTool {
 
         // Resolve recipient: explicit arg takes priority, then default_recipient
         let default = self.default_recipient.read().await.clone();
-        let target = args["target"]
-            .as_str()
-            .map(str::to_owned)
-            .or(default);
+        let target = args["target"].as_str().map(str::to_owned).or(default);
 
         match action {
             "send" => {
@@ -603,7 +606,8 @@ mod tests {
     async fn send_uses_default_recipient_when_target_omitted() {
         let (ch, sent) = DummyChannel::new();
         let tool = MessageSendTool::new(ch, test_security(AutonomyLevel::Full));
-        tool.set_default_recipient(Some("+19998887777".to_string())).await;
+        tool.set_default_recipient(Some("+19998887777".to_string()))
+            .await;
 
         let result = tool
             .execute(json!({
@@ -676,10 +680,7 @@ mod tests {
         let (ch, _) = DummyChannel::new();
         let tool = MessageSendTool::new(ch, test_security(AutonomyLevel::Full));
 
-        let result = tool
-            .execute(json!({ "action": "destroy" }))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({ "action": "destroy" })).await.unwrap();
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Unknown action"));
@@ -760,7 +761,11 @@ mod tests {
             .execute(json!({ "action": "send", "message": "first" }))
             .await
             .unwrap();
-        assert_eq!(original_sent.lock().await.len(), 1, "first send should go to original channel");
+        assert_eq!(
+            original_sent.lock().await.len(),
+            1,
+            "first send should go to original channel"
+        );
 
         // Simulate wacli message arriving: gateway switches active channel
         let (new_ch, new_sent) = DummyChannel::new();
@@ -772,8 +777,20 @@ mod tests {
             .execute(json!({ "action": "send", "message": "second" }))
             .await
             .unwrap();
-        assert!(result.success, "Expected success on second send: {:?}", result.error);
-        assert_eq!(original_sent.lock().await.len(), 1, "original channel should still have only 1 message");
-        assert_eq!(new_sent.lock().await.len(), 1, "new channel should have received the second message");
+        assert!(
+            result.success,
+            "Expected success on second send: {:?}",
+            result.error
+        );
+        assert_eq!(
+            original_sent.lock().await.len(),
+            1,
+            "original channel should still have only 1 message"
+        );
+        assert_eq!(
+            new_sent.lock().await.len(),
+            1,
+            "new channel should have received the second message"
+        );
     }
 }

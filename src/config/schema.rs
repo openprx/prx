@@ -95,6 +95,14 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
 
+    /// Session spawning configuration (`[sessions_spawn]`).
+    #[serde(default)]
+    pub sessions_spawn: SessionsSpawnConfig,
+
+    /// Self-system experimental automation controls (`[self_system]`).
+    #[serde(default)]
+    pub self_system: SelfSystemConfig,
+
     /// Skills loading and community repository behavior (`[skills]`).
     #[serde(default)]
     pub skills: SkillsConfig,
@@ -182,6 +190,10 @@ pub struct Config {
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
 
+    /// Remote node proxy configuration (`[nodes]`).
+    #[serde(default)]
+    pub nodes: NodesConfig,
+
     /// Delegate agent configurations for multi-agent workflows.
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
@@ -230,6 +242,15 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Optional identity files directory relative to workspace root.
+    #[serde(default)]
+    pub identity_dir: Option<String>,
+    /// Optional memory scope for spawned sessions: "shared" (default) or "isolated".
+    #[serde(default)]
+    pub memory_scope: Option<String>,
+    /// Whether this agent is allowed to be targeted by sessions_spawn (default: true).
+    #[serde(default)]
+    pub spawn_enabled: Option<bool>,
 }
 
 fn default_max_depth() -> u32 {
@@ -310,6 +331,159 @@ impl Default for HardwareConfig {
     }
 }
 
+/// Remote node proxy configuration for core-side RPC calls and node daemon defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodesConfig {
+    /// Enable remote node features.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default request timeout for node RPC calls.
+    #[serde(default = "default_nodes_timeout_ms")]
+    pub request_timeout_ms: u64,
+    /// Default max retries for node RPC calls.
+    #[serde(default = "default_nodes_retry_max")]
+    pub retry_max: u8,
+    /// Configured remote nodes.
+    #[serde(default)]
+    pub nodes: Vec<RemoteNodeConfig>,
+    /// Embedded node server defaults used by `zeroclaw-node`.
+    #[serde(default)]
+    pub server: NodeServerConfig,
+}
+
+fn default_nodes_timeout_ms() -> u64 {
+    15_000
+}
+
+fn default_nodes_retry_max() -> u8 {
+    2
+}
+
+impl Default for NodesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            request_timeout_ms: default_nodes_timeout_ms(),
+            retry_max: default_nodes_retry_max(),
+            nodes: Vec::new(),
+            server: NodeServerConfig::default(),
+        }
+    }
+}
+
+/// A remote node target for core-side node proxy calls.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteNodeConfig {
+    /// Stable node ID used by the nodes tool.
+    #[serde(alias = "name")]
+    pub id: String,
+    /// Base endpoint (e.g. "http://127.0.0.1:8787").
+    pub endpoint: String,
+    /// Bearer token for node RPC authentication.
+    #[serde(alias = "token")]
+    pub bearer_token: String,
+    /// Optional request signing key (HMAC-SHA256).
+    #[serde(default)]
+    pub hmac_secret: Option<String>,
+    /// Whether this node is enabled.
+    #[serde(default = "default_nodes_enabled")]
+    pub enabled: bool,
+    /// Optional per-node timeout override.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Optional per-node retry override.
+    #[serde(default, alias = "max_retries")]
+    pub retry_max: Option<u8>,
+}
+
+fn default_nodes_enabled() -> bool {
+    true
+}
+
+/// Node daemon runtime config used by `zeroclaw-node`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NodeServerConfig {
+    /// Listen address for node daemon.
+    #[serde(default = "default_node_server_listen_addr", alias = "bind")]
+    pub listen_addr: String,
+    /// Required bearer token for /rpc.
+    #[serde(default, alias = "token")]
+    pub bearer_token: String,
+    /// Optional HMAC signing secret.
+    #[serde(default)]
+    pub hmac_secret: Option<String>,
+    /// Sandbox root directory for read/write/cwd constraints.
+    #[serde(default = "default_node_server_sandbox_root")]
+    pub sandbox_root: String,
+    /// Default command timeout in milliseconds.
+    #[serde(default = "default_node_server_exec_timeout_ms")]
+    pub exec_timeout_ms: u64,
+    /// Maximum combined stdout/stderr bytes captured per command.
+    #[serde(default = "default_node_server_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Command allowlist matched on first token.
+    ///
+    /// In restricted mode this list is required unless explicitly set to `["*"]`.
+    #[serde(default = "default_node_server_allowed_commands")]
+    pub allowed_commands: Vec<String>,
+    /// Command denylist matched on first token. Always enforced.
+    #[serde(default, alias = "command_blacklist")]
+    pub blocked_commands: Vec<String>,
+    /// Require TLS for non-loopback binds.
+    ///
+    /// When true, node server must either bind to loopback or provide cert/key.
+    #[serde(default = "default_node_server_tls_required")]
+    pub tls_required: bool,
+    /// TLS certificate path (PEM).
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    /// TLS private key path (PEM).
+    #[serde(default)]
+    pub tls_key: Option<String>,
+}
+
+fn default_node_server_listen_addr() -> String {
+    "127.0.0.1:8787".to_string()
+}
+
+fn default_node_server_sandbox_root() -> String {
+    ".".to_string()
+}
+
+fn default_node_server_exec_timeout_ms() -> u64 {
+    15_000
+}
+
+fn default_node_server_max_output_bytes() -> usize {
+    1_048_576
+}
+
+fn default_node_server_allowed_commands() -> Vec<String> {
+    vec!["echo".to_string()]
+}
+
+fn default_node_server_tls_required() -> bool {
+    true
+}
+
+impl Default for NodeServerConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: default_node_server_listen_addr(),
+            bearer_token: String::new(),
+            hmac_secret: None,
+            sandbox_root: default_node_server_sandbox_root(),
+            exec_timeout_ms: default_node_server_exec_timeout_ms(),
+            max_output_bytes: default_node_server_max_output_bytes(),
+            allowed_commands: default_node_server_allowed_commands(),
+            blocked_commands: Vec::new(),
+            tls_required: default_node_server_tls_required(),
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
@@ -329,6 +503,68 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+}
+
+/// Sessions spawn configuration (`[sessions_spawn]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SessionsSpawnConfig {
+    /// Default execution mode for sessions_spawn (`task` or `process`).
+    #[serde(default = "default_sessions_spawn_mode")]
+    pub default_mode: String,
+    /// Optional root directory for process-mode worker workspaces.
+    ///
+    /// When unset, falls back to `<workspace>/workers`.
+    #[serde(default)]
+    pub worker_workspace_root: Option<String>,
+    /// Remove worker workspace directory after process-mode completion.
+    #[serde(default = "default_sessions_spawn_cleanup_on_complete")]
+    pub cleanup_on_complete: bool,
+}
+
+impl Default for SessionsSpawnConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: default_sessions_spawn_mode(),
+            worker_workspace_root: None,
+            cleanup_on_complete: default_sessions_spawn_cleanup_on_complete(),
+        }
+    }
+}
+
+fn default_sessions_spawn_mode() -> String {
+    "task".to_string()
+}
+
+fn default_sessions_spawn_cleanup_on_complete() -> bool {
+    true
+}
+
+/// Self-system experimental automation config (`[self_system]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SelfSystemConfig {
+    /// Enable periodic self-system jobs in daemon runtime.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fitness report interval in hours.
+    #[serde(default = "default_self_system_fitness_interval_hours")]
+    pub fitness_interval_hours: u64,
+    /// Enable evolution orchestrator cycles alongside fitness reports.
+    #[serde(default)]
+    pub evolution_enabled: bool,
+}
+
+fn default_self_system_fitness_interval_hours() -> u64 {
+    24
+}
+
+impl Default for SelfSystemConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fitness_interval_hours: default_self_system_fitness_interval_hours(),
+            evolution_enabled: false,
+        }
+    }
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -3266,6 +3502,8 @@ impl Default for Config {
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
+            sessions_spawn: SessionsSpawnConfig::default(),
+            self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -3287,6 +3525,7 @@ impl Default for Config {
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
+            nodes: NodesConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
@@ -4292,6 +4531,15 @@ default_temperature = 0.7
     }
 
     #[test]
+    async fn nodes_config_defaults() {
+        let nodes = NodesConfig::default();
+        assert!(!nodes.enabled);
+        assert_eq!(nodes.request_timeout_ms, 15_000);
+        assert_eq!(nodes.retry_max, 2);
+        assert_eq!(nodes.server.listen_addr, "127.0.0.1:8787");
+    }
+
+    #[test]
     async fn storage_provider_config_defaults() {
         let storage = StorageConfig::default();
         assert!(storage.provider.config.provider.is_empty());
@@ -4344,6 +4592,8 @@ default_temperature = 0.7
             },
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            sessions_spawn: SessionsSpawnConfig::default(),
+            self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -4397,6 +4647,7 @@ default_temperature = 0.7
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
+            nodes: NodesConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             media: MediaConfig::default(),
@@ -4546,6 +4797,8 @@ tool_dispatcher = "xml"
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            sessions_spawn: SessionsSpawnConfig::default(),
+            self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -4569,6 +4822,7 @@ tool_dispatcher = "xml"
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
+            nodes: NodesConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             media: MediaConfig::default(),
@@ -4622,6 +4876,9 @@ tool_dispatcher = "xml"
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
             },
         );
 

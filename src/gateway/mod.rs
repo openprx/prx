@@ -403,11 +403,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             ))
         });
     let signal_media_config = config.media.clone();
-    let signal_channel: Option<Arc<SignalChannel>> = config
-        .channels_config
-        .signal
-        .as_ref()
-        .map(|sg| {
+    let signal_channel: Option<Arc<SignalChannel>> =
+        config.channels_config.signal.as_ref().map(|sg| {
             Arc::new(SignalChannel::new_with_mode(
                 sg.effective_http_url(),
                 sg.account.clone(),
@@ -454,6 +451,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             security.clone(),
             config.workspace_dir.clone(),
             config.multimodal.clone(),
+            config.agents.clone(),
+            config.sessions_spawn.clone(),
         );
         let handle = spawn_tool.tools_handle();
         tools_list.push(Box::new(spawn_tool));
@@ -860,10 +859,8 @@ async fn run_gateway_chat_with_multimodal(
     let (system_prompt, multimodal_config, max_tool_iterations) = {
         let config_guard = state.config.lock();
         let native_tools = state.provider.supports_native_tools();
-        let skills = crate::skills::load_skills_with_config(
-            &config_guard.workspace_dir,
-            &config_guard,
-        );
+        let skills =
+            crate::skills::load_skills_with_config(&config_guard.workspace_dir, &config_guard);
         let tool_descs: Vec<(&str, &str)> = vec![
             ("shell", "Execute terminal commands"),
             ("file_read", "Read file contents"),
@@ -901,14 +898,14 @@ async fn run_gateway_chat_with_multimodal(
         provider_label,
         &state.model,
         state.temperature,
-        true,  // silent
-        None,  // no approval manager
+        true, // silent
+        None, // no approval manager
         "webhook",
         &multimodal_config,
         max_tool_iterations,
-        None,  // no cancellation token
-        None,  // no streaming delta sender
-        None,  // no scope context for webhooks
+        None, // no cancellation token
+        None, // no streaming delta sender
+        None, // no scope context for webhooks
     )
     .await
 }

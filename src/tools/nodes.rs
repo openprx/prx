@@ -1,10 +1,13 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::SharedConfig;
+use crate::config::{RemoteNodeConfig, SharedConfig};
+use crate::nodes::client::RemoteNodeClient;
+use crate::nodes::transport::H2Transport;
 use crate::security::SecurityPolicy;
+use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct NodesTool {
     config: SharedConfig,
@@ -36,119 +39,35 @@ impl NodesTool {
         None
     }
 
-    fn load_nodes_from_config(&self) -> anyhow::Result<Vec<Value>> {
+    fn load_nodes(&self) -> Vec<RemoteNodeConfig> {
+        self.config
+            .load_full()
+            .nodes
+            .nodes
+            .iter()
+            .filter(|node| node.enabled)
+            .cloned()
+            .collect()
+    }
+
+    fn resolve_node<'a>(nodes: &'a [RemoteNodeConfig], id: &str) -> Option<&'a RemoteNodeConfig> {
+        nodes.iter().find(|node| node.id == id)
+    }
+
+    fn make_client(&self, node: &RemoteNodeConfig) -> anyhow::Result<RemoteNodeClient> {
         let cfg = self.config.load_full();
-        let raw = fs::read_to_string(&cfg.config_path).map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to read config file {}: {error}",
-                cfg.config_path.display()
-            )
-        })?;
+        let timeout_ms = node
+            .timeout_ms
+            .unwrap_or(cfg.nodes.request_timeout_ms)
+            .max(100);
+        let retry_max = node.retry_max.unwrap_or(cfg.nodes.retry_max);
 
-        let parsed: toml::Value = toml::from_str(&raw).map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to parse config file {}: {error}",
-                cfg.config_path.display()
-            )
-        })?;
+        let transport = Arc::new(H2Transport::new(
+            Duration::from_millis(timeout_ms),
+            retry_max,
+        )?);
 
-        Ok(Self::parse_nodes_value(parsed.get("nodes")))
-    }
-
-    fn parse_nodes_value(nodes_value: Option<&toml::Value>) -> Vec<Value> {
-        let mut nodes = Vec::new();
-
-        let Some(nodes_value) = nodes_value else {
-            return nodes;
-        };
-
-        match nodes_value {
-            toml::Value::Table(table) => {
-                // Preferred shape:
-                // [nodes]
-                // edge_1 = { status = "healthy", endpoint = "http://..." }
-                for (name, value) in table {
-                    if let toml::Value::Table(node_table) = value {
-                        nodes.push(Self::normalize_node(Some(name.as_str()), node_table));
-                    }
-                }
-
-                // Also accept:
-                // [nodes]
-                // list = [{ id = "edge_1", ... }, ...]
-                if nodes.is_empty() {
-                    if let Some(list) = table.get("list").and_then(toml::Value::as_array) {
-                        for value in list {
-                            if let toml::Value::Table(node_table) = value {
-                                nodes.push(Self::normalize_node(None, node_table));
-                            }
-                        }
-                    }
-                }
-            }
-            toml::Value::Array(list) => {
-                // Also accept:
-                // [[nodes]]
-                // id = "edge_1"
-                for value in list {
-                    if let toml::Value::Table(node_table) = value {
-                        nodes.push(Self::normalize_node(None, node_table));
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        nodes
-    }
-
-    fn normalize_node(name_hint: Option<&str>, node_table: &toml::value::Table) -> Value {
-        let id = node_table
-            .get("id")
-            .and_then(toml::Value::as_str)
-            .or(name_hint)
-            .unwrap_or("unknown");
-
-        let status = node_table
-            .get("status")
-            .and_then(toml::Value::as_str)
-            .unwrap_or("unknown");
-
-        let health = node_table
-            .get("health")
-            .and_then(toml::Value::as_str)
-            .unwrap_or(status);
-
-        let endpoint = node_table
-            .get("endpoint")
-            .and_then(toml::Value::as_str)
-            .or_else(|| node_table.get("address").and_then(toml::Value::as_str))
-            .or_else(|| node_table.get("host").and_then(toml::Value::as_str));
-
-        let enabled = node_table
-            .get("enabled")
-            .and_then(toml::Value::as_bool)
-            .unwrap_or(true);
-
-        let raw = serde_json::to_value(node_table).unwrap_or_else(|_| json!({}));
-
-        json!({
-            "id": id,
-            "status": status,
-            "health": health,
-            "endpoint": endpoint,
-            "enabled": enabled,
-            "raw": raw,
-        })
-    }
-
-    fn find_node<'a>(nodes: &'a [Value], node_id: &str) -> Option<&'a Value> {
-        nodes.iter().find(|node| {
-            node.get("id")
-                .and_then(Value::as_str)
-                .map(|id| id == node_id)
-                .unwrap_or(false)
-        })
+        Ok(RemoteNodeClient::new(node.clone(), transport))
     }
 
     fn require_string_arg<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
@@ -156,7 +75,27 @@ impl NodesTool {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid '{key}' parameter"))
+            .ok_or_else(|| anyhow!("Missing or invalid '{key}' parameter"))
+    }
+
+    fn optional_u64_arg(args: &Value, key: &str) -> anyhow::Result<Option<u64>> {
+        args.get(key)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("'{key}' must be an unsigned integer"))
+            })
+            .transpose()
+    }
+
+    fn optional_bool_arg(args: &Value, key: &str) -> anyhow::Result<Option<bool>> {
+        args.get(key)
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| anyhow!("'{key}' must be a boolean"))
+            })
+            .transpose()
     }
 }
 
@@ -167,8 +106,7 @@ impl Tool for NodesTool {
     }
 
     fn description(&self) -> &str {
-        "Manage configured collaboration nodes. Actions: list, status, notify, invoke. \
-         Current implementation is config-backed stub using [nodes] in config.toml."
+        "Remote node management over HTTP/2 JSON-RPC. Actions: list, status, exec, read, write, cancel."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -178,20 +116,51 @@ impl Tool for NodesTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "status", "notify", "invoke"],
+                    "enum": ["list", "status", "exec", "read", "write", "cancel"],
                     "description": "Action to perform."
                 },
                 "node": {
                     "type": "string",
-                    "description": "Node ID for status/notify/invoke."
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Notification message for notify action."
+                    "description": "Node ID for status/exec/read/write/cancel"
                 },
                 "command": {
                     "type": "string",
-                    "description": "Command string for invoke action."
+                    "description": "Shell command for exec"
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Timeout override in milliseconds"
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for exec"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File path for read/write"
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Read offset"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Read byte limit"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Write content"
+                },
+                "create_dirs": {
+                    "type": "boolean",
+                    "description": "Create parent directories when writing"
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Task ID to cancel"
                 }
             },
             "required": ["action"]
@@ -200,134 +169,185 @@ impl Tool for NodesTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = Self::require_string_arg(&args, "action")?;
-        let nodes = self.load_nodes_from_config()?;
+        let nodes = self.load_nodes();
 
         match action {
-            "list" => Ok(ToolResult {
-                success: true,
-                output: serde_json::to_string_pretty(&json!({
-                    "mode": "stub",
-                    "count": nodes.len(),
-                    "nodes": nodes,
-                }))?,
-                error: None,
-            }),
+            "list" => {
+                let items: Vec<Value> = nodes
+                    .iter()
+                    .map(|node| {
+                        json!({
+                            "id": node.id,
+                            "endpoint": node.endpoint,
+                            "enabled": node.enabled,
+                        })
+                    })
+                    .collect();
+
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&json!({
+                        "count": items.len(),
+                        "nodes": items,
+                    }))?,
+                    error: None,
+                })
+            }
             "status" => {
-                if let Some(node_id) = args.get("node").and_then(Value::as_str).map(str::trim) {
-                    if node_id.is_empty() {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some("'node' must be a non-empty string when provided".into()),
-                        });
-                    }
-
-                    if let Some(node) = Self::find_node(&nodes, node_id) {
-                        Ok(ToolResult {
-                            success: true,
-                            output: serde_json::to_string_pretty(&json!({
-                                "mode": "stub",
-                                "node": node,
-                                "health": node.get("health").cloned().unwrap_or(json!("unknown")),
-                            }))?,
-                            error: None,
-                        })
-                    } else {
-                        Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(format!("Node '{node_id}' not found in [nodes] config")),
-                        })
-                    }
-                } else {
-                    let summary: Vec<Value> = nodes
-                        .iter()
-                        .map(|node| {
-                            json!({
-                                "id": node.get("id"),
-                                "health": node.get("health"),
-                                "status": node.get("status"),
-                                "enabled": node.get("enabled"),
-                            })
-                        })
-                        .collect();
-
-                    Ok(ToolResult {
-                        success: true,
-                        output: serde_json::to_string_pretty(&json!({
-                            "mode": "stub",
-                            "count": summary.len(),
-                            "nodes": summary,
-                        }))?,
-                        error: None,
-                    })
-                }
-            }
-            "notify" => {
-                if let Some(blocked) = self.require_write_access() {
-                    return Ok(blocked);
-                }
-
                 let node_id = Self::require_string_arg(&args, "node")?;
-                let message = Self::require_string_arg(&args, "message")?;
+                let node = Self::resolve_node(&nodes, node_id)
+                    .ok_or_else(|| anyhow!("node '{node_id}' not found or disabled"))?;
+                let client = self.make_client(node)?;
 
-                if let Some(node) = Self::find_node(&nodes, node_id) {
-                    Ok(ToolResult {
-                        success: true,
-                        output: serde_json::to_string_pretty(&json!({
-                            "mode": "stub",
-                            "delivered": false,
-                            "action": "notify",
-                            "node": node,
-                            "message": message,
-                            "note": "Stub implementation; no network call was made.",
-                        }))?,
-                        error: None,
-                    })
-                } else {
-                    Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Node '{node_id}' not found in [nodes] config")),
-                    })
-                }
+                let latency = client
+                    .ping()
+                    .await
+                    .with_context(|| format!("ping failed for node '{node_id}'"))?;
+                let metrics = client
+                    .metrics()
+                    .await
+                    .with_context(|| format!("metrics failed for node '{node_id}'"))?;
+
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&json!({
+                        "node": node_id,
+                        "latency_ms": latency.as_millis(),
+                        "metrics": metrics,
+                    }))?,
+                    error: None,
+                })
             }
-            "invoke" => {
+            "exec" => {
                 if let Some(blocked) = self.require_write_access() {
                     return Ok(blocked);
                 }
 
                 let node_id = Self::require_string_arg(&args, "node")?;
                 let command = Self::require_string_arg(&args, "command")?;
+                let timeout_ms = Self::optional_u64_arg(&args, "timeout_ms")?;
+                let cwd = args.get("cwd").and_then(Value::as_str);
 
-                if let Some(node) = Self::find_node(&nodes, node_id) {
-                    Ok(ToolResult {
-                        success: true,
-                        output: serde_json::to_string_pretty(&json!({
-                            "mode": "stub",
-                            "executed": false,
-                            "action": "invoke",
-                            "node": node,
-                            "command": command,
-                            "note": "Stub implementation; no remote command was executed.",
-                        }))?,
-                        error: None,
-                    })
-                } else {
-                    Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Node '{node_id}' not found in [nodes] config")),
-                    })
-                }
+                let node = Self::resolve_node(&nodes, node_id)
+                    .ok_or_else(|| anyhow!("node '{node_id}' not found or disabled"))?;
+                let client = self.make_client(node)?;
+                let result = client.exec_shell(command, timeout_ms, cwd).await?;
+
+                Ok(ToolResult {
+                    success: !result.timed_out && !result.cancelled,
+                    output: serde_json::to_string_pretty(&result)?,
+                    error: None,
+                })
             }
-            other => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Unknown action '{other}'. Use: list, status, notify, invoke."
-                )),
-            }),
+            "read" => {
+                let node_id = Self::require_string_arg(&args, "node")?;
+                let path = Self::require_string_arg(&args, "path")?;
+                let offset = Self::optional_u64_arg(&args, "offset")?;
+                let limit = Self::optional_u64_arg(&args, "limit")?;
+
+                let node = Self::resolve_node(&nodes, node_id)
+                    .ok_or_else(|| anyhow!("node '{node_id}' not found or disabled"))?;
+                let client = self.make_client(node)?;
+                let result = client.read_file(path, offset, limit).await?;
+
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&result)?,
+                    error: None,
+                })
+            }
+            "write" => {
+                if let Some(blocked) = self.require_write_access() {
+                    return Ok(blocked);
+                }
+
+                let node_id = Self::require_string_arg(&args, "node")?;
+                let path = Self::require_string_arg(&args, "path")?;
+                let content = Self::require_string_arg(&args, "content")?;
+                let create_dirs = Self::optional_bool_arg(&args, "create_dirs")?.unwrap_or(false);
+
+                let node = Self::resolve_node(&nodes, node_id)
+                    .ok_or_else(|| anyhow!("node '{node_id}' not found or disabled"))?;
+                let client = self.make_client(node)?;
+                let result = client.write_file(path, content, create_dirs).await?;
+
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&result)?,
+                    error: None,
+                })
+            }
+            "cancel" => {
+                if let Some(blocked) = self.require_write_access() {
+                    return Ok(blocked);
+                }
+
+                let node_id = Self::require_string_arg(&args, "node")?;
+                let task_id = Self::require_string_arg(&args, "task_id")?;
+
+                let node = Self::resolve_node(&nodes, node_id)
+                    .ok_or_else(|| anyhow!("node '{node_id}' not found or disabled"))?;
+                let client = self.make_client(node)?;
+                client.cancel(task_id).await?;
+
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&json!({
+                        "node": node_id,
+                        "task_id": task_id,
+                        "cancelled": true,
+                    }))?,
+                    error: None,
+                })
+            }
+            other => {
+                bail!("Unknown action '{other}'. Use: list, status, exec, read, write, cancel")
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{new_shared, Config};
+
+    fn make_tool() -> NodesTool {
+        let config = new_shared(Config::default());
+        let security = Arc::new(SecurityPolicy::default());
+        NodesTool::new(config, security)
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_non_string_command_param() {
+        let tool = make_tool();
+        let error = tool
+            .execute(json!({
+                "action": "exec",
+                "node": "n1",
+                "command": 123
+            }))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Missing or invalid 'command' parameter"));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_invalid_offset_param_type() {
+        let tool = make_tool();
+        let error = tool
+            .execute(json!({
+                "action": "read",
+                "node": "n1",
+                "path": "file.txt",
+                "offset": "bad"
+            }))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("'offset' must be an unsigned integer"));
     }
 }

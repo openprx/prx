@@ -8,8 +8,8 @@
 //! This mirrors OpenClaw's `media-understanding` module architecture:
 //! provider registry, config-driven routing, CLI fallback.
 
-use base64::Engine as _;
 use crate::config::MediaConfig;
+use base64::Engine as _;
 
 /// Process a media attachment and return enriched text.
 ///
@@ -82,13 +82,20 @@ async fn transcribe_ollama(path: &str, config: &MediaConfig) -> Option<String> {
         .ok()?;
 
     if !resp.status().is_success() {
-        tracing::warn!("media: Ollama audio transcription failed: {}", resp.status());
+        tracing::warn!(
+            "media: Ollama audio transcription failed: {}",
+            resp.status()
+        );
         return None;
     }
 
     let json: serde_json::Value = resp.json().await.ok()?;
     let text = json["message"]["content"].as_str()?.trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// Transcribe audio using a local whisper CLI tool.
@@ -137,7 +144,11 @@ async fn transcribe_cli(path: &str) -> Option<String> {
     let _ = std::fs::remove_file(&wav_path);
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() { None } else { Some(stdout) }
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout)
+    }
 }
 
 // ── Video ──────────────────────────────────────────────────────────
@@ -164,9 +175,12 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
     let duration: f64 = if which_bin("ffprobe") {
         let probe = tokio::process::Command::new("ffprobe")
             .args([
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "csv=p=0",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
                 path,
             ])
             .output()
@@ -190,10 +204,14 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
         let result = tokio::process::Command::new("ffmpeg")
             .args([
                 "-y",
-                "-ss", &format!("{timestamp:.2}"),
-                "-i", path,
-                "-vframes", "1",
-                "-q:v", "2",
+                "-ss",
+                &format!("{timestamp:.2}"),
+                "-i",
+                path,
+                "-vframes",
+                "1",
+                "-q:v",
+                "2",
                 &frame_path,
             ])
             .output()

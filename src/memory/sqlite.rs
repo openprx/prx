@@ -46,6 +46,20 @@ impl SqliteMemory {
         )
     }
 
+    /// Build SQLite memory using an explicit database file path.
+    ///
+    /// Uses the noop embedder and default weights/cache values, matching `new`.
+    pub fn new_with_path(db_path: PathBuf) -> anyhow::Result<Self> {
+        Self::with_embedder_and_path(
+            db_path,
+            Arc::new(super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            10_000,
+            None,
+        )
+    }
+
     /// Build SQLite memory with optional open timeout.
     ///
     /// If `open_timeout_secs` is `Some(n)`, opening the database is limited to `n` seconds
@@ -60,7 +74,24 @@ impl SqliteMemory {
         open_timeout_secs: Option<u64>,
     ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("brain.db");
+        Self::with_embedder_and_path(
+            db_path,
+            embedder,
+            vector_weight,
+            keyword_weight,
+            cache_max,
+            open_timeout_secs,
+        )
+    }
 
+    fn with_embedder_and_path(
+        db_path: PathBuf,
+        embedder: Arc<dyn EmbeddingProvider>,
+        vector_weight: f32,
+        keyword_weight: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+    ) -> anyhow::Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -790,6 +821,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
         (tmp, mem)
+    }
+
+    #[tokio::test]
+    async fn sqlite_new_with_custom_path_creates_db() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("workers").join("w1").join("brain.db");
+
+        let mem = SqliteMemory::new_with_path(db_path.clone()).unwrap();
+        mem.store("k1", "v1", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        assert!(db_path.exists());
+        assert_eq!(mem.name(), "sqlite");
     }
 
     #[tokio::test]

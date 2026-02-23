@@ -1128,7 +1128,10 @@ async fn execute_tools_parallel(
         pre_results[idx] = Some(result?);
     }
 
-    Ok(pre_results.into_iter().map(|r| r.unwrap_or_default()).collect())
+    Ok(pre_results
+        .into_iter()
+        .map(|r| r.unwrap_or_default())
+        .collect())
 }
 
 async fn execute_tools_sequential(
@@ -1251,8 +1254,10 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> =
-        tools_registry.iter().flat_map(|tool| tool.specs()).collect();
+    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
+        .iter()
+        .flat_map(|tool| tool.specs())
+        .collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
     for _iteration in 0..max_iterations {
@@ -1516,7 +1521,9 @@ pub(crate) async fn run_tool_call_loop(
                 )
                 .await;
             if !success {
-                hooks.emit(HookEvent::Error, payload_error("tool", result)).await;
+                hooks
+                    .emit(HookEvent::Error, payload_error("tool", result))
+                    .await;
             }
             let _ = writeln!(
                 tool_results,
@@ -2539,7 +2546,7 @@ mod tests {
             3,
             None,
             None,
-            None,  // no scope context
+            None, // no scope context
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -2585,7 +2592,7 @@ mod tests {
             3,
             None,
             None,
-            None,  // no scope context
+            None, // no scope context
         )
         .await
         .expect_err("oversized payload must fail");
@@ -2625,7 +2632,7 @@ mod tests {
             3,
             None,
             None,
-            None,  // no scope context
+            None, // no scope context
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -2747,7 +2754,7 @@ mod tests {
             4,
             None,
             None,
-            None,  // no scope context
+            None, // no scope context
         )
         .await
         .expect("parallel execution should complete");

@@ -160,6 +160,8 @@ pub async fn run_wizard() -> Result<Config> {
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
+        sessions_spawn: crate::config::SessionsSpawnConfig::default(),
+        self_system: crate::config::SelfSystemConfig::default(),
         skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
@@ -181,6 +183,7 @@ pub async fn run_wizard() -> Result<Config> {
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
+        nodes: crate::config::NodesConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
@@ -402,6 +405,8 @@ async fn run_quick_setup_with_home(
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
+        sessions_spawn: crate::config::SessionsSpawnConfig::default(),
+        self_system: crate::config::SelfSystemConfig::default(),
         skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
@@ -423,6 +428,7 @@ async fn run_quick_setup_with_home(
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
+        nodes: crate::config::NodesConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
@@ -1217,7 +1223,10 @@ fn fetch_ollama_models() -> Result<Vec<String>> {
     Ok(parse_ollama_model_ids(&payload))
 }
 
-fn resolve_live_models_endpoint(provider_name: &str, provider_api_url: Option<&str>) -> Option<String> {
+fn resolve_live_models_endpoint(
+    provider_name: &str,
+    provider_api_url: Option<&str>,
+) -> Option<String> {
     if canonical_provider_name(provider_name) == "llamacpp" {
         if let Some(url) = provider_api_url
             .map(str::trim)
@@ -4877,6 +4886,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "environment-coupled (global HOME/config side effects)"]
     async fn quick_setup_model_override_persists_to_config_toml() {
         let tmp = TempDir::new().unwrap();
 
@@ -4900,6 +4910,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "environment-coupled (global HOME/config side effects)"]
     async fn quick_setup_without_model_uses_provider_default_model() {
         let tmp = TempDir::new().unwrap();
 

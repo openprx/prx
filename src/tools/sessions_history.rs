@@ -72,7 +72,9 @@ impl Tool for SessionsHistoryTool {
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
-            .map_or(DEFAULT_LIMIT, |v| usize::try_from(v).unwrap_or(DEFAULT_LIMIT));
+            .map_or(DEFAULT_LIMIT, |v| {
+                usize::try_from(v).unwrap_or(DEFAULT_LIMIT)
+            });
 
         let runs = self.active_runs.read().await;
         let Some(run) = runs.iter().find(|r| r.id == run_id) else {
@@ -191,10 +193,7 @@ mod tests {
         let run = make_run("run-1", SubAgentStatus::Running, vec![]);
         let runs = Arc::new(RwLock::new(vec![run]));
         let tool = SessionsHistoryTool::new(runs);
-        let result = tool
-            .execute(json!({"run_id": "run-1"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"run_id": "run-1"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No history entries"));
         assert!(result.output.contains("still running"));
@@ -206,17 +205,10 @@ mod tests {
             make_entry("user", "Hello, what is 2+2?"),
             make_entry("assistant", "The answer is 4."),
         ];
-        let run = make_run(
-            "run-2",
-            SubAgentStatus::Completed("done".into()),
-            entries,
-        );
+        let run = make_run("run-2", SubAgentStatus::Completed("done".into()), entries);
         let runs = Arc::new(RwLock::new(vec![run]));
         let tool = SessionsHistoryTool::new(runs);
-        let result = tool
-            .execute(json!({"run_id": "run-2"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"run_id": "run-2"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("user"));
         assert!(result.output.contains("Hello, what is 2+2?"));
@@ -230,11 +222,7 @@ mod tests {
         let entries: Vec<HistoryEntry> = (0..20)
             .map(|i| make_entry("user", &format!("message {i}")))
             .collect();
-        let run = make_run(
-            "run-3",
-            SubAgentStatus::Completed("done".into()),
-            entries,
-        );
+        let run = make_run("run-3", SubAgentStatus::Completed("done".into()), entries);
         let runs = Arc::new(RwLock::new(vec![run]));
         let tool = SessionsHistoryTool::new(runs);
         let result = tool

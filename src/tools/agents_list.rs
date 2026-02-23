@@ -62,9 +62,16 @@ impl Tool for AgentsListTool {
             .iter()
             .map(|(name, cfg)| {
                 let agentic_tag = if cfg.agentic { " [agentic]" } else { "" };
+                let identity_dir = cfg.identity_dir.as_deref().unwrap_or("(workspace root)");
+                let spawn_enabled = cfg.spawn_enabled.unwrap_or(true);
+                let model_line = if cfg.model.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n  Model: {}", cfg.model)
+                };
                 format!(
-                    "• **{name}**{agentic_tag}\n  Provider: {} / Model: {}\n  Max depth: {}",
-                    cfg.provider, cfg.model, cfg.max_depth
+                    "• **{name}**{agentic_tag}\n  Identity dir: {identity_dir}\n  Spawn enabled: {spawn_enabled}{model_line}\n  Provider: {}\n  Max depth: {}",
+                    cfg.provider, cfg.max_depth
                 )
             })
             .collect();
@@ -100,6 +107,9 @@ mod tests {
             agentic: false,
             allowed_tools: Vec::new(),
             max_iterations: 10,
+            identity_dir: None,
+            memory_scope: None,
+            spawn_enabled: None,
         }
     }
 
@@ -121,7 +131,10 @@ mod tests {
     #[tokio::test]
     async fn lists_agents() {
         let mut agents = HashMap::new();
-        agents.insert("researcher".to_string(), make_agent("anthropic", "claude-3-5-sonnet"));
+        agents.insert(
+            "researcher".to_string(),
+            make_agent("anthropic", "claude-3-5-sonnet"),
+        );
         agents.insert("coder".to_string(), make_agent("openai", "gpt-4o"));
         let tool = AgentsListTool::new(agents);
 
@@ -145,5 +158,21 @@ mod tests {
         let tool = AgentsListTool::new(agents);
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.output.contains("[agentic]"));
+    }
+
+    #[tokio::test]
+    async fn output_includes_identity_and_spawn_fields() {
+        let mut agents = HashMap::new();
+        let mut cfg = make_agent("openai", "gpt-4o");
+        cfg.identity_dir = Some("identities/alpha".into());
+        cfg.spawn_enabled = Some(false);
+        agents.insert("alpha".to_string(), cfg);
+
+        let tool = AgentsListTool::new(agents);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Identity dir: identities/alpha"));
+        assert!(result.output.contains("Spawn enabled: false"));
+        assert!(result.output.contains("Model: gpt-4o"));
     }
 }

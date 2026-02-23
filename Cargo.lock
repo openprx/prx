@@ -7851,6 +7851,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "console",
+ "constant_time_eq",
  "criterion",
  "cron",
  "dialoguer",

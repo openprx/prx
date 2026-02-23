@@ -1786,20 +1786,70 @@ fn load_openclaw_bootstrap_files(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
     );
 
-    let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
-
-    for filename in &bootstrap_files {
-        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
-    }
+    prompt.push_str(&build_identity_prompt_with_limit(
+        workspace_dir,
+        max_chars_per_file,
+    ));
 
     // BOOTSTRAP.md — only if it exists (first-run ritual)
     let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
     if bootstrap_path.exists() {
         inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
     }
+}
 
-    // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
+/// Build identity prompt content from workspace identity files.
+///
+/// Loads (if present): SOUL.md, AGENTS.md, IDENTITY.md, USER.md, TOOLS.md, MEMORY.md.
+/// Missing files are skipped.
+pub fn build_identity_prompt(workspace_dir: &Path) -> String {
+    build_identity_prompt_with_limit(workspace_dir, BOOTSTRAP_MAX_CHARS)
+}
+
+fn build_identity_prompt_with_limit(workspace_dir: &Path, max_chars: usize) -> String {
+    let mut prompt = String::new();
+    let files = [
+        "SOUL.md",
+        "AGENTS.md",
+        "IDENTITY.md",
+        "USER.md",
+        "TOOLS.md",
+        "MEMORY.md",
+    ];
+
+    for filename in files {
+        let path = workspace_dir.join(filename);
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            use std::fmt::Write;
+            let _ = writeln!(prompt, "### {filename}\n");
+            // Use character-boundary-safe truncation for UTF-8.
+            let truncated = if trimmed.chars().count() > max_chars {
+                trimmed
+                    .char_indices()
+                    .nth(max_chars)
+                    .map(|(idx, _)| &trimmed[..idx])
+                    .unwrap_or(trimmed)
+            } else {
+                trimmed
+            };
+            if truncated.len() < trimmed.len() {
+                prompt.push_str(truncated);
+                let _ = writeln!(
+                    prompt,
+                    "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
+                );
+            } else {
+                prompt.push_str(trimmed);
+                prompt.push_str("\n\n");
+            }
+        }
+    }
+
+    prompt
 }
 
 /// Load workspace identity files and build a system prompt.
@@ -2676,7 +2726,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     ));
     tool_descs.push((
         "nodes",
-        "Manage paired nodes from [nodes] config. Actions: list, status, notify, invoke. Current implementation is config-backed stub.",
+        "Manage remote nodes from [nodes] config over JSON-RPC. Actions: list, status, exec, read, write, cancel.",
     ));
     if !config.agents.is_empty() {
         tool_descs.push((
@@ -2885,7 +2935,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 wc.allowed_from.clone(),
             )));
         } else {
-            tracing::debug!("wacli channel configured but not enabled (set enabled = true to activate)");
+            tracing::debug!(
+                "wacli channel configured but not enabled (set enabled = true to activate)"
+            );
         }
     }
 
@@ -2998,22 +3050,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
             security.clone(),
             config.workspace_dir.clone(),
             config.multimodal.clone(),
+            config.agents.clone(),
+            config.sessions_spawn.clone(),
         );
         let handle = spawn_tool.tools_handle();
         let active_runs = spawn_tool.active_runs_arc();
 
         // sessions_list: dedicated listing tool (OpenClaw alignment)
-        tools_list.push(Box::new(tools::SessionsListTool::new(
-            active_runs.clone(),
-        )));
+        tools_list.push(Box::new(tools::SessionsListTool::new(active_runs.clone())));
         // sessions_send: cross-session message injection (OpenClaw alignment)
-        tools_list.push(Box::new(tools::SessionsSendTool::new(
-            active_runs.clone(),
-        )));
+        tools_list.push(Box::new(tools::SessionsSendTool::new(active_runs.clone())));
         // subagents: OpenClaw-compatible subagent management interface
-        tools_list.push(Box::new(tools::SubagentsTool::new(
-            active_runs.clone(),
-        )));
+        tools_list.push(Box::new(tools::SubagentsTool::new(active_runs.clone())));
         // sessions_history: conversation log viewer (OpenClaw alignment)
         tools_list.push(Box::new(tools::SessionsHistoryTool::new(
             active_runs.clone(),
@@ -3790,7 +3838,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -3850,7 +3900,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -3910,7 +3962,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -3979,7 +4033,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4069,7 +4125,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4141,7 +4199,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4228,7 +4288,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4300,7 +4362,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4361,7 +4425,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4533,7 +4599,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4614,7 +4682,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4707,7 +4777,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4782,7 +4854,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -4898,14 +4972,28 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_missing_file_markers() {
+    fn prompt_missing_identity_files_are_skipped() {
         let tmp = TempDir::new().unwrap();
         // Empty workspace — no files at all
         let prompt = build_system_prompt(tmp.path(), "model", &[], &[], None, None);
 
-        assert!(prompt.contains("[File not found: SOUL.md]"));
-        assert!(prompt.contains("[File not found: AGENTS.md]"));
-        assert!(prompt.contains("[File not found: IDENTITY.md]"));
+        assert!(!prompt.contains("### SOUL.md"));
+        assert!(!prompt.contains("### AGENTS.md"));
+        assert!(!prompt.contains("### IDENTITY.md"));
+    }
+
+    #[test]
+    fn build_identity_prompt_loads_existing_files_only() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("SOUL.md"), "Soul").unwrap();
+        std::fs::write(tmp.path().join("TOOLS.md"), "Tools").unwrap();
+
+        let prompt = build_identity_prompt(tmp.path());
+        assert!(prompt.contains("### SOUL.md"));
+        assert!(prompt.contains("Soul"));
+        assert!(prompt.contains("### TOOLS.md"));
+        assert!(!prompt.contains("### AGENTS.md"));
+        assert!(!prompt.contains("File not found"));
     }
 
     #[test]
@@ -5246,7 +5334,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -5332,7 +5422,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
@@ -5418,7 +5510,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(crate::config::ToolPolicyConfig::default())),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
         });
 
         process_channel_message(
