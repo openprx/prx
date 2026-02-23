@@ -1,7 +1,9 @@
 use anyhow::Result;
 use regex::Regex;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, types::Value, Connection, OptionalExtension};
 use std::sync::LazyLock;
+use unicode_normalization::UnicodeNormalization;
+use uuid::Uuid;
 
 pub const CURRENT_POLICY_VERSION: i64 = 1;
 
@@ -134,6 +136,68 @@ pub struct Principal {
     pub current_chat_type: ChatType,
 }
 
+impl Principal {
+    pub fn build_sql_scope(&self) -> (String, Vec<Value>) {
+        match self.role {
+            Role::Owner => ("1=1".to_string(), Vec::new()),
+            Role::Anonymous => (
+                "visibility = 'public' AND sensitivity = 'normal'".to_string(),
+                Vec::new(),
+            ),
+            Role::Member | Role::Guest => {
+                let ceiling_ord = self.visibility_ceiling.ordinal();
+                let mut conditions = vec!["visibility = 'public'".to_string()];
+                let mut params = Vec::new();
+
+                if ceiling_ord >= Visibility::Private.ordinal() {
+                    conditions.push(
+                        "(visibility = 'private' AND chat_type = 'dm' AND channel = ? AND chat_id = ?)"
+                            .to_string(),
+                    );
+                    params.push(Value::from(self.current_channel.clone()));
+                    params.push(Value::from(self.current_chat_id.clone()));
+                }
+
+                if ceiling_ord >= Visibility::User.ordinal() {
+                    conditions.push("(visibility = 'user' AND sender_id = ?)".to_string());
+                    params.push(Value::from(self.user_id.clone()));
+                }
+
+                if ceiling_ord >= Visibility::Group.ordinal() {
+                    conditions.push(
+                        "(visibility = 'group' AND chat_type = 'group' AND channel = ? AND chat_id = ?)"
+                            .to_string(),
+                    );
+                    params.push(Value::from(self.current_channel.clone()));
+                    params.push(Value::from(self.current_chat_id.clone()));
+                }
+
+                if ceiling_ord >= Visibility::Project.ordinal() && !self.projects.is_empty() {
+                    let placeholders = (0..self.projects.len())
+                        .map(|_| "?")
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    conditions.push(format!(
+                        "(visibility = 'project' AND topic_id IN (\
+                            SELECT t.id FROM topics t \
+                            INNER JOIN topic_participants tp ON tp.topic_id = t.id \
+                            WHERE t.project IN ({placeholders}) \
+                            AND tp.user_id = ?\
+                        ))"
+                    ));
+                    params.extend(self.projects.iter().cloned().map(Value::from));
+                    params.push(Value::from(self.user_id.clone()));
+                }
+
+                (
+                    format!("({}) AND sensitivity != 'secret'", conditions.join(" OR ")),
+                    params,
+                )
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MemoryWriteContext {
     pub channel: Option<String>,
@@ -149,6 +213,57 @@ pub struct MemoryClassification {
     pub sensitivity: Sensitivity,
     pub risk_signals: Vec<String>,
     pub policy_version: i64,
+}
+
+pub fn post_filter<T, F>(memories: Vec<T>, principal: &Principal, mut content_of: F) -> Vec<T>
+where
+    F: FnMut(&T) -> &str,
+{
+    if principal.role == Role::Owner || principal.blocked_patterns.is_empty() {
+        return memories;
+    }
+
+    memories
+        .into_iter()
+        .filter(|memory| {
+            let normalized = content_of(memory).nfkc().collect::<String>().to_lowercase();
+            let no_space = normalized.replace(' ', "");
+            !principal
+                .blocked_patterns
+                .iter()
+                .any(|re| re.is_match(&normalized) || re.is_match(&no_space))
+        })
+        .collect()
+}
+
+pub fn log_access(
+    conn: &Connection,
+    principal: &Principal,
+    action: &str,
+    query: Option<&str>,
+    memory_id: Option<&str>,
+    policy_rule: Option<&str>,
+    result: &str,
+) {
+    if principal.role == Role::Owner {
+        return;
+    }
+
+    conn.execute(
+        "INSERT INTO access_audit_log (id, timestamp, requester, action, query, memory_id, policy_rule, result)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            Uuid::new_v4().to_string(),
+            chrono::Utc::now().to_rfc3339(),
+            &principal.user_id,
+            action,
+            query,
+            memory_id,
+            policy_rule,
+            result,
+        ],
+    )
+    .ok();
 }
 
 pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<Principal> {
@@ -464,5 +579,99 @@ mod tests {
     fn visibility_ordinal_is_stable() {
         assert!(Visibility::Owner.ordinal() < Visibility::Private.ordinal());
         assert!(Visibility::Private.ordinal() < Visibility::Public.ordinal());
+    }
+
+    fn base_principal(role: Role, ceiling: Visibility) -> Principal {
+        Principal {
+            user_id: "u1".into(),
+            role,
+            projects: vec!["proj-a".into(), "proj-b".into()],
+            visibility_ceiling: ceiling,
+            blocked_patterns: Vec::new(),
+            current_channel: "telegram".into(),
+            current_chat_id: "chat-1".into(),
+            current_chat_type: ChatType::Dm,
+        }
+    }
+
+    #[test]
+    fn build_sql_scope_owner_is_unrestricted() {
+        let principal = base_principal(Role::Owner, Visibility::Public);
+        let (scope, params) = principal.build_sql_scope();
+        assert_eq!(scope, "1=1");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn build_sql_scope_anonymous_is_public_normal_only() {
+        let principal = base_principal(Role::Anonymous, Visibility::Private);
+        let (scope, params) = principal.build_sql_scope();
+        assert_eq!(scope, "visibility = 'public' AND sensitivity = 'normal'");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn build_sql_scope_private_ceiling_excludes_user_group_project() {
+        let principal = base_principal(Role::Guest, Visibility::Private);
+        let (scope, params) = principal.build_sql_scope();
+        assert!(scope.contains("visibility = 'private'"));
+        assert!(!scope.contains("visibility = 'user'"));
+        assert!(!scope.contains("visibility = 'group'"));
+        assert!(!scope.contains("visibility = 'project'"));
+        assert!(scope.contains("sensitivity != 'secret'"));
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn build_sql_scope_user_ceiling_includes_sender_match() {
+        let principal = base_principal(Role::Member, Visibility::User);
+        let (scope, params) = principal.build_sql_scope();
+        assert!(scope.contains("visibility = 'user' AND sender_id = ?"));
+        assert!(!scope.contains("visibility = 'group'"));
+        assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn build_sql_scope_group_ceiling_includes_group_triplet() {
+        let principal = base_principal(Role::Member, Visibility::Group);
+        let (scope, params) = principal.build_sql_scope();
+        assert!(scope.contains("visibility = 'group' AND chat_type = 'group'"));
+        assert_eq!(params.len(), 5);
+    }
+
+    #[test]
+    fn build_sql_scope_project_ceiling_includes_project_participant_guard() {
+        let principal = base_principal(Role::Member, Visibility::Project);
+        let (scope, params) = principal.build_sql_scope();
+        assert!(scope.contains("visibility = 'project'"));
+        assert!(scope.contains("topic_participants tp"));
+        assert!(scope.contains("t.project IN (?,?)"));
+        assert_eq!(params.len(), 8);
+    }
+
+    #[test]
+    fn post_filter_applies_nfkc_and_regex() {
+        let mut principal = base_principal(Role::Guest, Visibility::Public);
+        principal.blocked_patterns = vec![Regex::new("api[_-]?key").unwrap()];
+
+        let inputs = vec![
+            "normal text".to_string(),
+            "ＡＰＩＫＥＹ leaked".to_string(),
+            "hello".to_string(),
+        ];
+        let filtered = post_filter(inputs, &principal, |s| s.as_str());
+        assert_eq!(
+            filtered,
+            vec!["normal text".to_string(), "hello".to_string()]
+        );
+    }
+
+    #[test]
+    fn post_filter_skips_owner() {
+        let mut principal = base_principal(Role::Owner, Visibility::Public);
+        principal.blocked_patterns = vec![Regex::new("secret").unwrap()];
+        let inputs = vec!["secret".to_string()];
+        let filtered = post_filter(inputs.clone(), &principal, |s| s.as_str());
+        assert_eq!(filtered, inputs);
     }
 }

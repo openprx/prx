@@ -323,12 +323,24 @@ impl SqliteMemory {
 
         // Migration: add missing columns for backward compatibility.
         let missing_columns = [
-            ("session_id", "ALTER TABLE memories ADD COLUMN session_id TEXT"),
+            (
+                "session_id",
+                "ALTER TABLE memories ADD COLUMN session_id TEXT",
+            ),
             ("channel", "ALTER TABLE memories ADD COLUMN channel TEXT"),
-            ("chat_type", "ALTER TABLE memories ADD COLUMN chat_type TEXT"),
+            (
+                "chat_type",
+                "ALTER TABLE memories ADD COLUMN chat_type TEXT",
+            ),
             ("chat_id", "ALTER TABLE memories ADD COLUMN chat_id TEXT"),
-            ("sender_id", "ALTER TABLE memories ADD COLUMN sender_id TEXT"),
-            ("raw_sender", "ALTER TABLE memories ADD COLUMN raw_sender TEXT"),
+            (
+                "sender_id",
+                "ALTER TABLE memories ADD COLUMN sender_id TEXT",
+            ),
+            (
+                "raw_sender",
+                "ALTER TABLE memories ADD COLUMN raw_sender TEXT",
+            ),
             ("topic_id", "ALTER TABLE memories ADD COLUMN topic_id TEXT"),
             (
                 "visibility",
