@@ -126,7 +126,10 @@ fn run_watcher(
                 hasher.update(&contents);
                 let content_hash = hasher.finalize().to_vec();
 
-                if last_content_hash.as_ref().is_some_and(|h| h == &content_hash) {
+                if last_content_hash
+                    .as_ref()
+                    .is_some_and(|h| h == &content_hash)
+                {
                     tracing::debug!(
                         path = %config_path.display(),
                         "Config watcher event ignored (content unchanged)"

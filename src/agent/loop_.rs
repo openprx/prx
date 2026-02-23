@@ -31,6 +31,7 @@ pub(crate) struct ScopeContext<'a> {
     pub sender: &'a str,
     pub channel: &'a str,
     pub chat_type: &'a str,
+    pub chat_id: &'a str,
     /// Optional multi-layer tool policy pipeline (P3-1).
     /// When set, tool calls are additionally evaluated against the pipeline
     /// before execution. A denial from the pipeline blocks the tool call.
@@ -988,14 +989,30 @@ pub(crate) async fn agent_turn(
 
 async fn execute_one_tool(
     call_name: &str,
-    call_arguments: serde_json::Value,
+    mut call_arguments: serde_json::Value,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    scope_ctx: Option<&ScopeContext<'_>>,
 ) -> Result<String> {
     let Some(tool) = find_tool(tools_registry, call_name) else {
         return Ok(format!("Unknown tool: {call_name}"));
     };
+
+    if let Some(ctx) = scope_ctx {
+        let root = call_arguments
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("tool arguments must be a JSON object"))?;
+        root.insert(
+            "_zc_scope".to_string(),
+            serde_json::json!({
+                "sender": ctx.sender,
+                "channel": ctx.channel,
+                "chat_type": ctx.chat_type,
+                "chat_id": ctx.chat_id,
+            }),
+        );
+    }
 
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
@@ -1104,6 +1121,7 @@ async fn execute_tools_parallel(
                 tools_registry,
                 observer,
                 cancellation_token,
+                scope_ctx,
             ))
         })
         .collect();
@@ -1204,6 +1222,7 @@ async fn execute_tools_sequential(
             tools_registry,
             observer,
             cancellation_token,
+            scope_ctx,
         )
         .await?;
         individual_results.push(result);

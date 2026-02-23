@@ -1504,6 +1504,7 @@ async fn process_channel_message(
         sender: &msg.sender,
         channel: &msg.channel,
         chat_type,
+        chat_id: &msg.reply_target,
         policy_pipeline: Some(&ctx.tool_policy_pipeline),
     };
 

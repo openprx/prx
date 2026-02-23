@@ -1315,8 +1315,11 @@ async fn run_sub_agent_process(
             Ok::<Vec<u8>, anyhow::Error>(stderr)
         };
 
-        let (status_result, stdout_result, stderr_result) =
-            tokio::join!(wait_with_parent_timeout(&mut child, parent_timeout), stdout_future, stderr_future);
+        let (status_result, stdout_result, stderr_result) = tokio::join!(
+            wait_with_parent_timeout(&mut child, parent_timeout),
+            stdout_future,
+            stderr_future
+        );
 
         let status = status_result?;
         let stdout = stdout_result?;

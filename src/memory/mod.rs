@@ -339,8 +339,7 @@ pub fn create_memory_with_storage_and_routes_with_acl(
         backend_kind,
         MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
     ) {
-        if let Err(error) = upsert_acl_bootstrap(workspace_dir, identity_bindings, user_policies)
-        {
+        if let Err(error) = upsert_acl_bootstrap(workspace_dir, identity_bindings, user_policies) {
             tracing::warn!("memory ACL bootstrap upsert skipped: {error}");
         }
     }

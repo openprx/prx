@@ -244,10 +244,12 @@ pub fn all_tools_with_runtime(
         Arc::new(MemorySearchTool::new(
             workspace_dir.to_path_buf(),
             memory.clone(),
+            config.memory.acl_enabled,
         )),
         Arc::new(MemoryGetTool::new(
             workspace_dir.to_path_buf(),
             memory.clone(),
+            config.memory.acl_enabled,
         )),
         Arc::new(ScheduleTool::new(
             security.clone(),
