@@ -34,6 +34,7 @@ const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 pub struct SqliteMemory {
     conn: Arc<Mutex<Connection>>,
     db_path: PathBuf,
+    acl_enabled: bool,
     embedder: Arc<dyn EmbeddingProvider>,
     vector_weight: f32,
     keyword_weight: f32,
@@ -42,13 +43,14 @@ pub struct SqliteMemory {
 
 impl SqliteMemory {
     pub fn new(workspace_dir: &Path) -> anyhow::Result<Self> {
-        Self::with_embedder(
+        Self::with_embedder_with_acl(
             workspace_dir,
             Arc::new(super::embeddings::NoopEmbedding),
             0.7,
             0.3,
             10_000,
             None,
+            false,
         )
     }
 
@@ -56,13 +58,27 @@ impl SqliteMemory {
     ///
     /// Uses the noop embedder and default weights/cache values, matching `new`.
     pub fn new_with_path(db_path: PathBuf) -> anyhow::Result<Self> {
-        Self::with_embedder_and_path(
+        Self::with_embedder_and_path_with_acl(
             db_path,
             Arc::new(super::embeddings::NoopEmbedding),
             0.7,
             0.3,
             10_000,
             None,
+            false,
+        )
+    }
+
+    /// Build SQLite memory using an explicit database file path and ACL mode.
+    pub fn new_with_path_and_acl(db_path: PathBuf, acl_enabled: bool) -> anyhow::Result<Self> {
+        Self::with_embedder_and_path_with_acl(
+            db_path,
+            Arc::new(super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            10_000,
+            None,
+            acl_enabled,
         )
     }
 
@@ -79,24 +95,47 @@ impl SqliteMemory {
         cache_max: usize,
         open_timeout_secs: Option<u64>,
     ) -> anyhow::Result<Self> {
+        Self::with_embedder_with_acl(
+            workspace_dir,
+            embedder,
+            vector_weight,
+            keyword_weight,
+            cache_max,
+            open_timeout_secs,
+            false,
+        )
+    }
+
+    /// Build SQLite memory with optional open timeout and ACL mode.
+    pub fn with_embedder_with_acl(
+        workspace_dir: &Path,
+        embedder: Arc<dyn EmbeddingProvider>,
+        vector_weight: f32,
+        keyword_weight: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+        acl_enabled: bool,
+    ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("brain.db");
-        Self::with_embedder_and_path(
+        Self::with_embedder_and_path_with_acl(
             db_path,
             embedder,
             vector_weight,
             keyword_weight,
             cache_max,
             open_timeout_secs,
+            acl_enabled,
         )
     }
 
-    fn with_embedder_and_path(
+    fn with_embedder_and_path_with_acl(
         db_path: PathBuf,
         embedder: Arc<dyn EmbeddingProvider>,
         vector_weight: f32,
         keyword_weight: f32,
         cache_max: usize,
         open_timeout_secs: Option<u64>,
+        acl_enabled: bool,
     ) -> anyhow::Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -123,6 +162,7 @@ impl SqliteMemory {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path,
+            acl_enabled,
             embedder,
             vector_weight,
             keyword_weight,
@@ -474,6 +514,7 @@ impl SqliteMemory {
 
         let conn = self.conn.clone();
         let db_path = self.db_path.clone();
+        let acl_enabled = self.acl_enabled;
         let key = key.to_string();
         let content = content.to_string();
         let sid = session_id.map(String::from);
@@ -579,7 +620,9 @@ impl SqliteMemory {
                 )?;
             }
 
-            Self::append_backup_entry(&db_path, &key, &content, &category);
+            if !acl_enabled {
+                Self::append_backup_entry(&db_path, &key, &content, &category);
+            }
             Ok(())
         })
         .await?
@@ -1168,6 +1211,20 @@ mod tests {
 
         assert!(db_path.exists());
         assert_eq!(mem.name(), "sqlite");
+    }
+
+    #[tokio::test]
+    async fn sqlite_acl_enabled_skips_markdown_backup() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory").join("brain.db");
+        let mem = SqliteMemory::new_with_path_and_acl(db_path, true).unwrap();
+
+        mem.store("k1", "sensitive", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        assert!(mem.get("k1").await.unwrap().is_some());
+        assert!(!tmp.path().join("MEMORY.md").exists());
     }
 
     #[tokio::test]
