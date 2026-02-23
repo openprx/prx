@@ -37,6 +37,7 @@ pub struct WebhookEvent {
 struct WebhookState {
     token: Arc<str>,
     db_path: Arc<PathBuf>,
+    acl_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,7 +45,7 @@ struct WebhookAck {
     topic_id: String,
 }
 
-pub async fn run(bind: &str, token: &str, workspace_dir: &Path) -> Result<()> {
+pub async fn run(bind: &str, token: &str, workspace_dir: &Path, acl_enabled: bool) -> Result<()> {
     let trimmed_token = token.trim();
     if trimmed_token.is_empty() {
         anyhow::bail!("webhook token must not be empty when webhook is enabled");
@@ -63,6 +64,7 @@ pub async fn run(bind: &str, token: &str, workspace_dir: &Path) -> Result<()> {
     let state = WebhookState {
         token: Arc::<str>::from(trimmed_token.to_string()),
         db_path: Arc::new(db_path),
+        acl_enabled,
     };
 
     run_with_listener(listener, state).await
@@ -108,7 +110,9 @@ async fn handle_webhook_event(
     };
 
     let db_path = (*state.db_path).clone();
-    let saved = tokio::task::spawn_blocking(move || persist_event(&db_path, &event)).await;
+    let acl_enabled = state.acl_enabled;
+    let saved =
+        tokio::task::spawn_blocking(move || persist_event(&db_path, &event, acl_enabled)).await;
 
     match saved {
         Ok(Ok(topic_id)) => (
@@ -330,11 +334,15 @@ fn normalize_openpr_event_type(raw: &str) -> String {
     format!("issue.{normalized}")
 }
 
-fn persist_event(db_path: &Path, event: &WebhookEvent) -> Result<String> {
+fn persist_event(db_path: &Path, event: &WebhookEvent, acl_enabled: bool) -> Result<String> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("failed to open webhook db {}", db_path.display()))?;
 
-    let topic_id = match crate::memory::topic::find_topic_by_external(&conn, &event.external_id)? {
+    let topic_id = match crate::memory::topic::find_topic_by_project_and_external(
+        &conn,
+        event.project.as_deref(),
+        &event.external_id,
+    )? {
         Some(topic) => topic.id,
         None => {
             let fingerprint = webhook_topic_fingerprint(
@@ -381,7 +389,7 @@ fn persist_event(db_path: &Path, event: &WebhookEvent) -> Result<String> {
     };
 
     // Persist via memory classification path to keep ACL policy consistent.
-    let memory = SqliteMemory::new_with_path(db_path.to_path_buf())?;
+    let memory = SqliteMemory::new_with_path_and_acl(db_path.to_path_buf(), acl_enabled)?;
     futures::executor::block_on(memory.store_with_context(
         &memory_key,
         &content,
@@ -465,6 +473,7 @@ mod tests {
         WebhookState {
             token: Arc::<str>::from(token.to_string()),
             db_path: Arc::new(db_path),
+            acl_enabled: false,
         }
     }
 
@@ -577,6 +586,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(visibility, "owner");
+    }
+
+    #[tokio::test]
+    async fn same_external_id_in_different_projects_keeps_separate_topics() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory").join("brain.db");
+        let app = router(setup_state(&tmp, "secret"));
+
+        for project in ["openpr", "lc"] {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/webhook/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret")
+                .body(Body::from(
+                    json!({
+                        "source": "custom",
+                        "event_type": "issue.created",
+                        "project": project,
+                        "external_id": "issue#42",
+                        "title": format!("{project} issue"),
+                        "content": "details",
+                        "actor": "zeroclaw_user",
+                        "timestamp": Utc::now().to_rfc3339()
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let conn = Connection::open(db_path).unwrap();
+        let topic_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM topics WHERE external_id = 'issue#42'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(topic_count, 2);
     }
 
     #[test]

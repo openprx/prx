@@ -109,8 +109,9 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
             &provider_runtime_options,
         )?);
 
-    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new_with_path(
+    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new_with_path_and_acl(
         manifest.memory_db_path.clone(),
+        config.memory.acl_enabled,
     )?);
 
     let security = Arc::new(SecurityPolicy::from_config(

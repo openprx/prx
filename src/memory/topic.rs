@@ -36,32 +36,14 @@ pub fn create_topic(
     external_id: Option<&str>,
     fingerprint: &str,
 ) -> Result<String> {
-    if let Some(external_id) = external_id {
-        let existing_by_external: Option<String> = conn
-            .query_row(
-                "SELECT id
-                 FROM topics
-                 WHERE external_id = ?1
-                   AND ((project = ?2) OR (project IS NULL AND ?2 IS NULL))
-                 ORDER BY updated_at DESC
-                 LIMIT 1",
-                params![external_id, project],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(id) = existing_by_external {
-            return Ok(id);
-        }
-    }
-
     let now = Utc::now().to_rfc3339();
     let topic_id = Uuid::new_v4().to_string();
 
-    let inserted_id: Option<String> = conn
-        .query_row(
+    if let Some(external_id) = external_id {
+        let id: String = conn.query_row(
             "INSERT INTO topics (id, title, project, external_id, fingerprint, status, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)
-             ON CONFLICT(fingerprint) DO UPDATE SET updated_at = excluded.updated_at
+             ON CONFLICT(project, external_id) DO UPDATE SET updated_at = excluded.updated_at
              RETURNING id",
             params![
                 &topic_id,
@@ -73,21 +55,27 @@ pub fn create_topic(
                 &now
             ],
             |row| row.get(0),
-        )
-        .optional()?;
-
-    if let Some(id) = inserted_id {
+        )?;
         return Ok(id);
     }
 
-    let existing_id: Option<String> = conn
-        .query_row(
-            "SELECT id FROM topics WHERE fingerprint = ?1",
-            params![fingerprint],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(existing_id.unwrap_or(topic_id))
+    let id: String = conn.query_row(
+        "INSERT INTO topics (id, title, project, external_id, fingerprint, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)
+         ON CONFLICT(fingerprint) DO UPDATE SET updated_at = excluded.updated_at
+         RETURNING id",
+        params![
+            &topic_id,
+            title,
+            project,
+            external_id,
+            fingerprint,
+            &now,
+            &now
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(id)
 }
 
 pub fn find_topic_by_external(conn: &Connection, external_id: &str) -> Result<Option<Topic>> {
@@ -98,6 +86,25 @@ pub fn find_topic_by_external(conn: &Connection, external_id: &str) -> Result<Op
          ORDER BY updated_at DESC
          LIMIT 1",
         params![external_id],
+        map_topic,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn find_topic_by_project_and_external(
+    conn: &Connection,
+    project: Option<&str>,
+    external_id: &str,
+) -> Result<Option<Topic>> {
+    conn.query_row(
+        "SELECT id, title, project, external_id, fingerprint, status, created_at, updated_at
+         FROM topics
+         WHERE external_id = ?1
+           AND ((project = ?2) OR (project IS NULL AND ?2 IS NULL))
+         ORDER BY updated_at DESC
+         LIMIT 1",
+        params![external_id, project],
         map_topic,
     )
     .optional()
@@ -451,7 +458,8 @@ mod tests {
         )
         .unwrap();
 
-        let by_external = find_topic_by_external(&conn, "openpr#42").unwrap();
+        let by_external =
+            find_topic_by_project_and_external(&conn, Some("openpr"), "openpr#42").unwrap();
         assert_eq!(by_external.unwrap().id, id);
 
         let by_fp = find_topic_by_fingerprint(&conn, "fp-1").unwrap();
@@ -526,6 +534,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn find_topic_by_project_and_external_prevents_cross_project_mixup() {
+        let (_tmp, conn) = setup_conn();
+        let first = create_topic(
+            &conn,
+            "OpenPR issue",
+            Some("openpr"),
+            Some("issue#42"),
+            "fp-openpr",
+        )
+        .unwrap();
+        let second =
+            create_topic(&conn, "LC issue", Some("lc"), Some("issue#42"), "fp-lc").unwrap();
+        assert_ne!(first, second);
+
+        let openpr = find_topic_by_project_and_external(&conn, Some("openpr"), "issue#42").unwrap();
+        let lc = find_topic_by_project_and_external(&conn, Some("lc"), "issue#42").unwrap();
+        assert_eq!(openpr.unwrap().id, first);
+        assert_eq!(lc.unwrap().id, second);
     }
 
     #[test]

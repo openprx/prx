@@ -108,7 +108,13 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                             "webhook.token must be configured when webhook.enabled=true"
                         )
                     })?;
-                    crate::webhook::run(&cfg.webhook.bind, token, &cfg.workspace_dir).await
+                    crate::webhook::run(
+                        &cfg.webhook.bind,
+                        token,
+                        &cfg.workspace_dir,
+                        cfg.memory.acl_enabled,
+                    )
+                    .await
                 }
             },
         ));
