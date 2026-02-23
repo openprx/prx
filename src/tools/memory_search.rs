@@ -1,7 +1,9 @@
 use super::traits::{Tool, ToolResult};
+use crate::memory::Memory;
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const DEFAULT_MAX_RESULTS: usize = 5;
 const MAX_RESULTS_LIMIT: usize = 100;
@@ -9,11 +11,15 @@ const MAX_RESULTS_LIMIT: usize = 100;
 /// Search curated workspace memory markdown files using text matching.
 pub struct MemorySearchTool {
     workspace_dir: PathBuf,
+    memory: Arc<dyn Memory>,
 }
 
 impl MemorySearchTool {
-    pub fn new(workspace_dir: PathBuf) -> Self {
-        Self { workspace_dir }
+    pub fn new(workspace_dir: PathBuf, memory: Arc<dyn Memory>) -> Self {
+        Self {
+            workspace_dir,
+            memory,
+        }
     }
 
     fn memory_files(&self) -> anyhow::Result<Vec<(String, PathBuf)>> {
@@ -121,7 +127,7 @@ impl Tool for MemorySearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search MEMORY.md and memory/*.md files for relevant snippets using text matching."
+        "Search memories from SQLite first (hybrid retrieval), with file fallback for compatibility."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -162,31 +168,91 @@ impl Tool for MemorySearchTool {
 
         let max_results = parse_max_results(&args);
         let min_score = parse_min_score(&args);
-        let terms = tokenize_query(trimmed_query);
+        match self.memory.recall(trimmed_query, max_results, None).await {
+            Ok(entries) => {
+                let terms = tokenize_query(trimmed_query);
+                let mut filtered = entries
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let score = compute_score(&entry.content, &terms);
+                        if score < min_score || score <= 0.0 {
+                            return None;
+                        }
+                        Some((entry, score))
+                    })
+                    .collect::<Vec<_>>();
+                filtered.sort_by(|(a, a_score), (b, b_score)| {
+                    b_score
+                        .partial_cmp(a_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            b.score
+                                .partial_cmp(&a.score)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                });
+                filtered.truncate(max_results);
 
+                if filtered.is_empty() {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: format!("No matches found for query: '{trimmed_query}'"),
+                        error: None,
+                    });
+                }
+
+                let mut output = format!("Found {} matches:\n", filtered.len());
+                for (entry, _score) in filtered {
+                    let snippet = best_snippet(&entry.content, &terms);
+                    let content = condensed_content(&entry.content);
+                    output.push_str(&format!(
+                        "- key: {}\n  content: {}\n  snippet: {}\n",
+                        entry.key, content, snippet
+                    ));
+                }
+
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
+            Err(error) => {
+                tracing::warn!("memory_search sqlite recall failed, using file fallback: {error}");
+                self.fallback_search_files(trimmed_query, max_results, min_score)
+            }
+        }
+    }
+}
+
+impl MemorySearchTool {
+    fn fallback_search_files(
+        &self,
+        trimmed_query: &str,
+        max_results: usize,
+        min_score: f64,
+    ) -> anyhow::Result<ToolResult> {
+        let terms = tokenize_query(trimmed_query);
         let files = self.memory_files()?;
         if files.is_empty() {
             return Ok(ToolResult {
                 success: true,
-                output: "No memory files found (expected MEMORY.md or memory/*.md).".to_string(),
+                output: "No memory data found in SQLite or fallback files.".to_string(),
                 error: None,
             });
         }
 
         let mut matches: Vec<MatchRow> = Vec::new();
-
         for (relative_path, full_path) in files {
             let contents = std::fs::read_to_string(&full_path).map_err(|e| {
                 anyhow::anyhow!("Failed to read memory file '{}': {e}", full_path.display())
             })?;
-
             for (idx, line) in contents.lines().enumerate() {
                 let line_no = idx + 1;
                 let score = compute_score(line, &terms);
                 if score < min_score || score <= 0.0 {
                     continue;
                 }
-
                 matches.push(MatchRow {
                     path: relative_path.clone(),
                     line: line_no,
@@ -215,14 +281,14 @@ impl Tool for MemorySearchTool {
 
         let mut output = format!("Found {} matches:\n", matches.len());
         for row in matches {
-            let snippet = if row.snippet.is_empty() {
+            let snippet_text = if row.snippet.is_empty() {
                 "(blank line)"
             } else {
                 &row.snippet
             };
             output.push_str(&format!(
-                "- {}:{} [score {:.2}]: {}\n",
-                row.path, row.line, row.score, snippet
+                "- key: {}:{}\n  content: {}\n  snippet: {}\n",
+                row.path, row.line, snippet_text, snippet_text
             ));
         }
 
@@ -234,51 +300,81 @@ impl Tool for MemorySearchTool {
     }
 }
 
+fn condensed_content(content: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let flattened = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= MAX_CHARS {
+        return flattened;
+    }
+    let truncated = flattened.chars().take(MAX_CHARS).collect::<String>();
+    format!("{truncated}...")
+}
+
+fn best_snippet(content: &str, terms: &[String]) -> String {
+    const MAX_SNIPPET_CHARS: usize = 160;
+    let first_match = content.lines().map(str::trim).find(|line| {
+        let lower = line.to_lowercase();
+        terms.iter().any(|term| lower.contains(term))
+    });
+    let line = first_match
+        .or_else(|| content.lines().map(str::trim).find(|line| !line.is_empty()))
+        .unwrap_or(content.trim());
+    if line.chars().count() <= MAX_SNIPPET_CHARS {
+        return line.to_string();
+    }
+    let truncated = line.chars().take(MAX_SNIPPET_CHARS).collect::<String>();
+    format!("{truncated}...")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use tempfile::TempDir;
 
-    fn write_file(path: &Path, content: &str) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(path, content).unwrap();
+    fn test_tool(tmp: &TempDir) -> MemorySearchTool {
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        MemorySearchTool::new(tmp.path().to_path_buf(), memory)
     }
 
     #[tokio::test]
-    async fn search_finds_memory_md_and_daily_files() {
+    async fn search_uses_sqlite_memory_recall() {
         let tmp = TempDir::new().unwrap();
-        write_file(
-            &tmp.path().join("MEMORY.md"),
-            "Core preference: Rust\nSecondary: tests\n",
-        );
-        write_file(
-            &tmp.path().join("memory/2026-02-22.md"),
-            "Daily note mentions Rust and reliability\n",
-        );
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("user_pref", "Core preference: Rust for reliability", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        memory
+            .store("daily_note", "Daily note mentions tests", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
 
-        let tool = MemorySearchTool::new(tmp.path().to_path_buf());
+        let tool = test_tool(&tmp);
         let result = tool
             .execute(json!({"query": "rust", "maxResults": 10, "minScore": 0.1}))
             .await
             .unwrap();
 
         assert!(result.success);
-        assert!(result.output.contains("MEMORY.md:1"));
-        assert!(result.output.contains("memory/2026-02-22.md:1"));
+        assert!(result.output.contains("key: user_pref"));
+        assert!(result.output.contains("snippet:"));
     }
 
     #[tokio::test]
     async fn search_respects_min_score_and_limit() {
         let tmp = TempDir::new().unwrap();
-        write_file(
-            &tmp.path().join("MEMORY.md"),
-            "alpha beta gamma\nalpha only\nbeta only\n",
-        );
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("k1", "alpha beta gamma", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        memory
+            .store("k2", "alpha only", MemoryCategory::Core, None)
+            .await
+            .unwrap();
 
-        let tool = MemorySearchTool::new(tmp.path().to_path_buf());
+        let tool = test_tool(&tmp);
         let result = tool
             .execute(json!({"query": "alpha beta", "maxResults": 1, "minScore": 1.0}))
             .await
@@ -286,14 +382,14 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("Found 1 matches"));
-        assert!(result.output.contains("MEMORY.md:1"));
-        assert!(!result.output.contains("MEMORY.md:2"));
+        assert!(result.output.contains("key: k1"));
+        assert!(!result.output.contains("key: k2"));
     }
 
     #[tokio::test]
     async fn search_requires_query() {
         let tmp = TempDir::new().unwrap();
-        let tool = MemorySearchTool::new(tmp.path().to_path_buf());
+        let tool = test_tool(&tmp);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
@@ -301,7 +397,7 @@ mod tests {
     #[test]
     fn schema_exposes_openclaw_parameters() {
         let tmp = TempDir::new().unwrap();
-        let tool = MemorySearchTool::new(tmp.path().to_path_buf());
+        let tool = test_tool(&tmp);
         let schema = tool.parameters_schema();
 
         assert_eq!(tool.name(), "memory_search");

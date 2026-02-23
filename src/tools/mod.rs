@@ -240,9 +240,15 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunsTool::new(shared_config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory, security.clone())),
-        Arc::new(MemorySearchTool::new(workspace_dir.to_path_buf())),
-        Arc::new(MemoryGetTool::new(workspace_dir.to_path_buf())),
+        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
+        Arc::new(MemorySearchTool::new(
+            workspace_dir.to_path_buf(),
+            memory.clone(),
+        )),
+        Arc::new(MemoryGetTool::new(
+            workspace_dir.to_path_buf(),
+            memory.clone(),
+        )),
         Arc::new(ScheduleTool::new(
             security.clone(),
             Arc::new(arc_swap::ArcSwap::from_pointee(root_config.clone())),

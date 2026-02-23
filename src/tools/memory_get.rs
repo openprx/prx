@@ -1,7 +1,9 @@
 use super::traits::{Tool, ToolResult};
+use crate::memory::Memory;
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 const DEFAULT_LINE_COUNT: usize = 50;
 const MAX_LINE_COUNT: usize = 2000;
@@ -9,11 +11,15 @@ const MAX_LINE_COUNT: usize = 2000;
 /// Read selected lines from MEMORY.md or memory/*.md in the workspace.
 pub struct MemoryGetTool {
     workspace_dir: PathBuf,
+    memory: Arc<dyn Memory>,
 }
 
 impl MemoryGetTool {
-    pub fn new(workspace_dir: PathBuf) -> Self {
-        Self { workspace_dir }
+    pub fn new(workspace_dir: PathBuf, memory: Arc<dyn Memory>) -> Self {
+        Self {
+            workspace_dir,
+            memory,
+        }
     }
 
     fn validate_memory_path(path: &str) -> anyhow::Result<()> {
@@ -86,7 +92,7 @@ impl Tool for MemoryGetTool {
     }
 
     fn description(&self) -> &str {
-        "Read selected lines from MEMORY.md or memory/*.md in the workspace."
+        "Read memory by key from SQLite first, with MEMORY.md and memory/*.md fallback."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -95,7 +101,7 @@ impl Tool for MemoryGetTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Target memory file path: MEMORY.md or memory/<file>.md"
+                    "description": "Memory key (preferred) or fallback memory file path"
                 },
                 "from": {
                     "type": "integer",
@@ -137,6 +143,14 @@ impl Tool for MemoryGetTool {
             });
         }
 
+        if let Ok(Some(entry)) = self.memory.get(path).await {
+            return Ok(ToolResult {
+                success: true,
+                output: render_range(&entry.key, &entry.content, from, requested_lines),
+                error: None,
+            });
+        }
+
         let resolved = match self.resolve_allowed_path(path) {
             Ok(p) => p,
             Err(e) => {
@@ -159,46 +173,41 @@ impl Tool for MemoryGetTool {
             }
         };
 
-        let lines: Vec<&str> = contents.lines().collect();
-        if lines.is_empty() {
-            return Ok(ToolResult {
-                success: true,
-                output: format!("{path} is empty."),
-                error: None,
-            });
-        }
-
-        let start_idx = from.saturating_sub(1).min(lines.len());
-        let end_idx = start_idx.saturating_add(requested_lines).min(lines.len());
-
-        if start_idx >= lines.len() {
-            return Ok(ToolResult {
-                success: true,
-                output: format!(
-                    "No content: requested line {from} is beyond end of file ({})",
-                    lines.len()
-                ),
-                error: None,
-            });
-        }
-
-        let mut output = format!("{} lines {}-{}:\n", path, start_idx + 1, end_idx);
-
-        for (line_no, line_text) in lines[start_idx..end_idx].iter().enumerate() {
-            output.push_str(&format!("{:>6}: {}\n", start_idx + line_no + 1, line_text));
-        }
-
         Ok(ToolResult {
             success: true,
-            output,
+            output: render_range(path, &contents, from, requested_lines),
             error: None,
         })
     }
 }
 
+fn render_range(label: &str, content: &str, from: usize, requested_lines: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return format!("{label} is empty.");
+    }
+
+    let start_idx = from.saturating_sub(1).min(lines.len());
+    let end_idx = start_idx.saturating_add(requested_lines).min(lines.len());
+
+    if start_idx >= lines.len() {
+        return format!(
+            "No content: requested line {from} is beyond end of entry ({})",
+            lines.len()
+        );
+    }
+
+    let mut output = format!("{label} lines {}-{}:\n", start_idx + 1, end_idx);
+    for (line_no, line_text) in lines[start_idx..end_idx].iter().enumerate() {
+        output.push_str(&format!("{:>6}: {}\n", start_idx + line_no + 1, line_text));
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use tempfile::TempDir;
 
     fn write_file(path: &Path, content: &str) {
@@ -208,12 +217,37 @@ mod tests {
         std::fs::write(path, content).unwrap();
     }
 
+    fn test_tool(tmp: &TempDir) -> MemoryGetTool {
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        MemoryGetTool::new(tmp.path().to_path_buf(), memory)
+    }
+
+    #[tokio::test]
+    async fn get_reads_sqlite_key_first() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("memory_key", "line1\nline2\nline3\n", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = test_tool(&tmp);
+        let result = tool
+            .execute(json!({"path": "memory_key", "from": 2, "lines": 1}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("memory_key lines 2-2"));
+        assert!(result.output.contains("2: line2"));
+    }
+
     #[tokio::test]
     async fn get_reads_memory_md_range() {
         let tmp = TempDir::new().unwrap();
         write_file(&tmp.path().join("MEMORY.md"), "a\nb\nc\n");
 
-        let tool = MemoryGetTool::new(tmp.path().to_path_buf());
+        let tool = test_tool(&tmp);
         let result = tool
             .execute(json!({"path": "MEMORY.md", "from": 2, "lines": 2}))
             .await
@@ -233,7 +267,7 @@ mod tests {
             "entry1\nentry2\nentry3\n",
         );
 
-        let tool = MemoryGetTool::new(tmp.path().to_path_buf());
+        let tool = test_tool(&tmp);
         let result = tool
             .execute(json!({"path": "memory/2026-02-22.md", "from": 1, "lines": 1}))
             .await
@@ -249,7 +283,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_file(&tmp.path().join("notes.md"), "not allowed\n");
 
-        let tool = MemoryGetTool::new(tmp.path().to_path_buf());
+        let tool = test_tool(&tmp);
         let result = tool.execute(json!({"path": "notes.md"})).await.unwrap();
 
         assert!(!result.success);
@@ -263,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn get_requires_path() {
         let tmp = TempDir::new().unwrap();
-        let tool = MemoryGetTool::new(tmp.path().to_path_buf());
+        let tool = test_tool(&tmp);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
@@ -271,7 +305,7 @@ mod tests {
     #[test]
     fn schema_exposes_openclaw_parameters() {
         let tmp = TempDir::new().unwrap();
-        let tool = MemoryGetTool::new(tmp.path().to_path_buf());
+        let tool = test_tool(&tmp);
         let schema = tool.parameters_schema();
 
         assert_eq!(tool.name(), "memory_get");

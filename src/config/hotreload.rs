@@ -8,11 +8,12 @@
 //!
 //! - `SharedConfig = Arc<ArcSwap<Config>>` — readers call `.load_full()` for a
 //!   snapshot `Arc<Config>` with no locks, no contention.
-//! - The manager spawns a Tokio task that runs a `notify` debouncer (300 ms
+//! - The manager spawns a Tokio task that runs a `notify` debouncer (1 s
 //!   window). On each confirmed write it parses the file and, if valid, calls
 //!   `.store()` to atomically publish the new config.
 //! - On parse failure the old config is kept and a warning is logged.
-//! - A monotonic `reload_version` counter is bumped on every successful reload.
+//! - A monotonic `reload_version` counter is bumped only when file content
+//!   changes and reload succeeds.
 
 use super::schema::Config;
 use arc_swap::ArcSwap;
@@ -77,18 +78,25 @@ fn run_watcher(
 ) -> anyhow::Result<()> {
     use notify::RecursiveMode;
     use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
+    use sha2::{Digest, Sha256};
 
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
-    let debounce_ms = std::time::Duration::from_millis(300);
+    let debounce_ms = std::time::Duration::from_secs(1);
 
     let mut debouncer = new_debouncer(debounce_ms, tx)?;
     debouncer
         .watcher()
         .watch(&config_path, RecursiveMode::NonRecursive)?;
 
+    let mut last_content_hash = std::fs::read(&config_path).ok().map(|bytes| {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher.finalize().to_vec()
+    });
+
     tracing::info!(
         path = %config_path.display(),
-        "Config hot-reload watcher started (300 ms debounce)"
+        "Config hot-reload watcher started (1 s debounce)"
     );
 
     for result in rx {
@@ -102,13 +110,38 @@ fn run_watcher(
                     continue;
                 }
 
-                match try_reload(&config_path, &shared) {
+                let contents = match std::fs::read(&config_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %config_path.display(),
+                            error = %e,
+                            "⚠️  Failed to read config for hot-reload"
+                        );
+                        continue;
+                    }
+                };
+
+                let mut hasher = Sha256::new();
+                hasher.update(&contents);
+                let content_hash = hasher.finalize().to_vec();
+
+                if last_content_hash.as_ref().is_some_and(|h| h == &content_hash) {
+                    tracing::debug!(
+                        path = %config_path.display(),
+                        "Config watcher event ignored (content unchanged)"
+                    );
+                    continue;
+                }
+
+                match try_reload(&contents, &shared) {
                     Ok(()) => {
+                        last_content_hash = Some(content_hash);
                         let version = reload_version.fetch_add(1, Ordering::Relaxed) + 1;
                         tracing::info!(
                             path = %config_path.display(),
                             version,
-                            "✅ Config hot-reloaded (version {version})"
+                            "Config hot-reloaded (version {version})"
                         );
                     }
                     Err(e) => {
@@ -130,9 +163,9 @@ fn run_watcher(
 }
 
 /// Parse config file and atomically store it.
-fn try_reload(config_path: &PathBuf, shared: &SharedConfig) -> anyhow::Result<()> {
-    let contents = std::fs::read_to_string(config_path)?;
-    let mut fresh: Config = toml::from_str(&contents)?;
+fn try_reload(contents: &[u8], shared: &SharedConfig) -> anyhow::Result<()> {
+    let contents = std::str::from_utf8(contents)?;
+    let mut fresh: Config = toml::from_str(contents)?;
 
     // Preserve runtime-resolved paths from the current config
     {
