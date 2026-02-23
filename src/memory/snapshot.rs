@@ -9,6 +9,7 @@
 use anyhow::Result;
 use chrono::Local;
 use rusqlite::{params, Connection};
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -95,12 +96,7 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
 /// Returns the number of entries hydrated.
 pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
     let snapshot = snapshot_path(workspace_dir);
-    if !snapshot.exists() {
-        return Ok(0);
-    }
-
-    let content = fs::read_to_string(&snapshot)?;
-    let entries = parse_snapshot(&content);
+    let entries = collect_hydration_entries(workspace_dir)?;
 
     if entries.is_empty() {
         return Ok(0);
@@ -123,11 +119,26 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
             category   TEXT NOT NULL DEFAULT 'core',
             embedding  BLOB,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            session_id TEXT,
+            channel TEXT,
+            chat_type TEXT,
+            chat_id TEXT,
+            sender_id TEXT,
+            raw_sender TEXT,
+            topic_id TEXT,
+            visibility TEXT NOT NULL DEFAULT 'private',
+            sensitivity TEXT NOT NULL DEFAULT 'normal',
+            risk_signals TEXT DEFAULT '[]',
+            policy_version INTEGER DEFAULT 1
         );
         CREATE INDEX IF NOT EXISTS idx_mem_key ON memories(key);
         CREATE INDEX IF NOT EXISTS idx_mem_cat ON memories(category);
         CREATE INDEX IF NOT EXISTS idx_mem_updated ON memories(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_mem_vis_chan_type_chat
+            ON memories(visibility, channel, chat_type, chat_id, sensitivity, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mem_sender ON memories(sender_id);
+        CREATE INDEX IF NOT EXISTS idx_mem_topic_time ON memories(topic_id, created_at DESC);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
             USING fts5(key, content, content='memories', content_rowid='rowid');
@@ -142,12 +153,12 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
     let now = Local::now().to_rfc3339();
     let mut hydrated = 0;
 
-    for (key, content) in &entries {
+    for (key, content, category) in &entries {
         let id = uuid::Uuid::new_v4().to_string();
         let result = conn.execute(
-            "INSERT OR IGNORE INTO memories (id, key, content, category, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'core', ?4, ?5)",
-            params![id, key, content, now, now],
+            "INSERT OR IGNORE INTO memories (id, key, content, category, visibility, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'owner', ?5, ?6)",
+            params![id, key, content, category, now, now],
         );
 
         match result {
@@ -173,6 +184,7 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
         hydrated,
         snapshot.display()
     );
+    tracing::info!("Hydrated {hydrated} memories from files");
 
     Ok(hydrated)
 }
@@ -195,7 +207,7 @@ pub fn should_hydrate(workspace_dir: &Path) -> bool {
         true
     };
 
-    db_missing_or_empty && snapshot.exists()
+    db_missing_or_empty && (snapshot.exists() || has_markdown_memory_files(workspace_dir))
 }
 
 /// Path to the snapshot file.
@@ -257,6 +269,92 @@ fn parse_snapshot(input: &str) -> Vec<(String, String)> {
     }
 
     entries
+}
+
+fn parse_memory_markdown_entries(path_label: &str, input: &str) -> Vec<(String, String)> {
+    input
+        .lines()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+            let clean = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+            Some((format!("{path_label}:{}", idx + 1), clean.to_string()))
+        })
+        .collect()
+}
+
+fn has_markdown_memory_files(workspace_dir: &Path) -> bool {
+    let memory_md = workspace_dir.join("MEMORY.md");
+    if memory_md.exists() && memory_md.is_file() {
+        return true;
+    }
+
+    let memory_dir = workspace_dir.join("memory");
+    if !(memory_dir.exists() && memory_dir.is_dir()) {
+        return false;
+    }
+
+    match fs::read_dir(memory_dir) {
+        Ok(entries) => entries.filter_map(std::result::Result::ok).any(|entry| {
+            let path = entry.path();
+            path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("md")
+        }),
+        Err(_) => false,
+    }
+}
+
+fn collect_hydration_entries(workspace_dir: &Path) -> Result<Vec<(String, String, String)>> {
+    let mut hydrated: Vec<(String, String, String)> = Vec::new();
+    let mut seen_keys = HashSet::new();
+
+    let snapshot = snapshot_path(workspace_dir);
+    if snapshot.exists() {
+        let content = fs::read_to_string(&snapshot)?;
+        for (key, content) in parse_snapshot(&content) {
+            if seen_keys.insert(key.clone()) {
+                hydrated.push((key, content, "core".to_string()));
+            }
+        }
+    }
+
+    let memory_md_path = workspace_dir.join("MEMORY.md");
+    if memory_md_path.exists() && memory_md_path.is_file() {
+        let content = fs::read_to_string(&memory_md_path)?;
+        for (key, value) in parse_memory_markdown_entries("MEMORY.md", &content) {
+            if seen_keys.insert(key.clone()) {
+                hydrated.push((key, value, "core".to_string()));
+            }
+        }
+    }
+
+    let memory_dir = workspace_dir.join("memory");
+    if memory_dir.exists() && memory_dir.is_dir() {
+        let mut files = fs::read_dir(memory_dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+            .collect::<Vec<_>>();
+        files.sort();
+
+        for path in files {
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let content = fs::read_to_string(&path)?;
+            let label = format!("memory/{file_name}");
+            for (key, value) in parse_memory_markdown_entries(&label, &content) {
+                if seen_keys.insert(key.clone()) {
+                    hydrated.push((key, value, "daily".to_string()));
+                }
+            }
+        }
+    }
+
+    Ok(hydrated)
 }
 
 #[cfg(test)]
@@ -325,6 +423,17 @@ Rule 3: Protect the user.
         assert_eq!(entries.len(), 1);
         assert!(entries[0].1.contains("Rule 1"));
         assert!(entries[0].1.contains("Rule 3"));
+    }
+
+    #[test]
+    fn parse_memory_markdown_entries_skips_headers_and_blank_lines() {
+        let input = "# Header\n\n- item one\nitem two\n";
+        let entries = parse_memory_markdown_entries("MEMORY.md", input);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "MEMORY.md:3");
+        assert_eq!(entries[0].1, "item one");
+        assert_eq!(entries[1].0, "MEMORY.md:4");
+        assert_eq!(entries[1].1, "item two");
     }
 
     #[test]
@@ -464,7 +573,28 @@ Rule 3: Protect the user.
     #[test]
     fn hydrate_no_snapshot_returns_zero() {
         let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("MEMORY.md"), "# Memory\n- one\n- two\n").unwrap();
+
         let count = hydrate_from_snapshot(tmp.path()).unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn hydrate_sets_owner_visibility_for_file_entries() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("MEMORY.md"), "# Memory\n- one\n").unwrap();
+
+        let count = hydrate_from_snapshot(tmp.path()).unwrap();
+        assert_eq!(count, 1);
+
+        let conn = Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
+        let visibility: String = conn
+            .query_row(
+                "SELECT visibility FROM memories WHERE key = 'MEMORY.md:2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visibility, "owner");
     }
 }

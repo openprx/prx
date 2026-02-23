@@ -7,6 +7,8 @@ use chrono::Local;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use std::fmt::Write as _;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -166,7 +168,17 @@ impl SqliteMemory {
                 category    TEXT NOT NULL DEFAULT 'core',
                 embedding   BLOB,
                 created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
+                updated_at  TEXT NOT NULL,
+                channel      TEXT,
+                chat_type    TEXT,
+                chat_id      TEXT,
+                sender_id    TEXT,
+                raw_sender   TEXT,
+                topic_id     TEXT,
+                visibility   TEXT NOT NULL DEFAULT 'private',
+                sensitivity  TEXT NOT NULL DEFAULT 'normal',
+                risk_signals TEXT DEFAULT '[]',
+                policy_version INTEGER DEFAULT 1
             );
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
@@ -202,17 +214,53 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
         )?;
 
-        // Migration: add session_id column if not present (safe to run repeatedly)
-        let has_session_id: bool = conn
-            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'")?
-            .query_row([], |row| row.get::<_, String>(0))?
-            .contains("session_id");
-        if !has_session_id {
-            conn.execute_batch(
-                "ALTER TABLE memories ADD COLUMN session_id TEXT;
-                 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
-            )?;
+        let mut column_stmt = conn.prepare("PRAGMA table_info(memories)")?;
+        let existing_columns = column_stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut names = std::collections::HashSet::new();
+        for column in existing_columns {
+            names.insert(column?);
         }
+
+        // Migration: add missing columns for backward compatibility.
+        let missing_columns = [
+            ("session_id", "ALTER TABLE memories ADD COLUMN session_id TEXT"),
+            ("channel", "ALTER TABLE memories ADD COLUMN channel TEXT"),
+            ("chat_type", "ALTER TABLE memories ADD COLUMN chat_type TEXT"),
+            ("chat_id", "ALTER TABLE memories ADD COLUMN chat_id TEXT"),
+            ("sender_id", "ALTER TABLE memories ADD COLUMN sender_id TEXT"),
+            ("raw_sender", "ALTER TABLE memories ADD COLUMN raw_sender TEXT"),
+            ("topic_id", "ALTER TABLE memories ADD COLUMN topic_id TEXT"),
+            (
+                "visibility",
+                "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'",
+            ),
+            (
+                "sensitivity",
+                "ALTER TABLE memories ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
+            ),
+            (
+                "risk_signals",
+                "ALTER TABLE memories ADD COLUMN risk_signals TEXT DEFAULT '[]'",
+            ),
+            (
+                "policy_version",
+                "ALTER TABLE memories ADD COLUMN policy_version INTEGER DEFAULT 1",
+            ),
+        ];
+        for (name, alter_sql) in missing_columns {
+            if !names.contains(name) {
+                conn.execute_batch(alter_sql)?;
+            }
+        }
+
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
+             CREATE INDEX IF NOT EXISTS idx_mem_vis_chan_type_chat
+                 ON memories(visibility, channel, chat_type, chat_id, sensitivity, created_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_mem_sender ON memories(sender_id);
+             CREATE INDEX IF NOT EXISTS idx_mem_topic_time ON memories(topic_id, created_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_mem_channel ON memories(channel);",
+        )?;
 
         Ok(())
     }
@@ -232,6 +280,68 @@ impl SqliteMemory {
             "daily" => MemoryCategory::Daily,
             "conversation" => MemoryCategory::Conversation,
             other => MemoryCategory::Custom(other.to_string()),
+        }
+    }
+
+    fn backup_file_path(db_path: &Path, category: &MemoryCategory) -> PathBuf {
+        let memory_dir = db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let workspace_dir = if memory_dir.file_name().and_then(|n| n.to_str()) == Some("memory") {
+            memory_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| memory_dir.clone())
+        } else {
+            memory_dir.clone()
+        };
+
+        match category {
+            MemoryCategory::Core => workspace_dir.join("MEMORY.md"),
+            _ => {
+                let date = Local::now().format("%Y-%m-%d").to_string();
+                memory_dir.join(format!("{date}.md"))
+            }
+        }
+    }
+
+    fn append_backup_entry(db_path: &Path, key: &str, content: &str, category: &MemoryCategory) {
+        let path = Self::backup_file_path(db_path, category);
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                tracing::warn!("memory backup mkdir failed ({}): {error}", parent.display());
+                return;
+            }
+        }
+
+        let header = if path.exists() {
+            None
+        } else if matches!(category, MemoryCategory::Core) {
+            Some("# Long-Term Memory\n\n".to_string())
+        } else {
+            let date = Local::now().format("%Y-%m-%d").to_string();
+            Some(format!("# Daily Log — {date}\n\n"))
+        };
+
+        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+        let body = format!("- [{timestamp}] **{key}**: {}\n", content.trim());
+        let payload = match header {
+            Some(header) => format!("{header}{body}"),
+            None => body,
+        };
+
+        let open_result = OpenOptions::new().create(true).append(true).open(&path);
+        match open_result {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(payload.as_bytes()) {
+                    tracing::warn!("memory backup append failed ({}): {error}", path.display());
+                }
+            }
+            Err(error) => {
+                tracing::warn!("memory backup open failed ({}): {error}", path.display());
+            }
         }
     }
 
@@ -481,6 +591,7 @@ impl Memory for SqliteMemory {
             .map(|emb| vector::vec_to_bytes(&emb));
 
         let conn = self.conn.clone();
+        let db_path = self.db_path.clone();
         let key = key.to_string();
         let content = content.to_string();
         let sid = session_id.map(String::from);
@@ -500,8 +611,9 @@ impl Memory for SqliteMemory {
                     embedding = excluded.embedding,
                     updated_at = excluded.updated_at,
                     session_id = excluded.session_id",
-                params![id, key, content, cat, embedding_bytes, now, now, sid],
+                params![id, &key, &content, cat, embedding_bytes, now, now, sid],
             )?;
+            Self::append_backup_entry(&db_path, &key, &content, &category);
             Ok(())
         })
         .await?

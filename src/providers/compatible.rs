@@ -903,9 +903,11 @@ impl Provider for OpenAiCompatibleProvider {
             || model_lower.contains("grok-4")
             || model_lower.contains("gpt-4o")
             || model_lower.contains("gpt-4-turbo")
+            || model_lower.contains("gpt-5")
             || model_lower.contains("gemini")
             || base_lower.contains("x.ai")
-            || base_lower.contains("xai");
+            || base_lower.contains("xai")
+            || base_lower.contains("openai");
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: true,
             vision: has_vision,
