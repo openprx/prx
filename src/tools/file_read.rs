@@ -30,12 +30,37 @@ impl FileReadTool {
             return false;
         };
 
-        if rel.file_name().and_then(|name| name.to_str()) == Some("MEMORY.md") {
+        if rel
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("MEMORY.md")
+                    || name.eq_ignore_ascii_case("MEMORY_SNAPSHOT.md")
+            })
+        {
             return true;
         }
 
-        rel.extension().and_then(|ext| ext.to_str()) == Some("md")
-            && rel.components().any(|component| component.as_os_str() == "memory")
+        if rel.components().count() == 2 {
+            let mut components = rel.components();
+            let first = components.next().and_then(|c| c.as_os_str().to_str());
+            let second = components.next().and_then(|c| c.as_os_str().to_str());
+            if first.is_some_and(|part| part.eq_ignore_ascii_case("memory"))
+                && second.is_some_and(|part| part.eq_ignore_ascii_case("brain.db"))
+            {
+                return true;
+            }
+        }
+
+        rel.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            && rel.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|part| part.eq_ignore_ascii_case("memory"))
+            })
     }
 }
 
@@ -475,6 +500,96 @@ mod tests {
         assert!(!memory_result.success);
         assert_eq!(
             memory_result.error.as_deref(),
+            Some("Access denied: memory files are protected by ACL policy")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_acl_enabled_blocks_memory_markdown_case_variants() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_acl_case_variants");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(dir.join("MeMoRy/Sub")).await.unwrap();
+        tokio::fs::write(dir.join("memory.md"), "legacy memory lowercase")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("MeMoRy/Sub/topic.MD"), "memory topic mixed case")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()), true);
+        let root_result = tool.execute(json!({"path": "memory.md"})).await.unwrap();
+        assert!(!root_result.success);
+        assert_eq!(
+            root_result.error.as_deref(),
+            Some("Access denied: memory files are protected by ACL policy")
+        );
+
+        let nested_result = tool
+            .execute(json!({"path": "MeMoRy/Sub/topic.MD"}))
+            .await
+            .unwrap();
+        assert!(!nested_result.success);
+        assert_eq!(
+            nested_result.error.as_deref(),
+            Some("Access denied: memory files are protected by ACL policy")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_acl_enabled_blocks_memory_snapshot_and_db_files() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_acl_snapshot_and_db");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(dir.join("memory")).await.unwrap();
+        tokio::fs::write(dir.join("MEMORY_SNAPSHOT.md"), "snapshot content")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("memory/brain.db"), b"not-a-real-sqlite")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()), true);
+        let snapshot_result = tool
+            .execute(json!({"path": "MEMORY_SNAPSHOT.md"}))
+            .await
+            .unwrap();
+        assert!(!snapshot_result.success);
+        assert_eq!(
+            snapshot_result.error.as_deref(),
+            Some("Access denied: memory files are protected by ACL policy")
+        );
+
+        let db_result = tool.execute(json!({"path": "memory/brain.db"})).await.unwrap();
+        assert!(!db_result.success);
+        assert_eq!(
+            db_result.error.as_deref(),
+            Some("Access denied: memory files are protected by ACL policy")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_read_acl_enabled_blocks_symlink_alias_to_memory_markdown() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_acl_symlink_alias");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(dir.join("memory")).await.unwrap();
+        tokio::fs::write(dir.join("memory/topic.md"), "memory topic via symlink")
+            .await
+            .unwrap();
+        symlink(dir.join("memory/topic.md"), dir.join("alias.md")).unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()), true);
+        let result = tool.execute(json!({"path": "alias.md"})).await.unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
             Some("Access denied: memory files are protected by ACL policy")
         );
 
