@@ -108,6 +108,14 @@ struct MemoryRow {
 }
 
 fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
+    let trusted = args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !trusted {
+        return None;
+    }
+
     let scope = args
         .get("_zc_scope")
         .and_then(serde_json::Value::as_object)?;
@@ -156,17 +164,17 @@ fn fallback_principal(ctx: &MemoryWriteContext) -> Principal {
     }
 }
 
-fn owner_principal() -> Principal {
+fn anonymous_principal() -> Principal {
     Principal {
-        user_id: "system:tool".to_string(),
-        role: Role::Owner,
+        user_id: "anonymous:unknown:unknown".to_string(),
+        role: Role::Anonymous,
         projects: Vec::new(),
-        visibility_ceiling: Visibility::Public,
+        visibility_ceiling: Visibility::Private,
         blocked_patterns: Vec::new(),
         current_channel: String::new(),
         current_chat_id: String::new(),
         current_chat_type: ChatType::Dm,
-        acl_enforced: false,
+        acl_enforced: true,
     }
 }
 
@@ -219,7 +227,7 @@ impl Tool for MemoryGetTool {
     }
 
     fn description(&self) -> &str {
-        "Read memory by key from SQLite with ACL observe/enforce mode, with MEMORY.md and memory/*.md fallback."
+        "Read memory by key from SQLite with ACL observe/enforce mode; file fallback is only used when ACL is disabled."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -277,12 +285,28 @@ impl Tool for MemoryGetTool {
 
         let db_path = self.db_path();
         if db_path.exists() {
-            let conn = Connection::open(&db_path)?;
+            let conn = match Connection::open(&db_path) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    if self.acl_enabled {
+                        tracing::warn!(
+                            "memory_get sqlite open failed while acl is enabled: {error}"
+                        );
+                        return Ok(ToolResult {
+                            success: true,
+                            output: format!("No memory entry found for key: '{path}'"),
+                            error: None,
+                        });
+                    }
+                    tracing::warn!("memory_get sqlite open failed, using file fallback: {error}");
+                    return self.read_fallback_file(path, from, requested_lines);
+                }
+            };
             let scope_ctx = parse_scope_ctx(&args);
             let principal = if let Some(ref ctx) = scope_ctx {
                 resolve_principal(&conn, ctx).unwrap_or_else(|_| fallback_principal(ctx))
             } else {
-                owner_principal()
+                anonymous_principal()
             };
             let (scope_sql, scope_params) = principal.build_sql_scope();
 
@@ -319,13 +343,11 @@ impl Tool for MemoryGetTool {
                     Some("scope_or_post_filter"),
                     "denied",
                 );
-                if !matches!(path, "MEMORY.md") && !path.starts_with("memory/") {
-                    return Ok(ToolResult {
-                        success: true,
-                        output: format!("No memory entry found for key: '{path}'"),
-                        error: None,
-                    });
-                }
+                return Ok(ToolResult {
+                    success: true,
+                    output: format!("No memory entry found for key: '{path}'"),
+                    error: None,
+                });
             } else {
                 // Observe mode: evaluate ACL but still return unrestricted result.
                 let scoped =
@@ -364,8 +386,25 @@ impl Tool for MemoryGetTool {
                     });
                 }
             }
+        } else if self.acl_enabled {
+            return Ok(ToolResult {
+                success: true,
+                output: format!("No memory entry found for key: '{path}'"),
+                error: None,
+            });
         }
 
+        self.read_fallback_file(path, from, requested_lines)
+    }
+}
+
+impl MemoryGetTool {
+    fn read_fallback_file(
+        &self,
+        path: &str,
+        from: usize,
+        requested_lines: usize,
+    ) -> anyhow::Result<ToolResult> {
         let resolved = match self.resolve_allowed_path(path) {
             Ok(p) => p,
             Err(e) => {
@@ -457,7 +496,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = test_tool(&tmp, true);
+        let tool = test_tool(&tmp, false);
         let result = tool
             .execute(json!({"path": "memory_key", "from": 2, "lines": 1}))
             .await
@@ -473,7 +512,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_file(&tmp.path().join("MEMORY.md"), "a\nb\nc\n");
 
-        let tool = test_tool(&tmp, true);
+        let tool = test_tool(&tmp, false);
         let result = tool
             .execute(json!({"path": "MEMORY.md", "from": 2, "lines": 2}))
             .await
@@ -493,7 +532,7 @@ mod tests {
             "entry1\nentry2\nentry3\n",
         );
 
-        let tool = test_tool(&tmp, true);
+        let tool = test_tool(&tmp, false);
         let result = tool
             .execute(json!({"path": "memory/2026-02-22.md", "from": 1, "lines": 1}))
             .await
@@ -505,11 +544,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acl_mode_disables_file_fallback() {
+        let tmp = TempDir::new().unwrap();
+        write_file(&tmp.path().join("MEMORY.md"), "line1\nline2\n");
+
+        let tool = test_tool(&tmp, true);
+        let result = tool.execute(json!({"path": "MEMORY.md"})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("No memory entry found for key"));
+    }
+
+    #[tokio::test]
     async fn get_blocks_non_memory_paths() {
         let tmp = TempDir::new().unwrap();
         write_file(&tmp.path().join("notes.md"), "not allowed\n");
 
-        let tool = test_tool(&tmp, true);
+        let tool = test_tool(&tmp, false);
         let result = tool.execute(json!({"path": "notes.md"})).await.unwrap();
 
         assert!(!result.success);
@@ -523,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn get_requires_path() {
         let tmp = TempDir::new().unwrap();
-        let tool = test_tool(&tmp, true);
+        let tool = test_tool(&tmp, false);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
@@ -537,7 +588,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = test_tool(&tmp, true);
+        let tool = test_tool(&tmp, false);
         let result = tool.execute(json!({"key": "memory_key"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("memory_key lines 1-2"));
@@ -570,6 +621,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "path": "open",
+                "_zc_scope_trusted": true,
                 "_zc_scope": {
                     "channel": "telegram",
                     "chat_type": "dm",
@@ -630,11 +682,58 @@ mod tests {
         let result = tool
             .execute(json!({
                 "path": "private_key",
+                "_zc_scope_trusted": true,
                 "_zc_scope": {
                     "channel": "telegram",
                     "chat_type": "dm",
                     "chat_id": "chat-1",
                     "sender": "sender-a"
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("No memory entry found for key"));
+    }
+
+    #[tokio::test]
+    async fn untrusted_scope_payload_defaults_to_anonymous() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("private_key", "owner note", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let conn = open_conn(&tmp);
+        conn.execute(
+            "INSERT INTO identity_bindings (id, user_id, channel, channel_account, bound_at, bound_by)
+             VALUES ('b1', 'owner_a', 'telegram', 'sender-owner', ?1, 'system')",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_policies (user_id, role, projects, visibility_ceiling, blocked_patterns, updated_at)
+             VALUES ('owner_a', 'owner', '[]', 'public', '[]', ?1)",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET visibility = 'private', sensitivity = 'normal' WHERE key = 'private_key'",
+            [],
+        )
+        .unwrap();
+
+        let tool = test_tool(&tmp, true);
+        let result = tool
+            .execute(json!({
+                "path": "private_key",
+                "_zc_scope": {
+                    "channel": "telegram",
+                    "chat_type": "dm",
+                    "chat_id": "chat-1",
+                    "sender": "sender-owner"
                 }
             }))
             .await

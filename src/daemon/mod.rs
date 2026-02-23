@@ -104,7 +104,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 let cfg = webhook_cfg.clone();
                 async move {
                     let token = cfg.webhook.token.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!("webhook.token must be configured when webhook.enabled=true")
+                        anyhow::anyhow!(
+                            "webhook.token must be configured when webhook.enabled=true"
+                        )
                     })?;
                     crate::webhook::run(&cfg.webhook.bind, token, &cfg.workspace_dir).await
                 }

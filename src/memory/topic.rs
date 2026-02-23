@@ -36,6 +36,24 @@ pub fn create_topic(
     external_id: Option<&str>,
     fingerprint: &str,
 ) -> Result<String> {
+    if let Some(external_id) = external_id {
+        let existing_by_external: Option<String> = conn
+            .query_row(
+                "SELECT id
+                 FROM topics
+                 WHERE external_id = ?1
+                   AND ((project = ?2) OR (project IS NULL AND ?2 IS NULL))
+                 ORDER BY updated_at DESC
+                 LIMIT 1",
+                params![external_id, project],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing_by_external {
+            return Ok(id);
+        }
+    }
+
     let now = Utc::now().to_rfc3339();
     let topic_id = Uuid::new_v4().to_string();
 
@@ -471,6 +489,39 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM topic_participants WHERE topic_id = ?1 AND user_id = ?2",
                 params![id1, "u-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn create_topic_reuses_existing_by_project_and_external_id() {
+        let (_tmp, conn) = setup_conn();
+        let first = create_topic(
+            &conn,
+            "Initial issue title",
+            Some("openpr"),
+            Some("issue#42"),
+            "fp-first",
+        )
+        .unwrap();
+
+        let second = create_topic(
+            &conn,
+            "Updated title but same external",
+            Some("openpr"),
+            Some("issue#42"),
+            "fp-second",
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM topics WHERE project = 'openpr' AND external_id = 'issue#42'",
+                [],
                 |row| row.get(0),
             )
             .unwrap();

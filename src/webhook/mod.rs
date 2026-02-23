@@ -1,3 +1,6 @@
+use crate::memory::principal::MemoryWriteContext;
+use crate::memory::traits::MemoryCategory;
+use crate::memory::{Memory, SqliteMemory};
 use anyhow::{Context, Result};
 use axum::{
     extract::State,
@@ -13,6 +16,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -107,9 +111,11 @@ async fn handle_webhook_event(
     let saved = tokio::task::spawn_blocking(move || persist_event(&db_path, &event)).await;
 
     match saved {
-        Ok(Ok(topic_id)) => {
-            (StatusCode::OK, Json(serde_json::json!(WebhookAck { topic_id }))).into_response()
-        }
+        Ok(Ok(topic_id)) => (
+            StatusCode::OK,
+            Json(serde_json::json!(WebhookAck { topic_id })),
+        )
+            .into_response(),
         Ok(Err(error)) => {
             tracing::error!("failed to persist webhook event: {error}");
             (
@@ -142,7 +148,10 @@ fn is_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
         return false;
     };
 
-    token.trim() == expected_token
+    expected_token
+        .as_bytes()
+        .ct_eq(token.trim().as_bytes())
+        .into()
 }
 
 fn parse_webhook_event(payload: Value) -> Result<WebhookEvent> {
@@ -230,7 +239,13 @@ fn map_openpr_event(payload: &Value) -> Result<WebhookEvent> {
 
     let external_url = first_string(
         payload,
-        &["external_url", "issue_url", "comment_url", "url", "html_url"],
+        &[
+            "external_url",
+            "issue_url",
+            "comment_url",
+            "url",
+            "html_url",
+        ],
     );
 
     let title = first_string(
@@ -241,7 +256,14 @@ fn map_openpr_event(payload: &Value) -> Result<WebhookEvent> {
 
     let content = first_string(
         payload,
-        &["content", "body", "description", "text", "comment", "message"],
+        &[
+            "content",
+            "body",
+            "description",
+            "text",
+            "comment",
+            "message",
+        ],
     )
     .unwrap_or_else(|| title.clone());
 
@@ -309,11 +331,10 @@ fn normalize_openpr_event_type(raw: &str) -> String {
 }
 
 fn persist_event(db_path: &Path, event: &WebhookEvent) -> Result<String> {
-    let mut conn = Connection::open(db_path)
+    let conn = Connection::open(db_path)
         .with_context(|| format!("failed to open webhook db {}", db_path.display()))?;
-    let tx = conn.transaction()?;
 
-    let topic_id = match crate::memory::topic::find_topic_by_external(&tx, &event.external_id)? {
+    let topic_id = match crate::memory::topic::find_topic_by_external(&conn, &event.external_id)? {
         Some(topic) => topic.id,
         None => {
             let fingerprint = webhook_topic_fingerprint(
@@ -322,7 +343,7 @@ fn persist_event(db_path: &Path, event: &WebhookEvent) -> Result<String> {
                 &event.title,
             );
             crate::memory::topic::create_topic(
-                &tx,
+                &conn,
                 &event.title,
                 event.project.as_deref(),
                 Some(&event.external_id),
@@ -332,7 +353,7 @@ fn persist_event(db_path: &Path, event: &WebhookEvent) -> Result<String> {
     };
 
     if let Some(url) = event.external_url.as_deref() {
-        tx.execute(
+        conn.execute(
             "UPDATE topics
              SET external_url = COALESCE(external_url, ?1),
                  updated_at = ?2
@@ -342,9 +363,8 @@ fn persist_event(db_path: &Path, event: &WebhookEvent) -> Result<String> {
     }
 
     let system_sender = format!("system:{}", event.source);
-    crate::memory::topic::add_participant(&tx, &topic_id, &system_sender, "observer")?;
+    crate::memory::topic::add_participant(&conn, &topic_id, &system_sender, "observer")?;
 
-    let memory_id = Uuid::new_v4().to_string();
     let memory_key = format!(
         "webhook:{}:{}:{}",
         event.source,
@@ -352,34 +372,38 @@ fn persist_event(db_path: &Path, event: &WebhookEvent) -> Result<String> {
         Uuid::new_v4()
     );
     let content = format_event_memory(event);
+    let memory_ctx = MemoryWriteContext {
+        channel: Some("webhook".to_string()),
+        chat_type: Some("webhook".to_string()),
+        chat_id: Some(format!("{}:{}", event.source, event.external_id)),
+        sender_id: None,
+        raw_sender: Some(system_sender.clone()),
+    };
 
-    tx.execute(
-        "INSERT INTO memories (
-            id, key, content, category, created_at, updated_at,
-            channel, chat_type, sender_id, topic_id,
-            visibility, sensitivity, risk_signals, policy_version
-         )
-         VALUES (?1, ?2, ?3, 'conversation', ?4, ?4, ?5, ?6, ?7, ?8, ?9, 'normal', '[]', 1)",
-        params![
-            &memory_id,
-            &memory_key,
-            &content,
-            &event.timestamp,
-            "webhook",
-            "webhook",
-            &system_sender,
-            &topic_id,
-            "project",
-        ],
+    // Persist via memory classification path to keep ACL policy consistent.
+    let memory = SqliteMemory::new_with_path(db_path.to_path_buf())?;
+    futures::executor::block_on(memory.store_with_context(
+        &memory_key,
+        &content,
+        MemoryCategory::Conversation,
+        None,
+        Some(&memory_ctx),
+    ))?;
+
+    conn.execute(
+        "UPDATE memories
+         SET topic_id = ?1,
+             created_at = ?2,
+             updated_at = ?2
+         WHERE key = ?3",
+        params![&topic_id, &event.timestamp, &memory_key],
     )?;
 
     match event.event_type.as_str() {
-        "issue.closed" => crate::memory::topic::update_topic_status(&tx, &topic_id, "resolved")?,
-        "issue.reopened" => crate::memory::topic::update_topic_status(&tx, &topic_id, "open")?,
-        _ => crate::memory::topic::touch_topic(&tx, &topic_id)?,
+        "issue.closed" => crate::memory::topic::update_topic_status(&conn, &topic_id, "resolved")?,
+        "issue.reopened" => crate::memory::topic::update_topic_status(&conn, &topic_id, "open")?,
+        _ => crate::memory::topic::touch_topic(&conn, &topic_id)?,
     }
-
-    tx.commit()?;
     Ok(topic_id)
 }
 
@@ -552,7 +576,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(visibility, "project");
+        assert_eq!(visibility, "owner");
     }
 
     #[test]
