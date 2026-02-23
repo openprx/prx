@@ -1,4 +1,7 @@
 use super::embeddings::EmbeddingProvider;
+use super::principal::{
+    classify_memory, resolve_principal, ChatType, MemoryWriteContext, Principal, Role, Visibility,
+};
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
 use anyhow::Context;
@@ -214,6 +217,103 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
         )?;
 
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS identity_bindings (
+                id              TEXT PRIMARY KEY,
+                user_id         TEXT NOT NULL,
+                channel         TEXT NOT NULL,
+                channel_account TEXT NOT NULL,
+                display_name    TEXT,
+                bound_at        TEXT NOT NULL,
+                bound_by        TEXT NOT NULL,
+                UNIQUE(channel, channel_account)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ib_user ON identity_bindings(user_id);
+            CREATE INDEX IF NOT EXISTS idx_ib_channel_account ON identity_bindings(channel, channel_account);
+
+            CREATE TABLE IF NOT EXISTS user_policies (
+                user_id             TEXT PRIMARY KEY,
+                role                TEXT NOT NULL DEFAULT 'guest',
+                projects            TEXT NOT NULL DEFAULT '[]',
+                visibility_ceiling  TEXT NOT NULL DEFAULT 'private',
+                blocked_patterns    TEXT NOT NULL DEFAULT '[]',
+                policy_version      INTEGER NOT NULL DEFAULT 1,
+                updated_at          TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS topics (
+                id              TEXT PRIMARY KEY,
+                title           TEXT NOT NULL,
+                project         TEXT,
+                external_id     TEXT,
+                external_url    TEXT,
+                fingerprint     TEXT,
+                status          TEXT NOT NULL DEFAULT 'open',
+                tags            TEXT DEFAULT '[]',
+                summary         TEXT,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                resolved_at     TEXT,
+                UNIQUE(project, external_id),
+                UNIQUE(fingerprint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_topic_project ON topics(project);
+            CREATE INDEX IF NOT EXISTS idx_topic_status ON topics(status);
+            CREATE INDEX IF NOT EXISTS idx_topic_external ON topics(external_id);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS topics_fts
+                USING fts5(title, summary, tags, content='topics', content_rowid='rowid');
+
+            CREATE TRIGGER IF NOT EXISTS topics_ai AFTER INSERT ON topics BEGIN
+                INSERT INTO topics_fts(rowid, title, summary, tags)
+                VALUES (new.rowid, new.title, new.summary, new.tags);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS topics_ad AFTER DELETE ON topics BEGIN
+                INSERT INTO topics_fts(topics_fts, rowid, title, summary, tags)
+                VALUES ('delete', old.rowid, old.title, old.summary, old.tags);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS topics_au AFTER UPDATE ON topics BEGIN
+                INSERT INTO topics_fts(topics_fts, rowid, title, summary, tags)
+                VALUES ('delete', old.rowid, old.title, old.summary, old.tags);
+                INSERT INTO topics_fts(rowid, title, summary, tags)
+                VALUES (new.rowid, new.title, new.summary, new.tags);
+            END;
+
+            CREATE TABLE IF NOT EXISTS topic_participants (
+                topic_id    TEXT NOT NULL,
+                user_id     TEXT NOT NULL,
+                role        TEXT NOT NULL DEFAULT 'participant',
+                joined_at   TEXT NOT NULL,
+                PRIMARY KEY (topic_id, user_id),
+                FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS topic_aliases (
+                from_topic_id TEXT NOT NULL,
+                to_topic_id   TEXT NOT NULL,
+                reason        TEXT,
+                operator      TEXT NOT NULL,
+                created_at    TEXT NOT NULL,
+                PRIMARY KEY (from_topic_id),
+                FOREIGN KEY (to_topic_id) REFERENCES topics(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS access_audit_log (
+                id          TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                requester   TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                query       TEXT,
+                memory_id   TEXT,
+                policy_rule TEXT,
+                result      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_time ON access_audit_log(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_requester ON access_audit_log(requester);",
+        )?;
+
         let mut column_stmt = conn.prepare("PRAGMA table_info(memories)")?;
         let existing_columns = column_stmt.query_map([], |row| row.get::<_, String>(1))?;
         let mut names = std::collections::HashSet::new();
@@ -343,6 +443,123 @@ impl SqliteMemory {
                 tracing::warn!("memory backup open failed ({}): {error}", path.display());
             }
         }
+    }
+
+    async fn store_internal(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+    ) -> anyhow::Result<()> {
+        // Compute embedding (async, before blocking work)
+        let embedding_bytes = self
+            .get_or_compute_embedding(content)
+            .await?
+            .map(|emb| vector::vec_to_bytes(&emb));
+
+        let conn = self.conn.clone();
+        let db_path = self.db_path.clone();
+        let key = key.to_string();
+        let content = content.to_string();
+        let sid = session_id.map(String::from);
+        let write_ctx = context.cloned();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            let now = Local::now().to_rfc3339();
+            let cat = Self::category_to_str(&category);
+            let id = Uuid::new_v4().to_string();
+
+            if let Some(ctx) = write_ctx {
+                let fallback_principal = Principal {
+                    user_id: "anonymous:unknown:unknown".to_string(),
+                    role: Role::Anonymous,
+                    projects: Vec::new(),
+                    visibility_ceiling: Visibility::Private,
+                    blocked_patterns: Vec::new(),
+                    current_channel: ctx.channel.clone().unwrap_or_default(),
+                    current_chat_id: ctx.chat_id.clone().unwrap_or_default(),
+                    current_chat_type: ctx
+                        .chat_type
+                        .as_deref()
+                        .map(ChatType::from_str)
+                        .unwrap_or(ChatType::Dm),
+                };
+                let principal = if ctx.channel.is_some() && ctx.raw_sender.is_some() {
+                    resolve_principal(&conn, &ctx).unwrap_or(fallback_principal)
+                } else {
+                    fallback_principal
+                };
+                let classified = classify_memory(&ctx, &content, &principal);
+                let risk_json = serde_json::to_string(&classified.risk_signals)?;
+                let sender_id = if ctx.channel.is_some() && ctx.raw_sender.is_some() {
+                    Some(principal.user_id)
+                } else {
+                    None
+                };
+                let explicit_sender_id = ctx.sender_id.or(sender_id);
+                let chat_type = ctx
+                    .chat_type
+                    .map(|raw| ChatType::from_str(&raw).as_str().to_string());
+
+                conn.execute(
+                    "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, channel, chat_type, chat_id, sender_id, raw_sender, visibility, sensitivity, risk_signals, policy_version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                     ON CONFLICT(key) DO UPDATE SET
+                        content = excluded.content,
+                        category = excluded.category,
+                        embedding = excluded.embedding,
+                        updated_at = excluded.updated_at,
+                        session_id = excluded.session_id,
+                        channel = excluded.channel,
+                        chat_type = excluded.chat_type,
+                        chat_id = excluded.chat_id,
+                        sender_id = excluded.sender_id,
+                        raw_sender = excluded.raw_sender,
+                        visibility = excluded.visibility,
+                        sensitivity = excluded.sensitivity,
+                        risk_signals = excluded.risk_signals,
+                        policy_version = excluded.policy_version",
+                    params![
+                        id,
+                        &key,
+                        &content,
+                        cat,
+                        embedding_bytes,
+                        now,
+                        now,
+                        sid,
+                        ctx.channel,
+                        chat_type,
+                        ctx.chat_id,
+                        explicit_sender_id,
+                        ctx.raw_sender,
+                        classified.visibility.as_str(),
+                        classified.sensitivity.as_str(),
+                        risk_json,
+                        classified.policy_version,
+                    ],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(key) DO UPDATE SET
+                        content = excluded.content,
+                        category = excluded.category,
+                        embedding = excluded.embedding,
+                        updated_at = excluded.updated_at,
+                        session_id = excluded.session_id",
+                    params![id, &key, &content, cat, embedding_bytes, now, now, sid],
+                )?;
+            }
+
+            Self::append_backup_entry(&db_path, &key, &content, &category);
+            Ok(())
+        })
+        .await?
     }
 
     /// Deterministic content hash for embedding cache.
@@ -584,39 +801,20 @@ impl Memory for SqliteMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        // Compute embedding (async, before blocking work)
-        let embedding_bytes = self
-            .get_or_compute_embedding(content)
-            .await?
-            .map(|emb| vector::vec_to_bytes(&emb));
+        self.store_internal(key, content, category, session_id, None)
+            .await
+    }
 
-        let conn = self.conn.clone();
-        let db_path = self.db_path.clone();
-        let key = key.to_string();
-        let content = content.to_string();
-        let sid = session_id.map(String::from);
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = conn.lock();
-            let now = Local::now().to_rfc3339();
-            let cat = Self::category_to_str(&category);
-            let id = Uuid::new_v4().to_string();
-
-            conn.execute(
-                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(key) DO UPDATE SET
-                    content = excluded.content,
-                    category = excluded.category,
-                    embedding = excluded.embedding,
-                    updated_at = excluded.updated_at,
-                    session_id = excluded.session_id",
-                params![id, &key, &content, cat, embedding_bytes, now, now, sid],
-            )?;
-            Self::append_backup_entry(&db_path, &key, &content, &category);
-            Ok(())
-        })
-        .await?
+    async fn store_with_context(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+    ) -> anyhow::Result<()> {
+        self.store_internal(key, content, category, session_id, context)
+            .await
     }
 
     async fn recall(

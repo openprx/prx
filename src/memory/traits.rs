@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::memory::principal::MemoryWriteContext;
+
 /// A single memory entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -52,6 +54,22 @@ pub trait Memory: Send + Sync {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> anyhow::Result<()>;
+
+    /// Store a memory entry with optional channel/tool context.
+    ///
+    /// Backends that do not support context-aware metadata can ignore `context`
+    /// by relying on this default implementation.
+    async fn store_with_context(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+    ) -> anyhow::Result<()> {
+        let _ = context;
+        self.store(key, content, category, session_id).await
+    }
 
     /// Recall memories matching a query (keyword search), optionally scoped to a session
     async fn recall(

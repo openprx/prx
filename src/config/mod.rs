@@ -11,14 +11,15 @@ pub use schema::{
     ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig, CronConfig,
     DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EmbeddingRouteConfig, GatewayConfig,
     HardwareConfig, HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
-    IdentityConfig, LarkConfig, MatrixConfig, McpConfig, McpServerConfig, McpTransport,
-    MediaConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig,
-    NodeServerConfig, NodesConfig, ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig,
-    ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig, RemoteNodeConfig,
-    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
-    ScopeConfig, ScopeRule, SecretsConfig, SecurityConfig, SelfSystemConfig, SessionsSpawnConfig,
-    SkillsConfig, SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection,
-    StreamMode, TelegramConfig, ToolPolicyConfig, TunnelConfig, WebSearchConfig, WebhookConfig,
+    IdentityBindingConfig, IdentityConfig, LarkConfig, MatrixConfig, McpConfig, McpServerConfig,
+    McpTransport, MediaConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig,
+    NextcloudTalkConfig, NodeServerConfig, NodesConfig, ObservabilityConfig,
+    PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
+    ReliabilityConfig, RemoteNodeConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend,
+    SandboxConfig, SchedulerConfig, ScopeConfig, ScopeRule, SecretsConfig, SecurityConfig,
+    SelfSystemConfig, SessionsSpawnConfig, SkillsConfig, SlackConfig, StorageConfig,
+    StorageProviderConfig, StorageProviderSection, StreamMode, TelegramConfig, ToolPolicyConfig,
+    TunnelConfig, UserPolicyConfig, WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]

@@ -82,12 +82,14 @@ fn spawn_self_system_runtime(config: &Config) -> Option<tokio::task::JoinHandle<
             }
 
             let storage_provider = Some(&runtime_config.storage.provider.config);
-            let memory = match crate::memory::create_memory_with_storage_and_routes(
+            let memory = match crate::memory::create_memory_with_storage_and_routes_with_acl(
                 &runtime_config.memory,
                 &runtime_config.embedding_routes,
                 storage_provider,
                 &runtime_config.workspace_dir,
                 runtime_config.api_key.as_deref(),
+                &runtime_config.identity_bindings,
+                &runtime_config.user_policies,
             ) {
                 Ok(memory) => memory,
                 Err(error) => {
