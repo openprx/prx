@@ -3,6 +3,7 @@ use crate::memory::principal::{
     log_access, post_filter, resolve_principal, ChatType, MemoryWriteContext, Principal, Role,
     Visibility,
 };
+use crate::memory::topic;
 use crate::memory::Memory;
 use async_trait::async_trait;
 use rusqlite::{params_from_iter, types::Value, Connection};
@@ -190,6 +191,21 @@ fn fallback_principal(ctx: &MemoryWriteContext) -> Principal {
             .as_deref()
             .map(ChatType::from_str)
             .unwrap_or(ChatType::Dm),
+        acl_enforced: true,
+    }
+}
+
+fn owner_principal() -> Principal {
+    Principal {
+        user_id: "system:tool".to_string(),
+        role: Role::Owner,
+        projects: Vec::new(),
+        visibility_ceiling: Visibility::Public,
+        blocked_patterns: Vec::new(),
+        current_channel: String::new(),
+        current_chat_id: String::new(),
+        current_chat_type: ChatType::Dm,
+        acl_enforced: false,
     }
 }
 
@@ -354,6 +370,32 @@ fn search_rows_with_scope(
     ))
 }
 
+fn search_topic_rows_with_scope(
+    conn: &Connection,
+    query: &str,
+    principal: &Principal,
+    max_results: usize,
+) -> anyhow::Result<Vec<MatchRow>> {
+    let topics = topic::search_topics_fts(conn, query, 3)?;
+    if topics.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut rows = Vec::new();
+    let per_topic_limit = max_results.max(1);
+    for hit in topics {
+        let scoped = topic::query_topic_context(conn, &hit.id, principal, per_topic_limit)?;
+        rows.extend(scoped.into_iter().map(|entry| MatchRow {
+            id: entry.id,
+            key: entry.key,
+            content: entry.content,
+            score: 0.55,
+        }));
+    }
+
+    Ok(rows)
+}
+
 fn observe_log_query(would_deny_count: usize) {
     let total = OBSERVE_TOTAL_QUERIES.fetch_add(1, Ordering::Relaxed) + 1;
     if would_deny_count > 0 {
@@ -438,20 +480,11 @@ impl Tool for MemorySearchTool {
         let principal = if let Some(ref ctx) = scope_ctx {
             resolve_principal(&conn, ctx).unwrap_or_else(|_| fallback_principal(ctx))
         } else {
-            Principal {
-                user_id: "system:tool".to_string(),
-                role: Role::Owner,
-                projects: Vec::new(),
-                visibility_ceiling: Visibility::Public,
-                blocked_patterns: Vec::new(),
-                current_channel: String::new(),
-                current_chat_id: String::new(),
-                current_chat_type: ChatType::Dm,
-            }
+            owner_principal()
         };
         let (scope_sql, scope_params) = principal.build_sql_scope();
 
-        if self.acl_enabled {
+        if self.acl_enabled && principal.acl_enforced {
             let scoped = search_rows_with_scope(
                 &conn,
                 trimmed_query,
@@ -460,7 +493,11 @@ impl Tool for MemorySearchTool {
                 &scope_sql,
                 &scope_params,
             )?;
-            let filtered = post_filter(scoped, &principal, |row| row.content.as_str());
+            let scoped_topic =
+                search_topic_rows_with_scope(&conn, trimmed_query, &principal, max_results)?;
+            let terms = tokenize_query(trimmed_query);
+            let merged = merge_results(scoped, scoped_topic, &terms, min_score, max_results);
+            let filtered = post_filter(merged, &principal, |row| row.content.as_str());
             log_access(
                 &conn,
                 &principal,
@@ -486,15 +523,22 @@ impl Tool for MemorySearchTool {
             &scope_sql,
             &scope_params,
         )?;
-        let filtered = post_filter(scoped.clone(), &principal, |row| row.content.as_str());
-        let all_rows =
+        let scoped_topic =
+            search_topic_rows_with_scope(&conn, trimmed_query, &principal, max_results)?;
+        let terms = tokenize_query(trimmed_query);
+        let scoped_all = merge_results(scoped, scoped_topic, &terms, min_score, max_results);
+        let filtered = post_filter(scoped_all.clone(), &principal, |row| row.content.as_str());
+        let all_rows_base =
             search_rows_with_scope(&conn, trimmed_query, max_results, min_score, "1=1", &[])?;
+        let all_topic =
+            search_topic_rows_with_scope(&conn, trimmed_query, &owner_principal(), max_results)?;
+        let all_rows = merge_results(all_rows_base, all_topic, &terms, min_score, max_results);
 
         let denied_by_scope = all_rows
             .iter()
-            .filter(|row| !scoped.iter().any(|allowed| allowed.id == row.id))
+            .filter(|row| !scoped_all.iter().any(|allowed| allowed.id == row.id))
             .count();
-        let denied_by_post = scoped
+        let denied_by_post = scoped_all
             .iter()
             .filter(|row| !filtered.iter().any(|allowed| allowed.id == row.id))
             .count();
@@ -653,11 +697,17 @@ fn best_snippet(content: &str, terms: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use chrono::Utc;
+    use rusqlite::params;
     use tempfile::TempDir;
 
     fn test_tool(tmp: &TempDir, acl_enabled: bool) -> MemorySearchTool {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         MemorySearchTool::new(tmp.path().to_path_buf(), memory, acl_enabled)
+    }
+
+    fn open_conn(tmp: &TempDir) -> Connection {
+        Connection::open(tmp.path().join("memory").join("brain.db")).unwrap()
     }
 
     #[tokio::test]
@@ -798,6 +848,245 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn acl_deny_anonymous_only_sees_public() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("public_k", "acl probe", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        memory
+            .store("private_k", "acl probe", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let conn = open_conn(&tmp);
+        conn.execute(
+            "UPDATE memories SET visibility = 'public', sensitivity = 'normal' WHERE key = 'public_k'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET visibility = 'private', sensitivity = 'normal' WHERE key = 'private_k'",
+            [],
+        )
+        .unwrap();
+
+        let tool = test_tool(&tmp, true);
+        let result = tool
+            .execute(json!({
+                "query": "acl probe",
+                "_zc_scope": {
+                    "channel": "telegram",
+                    "chat_type": "dm",
+                    "chat_id": "chat-1",
+                    "sender": "unknown-sender"
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("key: public_k"));
+        assert!(!result.output.contains("key: private_k"));
+    }
+
+    #[tokio::test]
+    async fn acl_deny_member_respects_visibility_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("pub_k", "ceiling probe", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        memory
+            .store("user_k", "ceiling probe", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let conn = open_conn(&tmp);
+        conn.execute(
+            "INSERT INTO identity_bindings (id, user_id, channel, channel_account, bound_at, bound_by)
+             VALUES ('b1', 'member_a', 'telegram', 'sender-a', ?1, 'system')",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_policies (user_id, role, projects, visibility_ceiling, blocked_patterns, updated_at)
+             VALUES ('member_a', 'member', '[]', 'private', '[]', ?1)",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET visibility = 'public', sensitivity = 'normal' WHERE key = 'pub_k'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET visibility = 'user', sender_id = 'member_a', sensitivity = 'normal' WHERE key = 'user_k'",
+            [],
+        )
+        .unwrap();
+
+        let tool = test_tool(&tmp, true);
+        let result = tool
+            .execute(json!({
+                "query": "ceiling probe",
+                "_zc_scope": {
+                    "channel": "telegram",
+                    "chat_type": "dm",
+                    "chat_id": "chat-1",
+                    "sender": "sender-a"
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("key: pub_k"));
+        assert!(!result.output.contains("key: user_k"));
+    }
+
+    #[tokio::test]
+    async fn acl_owner_sees_all() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("owner_k", "owner probe", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let conn = open_conn(&tmp);
+        conn.execute(
+            "INSERT INTO identity_bindings (id, user_id, channel, channel_account, bound_at, bound_by)
+             VALUES ('b1', 'owner_a', 'telegram', 'sender-owner', ?1, 'system')",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_policies (user_id, role, projects, visibility_ceiling, blocked_patterns, updated_at)
+             VALUES ('owner_a', 'owner', '[]', 'public', '[]', ?1)",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET visibility = 'private', sensitivity = 'normal' WHERE key = 'owner_k'",
+            [],
+        )
+        .unwrap();
+
+        let tool = test_tool(&tmp, true);
+        let result = tool
+            .execute(json!({
+                "query": "owner probe",
+                "_zc_scope": {
+                    "channel": "telegram",
+                    "chat_type": "dm",
+                    "chat_id": "chat-1",
+                    "sender": "sender-owner"
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("key: owner_k"));
+    }
+
+    #[tokio::test]
+    async fn acl_deny_blocked_patterns() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store("safe_k", "entry safe", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        memory
+            .store(
+                "blocked_k",
+                "entry secret token",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let conn = open_conn(&tmp);
+        conn.execute(
+            "INSERT INTO identity_bindings (id, user_id, channel, channel_account, bound_at, bound_by)
+             VALUES ('b1', 'member_a', 'telegram', 'sender-a', ?1, 'system')",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_policies (user_id, role, projects, visibility_ceiling, blocked_patterns, updated_at)
+             VALUES ('member_a', 'member', '[]', 'public', '[\"secret\"]', ?1)",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET visibility = 'public', sensitivity = 'normal' WHERE key IN ('safe_k','blocked_k')",
+            [],
+        )
+        .unwrap();
+
+        let tool = test_tool(&tmp, true);
+        let result = tool
+            .execute(json!({
+                "query": "entry",
+                "_zc_scope": {
+                    "channel": "telegram",
+                    "chat_type": "dm",
+                    "chat_id": "chat-1",
+                    "sender": "sender-a"
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("key: safe_k"));
+        assert!(!result.output.contains("key: blocked_k"));
+    }
+
+    #[tokio::test]
+    async fn topic_hit_loads_related_memories() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store(
+                "topic_related_k",
+                "cross channel checkpoint",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let conn = open_conn(&tmp);
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO topics (id, title, project, status, created_at, updated_at)
+             VALUES ('topic-1', 'openpr migration phase', 'openpr', 'open', ?1, ?1)",
+            params![&now],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET topic_id = 'topic-1', visibility = 'public', sensitivity = 'normal'
+             WHERE key = 'topic_related_k'",
+            [],
+        )
+        .unwrap();
+
+        let tool = test_tool(&tmp, true);
+        let result = tool
+            .execute(json!({"query": "openpr migration phase", "maxResults": 5}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("key: topic_related_k"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod principal;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
+pub mod topic;
 pub mod traits;
 pub mod vector;
 
@@ -25,6 +26,7 @@ pub use postgres::PostgresMemory;
 pub use principal::{ChatType, MemoryWriteContext, Principal, Role, Sensitivity, Visibility};
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
+pub use topic::{Topic, TopicMemory};
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};

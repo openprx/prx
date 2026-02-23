@@ -134,10 +134,15 @@ pub struct Principal {
     pub current_channel: String,
     pub current_chat_id: String,
     pub current_chat_type: ChatType,
+    pub acl_enforced: bool,
 }
 
 impl Principal {
     pub fn build_sql_scope(&self) -> (String, Vec<Value>) {
+        if !self.acl_enforced {
+            return ("1=1".to_string(), Vec::new());
+        }
+
         match self.role {
             Role::Owner => ("1=1".to_string(), Vec::new()),
             Role::Anonymous => (
@@ -320,18 +325,20 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
         .optional()?;
 
     if let Some((role_raw, projects_raw, ceiling_raw, blocked_raw)) = policy {
+        let role = Role::from_db(&role_raw);
         let projects = parse_json_array(&projects_raw);
         let blocked_patterns = compile_patterns(parse_json_array(&blocked_raw));
 
         return Ok(Principal {
             user_id,
-            role: Role::from_db(&role_raw),
+            role: role.clone(),
             projects,
             visibility_ceiling: Visibility::from_db(&ceiling_raw),
             blocked_patterns,
             current_channel,
             current_chat_id,
             current_chat_type,
+            acl_enforced: is_acl_enforced_for_role(&role),
         });
     }
 
@@ -344,6 +351,7 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
         current_channel,
         current_chat_id,
         current_chat_type,
+        acl_enforced: is_acl_enforced_for_role(&Role::Guest),
     })
 }
 
@@ -433,6 +441,20 @@ fn anonymous_principal(
         current_channel,
         current_chat_id,
         current_chat_type,
+        acl_enforced: is_acl_enforced_for_role(&Role::Anonymous),
+    }
+}
+
+const ACL_ENFORCE_ANONYMOUS: bool = true;
+const ACL_ENFORCE_GUEST: bool = true;
+const ACL_ENFORCE_MEMBER: bool = true;
+
+fn is_acl_enforced_for_role(role: &Role) -> bool {
+    match role {
+        Role::Owner => false,
+        Role::Anonymous => ACL_ENFORCE_ANONYMOUS,
+        Role::Guest => ACL_ENFORCE_GUEST,
+        Role::Member => ACL_ENFORCE_MEMBER,
     }
 }
 
@@ -520,6 +542,55 @@ mod tests {
         assert_eq!(principal.projects, vec!["alpha".to_string()]);
         assert_eq!(principal.visibility_ceiling, Visibility::Public);
         assert_eq!(principal.blocked_patterns.len(), 1);
+        assert!(!principal.acl_enforced);
+    }
+
+    #[test]
+    fn resolve_principal_sets_acl_rollout_flags() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE identity_bindings (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, channel TEXT NOT NULL, channel_account TEXT NOT NULL, display_name TEXT, bound_at TEXT NOT NULL, bound_by TEXT NOT NULL, UNIQUE(channel, channel_account));
+             CREATE TABLE user_policies (user_id TEXT PRIMARY KEY, role TEXT NOT NULL DEFAULT 'guest', projects TEXT NOT NULL DEFAULT '[]', visibility_ceiling TEXT NOT NULL DEFAULT 'private', blocked_patterns TEXT NOT NULL DEFAULT '[]', policy_version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO identity_bindings (id, user_id, channel, channel_account, bound_at, bound_by) VALUES ('1', 'member_u', 'signal', 'sender-member', '2026-02-23T00:00:00Z', 'system')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_policies (user_id, role, projects, visibility_ceiling, blocked_patterns, updated_at) VALUES ('member_u', 'member', '[]', 'private', '[]', '2026-02-23T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let anonymous = resolve_principal(
+            &conn,
+            &MemoryWriteContext {
+                channel: Some("signal".into()),
+                chat_type: Some("dm".into()),
+                chat_id: Some("chat-a".into()),
+                sender_id: None,
+                raw_sender: Some("unknown".into()),
+            },
+        )
+        .unwrap();
+        let member = resolve_principal(
+            &conn,
+            &MemoryWriteContext {
+                channel: Some("signal".into()),
+                chat_type: Some("dm".into()),
+                chat_id: Some("chat-m".into()),
+                sender_id: None,
+                raw_sender: Some("sender-member".into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(anonymous.role, Role::Anonymous);
+        assert!(anonymous.acl_enforced);
+        assert_eq!(member.role, Role::Member);
+        assert!(member.acl_enforced);
     }
 
     #[test]
@@ -533,6 +604,7 @@ mod tests {
             current_channel: "signal".into(),
             current_chat_id: "group:1".into(),
             current_chat_type: ChatType::Group,
+            acl_enforced: true,
         };
         let ctx = MemoryWriteContext {
             channel: Some("signal".into()),
@@ -560,6 +632,7 @@ mod tests {
             current_channel: "signal".into(),
             current_chat_id: "chat-ak".into(),
             current_chat_type: ChatType::Dm,
+            acl_enforced: false,
         };
         let ctx = MemoryWriteContext {
             channel: Some("signal".into()),
@@ -582,6 +655,7 @@ mod tests {
     }
 
     fn base_principal(role: Role, ceiling: Visibility) -> Principal {
+        let acl_enforced = !matches!(role, Role::Owner);
         Principal {
             user_id: "u1".into(),
             role,
@@ -591,6 +665,7 @@ mod tests {
             current_channel: "telegram".into(),
             current_chat_id: "chat-1".into(),
             current_chat_type: ChatType::Dm,
+            acl_enforced,
         }
     }
 

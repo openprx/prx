@@ -152,6 +152,21 @@ fn fallback_principal(ctx: &MemoryWriteContext) -> Principal {
             .as_deref()
             .map(ChatType::from_str)
             .unwrap_or(ChatType::Dm),
+        acl_enforced: true,
+    }
+}
+
+fn owner_principal() -> Principal {
+    Principal {
+        user_id: "system:tool".to_string(),
+        role: Role::Owner,
+        projects: Vec::new(),
+        visibility_ceiling: Visibility::Public,
+        blocked_patterns: Vec::new(),
+        current_channel: String::new(),
+        current_chat_id: String::new(),
+        current_chat_type: ChatType::Dm,
+        acl_enforced: false,
     }
 }
 
@@ -267,20 +282,11 @@ impl Tool for MemoryGetTool {
             let principal = if let Some(ref ctx) = scope_ctx {
                 resolve_principal(&conn, ctx).unwrap_or_else(|_| fallback_principal(ctx))
             } else {
-                Principal {
-                    user_id: "system:tool".to_string(),
-                    role: Role::Owner,
-                    projects: Vec::new(),
-                    visibility_ceiling: Visibility::Public,
-                    blocked_patterns: Vec::new(),
-                    current_channel: String::new(),
-                    current_chat_id: String::new(),
-                    current_chat_type: ChatType::Dm,
-                }
+                owner_principal()
             };
             let (scope_sql, scope_params) = principal.build_sql_scope();
 
-            if self.acl_enabled {
+            if self.acl_enabled && principal.acl_enforced {
                 let scoped =
                     fetch_memory_by_key_with_scope(&conn, path, &scope_sql, &scope_params)?;
                 if let Some(row) = scoped {
@@ -313,6 +319,13 @@ impl Tool for MemoryGetTool {
                     Some("scope_or_post_filter"),
                     "denied",
                 );
+                if !matches!(path, "MEMORY.md") && !path.starts_with("memory/") {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: format!("No memory entry found for key: '{path}'"),
+                        error: None,
+                    });
+                }
             } else {
                 // Observe mode: evaluate ACL but still return unrestricted result.
                 let scoped =
@@ -410,6 +423,8 @@ fn render_range(label: &str, content: &str, from: usize, requested_lines: usize)
 mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use chrono::Utc;
+    use rusqlite::params;
     use tempfile::TempDir;
 
     fn write_file(path: &Path, content: &str) {
@@ -422,6 +437,10 @@ mod tests {
     fn test_tool(tmp: &TempDir, acl_enabled: bool) -> MemoryGetTool {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         MemoryGetTool::new(tmp.path().to_path_buf(), memory, acl_enabled)
+    }
+
+    fn open_conn(tmp: &TempDir) -> Connection {
+        Connection::open(tmp.path().join("memory").join("brain.db")).unwrap()
     }
 
     #[tokio::test]
@@ -572,6 +591,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn acl_deny_returns_empty_for_unauthorized_key() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store(
+                "private_key",
+                "acl denied payload",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let conn = open_conn(&tmp);
+        conn.execute(
+            "INSERT INTO identity_bindings (id, user_id, channel, channel_account, bound_at, bound_by)
+             VALUES ('b1', 'member_a', 'telegram', 'sender-a', ?1, 'system')",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_policies (user_id, role, projects, visibility_ceiling, blocked_patterns, updated_at)
+             VALUES ('member_a', 'member', '[]', 'private', '[]', ?1)",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET visibility = 'user', sender_id = 'other_user', sensitivity = 'normal' WHERE key = 'private_key'",
+            [],
+        )
+        .unwrap();
+
+        let tool = test_tool(&tmp, true);
+        let result = tool
+            .execute(json!({
+                "path": "private_key",
+                "_zc_scope": {
+                    "channel": "telegram",
+                    "chat_type": "dm",
+                    "chat_id": "chat-1",
+                    "sender": "sender-a"
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("No memory entry found for key"));
     }
 
     #[test]
