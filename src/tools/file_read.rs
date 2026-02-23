@@ -2,6 +2,7 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
@@ -9,11 +10,32 @@ const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 /// Read file contents with path sandboxing
 pub struct FileReadTool {
     security: Arc<SecurityPolicy>,
+    acl_enabled: bool,
 }
 
 impl FileReadTool {
-    pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+    pub fn new(security: Arc<SecurityPolicy>, acl_enabled: bool) -> Self {
+        Self {
+            security,
+            acl_enabled,
+        }
+    }
+
+    fn is_protected_memory_markdown(&self, resolved_path: &Path) -> bool {
+        if !self.acl_enabled {
+            return false;
+        }
+
+        let Ok(rel) = resolved_path.strip_prefix(&self.security.workspace_dir) else {
+            return false;
+        };
+
+        if rel.file_name().and_then(|name| name.to_str()) == Some("MEMORY.md") {
+            return true;
+        }
+
+        rel.extension().and_then(|ext| ext.to_str()) == Some("md")
+            && rel.components().any(|component| component.as_os_str() == "memory")
     }
 }
 
@@ -99,6 +121,14 @@ impl Tool for FileReadTool {
             });
         }
 
+        if self.is_protected_memory_markdown(&resolved_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Access denied: memory files are protected by ACL policy".into()),
+            });
+        }
+
         // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
         match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => {
@@ -165,13 +195,13 @@ mod tests {
 
     #[test]
     fn file_read_name() {
-        let tool = FileReadTool::new(test_security(std::env::temp_dir()));
+        let tool = FileReadTool::new(test_security(std::env::temp_dir()), false);
         assert_eq!(tool.name(), "file_read");
     }
 
     #[test]
     fn file_read_schema_has_path() {
-        let tool = FileReadTool::new(test_security(std::env::temp_dir()));
+        let tool = FileReadTool::new(test_security(std::env::temp_dir()), false);
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["required"]
@@ -189,7 +219,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = FileReadTool::new(test_security(dir.clone()), false);
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
         assert!(result.success);
         assert_eq!(result.output, "hello world");
@@ -204,7 +234,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = FileReadTool::new(test_security(dir.clone()), false);
         let result = tool.execute(json!({"path": "nope.txt"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("Failed to resolve"));
@@ -218,7 +248,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = FileReadTool::new(test_security(dir.clone()), false);
         let result = tool
             .execute(json!({"path": "../../../etc/passwd"}))
             .await
@@ -231,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_blocks_absolute_path() {
-        let tool = FileReadTool::new(test_security(std::env::temp_dir()));
+        let tool = FileReadTool::new(test_security(std::env::temp_dir()), false);
         let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
@@ -246,11 +276,14 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security_with(
+        let tool = FileReadTool::new(
+            test_security_with(
             dir.clone(),
             AutonomyLevel::Supervised,
             0,
-        ));
+        ),
+            false,
+        );
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
 
         assert!(!result.success);
@@ -272,7 +305,10 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
+        let tool = FileReadTool::new(
+            test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20),
+            false,
+        );
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
 
         assert!(result.success);
@@ -283,7 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_missing_path_param() {
-        let tool = FileReadTool::new(test_security(std::env::temp_dir()));
+        let tool = FileReadTool::new(test_security(std::env::temp_dir()), false);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
@@ -295,7 +331,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("empty.txt"), "").await.unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = FileReadTool::new(test_security(dir.clone()), false);
         let result = tool.execute(json!({"path": "empty.txt"})).await.unwrap();
         assert!(result.success);
         assert_eq!(result.output, "");
@@ -314,7 +350,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = FileReadTool::new(test_security(dir.clone()), false);
         let result = tool
             .execute(json!({"path": "sub/dir/deep.txt"}))
             .await
@@ -344,7 +380,7 @@ mod tests {
 
         symlink(outside.join("secret.txt"), workspace.join("escape.txt")).unwrap();
 
-        let tool = FileReadTool::new(test_security(workspace.clone()));
+        let tool = FileReadTool::new(test_security(workspace.clone()), false);
         let result = tool.execute(json!({"path": "escape.txt"})).await.unwrap();
 
         assert!(!result.success);
@@ -364,11 +400,14 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         // Allow only 2 actions total
-        let tool = FileReadTool::new(test_security_with(
+        let tool = FileReadTool::new(
+            test_security_with(
             dir.clone(),
             AutonomyLevel::Supervised,
             2,
-        ));
+        ),
+            false,
+        );
 
         // Both reads fail (file doesn't exist) but should consume budget
         let r1 = tool.execute(json!({"path": "nope1.txt"})).await.unwrap();
@@ -401,10 +440,67 @@ mod tests {
         let big = vec![b'x'; 10 * 1024 * 1024 + 1];
         tokio::fs::write(dir.join("huge.bin"), &big).await.unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = FileReadTool::new(test_security(dir.clone()), false);
         let result = tool.execute(json!({"path": "huge.bin"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("File too large"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_acl_enabled_blocks_memory_markdown_files() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_acl_blocks");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(dir.join("memory/sub")).await.unwrap();
+        tokio::fs::write(dir.join("MEMORY.md"), "legacy memory")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("memory/sub/topic.md"), "memory topic")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()), true);
+        let root_result = tool.execute(json!({"path": "MEMORY.md"})).await.unwrap();
+        assert!(!root_result.success);
+        assert_eq!(
+            root_result.error.as_deref(),
+            Some("Access denied: memory files are protected by ACL policy")
+        );
+
+        let memory_result = tool
+            .execute(json!({"path": "memory/sub/topic.md"}))
+            .await
+            .unwrap();
+        assert!(!memory_result.success);
+        assert_eq!(
+            memory_result.error.as_deref(),
+            Some("Access denied: memory files are protected by ACL policy")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_acl_disabled_allows_memory_markdown_files() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_acl_disabled");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(dir.join("memory")).await.unwrap();
+        tokio::fs::write(dir.join("MEMORY.md"), "legacy memory")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("memory/topic.md"), "memory topic")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()), false);
+        let root_result = tool.execute(json!({"path": "MEMORY.md"})).await.unwrap();
+        assert!(root_result.success);
+        assert_eq!(root_result.output, "legacy memory");
+
+        let memory_result = tool.execute(json!({"path": "memory/topic.md"})).await.unwrap();
+        assert!(memory_result.success);
+        assert_eq!(memory_result.output, "memory topic");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
