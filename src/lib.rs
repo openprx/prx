@@ -73,6 +73,7 @@ pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod tunnel;
 pub(crate) mod util;
+pub mod webhook;
 
 pub use config::Config;
 

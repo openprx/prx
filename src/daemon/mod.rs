@@ -94,9 +94,30 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
+    if config.webhook.enabled {
+        let webhook_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "webhook_receiver",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = webhook_cfg.clone();
+                async move {
+                    let token = cfg.webhook.token.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("webhook.token must be configured when webhook.enabled=true")
+                    })?;
+                    crate::webhook::run(&cfg.webhook.bind, token, &cfg.workspace_dir).await
+                }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("webhook_receiver");
+        tracing::info!("Webhook receiver disabled; webhook supervisor not started");
+    }
+
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
+    println!("   Components: gateway, channels, heartbeat, scheduler, webhook_receiver");
     println!("   Ctrl+C to stop");
 
     tokio::signal::ctrl_c().await?;
