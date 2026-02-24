@@ -20,11 +20,36 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    acl_enabled: bool,
 }
 
 impl ShellTool {
-    pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        acl_enabled: bool,
+    ) -> Self {
+        Self {
+            security,
+            runtime,
+            acl_enabled,
+        }
+    }
+
+    fn references_protected_memory_path(command: &str) -> bool {
+        let lowered = command.to_ascii_lowercase();
+        let protected_markers = [
+            "memory.md",
+            "memory_snapshot.md",
+            "memory/brain.db",
+            "memory/brain.db-wal",
+            "memory/brain.db-shm",
+            "memory/brain.db-journal",
+            "memory/",
+        ];
+        protected_markers
+            .iter()
+            .any(|marker| lowered.contains(marker))
     }
 }
 
@@ -65,6 +90,16 @@ impl Tool for ShellTool {
             .get("approved")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        if self.acl_enabled && Self::references_protected_memory_path(command) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Access denied: shell command references ACL-protected memory path".into(),
+                ),
+            });
+        }
 
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
@@ -181,19 +216,31 @@ mod tests {
 
     #[test]
     fn shell_tool_name() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            false,
+        );
         assert_eq!(tool.name(), "shell");
     }
 
     #[test]
     fn shell_tool_description() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            false,
+        );
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn shell_tool_schema_has_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            false,
+        );
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["command"].is_object());
         assert!(schema["required"]
@@ -205,7 +252,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_executes_allowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            false,
+        );
         let result = tool
             .execute(json!({"command": "echo hello"}))
             .await
@@ -217,7 +268,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_disallowed_command() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            false,
+        );
         let result = tool
             .execute(json!({"command": "rm -rf /"}))
             .await
@@ -229,7 +284,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_readonly() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime());
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::ReadOnly),
+            test_runtime(),
+            false,
+        );
         let result = tool
             .execute(json!({"command": "ls"}))
             .await
@@ -244,7 +303,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_missing_command_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            false,
+        );
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("command"));
@@ -252,14 +315,22 @@ mod tests {
 
     #[tokio::test]
     async fn shell_wrong_type_param() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            false,
+        );
         let result = tool.execute(json!({"command": 123})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn shell_captures_exit_code() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            false,
+        );
         let result = tool
             .execute(json!({"command": "ls /nonexistent_dir_xyz"}))
             .await
@@ -305,7 +376,7 @@ mod tests {
         let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
         let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
 
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime(), false);
         let result = tool
             .execute(json!({"command": "env"}))
             .await
@@ -323,7 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_preserves_path_and_home() {
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime(), false);
 
         let result = tool
             .execute(json!({"command": "echo $HOME"}))
@@ -355,7 +426,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
 
-        let tool = ShellTool::new(security.clone(), test_runtime());
+        let tool = ShellTool::new(security.clone(), test_runtime(), false);
         let denied = tool
             .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
             .await
@@ -432,12 +503,31 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(security, test_runtime());
+        let tool = ShellTool::new(security, test_runtime(), false);
         let result = tool
             .execute(json!({"command": "echo test"}))
             .await
             .expect("rate-limited command should return a result");
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("Rate limit"));
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_protected_memory_paths_when_acl_enabled() {
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Supervised),
+            test_runtime(),
+            true,
+        );
+        let result = tool
+            .execute(json!({"command": "cat memory/brain.db"}))
+            .await
+            .expect("acl-protected command should return a result");
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("ACL-protected memory path"));
     }
 }

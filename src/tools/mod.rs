@@ -169,7 +169,7 @@ pub fn default_tools_with_runtime(
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(ShellTool::new(security.clone(), runtime, false)),
         Box::new(FileReadTool::new(security.clone(), false)),
         Box::new(FileWriteTool::new(security)),
     ]
@@ -227,8 +227,15 @@ pub fn all_tools_with_runtime(
         Arc::new(arc_swap::ArcSwap::from(config.clone()));
 
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime)),
-        Arc::new(FileReadTool::new(security.clone(), config.memory.acl_enabled)),
+        Arc::new(ShellTool::new(
+            security.clone(),
+            runtime,
+            config.memory.acl_enabled,
+        )),
+        Arc::new(FileReadTool::new(
+            security.clone(),
+            config.memory.acl_enabled,
+        )),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(CanvasTool::new(security.clone())),
         Arc::new(CronTool::new(shared_config.clone(), security.clone())),

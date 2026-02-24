@@ -198,6 +198,9 @@ impl SqliteMemory {
             Connection::open(&path_buf).context("SQLite failed to open database")?
         };
 
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("SQLite failed to configure busy_timeout")?;
+
         Ok(conn)
     }
 

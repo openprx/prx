@@ -185,6 +185,13 @@ impl Tool for ConfigReloadTool {
             let mut updated = fresh;
             updated.config_path = old.config_path.clone();
             updated.workspace_dir = old.workspace_dir.clone();
+            if updated.memory.acl_enabled != old.memory.acl_enabled {
+                changes.push(format!(
+                    "memory.acl_enabled: {} → {} (deferred; restart required)",
+                    old.memory.acl_enabled, updated.memory.acl_enabled
+                ));
+                updated.memory.acl_enabled = old.memory.acl_enabled;
+            }
             self.config.store(Arc::new(updated));
         }
 

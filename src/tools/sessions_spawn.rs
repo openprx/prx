@@ -9,7 +9,7 @@
 //! - `steer` action: inject a message into a running sub-agent's context
 
 use super::traits::{Tool, ToolResult};
-use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::loop_::{run_tool_call_loop, ScopeContext};
 use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
 use crate::config::{DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
@@ -65,6 +65,59 @@ pub struct SubAgentRun {
     pub history: Arc<RwLock<Vec<HistoryEntry>>>,
     /// Channel to inject steering messages into the running sub-agent.
     pub steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct SpawnScope {
+    sender: String,
+    channel: String,
+    chat_type: String,
+    chat_id: String,
+}
+
+fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
+    let trusted = args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !trusted {
+        return None;
+    }
+
+    let scope = args
+        .get("_zc_scope")
+        .and_then(serde_json::Value::as_object)?;
+    let sender = scope
+        .get("sender")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let channel = scope
+        .get("channel")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let chat_type = scope
+        .get("chat_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let chat_id = scope
+        .get("chat_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+
+    Some(SpawnScope {
+        sender,
+        channel,
+        chat_type,
+        chat_id,
+    })
 }
 
 /// Tool that spawns an asynchronous sub-agent to handle a task in isolation.
@@ -351,6 +404,7 @@ impl Tool for SessionsSpawnTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let spawn_scope = parse_spawn_scope(&args);
 
         // Security check
         if let Err(error) = self
@@ -474,6 +528,7 @@ impl Tool for SessionsSpawnTool {
             });
             let task_owned = task.to_string();
             let rid = run_id.clone();
+            let process_scope = spawn_scope.clone();
 
             let jh = tokio::spawn(async move {
                 tracing::info!(run_id = %rid, "Sub-agent process starting");
@@ -490,6 +545,7 @@ impl Tool for SessionsSpawnTool {
                     identity_dir.as_deref(),
                     &allowed_tools,
                     keep_workspace,
+                    process_scope.as_ref(),
                 )
                 .await;
 
@@ -583,6 +639,8 @@ impl Tool for SessionsSpawnTool {
         let tools = self.tools.get().cloned();
         let workspace_dir = self.workspace_dir.clone();
         let multimodal_config = self.multimodal_config.clone();
+        let security = self.security.clone();
+        let task_scope = spawn_scope.clone();
         let (system_prompt, filtered_tools) = if let Some((agent, cfg)) = selected_agent {
             let identity_prompt = cfg
                 .identity_dir
@@ -628,9 +686,11 @@ impl Tool for SessionsSpawnTool {
                     filtered_tools,
                     &system_prompt,
                     &workspace_dir,
+                    security,
                     &multimodal_config,
                     steer_rx,
                     history_arc,
+                    task_scope,
                 ),
             )
             .await;
@@ -1041,9 +1101,11 @@ async fn run_sub_agent_task(
     tools: Option<Arc<Vec<Box<dyn Tool>>>>,
     system_prompt: &str,
     workspace_dir: &std::path::Path,
+    security: Arc<SecurityPolicy>,
     multimodal_config: &MultimodalConfig,
     mut steer_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     history_out: Arc<RwLock<Vec<HistoryEntry>>>,
+    scope: Option<SpawnScope>,
 ) -> anyhow::Result<String> {
     // --- No-tools fallback: single-turn completion ---
     let Some(tools_registry) = tools else {
@@ -1088,10 +1150,20 @@ async fn run_sub_agent_task(
         let wd = workspace_dir.to_path_buf();
         let mc = multimodal_config.clone();
         let ct = cancel_token.clone();
+        let security = security.clone();
+        let scope_owned = scope.clone();
 
         let mut loop_handle = tokio::spawn(async move {
             let observer = NoopObserver;
             let hooks = HookManager::new(wd);
+            let scope_ctx = scope_owned.as_ref().map(|scope| ScopeContext {
+                policy: &security,
+                sender: scope.sender.as_str(),
+                channel: scope.channel.as_str(),
+                chat_type: scope.chat_type.as_str(),
+                chat_id: scope.chat_id.as_str(),
+                policy_pipeline: None,
+            });
             let result = run_tool_call_loop(
                 p.as_ref(),
                 &mut h,
@@ -1108,7 +1180,7 @@ async fn run_sub_agent_task(
                 SUB_AGENT_MAX_ITERATIONS,
                 Some(ct),
                 None, // no streaming sender
-                None, // no scope context for spawned sessions
+                scope_ctx.as_ref(),
             )
             .await;
             (h, result)
@@ -1233,6 +1305,7 @@ async fn run_sub_agent_process(
     agent_identity_dir: Option<&str>,
     allowed_tools: &[String],
     keep_workspace: bool,
+    scope: Option<&SpawnScope>,
 ) -> anyhow::Result<WorkerResult> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1274,6 +1347,10 @@ async fn run_sub_agent_process(
         timeout_seconds: timeout_secs,
         system_prompt: None,
         identity_dir,
+        scope_sender: scope.map(|ctx| ctx.sender.clone()),
+        scope_channel: scope.map(|ctx| ctx.channel.clone()),
+        scope_chat_type: scope.map(|ctx| ctx.chat_type.clone()),
+        scope_chat_id: scope.map(|ctx| ctx.chat_id.clone()),
     };
 
     let executable = std::env::current_exe()?;
@@ -1960,6 +2037,10 @@ mod tests {
             timeout_seconds: 30,
             system_prompt: None,
             identity_dir: None,
+            scope_sender: None,
+            scope_channel: None,
+            scope_chat_type: None,
+            scope_chat_id: None,
         };
 
         let args = build_session_worker_cli_args(&manifest).unwrap();

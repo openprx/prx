@@ -1,4 +1,4 @@
-use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::loop_::{run_tool_call_loop, ScopeContext};
 use crate::channels::build_identity_prompt;
 use crate::config::Config;
 use crate::hooks::HookManager;
@@ -156,6 +156,29 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
 
         let observer = NoopObserver;
         let hooks = HookManager::new(manifest.workspace_dir.clone());
+        let scope_ctx = match (
+            manifest.scope_sender.as_deref(),
+            manifest.scope_channel.as_deref(),
+            manifest.scope_chat_type.as_deref(),
+            manifest.scope_chat_id.as_deref(),
+        ) {
+            (Some(sender), Some(channel), Some(chat_type), Some(chat_id))
+                if !sender.is_empty()
+                    && !channel.is_empty()
+                    && !chat_type.is_empty()
+                    && !chat_id.is_empty() =>
+            {
+                Some(ScopeContext {
+                    policy: &security,
+                    sender,
+                    channel,
+                    chat_type,
+                    chat_id,
+                    policy_pipeline: None,
+                })
+            }
+            _ => None,
+        };
         run_tool_call_loop(
             provider.as_ref(),
             &mut history,
@@ -172,7 +195,7 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
             config.agent.max_tool_iterations,
             None,
             None,
-            None,
+            scope_ctx.as_ref(),
         )
         .await
     };

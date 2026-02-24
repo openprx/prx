@@ -15,6 +15,10 @@ pub struct WorkerManifest {
     pub timeout_seconds: u64,
     pub system_prompt: Option<String>,
     pub identity_dir: Option<String>,
+    pub scope_sender: Option<String>,
+    pub scope_channel: Option<String>,
+    pub scope_chat_type: Option<String>,
+    pub scope_chat_id: Option<String>,
 }
 
 /// Result returned by `session-worker` on stdout.
@@ -43,6 +47,10 @@ mod tests {
             timeout_seconds: 120,
             system_prompt: None,
             identity_dir: Some("identity/worker".into()),
+            scope_sender: Some("zeroclaw_user".into()),
+            scope_channel: Some("telegram".into()),
+            scope_chat_type: Some("direct".into()),
+            scope_chat_id: Some("chat-1".into()),
         };
 
         let json = serde_json::to_string(&manifest).expect("serialize manifest");
@@ -51,6 +59,7 @@ mod tests {
         assert_eq!(parsed.run_id, "run-1");
         assert_eq!(parsed.allowed_tools.len(), 2);
         assert_eq!(parsed.identity_dir.as_deref(), Some("identity/worker"));
+        assert_eq!(parsed.scope_sender.as_deref(), Some("zeroclaw_user"));
     }
 
     #[test]
