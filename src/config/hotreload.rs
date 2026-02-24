@@ -171,14 +171,21 @@ fn try_reload(contents: &[u8], shared: &SharedConfig) -> anyhow::Result<()> {
     let mut fresh: Config = toml::from_str(contents)?;
 
     // Preserve runtime-resolved paths from the current config
-    {
-        let current = shared.load();
-        fresh.config_path = current.config_path.clone();
-        fresh.workspace_dir = current.workspace_dir.clone();
+    let old = shared.load_full();
+    fresh.config_path = old.config_path.clone();
+    fresh.workspace_dir = old.workspace_dir.clone();
+    // ACL mode is not hot-reloadable for already-initialized tool instances.
+    // Keep runtime behavior deterministic until restart.
+    if fresh.memory.acl_enabled != old.memory.acl_enabled {
+        tracing::warn!(
+            old = old.memory.acl_enabled,
+            new = fresh.memory.acl_enabled,
+            "memory.acl_enabled change detected but requires restart; keeping current runtime value"
+        );
+        fresh.memory.acl_enabled = old.memory.acl_enabled;
     }
 
     // Log diff of key hot-reloadable fields
-    let old = shared.load_full();
     log_diff(&old, &fresh);
 
     // Atomically publish new config

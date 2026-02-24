@@ -46,7 +46,12 @@ impl FileReadTool {
             let first = components.next().and_then(|c| c.as_os_str().to_str());
             let second = components.next().and_then(|c| c.as_os_str().to_str());
             if first.is_some_and(|part| part.eq_ignore_ascii_case("memory"))
-                && second.is_some_and(|part| part.eq_ignore_ascii_case("brain.db"))
+                && second.is_some_and(|part| {
+                    part.eq_ignore_ascii_case("brain.db")
+                        || part.eq_ignore_ascii_case("brain.db-wal")
+                        || part.eq_ignore_ascii_case("brain.db-shm")
+                        || part.eq_ignore_ascii_case("brain.db-journal")
+                })
             {
                 return true;
             }
@@ -302,11 +307,7 @@ mod tests {
             .unwrap();
 
         let tool = FileReadTool::new(
-            test_security_with(
-            dir.clone(),
-            AutonomyLevel::Supervised,
-            0,
-        ),
+            test_security_with(dir.clone(), AutonomyLevel::Supervised, 0),
             false,
         );
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
@@ -426,11 +427,7 @@ mod tests {
 
         // Allow only 2 actions total
         let tool = FileReadTool::new(
-            test_security_with(
-            dir.clone(),
-            AutonomyLevel::Supervised,
-            2,
-        ),
+            test_security_with(dir.clone(), AutonomyLevel::Supervised, 2),
             false,
         );
 
@@ -477,7 +474,9 @@ mod tests {
     async fn file_read_acl_enabled_blocks_memory_markdown_files() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_acl_blocks");
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(dir.join("memory/sub")).await.unwrap();
+        tokio::fs::create_dir_all(dir.join("memory/sub"))
+            .await
+            .unwrap();
         tokio::fs::write(dir.join("MEMORY.md"), "legacy memory")
             .await
             .unwrap();
@@ -510,7 +509,9 @@ mod tests {
     async fn file_read_acl_enabled_blocks_memory_markdown_case_variants() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_acl_case_variants");
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(dir.join("MeMoRy/Sub")).await.unwrap();
+        tokio::fs::create_dir_all(dir.join("MeMoRy/Sub"))
+            .await
+            .unwrap();
         tokio::fs::write(dir.join("memory.md"), "legacy memory lowercase")
             .await
             .unwrap();
@@ -550,6 +551,9 @@ mod tests {
         tokio::fs::write(dir.join("memory/brain.db"), b"not-a-real-sqlite")
             .await
             .unwrap();
+        tokio::fs::write(dir.join("memory/brain.db-wal"), b"wal-content")
+            .await
+            .unwrap();
 
         let tool = FileReadTool::new(test_security(dir.clone()), true);
         let snapshot_result = tool
@@ -562,10 +566,22 @@ mod tests {
             Some("Access denied: memory files are protected by ACL policy")
         );
 
-        let db_result = tool.execute(json!({"path": "memory/brain.db"})).await.unwrap();
+        let db_result = tool
+            .execute(json!({"path": "memory/brain.db"}))
+            .await
+            .unwrap();
         assert!(!db_result.success);
         assert_eq!(
             db_result.error.as_deref(),
+            Some("Access denied: memory files are protected by ACL policy")
+        );
+        let wal_result = tool
+            .execute(json!({"path": "memory/brain.db-wal"}))
+            .await
+            .unwrap();
+        assert!(!wal_result.success);
+        assert_eq!(
+            wal_result.error.as_deref(),
             Some("Access denied: memory files are protected by ACL policy")
         );
 
@@ -613,7 +629,10 @@ mod tests {
         assert!(root_result.success);
         assert_eq!(root_result.output, "legacy memory");
 
-        let memory_result = tool.execute(json!({"path": "memory/topic.md"})).await.unwrap();
+        let memory_result = tool
+            .execute(json!({"path": "memory/topic.md"}))
+            .await
+            .unwrap();
         assert!(memory_result.success);
         assert_eq!(memory_result.output, "memory topic");
 

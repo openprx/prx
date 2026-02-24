@@ -150,6 +150,7 @@ impl SlidingWindowRateLimiter {
 pub struct GatewayRateLimiter {
     pair: SlidingWindowRateLimiter,
     webhook: SlidingWindowRateLimiter,
+    webhook_credential: SlidingWindowRateLimiter,
 }
 
 impl GatewayRateLimiter {
@@ -158,6 +159,7 @@ impl GatewayRateLimiter {
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
             webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
+            webhook_credential: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
         }
     }
 
@@ -167,6 +169,10 @@ impl GatewayRateLimiter {
 
     fn allow_webhook(&self, key: &str) -> bool {
         self.webhook.allow(key)
+    }
+
+    fn allow_webhook_credential(&self, key: &str) -> bool {
+        self.webhook_credential.allow(key)
     }
 }
 
@@ -923,6 +929,18 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    let bearer_token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+    let webhook_secret_header = headers
+        .get("X-Webhook-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
     let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
@@ -936,12 +954,7 @@ async fn handle_webhook(
 
     // ── Bearer token auth (pairing) ──
     if state.pairing.require_pairing() {
-        let auth = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
+        if !state.pairing.is_authenticated(bearer_token) {
             tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
             let err = serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
@@ -952,12 +965,7 @@ async fn handle_webhook(
 
     // ── Webhook secret auth (optional, additional layer) ──
     if let Some(ref secret_hash) = state.webhook_secret_hash {
-        let header_hash = headers
-            .get("X-Webhook-Secret")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(hash_webhook_secret);
+        let header_hash = webhook_secret_header.map(hash_webhook_secret);
         match header_hash {
             Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
             _ => {
@@ -966,6 +974,26 @@ async fn handle_webhook(
                 return (StatusCode::UNAUTHORIZED, Json(err));
             }
         }
+    }
+
+    // Additional credential-based limiter reduces distributed IP rotation bypass.
+    let credential_rate_key = if !bearer_token.is_empty() {
+        format!("bearer:{}", hash_webhook_secret(bearer_token))
+    } else if let Some(secret) = webhook_secret_header {
+        format!("secret:{}", hash_webhook_secret(secret))
+    } else {
+        "public".to_string()
+    };
+    if !state
+        .rate_limiter
+        .allow_webhook_credential(&credential_rate_key)
+    {
+        tracing::warn!("/webhook credential rate limit exceeded");
+        let err = serde_json::json!({
+            "error": "Too many webhook requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
     }
 
     // ── Parse body ──
@@ -1633,6 +1661,14 @@ mod tests {
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(!limiter.allow_pair("127.0.0.1"));
+    }
+
+    #[test]
+    fn gateway_webhook_credential_limiter_blocks_after_limit() {
+        let limiter = GatewayRateLimiter::new(2, 2, 100);
+        assert!(limiter.allow_webhook_credential("bearer:token-a"));
+        assert!(limiter.allow_webhook_credential("bearer:token-a"));
+        assert!(!limiter.allow_webhook_credential("bearer:token-a"));
     }
 
     #[test]

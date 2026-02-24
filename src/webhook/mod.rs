@@ -455,6 +455,8 @@ fn normalize_openpr_event_type(raw: &str) -> String {
 fn persist_event(db_path: &Path, event: &WebhookEvent, acl_enabled: bool) -> Result<String> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("failed to open webhook db {}", db_path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("failed to configure webhook sqlite busy_timeout")?;
 
     let topic_id = match crate::memory::topic::find_topic_by_project_and_external(
         &conn,
@@ -572,9 +574,19 @@ fn webhook_replay_fingerprint(event: &WebhookEvent) -> String {
         "{}:{}:{}:{}:{}:{}",
         event.source.trim().to_lowercase(),
         event.event_type.trim().to_lowercase(),
-        event.project.as_deref().unwrap_or("_global").trim().to_lowercase(),
+        event
+            .project
+            .as_deref()
+            .unwrap_or("_global")
+            .trim()
+            .to_lowercase(),
         event.external_id.trim().to_lowercase(),
-        event.actor.as_deref().unwrap_or_default().trim().to_lowercase(),
+        event
+            .actor
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase(),
         event.timestamp.trim()
     );
     let digest = Sha256::digest(payload.as_bytes());

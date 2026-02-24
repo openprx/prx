@@ -267,7 +267,8 @@ pub fn resolve_topic(
     let external_id = extract_external_ref(content);
 
     if let Some(external_id) = external_id.as_deref() {
-        let maybe_topic = find_topic_by_project_and_external(conn, project.as_deref(), external_id)?;
+        let maybe_topic =
+            find_topic_by_project_and_external(conn, project.as_deref(), external_id)?;
 
         if let Some(topic) = maybe_topic {
             let real_id = resolve_alias(conn, &topic.id)?;
@@ -617,14 +618,8 @@ mod tests {
             "fp-openpr-88",
         )
         .unwrap();
-        let _lc_id = create_topic(
-            &conn,
-            "LC ticket",
-            Some("lc"),
-            Some("issue#88"),
-            "fp-lc-88",
-        )
-        .unwrap();
+        let _lc_id =
+            create_topic(&conn, "LC ticket", Some("lc"), Some("issue#88"), "fp-lc-88").unwrap();
 
         let principal = base_principal("u-2");
         let resolved = resolve_topic(&conn, "openpr 处理 issue#88", &principal)

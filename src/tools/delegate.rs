@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::loop_::{run_tool_call_loop, ScopeContext};
 use crate::config::DelegateAgentConfig;
 use crate::hooks::HookManager;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -34,6 +34,59 @@ pub struct DelegateTool {
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
+}
+
+#[derive(Debug, Clone)]
+struct DelegateScope {
+    sender: String,
+    channel: String,
+    chat_type: String,
+    chat_id: String,
+}
+
+fn parse_delegate_scope(args: &serde_json::Value) -> Option<DelegateScope> {
+    let trusted = args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !trusted {
+        return None;
+    }
+
+    let scope = args
+        .get("_zc_scope")
+        .and_then(serde_json::Value::as_object)?;
+    let sender = scope
+        .get("sender")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let channel = scope
+        .get("channel")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let chat_type = scope
+        .get("chat_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let chat_id = scope
+        .get("chat_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+
+    Some(DelegateScope {
+        sender,
+        channel,
+        chat_type,
+        chat_id,
+    })
 }
 
 impl DelegateTool {
@@ -161,6 +214,7 @@ impl Tool for DelegateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let scope = parse_delegate_scope(&args);
         let agent_name = args
             .get("agent")
             .and_then(|v| v.as_str())
@@ -285,6 +339,7 @@ impl Tool for DelegateTool {
                     &*provider,
                     &full_prompt,
                     temperature,
+                    scope.as_ref(),
                 )
                 .await;
         }
@@ -348,6 +403,7 @@ impl DelegateTool {
         provider: &dyn Provider,
         full_prompt: &str,
         temperature: f64,
+        scope: Option<&DelegateScope>,
     ) -> anyhow::Result<ToolResult> {
         if agent_config.allowed_tools.is_empty() {
             return Ok(ToolResult {
@@ -393,6 +449,14 @@ impl DelegateTool {
 
         let noop_observer = NoopObserver;
         let hooks = HookManager::new(self.security.workspace_dir.clone());
+        let scope_ctx = scope.map(|scope| ScopeContext {
+            policy: &self.security,
+            sender: scope.sender.as_str(),
+            channel: scope.channel.as_str(),
+            chat_type: scope.chat_type.as_str(),
+            chat_id: scope.chat_id.as_str(),
+            policy_pipeline: None,
+        });
 
         let result = tokio::time::timeout(
             Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
@@ -412,7 +476,7 @@ impl DelegateTool {
                 agent_config.max_iterations,
                 None,
                 None,
-                None, // no scope context for delegated tasks
+                scope_ctx.as_ref(),
             ),
         )
         .await;
@@ -1040,7 +1104,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
             .await
             .unwrap();
 
@@ -1062,7 +1126,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
             .await
             .unwrap();
 
@@ -1082,7 +1146,7 @@ mod tests {
 
         let provider = InfiniteToolCallProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
             .await
             .unwrap();
 
@@ -1102,7 +1166,7 @@ mod tests {
 
         let provider = FailingProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
             .await
             .unwrap();
 
