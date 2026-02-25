@@ -1,7 +1,7 @@
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
 use crate::providers::{
-    is_glm_alias, is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias,
-    is_zai_alias,
+    is_glm_alias, is_huggingface_alias, is_litellm_alias, is_minimax_alias, is_moonshot_alias,
+    is_qianfan_alias, is_qwen_alias, is_vllm_alias, is_zai_alias,
 };
 
 /// Returns the full catalog of integrations
@@ -284,7 +284,40 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Hugging Face",
             description: "Open-source models",
             category: IntegrationCategory::AiModel,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if c.default_provider
+                    .as_deref()
+                    .is_some_and(is_huggingface_alias)
+                {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "LiteLLM",
+            description: "Unified LLM gateway",
+            category: IntegrationCategory::AiModel,
+            status_fn: |c| {
+                if c.default_provider.as_deref().is_some_and(is_litellm_alias) {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
+            name: "vLLM",
+            description: "High-throughput local inference",
+            category: IntegrationCategory::AiModel,
+            status_fn: |c| {
+                if c.default_provider.as_deref().is_some_and(is_vllm_alias) {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "LM Studio",
@@ -986,6 +1019,27 @@ mod tests {
         let qianfan = entries.iter().find(|e| e.name == "Qianfan").unwrap();
         assert!(matches!(
             (qianfan.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+
+        config.default_provider = Some("lite-llm".to_string());
+        let litellm = entries.iter().find(|e| e.name == "LiteLLM").unwrap();
+        assert!(matches!(
+            (litellm.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+
+        config.default_provider = Some("v-llm".to_string());
+        let vllm = entries.iter().find(|e| e.name == "vLLM").unwrap();
+        assert!(matches!(
+            (vllm.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+
+        config.default_provider = Some("hf".to_string());
+        let huggingface = entries.iter().find(|e| e.name == "Hugging Face").unwrap();
+        assert!(matches!(
+            (huggingface.status_fn)(&config),
             IntegrationStatus::Active
         ));
     }

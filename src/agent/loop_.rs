@@ -113,6 +113,7 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
+const MEMORY_FLUSH_MAX_CHARS: usize = 800;
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
@@ -177,6 +178,119 @@ fn apply_compaction_summary(
 ) {
     let summary_msg = ChatMessage::assistant(format!("[Compaction summary]\n{}", summary.trim()));
     history.splice(start..compact_end, std::iter::once(summary_msg));
+}
+
+fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
+    // Fast heuristic: ~4 chars/token + small per-message framing.
+    history
+        .iter()
+        .map(|msg| msg.role.chars().count() + msg.content.chars().count() + 12)
+        .sum::<usize>()
+        / 4
+}
+
+fn compaction_trigger_limit(config: &crate::config::AgentCompactionConfig) -> Option<usize> {
+    if config.mode == crate::config::AgentCompactionMode::Off {
+        return None;
+    }
+    let max_tokens = config.max_context_tokens;
+    let reserve = config.reserve_tokens;
+    if max_tokens <= reserve {
+        return Some(0);
+    }
+    Some(max_tokens - reserve)
+}
+
+async fn apply_configurable_compaction(
+    history: &mut Vec<ChatMessage>,
+    provider: &dyn Provider,
+    model: &str,
+    config: &crate::config::AgentCompactionConfig,
+) -> Result<bool> {
+    let Some(limit) = compaction_trigger_limit(config) else {
+        return Ok(false);
+    };
+    if estimate_history_tokens(history) <= limit {
+        return Ok(false);
+    }
+
+    let has_system = history.first().is_some_and(|m| m.role == "system");
+    let start = if has_system { 1 } else { 0 };
+    let non_system_count = history.len().saturating_sub(start);
+    if non_system_count <= 1 {
+        return Ok(false);
+    }
+
+    let keep_recent = config.keep_recent_messages.max(1).min(non_system_count);
+    let compact_count = non_system_count.saturating_sub(keep_recent);
+    if compact_count == 0 {
+        return Ok(false);
+    }
+    let compact_end = start + compact_count;
+    let to_compact = history[start..compact_end].to_vec();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    if config.memory_flush {
+        let flush_prompt = format!(
+            "Write a concise memory flush message (max 6 bullets) capturing durable facts, decisions, and unresolved tasks from this history:\n\n{}",
+            build_compaction_transcript(&to_compact)
+        );
+        let flush_note = provider
+            .chat_with_system(
+                Some("You write memory flush notes before context compaction."),
+                &flush_prompt,
+                model,
+                0.1,
+            )
+            .await
+            .unwrap_or_else(|_| "Memory flush fallback: key context retained.".to_string());
+        history.insert(
+            compact_end,
+            ChatMessage::assistant(format!(
+                "[Memory flush at {timestamp}: {}]",
+                truncate_with_ellipsis(&flush_note, MEMORY_FLUSH_MAX_CHARS)
+            )),
+        );
+    }
+
+    let summary = match config.mode {
+        crate::config::AgentCompactionMode::Safeguard => {
+            let prompt = format!(
+                "Summarize this conversation segment into concise context. Preserve decisions, preferences, commitments, unresolved tasks, and key facts.\n\n{}",
+                build_compaction_transcript(&to_compact)
+            );
+            let raw = provider
+                .chat_with_system(
+                    Some("You are a context compaction summarizer."),
+                    &prompt,
+                    model,
+                    0.2,
+                )
+                .await
+                .unwrap_or_else(|_| "Summary unavailable; compacted conservatively.".to_string());
+            truncate_with_ellipsis(&raw, COMPACTION_MAX_SUMMARY_CHARS)
+        }
+        crate::config::AgentCompactionMode::Aggressive => {
+            let mut summary = format!(
+                "Aggressive compaction removed {} older messages; retained {} recent messages.",
+                compact_count, keep_recent
+            );
+            if let Some(last_user) = to_compact.iter().rev().find(|m| m.role == "user") {
+                summary.push_str(" Last preserved user intent: ");
+                summary.push_str(&truncate_with_ellipsis(&last_user.content, 240));
+            }
+            truncate_with_ellipsis(&summary, COMPACTION_MAX_SUMMARY_CHARS)
+        }
+        crate::config::AgentCompactionMode::Off => return Ok(false),
+    };
+
+    history.splice(
+        start..compact_end,
+        std::iter::once(ChatMessage::assistant(format!(
+            "[Context compacted at {timestamp}. Summary: {summary}]"
+        ))),
+    );
+    Ok(true)
 }
 
 /// Extract key facts from messages about to be compacted and store them in memory.
@@ -855,7 +969,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // (e.g., in emails, files, or web pages) could include JSON that mimics a
     // tool call. Tool calls MUST be explicitly wrapped in either:
     // 1. OpenAI-style JSON with a "tool_calls" array
-    // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
+    // 2. OpenPRX tool-call tags (<tool_call>, <toolcall>, <tool-call>)
     // 3. Markdown code blocks with tool_call/toolcall/tool-call language
     // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`)
     // This ensures only the LLM's intentional tool calls are executed.
@@ -980,6 +1094,7 @@ pub(crate) async fn agent_turn(
         "channel",
         multimodal_config,
         max_tool_iterations,
+        None,
         None,
         None,
         None,
@@ -1274,6 +1389,7 @@ pub(crate) async fn run_tool_call_loop(
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    compaction_config: Option<&crate::config::AgentCompactionConfig>,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     scope_ctx: Option<&ScopeContext<'_>>,
@@ -1296,6 +1412,10 @@ pub(crate) async fn run_tool_call_loop(
             .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(ToolLoopCancelled.into());
+        }
+
+        if let Some(config) = compaction_config {
+            let _ = apply_configurable_compaction(history, provider, model, config).await?;
         }
 
         let image_marker_count = multimodal::count_image_markers(history);
@@ -1839,7 +1959,7 @@ pub async fn run(
         ));
         tool_descs.push((
             "arduino_upload",
-            "Upload agent-generated Arduino sketch. Use when: user asks for 'make a heart', 'blink pattern', or custom LED behavior on Arduino. You write the full .ino code; ZeroClaw compiles and uploads it. Pin 13 = built-in LED on Uno.",
+            "Upload agent-generated Arduino sketch. Use when: user asks for 'make a heart', 'blink pattern', or custom LED behavior on Arduino. You write the full .ino code; OpenPRX compiles and uploads it. Pin 13 = built-in LED on Uno.",
         ));
         tool_descs.push((
             "hardware_memory_map",
@@ -1930,6 +2050,7 @@ pub async fn run(
             "cli",
             &config.multimodal,
             config.agent.max_tool_iterations,
+            Some(&config.agent.compaction),
             None,
             None,
             None,
@@ -1957,7 +2078,7 @@ pub async fn run(
                 .await;
         }
     } else {
-        println!("🦀 ZeroClaw Interactive Mode");
+        println!("🦀 OpenPRX Interactive Mode");
         println!("Type /help for commands.\n");
         let cli = crate::channels::CliChannel::new();
 
@@ -2069,6 +2190,7 @@ pub async fn run(
                 "cli",
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                Some(&config.agent.compaction),
                 None,
                 None,
                 None,
@@ -2257,7 +2379,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ));
         tool_descs.push((
             "arduino_upload",
-            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; ZeroClaw uploads it.",
+            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; OpenPRX uploads it.",
         ));
         tool_descs.push((
             "hardware_memory_map",
@@ -2582,6 +2704,7 @@ mod tests {
             3,
             None,
             None,
+            None,
             None, // no scope context
         )
         .await
@@ -2628,6 +2751,7 @@ mod tests {
             3,
             None,
             None,
+            None,
             None, // no scope context
         )
         .await
@@ -2666,6 +2790,7 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            None,
             None,
             None,
             None, // no scope context
@@ -2788,6 +2913,7 @@ mod tests {
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
+            None,
             None,
             None,
             None, // no scope context
@@ -3234,6 +3360,69 @@ Done."#;
         assert!(history[1].content.contains("Compaction summary"));
         assert!(history[2].content.contains("recent 1"));
         assert!(history[3].content.contains("recent 2"));
+    }
+
+    #[test]
+    fn compaction_trigger_limit_respects_reserve_tokens() {
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 100,
+            max_context_tokens: 500,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        assert_eq!(compaction_trigger_limit(&config), Some(400));
+    }
+
+    #[tokio::test]
+    async fn configurable_compaction_safeguard_inserts_summary_marker() {
+        let provider = ScriptedProvider::from_text_responses(vec!["- concise summary"]);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1 ".repeat(120)),
+            ChatMessage::assistant("a1 ".repeat(120)),
+            ChatMessage::user("u2 ".repeat(120)),
+            ChatMessage::assistant("a2 ".repeat(120)),
+        ];
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 1,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 50,
+        };
+        let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config)
+            .await
+            .unwrap();
+        assert!(compacted);
+        assert!(history.iter().any(|msg| {
+            msg.content.contains("[Context compacted at") && msg.content.contains("Summary:")
+        }));
+    }
+
+    #[tokio::test]
+    async fn configurable_compaction_aggressive_adds_memory_flush_note() {
+        let provider = ScriptedProvider::from_text_responses(vec!["flush notes"]);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u ".repeat(150)),
+            ChatMessage::assistant("a ".repeat(150)),
+            ChatMessage::user("u2 ".repeat(150)),
+            ChatMessage::assistant("a2 ".repeat(150)),
+        ];
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Aggressive,
+            reserve_tokens: 1,
+            keep_recent_messages: 1,
+            memory_flush: true,
+            max_context_tokens: 40,
+        };
+        let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config)
+            .await
+            .unwrap();
+        assert!(compacted);
+        assert!(history
+            .iter()
+            .any(|msg| msg.content.contains("[Memory flush at")));
     }
 
     #[test]

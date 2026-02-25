@@ -37,7 +37,7 @@ pub use traits::{
 
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const MAX_API_ERROR_CHARS: usize = 200;
@@ -69,6 +69,11 @@ const QWEN_OAUTH_RESOURCE_URL_ENV: &str = "QWEN_OAUTH_RESOURCE_URL";
 const QWEN_OAUTH_CLIENT_ID_ENV: &str = "QWEN_OAUTH_CLIENT_ID";
 const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
+const CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT: &str = "https://console.anthropic.com/v1/oauth/token";
+const CLAUDE_CODE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_CODE_CREDENTIAL_FILE: &str = ".claude/.credentials.json";
+const CLAUDE_CODE_ACCESS_TOKEN_ENV: &str = "CLAUDE_CODE_ACCESS_TOKEN";
+const CLAUDE_CODE_REFRESH_TOKEN_ENV: &str = "CLAUDE_CODE_REFRESH_TOKEN";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 
@@ -166,6 +171,22 @@ pub(crate) fn is_qianfan_alias(name: &str) -> bool {
     matches!(name, "qianfan" | "baidu")
 }
 
+pub(crate) fn is_claude_code_alias(name: &str) -> bool {
+    matches!(name, "claude-code" | "claude-cli")
+}
+
+pub(crate) fn is_litellm_alias(name: &str) -> bool {
+    matches!(name, "litellm" | "lite-llm")
+}
+
+pub(crate) fn is_vllm_alias(name: &str) -> bool {
+    matches!(name, "vllm" | "v-llm")
+}
+
+pub(crate) fn is_huggingface_alias(name: &str) -> bool {
+    matches!(name, "huggingface" | "hf" | "hf-inference")
+}
+
 #[derive(Clone, Copy, Debug)]
 enum MinimaxOauthRegion {
     Global,
@@ -242,6 +263,71 @@ struct QwenOauthTokenResponse {
     error_description: Option<String>,
 }
 
+#[derive(Clone, Deserialize, Serialize, Default)]
+struct ClaudeCodeCredentials {
+    #[serde(rename = "accessToken", default)]
+    access_token: Option<String>,
+    #[serde(rename = "refreshToken", default)]
+    refresh_token: Option<String>,
+    #[serde(rename = "expiresAt", default)]
+    expires_at: Option<i64>,
+    #[serde(rename = "subscriptionType", default)]
+    subscription_type: Option<String>,
+}
+
+impl std::fmt::Debug for ClaudeCodeCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaudeCodeCredentials")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("subscription_type", &self.subscription_type)
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ClaudeCodeCredentialsFile {
+    #[serde(rename = "claudeAiOauth", default)]
+    claude_ai_oauth: Option<ClaudeCodeCredentials>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeCodeOauthTokenResponse {
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct ClaudeCodeProviderContext {
+    credential: Option<String>,
+}
+
+impl std::fmt::Debug for ClaudeCodeProviderContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaudeCodeProviderContext")
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
 #[derive(Clone, Default)]
 struct QwenOauthProviderContext {
     credential: Option<String>,
@@ -307,6 +393,13 @@ fn qwen_oauth_credentials_file_path() -> Option<PathBuf> {
         .map(|home| home.join(QWEN_OAUTH_CREDENTIAL_FILE))
 }
 
+fn claude_code_credentials_file_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .map(|home| home.join(CLAUDE_CODE_CREDENTIAL_FILE))
+}
+
 fn normalize_qwen_oauth_base_url(raw: &str) -> Option<String> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -333,6 +426,77 @@ fn read_qwen_oauth_cached_credentials() -> Option<QwenOauthCredentials> {
     serde_json::from_str::<QwenOauthCredentials>(&content).ok()
 }
 
+fn read_claude_code_cached_credentials() -> Option<ClaudeCodeCredentials> {
+    let path = claude_code_credentials_file_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let parsed = serde_json::from_str::<ClaudeCodeCredentialsFile>(&content).ok()?;
+    parsed.claude_ai_oauth
+}
+
+fn write_claude_code_cached_credentials(credentials: &ClaudeCodeCredentials) -> anyhow::Result<()> {
+    let Some(path) = claude_code_credentials_file_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut root = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Claude credentials root must be an object"))?;
+
+    if !root_obj
+        .get("claudeAiOauth")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        root_obj.insert("claudeAiOauth".to_string(), serde_json::json!({}));
+    }
+    let oauth_obj = root_obj
+        .get_mut("claudeAiOauth")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("claudeAiOauth must be an object"))?;
+
+    if let Some(access_token) = credentials
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        oauth_obj.insert("accessToken".to_string(), serde_json::json!(access_token));
+    }
+    if let Some(refresh_token) = credentials
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        oauth_obj.insert("refreshToken".to_string(), serde_json::json!(refresh_token));
+    }
+    if let Some(expires_at) = credentials.expires_at {
+        oauth_obj.insert("expiresAt".to_string(), serde_json::json!(expires_at));
+    }
+    if let Some(subscription_type) = credentials
+        .subscription_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        oauth_obj.insert(
+            "subscriptionType".to_string(),
+            serde_json::json!(subscription_type),
+        );
+    }
+
+    let serialized = serde_json::to_string(&root)?;
+    std::fs::write(path, serialized)?;
+    Ok(())
+}
+
 fn normalized_qwen_expiry_millis(raw: i64) -> i64 {
     if raw < 10_000_000_000 {
         raw.saturating_mul(1000)
@@ -354,6 +518,20 @@ fn qwen_oauth_token_expired(credentials: &QwenOauthCredentials) -> bool {
         .unwrap_or(i64::MAX);
 
     expiry_millis <= now_millis.saturating_add(30_000)
+}
+
+fn claude_code_token_expired(credentials: &ClaudeCodeCredentials) -> bool {
+    let Some(expires_at) = credentials.expires_at else {
+        return false;
+    };
+
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX);
+
+    expires_at <= now_millis.saturating_add(300_000)
 }
 
 fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOauthCredentials> {
@@ -441,6 +619,86 @@ fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOa
     })
 }
 
+fn refresh_claude_code_access_token(refresh_token: &str) -> anyhow::Result<ClaudeCodeCredentials> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+
+    // TODO: Verify this endpoint against official Anthropic OAuth docs/source if it changes.
+    let response = client
+        .post(CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", CLAUDE_CODE_OAUTH_CLIENT_ID),
+        ])
+        .send()
+        .map_err(|error| anyhow::anyhow!("Claude Code OAuth refresh request failed: {error}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .unwrap_or_else(|_| "<failed to read Claude Code OAuth response body>".to_string());
+    let parsed = serde_json::from_str::<ClaudeCodeOauthTokenResponse>(&body).ok();
+
+    if !status.is_success() {
+        let detail = parsed
+            .as_ref()
+            .and_then(|payload| payload.error_description.as_deref())
+            .or_else(|| parsed.as_ref().and_then(|payload| payload.error.as_deref()))
+            .filter(|msg| !msg.trim().is_empty())
+            .unwrap_or(body.as_str());
+        anyhow::bail!("Claude Code OAuth refresh failed (HTTP {status}): {detail}");
+    }
+
+    let payload =
+        parsed.ok_or_else(|| anyhow::anyhow!("Claude Code OAuth refresh response is not JSON"))?;
+
+    if let Some(error_code) = payload
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let detail = payload.error_description.as_deref().unwrap_or(error_code);
+        anyhow::bail!("Claude Code OAuth refresh failed: {detail}");
+    }
+
+    let access_token = payload
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Claude Code OAuth refresh response missing access_token"))?
+        .to_string();
+
+    let expires_at = payload.expires_in.and_then(|seconds| {
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok())?;
+        seconds
+            .checked_mul(1000)
+            .and_then(|duration_millis| now_millis.checked_add(duration_millis))
+    });
+
+    Ok(ClaudeCodeCredentials {
+        access_token: Some(access_token),
+        refresh_token: payload
+            .refresh_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(ToString::to_string),
+        expires_at,
+        subscription_type: None,
+    })
+}
+
 fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthProviderContext {
     let override_value = credential_override
         .map(str::trim)
@@ -519,6 +777,91 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
     QwenOauthProviderContext {
         credential,
         base_url,
+    }
+}
+
+fn is_claude_code_oauth_placeholder(value: &str) -> bool {
+    is_claude_code_alias(value)
+}
+
+fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeProviderContext {
+    let override_value = credential_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let placeholder_requested = override_value
+        .map(is_claude_code_oauth_placeholder)
+        .unwrap_or(false);
+
+    if let Some(explicit) = override_value {
+        if !placeholder_requested {
+            return ClaudeCodeProviderContext {
+                credential: Some(explicit.to_string()),
+            };
+        }
+    }
+
+    let env_access_token = read_non_empty_env(CLAUDE_CODE_ACCESS_TOKEN_ENV);
+    let env_refresh_token = read_non_empty_env(CLAUDE_CODE_REFRESH_TOKEN_ENV);
+    let mut cached = if env_access_token.is_some() || env_refresh_token.is_some() {
+        None
+    } else {
+        read_claude_code_cached_credentials()
+    };
+
+    if env_access_token.is_none() {
+        let refresh_token = env_refresh_token.clone().or_else(|| {
+            cached
+                .as_ref()
+                .and_then(|credentials| credentials.refresh_token.clone())
+        });
+        let should_refresh = cached.as_ref().is_some_and(claude_code_token_expired)
+            || cached
+                .as_ref()
+                .and_then(|credentials| credentials.access_token.as_deref())
+                .is_none_or(|token| token.trim().is_empty());
+
+        if should_refresh {
+            if let Some(refresh_token) = refresh_token.as_deref() {
+                match refresh_claude_code_access_token(refresh_token) {
+                    Ok(mut refreshed) => {
+                        if refreshed.refresh_token.is_none() {
+                            refreshed.refresh_token = Some(refresh_token.to_string());
+                        }
+                        if refreshed.subscription_type.is_none() {
+                            refreshed.subscription_type = cached
+                                .as_ref()
+                                .and_then(|credentials| credentials.subscription_type.clone());
+                        }
+                        if let Err(error) = write_claude_code_cached_credentials(&refreshed) {
+                            tracing::warn!(error = %error, "Failed to write Claude Code credentials");
+                        }
+                        cached = Some(refreshed);
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Claude Code OAuth refresh failed");
+                    }
+                }
+            }
+        }
+    }
+
+    let credential = env_access_token
+        .or_else(|| {
+            cached
+                .as_ref()
+                .and_then(|credentials| credentials.access_token.clone())
+        })
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string);
+
+    ClaudeCodeProviderContext {
+        credential: if placeholder_requested {
+            credential
+        } else {
+            credential.or_else(|| read_non_empty_env("ANTHROPIC_OAUTH_TOKEN"))
+        },
     }
 }
 
@@ -843,6 +1186,16 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
+        name if is_claude_code_alias(name) => {
+            vec![
+                CLAUDE_CODE_ACCESS_TOKEN_ENV,
+                "ANTHROPIC_OAUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+            ]
+        }
+        name if is_litellm_alias(name) => vec!["LITELLM_API_KEY"],
+        name if is_vllm_alias(name) => vec!["VLLM_API_KEY"],
+        name if is_huggingface_alias(name) => vec!["HF_TOKEN", "HUGGINGFACE_API_KEY"],
         _ => vec![],
     };
 
@@ -937,12 +1290,39 @@ fn create_provider_with_url_and_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let qwen_oauth_context = is_qwen_oauth_alias(name).then(|| resolve_qwen_oauth_context(api_key));
+    let claude_code_placeholder_requested = api_key
+        .map(str::trim)
+        .is_some_and(is_claude_code_oauth_placeholder);
+    let claude_code_context = if is_claude_code_alias(name) {
+        Some(resolve_claude_code_context(api_key))
+    } else if name == "anthropic" {
+        if api_key.is_none() || claude_code_placeholder_requested {
+            Some(resolve_claude_code_context(api_key))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Resolve credential and break static-analysis taint chain from the
     // `api_key` parameter so that downstream provider storage of the value
     // is not linked to the original sensitive-named source.
     let resolved_credential = if let Some(context) = qwen_oauth_context.as_ref() {
         context.credential.clone()
+    } else if let Some(context) = claude_code_context.as_ref() {
+        let fallback_override = if claude_code_placeholder_requested {
+            None
+        } else {
+            api_key
+        };
+        context.credential.clone().or_else(|| {
+            if is_claude_code_alias(name) {
+                resolve_provider_credential("anthropic", fallback_override)
+            } else {
+                resolve_provider_credential(name, fallback_override)
+            }
+        })
     } else {
         resolve_provider_credential(name, api_key)
     }
@@ -953,6 +1333,7 @@ fn create_provider_with_url_and_options(
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
+        name if is_claude_code_alias(name) => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
@@ -1101,6 +1482,36 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
             )))
         }
+        name if is_litellm_alias(name) => {
+            let base = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:4000");
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "LiteLLM",
+                base,
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
+        name if is_vllm_alias(name) => {
+            let base = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:8000/v1");
+            Ok(Box::new(OpenAiCompatibleProvider::new(
+                "vLLM",
+                base,
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
+        name if is_huggingface_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Hugging Face",
+            "https://api-inference.huggingface.co/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(
             OpenAiCompatibleProvider::new(
                 "NVIDIA NIM",
@@ -1357,7 +1768,7 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         ProviderInfo {
             name: "anthropic",
             display_name: "Anthropic",
-            aliases: &[],
+            aliases: &["claude-code", "claude-cli"],
             local: false,
         },
         ProviderInfo {
@@ -1549,6 +1960,24 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: true,
         },
         ProviderInfo {
+            name: "litellm",
+            display_name: "LiteLLM",
+            aliases: &["lite-llm"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "vllm",
+            display_name: "vLLM",
+            aliases: &["v-llm"],
+            local: true,
+        },
+        ProviderInfo {
+            name: "huggingface",
+            display_name: "Hugging Face Inference",
+            aliases: &["hf", "hf-inference"],
+            local: false,
+        },
+        ProviderInfo {
             name: "nvidia",
             display_name: "NVIDIA NIM",
             aliases: &["nvidia-nim", "build.nvidia.com"],
@@ -1659,6 +2088,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_provider_credential_supports_litellm_env() {
+        let _env_lock = env_lock();
+        let _litellm_guard = EnvGuard::set("LITELLM_API_KEY", Some("litellm-key"));
+        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
+
+        let resolved = resolve_provider_credential("litellm", None);
+        assert_eq!(resolved.as_deref(), Some("litellm-key"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_supports_optional_vllm_env() {
+        let _env_lock = env_lock();
+        let _vllm_guard = EnvGuard::set("VLLM_API_KEY", Some("vllm-key"));
+        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
+
+        let resolved = resolve_provider_credential("vllm", None);
+        assert_eq!(resolved.as_deref(), Some("vllm-key"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_huggingface_prefers_hf_token() {
+        let _env_lock = env_lock();
+        let _hf_token_guard = EnvGuard::set("HF_TOKEN", Some("hf-token"));
+        let _hf_api_key_guard = EnvGuard::set("HUGGINGFACE_API_KEY", Some("hf-api-key"));
+        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
+
+        let resolved = resolve_provider_credential("hf", None);
+        assert_eq!(resolved.as_deref(), Some("hf-token"));
+    }
+
+    #[test]
     fn resolve_qwen_oauth_context_prefers_explicit_override() {
         let _env_lock = env_lock();
         let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}", std::process::id());
@@ -1744,6 +2204,82 @@ mod tests {
     }
 
     #[test]
+    fn resolve_claude_code_context_prefers_explicit_override() {
+        let _env_lock = env_lock();
+        let fake_home = format!("/tmp/zeroclaw-claude-oauth-home-{}", std::process::id());
+        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, Some("oauth-token"));
+        let _refresh_guard = EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, Some("oauth-refresh"));
+        let _anthropic_oauth_guard =
+            EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
+
+        let context = resolve_claude_code_context(Some("  explicit-claude-token  "));
+
+        assert_eq!(context.credential.as_deref(), Some("explicit-claude-token"));
+    }
+
+    #[test]
+    fn resolve_claude_code_context_uses_env_access_token_before_file() {
+        let _env_lock = env_lock();
+        let fake_home = format!("/tmp/zeroclaw-claude-oauth-home-{}-env", std::process::id());
+        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, Some("env-access-token"));
+        let _refresh_guard =
+            EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, Some("env-refresh-token"));
+        let _anthropic_oauth_guard =
+            EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
+
+        let context = resolve_claude_code_context(Some("claude-code"));
+
+        assert_eq!(context.credential.as_deref(), Some("env-access-token"));
+    }
+
+    #[test]
+    fn resolve_claude_code_context_reads_cached_credentials_file() {
+        let _env_lock = env_lock();
+        let fake_home = format!(
+            "/tmp/zeroclaw-claude-oauth-home-{}-file",
+            std::process::id()
+        );
+        let creds_dir = PathBuf::from(&fake_home).join(".claude");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        let creds_path = creds_dir.join(".credentials.json");
+        std::fs::write(
+            &creds_path,
+            r#"{"claudeAiOauth":{"accessToken":"cached-token","refreshToken":"cached-refresh","expiresAt":4102444800000,"subscriptionType":"max","scopes":["org:create_api_key"]}}"#,
+        )
+        .unwrap();
+
+        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, None);
+        let _refresh_guard = EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, None);
+        let _anthropic_oauth_guard = EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", None);
+
+        let context = resolve_claude_code_context(Some("claude-code"));
+
+        assert_eq!(context.credential.as_deref(), Some("cached-token"));
+    }
+
+    #[test]
+    fn resolve_claude_code_context_placeholder_does_not_use_anthropic_oauth_fallback() {
+        let _env_lock = env_lock();
+        let fake_home = format!(
+            "/tmp/zeroclaw-claude-oauth-home-{}-placeholder",
+            std::process::id()
+        );
+        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, None);
+        let _refresh_guard = EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, None);
+        let _anthropic_oauth_guard =
+            EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
+        let _anthropic_api_guard = EnvGuard::set("ANTHROPIC_API_KEY", Some("anthropic-api-key"));
+
+        let context = resolve_claude_code_context(Some("claude-code"));
+
+        assert!(context.credential.is_none());
+    }
+
+    #[test]
     fn regional_alias_predicates_cover_expected_variants() {
         assert!(is_moonshot_alias("moonshot"));
         assert!(is_moonshot_alias("kimi-global"));
@@ -1758,16 +2294,29 @@ mod tests {
         assert!(is_qwen_alias("qwen-code"));
         assert!(is_qwen_oauth_alias("qwen-code"));
         assert!(is_qwen_oauth_alias("qwen_oauth"));
+        assert!(is_claude_code_alias("claude-code"));
+        assert!(is_claude_code_alias("claude-cli"));
         assert!(is_zai_alias("z.ai"));
         assert!(is_zai_alias("zai-cn"));
         assert!(is_qianfan_alias("qianfan"));
         assert!(is_qianfan_alias("baidu"));
+        assert!(is_litellm_alias("litellm"));
+        assert!(is_litellm_alias("lite-llm"));
+        assert!(is_vllm_alias("vllm"));
+        assert!(is_vllm_alias("v-llm"));
+        assert!(is_huggingface_alias("huggingface"));
+        assert!(is_huggingface_alias("hf"));
+        assert!(is_huggingface_alias("hf-inference"));
 
         assert!(!is_moonshot_alias("openrouter"));
         assert!(!is_glm_alias("openai"));
         assert!(!is_qwen_alias("gemini"));
+        assert!(!is_claude_code_alias("anthropic"));
         assert!(!is_zai_alias("anthropic"));
         assert!(!is_qianfan_alias("cohere"));
+        assert!(!is_litellm_alias("lite"));
+        assert!(!is_vllm_alias("vllm-local"));
+        assert!(!is_huggingface_alias("hugging-face"));
     }
 
     #[test]
@@ -1986,6 +2535,33 @@ mod tests {
         assert!(create_provider("llamacpp", Some("key")).is_ok());
         assert!(create_provider("llama.cpp", Some("key")).is_ok());
         assert!(create_provider("llamacpp", None).is_ok());
+    }
+
+    #[test]
+    fn factory_litellm() {
+        assert!(create_provider("litellm", Some("key")).is_ok());
+        assert!(create_provider("lite-llm", Some("key")).is_ok());
+        assert!(create_provider("litellm", None).is_ok());
+        assert!(
+            create_provider_with_url("litellm", Some("key"), Some("http://127.0.0.1:4001")).is_ok()
+        );
+    }
+
+    #[test]
+    fn factory_vllm() {
+        assert!(create_provider("vllm", Some("key")).is_ok());
+        assert!(create_provider("v-llm", Some("key")).is_ok());
+        assert!(create_provider("vllm", None).is_ok());
+        assert!(
+            create_provider_with_url("vllm", Some("key"), Some("http://127.0.0.1:9000/v1")).is_ok()
+        );
+    }
+
+    #[test]
+    fn factory_huggingface() {
+        assert!(create_provider("huggingface", Some("key")).is_ok());
+        assert!(create_provider("hf", Some("key")).is_ok());
+        assert!(create_provider("hf-inference", Some("key")).is_ok());
     }
 
     // ── Extended ecosystem ───────────────────────────────────
@@ -2337,6 +2913,9 @@ mod tests {
             "qwen-code",
             "lmstudio",
             "llamacpp",
+            "litellm",
+            "vllm",
+            "huggingface",
             "groq",
             "mistral",
             "xai",

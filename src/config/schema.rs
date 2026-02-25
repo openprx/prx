@@ -49,9 +49,11 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 // ── Top-level config ──────────────────────────────────────────────
 
-/// Top-level ZeroClaw configuration, loaded from `config.toml`.
+/// Top-level OpenPRX configuration, loaded from `config.toml`.
 ///
-/// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
+/// Resolution order: `OPENPRX_WORKSPACE`/`ZEROCLAW_WORKSPACE` env
+/// → `active_workspace.toml` marker
+/// → `~/.openprx/config.toml` (fallback `~/.zeroclaw/config.toml`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
     /// Workspace directory - computed from home, not serialized
@@ -60,7 +62,7 @@ pub struct Config {
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
     pub config_path: PathBuf,
-    /// API key for the selected provider. Overridden by `ZEROCLAW_API_KEY` or `API_KEY` env vars.
+    /// API key for the selected provider. Overridden by `OPENPRX_API_KEY`, `ZEROCLAW_API_KEY`, or `API_KEY` env vars.
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
@@ -515,6 +517,54 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Context compaction controls (`[agent.compaction]`).
+    #[serde(default)]
+    pub compaction: AgentCompactionConfig,
+}
+
+/// Compaction mode for long conversation contexts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentCompactionMode {
+    /// Disable proactive compaction.
+    Off,
+    /// Conservative compaction that prefers summary replacement.
+    #[default]
+    Safeguard,
+    /// Aggressive truncation mode for tighter contexts.
+    Aggressive,
+}
+
+/// Agent context compaction configuration (`[agent.compaction]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentCompactionConfig {
+    /// Compaction strategy (`off`, `safeguard`, `aggressive`).
+    #[serde(default)]
+    pub mode: AgentCompactionMode,
+    /// Tokens reserved for the next model response.
+    #[serde(default = "default_agent_compaction_reserve_tokens")]
+    pub reserve_tokens: usize,
+    /// Number of recent non-system messages to keep after compaction.
+    #[serde(default = "default_agent_compaction_keep_recent_messages")]
+    pub keep_recent_messages: usize,
+    /// Run memory flush extraction before compacting.
+    #[serde(default = "default_true")]
+    pub memory_flush: bool,
+    /// Token threshold that triggers compaction.
+    #[serde(default = "default_agent_compaction_max_context_tokens")]
+    pub max_context_tokens: usize,
+}
+
+impl Default for AgentCompactionConfig {
+    fn default() -> Self {
+        Self {
+            mode: AgentCompactionMode::Safeguard,
+            reserve_tokens: default_agent_compaction_reserve_tokens(),
+            keep_recent_messages: default_agent_compaction_keep_recent_messages(),
+            memory_flush: true,
+            max_context_tokens: default_agent_compaction_max_context_tokens(),
+        }
+    }
 }
 
 /// Sessions spawn configuration (`[sessions_spawn]` section).
@@ -531,6 +581,15 @@ pub struct SessionsSpawnConfig {
     /// Remove worker workspace directory after process-mode completion.
     #[serde(default = "default_sessions_spawn_cleanup_on_complete")]
     pub cleanup_on_complete: bool,
+    /// Maximum concurrent running sub-agent processes/tasks globally.
+    #[serde(default = "default_sessions_spawn_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Maximum nested spawn depth (`sessions_spawn` from a spawned sub-agent).
+    #[serde(default = "default_sessions_spawn_max_spawn_depth")]
+    pub max_spawn_depth: usize,
+    /// Maximum concurrent child runs allowed per parent session.
+    #[serde(default = "default_sessions_spawn_max_children_per_agent")]
+    pub max_children_per_agent: usize,
 }
 
 impl Default for SessionsSpawnConfig {
@@ -539,6 +598,9 @@ impl Default for SessionsSpawnConfig {
             default_mode: default_sessions_spawn_mode(),
             worker_workspace_root: None,
             cleanup_on_complete: default_sessions_spawn_cleanup_on_complete(),
+            max_concurrent: default_sessions_spawn_max_concurrent(),
+            max_spawn_depth: default_sessions_spawn_max_spawn_depth(),
+            max_children_per_agent: default_sessions_spawn_max_children_per_agent(),
         }
     }
 }
@@ -549,6 +611,18 @@ fn default_sessions_spawn_mode() -> String {
 
 fn default_sessions_spawn_cleanup_on_complete() -> bool {
     true
+}
+
+fn default_sessions_spawn_max_concurrent() -> usize {
+    4
+}
+
+fn default_sessions_spawn_max_spawn_depth() -> usize {
+    2
+}
+
+fn default_sessions_spawn_max_children_per_agent() -> usize {
+    5
 }
 
 /// Self-system experimental automation config (`[self_system]`).
@@ -591,6 +665,18 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_agent_compaction_reserve_tokens() -> usize {
+    4096
+}
+
+fn default_agent_compaction_keep_recent_messages() -> usize {
+    12
+}
+
+fn default_agent_compaction_max_context_tokens() -> usize {
+    128_000
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -599,6 +685,7 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            compaction: AgentCompactionConfig::default(),
         }
     }
 }
@@ -1025,6 +1112,9 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+    /// Request timeout in seconds for gateway HTTP handlers.
+    #[serde(default = "default_gateway_request_timeout_secs")]
+    pub request_timeout_secs: u64,
 }
 
 fn default_gateway_port() -> u16 {
@@ -1055,6 +1145,10 @@ fn default_gateway_idempotency_max_keys() -> usize {
     10_000
 }
 
+fn default_gateway_request_timeout_secs() -> u64 {
+    60
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1073,6 +1167,7 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            request_timeout_secs: default_gateway_request_timeout_secs(),
         }
     }
 }
@@ -2677,6 +2772,13 @@ pub struct HeartbeatConfig {
     pub enabled: bool,
     /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
+    /// Inclusive active hour window `[start_hour, end_hour]` in local time.
+    /// Heartbeat ticks outside this range are skipped.
+    #[serde(default = "default_heartbeat_active_hours")]
+    pub active_hours: Vec<u8>,
+    /// Prompt used by heartbeat worker when dispatching tasks.
+    #[serde(default = "default_heartbeat_prompt")]
+    pub prompt: String,
 }
 
 impl Default for HeartbeatConfig {
@@ -2684,8 +2786,46 @@ impl Default for HeartbeatConfig {
         Self {
             enabled: false,
             interval_minutes: 30,
+            active_hours: default_heartbeat_active_hours(),
+            prompt: default_heartbeat_prompt(),
         }
     }
+}
+
+fn default_heartbeat_active_hours() -> Vec<u8> {
+    vec![8, 23]
+}
+
+fn default_heartbeat_prompt() -> String {
+    "Check HEARTBEAT.md and follow instructions.".to_string()
+}
+
+/// Policy for direct-message handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DmPolicy {
+    /// Future pairing handshake flow (placeholder, currently deny-by-default).
+    Pairing,
+    /// Accept only senders listed in `allowed_from`.
+    #[default]
+    Allowlist,
+    /// Accept any direct sender.
+    Open,
+    /// Ignore direct messages.
+    Disabled,
+}
+
+/// Policy for group-message handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupPolicy {
+    /// Accept only groups listed in `group_allow_from`.
+    #[default]
+    Allowlist,
+    /// Accept any group.
+    Open,
+    /// Ignore group messages.
+    Disabled,
 }
 
 // ── Cron ────────────────────────────────────────────────────────
@@ -3040,10 +3180,26 @@ pub struct SignalConfig {
     /// Skip incoming story messages.
     #[serde(default)]
     pub ignore_stories: bool,
+    /// Startup readiness timeout in milliseconds for native `signal-cli` daemon mode.
+    #[serde(default = "default_signal_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    /// Direct-message policy.
+    #[serde(default)]
+    pub dm_policy: DmPolicy,
+    /// Group-message policy.
+    #[serde(default)]
+    pub group_policy: GroupPolicy,
+    /// Allowlisted group IDs used when `group_policy = "allowlist"`.
+    #[serde(default)]
+    pub group_allow_from: Vec<String>,
 }
 
 fn default_signal_http_url() -> String {
     "http://localhost:8080".to_string()
+}
+
+fn default_signal_startup_timeout_ms() -> u64 {
+    30_000
 }
 
 impl Default for SignalConfig {
@@ -3060,6 +3216,10 @@ impl Default for SignalConfig {
             allowed_from: Vec::new(),
             ignore_attachments: false,
             ignore_stories: false,
+            startup_timeout_ms: default_signal_startup_timeout_ms(),
+            dm_policy: DmPolicy::default(),
+            group_policy: GroupPolicy::default(),
+            group_allow_from: Vec::new(),
         }
     }
 }
@@ -3117,8 +3277,17 @@ pub struct WhatsAppConfig {
     #[serde(default)]
     pub pair_code: Option<String>,
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
-    #[serde(default)]
+    #[serde(default, alias = "allowed_from")]
     pub allowed_numbers: Vec<String>,
+    /// Direct-message policy.
+    #[serde(default)]
+    pub dm_policy: DmPolicy,
+    /// Group-message policy.
+    #[serde(default)]
+    pub group_policy: GroupPolicy,
+    /// Allowlisted group IDs used when `group_policy = "allowlist"`.
+    #[serde(default)]
+    pub group_allow_from: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3561,7 +3730,7 @@ impl Default for Config {
     fn default() -> Self {
         let home =
             UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
-        let zeroclaw_dir = home.join(".zeroclaw");
+        let zeroclaw_dir = preferred_user_config_dir(&home);
 
         Self {
             workspace_dir: zeroclaw_dir.join("workspace"),
@@ -3619,6 +3788,8 @@ fn default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
 }
 
 const ACTIVE_WORKSPACE_STATE_FILE: &str = "active_workspace.toml";
+const PRIMARY_CONFIG_DIR_NAME: &str = ".openprx";
+const LEGACY_CONFIG_DIR_NAME: &str = ".zeroclaw";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ActiveWorkspaceState {
@@ -3629,7 +3800,21 @@ fn default_config_dir() -> Result<PathBuf> {
     let home = UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
-    Ok(home.join(".zeroclaw"))
+    Ok(preferred_user_config_dir(&home))
+}
+
+fn preferred_user_config_dir(home: &Path) -> PathBuf {
+    let primary = home.join(PRIMARY_CONFIG_DIR_NAME);
+    if primary.exists() {
+        return primary;
+    }
+
+    let legacy = home.join(LEGACY_CONFIG_DIR_NAME);
+    if legacy.exists() {
+        return legacy;
+    }
+
+    primary
 }
 
 fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
@@ -3747,19 +3932,24 @@ fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) 
         );
     }
 
-    let legacy_config_dir = workspace_dir
-        .parent()
-        .map(|parent| parent.join(".zeroclaw"));
-    if let Some(legacy_dir) = legacy_config_dir {
-        if legacy_dir.join("config.toml").exists() {
-            return (legacy_dir, workspace_config_dir);
+    let legacy_candidates = workspace_dir.parent().map(|parent| {
+        [
+            parent.join(PRIMARY_CONFIG_DIR_NAME),
+            parent.join(LEGACY_CONFIG_DIR_NAME),
+        ]
+    });
+    if let Some(candidates) = legacy_candidates {
+        for legacy_dir in &candidates {
+            if legacy_dir.join("config.toml").exists() {
+                return (legacy_dir.clone(), workspace_config_dir);
+            }
         }
 
         if workspace_dir
             .file_name()
             .is_some_and(|name| name == std::ffi::OsStr::new("workspace"))
         {
-            return (legacy_dir, workspace_config_dir);
+            return (candidates[0].clone(), workspace_config_dir);
         }
     }
 
@@ -3780,19 +3970,24 @@ enum ConfigResolutionSource {
 impl ConfigResolutionSource {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::EnvConfigDir => "ZEROCLAW_CONFIG_DIR",
-            Self::EnvWorkspace => "ZEROCLAW_WORKSPACE",
+            Self::EnvConfigDir => "OPENPRX_CONFIG_DIR/ZEROCLAW_CONFIG_DIR",
+            Self::EnvWorkspace => "OPENPRX_WORKSPACE/ZEROCLAW_WORKSPACE",
             Self::ActiveWorkspaceMarker => "active_workspace.toml",
             Self::DefaultConfigDir => "default",
         }
     }
 }
 
+fn env_openprx_or_zeroclaw(name_suffix: &str) -> std::result::Result<String, std::env::VarError> {
+    std::env::var(format!("OPENPRX_{name_suffix}"))
+        .or_else(|_| std::env::var(format!("ZEROCLAW_{name_suffix}")))
+}
+
 async fn resolve_runtime_config_dirs(
     default_zeroclaw_dir: &Path,
     default_workspace_dir: &Path,
 ) -> Result<(PathBuf, PathBuf, ConfigResolutionSource)> {
-    if let Ok(custom_config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+    if let Ok(custom_config_dir) = env_openprx_or_zeroclaw("CONFIG_DIR") {
         let custom_config_dir = custom_config_dir.trim();
         if !custom_config_dir.is_empty() {
             let zeroclaw_dir = PathBuf::from(custom_config_dir);
@@ -3804,7 +3999,7 @@ async fn resolve_runtime_config_dirs(
         }
     }
 
-    if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+    if let Ok(custom_workspace) = env_openprx_or_zeroclaw("WORKSPACE") {
         if !custom_workspace.is_empty() {
             let (zeroclaw_dir, workspace_dir) =
                 resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
@@ -4061,7 +4256,7 @@ impl Config {
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
         // API Key: ZEROCLAW_API_KEY or API_KEY (generic)
-        if let Ok(key) = std::env::var("ZEROCLAW_API_KEY").or_else(|_| std::env::var("API_KEY")) {
+        if let Ok(key) = env_openprx_or_zeroclaw("API_KEY").or_else(|_| std::env::var("API_KEY")) {
             if !key.is_empty() {
                 self.api_key = Some(key);
             }
@@ -4089,7 +4284,7 @@ impl Config {
         // 2) Legacy PROVIDER is only honored when config still uses the
         //    default provider (openrouter) or provider is unset. This prevents
         //    container defaults from overriding explicit custom providers.
-        if let Ok(provider) = std::env::var("ZEROCLAW_PROVIDER") {
+        if let Ok(provider) = env_openprx_or_zeroclaw("PROVIDER") {
             if !provider.is_empty() {
                 self.default_provider = Some(provider);
             }
@@ -4104,14 +4299,14 @@ impl Config {
         }
 
         // Model: ZEROCLAW_MODEL or MODEL
-        if let Ok(model) = std::env::var("ZEROCLAW_MODEL").or_else(|_| std::env::var("MODEL")) {
+        if let Ok(model) = env_openprx_or_zeroclaw("MODEL").or_else(|_| std::env::var("MODEL")) {
             if !model.is_empty() {
                 self.default_model = Some(model);
             }
         }
 
         // Workspace directory: ZEROCLAW_WORKSPACE
-        if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+        if let Ok(workspace) = env_openprx_or_zeroclaw("WORKSPACE") {
             if !workspace.is_empty() {
                 let (_, workspace_dir) =
                     resolve_config_dir_for_workspace(&PathBuf::from(workspace));
@@ -4120,7 +4315,7 @@ impl Config {
         }
 
         // Open-skills opt-in flag: ZEROCLAW_OPEN_SKILLS_ENABLED
-        if let Ok(flag) = std::env::var("ZEROCLAW_OPEN_SKILLS_ENABLED") {
+        if let Ok(flag) = env_openprx_or_zeroclaw("OPEN_SKILLS_ENABLED") {
             if !flag.trim().is_empty() {
                 match flag.trim().to_ascii_lowercase().as_str() {
                     "1" | "true" | "yes" | "on" => self.skills.open_skills_enabled = true,
@@ -4133,7 +4328,7 @@ impl Config {
         }
 
         // Open-skills directory override: ZEROCLAW_OPEN_SKILLS_DIR
-        if let Ok(path) = std::env::var("ZEROCLAW_OPEN_SKILLS_DIR") {
+        if let Ok(path) = env_openprx_or_zeroclaw("OPEN_SKILLS_DIR") {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 self.skills.open_skills_dir = Some(trimmed.to_string());
@@ -4141,7 +4336,7 @@ impl Config {
         }
 
         // OpenClaw skills opt-in flag: ZEROCLAW_OPENCLAW_SKILLS_ENABLED
-        if let Ok(flag) = std::env::var("ZEROCLAW_OPENCLAW_SKILLS_ENABLED") {
+        if let Ok(flag) = env_openprx_or_zeroclaw("OPENCLAW_SKILLS_ENABLED") {
             if !flag.trim().is_empty() {
                 match flag.trim().to_ascii_lowercase().as_str() {
                     "1" | "true" | "yes" | "on" => self.skills.openclaw_skills_enabled = true,
@@ -4154,7 +4349,7 @@ impl Config {
         }
 
         // OpenClaw skills directory override: ZEROCLAW_OPENCLAW_SKILLS_DIR
-        if let Ok(path) = std::env::var("ZEROCLAW_OPENCLAW_SKILLS_DIR") {
+        if let Ok(path) = env_openprx_or_zeroclaw("OPENCLAW_SKILLS_DIR") {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 self.skills.openclaw_skills_dir = Some(trimmed.to_string());
@@ -4163,7 +4358,7 @@ impl Config {
 
         // Gateway port: ZEROCLAW_GATEWAY_PORT or PORT
         if let Ok(port_str) =
-            std::env::var("ZEROCLAW_GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
+            env_openprx_or_zeroclaw("GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
         {
             if let Ok(port) = port_str.parse::<u16>() {
                 self.gateway.port = port;
@@ -4171,7 +4366,7 @@ impl Config {
         }
 
         // Gateway host: ZEROCLAW_GATEWAY_HOST or HOST
-        if let Ok(host) = std::env::var("ZEROCLAW_GATEWAY_HOST").or_else(|_| std::env::var("HOST"))
+        if let Ok(host) = env_openprx_or_zeroclaw("GATEWAY_HOST").or_else(|_| std::env::var("HOST"))
         {
             if !host.is_empty() {
                 self.gateway.host = host;
@@ -4179,12 +4374,12 @@ impl Config {
         }
 
         // Allow public bind: ZEROCLAW_ALLOW_PUBLIC_BIND
-        if let Ok(val) = std::env::var("ZEROCLAW_ALLOW_PUBLIC_BIND") {
+        if let Ok(val) = env_openprx_or_zeroclaw("ALLOW_PUBLIC_BIND") {
             self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
         }
 
         // Temperature: ZEROCLAW_TEMPERATURE
-        if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
+        if let Ok(temp_str) = env_openprx_or_zeroclaw("TEMPERATURE") {
             if let Ok(temp) = temp_str.parse::<f64>() {
                 if (0.0..=2.0).contains(&temp) {
                     self.default_temperature = temp;
@@ -4193,7 +4388,7 @@ impl Config {
         }
 
         // Reasoning override: ZEROCLAW_REASONING_ENABLED or REASONING_ENABLED
-        if let Ok(flag) = std::env::var("ZEROCLAW_REASONING_ENABLED")
+        if let Ok(flag) = env_openprx_or_zeroclaw("REASONING_ENABLED")
             .or_else(|_| std::env::var("REASONING_ENABLED"))
         {
             let normalized = flag.trim().to_ascii_lowercase();
@@ -4205,14 +4400,14 @@ impl Config {
         }
 
         // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
-        if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
+        if let Ok(enabled) = env_openprx_or_zeroclaw("WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
         {
             self.web_search.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
 
         // Web search provider: ZEROCLAW_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
-        if let Ok(provider) = std::env::var("ZEROCLAW_WEB_SEARCH_PROVIDER")
+        if let Ok(provider) = env_openprx_or_zeroclaw("WEB_SEARCH_PROVIDER")
             .or_else(|_| std::env::var("WEB_SEARCH_PROVIDER"))
         {
             let provider = provider.trim();
@@ -4223,7 +4418,7 @@ impl Config {
 
         // Brave API key: ZEROCLAW_BRAVE_API_KEY or BRAVE_API_KEY
         if let Ok(api_key) =
-            std::env::var("ZEROCLAW_BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY"))
+            env_openprx_or_zeroclaw("BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY"))
         {
             let api_key = api_key.trim();
             if !api_key.is_empty() {
@@ -4232,7 +4427,7 @@ impl Config {
         }
 
         // Web search max results: ZEROCLAW_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
-        if let Ok(max_results) = std::env::var("ZEROCLAW_WEB_SEARCH_MAX_RESULTS")
+        if let Ok(max_results) = env_openprx_or_zeroclaw("WEB_SEARCH_MAX_RESULTS")
             .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
         {
             if let Ok(max_results) = max_results.parse::<usize>() {
@@ -4243,7 +4438,7 @@ impl Config {
         }
 
         // Web search timeout: ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS or WEB_SEARCH_TIMEOUT_SECS
-        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS")
+        if let Ok(timeout_secs) = env_openprx_or_zeroclaw("WEB_SEARCH_TIMEOUT_SECS")
             .or_else(|_| std::env::var("WEB_SEARCH_TIMEOUT_SECS"))
         {
             if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
@@ -4254,7 +4449,7 @@ impl Config {
         }
 
         // Storage provider key (optional backend override): ZEROCLAW_STORAGE_PROVIDER
-        if let Ok(provider) = std::env::var("ZEROCLAW_STORAGE_PROVIDER") {
+        if let Ok(provider) = env_openprx_or_zeroclaw("STORAGE_PROVIDER") {
             let provider = provider.trim();
             if !provider.is_empty() {
                 self.storage.provider.config.provider = provider.to_string();
@@ -4262,7 +4457,7 @@ impl Config {
         }
 
         // Storage connection URL (for remote backends): ZEROCLAW_STORAGE_DB_URL
-        if let Ok(db_url) = std::env::var("ZEROCLAW_STORAGE_DB_URL") {
+        if let Ok(db_url) = env_openprx_or_zeroclaw("STORAGE_DB_URL") {
             let db_url = db_url.trim();
             if !db_url.is_empty() {
                 self.storage.provider.config.db_url = Some(db_url.to_string());
@@ -4270,7 +4465,7 @@ impl Config {
         }
 
         // Storage connect timeout: ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS
-        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS") {
+        if let Ok(timeout_secs) = env_openprx_or_zeroclaw("STORAGE_CONNECT_TIMEOUT_SECS") {
             if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
                 if timeout_secs > 0 {
                     self.storage.provider.config.connect_timeout_secs = Some(timeout_secs);
@@ -4278,7 +4473,7 @@ impl Config {
             }
         }
         // Proxy enabled flag: ZEROCLAW_PROXY_ENABLED
-        let explicit_proxy_enabled = std::env::var("ZEROCLAW_PROXY_ENABLED")
+        let explicit_proxy_enabled = env_openprx_or_zeroclaw("PROXY_ENABLED")
             .ok()
             .as_deref()
             .and_then(parse_proxy_enabled);
@@ -4289,25 +4484,25 @@ impl Config {
         // Proxy URLs: ZEROCLAW_* wins, then generic *PROXY vars.
         let mut proxy_url_overridden = false;
         if let Ok(proxy_url) =
-            std::env::var("ZEROCLAW_HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
+            env_openprx_or_zeroclaw("HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
         {
             self.proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
         if let Ok(proxy_url) =
-            std::env::var("ZEROCLAW_HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
+            env_openprx_or_zeroclaw("HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
         {
             self.proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
         if let Ok(proxy_url) =
-            std::env::var("ZEROCLAW_ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY"))
+            env_openprx_or_zeroclaw("ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY"))
         {
             self.proxy.all_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
         if let Ok(no_proxy) =
-            std::env::var("ZEROCLAW_NO_PROXY").or_else(|_| std::env::var("NO_PROXY"))
+            env_openprx_or_zeroclaw("NO_PROXY").or_else(|_| std::env::var("NO_PROXY"))
         {
             self.proxy.no_proxy = normalize_no_proxy_list(vec![no_proxy]);
         }
@@ -4320,7 +4515,7 @@ impl Config {
         }
 
         // Proxy scope and service selectors.
-        if let Ok(scope_raw) = std::env::var("ZEROCLAW_PROXY_SCOPE") {
+        if let Ok(scope_raw) = env_openprx_or_zeroclaw("PROXY_SCOPE") {
             if let Some(scope) = parse_proxy_scope(&scope_raw) {
                 self.proxy.scope = scope;
             } else {
@@ -4331,7 +4526,7 @@ impl Config {
             }
         }
 
-        if let Ok(services_raw) = std::env::var("ZEROCLAW_PROXY_SERVICES") {
+        if let Ok(services_raw) = env_openprx_or_zeroclaw("PROXY_SERVICES") {
             self.proxy.services = normalize_service_list(vec![services_raw]);
         }
 
@@ -4701,6 +4896,7 @@ default_temperature = 0.7
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
+                ..HeartbeatConfig::default()
             },
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
@@ -5421,6 +5617,9 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
+            dm_policy: DmPolicy::default(),
+            group_policy: GroupPolicy::default(),
+            group_allow_from: vec![],
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -5441,6 +5640,9 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+            dm_policy: DmPolicy::default(),
+            group_policy: GroupPolicy::default(),
+            group_allow_from: vec![],
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -5466,6 +5668,9 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["*".into()],
+            dm_policy: DmPolicy::default(),
+            group_policy: GroupPolicy::default(),
+            group_allow_from: vec![],
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -5483,6 +5688,9 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+            dm_policy: DmPolicy::default(),
+            group_policy: GroupPolicy::default(),
+            group_allow_from: vec![],
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -5499,6 +5707,9 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec![],
+            dm_policy: DmPolicy::default(),
+            group_policy: GroupPolicy::default(),
+            group_allow_from: vec![],
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -5525,6 +5736,9 @@ channel_id = "C123"
                 pair_phone: None,
                 pair_code: None,
                 allowed_numbers: vec!["+1".into()],
+                dm_policy: DmPolicy::default(),
+                group_policy: GroupPolicy::default(),
+                group_allow_from: vec![],
             }),
             wacli: None,
             linq: None,
@@ -5619,6 +5833,7 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            request_timeout_secs: 45,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -5631,6 +5846,7 @@ channel_id = "C123"
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
+        assert_eq!(parsed.request_timeout_secs, 45);
     }
 
     #[test]
@@ -6715,6 +6931,47 @@ default_model = "legacy-model"
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert_eq!(g.request_timeout_secs, 60);
+    }
+
+    #[test]
+    async fn signal_policy_defaults_and_startup_timeout() {
+        let parsed: SignalConfig = toml::from_str(r#"account = "+1234567890""#).unwrap();
+        assert_eq!(parsed.startup_timeout_ms, 30_000);
+        assert_eq!(parsed.dm_policy, DmPolicy::Allowlist);
+        assert_eq!(parsed.group_policy, GroupPolicy::Allowlist);
+    }
+
+    #[test]
+    async fn signal_dm_policy_unknown_variant_fails_deserialization() {
+        let parsed = toml::from_str::<SignalConfig>(
+            r#"
+account = "+1234567890"
+dm_policy = "unknown_policy"
+"#,
+        );
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    async fn whatsapp_allowed_from_alias_deserializes_into_allowed_numbers() {
+        let parsed: WhatsAppConfig = toml::from_str(
+            r#"
+access_token = "tok"
+phone_number_id = "id"
+verify_token = "verify"
+allowed_from = ["*"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.allowed_numbers, vec!["*"]);
+    }
+
+    #[test]
+    async fn heartbeat_defaults_include_active_hours_and_prompt() {
+        let hb = HeartbeatConfig::default();
+        assert_eq!(hb.active_hours, vec![8, 23]);
+        assert_eq!(hb.prompt, "Check HEARTBEAT.md and follow instructions.");
     }
 
     // ── Peripherals config ───────────────────────────────────────

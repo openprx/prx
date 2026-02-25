@@ -3,16 +3,28 @@ members = [".", "crates/robot-kit"]
 resolver = "2"
 
 [package]
-name = "zeroclaw"
+name = "openprx"
 version = "0.1.0"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "Apache-2.0"
-description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
-repository = "https://github.com/zeroclaw-labs/zeroclaw"
+description = "OpenPRX: high-performance Rust-first autonomous agent runtime."
+repository = "https://openprx.dev"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
+
+[lib]
+name = "zeroclaw"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openprx"
+path = "src/main.rs"
+
+[[bin]]
+name = "zeroclaw"
+path = "src/main.rs"
 
 [dependencies]
 # CLI - minimal and fast
@@ -62,7 +74,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # UUID generation
-uuid = { version = "1.11", default-features = false, features = ["v4", "std"] }
+uuid = { version = "1.11", default-features = false, features = ["v4", "v7", "std"] }
 
 # Authenticated encryption (AEAD) for secret store
 chacha20poly1305 = "0.10"

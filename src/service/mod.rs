@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
-const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
-const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
+const SERVICE_LABEL: &str = "com.openprx.daemon";
+const WINDOWS_TASK_NAME: &str = "OpenPRX Daemon";
 
 /// Supported init systems for service management
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -142,7 +142,7 @@ fn start_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "start", "zeroclaw.service"]))?;
+            run_checked(Command::new("systemctl").args(["--user", "start", "openprx.service"]))?;
         }
         InitSystem::Openrc => {
             run_checked(Command::new("rc-service").args(["zeroclaw", "start"]))?;
@@ -184,7 +184,7 @@ fn stop_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             let _ =
-                run_checked(Command::new("systemctl").args(["--user", "stop", "zeroclaw.service"]));
+                run_checked(Command::new("systemctl").args(["--user", "stop", "openprx.service"]));
         }
         InitSystem::Openrc => {
             let _ = run_checked(Command::new("rc-service").args(["zeroclaw", "stop"]));
@@ -222,7 +222,7 @@ fn restart_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "restart", "zeroclaw.service"]))?;
+            run_checked(Command::new("systemctl").args(["--user", "restart", "openprx.service"]))?;
         }
         InitSystem::Openrc => {
             run_checked(Command::new("rc-service").args(["zeroclaw", "restart"]))?;
@@ -288,7 +288,7 @@ fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             let out = run_capture(Command::new("systemctl").args([
                 "--user",
                 "is-active",
-                "zeroclaw.service",
+                "openprx.service",
             ]))
             .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
@@ -332,7 +332,7 @@ fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
             .parent()
             .map_or_else(|| PathBuf::from("."), PathBuf::from)
             .join("logs")
-            .join("zeroclaw-daemon.cmd");
+            .join("openprx-daemon.cmd");
         if wrapper.exists() {
             fs::remove_file(&wrapper).ok();
         }
@@ -422,7 +422,7 @@ fn install_macos(config: &Config) -> Result<()> {
 
     fs::write(&file, plist)?;
     println!("✅ Installed launchd service: {}", file.display());
-    println!("   Start with: zeroclaw service start");
+    println!("   Start with: openprx service start");
     Ok(())
 }
 
@@ -442,15 +442,15 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     let unit = format!(
-        "[Unit]\nDescription=ZeroClaw daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=OpenPRX daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
         exe.display()
     );
 
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
-    let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "zeroclaw.service"]));
+    let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "openprx.service"]));
     println!("✅ Installed systemd user service: {}", file.display());
-    println!("   Start with: zeroclaw service start");
+    println!("   Start with: openprx service start");
     Ok(())
 }
 
@@ -667,6 +667,18 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
+    fn preferred_user_config_dir(home: PathBuf) -> PathBuf {
+        let primary = home.join(".openprx");
+        if primary.exists() {
+            return primary;
+        }
+        let legacy = home.join(".zeroclaw");
+        if legacy.exists() {
+            return legacy;
+        }
+        primary
+    }
+
     let sudo_user = std::env::var("SUDO_USER")
         .ok()
         .map(|value| value.trim().to_string())
@@ -678,7 +690,7 @@ fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
                 let entry = String::from_utf8_lossy(&output.stdout);
                 let fields: Vec<&str> = entry.trim().split(':').collect();
                 if fields.len() >= 6 {
-                    return Some(PathBuf::from(fields[5]).join(".zeroclaw"));
+                    return Some(preferred_user_config_dir(PathBuf::from(fields[5])));
                 }
             }
         }
@@ -687,7 +699,7 @@ fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(PathBuf::from)
-        .map(|home| home.join(".zeroclaw"))
+        .map(preferred_user_config_dir)
 }
 
 fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
@@ -775,7 +787,7 @@ fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
         };
         bail!(
             "OpenRC runtime user 'zeroclaw' cannot write {} ({details}). \
-             Re-run `sudo zeroclaw service install` and ensure ownership is zeroclaw:zeroclaw.",
+             Re-run `sudo openprx service install` and ensure ownership is zeroclaw:zeroclaw.",
             path.display(),
         );
     }
@@ -811,7 +823,7 @@ fn warn_if_binary_in_home(exe_path: &Path) {
         eprintln!(
             "⚠️  Warning: Binary path '{}' appears to be in a user home directory.\n\
              For system-wide OpenRC service, consider installing to /usr/local/bin:\n\
-             sudo cp '{}' /usr/local/bin/zeroclaw",
+             sudo cp '{}' /usr/local/bin/openprx",
             exe_path.display(),
             exe_path.display()
         );
@@ -824,7 +836,7 @@ fn generate_openrc_script(exe_path: &Path, config_dir: &Path) -> String {
         r#"#!/sbin/openrc-run
 
 name="zeroclaw"
-description="ZeroClaw daemon"
+description="OpenPRX daemon"
 
 command="{}"
 command_args="--config-dir {} daemon"
@@ -846,7 +858,7 @@ depend() {{
 }
 
 fn resolve_openrc_executable() -> Result<PathBuf> {
-    let preferred = Path::new("/usr/local/bin/zeroclaw");
+    let preferred = Path::new("/usr/local/bin/openprx");
     if preferred.exists() {
         return Ok(preferred.to_path_buf());
     }
@@ -859,7 +871,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     if !is_root() {
         bail!(
             "OpenRC service installation requires root privileges.\n\
-             Please run with sudo: sudo zeroclaw service install"
+             Please run with sudo: sudo openprx service install"
         );
     }
 
@@ -970,7 +982,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     run_checked(Command::new("rc-update").args(["add", "zeroclaw", "default"]))?;
     println!("✅ Installed OpenRC service: /etc/init.d/zeroclaw");
     println!("   Config path: /etc/zeroclaw/config.toml");
-    println!("   Start with: sudo zeroclaw service start");
+    println!("   Start with: sudo openprx service start");
     let _ = config;
     Ok(())
 }
@@ -985,7 +997,7 @@ fn install_windows(config: &Config) -> Result<()> {
     fs::create_dir_all(&logs_dir)?;
 
     // Create a wrapper script that redirects output to log files
-    let wrapper = logs_dir.join("zeroclaw-daemon.cmd");
+    let wrapper = logs_dir.join("openprx-daemon.cmd");
     let stdout_log = logs_dir.join("daemon.stdout.log");
     let stderr_log = logs_dir.join("daemon.stderr.log");
 
@@ -1020,7 +1032,7 @@ fn install_windows(config: &Config) -> Result<()> {
     println!("✅ Installed Windows scheduled task: {}", task_name);
     println!("   Wrapper: {}", wrapper.display());
     println!("   Logs: {}", logs_dir.display());
-    println!("   Start with: zeroclaw service start");
+    println!("   Start with: openprx service start");
     Ok(())
 }
 
@@ -1043,7 +1055,7 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
         .join(".config")
         .join("systemd")
         .join("user")
-        .join("zeroclaw.service"))
+        .join("openprx.service"))
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
@@ -1111,12 +1123,12 @@ mod tests {
     fn linux_service_file_has_expected_suffix() {
         let file = linux_service_file(&Config::default()).unwrap();
         let path = file.to_string_lossy();
-        assert!(path.ends_with(".config/systemd/user/zeroclaw.service"));
+        assert!(path.ends_with(".config/systemd/user/openprx.service"));
     }
 
     #[test]
     fn windows_task_name_is_constant() {
-        assert_eq!(windows_task_name(), "ZeroClaw Daemon");
+        assert_eq!(windows_task_name(), "OpenPRX Daemon");
     }
 
     #[cfg(target_os = "windows")]
@@ -1175,13 +1187,13 @@ mod tests {
     fn generate_openrc_script_contains_required_directives() {
         use std::path::PathBuf;
 
-        let exe_path = PathBuf::from("/usr/local/bin/zeroclaw");
+        let exe_path = PathBuf::from("/usr/local/bin/openprx");
         let script = generate_openrc_script(&exe_path, Path::new("/etc/zeroclaw"));
 
         assert!(script.starts_with("#!/sbin/openrc-run"));
         assert!(script.contains("name=\"zeroclaw\""));
-        assert!(script.contains("description=\"ZeroClaw daemon\""));
-        assert!(script.contains("command=\"/usr/local/bin/zeroclaw\""));
+        assert!(script.contains("description=\"OpenPRX daemon\""));
+        assert!(script.contains("command=\"/usr/local/bin/openprx\""));
         assert!(script.contains("command_args=\"--config-dir /etc/zeroclaw daemon\""));
         assert!(!script.contains("env ZEROCLAW_CONFIG_DIR"));
         assert!(!script.contains("env ZEROCLAW_WORKSPACE"));
@@ -1200,14 +1212,14 @@ mod tests {
     fn warn_if_binary_in_home_detects_home_path() {
         use std::path::PathBuf;
 
-        let home_path = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
+        let home_path = PathBuf::from("/home/user/.cargo/bin/openprx");
         assert!(home_path.to_string_lossy().contains("/home/"));
         assert!(home_path.to_string_lossy().contains(".cargo/bin"));
 
-        let cargo_path = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
+        let cargo_path = PathBuf::from("/home/user/.cargo/bin/openprx");
         assert!(cargo_path.to_string_lossy().contains(".cargo/bin"));
 
-        let system_path = PathBuf::from("/usr/local/bin/zeroclaw");
+        let system_path = PathBuf::from("/usr/local/bin/openprx");
         assert!(!system_path.to_string_lossy().contains("/home/"));
         assert!(!system_path.to_string_lossy().contains(".cargo/bin"));
     }

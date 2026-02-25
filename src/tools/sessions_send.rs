@@ -138,6 +138,9 @@ mod tests {
             abort_handle: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: Some(tx),
+            parent_run_id: None,
+            session_scope_key: "test-session".to_string(),
+            spawn_depth: 0,
         };
         (run, rx)
     }
@@ -207,6 +210,9 @@ mod tests {
             abort_handle: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: None,
+            parent_run_id: None,
+            session_scope_key: "test-session".to_string(),
+            spawn_depth: 0,
         };
         let runs = Arc::new(RwLock::new(vec![run]));
         let tool = SessionsSendTool::new(runs);

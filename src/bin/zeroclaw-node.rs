@@ -5,7 +5,7 @@ use zeroclaw::config::{NodeServerConfig, NodesConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw-node")]
-#[command(about = "ZeroClaw remote node server")]
+#[command(about = "OpenPRX remote node server")]
 struct Cli {
     #[arg(long)]
     config: Option<String>,

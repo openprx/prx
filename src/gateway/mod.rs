@@ -4,7 +4,7 @@
 //! - Proper HTTP/1.1 parsing and compliance
 //! - Content-Length validation (handled by hyper)
 //! - Request body size limits (64KB max)
-//! - Request timeouts (30s) to prevent slow-loris attacks
+//! - Request timeouts (configurable) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
 use crate::agent::loop_::run_tool_call_loop;
@@ -41,8 +41,6 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -329,17 +327,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    let provider_runtime_options = providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+    };
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
-        &providers::ProviderRuntimeOptions {
-            auth_profile_override: None,
-            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-            secrets_encrypt: config.secrets.encrypt,
-            reasoning_enabled: config.runtime.reasoning_enabled,
-        },
+        &provider_runtime_options,
     )?);
     let model = config
         .default_model
@@ -457,7 +456,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             security.clone(),
             config.workspace_dir.clone(),
             config.multimodal.clone(),
+            config.agent.compaction.clone(),
             config.agents.clone(),
+            config.api_key.clone(),
+            provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         );
         let handle = spawn_tool.tools_handle();
@@ -604,7 +606,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     }
 
-    println!("🦀 ZeroClaw Gateway listening on http://{display_addr}");
+    println!("🦀 OpenPRX Gateway listening on http://{display_addr}");
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
@@ -682,7 +684,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(config.gateway.request_timeout_secs.max(1)),
         ));
 
     // Run the server
@@ -909,6 +911,7 @@ async fn run_gateway_chat_with_multimodal(
         "webhook",
         &multimodal_config,
         max_tool_iterations,
+        None,
         None, // no cancellation token
         None, // no streaming delta sender
         None, // no scope context for webhooks
@@ -1539,8 +1542,20 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    fn security_timeout_uses_gateway_config_default() {
+        assert_eq!(
+            crate::config::GatewayConfig::default().request_timeout_secs,
+            60
+        );
+    }
+
+    #[test]
+    fn security_timeout_config_allows_override() {
+        let cfg = crate::config::GatewayConfig {
+            request_timeout_secs: 12,
+            ..crate::config::GatewayConfig::default()
+        };
+        assert_eq!(cfg.request_timeout_secs, 12);
     }
 
     #[test]

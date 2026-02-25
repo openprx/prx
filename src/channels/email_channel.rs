@@ -509,10 +509,10 @@ impl Channel for EmailChannel {
             if let Some(pos) = message.content.find('\n') {
                 (&message.content[9..pos], message.content[pos + 1..].trim())
             } else {
-                ("ZeroClaw Message", message.content.as_str())
+                ("OpenPRX Message", message.content.as_str())
             }
         } else {
-            ("ZeroClaw Message", message.content.as_str())
+            ("OpenPRX Message", message.content.as_str())
         };
 
         let email = Message::builder()

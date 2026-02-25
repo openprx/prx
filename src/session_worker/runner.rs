@@ -8,8 +8,10 @@ use crate::providers::{ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::session_worker::protocol::{WorkerManifest, WorkerResult};
+use crate::tools::sessions_spawn::with_spawn_execution_context;
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
+use std::future::Future;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -103,7 +105,7 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
     let provider: Arc<dyn Provider> =
         Arc::from(crate::providers::create_resilient_provider_with_options(
             &manifest.provider_name,
-            config.api_key.as_deref(),
+            manifest.api_key.as_deref().or(config.api_key.as_deref()),
             config.api_url.as_deref(),
             &config.reliability,
             &provider_runtime_options,
@@ -141,7 +143,7 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
         &config.http_request,
         &manifest.workspace_dir,
         &config.agents,
-        config.api_key.as_deref(),
+        manifest.api_key.as_deref().or(config.api_key.as_deref()),
         &config,
     );
 
@@ -192,13 +194,16 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
             None,
             "session-worker",
             &config.multimodal,
-            config.agent.max_tool_iterations,
+            manifest.max_iterations.max(1),
+            manifest.compaction_config.as_ref(),
             None,
             None,
             scope_ctx.as_ref(),
         )
         .await
     };
+
+    let run_future = with_manifest_spawn_context(&manifest, run_future);
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(manifest.timeout_seconds),
@@ -228,6 +233,23 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
                 manifest.timeout_seconds
             )),
         }),
+    }
+}
+
+async fn with_manifest_spawn_context<T, Fut>(manifest: &WorkerManifest, fut: Fut) -> T
+where
+    Fut: Future<Output = T>,
+{
+    if !manifest.session_scope_key.trim().is_empty() {
+        with_spawn_execution_context(
+            manifest.run_id.clone(),
+            manifest.session_scope_key.clone(),
+            manifest.spawn_depth,
+            fut,
+        )
+        .await
+    } else {
+        fut.await
     }
 }
 
@@ -300,5 +322,45 @@ mod tests {
         assert!(error
             .to_string()
             .contains("parse --tools JSON as string array"));
+    }
+
+    #[tokio::test]
+    async fn process_mode_restores_spawn_context_for_nested_runs() {
+        let manifest = WorkerManifest {
+            run_id: "run-child".to_string(),
+            task: "noop".to_string(),
+            provider_name: "provider".to_string(),
+            model: "model".to_string(),
+            api_key: None,
+            temperature: 0.7,
+            workspace_dir: std::path::PathBuf::from("/tmp/ws"),
+            memory_db_path: std::path::PathBuf::from("/tmp/ws/brain.db"),
+            allowed_tools: Vec::new(),
+            timeout_seconds: 30,
+            max_iterations: 1,
+            system_prompt: None,
+            identity_dir: None,
+            scope_sender: None,
+            scope_channel: None,
+            scope_chat_type: None,
+            scope_chat_id: None,
+            spawn_depth: 1,
+            session_scope_key: "signal:group:test".to_string(),
+            parent_run_id: Some("run-parent".to_string()),
+            compaction_config: None,
+        };
+
+        let snapshot = with_manifest_spawn_context(&manifest, async {
+            crate::tools::sessions_spawn::spawn_execution_context_snapshot()
+        })
+        .await;
+        assert_eq!(
+            snapshot,
+            Some((
+                "run-child".to_string(),
+                "signal:group:test".to_string(),
+                1usize
+            ))
+        );
     }
 }

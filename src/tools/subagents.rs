@@ -276,6 +276,9 @@ mod tests {
             abort_handle: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: None,
+            parent_run_id: None,
+            session_scope_key: "test-session".to_string(),
+            spawn_depth: 0,
         }
     }
 
@@ -321,6 +324,9 @@ mod tests {
             abort_handle: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: Some(tx),
+            parent_run_id: None,
+            session_scope_key: "test-session".to_string(),
+            spawn_depth: 0,
         };
         let tool = SubagentsTool::new(Arc::new(RwLock::new(vec![run])));
 

@@ -9,8 +9,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
-const DEFAULT_CODEX_INSTRUCTIONS: &str =
-    "You are ZeroClaw, a concise and helpful coding assistant.";
+const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are OpenPRX, a concise and helpful coding assistant.";
 
 pub struct OpenAiCodexProvider {
     auth: AuthService,
@@ -99,8 +98,20 @@ impl OpenAiCodexProvider {
 
 fn default_zeroclaw_dir() -> PathBuf {
     directories::UserDirs::new().map_or_else(
-        || PathBuf::from(".zeroclaw"),
-        |dirs| dirs.home_dir().join(".zeroclaw"),
+        || PathBuf::from(".openprx"),
+        |dirs| {
+            let primary = dirs.home_dir().join(".openprx");
+            if primary.exists() {
+                primary
+            } else {
+                let legacy = dirs.home_dir().join(".zeroclaw");
+                if legacy.exists() {
+                    legacy
+                } else {
+                    primary
+                }
+            }
+        },
     )
 }
 
@@ -389,7 +400,7 @@ impl OpenAiCodexProvider {
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`."
+                    "OpenAI Codex auth profile not found. Run `openprx auth login --provider openai-codex`."
                 )
             })?;
         let account_id = profile
@@ -397,7 +408,7 @@ impl OpenAiCodexProvider {
             .or_else(|| extract_account_id_from_jwt(&access_token))
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again."
+                    "OpenAI Codex account id not found in auth profile/token. Run `openprx auth login --provider openai-codex` again."
                 )
             })?;
         let normalized_model = normalize_model_id(model);
@@ -443,6 +454,13 @@ impl OpenAiCodexProvider {
 
 #[async_trait]
 impl Provider for OpenAiCodexProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,

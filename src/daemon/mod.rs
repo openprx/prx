@@ -1,6 +1,6 @@
 use crate::config::{new_shared, Config, HotReloadManager};
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use std::future::Future;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
@@ -123,7 +123,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Webhook receiver disabled; webhook supervisor not started");
     }
 
-    println!("🧠 ZeroClaw daemon started");
+    println!("🧠 OpenPRX daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler, webhook_receiver");
     println!("   Ctrl+C to stop");
@@ -223,6 +223,13 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
     loop {
         interval.tick().await;
+        let local_hour = chrono::Local::now().hour() as u8;
+        if !crate::heartbeat::engine::HeartbeatEngine::is_within_active_hours(
+            &config.heartbeat,
+            local_hour,
+        ) {
+            continue;
+        }
 
         let tasks = engine.collect_tasks().await?;
         if tasks.is_empty() {
@@ -230,7 +237,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         }
 
         for task in tasks {
-            let prompt = format!("[Heartbeat Task] {task}");
+            let prompt = format!("{}\n\n[Heartbeat Task] {task}", config.heartbeat.prompt);
             let temp = config.default_temperature;
             if let Err(e) =
                 crate::agent::run(config.clone(), Some(prompt), None, None, temp, vec![]).await

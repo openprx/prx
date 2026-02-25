@@ -34,6 +34,8 @@ pub struct DelegateTool {
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
+    /// Compaction config inherited from root agent config.
+    compaction_config: crate::config::AgentCompactionConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +119,7 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            compaction_config: crate::config::AgentCompactionConfig::default(),
         }
     }
 
@@ -153,6 +156,7 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
+            compaction_config: crate::config::AgentCompactionConfig::default(),
         }
     }
 
@@ -165,6 +169,12 @@ impl DelegateTool {
     /// Attach multimodal configuration for sub-agent tool loops.
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
+        self
+    }
+
+    /// Attach compaction configuration for agentic sub-agent loops.
+    pub fn with_compaction_config(mut self, config: crate::config::AgentCompactionConfig) -> Self {
+        self.compaction_config = config;
         self
     }
 }
@@ -474,6 +484,7 @@ impl DelegateTool {
                 "delegate",
                 &self.multimodal_config,
                 agent_config.max_iterations,
+                Some(&self.compaction_config),
                 None,
                 None,
                 scope_ctx.as_ref(),

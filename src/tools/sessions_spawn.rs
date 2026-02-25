@@ -12,10 +12,12 @@ use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::{run_tool_call_loop, ScopeContext};
 use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
-use crate::config::{DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
+use crate::config::{
+    AgentCompactionConfig, DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig,
+};
 use crate::hooks::HookManager;
 use crate::observability::NoopObserver;
-use crate::providers::{ChatMessage, Provider};
+use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use crate::session_worker::protocol::{WorkerManifest, WorkerResult};
@@ -65,6 +67,20 @@ pub struct SubAgentRun {
     pub history: Arc<RwLock<Vec<HistoryEntry>>>,
     /// Channel to inject steering messages into the running sub-agent.
     pub steer_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    pub parent_run_id: Option<String>,
+    pub session_scope_key: String,
+    pub spawn_depth: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SpawnExecutionContext {
+    run_id: String,
+    session_scope_key: String,
+    spawn_depth: usize,
+}
+
+tokio::task_local! {
+    static SPAWN_EXECUTION_CONTEXT: SpawnExecutionContext;
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +136,58 @@ fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
     })
 }
 
+fn current_spawn_execution_context() -> Option<SpawnExecutionContext> {
+    SPAWN_EXECUTION_CONTEXT.try_with(|ctx| ctx.clone()).ok()
+}
+
+pub(crate) async fn with_spawn_execution_context<T, Fut>(
+    run_id: String,
+    session_scope_key: String,
+    spawn_depth: usize,
+    fut: Fut,
+) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    SPAWN_EXECUTION_CONTEXT
+        .scope(
+            SpawnExecutionContext {
+                run_id,
+                session_scope_key,
+                spawn_depth,
+            },
+            fut,
+        )
+        .await
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_execution_context_snapshot() -> Option<(String, String, usize)> {
+    current_spawn_execution_context()
+        .map(|ctx| (ctx.run_id, ctx.session_scope_key, ctx.spawn_depth))
+}
+
+fn spawn_session_scope_key(
+    parent_ctx: Option<&SpawnExecutionContext>,
+    scope: Option<&SpawnScope>,
+) -> String {
+    if let Some(parent) = parent_ctx {
+        return parent.session_scope_key.clone();
+    }
+
+    if let Some(scope) = scope {
+        return format!("{}:{}:{}", scope.channel, scope.chat_id, scope.sender);
+    }
+
+    "sessions_spawn:global".to_string()
+}
+
+fn running_run_count(runs: &[SubAgentRun]) -> usize {
+    runs.iter()
+        .filter(|run| matches!(run.status, SubAgentStatus::Running))
+        .count()
+}
+
 /// Tool that spawns an asynchronous sub-agent to handle a task in isolation.
 /// Returns immediately with a run ID; results are announced via the active channel
 /// when the sub-agent completes.
@@ -149,8 +217,14 @@ pub struct SessionsSpawnTool {
     workspace_dir: PathBuf,
     /// Multimodal config for sub-agent tool call loops.
     multimodal_config: MultimodalConfig,
+    /// Compaction config for sub-agent tool call loops.
+    compaction_config: AgentCompactionConfig,
     /// Configured named agents for identity/model/tool scoping in spawn.
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
+    /// Global credential fallback from root config.
+    fallback_api_key: Option<String>,
+    /// Provider runtime options (auth profile, state dir, etc.).
+    provider_runtime_options: providers::ProviderRuntimeOptions,
     /// Process-mode controls for workspace lifecycle.
     spawn_config: SessionsSpawnConfig,
 }
@@ -166,7 +240,10 @@ impl SessionsSpawnTool {
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
         multimodal_config: MultimodalConfig,
+        compaction_config: AgentCompactionConfig,
         agents: HashMap<String, DelegateAgentConfig>,
+        fallback_api_key: Option<String>,
+        provider_runtime_options: providers::ProviderRuntimeOptions,
         spawn_config: SessionsSpawnConfig,
     ) -> Self {
         Self {
@@ -181,7 +258,10 @@ impl SessionsSpawnTool {
             tools: Arc::new(OnceLock::new()),
             workspace_dir,
             multimodal_config,
+            compaction_config,
             agents: Arc::new(agents),
+            fallback_api_key,
+            provider_runtime_options,
             spawn_config,
         }
     }
@@ -405,6 +485,73 @@ impl Tool for SessionsSpawnTool {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         let spawn_scope = parse_spawn_scope(&args);
+        let parent_exec_ctx = current_spawn_execution_context();
+        let spawn_depth = parent_exec_ctx
+            .as_ref()
+            .map_or(0, |ctx| ctx.spawn_depth.saturating_add(1));
+        let parent_run_id = parent_exec_ctx.as_ref().map(|ctx| ctx.run_id.clone());
+        let session_scope_key =
+            spawn_session_scope_key(parent_exec_ctx.as_ref(), spawn_scope.as_ref());
+
+        {
+            let runs = self.active_runs.read().await;
+            let active_count = running_run_count(&runs);
+            if active_count >= self.spawn_config.max_concurrent {
+                tracing::warn!(
+                    active_count,
+                    max_concurrent = self.spawn_config.max_concurrent,
+                    "sessions_spawn rejected: max concurrent runs reached"
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "sessions_spawn rejected: max_concurrent={} reached",
+                        self.spawn_config.max_concurrent
+                    )),
+                });
+            }
+
+            if spawn_depth > self.spawn_config.max_spawn_depth {
+                tracing::warn!(
+                    spawn_depth,
+                    max_spawn_depth = self.spawn_config.max_spawn_depth,
+                    "sessions_spawn rejected: max spawn depth exceeded"
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "sessions_spawn rejected: spawn depth {} exceeds max_spawn_depth={}",
+                        spawn_depth, self.spawn_config.max_spawn_depth
+                    )),
+                });
+            }
+
+            let same_session_children = runs
+                .iter()
+                .filter(|run| {
+                    matches!(run.status, SubAgentStatus::Running)
+                        && run.session_scope_key == session_scope_key
+                })
+                .count();
+            if same_session_children >= self.spawn_config.max_children_per_agent {
+                tracing::warn!(
+                    same_session_children,
+                    max_children_per_agent = self.spawn_config.max_children_per_agent,
+                    session_scope_key = %session_scope_key,
+                    "sessions_spawn rejected: max children per session reached"
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "sessions_spawn rejected: max_children_per_agent={} reached",
+                        self.spawn_config.max_children_per_agent
+                    )),
+                });
+            }
+        }
 
         // Security check
         if let Err(error) = self
@@ -465,8 +612,39 @@ impl Tool for SessionsSpawnTool {
             None => self.default_recipient.read().await.clone(),
         };
 
+        let resolved_provider_name = selected_agent
+            .as_ref()
+            .map(|(_, cfg)| cfg.provider.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.provider_name.clone());
+        let resolved_model = model_override.unwrap_or_else(|| {
+            selected_agent
+                .as_ref()
+                .map(|(_, cfg)| cfg.model.trim().to_string())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| self.model.clone())
+        });
+        let resolved_temperature = selected_agent
+            .as_ref()
+            .and_then(|(_, cfg)| cfg.temperature)
+            .unwrap_or(self.temperature);
+        let resolved_api_key = selected_agent
+            .as_ref()
+            .and_then(|(_, cfg)| {
+                cfg.api_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| self.fallback_api_key.clone());
+        let resolved_max_iterations = selected_agent
+            .as_ref()
+            .map(|(_, cfg)| cfg.max_iterations.max(1))
+            .unwrap_or(SUB_AGENT_MAX_ITERATIONS);
+
         if mode == "process" {
-            let temperature = self.temperature;
+            let temperature = resolved_temperature;
             let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(Vec::new()));
 
             {
@@ -479,17 +657,16 @@ impl Tool for SessionsSpawnTool {
                     abort_handle: None,
                     history: history_arc,
                     steer_tx: None,
+                    parent_run_id: parent_run_id.clone(),
+                    session_scope_key: session_scope_key.clone(),
+                    spawn_depth,
                 });
             }
 
-            let model = model_override.unwrap_or_else(|| {
-                selected_agent
-                    .as_ref()
-                    .map(|(_, cfg)| cfg.model.trim().to_string())
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| self.model.clone())
-            });
-            let provider_name = self.provider_name.clone();
+            let model = resolved_model;
+            let provider_name = resolved_provider_name;
+            let api_key = resolved_api_key;
+            let max_iterations = resolved_max_iterations;
             let workspace_root = self.workspace_dir.clone();
             let worker_workspace_root = self
                 .spawn_config
@@ -529,63 +706,81 @@ impl Tool for SessionsSpawnTool {
             let task_owned = task.to_string();
             let rid = run_id.clone();
             let process_scope = spawn_scope.clone();
+            let process_parent_run_id = parent_run_id.clone();
+            let process_session_scope_key = session_scope_key.clone();
+            let process_spawn_depth = spawn_depth;
+            let process_compaction_config = self.compaction_config.clone();
+            let process_execution_ctx = SpawnExecutionContext {
+                run_id: rid.clone(),
+                session_scope_key: session_scope_key.clone(),
+                spawn_depth,
+            };
 
-            let jh = tokio::spawn(async move {
-                tracing::info!(run_id = %rid, "Sub-agent process starting");
+            let jh = tokio::spawn(SPAWN_EXECUTION_CONTEXT.scope(
+                process_execution_ctx,
+                async move {
+                    tracing::info!(run_id = %rid, "Sub-agent process starting");
 
-                let worker_result = run_sub_agent_process(
-                    &rid,
-                    &task_owned,
-                    &provider_name,
-                    &model,
-                    temperature,
-                    timeout_secs,
-                    &workspace_root,
-                    &worker_workspace_root,
-                    identity_dir.as_deref(),
-                    &allowed_tools,
-                    keep_workspace,
-                    process_scope.as_ref(),
-                )
-                .await;
+                    let worker_result = run_sub_agent_process(
+                        &rid,
+                        &task_owned,
+                        &provider_name,
+                        &model,
+                        api_key.as_deref(),
+                        temperature,
+                        timeout_secs,
+                        max_iterations,
+                        &workspace_root,
+                        &worker_workspace_root,
+                        identity_dir.as_deref(),
+                        &allowed_tools,
+                        keep_workspace,
+                        process_scope.as_ref(),
+                        process_spawn_depth,
+                        &process_session_scope_key,
+                        process_parent_run_id.as_deref(),
+                        &process_compaction_config,
+                    )
+                    .await;
 
-                let (status, result_text) = match worker_result {
-                    Ok(result) if result.success => (
-                        SubAgentStatus::Completed(result.output.clone()),
-                        result.output,
-                    ),
-                    Ok(result) => {
-                        let error = result.error.unwrap_or_else(|| "worker failed".to_string());
-                        let msg = format!("Sub-agent error: {error}");
-                        (SubAgentStatus::Failed(error), msg)
+                    let (status, result_text) = match worker_result {
+                        Ok(result) if result.success => (
+                            SubAgentStatus::Completed(result.output.clone()),
+                            result.output,
+                        ),
+                        Ok(result) => {
+                            let error = result.error.unwrap_or_else(|| "worker failed".to_string());
+                            let msg = format!("Sub-agent error: {error}");
+                            (SubAgentStatus::Failed(error), msg)
+                        }
+                        Err(error) => {
+                            let msg = format!("Sub-agent process error: {error}");
+                            (SubAgentStatus::Failed(error.to_string()), msg)
+                        }
+                    };
+
+                    {
+                        let mut runs = active_runs.write().await;
+                        if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
+                            run.status = status;
+                            run.steer_tx = None;
+                        }
                     }
-                    Err(error) => {
-                        let msg = format!("Sub-agent process error: {error}");
-                        (SubAgentStatus::Failed(error.to_string()), msg)
-                    }
-                };
 
-                {
-                    let mut runs = active_runs.write().await;
-                    if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
-                        run.status = status;
-                        run.steer_tx = None;
+                    if let Some(target) = recipient {
+                        let announce = format!("🤖 Sub-agent `{rid}` completed:\n\n{result_text}");
+                        let msg = SendMessage::new(&announce, &target);
+                        if let Err(error) = channel.send(&msg).await {
+                            tracing::error!(
+                                run_id = %rid,
+                                "Failed to announce sub-agent process result: {error}"
+                            );
+                        }
                     }
-                }
 
-                if let Some(target) = recipient {
-                    let announce = format!("🤖 Sub-agent `{rid}` completed:\n\n{result_text}");
-                    let msg = SendMessage::new(&announce, &target);
-                    if let Err(error) = channel.send(&msg).await {
-                        tracing::error!(
-                            run_id = %rid,
-                            "Failed to announce sub-agent process result: {error}"
-                        );
-                    }
-                }
-
-                tracing::info!(run_id = %rid, "Sub-agent process finished");
-            });
+                    tracing::info!(run_id = %rid, "Sub-agent process finished");
+                },
+            ));
 
             {
                 let mut runs = self.active_runs.write().await;
@@ -618,21 +813,38 @@ impl Tool for SessionsSpawnTool {
                 abort_handle: None,
                 history: history_arc.clone(),
                 steer_tx: Some(steer_tx),
+                parent_run_id: parent_run_id.clone(),
+                session_scope_key: session_scope_key.clone(),
+                spawn_depth,
             });
         }
 
         // Clone everything the spawned task needs
         let channel = self.channel.clone();
-        let provider = self.provider.clone();
-        let provider_name = self.provider_name.clone();
-        let model = model_override.unwrap_or_else(|| {
-            selected_agent
-                .as_ref()
-                .map(|(_, cfg)| cfg.model.trim().to_string())
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| self.model.clone())
-        });
-        let temperature = self.temperature;
+        let provider_name = resolved_provider_name;
+        let model = resolved_model;
+        let temperature = resolved_temperature;
+        let max_iterations = resolved_max_iterations;
+        let provider = if selected_agent.is_some() && provider_name != self.provider_name {
+            match providers::create_provider_with_options(
+                &provider_name,
+                resolved_api_key.as_deref(),
+                &self.provider_runtime_options,
+            ) {
+                Ok(provider) => Arc::<dyn Provider>::from(provider),
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Failed to create provider '{provider_name}' for sessions_spawn: {error}"
+                        )),
+                    });
+                }
+            }
+        } else {
+            self.provider.clone()
+        };
         let active_runs = self.active_runs.clone();
         let rid = run_id.clone();
         let task_owned = task.to_string();
@@ -641,6 +853,12 @@ impl Tool for SessionsSpawnTool {
         let multimodal_config = self.multimodal_config.clone();
         let security = self.security.clone();
         let task_scope = spawn_scope.clone();
+        let compaction_config = self.compaction_config.clone();
+        let task_execution_ctx = SpawnExecutionContext {
+            run_id: rid.clone(),
+            session_scope_key: session_scope_key.clone(),
+            spawn_depth,
+        };
         let (system_prompt, filtered_tools) = if let Some((agent, cfg)) = selected_agent {
             let identity_prompt = cfg
                 .identity_dir
@@ -673,64 +891,68 @@ impl Tool for SessionsSpawnTool {
         };
 
         // Spawn async task (fire-and-forget); capture handle to support kill
-        let jh = tokio::spawn(async move {
-            tracing::info!(run_id = %rid, "Sub-agent task starting");
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                run_sub_agent_task(
-                    &task_owned,
-                    provider,
-                    &provider_name,
-                    &model,
-                    temperature,
-                    filtered_tools,
-                    &system_prompt,
-                    &workspace_dir,
-                    security,
-                    &multimodal_config,
-                    steer_rx,
-                    history_arc,
-                    task_scope,
-                ),
-            )
-            .await;
-            tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
+        let jh = tokio::spawn(
+            SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
+                tracing::info!(run_id = %rid, "Sub-agent task starting");
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    run_sub_agent_task(
+                        &task_owned,
+                        provider,
+                        &provider_name,
+                        &model,
+                        temperature,
+                        filtered_tools,
+                        &system_prompt,
+                        &workspace_dir,
+                        security,
+                        &multimodal_config,
+                        &compaction_config,
+                        max_iterations,
+                        steer_rx,
+                        history_arc,
+                        task_scope,
+                    ),
+                )
+                .await;
+                tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
 
-            let (status, result_text) = match result {
-                Ok(Ok(text)) => (SubAgentStatus::Completed(text.clone()), text),
-                Ok(Err(e)) => {
-                    let msg = format!("Sub-agent error: {e}");
-                    (SubAgentStatus::Failed(e.to_string()), msg)
-                }
-                Err(_) => {
-                    let msg = format!("Sub-agent timed out after {timeout_secs}s");
-                    (SubAgentStatus::Failed("timeout".into()), msg)
-                }
-            };
+                let (status, result_text) = match result {
+                    Ok(Ok(text)) => (SubAgentStatus::Completed(text.clone()), text),
+                    Ok(Err(e)) => {
+                        let msg = format!("Sub-agent error: {e}");
+                        (SubAgentStatus::Failed(e.to_string()), msg)
+                    }
+                    Err(_) => {
+                        let msg = format!("Sub-agent timed out after {timeout_secs}s");
+                        (SubAgentStatus::Failed("timeout".into()), msg)
+                    }
+                };
 
-            // Update run status
-            {
-                let mut runs = active_runs.write().await;
-                if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
-                    run.status = status;
-                    run.steer_tx = None; // drop sender — no more steering possible
+                // Update run status
+                {
+                    let mut runs = active_runs.write().await;
+                    if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
+                        run.status = status;
+                        run.steer_tx = None; // drop sender — no more steering possible
+                    }
                 }
-            }
 
-            // Announce result back to channel if we have a recipient
-            if let Some(target) = recipient {
-                let announce = format!("🤖 Sub-agent `{rid}` completed:\n\n{result_text}");
-                let msg = SendMessage::new(&announce, &target);
-                if let Err(e) = channel.send(&msg).await {
-                    tracing::error!(run_id = %rid, "Failed to announce sub-agent result: {e}");
+                // Announce result back to channel if we have a recipient
+                if let Some(target) = recipient {
+                    let announce = format!("🤖 Sub-agent `{rid}` completed:\n\n{result_text}");
+                    let msg = SendMessage::new(&announce, &target);
+                    if let Err(e) = channel.send(&msg).await {
+                        tracing::error!(run_id = %rid, "Failed to announce sub-agent result: {e}");
+                    }
+                } else {
+                    tracing::warn!(
+                        run_id = %rid,
+                        "Sub-agent completed but no recipient configured for announcement"
+                    );
                 }
-            } else {
-                tracing::warn!(
-                    run_id = %rid,
-                    "Sub-agent completed but no recipient configured for announcement"
-                );
-            }
-        });
+            }),
+        );
 
         // Store the abort handle so kill action can cancel this run
         {
@@ -775,7 +997,11 @@ impl SessionsSpawnTool {
                     SubAgentStatus::Failed(e) => format!("❌ failed: {e}"),
                 };
                 let age = (Utc::now() - r.started_at).num_seconds();
-                format!("• `{}` [{age}s ago] {status}\n  task: {}", r.id, r.task)
+                let parent = r.parent_run_id.as_deref().unwrap_or("root");
+                format!(
+                    "• `{}` [{age}s ago] {status}\n  task: {}\n  depth: {} | parent: {}",
+                    r.id, r.task, r.spawn_depth, parent
+                )
             })
             .collect();
 
@@ -1068,7 +1294,7 @@ fn resolve_tools_for_agent(
 }
 
 /// Maximum tool-call iterations for a sub-agent run (per steering segment).
-const SUB_AGENT_MAX_ITERATIONS: usize = 15;
+const SUB_AGENT_MAX_ITERATIONS: usize = 200;
 
 /// Convert a slice of `ChatMessage` to `HistoryEntry` values.
 /// Each entry is timestamped with the current wall-clock time (approximate).
@@ -1103,6 +1329,8 @@ async fn run_sub_agent_task(
     workspace_dir: &std::path::Path,
     security: Arc<SecurityPolicy>,
     multimodal_config: &MultimodalConfig,
+    compaction_config: &AgentCompactionConfig,
+    max_iterations: usize,
     mut steer_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     history_out: Arc<RwLock<Vec<HistoryEntry>>>,
     scope: Option<SpawnScope>,
@@ -1149,6 +1377,7 @@ async fn run_sub_agent_task(
         let tr = tools_registry.clone();
         let wd = workspace_dir.to_path_buf();
         let mc = multimodal_config.clone();
+        let cc = compaction_config.clone();
         let ct = cancel_token.clone();
         let security = security.clone();
         let scope_owned = scope.clone();
@@ -1177,7 +1406,8 @@ async fn run_sub_agent_task(
                 None, // no approval manager
                 "sessions_spawn",
                 &mc,
-                SUB_AGENT_MAX_ITERATIONS,
+                max_iterations,
+                Some(&cc),
                 Some(ct),
                 None, // no streaming sender
                 scope_ctx.as_ref(),
@@ -1298,14 +1528,20 @@ async fn run_sub_agent_process(
     task: &str,
     provider_name: &str,
     model: &str,
+    api_key: Option<&str>,
     temperature: f64,
     timeout_secs: u64,
+    max_iterations: usize,
     workspace_root: &std::path::Path,
     worker_workspace_root: &std::path::Path,
     agent_identity_dir: Option<&str>,
     allowed_tools: &[String],
     keep_workspace: bool,
     scope: Option<&SpawnScope>,
+    spawn_depth: usize,
+    session_scope_key: &str,
+    parent_run_id: Option<&str>,
+    compaction_config: &AgentCompactionConfig,
 ) -> anyhow::Result<WorkerResult> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1340,17 +1576,23 @@ async fn run_sub_agent_process(
         task: task.to_string(),
         provider_name: provider_name.to_string(),
         model: model.to_string(),
+        api_key: api_key.map(str::to_string),
         temperature,
         workspace_dir: worker_workspace.clone(),
         memory_db_path: worker_workspace.join("brain.db"),
         allowed_tools: allowed_tools.to_vec(),
         timeout_seconds: timeout_secs,
+        max_iterations,
         system_prompt: None,
         identity_dir,
         scope_sender: scope.map(|ctx| ctx.sender.clone()),
         scope_channel: scope.map(|ctx| ctx.channel.clone()),
         scope_chat_type: scope.map(|ctx| ctx.chat_type.clone()),
         scope_chat_id: scope.map(|ctx| ctx.chat_id.clone()),
+        spawn_depth,
+        session_scope_key: session_scope_key.to_string(),
+        parent_run_id: parent_run_id.map(str::to_string),
+        compaction_config: Some(compaction_config.clone()),
     };
 
     let executable = std::env::current_exe()?;
@@ -1581,7 +1823,7 @@ mod tests {
 
     fn make_agent_config(identity_dir: Option<String>) -> DelegateAgentConfig {
         DelegateAgentConfig {
-            provider: "openrouter".to_string(),
+            provider: "test-provider".to_string(),
             model: "agent-model".to_string(),
             system_prompt: None,
             api_key: None,
@@ -1600,6 +1842,18 @@ mod tests {
         channel: Arc<dyn Channel>,
         provider: Arc<dyn crate::providers::Provider>,
     ) -> SessionsSpawnTool {
+        make_tool_with_spawn_config(
+            channel,
+            provider,
+            crate::config::SessionsSpawnConfig::default(),
+        )
+    }
+
+    fn make_tool_with_spawn_config(
+        channel: Arc<dyn Channel>,
+        provider: Arc<dyn crate::providers::Provider>,
+        spawn_config: crate::config::SessionsSpawnConfig,
+    ) -> SessionsSpawnTool {
         SessionsSpawnTool::new(
             channel,
             provider,
@@ -1609,8 +1863,11 @@ mod tests {
             test_security(),
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
+            crate::config::AgentCompactionConfig::default(),
             HashMap::new(),
-            crate::config::SessionsSpawnConfig::default(),
+            None,
+            crate::providers::ProviderRuntimeOptions::default(),
+            spawn_config,
         )
     }
 
@@ -1764,6 +2021,85 @@ mod tests {
         let messages = sent.lock().await;
         // Should have sent to explicit-recipient (check channel.sent has a message)
         assert_eq!(messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_rejected_when_max_concurrent_reached() {
+        let (ch, _) = RecordingChannel::new();
+        let mut spawn_cfg = crate::config::SessionsSpawnConfig::default();
+        spawn_cfg.max_concurrent = 0;
+        let tool = make_tool_with_spawn_config(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "ok".into(),
+            }),
+            spawn_cfg,
+        );
+
+        let result = tool.execute(json!({"task": "blocked"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("max_concurrent"));
+    }
+
+    #[tokio::test]
+    async fn spawn_rejected_when_depth_exceeded() {
+        let (ch, _) = RecordingChannel::new();
+        let mut spawn_cfg = crate::config::SessionsSpawnConfig::default();
+        spawn_cfg.max_spawn_depth = 0;
+        let tool = make_tool_with_spawn_config(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "ok".into(),
+            }),
+            spawn_cfg,
+        );
+
+        let result = SPAWN_EXECUTION_CONTEXT
+            .scope(
+                SpawnExecutionContext {
+                    run_id: "parent-run".to_string(),
+                    session_scope_key: "signal:group:test".to_string(),
+                    spawn_depth: 0,
+                },
+                async { tool.execute(json!({"task": "nested"})).await },
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("max_spawn_depth"));
+    }
+
+    #[tokio::test]
+    async fn spawn_rejected_when_max_children_per_session_reached() {
+        let (ch, _) = RecordingChannel::new();
+        let mut spawn_cfg = crate::config::SessionsSpawnConfig::default();
+        spawn_cfg.max_children_per_agent = 0;
+        let tool = make_tool_with_spawn_config(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "ok".into(),
+            }),
+            spawn_cfg,
+        );
+
+        let result = tool
+            .execute(json!({
+                "task": "child",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "sender": "zeroclaw_user",
+                    "channel": "signal",
+                    "chat_type": "direct",
+                    "chat_id": "+15551234567"
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("max_children_per_agent"));
     }
 
     #[tokio::test]
@@ -1938,7 +2274,10 @@ mod tests {
             test_security(),
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
+            crate::config::AgentCompactionConfig::default(),
             agents,
+            None,
+            crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
         );
         let result = tool
@@ -1967,7 +2306,10 @@ mod tests {
             test_security(),
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
+            crate::config::AgentCompactionConfig::default(),
             agents,
+            None,
+            crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
         );
         let result = tool
@@ -2004,7 +2346,10 @@ mod tests {
             test_security(),
             ws.path().to_path_buf(),
             crate::config::MultimodalConfig::default(),
+            crate::config::AgentCompactionConfig::default(),
             agents,
+            None,
+            crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
         );
         tool.set_default_recipient(Some("test-recipient".to_string()))
@@ -2030,17 +2375,23 @@ mod tests {
             task: "say \"hello\"".to_string(),
             provider_name: "provider".to_string(),
             model: "model".to_string(),
+            api_key: None,
             temperature: 0.7,
             workspace_dir: std::path::PathBuf::from("/tmp/ws"),
             memory_db_path: std::path::PathBuf::from("/tmp/ws/brain.db"),
             allowed_tools: vec!["shell".to_string()],
             timeout_seconds: 30,
+            max_iterations: 20,
             system_prompt: None,
             identity_dir: None,
             scope_sender: None,
             scope_channel: None,
             scope_chat_type: None,
             scope_chat_id: None,
+            spawn_depth: 0,
+            session_scope_key: "sessions_spawn:global".to_string(),
+            parent_run_id: None,
+            compaction_config: None,
         };
 
         let args = build_session_worker_cli_args(&manifest).unwrap();

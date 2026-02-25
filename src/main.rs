@@ -126,6 +126,7 @@ mod cost;
 mod cron;
 mod daemon;
 mod doctor;
+mod evolution_cli;
 mod gateway;
 mod hardware;
 mod health;
@@ -159,9 +160,9 @@ use config::Config;
 // Re-export so binary's hardware/peripherals modules can use crate::HardwareCommands etc.
 pub use zeroclaw::{HardwareCommands, PeripheralCommands};
 
-/// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
+/// `OpenPRX` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
-#[command(name = "zeroclaw")]
+#[command(name = "openprx")]
 #[command(author = "theonlyhennygod")]
 #[command(version = "0.1.0")]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
@@ -238,10 +239,10 @@ Launches an interactive chat session with the configured AI provider. \
 Use --message for single-shot queries without entering interactive mode.
 
 Examples:
-  zeroclaw agent                              # interactive session
-  zeroclaw agent -m \"Summarize today's logs\"  # single message
-  zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
-  zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
+  openprx agent                              # interactive session
+  openprx agent -m \"Summarize today's logs\"  # single message
+  openprx agent -p anthropic --model claude-sonnet-4-20250514
+  openprx agent --peripheral nucleo-f401re:/dev/ttyACM0")]
     Agent {
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
@@ -273,10 +274,10 @@ and WebSocket connections. Bind address defaults to the values in \
 your config file (gateway.host / gateway.port).
 
 Examples:
-  zeroclaw gateway                  # use config defaults
-  zeroclaw gateway -p 8080          # listen on port 8080
-  zeroclaw gateway --host 0.0.0.0   # bind to all interfaces
-  zeroclaw gateway -p 0             # random available port")]
+  openprx gateway                  # use config defaults
+  openprx gateway -p 8080          # listen on port 8080
+  openprx gateway --host 0.0.0.0   # bind to all interfaces
+  openprx gateway -p 0             # random available port")]
     Gateway {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -291,18 +292,18 @@ Examples:
     #[command(long_about = "\
 Start the long-running autonomous daemon.
 
-Launches the full ZeroClaw runtime: gateway server, all configured \
+Launches the full OpenPRX runtime: gateway server, all configured \
 channels (Telegram, Discord, Slack, etc.), heartbeat monitor, and \
-the cron scheduler. This is the recommended way to run ZeroClaw in \
+the cron scheduler. This is the recommended way to run OpenPRX in \
 production or as an always-on assistant.
 
-Use 'zeroclaw service install' to register the daemon as an OS \
+Use 'openprx service install' to register the daemon as an OS \
 service (systemd/launchd) for auto-start on boot.
 
 Examples:
-  zeroclaw daemon                   # use config defaults
-  zeroclaw daemon -p 9090           # gateway on port 9090
-  zeroclaw daemon --host 127.0.0.1  # localhost only")]
+  openprx daemon                   # use config defaults
+  openprx daemon -p 9090           # gateway on port 9090
+  openprx daemon --host 127.0.0.1  # localhost only")]
     Daemon {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -332,6 +333,15 @@ Examples:
     /// Show system status (full details)
     Status,
 
+    /// Evolution dashboard and operations
+    Evolution {
+        /// Output machine-readable JSON
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        evolution_command: EvolutionCommands,
+    },
+
     /// Configure and manage scheduled tasks
     #[command(long_about = "\
 Configure and manage scheduled tasks.
@@ -344,14 +354,14 @@ Cron expressions use the standard 5-field format: \
 override with --tz and an IANA timezone name.
 
 Examples:
-  zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  zeroclaw cron add '*/30 * * * *' 'Check system health'
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
-  zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes'
-  zeroclaw cron pause <task-id>
-  zeroclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
+  openprx cron list
+  openprx cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
+  openprx cron add '*/30 * * * *' 'Check system health'
+  openprx cron add-at 2025-01-15T14:00:00Z 'Send reminder'
+  openprx cron add-every 60000 'Ping heartbeat'
+  openprx cron once 30m 'Run backup in 30 minutes'
+  openprx cron pause <task-id>
+  openprx cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
     Cron {
         #[command(subcommand)]
         cron_command: CronCommands,
@@ -370,16 +380,16 @@ Examples:
     #[command(long_about = "\
 Manage communication channels.
 
-Add, remove, list, and health-check channels that connect ZeroClaw \
+Add, remove, list, and health-check channels that connect OpenPRX \
 to messaging platforms. Supported channel types: telegram, discord, \
 slack, whatsapp, matrix, imessage, email.
 
 Examples:
-  zeroclaw channel list
-  zeroclaw channel doctor
-  zeroclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
-  zeroclaw channel remove my-bot
-  zeroclaw channel bind-telegram zeroclaw_user")]
+  openprx channel list
+  openprx channel doctor
+  openprx channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
+  openprx channel remove my-bot
+  openprx channel bind-telegram openprx_user")]
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
@@ -418,9 +428,9 @@ Enumerate connected USB devices, identify known development boards \
 probe-rs / ST-Link.
 
 Examples:
-  zeroclaw hardware discover
-  zeroclaw hardware introspect /dev/ttyACM0
-  zeroclaw hardware info --chip STM32F401RETx")]
+  openprx hardware discover
+  openprx hardware introspect /dev/ttyACM0
+  openprx hardware info --chip STM32F401RETx")]
     Hardware {
         #[command(subcommand)]
         hardware_command: zeroclaw::HardwareCommands,
@@ -435,11 +445,11 @@ to the agent (GPIO, sensors, actuators). Supported boards: \
 nucleo-f401re, rpi-gpio, esp32, arduino-uno.
 
 Examples:
-  zeroclaw peripheral list
-  zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
-  zeroclaw peripheral add rpi-gpio native
-  zeroclaw peripheral flash --port /dev/cu.usbmodem12345
-  zeroclaw peripheral flash-nucleo")]
+  openprx peripheral list
+  openprx peripheral add nucleo-f401re /dev/ttyACM0
+  openprx peripheral add rpi-gpio native
+  openprx peripheral flash --port /dev/cu.usbmodem12345
+  openprx peripheral flash-nucleo")]
     Peripheral {
         #[command(subcommand)]
         peripheral_command: zeroclaw::PeripheralCommands,
@@ -447,15 +457,15 @@ Examples:
 
     /// Manage configuration
     #[command(long_about = "\
-Manage ZeroClaw configuration.
+Manage OpenPRX configuration.
 
 Inspect and export configuration settings. Use 'schema' to dump \
 the full JSON Schema for the config file, which documents every \
 available key, type, and default value.
 
 Examples:
-  zeroclaw config schema              # print JSON Schema to stdout
-  zeroclaw config schema > schema.json")]
+  openprx config schema              # print JSON Schema to stdout
+  openprx config schema > schema.json")]
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
@@ -482,14 +492,14 @@ Examples:
 
     /// Generate shell completion script to stdout
     #[command(long_about = "\
-Generate shell completion scripts for `zeroclaw`.
+Generate shell completion scripts for `openprx`.
 
 The script is printed to stdout so it can be sourced directly:
 
 Examples:
-  source <(zeroclaw completions bash)
-  zeroclaw completions zsh > ~/.zfunc/_zeroclaw
-  zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish")]
+  source <(openprx completions bash)
+  openprx completions zsh > ~/.zfunc/_openprx
+  openprx completions fish > ~/.config/fish/completions/openprx.fish")]
     Completions {
         /// Target shell
         #[arg(value_enum)]
@@ -501,6 +511,42 @@ Examples:
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout
     Schema,
+}
+
+#[derive(Subcommand, Debug)]
+enum EvolutionCommands {
+    /// Show evolution runtime status dashboard
+    Status,
+    /// Show evolution history from JSONL logs
+    History {
+        /// Maximum rows to display
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Show daily digest by date (YYYY-MM-DD)
+    Digest {
+        /// Date in YYYY-MM-DD format (default: today UTC)
+        #[arg(long)]
+        date: Option<String>,
+    },
+    /// Show parsed evolution_config.toml
+    Config,
+    /// Manually trigger one evolution cycle
+    Trigger {
+        /// Layer choice: L1 (memory), L2 (prompt), L3 (strategy/policy)
+        #[arg(long, value_enum)]
+        layer: Option<EvolutionLayerArg>,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum EvolutionLayerArg {
+    #[value(name = "L1")]
+    L1,
+    #[value(name = "L2")]
+    L2,
+    #[value(name = "L3")]
+    L3,
 }
 
 #[derive(Subcommand, Debug)]
@@ -588,7 +634,7 @@ enum AuthCommands {
 
 #[derive(Subcommand, Debug)]
 enum MigrateCommands {
-    /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
+    /// Import memory from an `OpenClaw` workspace into this `OpenPRX` workspace
     Openclaw {
         /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
         #[arg(long)]
@@ -765,7 +811,7 @@ async fn main() -> Result<()> {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
         }
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir);
+        std::env::set_var("OPENPRX_CONFIG_DIR", config_dir);
     }
 
     // session-worker must stay stdout-clean for IPC JSON.
@@ -846,7 +892,11 @@ async fn main() -> Result<()> {
             .await
         }?;
         // Auto-start channels if user said yes during wizard
-        if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
+        if std::env::var("OPENPRX_AUTOSTART_CHANNELS")
+            .or_else(|_| std::env::var("ZEROCLAW_AUTOSTART_CHANNELS"))
+            .as_deref()
+            == Ok("1")
+        {
             channels::start_channels(config).await?;
         }
         return Ok(());
@@ -875,9 +925,9 @@ async fn main() -> Result<()> {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
-                info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+                info!("🚀 Starting OpenPRX Gateway on {host} (random port)");
             } else {
-                info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+                info!("🚀 Starting OpenPRX Gateway on {host}:{port}");
             }
             gateway::run_gateway(&host, port, config).await
         }
@@ -886,16 +936,16 @@ async fn main() -> Result<()> {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
-                info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
+                info!("🧠 Starting OpenPRX Daemon on {host} (random port)");
             } else {
-                info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
+                info!("🧠 Starting OpenPRX Daemon on {host}:{port}");
             }
             let _self_system_task = spawn_self_system_runtime(&config);
             daemon::run(config, host, port).await
         }
 
         Commands::Status => {
-            println!("🦀 ZeroClaw Status");
+            println!("🦀 OpenPRX Status");
             println!();
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
             println!("Workspace:   {}", config.workspace_dir.display());
@@ -978,6 +1028,11 @@ async fn main() -> Result<()> {
 
             Ok(())
         }
+
+        Commands::Evolution {
+            json,
+            evolution_command,
+        } => evolution_cli::handle_command(evolution_command, json, &config).await,
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
@@ -1330,7 +1385,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 Err(e) => {
                     println!("Callback capture failed: {e}");
                     println!(
-                            "Run `zeroclaw auth paste-redirect --provider openai-codex --profile {profile}`"
+                            "Run `openprx auth paste-redirect --provider openai-codex --profile {profile}`"
                         );
                     return Ok(());
                 }
@@ -1360,7 +1415,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             let pending = load_pending_openai_login(config)?.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "No pending OpenAI login found. Run `zeroclaw auth login --provider openai-codex` first."
+                    "No pending OpenAI login found. Run `openprx auth login --provider openai-codex` first."
                 )
             })?;
 
@@ -1465,7 +1520,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 }
                 None => {
                     bail!(
-                        "No OpenAI Codex auth profile found. Run `zeroclaw auth login --provider openai-codex`."
+                        "No OpenAI Codex auth profile found. Run `openprx auth login --provider openai-codex`."
                     )
                 }
             }
@@ -1573,7 +1628,7 @@ mod tests {
     #[test]
     fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
         let cli = Cli::try_parse_from([
-            "zeroclaw",
+            "openprx",
             "onboard",
             "--provider",
             "openrouter",
@@ -1606,7 +1661,7 @@ mod tests {
     #[test]
     fn completions_cli_parses_supported_shells() {
         for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
-            let cli = Cli::try_parse_from(["zeroclaw", "completions", shell])
+            let cli = Cli::try_parse_from(["openprx", "completions", shell])
                 .expect("completions invocation should parse");
             match cli.command {
                 Commands::Completions { .. } => {}
@@ -1622,7 +1677,7 @@ mod tests {
             .expect("completion generation should succeed");
         let script = String::from_utf8(output).expect("completion output should be valid utf-8");
         assert!(
-            script.contains("zeroclaw"),
+            script.contains("openprx"),
             "completion script should reference binary name"
         );
     }

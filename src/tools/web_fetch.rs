@@ -121,7 +121,7 @@ impl Tool for WebFetchTool {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent("Mozilla/5.0 (compatible; ZeroClaw/1.0; +https://zeroclaw.ai)")
+            .user_agent("Mozilla/5.0 (compatible; OpenPRX/1.0; +https://openprx.dev)")
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()?;
 

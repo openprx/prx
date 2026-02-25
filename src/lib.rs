@@ -163,7 +163,7 @@ pub(crate) enum SkillCommands {
 /// Migration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum MigrateCommands {
-    /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
+    /// Import memory from an `OpenClaw` workspace into this `OpenPRX` workspace
     Openclaw {
         /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
         #[arg(long)]
@@ -369,9 +369,9 @@ Examples:
         /// Path for serial transport (/dev/ttyACM0) or "native" for local GPIO
         path: String,
     },
-    /// Flash ZeroClaw firmware to Arduino (creates .ino, installs arduino-cli if needed, uploads)
+    /// Flash OpenPRX firmware to Arduino (creates .ino, installs arduino-cli if needed, uploads)
     #[command(long_about = "\
-Flash ZeroClaw firmware to an Arduino board.
+Flash OpenPRX firmware to an Arduino board.
 
 Generates the .ino sketch, installs arduino-cli if it is not \
 already available, compiles, and uploads the firmware.
@@ -391,6 +391,6 @@ Examples:
         #[arg(long)]
         host: Option<String>,
     },
-    /// Flash ZeroClaw firmware to Nucleo-F401RE (builds + probe-rs run)
+    /// Flash OpenPRX firmware to Nucleo-F401RE (builds + probe-rs run)
     FlashNucleo,
 }
