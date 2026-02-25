@@ -48,9 +48,59 @@ See [LICENSE](LICENSE) (MIT) and [LICENSE-APACHE](LICENSE-APACHE) for full terms
 | HuggingFace | Open models | Inference API |
 | Compatible | Any OpenAI-compatible | Custom base URL |
 
+Provider features: automatic fallback chains, model routing, token refresh, rate limiting.
+
 ### Multi-Channel (19 channels)
 
 Signal · WhatsApp (whatsmeow) · WhatsApp CLI (wacli) · Telegram · Discord · Slack · iMessage · Matrix · IRC · Email · DingTalk · Lark/Feishu · QQ · Mattermost · Nextcloud Talk · LinQ · CLI
+
+### 45+ Built-in Tools
+
+| Category | Tools |
+|----------|-------|
+| **Shell & Files** | `shell`, `file_read`, `file_write`, `git_operations` |
+| **Web** | `web_search`, `web_fetch`, `http_request` |
+| **Browser** | `browser` (automation), `browser_open`, `screenshot`, `canvas` |
+| **Memory** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `memory_forget` |
+| **Messaging** | `message_send`, `tts` (text-to-speech) |
+| **Sessions** | `sessions_spawn`, `sessions_send`, `sessions_list`, `sessions_history`, `session_status`, `subagents`, `delegate` |
+| **Scheduling** | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_run`, `cron_runs`, `schedule` |
+| **Images** | `image`, `image_info` |
+| **MCP** | `mcp` (Model Context Protocol client — connect to any MCP server) |
+| **Remote Nodes** | `nodes` (control paired devices — camera, screen, location, run commands) |
+| **Infrastructure** | `gateway`, `config_reload`, `proxy_config`, `agents_list` |
+| **Integrations** | `composio` (1000+ OAuth apps), `pushover` (notifications) |
+| **Hardware** | `hardware_board_info`, `hardware_memory_map`, `hardware_memory_read` (ESP32/Arduino) |
+
+### Hooks System
+
+Event-driven hooks for extending agent behavior without modifying core code:
+
+- **Hook events**: `agent_start`, `agent_end`, `llm_request`, `llm_response`, `tool_call_start`, `tool_call_end`, `message_received`, `message_sent`
+- **Configuration**: `hooks.json` in workspace — map events to shell commands
+- **Use cases**: Logging, metrics, external notifications, custom workflows
+- **Timeout protection**: Configurable per-hook timeout (default 5s)
+
+### Webhook Receiver
+
+Built-in HTTP webhook endpoint for receiving external events:
+
+- HMAC-SHA256 signature verification
+- Memory-backed event storage
+- Route external events (GitHub, CI/CD, monitoring) into agent context
+
+### Remote Nodes
+
+Pair and control remote devices over HTTP/2:
+
+- **Camera**: Snap photos (front/back), record clips
+- **Screen**: Screen recording and capture
+- **Location**: GPS coordinates
+- **Run**: Execute commands on paired devices
+- **Notify**: Push notifications to devices
+- **Transport**: HTTP/2 with TLS, pairing-based authentication
+
+Includes `zeroclaw-node` binary for running on remote devices (Raspberry Pi, phones, etc.).
 
 ### Self-Evolution System
 
@@ -66,23 +116,49 @@ Record (realtime) → Analyze (daily) → Evolve (every 3 days)
 - **Evolution engines**: Memory evolution, prompt evolution, strategy evolution
 - **Safety**: Rollback capability, gate checks, shadow mode for first rounds
 - **Pipeline**: Scheduler, pipeline orchestration, annotation system
+- **22 modules, ~9500 lines** of evolution infrastructure
 
 ### Subagent Governance
 
+- **Spawn**: `sessions_spawn` with isolated or persistent sessions
+- **Delegate**: `delegate` for inline sub-agent execution
 - Max concurrent subagents (default: 4)
 - Max spawn depth (default: 2) — propagated across processes
 - Max children per agent (default: 5)
 - Config inheritance: provider, model, API key, iterations, compaction
 - Isolated sessions with configurable timeouts
 
+### Memory System
+
+Multiple storage backends with unified API:
+
+| Backend | Description |
+|---------|-------------|
+| **SQLite** | Default, local, FTS5 full-text search + vector search |
+| **Lucid** | Lightweight markdown-based memory |
+| **PostgreSQL** | Scalable, multi-user |
+| **Markdown** | File-based, human-readable |
+
+Features: memory ACL (per-user/per-project access control), topic system, embedding cache, chunking, snapshot/restore, hygiene (auto-cleanup).
+
 ### Security
 
+- **Sandboxing**: Bubblewrap, Firejail, Landlock (Linux kernel), Docker — pluggable backends
 - **DM policy**: Allowlist / open / disabled per channel
 - **Group policy**: Allowlist / open with group-level filtering
 - **Context compaction**: Token-threshold trigger, full-chain propagation
 - **Gateway timeout**: Configurable (default 60s, recommended 180s for complex tasks)
 - **Path validation**: Workspace-scoped file access with symlink protection
 - **Memory ACL**: Per-user, per-project access control with audit logging
+- **Encrypted secret store**: For API keys, OAuth tokens
+- **Pairing authentication**: For remote node connections
+
+### Cron & Scheduling
+
+- Cron expressions, intervals, or one-shot timers
+- Per-job session isolation (main session or isolated)
+- `systemEvent` (inject into session) or `agentTurn` (run agent)
+- Delivery: announce to chat, webhook POST, or silent
 
 ### Heartbeat
 
@@ -90,6 +166,21 @@ Record (realtime) → Analyze (daily) → Evolve (every 3 days)
 - Custom heartbeat prompt
 - Background task scheduling via cron
 - Proactive checks (email, calendar, weather)
+
+### Observability
+
+- **OpenTelemetry**: Traces and metrics export
+- **Prometheus**: Metrics endpoint
+- **Structured logging**: Tracing with env-filter
+- **Verbose mode**: Detailed tool/LLM interaction logging
+
+### Hardware Support
+
+ESP32 and Arduino firmware for physical agent nodes:
+
+- `firmware/zeroclaw-esp32` — Rust firmware for ESP32
+- `firmware/zeroclaw-esp32-ui` — UI firmware
+- `firmware/zeroclaw-uno-q-bridge` — Arduino Uno bridge
 
 ## Quick Start
 
