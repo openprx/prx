@@ -459,8 +459,9 @@ impl SignalChannel {
             return None;
         }
         let sender = Self::sender(envelope)?;
+        let is_group_message = data_msg.group_info.is_some();
 
-        if !self.is_sender_allowed(&sender) {
+        if !is_group_message && !self.is_sender_allowed(&sender) {
             return None;
         }
 
