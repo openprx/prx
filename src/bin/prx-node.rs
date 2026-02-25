@@ -4,7 +4,7 @@ use serde::Deserialize;
 use zeroclaw::config::{NodeServerConfig, NodesConfig};
 
 #[derive(Parser, Debug)]
-#[command(name = "zeroclaw-node")]
+#[command(name = "prx-node")]
 #[command(about = "OpenPRX remote node server")]
 struct Cli {
     #[arg(long)]
