@@ -360,7 +360,7 @@ pub struct NodesConfig {
     /// Configured remote nodes.
     #[serde(default)]
     pub nodes: Vec<RemoteNodeConfig>,
-    /// Embedded node server defaults used by `zeroclaw-node`.
+    /// Embedded node server defaults used by `prx-node`.
     #[serde(default)]
     pub server: NodeServerConfig,
 }
@@ -414,7 +414,7 @@ fn default_nodes_enabled() -> bool {
     true
 }
 
-/// Node daemon runtime config used by `zeroclaw-node`.
+/// Node daemon runtime config used by `prx-node`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NodeServerConfig {
     /// Listen address for node daemon.

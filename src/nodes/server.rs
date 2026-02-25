@@ -50,7 +50,7 @@ pub async fn run_node_server(config: NodeServerConfig) -> Result<()> {
         .with_context(|| format!("failed to bind {}", config.listen_addr))?;
 
     tracing::info!(
-        "zeroclaw-node listening on {}, sandbox_root={}",
+        "prx-node listening on {}, sandbox_root={}",
         config.listen_addr,
         config.sandbox_root
     );
