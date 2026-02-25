@@ -60,6 +60,8 @@ const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
 const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
+const QWEN_CODING_CN_BASE_URL: &str = "https://coding.dashscope.aliyuncs.com/v1";
+const QWEN_CODING_INTL_BASE_URL: &str = "https://coding-intl.dashscope.aliyuncs.com/v1";
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
@@ -148,10 +150,18 @@ pub(crate) fn is_qwen_oauth_alias(name: &str) -> bool {
     matches!(name, "qwen-code" | "qwen-oauth" | "qwen_oauth")
 }
 
+pub(crate) fn is_qwen_coding_alias(name: &str) -> bool {
+    matches!(
+        name,
+        "dashscope-coding" | "qwen-coding" | "dashscope-coding-intl" | "qwen-coding-intl"
+    )
+}
+
 pub(crate) fn is_qwen_alias(name: &str) -> bool {
     is_qwen_cn_alias(name)
         || is_qwen_intl_alias(name)
         || is_qwen_us_alias(name)
+        || is_qwen_coding_alias(name)
         || is_qwen_oauth_alias(name)
 }
 
@@ -1005,6 +1015,16 @@ fn qwen_base_url(name: &str) -> Option<&'static str> {
     }
 }
 
+fn qwen_coding_base_url(name: &str) -> Option<&'static str> {
+    if matches!(name, "dashscope-coding" | "qwen-coding") {
+        Some(QWEN_CODING_CN_BASE_URL)
+    } else if matches!(name, "dashscope-coding-intl" | "qwen-coding-intl") {
+        Some(QWEN_CODING_INTL_BASE_URL)
+    } else {
+        None
+    }
+}
+
 fn zai_base_url(name: &str) -> Option<&'static str> {
     if is_zai_cn_alias(name) {
         Some(ZAI_CN_BASE_URL)
@@ -1420,6 +1440,12 @@ fn create_provider_with_url_and_options(
         }
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
+        ))),
+        name if qwen_coding_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "Qwen Coding Plan Pro",
+            qwen_coding_base_url(name).expect("checked in guard"),
+            key,
+            AuthStyle::Bearer,
         ))),
         name if qwen_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qwen",
@@ -2292,6 +2318,10 @@ mod tests {
         assert!(is_qwen_alias("dashscope"));
         assert!(is_qwen_alias("qwen-us"));
         assert!(is_qwen_alias("qwen-code"));
+        assert!(is_qwen_alias("qwen-coding"));
+        assert!(is_qwen_alias("dashscope-coding-intl"));
+        assert!(is_qwen_coding_alias("dashscope-coding"));
+        assert!(is_qwen_coding_alias("qwen-coding-intl"));
         assert!(is_qwen_oauth_alias("qwen-code"));
         assert!(is_qwen_oauth_alias("qwen_oauth"));
         assert!(is_claude_code_alias("claude-code"));
@@ -2361,6 +2391,22 @@ mod tests {
         assert_eq!(qwen_base_url("qwen-intl"), Some(QWEN_INTL_BASE_URL));
         assert_eq!(qwen_base_url("qwen-us"), Some(QWEN_US_BASE_URL));
         assert_eq!(qwen_base_url("qwen-code"), Some(QWEN_CN_BASE_URL));
+        assert_eq!(
+            qwen_coding_base_url("dashscope-coding"),
+            Some(QWEN_CODING_CN_BASE_URL)
+        );
+        assert_eq!(
+            qwen_coding_base_url("qwen-coding"),
+            Some(QWEN_CODING_CN_BASE_URL)
+        );
+        assert_eq!(
+            qwen_coding_base_url("dashscope-coding-intl"),
+            Some(QWEN_CODING_INTL_BASE_URL)
+        );
+        assert_eq!(
+            qwen_coding_base_url("qwen-coding-intl"),
+            Some(QWEN_CODING_INTL_BASE_URL)
+        );
 
         assert_eq!(zai_base_url("zai"), Some(ZAI_GLOBAL_BASE_URL));
         assert_eq!(zai_base_url("z.ai"), Some(ZAI_GLOBAL_BASE_URL));
@@ -2519,6 +2565,10 @@ mod tests {
         assert!(create_provider("dashscope-international", Some("key")).is_ok());
         assert!(create_provider("qwen-us", Some("key")).is_ok());
         assert!(create_provider("dashscope-us", Some("key")).is_ok());
+        assert!(create_provider("dashscope-coding", Some("key")).is_ok());
+        assert!(create_provider("qwen-coding", Some("key")).is_ok());
+        assert!(create_provider("dashscope-coding-intl", Some("key")).is_ok());
+        assert!(create_provider("qwen-coding-intl", Some("key")).is_ok());
         assert!(create_provider("qwen-code", Some("key")).is_ok());
         assert!(create_provider("qwen-oauth", Some("key")).is_ok());
     }
