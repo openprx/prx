@@ -91,6 +91,14 @@ impl MarkdownMemory {
                     timestamp: filename.to_string(),
                     session_id: None,
                     score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: None,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
                 }
             })
             .collect()

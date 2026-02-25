@@ -3,6 +3,9 @@ use crate::cron::{self, CronRun};
 use crate::health::{self, HealthSnapshot};
 use crate::memory::{Memory, MemoryCategory};
 use crate::self_system::decision_log::{log_change_outcome, log_change_proposal};
+use crate::self_system::evolution::{
+    CycleResult, EngineCycleInput, EvolutionCandidate, EvolutionEngine,
+};
 use crate::self_system::experiment::{complete_experiment, rollback_experiment, start_experiment};
 use crate::self_system::fitness::{run_fitness_report, FitnessReport};
 use async_trait::async_trait;
@@ -416,6 +419,21 @@ pub async fn run_evolution_cycle(
     cycle
 }
 
+/// Execute a layer engine and return a cycle result that is already aligned
+/// with [`EvolutionCycle`] and [`EvolutionProposal`].
+pub async fn run_engine_cycle(
+    engine: &mut dyn EvolutionEngine,
+    cycle_id: impl Into<String>,
+    analyzer_candidates: Vec<EvolutionCandidate>,
+) -> anyhow::Result<CycleResult> {
+    engine
+        .run_cycle(EngineCycleInput {
+            cycle_id: cycle_id.into(),
+            analyzer_candidates,
+        })
+        .await
+}
+
 pub async fn get_evolution_history(memory: &dyn Memory, limit: usize) -> Vec<EvolutionCycle> {
     let Ok(entries) = memory.list(Some(&MemoryCategory::Core), None).await else {
         return Vec::new();
@@ -816,6 +834,14 @@ mod tests {
                     timestamp: Utc::now().to_rfc3339(),
                     session_id: session_id.map(str::to_string),
                     score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: None,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
                 },
             );
             Ok(())

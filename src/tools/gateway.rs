@@ -1,11 +1,11 @@
-//! Gateway management tool — inspect and control the ZeroClaw daemon.
+//! Gateway management tool — inspect and control the OpenPRX daemon.
 //!
 //! Provides a minimal interface for the agent to manage its own gateway:
 //!  - `config.get` — return the current gateway configuration
 //!  - `config.patch` — apply a JSON merge patch to config.toml
 //!  - `status`     — show uptime, model, provider, and channel info
 //!  - `restart`    — trigger a graceful daemon restart via SIGHUP
-//!  - `version`    — return ZeroClaw version info
+//!  - `version`    — return OpenPRX version info
 //!  - `components` — list active runtime components
 //!
 //! Designed to align with OpenClaw's `gateway` tool interface.
@@ -131,7 +131,7 @@ impl GatewayTool {
         Self::merge_json_patch(&mut raw_json, patch);
 
         let mut patched_config: Config =
-            serde_json::from_value(raw_json).context("Patched config is invalid for ZeroClaw")?;
+            serde_json::from_value(raw_json).context("Patched config is invalid for OpenPRX")?;
         patched_config.workspace_dir = current.workspace_dir.clone();
         patched_config.config_path = current.config_path.clone();
         patched_config.save().await?;
@@ -157,7 +157,7 @@ impl Tool for GatewayTool {
     }
 
     fn description(&self) -> &str {
-        "Manage the ZeroClaw gateway daemon. \
+        "Manage the OpenPRX gateway daemon. \
          Actions: 'config.get' (read current config), 'config.patch' (merge patch config), \
          'status' (uptime/model/channels), 'version' (build version), \
          'components' (active channels/providers/memory/tools), \

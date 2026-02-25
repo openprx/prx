@@ -1,7 +1,7 @@
 //! Channel subsystem for messaging platform integrations.
 //!
 //! This module provides the multi-channel messaging infrastructure that connects
-//! ZeroClaw to external platforms. Each channel implements the [`Channel`] trait
+//! OpenPRX to external platforms. Each channel implements the [`Channel`] trait
 //! defined in [`traits`], which provides a uniform interface for sending messages,
 //! listening for incoming messages, health checking, and typing indicators.
 //!
@@ -185,8 +185,8 @@ fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
-const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"];
+const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "openprx.service"];
+const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "openprx.service"];
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
 const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
 
@@ -220,6 +220,17 @@ struct ChannelRuntimeContext {
     security: Arc<crate::security::SecurityPolicy>,
     /// Tool policy pipeline (P3-1): multi-layer allow/deny for tool calls.
     tool_policy_pipeline: Arc<crate::security::PolicyPipeline>,
+    agent_compaction: crate::config::AgentCompactionConfig,
+    signal_inbound_policy: Option<InboundPolicyConfig>,
+    whatsapp_inbound_policy: Option<InboundPolicyConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct InboundPolicyConfig {
+    dm_policy: crate::config::DmPolicy,
+    group_policy: crate::config::GroupPolicy,
+    allowed_from: HashSet<String>,
+    group_allow_from: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -257,6 +268,123 @@ impl InFlightTaskCompletion {
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
+}
+
+fn normalize_allowlist(values: &[String]) -> HashSet<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn infer_chat_type_from_message(msg: &traits::ChannelMessage) -> &'static str {
+    if msg.reply_target.starts_with("group:")
+        || msg.reply_target.ends_with("@g.us")
+        || msg.sender.ends_with("@g.us")
+    {
+        "group"
+    } else {
+        "direct"
+    }
+}
+
+fn extract_group_identifier(msg: &traits::ChannelMessage) -> Option<String> {
+    if let Some(group_id) = msg.reply_target.strip_prefix("group:") {
+        return Some(group_id.to_string());
+    }
+    if msg.reply_target.ends_with("@g.us") {
+        return Some(msg.reply_target.clone());
+    }
+    if msg.sender.ends_with("@g.us") {
+        return Some(msg.sender.clone());
+    }
+    None
+}
+
+fn allowlist_matches(allowlist: &HashSet<String>, value: &str) -> bool {
+    allowlist.contains("*") || allowlist.contains(value)
+}
+
+fn evaluate_inbound_policy(policy: &InboundPolicyConfig, msg: &traits::ChannelMessage) -> bool {
+    match infer_chat_type_from_message(msg) {
+        "group" => match policy.group_policy {
+            crate::config::GroupPolicy::Disabled => {
+                tracing::warn!(channel = %msg.channel, sender = %msg.sender, "Ignoring group message due to disabled group_policy");
+                false
+            }
+            crate::config::GroupPolicy::Open => true,
+            crate::config::GroupPolicy::Allowlist => {
+                let Some(group_id) = extract_group_identifier(msg) else {
+                    tracing::warn!(channel = %msg.channel, sender = %msg.sender, "Dropping group message: missing group identifier for allowlist check");
+                    return false;
+                };
+                if allowlist_matches(&policy.group_allow_from, &group_id) {
+                    true
+                } else {
+                    tracing::warn!(channel = %msg.channel, sender = %msg.sender, group_id = %group_id, "Dropping group message: group not in allowlist");
+                    false
+                }
+            }
+        },
+        _ => match policy.dm_policy {
+            crate::config::DmPolicy::Disabled => {
+                tracing::warn!(channel = %msg.channel, sender = %msg.sender, "Ignoring direct message due to disabled dm_policy");
+                false
+            }
+            crate::config::DmPolicy::Open => true,
+            crate::config::DmPolicy::Allowlist => {
+                if allowlist_matches(&policy.allowed_from, &msg.sender) {
+                    true
+                } else {
+                    tracing::warn!(channel = %msg.channel, sender = %msg.sender, "Dropping direct message: sender not in allowlist");
+                    false
+                }
+            }
+            crate::config::DmPolicy::Pairing => {
+                tracing::warn!(channel = %msg.channel, sender = %msg.sender, "Dropping direct message: dm_policy=pairing is not implemented yet");
+                false
+            }
+        },
+    }
+}
+
+fn should_process_inbound_message(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+) -> bool {
+    let policy = match msg.channel.as_str() {
+        "signal" => ctx.signal_inbound_policy.as_ref(),
+        "whatsapp" => ctx.whatsapp_inbound_policy.as_ref(),
+        _ => None,
+    };
+    let Some(policy) = policy else {
+        return true;
+    };
+
+    evaluate_inbound_policy(policy, msg)
+}
+
+fn warn_open_policy_allowlist_alignment(
+    channel_name: &str,
+    dm_policy: crate::config::DmPolicy,
+    group_policy: crate::config::GroupPolicy,
+    allowed_from: &HashSet<String>,
+    group_allow_from: &HashSet<String>,
+) {
+    if dm_policy == crate::config::DmPolicy::Open && !allowed_from.contains("*") {
+        tracing::warn!(
+            channel = channel_name,
+            "dm_policy=open configured without '*' in allowed_from; this weakens static safety intent"
+        );
+    }
+    if group_policy == crate::config::GroupPolicy::Open && !group_allow_from.contains("*") {
+        tracing::warn!(
+            channel = channel_name,
+            "group_policy=open configured without '*' in group_allow_from; this weakens static safety intent"
+        );
+    }
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
@@ -744,7 +872,7 @@ fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &P
     if cached_models.is_empty() {
         let _ = writeln!(
             response,
-            "\nNo cached model list found for `{}`. Ask the operator to run `zeroclaw models refresh --provider {}`.",
+            "\nNo cached model list found for `{}`. Ask the operator to run `openprx models refresh --provider {}`.",
             current.provider, current.provider
         );
     } else {
@@ -1318,6 +1446,9 @@ async fn process_channel_message(
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
+    if !should_process_inbound_message(ctx.as_ref(), &msg) {
+        return;
+    }
 
     let history_key = conversation_history_key(&msg);
     let route = get_route_selection(ctx.as_ref(), &history_key);
@@ -1494,11 +1625,7 @@ async fn process_channel_message(
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
 
     // Derive chat_type from reply_target: "group" if the reply target is a group, else "direct".
-    let chat_type = if msg.reply_target.starts_with("group:") {
-        "group"
-    } else {
-        "direct"
-    };
+    let chat_type = infer_chat_type_from_message(&msg);
     let scope_ctx = ScopeContext {
         policy: &ctx.security,
         sender: &msg.sender,
@@ -1526,6 +1653,7 @@ async fn process_channel_message(
                 msg.channel.as_str(),
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
+                Some(&ctx.agent_compaction),
                 Some(cancellation_token.clone()),
                 delta_tx,
                 Some(&scope_ctx),
@@ -1829,6 +1957,8 @@ fn build_identity_prompt_with_limit(workspace_dir: &Path, max_chars: usize) -> S
         "USER.md",
         "TOOLS.md",
         "MEMORY.md",
+        "THINKING.md",
+        "HEARTBEAT.md",
     ];
 
     for filename in files {
@@ -2047,7 +2177,7 @@ pub fn build_system_prompt_with_mode(
     prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
 
     if prompt.is_empty() {
-        "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
+        "You are OpenPRX, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
             .to_string()
     } else {
         prompt
@@ -2112,7 +2242,7 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     let mut updated = config.clone();
     let Some(telegram) = updated.channels_config.telegram.as_mut() else {
         anyhow::bail!(
-            "Telegram channel is not configured. Run `zeroclaw onboard --channels-only` first"
+            "Telegram channel is not configured. Run `openprx onboard --channels-only` first"
         );
     };
 
@@ -2142,13 +2272,13 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
         }
         Ok(false) => {
             println!(
-                "ℹ️ No managed daemon service detected. If `zeroclaw daemon`/`channel start` is already running, restart it to load the updated allowlist."
+                "ℹ️ No managed daemon service detected. If `openprx daemon`/`channel start` is already running, restart it to load the updated allowlist."
             );
         }
         Err(e) => {
             eprintln!(
                 "⚠️ Allowlist saved, but failed to reload daemon service automatically: {e}\n\
-                 Restart service manually with `zeroclaw service stop && zeroclaw service start`."
+                 Restart service manually with `openprx service stop && openprx service start`."
             );
         }
     }
@@ -2163,7 +2293,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
         let plist = home
             .join("Library")
             .join("LaunchAgents")
-            .join("com.zeroclaw.daemon.plist");
+            .join("com.openprx.daemon.plist");
         if !plist.exists() {
             return Ok(false);
         }
@@ -2173,15 +2303,15 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
             .output()
             .context("Failed to query launchctl list")?;
         let listed = String::from_utf8_lossy(&list_output.stdout);
-        if !listed.contains("com.zeroclaw.daemon") {
+        if !listed.contains("com.openprx.daemon") {
             return Ok(false);
         }
 
         let _ = Command::new("launchctl")
-            .args(["stop", "com.zeroclaw.daemon"])
+            .args(["stop", "com.openprx.daemon"])
             .output();
         let start_output = Command::new("launchctl")
-            .args(["start", "com.zeroclaw.daemon"])
+            .args(["start", "com.openprx.daemon"])
             .output()
             .context("Failed to start launchd daemon service")?;
         if !start_output.status.success() {
@@ -2221,7 +2351,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
             .join(".config")
             .join("systemd")
             .join("user")
-            .join("zeroclaw.service");
+            .join("openprx.service");
         if !unit_path.exists() {
             return Ok(false);
         }
@@ -2292,9 +2422,9 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
                     "  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`)."
                 );
             }
-            println!("\nTo start channels: zeroclaw channel start");
-            println!("To check health:    zeroclaw channel doctor");
-            println!("To configure:      zeroclaw onboard");
+            println!("\nTo start channels: openprx channel start");
+            println!("To check health:    openprx channel doctor");
+            println!("To configure:      openprx onboard");
             Ok(())
         }
         crate::ChannelCommands::Add {
@@ -2302,11 +2432,11 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             config: _,
         } => {
             anyhow::bail!(
-                "Channel type '{channel_type}' — use `zeroclaw onboard` to configure channels"
+                "Channel type '{channel_type}' — use `openprx onboard` to configure channels"
             );
         }
         crate::ChannelCommands::Remove { name } => {
-            anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
+            anyhow::bail!("Remove channel '{name}' — edit ~/.openprx/config.toml directly");
         }
         crate::ChannelCommands::BindTelegram { identity } => {
             bind_telegram_identity(config, &identity).await
@@ -2554,11 +2684,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
-        println!("No real-time channels configured. Run `zeroclaw onboard` first.");
+        println!("No real-time channels configured. Run `openprx onboard` first.");
         return Ok(());
     }
 
-    println!("🩺 ZeroClaw Channel Doctor");
+    println!("🩺 OpenPRX Channel Doctor");
     println!();
 
     let mut healthy = 0_u32;
@@ -2586,7 +2716,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if config.channels_config.webhook.is_some() {
-        println!("  ℹ️  Webhook   check via `zeroclaw gateway` then GET /health");
+        println!("  ℹ️  Webhook   check via `openprx gateway` then GET /health");
     }
 
     println!();
@@ -2868,6 +2998,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 sig.account.clone(),
                 sig.data_dir.clone(),
                 sig.daemon_http_port.unwrap_or(8686),
+                sig.startup_timeout_ms,
                 sig.group_id.clone(),
                 sig.allowed_from.clone(),
                 sig.ignore_attachments,
@@ -3003,7 +3134,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
-        println!("No channels configured. Run `zeroclaw onboard` to set up channels.");
+        println!("No channels configured. Run `openprx onboard` to set up channels.");
         return Ok(());
     }
 
@@ -3064,7 +3195,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             security.clone(),
             config.workspace_dir.clone(),
             config.multimodal.clone(),
+            config.agent.compaction.clone(),
             config.agents.clone(),
+            config.api_key.clone(),
+            provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         );
         let handle = spawn_tool.tools_handle();
@@ -3127,7 +3261,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         handle.set(Arc::clone(&tools_registry)).ok();
     }
 
-    println!("🦀 ZeroClaw Channel Server");
+    println!("🦀 OpenPRX Channel Server");
     println!("  🤖 Model:    {model}");
     let effective_backend = memory::effective_memory_backend_name(
         &config.memory.backend,
@@ -3190,6 +3324,40 @@ pub async fn start_channels(config: Config) -> Result<()> {
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
     let message_timeout_secs =
         effective_channel_message_timeout_secs(config.channels_config.message_timeout_secs);
+    let signal_inbound_policy = config.channels_config.signal.as_ref().map(|signal| {
+        let allowed_from = normalize_allowlist(&signal.allowed_from);
+        let group_allow_from = normalize_allowlist(&signal.group_allow_from);
+        warn_open_policy_allowlist_alignment(
+            "signal",
+            signal.dm_policy,
+            signal.group_policy,
+            &allowed_from,
+            &group_allow_from,
+        );
+        InboundPolicyConfig {
+            dm_policy: signal.dm_policy,
+            group_policy: signal.group_policy,
+            allowed_from,
+            group_allow_from,
+        }
+    });
+    let whatsapp_inbound_policy = config.channels_config.whatsapp.as_ref().map(|whatsapp| {
+        let allowed_from = normalize_allowlist(&whatsapp.allowed_numbers);
+        let group_allow_from = normalize_allowlist(&whatsapp.group_allow_from);
+        warn_open_policy_allowlist_alignment(
+            "whatsapp",
+            whatsapp.dm_policy,
+            whatsapp.group_policy,
+            &allowed_from,
+            &group_allow_from,
+        );
+        InboundPolicyConfig {
+            dm_policy: whatsapp.dm_policy,
+            group_policy: whatsapp.group_policy,
+            allowed_from,
+            group_allow_from,
+        }
+    });
     let interrupt_on_new_message = config
         .channels_config
         .telegram
@@ -3223,6 +3391,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         multimodal: config.multimodal.clone(),
         security: Arc::clone(&security),
         tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::from_config(&config)),
+        agent_compaction: config.agent.compaction.clone(),
+        signal_inbound_policy,
+        whatsapp_inbound_policy,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3251,7 +3422,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // Create minimal workspace files
         std::fs::write(tmp.path().join("SOUL.md"), "# Soul\nBe helpful.").unwrap();
-        std::fs::write(tmp.path().join("IDENTITY.md"), "# Identity\nName: ZeroClaw").unwrap();
+        std::fs::write(tmp.path().join("IDENTITY.md"), "# Identity\nName: OpenPRX").unwrap();
         std::fs::write(tmp.path().join("USER.md"), "# User\nName: Test User").unwrap();
         std::fs::write(
             tmp.path().join("AGENTS.md"),
@@ -3403,6 +3574,9 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3421,6 +3595,106 @@ mod tests {
                 || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
                     && turn.content.ends_with("..."))
         }));
+    }
+
+    #[test]
+    fn inbound_policy_allowlist_rejects_unknown_direct_sender() {
+        let policy = InboundPolicyConfig {
+            dm_policy: crate::config::DmPolicy::Allowlist,
+            group_policy: crate::config::GroupPolicy::Allowlist,
+            allowed_from: normalize_allowlist(&["+1111111111".to_string()]),
+            group_allow_from: HashSet::new(),
+        };
+        let msg = traits::ChannelMessage {
+            id: "1".to_string(),
+            sender: "+2222222222".to_string(),
+            reply_target: "+2222222222".to_string(),
+            content: "hello".to_string(),
+            channel: "signal".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+        assert!(!evaluate_inbound_policy(&policy, &msg));
+    }
+
+    #[test]
+    fn inbound_policy_open_with_wildcard_allowlist_allows_direct_sender() {
+        let policy = InboundPolicyConfig {
+            dm_policy: crate::config::DmPolicy::Open,
+            group_policy: crate::config::GroupPolicy::Allowlist,
+            allowed_from: normalize_allowlist(&["*".to_string()]),
+            group_allow_from: HashSet::new(),
+        };
+        let msg = traits::ChannelMessage {
+            id: "dm-open".to_string(),
+            sender: "+19999999999".to_string(),
+            reply_target: "+19999999999".to_string(),
+            content: "hello".to_string(),
+            channel: "signal".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+        assert!(evaluate_inbound_policy(&policy, &msg));
+    }
+
+    #[test]
+    fn inbound_policy_group_disabled_rejects_group_message() {
+        let policy = InboundPolicyConfig {
+            dm_policy: crate::config::DmPolicy::Open,
+            group_policy: crate::config::GroupPolicy::Disabled,
+            allowed_from: normalize_allowlist(&["*".to_string()]),
+            group_allow_from: normalize_allowlist(&["group-1".to_string()]),
+        };
+        let msg = traits::ChannelMessage {
+            id: "grp-disabled".to_string(),
+            sender: "+1111111111".to_string(),
+            reply_target: "group:group-1".to_string(),
+            content: "group hello".to_string(),
+            channel: "signal".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+        assert!(!evaluate_inbound_policy(&policy, &msg));
+    }
+
+    #[test]
+    fn inbound_policy_pairing_rejects_direct_message() {
+        let policy = InboundPolicyConfig {
+            dm_policy: crate::config::DmPolicy::Pairing,
+            group_policy: crate::config::GroupPolicy::Allowlist,
+            allowed_from: normalize_allowlist(&["*".to_string()]),
+            group_allow_from: HashSet::new(),
+        };
+        let msg = traits::ChannelMessage {
+            id: "dm-pairing".to_string(),
+            sender: "+10000000000".to_string(),
+            reply_target: "+10000000000".to_string(),
+            content: "hello".to_string(),
+            channel: "signal".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+        assert!(!evaluate_inbound_policy(&policy, &msg));
+    }
+
+    #[test]
+    fn inbound_policy_group_allowlist_accepts_allowed_group() {
+        let policy = InboundPolicyConfig {
+            dm_policy: crate::config::DmPolicy::Allowlist,
+            group_policy: crate::config::GroupPolicy::Allowlist,
+            allowed_from: HashSet::new(),
+            group_allow_from: normalize_allowlist(&["group-1".to_string()]),
+        };
+        let msg = traits::ChannelMessage {
+            id: "2".to_string(),
+            sender: "+1111111111".to_string(),
+            reply_target: "group:group-1".to_string(),
+            content: "group hello".to_string(),
+            channel: "signal".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+        assert!(evaluate_inbound_policy(&policy, &msg));
     }
 
     struct DummyProvider;
@@ -3849,6 +4123,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -3911,6 +4188,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -3973,6 +4253,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4044,6 +4327,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4136,6 +4422,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4210,6 +4499,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4299,6 +4591,9 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4373,6 +4668,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4436,6 +4734,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4549,6 +4850,14 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: "2026-02-20T00:00:00Z".to_string(),
                 session_id: None,
                 score: Some(0.9),
+                tags: None,
+                access_count: None,
+                useful_count: None,
+                source: None,
+                source_confidence: None,
+                verification_status: None,
+                lifecycle_state: None,
+                compressed_from: None,
             }])
         }
 
@@ -4610,6 +4919,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4693,6 +5005,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4788,6 +5103,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4865,6 +5183,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4967,10 +5288,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
         assert!(prompt.contains("Be helpful"), "missing SOUL content");
         assert!(prompt.contains("### IDENTITY.md"), "missing IDENTITY.md");
-        assert!(
-            prompt.contains("Name: ZeroClaw"),
-            "missing IDENTITY content"
-        );
+        assert!(prompt.contains("Name: OpenPRX"), "missing IDENTITY content");
         assert!(prompt.contains("### USER.md"), "missing USER.md");
         assert!(prompt.contains("### AGENTS.md"), "missing AGENTS.md");
         assert!(prompt.contains("### TOOLS.md"), "missing TOOLS.md");
@@ -5169,7 +5487,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn channel_log_truncation_is_utf8_safe_for_multibyte_text() {
-        let msg = "Hello from ZeroClaw 🌍. Current status is healthy, and café-style UTF-8 text stays safe in logs.";
+        let msg = "Hello from OpenPRX 🌍. Current status is healthy, and café-style UTF-8 text stays safe in logs.";
 
         // Reproduces the production crash path where channel logs truncate at 80 chars.
         let result = std::panic::catch_unwind(|| crate::util::truncate_with_ellipsis(msg, 80));
@@ -5345,6 +5663,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -5433,6 +5754,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -5521,6 +5845,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -5955,11 +6282,11 @@ This is an example JSON object for profile settings."#;
     fn maybe_restart_daemon_systemd_args_regression() {
         assert_eq!(
             SYSTEMD_STATUS_ARGS,
-            ["--user", "is-active", "zeroclaw.service"]
+            ["--user", "is-active", "openprx.service"]
         );
         assert_eq!(
             SYSTEMD_RESTART_ARGS,
-            ["--user", "restart", "zeroclaw.service"]
+            ["--user", "restart", "openprx.service"]
         );
     }
 

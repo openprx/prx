@@ -134,6 +134,14 @@ impl PostgresMemory {
             timestamp: timestamp.to_rfc3339(),
             session_id: row.get(5),
             score: row.try_get(6).ok(),
+            tags: None,
+            access_count: None,
+            useful_count: None,
+            source: None,
+            source_confidence: None,
+            verification_status: None,
+            lifecycle_state: None,
+            compressed_from: None,
         })
     }
 }

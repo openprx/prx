@@ -62,7 +62,7 @@ const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
     let ChannelsConfig {
         cli: _,     // `cli` is always available and does not require channel server startup
-        webhook: _, // webhook traffic is handled by gateway, not `zeroclaw channel start`
+        webhook: _, // webhook traffic is handled by gateway, not `openprx channel start`
         telegram,
         discord,
         slack,
@@ -103,7 +103,7 @@ pub async fn run_wizard() -> Result<Config> {
 
     println!(
         "  {}",
-        style("Welcome to ZeroClaw — the fastest, smallest AI assistant.")
+        style("Welcome to OpenPRX — the fastest, smallest AI assistant.")
             .white()
             .bold()
     );
@@ -119,7 +119,7 @@ pub async fn run_wizard() -> Result<Config> {
     print_step(2, 9, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
 
-    print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
+    print_step(3, 9, "Channels (How You Talk to OpenPRX)");
     let channels_config = setup_channels()?;
 
     print_step(4, 9, "Tunnel (Expose to Internet)");
@@ -233,7 +233,7 @@ pub async fn run_wizard() -> Result<Config> {
             );
             println!();
             // Signal to main.rs to call start_channels after wizard returns
-            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+            std::env::set_var("OPENPRX_AUTOSTART_CHANNELS", "1");
         }
     }
 
@@ -253,7 +253,7 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
 
     let mut config = Config::load_or_init().await?;
 
-    print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
+    print_step(1, 1, "Channels (How You Talk to OpenPRX)");
     config.channels_config = setup_channels()?;
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
@@ -285,7 +285,7 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
             );
             println!();
             // Signal to main.rs to call start_channels after wizard returns
-            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+            std::env::set_var("OPENPRX_AUTOSTART_CHANNELS", "1");
         }
     }
 
@@ -295,8 +295,8 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
-/// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
-/// Use `zeroclaw onboard --interactive` for the full wizard.
+/// Use `openprx onboard` or `openprx onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
+/// Use `openprx onboard --interactive` for the full wizard.
 fn backend_key_from_choice(choice: usize) -> &'static str {
     selectable_memory_backends()
         .get(choice)
@@ -374,7 +374,7 @@ async fn run_quick_setup_with_home(
     );
     println!();
 
-    let zeroclaw_dir = home.join(".zeroclaw");
+    let zeroclaw_dir = default_user_config_dir(home);
     let workspace_dir = zeroclaw_dir.join("workspace");
     let config_path = zeroclaw_dir.join("config.toml");
 
@@ -450,7 +450,7 @@ async fn run_quick_setup_with_home(
     let default_ctx = ProjectContext {
         user_name: std::env::var("USER").unwrap_or_else(|_| "User".into()),
         timezone: "UTC".into(),
-        agent_name: "ZeroClaw".into(),
+        agent_name: "OpenPRX".into(),
         communication_style:
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
@@ -526,13 +526,13 @@ async fn run_quick_setup_with_home(
     println!("  {}", style("Next steps:").white().bold());
     if credential_override.is_none() {
         println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
-        println!("    2. Or edit:           ~/.zeroclaw/config.toml");
-        println!("    3. Chat:              zeroclaw agent -m \"Hello!\"");
-        println!("    4. Gateway:           zeroclaw gateway");
+        println!("    2. Or edit:           ~/.openprx/config.toml");
+        println!("    3. Chat:              openprx agent -m \"Hello!\"");
+        println!("    4. Gateway:           openprx gateway");
     } else {
-        println!("    1. Chat:     zeroclaw agent -m \"Hello!\"");
-        println!("    2. Gateway:  zeroclaw gateway");
-        println!("    3. Status:   zeroclaw status");
+        println!("    1. Chat:     openprx agent -m \"Hello!\"");
+        println!("    2. Gateway:  openprx gateway");
+        println!("    3. Status:   openprx status");
     }
     println!();
 
@@ -1524,7 +1524,7 @@ pub fn run_models_refresh(
             print_model_preview(&cached.models);
             println!();
             println!(
-                "Tip: run `zeroclaw models refresh --force --provider {}` to fetch latest now.",
+                "Tip: run `openprx models refresh --force --provider {}` to fetch latest now.",
                 provider_name
             );
             return Ok(());
@@ -1613,7 +1613,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
-    let default_dir = home.join(".zeroclaw");
+    let default_dir = default_user_config_dir(&home);
 
     print_bullet(&format!(
         "Default location: {}",
@@ -1647,6 +1647,18 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
     );
 
     Ok((workspace_dir, config_path))
+}
+
+fn default_user_config_dir(home: &Path) -> PathBuf {
+    let primary = home.join(".openprx");
+    if primary.exists() {
+        return primary;
+    }
+    let legacy = home.join(".zeroclaw");
+    if legacy.exists() {
+        return legacy;
+    }
+    primary
 }
 
 // ── Step 2: Provider & API Key ───────────────────────────────────
@@ -1755,7 +1767,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             style("Custom Provider Setup").white().bold(),
             style("— any OpenAI-compatible API").dim()
         );
-        print_bullet("ZeroClaw works with ANY API that speaks the OpenAI chat completions format.");
+        print_bullet("OpenPRX works with ANY API that speaks the OpenAI chat completions format.");
         print_bullet("Examples: LiteLLM, LocalAI, vLLM, text-generation-webui, LM Studio, etc.");
         println!();
 
@@ -1885,7 +1897,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 "{} Gemini CLI credentials detected! You can skip the API key.",
                 style("✓").green().bold()
             ));
-            print_bullet("ZeroClaw will reuse your existing Gemini CLI authentication.");
+            print_bullet("OpenPRX will reuse your existing Gemini CLI authentication.");
             println!();
 
             let use_cli: bool = dialoguer::Confirm::new()
@@ -2306,7 +2318,7 @@ fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
 // ── Step 5: Tool Mode & Security ────────────────────────────────
 
 fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
-    print_bullet("Choose how ZeroClaw connects to external apps.");
+    print_bullet("Choose how OpenPRX connects to external apps.");
     print_bullet("You can always change this later in config.toml.");
     println!();
 
@@ -2329,7 +2341,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
             style("— 1000+ OAuth integrations (Gmail, Notion, GitHub, Slack, ...)").dim()
         );
         print_bullet("Get your API key at: https://app.composio.dev/settings");
-        print_bullet("ZeroClaw uses Composio as a tool — your core agent stays local.");
+        print_bullet("OpenPRX uses Composio as a tool — your core agent stays local.");
         println!();
 
         let api_key: String = Input::new()
@@ -2366,7 +2378,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
 
     // ── Encrypted secrets ──
     println!();
-    print_bullet("ZeroClaw can encrypt API keys stored in config.toml.");
+    print_bullet("OpenPRX can encrypt API keys stored in config.toml.");
     print_bullet("A local key file protects against plaintext exposure and accidental leaks.");
 
     let encrypt = Confirm::new()
@@ -2396,7 +2408,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
 // ── Step 6: Hardware (Physical World) ───────────────────────────
 
 fn setup_hardware() -> Result<HardwareConfig> {
-    print_bullet("ZeroClaw can talk to physical hardware (LEDs, sensors, motors).");
+    print_bullet("OpenPRX can talk to physical hardware (LEDs, sensors, motors).");
     print_bullet("Scanning for connected devices...");
     println!();
 
@@ -2453,7 +2465,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
     let recommended = hardware::recommended_wizard_default(&devices);
 
     let choice = Select::new()
-        .with_prompt("  How should ZeroClaw interact with the physical world?")
+        .with_prompt("  How should OpenPRX interact with the physical world?")
         .items(&options)
         .default(recommended)
         .interact()?;
@@ -2628,7 +2640,7 @@ fn setup_project_context() -> Result<ProjectContext> {
 
     let agent_name: String = Input::new()
         .with_prompt("  Agent name")
-        .default("ZeroClaw".into())
+        .default("OpenPRX".into())
         .interact_text()?;
 
     let style_options = vec![
@@ -2682,7 +2694,7 @@ fn setup_project_context() -> Result<ProjectContext> {
 // ── Step 6: Memory Configuration ───────────────────────────────
 
 fn setup_memory() -> Result<MemoryConfig> {
-    print_bullet("Choose how ZeroClaw stores and searches memories.");
+    print_bullet("Choose how OpenPRX stores and searches memories.");
     print_bullet("You can always change this later in config.toml.");
     println!();
 
@@ -2722,7 +2734,7 @@ fn setup_memory() -> Result<MemoryConfig> {
 
 #[allow(clippy::too_many_lines)]
 fn setup_channels() -> Result<ChannelsConfig> {
-    print_bullet("Channels let you talk to ZeroClaw from anywhere.");
+    print_bullet("Channels let you talk to OpenPRX from anywhere.");
     print_bullet("CLI is always available. Connect more channels now.");
     println!();
 
@@ -2881,7 +2893,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 println!(
                     "  {} {}",
                     style("Telegram Setup").white().bold(),
-                    style("— talk to ZeroClaw from Telegram").dim()
+                    style("— talk to OpenPRX from Telegram").dim()
                 );
                 print_bullet("1. Open Telegram and message @BotFather");
                 print_bullet("2. Send /newbot and follow the prompts");
@@ -2979,7 +2991,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 println!(
                     "  {} {}",
                     style("Discord Setup").white().bold(),
-                    style("— talk to ZeroClaw from Discord").dim()
+                    style("— talk to OpenPRX from Discord").dim()
                 );
                 print_bullet("1. Go to https://discord.com/developers/applications");
                 print_bullet("2. Create a New Application → Bot → Copy token");
@@ -3078,7 +3090,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 println!(
                     "  {} {}",
                     style("Slack Setup").white().bold(),
-                    style("— talk to ZeroClaw from Slack").dim()
+                    style("— talk to OpenPRX from Slack").dim()
                 );
                 print_bullet("1. Go to https://api.slack.com/apps → Create New App");
                 print_bullet("2. Add Bot Token Scopes: chat:write, channels:history");
@@ -3214,7 +3226,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                print_bullet("ZeroClaw reads your iMessage database and replies via AppleScript.");
+                print_bullet("OpenPRX reads your iMessage database and replies via AppleScript.");
                 print_bullet(
                     "You need to grant Full Disk Access to your terminal in System Settings.",
                 );
@@ -3379,7 +3391,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                     let session_path: String = Input::new()
                         .with_prompt("  Session database path")
-                        .default("~/.zeroclaw/state/whatsapp-web/session.db".into())
+                        .default("~/.openprx/state/whatsapp-web/session.db".into())
                         .interact_text()?;
 
                     if session_path.trim().is_empty() {
@@ -3429,6 +3441,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         pair_code: (!pair_code.trim().is_empty())
                             .then(|| pair_code.trim().to_string()),
                         allowed_numbers,
+                        dm_policy: crate::config::schema::DmPolicy::default(),
+                        group_policy: crate::config::schema::GroupPolicy::default(),
+                        group_allow_from: Vec::new(),
                     });
 
                     println!(
@@ -3469,7 +3484,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let verify_token: String = Input::new()
                     .with_prompt("  Webhook verify token (create your own)")
-                    .default("zeroclaw-whatsapp-verify".into())
+                    .default("openprx-whatsapp-verify".into())
                     .interact_text()?;
 
                 // Test connection (run entirely in separate thread — Response must be used/dropped there)
@@ -3525,11 +3540,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     access_token: Some(access_token.trim().to_string()),
                     phone_number_id: Some(phone_number_id.trim().to_string()),
                     verify_token: Some(verify_token.trim().to_string()),
-                    app_secret: None, // Can be set via ZEROCLAW_WHATSAPP_APP_SECRET env var
+                    app_secret: None, // Can be set via OPENPRX_WHATSAPP_APP_SECRET env var
                     session_path: None,
                     pair_phone: None,
                     pair_code: None,
                     allowed_numbers,
+                    dm_policy: crate::config::schema::DmPolicy::default(),
+                    group_policy: crate::config::schema::GroupPolicy::default(),
+                    group_allow_from: Vec::new(),
                 });
             }
             ChannelMenuChoice::Linq => {
@@ -3948,7 +3966,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 println!(
                     "  {} {}",
                     style("Lark/Feishu Setup").white().bold(),
-                    style("— talk to ZeroClaw from Lark or Feishu").dim()
+                    style("— talk to OpenPRX from Lark or Feishu").dim()
                 );
                 print_bullet(
                     "1. Go to Lark/Feishu Open Platform (open.larksuite.com / open.feishu.cn)",
@@ -4345,7 +4363,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
 #[allow(clippy::too_many_lines)]
 fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
     let agent = if ctx.agent_name.is_empty() {
-        "ZeroClaw"
+        "OpenPRX"
     } else {
         &ctx.agent_name
     };
@@ -4632,7 +4650,7 @@ fn print_summary(config: &Config) {
     println!(
         "  {}  {}",
         style("⚡").cyan(),
-        style("ZeroClaw is ready!").white().bold()
+        style("OpenPRX is ready!").white().bold()
     );
     println!(
         "  {}",
@@ -4796,7 +4814,7 @@ fn print_summary(config: &Config) {
             );
             println!(
                 "       {}",
-                style("zeroclaw auth login --provider openai-codex --device-code").yellow()
+                style("openprx auth login --provider openai-codex --device-code").yellow()
             );
         } else if provider == "anthropic" {
             println!(
@@ -4810,7 +4828,7 @@ fn print_summary(config: &Config) {
             println!(
                 "       {}",
                 style(
-                    "or: zeroclaw auth paste-token --provider anthropic --auth-kind authorization"
+                    "or: openprx auth paste-token --provider anthropic --auth-kind authorization"
                 )
                 .yellow()
             );
@@ -4836,7 +4854,7 @@ fn print_summary(config: &Config) {
             style(format!("{step}.")).cyan().bold(),
             style("Launch your channels").white().bold()
         );
-        println!("       {}", style("zeroclaw channel start").yellow());
+        println!("       {}", style("openprx channel start").yellow());
         println!();
         step += 1;
     }
@@ -4847,7 +4865,7 @@ fn print_summary(config: &Config) {
     );
     println!(
         "       {}",
-        style("zeroclaw agent -m \"Hello, ZeroClaw!\"").yellow()
+        style("openprx agent -m \"Hello, OpenPRX!\"").yellow()
     );
     println!();
     step += 1;
@@ -4856,7 +4874,7 @@ fn print_summary(config: &Config) {
         "    {} Start interactive CLI mode:",
         style(format!("{step}.")).cyan().bold()
     );
-    println!("       {}", style("zeroclaw agent").yellow());
+    println!("       {}", style("openprx agent").yellow());
     println!();
     step += 1;
 
@@ -4864,7 +4882,16 @@ fn print_summary(config: &Config) {
         "    {} Check full status:",
         style(format!("{step}.")).cyan().bold()
     );
-    println!("       {}", style("zeroclaw status").yellow());
+    println!("       {}", style("openprx status").yellow());
+    println!();
+    println!(
+        "    {} Legacy alias (optional):",
+        style(format!("{}.", step + 1)).cyan().bold()
+    );
+    println!(
+        "       {}",
+        style("ln -s \"$(command -v openprx)\" \"$HOME/.local/bin/zeroclaw\"").yellow()
+    );
 
     println!();
     println!(
@@ -5120,8 +5147,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            identity.contains("**Name:** ZeroClaw"),
-            "should default agent name to ZeroClaw"
+            identity.contains("**Name:** OpenPRX"),
+            "should default agent name to OpenPRX"
         );
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
@@ -5329,7 +5356,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "José María".into(),
-            agent_name: "ZeroClaw-v2".into(),
+            agent_name: "OpenPRX-v2".into(),
             timezone: "Europe/Madrid".into(),
             communication_style: "Be direct.".into(),
         };
@@ -5343,7 +5370,7 @@ mod tests {
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
-        assert!(soul.contains("ZeroClaw-v2"));
+        assert!(soul.contains("OpenPRX-v2"));
     }
 
     // ── scaffold_workspace: full personalization round-trip ─────

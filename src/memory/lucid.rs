@@ -226,6 +226,14 @@ impl LucidMemory {
                 timestamp: now.clone(),
                 session_id: None,
                 score: Some((1.0 - rank as f64 * 0.05).max(0.1)),
+                tags: None,
+                access_count: None,
+                useful_count: None,
+                source: None,
+                source_confidence: None,
+                verification_status: None,
+                lifecycle_state: None,
+                compressed_from: None,
             });
         }
 

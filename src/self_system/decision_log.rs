@@ -135,6 +135,14 @@ mod tests {
                     timestamp: Utc::now().to_rfc3339(),
                     session_id: session_id.map(str::to_string),
                     score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: None,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
                 },
             );
             Ok(())

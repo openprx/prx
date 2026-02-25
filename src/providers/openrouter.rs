@@ -227,6 +227,13 @@ impl OpenRouterProvider {
 
 #[async_trait]
 impl Provider for OpenRouterProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         // Hit a lightweight endpoint to establish TLS + HTTP/2 connection pool.
         // This prevents the first real chat request from timing out on cold start.
@@ -279,7 +286,7 @@ impl Provider for OpenRouterProvider {
                 "HTTP-Referer",
                 "https://github.com/theonlyhennygod/zeroclaw",
             )
-            .header("X-Title", "ZeroClaw")
+            .header("X-Title", "OpenPRX")
             .json(&request)
             .send()
             .await?;
@@ -329,7 +336,7 @@ impl Provider for OpenRouterProvider {
                 "HTTP-Referer",
                 "https://github.com/theonlyhennygod/zeroclaw",
             )
-            .header("X-Title", "ZeroClaw")
+            .header("X-Title", "OpenPRX")
             .json(&request)
             .send()
             .await?;
@@ -377,7 +384,7 @@ impl Provider for OpenRouterProvider {
                 "HTTP-Referer",
                 "https://github.com/theonlyhennygod/zeroclaw",
             )
-            .header("X-Title", "ZeroClaw")
+            .header("X-Title", "OpenPRX")
             .json(&native_request)
             .send()
             .await?;
@@ -465,7 +472,7 @@ impl Provider for OpenRouterProvider {
                 "HTTP-Referer",
                 "https://github.com/theonlyhennygod/zeroclaw",
             )
-            .header("X-Title", "ZeroClaw")
+            .header("X-Title", "OpenPRX")
             .json(&native_request)
             .send()
             .await?;

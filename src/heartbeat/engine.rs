@@ -1,6 +1,7 @@
 use crate::config::HeartbeatConfig;
 use crate::observability::{Observer, ObserverEvent};
 use anyhow::Result;
+use chrono::Timelike;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
@@ -41,6 +42,10 @@ impl HeartbeatEngine {
         loop {
             interval.tick().await;
             self.observer.record_event(&ObserverEvent::HeartbeatTick);
+            let current_hour = chrono::Local::now().hour() as u8;
+            if !Self::is_within_active_hours(&self.config, current_hour) {
+                continue;
+            }
 
             match self.tick().await {
                 Ok(tasks) => {
@@ -83,6 +88,25 @@ impl HeartbeatEngine {
                 trimmed.strip_prefix("- ").map(ToString::to_string)
             })
             .collect()
+    }
+
+    /// Returns true when the provided local hour is inside the configured active window.
+    pub fn is_within_active_hours(config: &HeartbeatConfig, hour: u8) -> bool {
+        let Some((start, end)) = config
+            .active_hours
+            .get(0)
+            .copied()
+            .zip(config.active_hours.get(1).copied())
+        else {
+            return true;
+        };
+        let start = start.min(23);
+        let end = end.min(23);
+        if start <= end {
+            hour >= start && hour <= end
+        } else {
+            hour >= start || hour <= end
+        }
     }
 
     /// Create a default HEARTBEAT.md if it doesn't exist
@@ -204,6 +228,56 @@ mod tests {
         assert_eq!(tasks[99], "Task 99");
     }
 
+    #[test]
+    fn active_hours_inclusive_range() {
+        let config = HeartbeatConfig {
+            enabled: true,
+            interval_minutes: 30,
+            active_hours: vec![8, 23],
+            prompt: "p".to_string(),
+        };
+        assert!(HeartbeatEngine::is_within_active_hours(&config, 8));
+        assert!(HeartbeatEngine::is_within_active_hours(&config, 23));
+        assert!(!HeartbeatEngine::is_within_active_hours(&config, 7));
+    }
+
+    #[test]
+    fn active_hours_wraparound_range() {
+        let config = HeartbeatConfig {
+            enabled: true,
+            interval_minutes: 30,
+            active_hours: vec![22, 6],
+            prompt: "p".to_string(),
+        };
+        assert!(HeartbeatEngine::is_within_active_hours(&config, 23));
+        assert!(HeartbeatEngine::is_within_active_hours(&config, 2));
+        assert!(!HeartbeatEngine::is_within_active_hours(&config, 12));
+    }
+
+    #[test]
+    fn active_hours_empty_allows_all_hours() {
+        let config = HeartbeatConfig {
+            enabled: true,
+            interval_minutes: 30,
+            active_hours: Vec::new(),
+            prompt: "p".to_string(),
+        };
+        assert!(HeartbeatEngine::is_within_active_hours(&config, 0));
+        assert!(HeartbeatEngine::is_within_active_hours(&config, 12));
+        assert!(HeartbeatEngine::is_within_active_hours(&config, 23));
+    }
+
+    #[test]
+    fn active_hours_out_of_range_hour_is_rejected() {
+        let config = HeartbeatConfig {
+            enabled: true,
+            interval_minutes: 30,
+            active_hours: vec![8, 23],
+            prompt: "p".to_string(),
+        };
+        assert!(!HeartbeatEngine::is_within_active_hours(&config, 25));
+    }
+
     #[tokio::test]
     async fn ensure_heartbeat_file_creates_file() {
         let dir = std::env::temp_dir().join("zeroclaw_test_heartbeat");
@@ -248,6 +322,7 @@ mod tests {
             HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 30,
+                ..HeartbeatConfig::default()
             },
             dir.clone(),
             observer,
@@ -273,6 +348,7 @@ mod tests {
             HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 30,
+                ..HeartbeatConfig::default()
             },
             dir.clone(),
             observer,
@@ -290,6 +366,7 @@ mod tests {
             HeartbeatConfig {
                 enabled: false,
                 interval_minutes: 30,
+                ..HeartbeatConfig::default()
             },
             std::env::temp_dir(),
             observer,

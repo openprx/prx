@@ -15,7 +15,7 @@
 //! 1. [`SignalNativeChannel::listen`] spawns
 //!    `signal-cli -a <account> daemon --http 127.0.0.1:<port> --no-receive-stdout`.
 //! 2. It waits for the daemon's JSON-RPC endpoint (`/api/v1/rpc`) to become
-//!    reachable (up to 15 s, polling every 500 ms).
+//!    reachable (configurable timeout, polling every 500 ms).
 //! 3. It then delegates the long-running SSE listener to the inner
 //!    [`SignalChannel`] which connects to the local HTTP daemon.
 //! 4. When `listen` returns (error or graceful shutdown) the child `signal-cli`
@@ -46,11 +46,18 @@ pub struct SignalNativeChannel {
     data_dir: Option<String>,
     /// Port on which the spawned daemon will listen for HTTP connections.
     http_port: u16,
+    /// Startup readiness timeout for daemon boot.
+    startup_timeout_ms: u64,
     /// Inner channel that handles all HTTP communication with the daemon.
     inner: SignalChannel,
 }
 
 impl SignalNativeChannel {
+    fn max_startup_attempts(startup_timeout_ms: u64) -> u64 {
+        let poll_ms: u64 = 500;
+        startup_timeout_ms.max(poll_ms).div_ceil(poll_ms)
+    }
+
     /// Create a new `SignalNativeChannel`.
     ///
     /// The daemon is **not** spawned here; it is started lazily in [`listen`].
@@ -60,6 +67,7 @@ impl SignalNativeChannel {
         account: String,
         data_dir: Option<String>,
         http_port: u16,
+        startup_timeout_ms: u64,
         group_id: Option<String>,
         allowed_from: Vec<String>,
         ignore_attachments: bool,
@@ -83,6 +91,7 @@ impl SignalNativeChannel {
             account,
             data_dir,
             http_port,
+            startup_timeout_ms,
             inner,
         }
     }
@@ -93,7 +102,11 @@ impl SignalNativeChannel {
         let url = format!("http://127.0.0.1:{}/api/v1/rpc", self.http_port);
         let ping_body = r#"{"jsonrpc":"2.0","method":"version","id":"init"}"#;
 
-        for attempt in 0u32..30 {
+        let poll_ms: u64 = 500;
+        let max_wait_ms = self.startup_timeout_ms.max(poll_ms);
+        let max_attempts = Self::max_startup_attempts(self.startup_timeout_ms);
+
+        for attempt in 0..max_attempts {
             sleep(Duration::from_millis(500)).await;
             let result = client
                 .post(&url)
@@ -105,14 +118,15 @@ impl SignalNativeChannel {
             if result.is_ok() {
                 tracing::info!(
                     "Signal native: daemon ready after {}ms",
-                    (attempt + 1) * 500
+                    (attempt + 1) * poll_ms
                 );
                 return Ok(());
             }
         }
         anyhow::bail!(
-            "Signal native: daemon on port {} did not become ready within 15 s",
-            self.http_port
+            "Signal native: daemon on port {} did not become ready within {} ms",
+            self.http_port,
+            max_wait_ms
         )
     }
 
@@ -137,6 +151,23 @@ impl SignalNativeChannel {
             // Inherit stderr so daemon logs reach our log output
             .stderr(Stdio::inherit());
         cmd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SignalNativeChannel;
+
+    #[test]
+    fn startup_attempts_have_minimum_single_poll() {
+        assert_eq!(SignalNativeChannel::max_startup_attempts(1), 1);
+        assert_eq!(SignalNativeChannel::max_startup_attempts(499), 1);
+    }
+
+    #[test]
+    fn startup_attempts_scale_with_timeout() {
+        assert_eq!(SignalNativeChannel::max_startup_attempts(30_000), 60);
+        assert_eq!(SignalNativeChannel::max_startup_attempts(30_100), 61);
     }
 }
 

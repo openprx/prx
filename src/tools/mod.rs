@@ -407,7 +407,8 @@ pub fn all_tools_with_runtime(
             },
         )
         .with_parent_tools(parent_tools)
-        .with_multimodal_config(root_config.multimodal.clone());
+        .with_multimodal_config(root_config.multimodal.clone())
+        .with_compaction_config(root_config.agent.compaction.clone());
         tool_arcs.push(Arc::new(delegate_tool));
     }
 

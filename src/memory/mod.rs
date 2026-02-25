@@ -29,6 +29,8 @@ pub use sqlite::SqliteMemory;
 pub use topic::{Topic, TopicMemory};
 pub use traits::Memory;
 #[allow(unused_imports)]
+pub use traits::{LifecycleState, VerificationStatus};
+#[allow(unused_imports)]
 pub use traits::{MemoryCategory, MemoryEntry};
 
 use crate::config::{

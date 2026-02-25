@@ -185,6 +185,9 @@ mod tests {
                 abort_handle: None,
                 history: Arc::new(RwLock::new(vec![])),
                 steer_tx: None,
+                parent_run_id: None,
+                session_scope_key: "test-session".to_string(),
+                spawn_depth: 0,
             },
             SubAgentRun {
                 id: "r2".into(),
@@ -194,6 +197,9 @@ mod tests {
                 abort_handle: None,
                 history: Arc::new(RwLock::new(vec![])),
                 steer_tx: None,
+                parent_run_id: None,
+                session_scope_key: "test-session".to_string(),
+                spawn_depth: 0,
             },
             SubAgentRun {
                 id: "r3".into(),
@@ -203,6 +209,9 @@ mod tests {
                 abort_handle: None,
                 history: Arc::new(RwLock::new(vec![])),
                 steer_tx: None,
+                parent_run_id: None,
+                session_scope_key: "test-session".to_string(),
+                spawn_depth: 0,
             },
         ];
         let tool = make_tool_with_runs(runs);

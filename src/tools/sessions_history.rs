@@ -145,6 +145,9 @@ mod tests {
             abort_handle: None,
             history: Arc::new(RwLock::new(entries)),
             steer_tx: None,
+            parent_run_id: None,
+            session_scope_key: "test-session".to_string(),
+            spawn_depth: 0,
         }
     }
 

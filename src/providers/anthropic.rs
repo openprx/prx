@@ -493,6 +493,14 @@ impl Provider for AnthropicProvider {
         Ok(Self::parse_native_response(native_response))
     }
 
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+            ..Default::default()
+        }
+    }
+
     fn supports_native_tools(&self) -> bool {
         true
     }
@@ -692,7 +700,7 @@ mod tests {
     async fn chat_with_system_fails_without_key() {
         let p = AnthropicProvider::new(None);
         let result = p
-            .chat_with_system(Some("You are ZeroClaw"), "hello", "claude-3-opus", 0.7)
+            .chat_with_system(Some("You are OpenPRX"), "hello", "claude-3-opus", 0.7)
             .await;
         assert!(result.is_err());
     }
@@ -723,7 +731,7 @@ mod tests {
         let req = ChatRequest {
             model: "claude-3-opus".to_string(),
             max_tokens: 4096,
-            system: Some("You are ZeroClaw".to_string()),
+            system: Some("You are OpenPRX".to_string()),
             messages: vec![Message {
                 role: "user".to_string(),
                 content: "hello".to_string(),
@@ -731,7 +739,7 @@ mod tests {
             temperature: 0.7,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"system\":\"You are ZeroClaw\""));
+        assert!(json.contains("\"system\":\"You are OpenPRX\""));
     }
 
     #[test]

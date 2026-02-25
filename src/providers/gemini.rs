@@ -397,6 +397,13 @@ impl GeminiProvider {
 
 #[async_trait]
 impl Provider for GeminiProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,

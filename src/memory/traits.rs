@@ -13,6 +13,41 @@ pub struct MemoryEntry {
     pub timestamp: String,
     pub session_id: Option<String>,
     pub score: Option<f64>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub access_count: Option<u32>,
+    #[serde(default)]
+    pub useful_count: Option<u32>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub source_confidence: Option<f64>,
+    #[serde(default)]
+    pub verification_status: Option<VerificationStatus>,
+    #[serde(default)]
+    pub lifecycle_state: Option<LifecycleState>,
+    #[serde(default)]
+    pub compressed_from: Option<Vec<String>>,
+}
+
+/// Verification state of a memory entry's factual quality.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    Unverified,
+    Verified,
+    Conflicted,
+    Deprecated,
+}
+
+/// Lifecycle state used by evolution-aware memory retrieval and maintenance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+    Active,
+    Archived,
+    Tombstoned,
 }
 
 /// Memory categories for organization
@@ -135,6 +170,14 @@ mod tests {
             timestamp: "2026-02-16T00:00:00Z".into(),
             session_id: Some("session-abc".into()),
             score: Some(0.98),
+            tags: Some(vec!["language".into(), "preference".into()]),
+            access_count: Some(4),
+            useful_count: Some(3),
+            source: Some("task-2026-02-16".into()),
+            source_confidence: Some(0.92),
+            verification_status: Some(VerificationStatus::Verified),
+            lifecycle_state: Some(LifecycleState::Active),
+            compressed_from: Some(vec!["old-1".into(), "old-2".into()]),
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -146,5 +189,39 @@ mod tests {
         assert_eq!(parsed.category, MemoryCategory::Core);
         assert_eq!(parsed.session_id.as_deref(), Some("session-abc"));
         assert_eq!(parsed.score, Some(0.98));
+        assert_eq!(parsed.tags.as_ref().map(Vec::len), Some(2));
+        assert_eq!(parsed.access_count, Some(4));
+        assert_eq!(parsed.useful_count, Some(3));
+        assert_eq!(parsed.source.as_deref(), Some("task-2026-02-16"));
+        assert_eq!(parsed.source_confidence, Some(0.92));
+        assert_eq!(
+            parsed.verification_status,
+            Some(VerificationStatus::Verified)
+        );
+        assert_eq!(parsed.lifecycle_state, Some(LifecycleState::Active));
+        assert_eq!(parsed.compressed_from.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn memory_entry_deserialize_legacy_payload_defaults_new_fields() {
+        let raw = r#"{
+            "id":"id-legacy",
+            "key":"legacy_key",
+            "content":"legacy content",
+            "category":"core",
+            "timestamp":"2026-02-01T00:00:00Z",
+            "session_id":null,
+            "score":0.7
+        }"#;
+        let parsed: MemoryEntry = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.id, "id-legacy");
+        assert!(parsed.tags.is_none());
+        assert!(parsed.access_count.is_none());
+        assert!(parsed.useful_count.is_none());
+        assert!(parsed.source.is_none());
+        assert!(parsed.source_confidence.is_none());
+        assert!(parsed.verification_status.is_none());
+        assert!(parsed.lifecycle_state.is_none());
+        assert!(parsed.compressed_from.is_none());
     }
 }

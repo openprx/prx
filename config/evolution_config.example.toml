@@ -1,0 +1,96 @@
+# OpenPRX / ZeroClaw Evolution 配置示例
+# 说明：这是完整示例，覆盖所有 evolution_config.toml 字段。
+# 可复制为 workspace/evolution_config.toml 后按需调整。
+
+[runtime]
+# 进化模式：shadow(仅建议，不落盘) / auto(自动执行)
+mode = "shadow"
+# 进化日志根目录（相对路径将相对 workspace_dir 解析）
+storage_dir = "self/evolution"
+# JSONL 批量写入阈值（到达后自动 flush）
+batch_size = 64
+# 配置热重载轮询间隔（秒）
+poll_interval_secs = 3
+
+[runtime.retention]
+# 热数据保留天数（hot）
+hot_days = 30
+# 温数据保留天数（warm）
+warm_days = 90
+# 冷数据保留天数（cold）
+cold_days = 180
+
+[runtime.data_thresholds]
+# 决策日志门槛（达到后允许更强进化动作）
+decision_log = 200
+# 记忆访问日志门槛
+memory_access = 800
+# 同类失败门槛（用于降级/熔断策略）
+same_failure = 25
+
+[retrieval]
+# 启用向量检索增强的样本规模阈值
+vector_retrieval_threshold = 2000
+
+[retrieval.score_weights]
+# 记忆检索分数权重：时效性
+recency = 0.3
+# 记忆检索分数权重：访问频率
+access_freq = 0.2
+# 记忆检索分数权重：类别匹配
+category_weight = 0.15
+# 记忆检索分数权重：有用率
+useful_ratio = 0.2
+# 记忆检索分数权重：来源可信度
+source_confidence = 0.15
+
+[gate]
+# Gate 最小提升阈值（平均提升低于该值则拒绝）
+min_improvement = 0.03
+# Gate 最大允许回归（更低则拒绝）
+max_regression = -0.05
+# Gate 最大允许 token 劣化比例
+max_token_degradation = 0.10
+
+[memory]
+# L1 记忆层输出 token 上限
+max_tokens = 2048
+
+[memory.retrieval_fusion]
+# L1 融合权重：bm25
+bm25 = 0.4
+# L1 融合权重：vector
+vector = 0.4
+# L1 融合权重：metadata
+metadata = 0.2
+
+[prompt]
+# L2 可变 prompt 文件列表（相对 workspace）
+mutable_files = []
+# L2 不可变 prompt 文件列表（相对 workspace）
+immutable_files = []
+# L2 需要人工审批的严重级别阈值
+human_approval_severity = 3
+# L2 prompt 历史版本最大保留数
+max_rollback_versions = 10
+# L2 禁止新增的关键词（安全防护）
+blocked_keywords = [
+  "disable safety",
+  "bypass policy",
+  "ignore security",
+  "remove guardrail",
+]
+
+[strategy]
+# L3 策略文件路径（相对 workspace）
+decision_policy_path = "decision_policy.toml"
+# L3 参数变异范围（0.15 = ±15%）
+param_mutation_range = 0.15
+
+[rollback]
+# 回滚快照最大版本数
+max_versions = 10
+# 熔断阈值（连续失败次数达到后 Open）
+circuit_breaker_threshold = 5
+# 回滚后冷却时间（小时）
+cooldown_after_rollback_hours = 24
