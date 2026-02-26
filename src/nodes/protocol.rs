@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -73,6 +74,12 @@ pub struct ExecShellParams {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+    #[serde(default, rename = "async")]
+    pub async_exec: Option<bool>,
+    #[serde(default)]
+    pub callback_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +113,46 @@ pub struct ExecShellResult {
     pub duration_ms: u64,
     pub timed_out: bool,
     pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsyncTaskAccepted {
+    pub task_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStatusParams {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStatusResult {
+    pub task_id: String,
+    pub status: String,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskListItem {
+    pub task_id: String,
+    pub status: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskListResult {
+    pub tasks: Vec<TaskListItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
