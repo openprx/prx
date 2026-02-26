@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde::Deserialize;
+use tracing_subscriber::EnvFilter;
 use zeroclaw::config::{NodeServerConfig, NodesConfig};
 
 #[derive(Parser, Debug)]
@@ -54,6 +55,10 @@ struct NodeConfigFile {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+        .init();
+
     let cli = Cli::parse();
     let mut cfg = NodeServerConfig::default();
 
