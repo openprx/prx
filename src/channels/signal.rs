@@ -259,6 +259,8 @@ struct DataMessage {
 struct GroupInfo {
     #[serde(rename = "groupId", default)]
     group_id: Option<String>,
+    #[serde(rename = "groupName", alias = "name", default)]
+    group_name: Option<String>,
 }
 
 impl SignalChannel {
@@ -484,14 +486,42 @@ impl SignalChannel {
                 .unwrap_or(u64::MAX)
             });
 
+        let group_info = data_msg.group_info.as_ref();
+        let group_label = group_info.and_then(|g| {
+            g.group_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .or(g.group_id.as_deref())
+        });
+        let content_prefix = if is_group_message {
+            if let Some(group_name) = group_info
+                .and_then(|g| g.group_name.as_deref())
+                .filter(|name| !name.trim().is_empty())
+            {
+                format!("[Signal Group: {group_name}] {sender}: ")
+            } else {
+                format!("[Signal Group] {sender}: ")
+            }
+        } else {
+            String::new()
+        };
+
         // Append Signal reaction metadata so the LLM has the information needed
         // to call message_send(action="react", target_author=..., target_timestamp=...).
-        // Format: [signal-meta sender=<id> ts=<ms>]
-        let content_with_meta = if text.is_empty() {
-            format!("[signal-meta sender={sender} ts={timestamp}]")
+        let signal_meta = if is_group_message {
+            let group = group_label.unwrap_or("unknown");
+            format!("[signal-meta sender={sender} ts={timestamp} group={group} chat_type=group]")
         } else {
-            format!("{text}\n[signal-meta sender={sender} ts={timestamp}]")
+            format!("[signal-meta sender={sender} ts={timestamp} chat_type=direct]")
         };
+
+        let mut content_with_meta = String::new();
+        content_with_meta.push_str(&content_prefix);
+        if !text.is_empty() {
+            content_with_meta.push_str(text);
+            content_with_meta.push('\n');
+        }
+        content_with_meta.push_str(&signal_meta);
 
         Some(ChannelMessage {
             id: format!("sig_{timestamp}"),
@@ -1377,6 +1407,7 @@ mod tests {
             timestamp: Some(1000),
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
+                group_name: None,
             }),
             attachments: None,
         };
@@ -1391,6 +1422,7 @@ mod tests {
             timestamp: Some(1000),
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
+                group_name: None,
             }),
             attachments: None,
         };
@@ -1401,6 +1433,7 @@ mod tests {
             timestamp: Some(1000),
             group_info: Some(GroupInfo {
                 group_id: Some("other_group".to_string()),
+                group_name: None,
             }),
             attachments: None,
         };
@@ -1423,6 +1456,7 @@ mod tests {
             timestamp: Some(1000),
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
+                group_name: None,
             }),
             attachments: None,
         };
@@ -1449,6 +1483,7 @@ mod tests {
             timestamp: Some(1000),
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
+                group_name: None,
             }),
             attachments: None,
         };
@@ -1567,6 +1602,11 @@ mod tests {
             "content: {}",
             msg.content
         );
+        assert!(
+            msg.content.contains("chat_type=direct"),
+            "content: {}",
+            msg.content
+        );
 
         // Verify reply routing: UUID sender in DM should route as Direct
         let target = SignalChannel::parse_recipient_target(&msg.reply_target);
@@ -1593,6 +1633,7 @@ mod tests {
                 timestamp: Some(1_700_000_000_000),
                 group_info: Some(GroupInfo {
                     group_id: Some("testgroup".to_string()),
+                    group_name: Some("Test Group".to_string()),
                 }),
                 attachments: None,
             }),
@@ -1602,6 +1643,17 @@ mod tests {
         let msg = ch.process_envelope(&env).unwrap();
         assert_eq!(msg.sender, uuid);
         assert_eq!(msg.reply_target, "group:testgroup");
+        assert!(
+            msg.content
+                .starts_with(&format!("[Signal Group: Test Group] {uuid}: Group msg from privacy user")),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("group=Test Group chat_type=group"),
+            "content: {}",
+            msg.content
+        );
 
         // Verify reply routing: group message should still route as Group
         let target = SignalChannel::parse_recipient_target(&msg.reply_target);
@@ -1632,6 +1684,11 @@ mod tests {
         );
         assert!(
             msg.content.contains("[signal-meta sender=+1111111111"),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("chat_type=direct"),
             "content: {}",
             msg.content
         );
@@ -1714,7 +1771,8 @@ mod tests {
                 "dataMessage": {
                     "message": "Group msg",
                     "groupInfo": {
-                        "groupId": "abc123"
+                        "groupId": "abc123",
+                        "name": "Signal Crew"
                     }
                 }
             }
@@ -1725,6 +1783,10 @@ mod tests {
         assert_eq!(
             dm.group_info.as_ref().unwrap().group_id.as_deref(),
             Some("abc123")
+        );
+        assert_eq!(
+            dm.group_info.as_ref().unwrap().group_name.as_deref(),
+            Some("Signal Crew")
         );
     }
 
