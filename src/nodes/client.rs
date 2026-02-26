@@ -1,10 +1,12 @@
 use crate::config::RemoteNodeConfig;
 use crate::nodes::protocol::{
-    CancelParams, ExecShellParams, ExecShellResult, MetricsResult, PingResult, ReadFileParams,
-    ReadFileResult, WriteFileParams, WriteFileResult,
+    AsyncTaskAccepted, CancelParams, ExecShellParams, ExecShellResult, MetricsResult, PingResult,
+    ReadFileParams, ReadFileResult, TaskListResult, TaskStatusParams, TaskStatusResult,
+    WriteFileParams, WriteFileResult,
 };
 use crate::nodes::transport::{NodeTransport, TransportRequest};
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -131,6 +133,35 @@ impl RemoteNodeClient {
                 cmd: cmd.to_string(),
                 timeout_ms,
                 cwd: cwd.map(ToOwned::to_owned),
+                env: None,
+                async_exec: None,
+                callback_url: None,
+            })?,
+        )
+        .await
+    }
+
+    pub async fn exec_shell_async(
+        &self,
+        cmd: &str,
+        timeout_ms: Option<u64>,
+        cwd: Option<&str>,
+        env: Option<HashMap<String, String>>,
+        callback_url: Option<&str>,
+    ) -> Result<AsyncTaskAccepted> {
+        if cmd.trim().is_empty() {
+            bail!("command cannot be empty")
+        }
+
+        self.call_rpc(
+            "node.exec_shell",
+            serde_json::to_value(ExecShellParams {
+                cmd: cmd.to_string(),
+                timeout_ms,
+                cwd: cwd.map(ToOwned::to_owned),
+                env,
+                async_exec: Some(true),
+                callback_url: callback_url.map(ToOwned::to_owned),
             })?,
         )
         .await
@@ -184,6 +215,24 @@ impl RemoteNodeClient {
             )
             .await?;
         Ok(())
+    }
+
+    pub async fn task_status(&self, task_id: &str) -> Result<TaskStatusResult> {
+        if task_id.trim().is_empty() {
+            return Err(anyhow!("task_id cannot be empty"));
+        }
+
+        self.call_rpc(
+            "node.task_status",
+            serde_json::to_value(TaskStatusParams {
+                task_id: task_id.to_string(),
+            })?,
+        )
+        .await
+    }
+
+    pub async fn task_list(&self) -> Result<TaskListResult> {
+        self.call_rpc("node.task_list", serde_json::json!({})).await
     }
 
     pub async fn metrics(&self) -> Result<MetricsResult> {

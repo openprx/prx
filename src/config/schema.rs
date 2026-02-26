@@ -435,6 +435,12 @@ pub struct NodeServerConfig {
     /// Maximum combined stdout/stderr bytes captured per command.
     #[serde(default = "default_node_server_max_output_bytes")]
     pub max_output_bytes: usize,
+    /// Maximum number of concurrent async command tasks.
+    #[serde(default = "default_node_server_max_concurrent_tasks")]
+    pub max_concurrent_tasks: usize,
+    /// TTL for completed task results in milliseconds.
+    #[serde(default = "default_node_server_task_result_ttl_ms")]
+    pub task_result_ttl_ms: u64,
     /// Command allowlist matched on first token.
     ///
     /// In restricted mode this list is required unless explicitly set to `["*"]`.
@@ -472,6 +478,14 @@ fn default_node_server_max_output_bytes() -> usize {
     1_048_576
 }
 
+fn default_node_server_max_concurrent_tasks() -> usize {
+    8
+}
+
+fn default_node_server_task_result_ttl_ms() -> u64 {
+    3_600_000
+}
+
 fn default_node_server_allowed_commands() -> Vec<String> {
     vec!["echo".to_string()]
 }
@@ -489,6 +503,8 @@ impl Default for NodeServerConfig {
             sandbox_root: default_node_server_sandbox_root(),
             exec_timeout_ms: default_node_server_exec_timeout_ms(),
             max_output_bytes: default_node_server_max_output_bytes(),
+            max_concurrent_tasks: default_node_server_max_concurrent_tasks(),
+            task_result_ttl_ms: default_node_server_task_result_ttl_ms(),
             allowed_commands: default_node_server_allowed_commands(),
             blocked_commands: Vec::new(),
             tls_required: default_node_server_tls_required(),
@@ -4832,6 +4848,8 @@ default_temperature = 0.7
         assert_eq!(nodes.request_timeout_ms, 15_000);
         assert_eq!(nodes.retry_max, 2);
         assert_eq!(nodes.server.listen_addr, "127.0.0.1:8787");
+        assert_eq!(nodes.server.max_concurrent_tasks, 8);
+        assert_eq!(nodes.server.task_result_ttl_ms, 3_600_000);
     }
 
     #[test]

@@ -1,10 +1,11 @@
 use crate::config::NodeServerConfig;
 use crate::nodes::protocol::{
-    CancelParams, ExecShellParams, ExecShellResult, JsonRpcRequest, JsonRpcResponse, MetricsResult,
-    PingResult, ReadFileParams, ReadFileResult, WriteFileParams, WriteFileResult,
+    AsyncTaskAccepted, CancelParams, ExecShellParams, ExecShellResult, JsonRpcRequest,
+    JsonRpcResponse, MetricsResult, PingResult, ReadFileParams, ReadFileResult, TaskListItem,
+    TaskListResult, TaskStatusParams, TaskStatusResult, WriteFileParams, WriteFileResult,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{routing::get, routing::post, Json, Router};
@@ -15,6 +16,7 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,20 +26,133 @@ use tokio_util::sync::CancellationToken;
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskState {
+    Running,
+    Completed,
+    Cancelled,
+}
+
+impl TaskState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TaskResult {
+    task_id: String,
+    status: TaskState,
+    started_at: Instant,
+    completed_at: Option<Instant>,
+    duration_ms: u64,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+    cancelled: bool,
+    async_exec: bool,
+}
+
+impl TaskResult {
+    fn running(task_id: String, async_exec: bool) -> Self {
+        Self {
+            task_id,
+            status: TaskState::Running,
+            started_at: Instant::now(),
+            completed_at: None,
+            duration_ms: 0,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            cancelled: false,
+            async_exec,
+        }
+    }
+
+    fn current_duration_ms(&self, now: Instant) -> u64 {
+        if self.status == TaskState::Running {
+            elapsed_ms_u64(now.saturating_duration_since(self.started_at))
+        } else {
+            self.duration_ms
+        }
+    }
+
+    fn apply_exec_result(&mut self, result: &ExecShellResult, completed_at: Instant) {
+        self.status = if result.cancelled {
+            TaskState::Cancelled
+        } else {
+            TaskState::Completed
+        };
+        self.completed_at = Some(completed_at);
+        self.duration_ms = result.duration_ms;
+        self.exit_code = result.exit_code;
+        self.stdout = result.stdout.clone();
+        self.stderr = result.stderr.clone();
+        self.timed_out = result.timed_out;
+        self.cancelled = result.cancelled;
+    }
+
+    fn to_status_result(&self, now: Instant) -> TaskStatusResult {
+        if self.status == TaskState::Running {
+            return TaskStatusResult {
+                task_id: self.task_id.clone(),
+                status: self.status.as_str().to_string(),
+                duration_ms: self.current_duration_ms(now),
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                timed_out: None,
+                cancelled: None,
+            };
+        }
+
+        TaskStatusResult {
+            task_id: self.task_id.clone(),
+            status: self.status.as_str().to_string(),
+            duration_ms: self.current_duration_ms(now),
+            exit_code: self.exit_code,
+            stdout: Some(self.stdout.clone()),
+            stderr: Some(self.stderr.clone()),
+            timed_out: Some(self.timed_out),
+            cancelled: Some(self.cancelled),
+        }
+    }
+
+    fn to_list_item(&self, now: Instant) -> TaskListItem {
+        TaskListItem {
+            task_id: self.task_id.clone(),
+            status: self.status.as_str().to_string(),
+            duration_ms: self.current_duration_ms(now),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<NodeServerConfig>,
     sandbox_root: Arc<PathBuf>,
-    tasks: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    running_tasks: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    task_results: Arc<RwLock<HashMap<String, TaskResult>>>,
 }
 
 pub async fn run_node_server(config: NodeServerConfig) -> Result<()> {
+    let mut config = config;
+    config.max_concurrent_tasks = config.max_concurrent_tasks.max(1);
+    config.task_result_ttl_ms = config.task_result_ttl_ms.max(1);
+
     validate_tls_requirements(&config)?;
     let sandbox_root = prepare_sandbox_root(&config.sandbox_root)?;
     let state = AppState {
         config: Arc::new(config.clone()),
         sandbox_root: Arc::new(sandbox_root),
-        tasks: Arc::new(RwLock::new(HashMap::new())),
+        running_tasks: Arc::new(RwLock::new(HashMap::new())),
+        task_results: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -55,12 +170,15 @@ pub async fn run_node_server(config: NodeServerConfig) -> Result<()> {
         config.sandbox_root
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .context("node server exited with error")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+    .context("node server exited with error")
 }
 
 async fn handle_health() -> impl IntoResponse {
@@ -69,6 +187,7 @@ async fn handle_health() -> impl IntoResponse {
 
 async fn handle_rpc(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
@@ -108,8 +227,10 @@ async fn handle_rpc(
         }
     };
 
+    let source_ip = addr.ip().to_string();
+
     let id = request.id.clone();
-    let result = dispatch_rpc(&state, request).await;
+    let result = dispatch_rpc(&state, request, &source_ip).await;
 
     match result {
         Ok(payload) => (StatusCode::OK, Json(JsonRpcResponse::success(id, payload))),
@@ -120,7 +241,7 @@ async fn handle_rpc(
     }
 }
 
-async fn dispatch_rpc(state: &AppState, request: JsonRpcRequest) -> Result<Value> {
+async fn dispatch_rpc(state: &AppState, request: JsonRpcRequest, source_ip: &str) -> Result<Value> {
     match request.method.as_str() {
         "node.ping" => Ok(serde_json::to_value(PingResult {
             message: "pong".into(),
@@ -128,8 +249,7 @@ async fn dispatch_rpc(state: &AppState, request: JsonRpcRequest) -> Result<Value
         })?),
         "node.exec_shell" => {
             let params: ExecShellParams = serde_json::from_value(request.params)?;
-            let output = handle_exec_shell(state, params).await?;
-            Ok(serde_json::to_value(output)?)
+            handle_exec_shell(state, params, source_ip).await
         }
         "node.read_file" => {
             let params: ReadFileParams = serde_json::from_value(request.params)?;
@@ -143,15 +263,30 @@ async fn dispatch_rpc(state: &AppState, request: JsonRpcRequest) -> Result<Value
         }
         "node.cancel" => {
             let params: CancelParams = serde_json::from_value(request.params)?;
-            handle_cancel(state, params).await?;
+            handle_cancel(state, params, source_ip).await?;
             Ok(json!({"ok": true}))
+        }
+        "node.task_status" => {
+            let params: TaskStatusParams = serde_json::from_value(request.params)?;
+            let result = handle_task_status(state, params).await?;
+            Ok(serde_json::to_value(result)?)
+        }
+        "node.task_list" => {
+            let result = handle_task_list(state).await?;
+            Ok(serde_json::to_value(result)?)
         }
         "node.metrics" => Ok(serde_json::to_value(read_metrics()?)?),
         method => bail!("unsupported method: {method}"),
     }
 }
 
-async fn handle_exec_shell(state: &AppState, params: ExecShellParams) -> Result<ExecShellResult> {
+async fn handle_exec_shell(
+    state: &AppState,
+    params: ExecShellParams,
+    source_ip: &str,
+) -> Result<Value> {
+    cleanup_expired_task_results(state).await;
+
     let command_text = params.cmd.trim();
     if command_text.is_empty() {
         bail!("cmd cannot be empty");
@@ -170,21 +305,102 @@ async fn handle_exec_shell(state: &AppState, params: ExecShellParams) -> Result<
         None
     };
 
+    let callback_url = validate_callback_url(params.callback_url.as_deref())?;
     let timeout_ms = params.timeout_ms.unwrap_or(state.config.exec_timeout_ms);
     let timeout = Duration::from_millis(timeout_ms.max(1));
-    let task_id = uuid::Uuid::new_v4().to_string();
-    let cancellation = CancellationToken::new();
+    let async_exec = params.async_exec.unwrap_or(false);
 
-    {
-        let mut tasks = state.tasks.write().await;
-        tasks.insert(task_id.clone(), cancellation.clone());
+    if async_exec {
+        let running_async_tasks = count_running_async_tasks(state).await;
+        if running_async_tasks >= state.config.max_concurrent_tasks {
+            bail!(
+                "max concurrent async tasks reached ({})",
+                state.config.max_concurrent_tasks
+            );
+        }
     }
 
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let cancellation = CancellationToken::new();
+    register_task(state, &task_id, cancellation.clone(), async_exec).await;
+
+    if async_exec {
+        let state_clone = state.clone();
+        let parsed_clone = parsed_command.clone();
+        let cwd_clone = cwd.clone();
+        let env_clone = params.env.clone();
+        let callback_url_clone = callback_url.clone();
+        let source_ip_owned = source_ip.to_string();
+        let task_id_clone = task_id.clone();
+
+        tokio::spawn(async move {
+            let result = execute_shell_command(
+                &state_clone,
+                &parsed_clone,
+                cwd_clone,
+                env_clone,
+                timeout,
+                &task_id_clone,
+                cancellation,
+            )
+            .await;
+
+            let callback_payload = finalize_task(state_clone.clone(), &result).await;
+            log_exec_shell_event(&parsed_clone, &result, &source_ip_owned);
+
+            if let Some(url) = callback_url_clone {
+                send_callback(url, callback_payload).await;
+            }
+        });
+
+        let accepted = AsyncTaskAccepted {
+            task_id,
+            status: "running".to_string(),
+        };
+        return Ok(serde_json::to_value(accepted)?);
+    }
+
+    let result = execute_shell_command(
+        state,
+        &parsed_command,
+        cwd,
+        params.env,
+        timeout,
+        &task_id,
+        cancellation,
+    )
+    .await;
+
+    let callback_payload = finalize_task(state.clone(), &result).await;
+    log_exec_shell_event(&parsed_command, &result, source_ip);
+
+    if let Some(url) = callback_url {
+        tokio::spawn(async move {
+            send_callback(url, callback_payload).await;
+        });
+    }
+
+    Ok(serde_json::to_value(result)?)
+}
+
+async fn execute_shell_command(
+    state: &AppState,
+    parsed_command: &ParsedCommand,
+    cwd: Option<PathBuf>,
+    env: Option<HashMap<String, String>>,
+    timeout: Duration,
+    task_id: &str,
+    cancellation: CancellationToken,
+) -> ExecShellResult {
     let started = Instant::now();
     let mut cmd = Command::new(&parsed_command.program);
+    cmd.kill_on_drop(true);
     cmd.args(&parsed_command.args);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
+    }
+    if let Some(env) = env {
+        cmd.envs(env);
     }
 
     let child = cmd.output();
@@ -206,17 +422,17 @@ async fn handle_exec_shell(state: &AppState, params: ExecShellParams) -> Result<
                         }
                     }
                     ExecShellResult {
-                    task_id: task_id.clone(),
-                    exit_code: output.status.code(),
-                    stdout,
-                    stderr,
-                    duration_ms: elapsed_ms_u64(started.elapsed()),
-                    timed_out: false,
-                    cancelled: false,
-                }
+                        task_id: task_id.to_string(),
+                        exit_code: output.status.code(),
+                        stdout,
+                        stderr,
+                        duration_ms: elapsed_ms_u64(started.elapsed()),
+                        timed_out: false,
+                        cancelled: false,
+                    }
                 }
                 Ok(Err(error)) => ExecShellResult {
-                    task_id: task_id.clone(),
+                    task_id: task_id.to_string(),
                     exit_code: None,
                     stdout: String::new(),
                     stderr: error.to_string(),
@@ -225,7 +441,7 @@ async fn handle_exec_shell(state: &AppState, params: ExecShellParams) -> Result<
                     cancelled: false,
                 },
                 Err(_) => ExecShellResult {
-                    task_id: task_id.clone(),
+                    task_id: task_id.to_string(),
                     exit_code: None,
                     stdout: String::new(),
                     stderr: "command execution timed out".into(),
@@ -236,7 +452,7 @@ async fn handle_exec_shell(state: &AppState, params: ExecShellParams) -> Result<
             }
         }
         _ = cancellation.cancelled() => ExecShellResult {
-            task_id: task_id.clone(),
+            task_id: task_id.to_string(),
             exit_code: None,
             stdout: String::new(),
             stderr: "command cancelled".into(),
@@ -246,24 +462,135 @@ async fn handle_exec_shell(state: &AppState, params: ExecShellParams) -> Result<
         }
     };
     result.duration_ms = elapsed_ms_u64(started.elapsed());
+    result
+}
 
-    {
-        let mut tasks = state.tasks.write().await;
-        tasks.remove(&task_id);
-    }
-
+fn log_exec_shell_event(command: &ParsedCommand, result: &ExecShellResult, source_ip: &str) {
     tracing::info!(
         target: "security_audit",
         event = "node.exec_shell",
-        command = %parsed_command.program,
-        args = %parsed_command.args.join(" "),
+        source_ip = source_ip,
+        command = %command.program,
+        args = %command.args.join(" "),
         exit_code = ?result.exit_code,
         duration_ms = result.duration_ms,
         timed_out = result.timed_out,
         cancelled = result.cancelled
     );
+}
 
-    Ok(result)
+async fn register_task(
+    state: &AppState,
+    task_id: &str,
+    cancellation: CancellationToken,
+    async_exec: bool,
+) {
+    {
+        let mut running_tasks = state.running_tasks.write().await;
+        running_tasks.insert(task_id.to_string(), cancellation);
+    }
+
+    let mut task_results = state.task_results.write().await;
+    task_results.insert(
+        task_id.to_string(),
+        TaskResult::running(task_id.to_string(), async_exec),
+    );
+}
+
+async fn finalize_task(state: AppState, result: &ExecShellResult) -> Value {
+    let now = Instant::now();
+    {
+        let mut running_tasks = state.running_tasks.write().await;
+        running_tasks.remove(&result.task_id);
+    }
+
+    let status_result = {
+        let mut task_results = state.task_results.write().await;
+        let entry = task_results.entry(result.task_id.clone()).or_insert_with(|| {
+            TaskResult::running(result.task_id.clone(), false)
+        });
+        entry.apply_exec_result(result, now);
+        entry.to_status_result(now)
+    };
+
+    cleanup_expired_task_results(&state).await;
+    serde_json::to_value(status_result).unwrap_or_else(|_| json!({ "task_id": result.task_id }))
+}
+
+async fn cleanup_expired_task_results(state: &AppState) {
+    let ttl = Duration::from_millis(state.config.task_result_ttl_ms.max(1));
+    let now = Instant::now();
+    let mut task_results = state.task_results.write().await;
+    task_results.retain(|_, task| {
+        if task.status == TaskState::Running {
+            return true;
+        }
+        task.completed_at
+            .map(|completed_at| now.saturating_duration_since(completed_at) <= ttl)
+            .unwrap_or(false)
+    });
+}
+
+async fn count_running_async_tasks(state: &AppState) -> usize {
+    let task_results = state.task_results.read().await;
+    task_results
+        .values()
+        .filter(|task| task.status == TaskState::Running && task.async_exec)
+        .count()
+}
+
+async fn handle_task_status(state: &AppState, params: TaskStatusParams) -> Result<TaskStatusResult> {
+    cleanup_expired_task_results(state).await;
+    let task_results = state.task_results.read().await;
+    let now = Instant::now();
+    let Some(task) = task_results.get(&params.task_id) else {
+        bail!("task not found")
+    };
+    Ok(task.to_status_result(now))
+}
+
+async fn handle_task_list(state: &AppState) -> Result<TaskListResult> {
+    cleanup_expired_task_results(state).await;
+    let task_results = state.task_results.read().await;
+    let now = Instant::now();
+    let tasks = task_results
+        .values()
+        .map(|task| task.to_list_item(now))
+        .collect::<Vec<_>>();
+    Ok(TaskListResult { tasks })
+}
+
+fn validate_callback_url(callback_url: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = callback_url else {
+        return Ok(None);
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        bail!("callback_url cannot be empty");
+    }
+    reqwest::Url::parse(value).context("invalid callback_url")?;
+    Ok(Some(value.to_string()))
+}
+
+async fn send_callback(callback_url: String, payload: Value) {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&callback_url)
+        .timeout(Duration::from_secs(10))
+        .json(&payload)
+        .send()
+        .await;
+
+    match response {
+        Ok(response) => {
+            if let Err(error) = response.error_for_status_ref() {
+                tracing::warn!(callback_url = %callback_url, error = %error, "node callback failed");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(callback_url = %callback_url, error = %error, "node callback failed");
+        }
+    }
 }
 
 async fn handle_read_file(state: &AppState, params: ReadFileParams) -> Result<ReadFileResult> {
@@ -314,12 +641,18 @@ async fn handle_write_file(state: &AppState, params: WriteFileParams) -> Result<
     })
 }
 
-async fn handle_cancel(state: &AppState, params: CancelParams) -> Result<()> {
-    let tasks = state.tasks.read().await;
+async fn handle_cancel(state: &AppState, params: CancelParams, source_ip: &str) -> Result<()> {
+    let tasks = state.running_tasks.read().await;
     let Some(token) = tasks.get(&params.task_id) else {
         bail!("task not found")
     };
     token.cancel();
+    tracing::info!(
+        target: "security_audit",
+        event = "node.cancel",
+        source_ip = source_ip,
+        task_id = %params.task_id
+    );
     Ok(())
 }
 

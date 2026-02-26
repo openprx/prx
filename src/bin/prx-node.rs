@@ -36,6 +36,12 @@ struct Cli {
     max_output_bytes: Option<usize>,
 
     #[arg(long)]
+    max_concurrent_tasks: Option<usize>,
+
+    #[arg(long)]
+    task_result_ttl_ms: Option<u64>,
+
+    #[arg(long)]
     tls_required: Option<bool>,
 
     #[arg(long)]
@@ -98,6 +104,12 @@ async fn main() -> Result<()> {
     }
     if let Some(max_output_bytes) = cli.max_output_bytes {
         cfg.max_output_bytes = max_output_bytes;
+    }
+    if let Some(max_concurrent_tasks) = cli.max_concurrent_tasks {
+        cfg.max_concurrent_tasks = max_concurrent_tasks.max(1);
+    }
+    if let Some(task_result_ttl_ms) = cli.task_result_ttl_ms {
+        cfg.task_result_ttl_ms = task_result_ttl_ms.max(1);
     }
     if let Some(tls_required) = cli.tls_required {
         cfg.tls_required = tls_required;
