@@ -1522,31 +1522,39 @@ async fn process_channel_message(
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
 
-    // Build history from per-sender conversation cache.
-    let prior_turns_raw = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&history_key)
-        .cloned()
-        .unwrap_or_default();
-    let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
-
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
-    if !had_prior_history {
-        let memory_context =
-            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
-        if let Some(last_turn) = prior_turns.last_mut() {
-            if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
-            }
-        }
-    }
+    let memory_context = if had_prior_history {
+        String::new()
+    } else {
+        build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await
+    };
 
     let system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
-    let mut history = vec![ChatMessage::system(system_prompt)];
-    history.extend(prior_turns);
+    let rebuild_history = || {
+        let prior_turns_raw = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&history_key)
+            .cloned()
+            .unwrap_or_default();
+        let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
+
+        if !had_prior_history {
+            if let Some(last_turn) = prior_turns.last_mut() {
+                if last_turn.role == "user" && !memory_context.is_empty() {
+                    last_turn.content = format!("{memory_context}{}", msg.content);
+                }
+            }
+        }
+
+        let mut next_history = vec![ChatMessage::system(system_prompt.clone())];
+        next_history.extend(prior_turns);
+        next_history
+    };
+
+    let mut history = rebuild_history();
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -1613,13 +1621,23 @@ async fn process_channel_message(
         _ => None,
     };
 
-    // Record history length before tool loop so we can extract tool context after.
-    let history_len_before_tools = history.len();
-
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
     }
+
+    enum LlmFinalOutcome {
+        Cancelled,
+        Success {
+            response: String,
+            history_len_before_tools: usize,
+        },
+        Error(anyhow::Error),
+        Timeout,
+        ContextOverflowExhausted,
+    }
+
+    const MAX_CONTEXT_OVERFLOW_RETRIES: usize = 2;
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
@@ -1635,32 +1653,74 @@ async fn process_channel_message(
         policy_pipeline: Some(&ctx.tool_policy_pipeline),
     };
 
-    let llm_result = tokio::select! {
-        () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-        result = tokio::time::timeout(
-            Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop(
-                active_provider.as_ref(),
-                &mut history,
-                ctx.tools_registry.as_ref(),
-                ctx.observer.as_ref(),
-                ctx.hooks.as_ref(),
-                route.provider.as_str(),
-                route.model.as_str(),
-                runtime_defaults.temperature,
-                true,
-                None,
-                msg.channel.as_str(),
-                &ctx.multimodal,
-                ctx.max_tool_iterations,
-                Some(&ctx.agent_compaction),
-                Some(cancellation_token.clone()),
-                delta_tx,
-                Some(&scope_ctx),
-            ),
-        ) => LlmExecutionResult::Completed(result),
+    let mut context_overflow_retries = 0usize;
+    let final_outcome = loop {
+        // Record history length before tool loop so we can extract tool context after.
+        let history_len_before_tools = history.len();
+        let llm_result = tokio::select! {
+            () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+            result = tokio::time::timeout(
+                Duration::from_secs(timeout_budget_secs),
+                run_tool_call_loop(
+                    active_provider.as_ref(),
+                    &mut history,
+                    ctx.tools_registry.as_ref(),
+                    ctx.observer.as_ref(),
+                    ctx.hooks.as_ref(),
+                    route.provider.as_str(),
+                    route.model.as_str(),
+                    runtime_defaults.temperature,
+                    true,
+                    None,
+                    msg.channel.as_str(),
+                    &ctx.multimodal,
+                    ctx.max_tool_iterations,
+                    Some(&ctx.agent_compaction),
+                    Some(cancellation_token.clone()),
+                    delta_tx.clone(),
+                    Some(&scope_ctx),
+                ),
+            ) => LlmExecutionResult::Completed(result),
+        };
+
+        match llm_result {
+            LlmExecutionResult::Cancelled => break LlmFinalOutcome::Cancelled,
+            LlmExecutionResult::Completed(Ok(Ok(response))) => {
+                break LlmFinalOutcome::Success {
+                    response,
+                    history_len_before_tools,
+                }
+            }
+            LlmExecutionResult::Completed(Ok(Err(e))) => {
+                if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()
+                {
+                    break LlmFinalOutcome::Cancelled;
+                }
+
+                if is_context_window_overflow_error(&e) {
+                    let compacted = compact_sender_history(ctx.as_ref(), &history_key);
+                    eprintln!(
+                        "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
+                        started_at.elapsed().as_millis(),
+                        compacted
+                    );
+
+                    if context_overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES {
+                        context_overflow_retries += 1;
+                        history = rebuild_history();
+                        continue;
+                    }
+
+                    break LlmFinalOutcome::ContextOverflowExhausted;
+                }
+
+                break LlmFinalOutcome::Error(e);
+            }
+            LlmExecutionResult::Completed(Err(_)) => break LlmFinalOutcome::Timeout,
+        }
     };
 
+    drop(delta_tx);
     if let Some(handle) = draft_updater {
         let _ = handle.await;
     }
@@ -1672,8 +1732,8 @@ async fn process_channel_message(
         log_worker_join_result(handle.await);
     }
 
-    match llm_result {
-        LlmExecutionResult::Cancelled => {
+    match final_outcome {
+        LlmFinalOutcome::Cancelled => {
             tracing::info!(
                 channel = %msg.channel,
                 sender = %msg.sender,
@@ -1687,7 +1747,10 @@ async fn process_channel_message(
                 }
             }
         }
-        LlmExecutionResult::Completed(Ok(Ok(response))) => {
+        LlmFinalOutcome::Success {
+            response,
+            history_len_before_tools,
+        } => {
             let sanitized_response =
                 sanitize_channel_response(&response, ctx.tools_registry.as_ref());
             let delivered_response = if sanitized_response.is_empty() && !response.trim().is_empty()
@@ -1742,53 +1805,7 @@ async fn process_channel_message(
                 }
             }
         }
-        LlmExecutionResult::Completed(Ok(Err(e))) => {
-            if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()
-            {
-                tracing::info!(
-                    channel = %msg.channel,
-                    sender = %msg.sender,
-                    "Cancelled in-flight channel request due to newer message"
-                );
-                if let (Some(channel), Some(draft_id)) =
-                    (target_channel.as_ref(), draft_message_id.as_deref())
-                {
-                    if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
-                        tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
-                    }
-                }
-                return;
-            }
-
-            if is_context_window_overflow_error(&e) {
-                let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                let error_text = if compacted {
-                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
-                } else {
-                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
-                };
-                eprintln!(
-                    "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
-                    started_at.elapsed().as_millis(),
-                    compacted
-                );
-                if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
-                            .await;
-                    } else {
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(error_text, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
-                    }
-                }
-                return;
-            }
-
+        LlmFinalOutcome::Error(e) => {
             eprintln!(
                 "  ❌ LLM error after {}ms: {e}",
                 started_at.elapsed().as_millis()
@@ -1808,7 +1825,7 @@ async fn process_channel_message(
                 }
             }
         }
-        LlmExecutionResult::Completed(Err(_)) => {
+        LlmFinalOutcome::Timeout => {
             let timeout_msg = format!(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
                 timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
@@ -1821,6 +1838,23 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
                     "⚠️ Request timed out while waiting for the model. Please try again.";
+                if let Some(ref draft_id) = draft_message_id {
+                    let _ = channel
+                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .await;
+                } else {
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(error_text, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
+                }
+            }
+        }
+        LlmFinalOutcome::ContextOverflowExhausted => {
+            if let Some(channel) = target_channel.as_ref() {
+                let error_text = "Session context reset. Please try again.";
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
                         .finalize_draft(&msg.reply_target, draft_id, error_text)
