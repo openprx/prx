@@ -3207,6 +3207,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         Some(channel)
                     },
                     allowed_users,
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::IMessage => {
@@ -3246,7 +3247,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .collect()
                 };
 
-                config.imessage = Some(IMessageConfig { allowed_contacts });
+                config.imessage = Some(IMessageConfig { allowed_contacts, mention_only: false });
                 println!(
                     "  {} iMessage configured (contacts: {})",
                     style("✅").green().bold(),
@@ -3363,6 +3364,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     device_id: detected_device_id,
                     room_id,
                     allowed_users,
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::WhatsApp => {
@@ -3444,6 +3446,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         dm_policy: crate::config::schema::DmPolicy::default(),
                         group_policy: crate::config::schema::GroupPolicy::default(),
                         group_allow_from: Vec::new(),
+                        mention_only: false,
                     });
 
                     println!(
@@ -3548,6 +3551,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     dm_policy: crate::config::schema::DmPolicy::default(),
                     group_policy: crate::config::schema::GroupPolicy::default(),
                     group_allow_from: Vec::new(),
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::Linq => {
@@ -3640,6 +3644,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         Some(signing_secret.trim().to_string())
                     },
                     allowed_senders,
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::Irc => {
@@ -3779,6 +3784,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         Some(sasl_password.trim().to_string())
                     },
                     verify_tls: Some(verify_tls),
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::Webhook => {
@@ -3882,6 +3888,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     client_id,
                     client_secret,
                     allowed_users,
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::QqOfficial => {
@@ -3958,6 +3965,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     app_id,
                     app_secret,
                     allowed_users,
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::LarkFeishu => {
@@ -4145,6 +4153,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     use_feishu,
                     receive_mode,
                     port,
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::Done => break,
@@ -6025,6 +6034,7 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
+            mention_only: false,
         });
         assert!(has_launchable_channels(&channels));
     }
