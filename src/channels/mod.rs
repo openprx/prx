@@ -223,6 +223,8 @@ struct ChannelRuntimeContext {
     agent_compaction: crate::config::AgentCompactionConfig,
     signal_inbound_policy: Option<InboundPolicyConfig>,
     whatsapp_inbound_policy: Option<InboundPolicyConfig>,
+    bot_names: Vec<String>,
+    mention_only_by_channel: HashMap<String, bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -364,6 +366,140 @@ fn should_process_inbound_message(
     };
 
     evaluate_inbound_policy(policy, msg)
+}
+
+fn collect_bot_names(config: &Config) -> Vec<String> {
+    let mut names: Vec<String> = vec!["openprx".to_string()];
+
+    if let Ok(Some(aieos_identity)) = identity::load_aieos_identity(&config.identity, &config.workspace_dir)
+    {
+        if let Some(identity) = aieos_identity.identity {
+            if let Some(agent_names) = identity.names {
+                if let Some(first) = agent_names.first {
+                    names.push(first);
+                }
+                if let Some(last) = agent_names.last {
+                    names.push(last);
+                }
+                if let Some(nickname) = agent_names.nickname {
+                    names.push(nickname);
+                }
+                if let Some(full) = agent_names.full {
+                    names.push(full);
+                }
+            }
+        }
+    }
+
+    for binding in &config.identity_bindings {
+        if let Some(display_name) = binding.display_name.as_deref() {
+            names.push(display_name.to_string());
+        }
+    }
+
+    if let Some(signal) = config.channels_config.signal.as_ref() {
+        names.push(signal.account.clone());
+    }
+
+    if let Some(whatsapp) = config.channels_config.whatsapp.as_ref() {
+        if let Some(pair_phone) = whatsapp.pair_phone.as_deref() {
+            names.push(pair_phone.to_string());
+            if !pair_phone.starts_with('+') {
+                names.push(format!("+{pair_phone}"));
+            }
+        }
+        if let Some(phone_number_id) = whatsapp.phone_number_id.as_deref() {
+            names.push(phone_number_id.to_string());
+        }
+    }
+
+    if let Some(irc) = config.channels_config.irc.as_ref() {
+        names.push(irc.nickname.clone());
+    }
+
+    let mut seen = HashSet::new();
+    names
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .filter(|name| seen.insert(name.to_ascii_lowercase()))
+        .collect()
+}
+
+fn collect_mention_only_by_channel(config: &Config) -> HashMap<String, bool> {
+    let mut mention_only = HashMap::new();
+
+    if let Some(telegram) = config.channels_config.telegram.as_ref() {
+        mention_only.insert("telegram".to_string(), telegram.mention_only);
+    }
+    if let Some(discord) = config.channels_config.discord.as_ref() {
+        mention_only.insert("discord".to_string(), discord.mention_only);
+    }
+    if let Some(slack) = config.channels_config.slack.as_ref() {
+        mention_only.insert("slack".to_string(), slack.mention_only);
+    }
+    if let Some(mattermost) = config.channels_config.mattermost.as_ref() {
+        mention_only.insert(
+            "mattermost".to_string(),
+            mattermost.mention_only.unwrap_or(false),
+        );
+    }
+    if let Some(imessage) = config.channels_config.imessage.as_ref() {
+        mention_only.insert("imessage".to_string(), imessage.mention_only);
+    }
+    if let Some(matrix) = config.channels_config.matrix.as_ref() {
+        mention_only.insert("matrix".to_string(), matrix.mention_only);
+    }
+    if let Some(signal) = config.channels_config.signal.as_ref() {
+        mention_only.insert("signal".to_string(), signal.mention_only);
+    }
+    if let Some(whatsapp) = config.channels_config.whatsapp.as_ref() {
+        mention_only.insert("whatsapp".to_string(), whatsapp.mention_only);
+    }
+    if let Some(wacli) = config.channels_config.wacli.as_ref() {
+        mention_only.insert("wacli".to_string(), wacli.mention_only);
+    }
+    if let Some(linq) = config.channels_config.linq.as_ref() {
+        mention_only.insert("linq".to_string(), linq.mention_only);
+    }
+    if let Some(nextcloud_talk) = config.channels_config.nextcloud_talk.as_ref() {
+        mention_only.insert("nextcloud_talk".to_string(), nextcloud_talk.mention_only);
+    }
+    if let Some(irc) = config.channels_config.irc.as_ref() {
+        mention_only.insert("irc".to_string(), irc.mention_only);
+    }
+    if let Some(lark) = config.channels_config.lark.as_ref() {
+        mention_only.insert("lark".to_string(), lark.mention_only);
+    }
+    if let Some(dingtalk) = config.channels_config.dingtalk.as_ref() {
+        mention_only.insert("dingtalk".to_string(), dingtalk.mention_only);
+    }
+    if let Some(qq) = config.channels_config.qq.as_ref() {
+        mention_only.insert("qq".to_string(), qq.mention_only);
+    }
+
+    mention_only
+}
+
+fn is_mention_only_enabled(ctx: &ChannelRuntimeContext, channel_name: &str) -> bool {
+    ctx.mention_only_by_channel
+        .get(channel_name)
+        .copied()
+        .unwrap_or(false)
+}
+
+fn is_bot_mentioned(ctx: &ChannelRuntimeContext, content: &str) -> bool {
+    let content_lower = content.to_lowercase();
+    for name in &ctx.bot_names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if content_lower.contains(&trimmed.to_lowercase()) {
+            return true;
+        }
+    }
+    false
 }
 
 fn warn_open_policy_allowlist_alignment(
@@ -1521,6 +1657,18 @@ async fn process_channel_message(
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+
+    // Skip LLM call for group messages when mention_only is enabled and bot is not mentioned.
+    let is_group = msg.reply_target.starts_with("group:")
+        || msg.reply_target.ends_with("@g.us")
+        || msg.reply_target.contains("@g.us");
+    if is_group {
+        let mention_only = is_mention_only_enabled(ctx.as_ref(), &msg.channel);
+        if mention_only && !is_bot_mentioned(ctx.as_ref(), &msg.content) {
+            println!("  ⏭️ Group message stored but skipped (no mention)");
+            return;
+        }
+    }
 
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
@@ -3397,6 +3545,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
+    let bot_names = collect_bot_names(&config);
+    let mention_only_by_channel = collect_mention_only_by_channel(&config);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -3428,6 +3578,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         agent_compaction: config.agent.compaction.clone(),
         signal_inbound_policy,
         whatsapp_inbound_policy,
+        bot_names,
+        mention_only_by_channel,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3611,6 +3763,8 @@ mod tests {
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -4160,6 +4314,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4225,6 +4381,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4290,6 +4448,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4364,6 +4524,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4459,6 +4621,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4536,6 +4700,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4628,6 +4794,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4705,6 +4873,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4771,6 +4941,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -4956,6 +5128,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -5042,6 +5216,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -5140,6 +5316,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -5220,6 +5398,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -5700,6 +5880,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -5791,6 +5973,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
@@ -5882,6 +6066,8 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),

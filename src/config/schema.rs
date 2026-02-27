@@ -3097,6 +3097,9 @@ pub struct SlackConfig {
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only process group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 /// Mattermost bot channel configuration.
@@ -3135,6 +3138,9 @@ pub struct WebhookConfig {
 pub struct IMessageConfig {
     /// Allowed iMessage contacts (phone numbers or email addresses). Empty = deny all.
     pub allowed_contacts: Vec<String>,
+    /// When true, only process group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 /// Matrix channel configuration.
@@ -3154,6 +3160,9 @@ pub struct MatrixConfig {
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
+    /// When true, only process group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3208,6 +3217,9 @@ pub struct SignalConfig {
     /// Allowlisted group IDs used when `group_policy = "allowlist"`.
     #[serde(default)]
     pub group_allow_from: Vec<String>,
+    /// When true, only process group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 fn default_signal_http_url() -> String {
@@ -3236,6 +3248,7 @@ impl Default for SignalConfig {
             dm_policy: DmPolicy::default(),
             group_policy: GroupPolicy::default(),
             group_allow_from: Vec::new(),
+            mention_only: false,
         }
     }
 }
@@ -3304,6 +3317,9 @@ pub struct WhatsAppConfig {
     /// Allowlisted group IDs used when `group_policy = "allowlist"`.
     #[serde(default)]
     pub group_allow_from: Vec<String>,
+    /// When true, only process group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3318,6 +3334,9 @@ pub struct LinqConfig {
     /// Allowed sender handles (phone numbers) or "*" for all
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+    /// When true, only process group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 /// Nextcloud Talk bot configuration (webhook receive + OCS send API).
@@ -3335,6 +3354,9 @@ pub struct NextcloudTalkConfig {
     /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only process group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 impl WhatsAppConfig {
@@ -3404,6 +3426,9 @@ pub struct WacliConfig {
     /// Path to the wacli store directory (for future auto-start support).
     #[serde(default)]
     pub store_dir: Option<String>,
+    /// When true, only process group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 fn default_wacli_host() -> String {
@@ -3427,6 +3452,7 @@ impl Default for WacliConfig {
             allowed_from: default_wacli_allowed_from(),
             cli_path: None,
             store_dir: None,
+            mention_only: false,
         }
     }
 }
@@ -3449,6 +3475,9 @@ pub struct IrcConfig {
     /// Allowed nicknames (case-insensitive) or "*" for all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only process channel/group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
     /// Server password (for bouncers like ZNC)
     pub server_password: Option<String>,
     /// NickServ IDENTIFY password
@@ -3502,6 +3531,9 @@ pub struct LarkConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// When true, only process group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 // ── Security Config ─────────────────────────────────────────────────
@@ -3726,6 +3758,9 @@ pub struct DingTalkConfig {
     /// Allowed user IDs (staff IDs). Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only process group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
@@ -3738,6 +3773,9 @@ pub struct QQConfig {
     /// Allowed user IDs. Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only process group messages that mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 // ── Config impl ──────────────────────────────────────────────────
