@@ -441,6 +441,12 @@ impl WacliChannel {
                     .unwrap_or(0)
             });
 
+        let mentioned_uuids: Vec<String> = payload
+            .get("mentionedJids")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
         let channel_msg = ChannelMessage {
             id: msg_id,
             sender: sender.to_string(),
@@ -449,7 +455,7 @@ impl WacliChannel {
             channel: "wacli".to_string(),
             timestamp,
             thread_ts: None,
-            mentioned_uuids: vec![],
+            mentioned_uuids,
         };
 
         tracing::debug!(
