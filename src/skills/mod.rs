@@ -7,15 +7,15 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
-const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
+const OPEN_SKILLS_SYNC_MARKER: &str = ".openprx-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
 const OPENCLAW_SKILLS_REPO_URL: &str = "https://github.com/openclaw/openclaw";
-const OPENCLAW_SKILLS_SYNC_MARKER: &str = ".zeroclaw-openclaw-skills-sync";
+const OPENCLAW_SKILLS_SYNC_MARKER: &str = ".openprx-openclaw-skills-sync";
 const OPENCLAW_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
 /// A skill is a user-defined or community-built capability.
-/// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
+/// Skills live in `~/.openprx/workspace/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
@@ -439,7 +439,7 @@ fn extract_description(content: &str) -> String {
 }
 
 /// Resolve the local clone directory for the openclaw-skills repo.
-/// Priority: env var → config value → `~/.zeroclaw/openclaw-skills/`
+/// Priority: env var → config value → `~/.openprx/openclaw-skills/`
 fn resolve_openclaw_skills_dir(config_openclaw_skills_dir: Option<&str>) -> Option<PathBuf> {
     let parse_dir = |raw: &str| {
         let trimmed = raw.trim();
@@ -464,8 +464,8 @@ fn resolve_openclaw_skills_dir(config_openclaw_skills_dir: Option<&str>) -> Opti
         return Some(config_dir);
     }
 
-    // 3. Default: ~/.zeroclaw/openclaw-skills/
-    UserDirs::new().map(|dirs| dirs.home_dir().join(".zeroclaw/openclaw-skills"))
+    // 3. Default: ~/.openprx/openclaw-skills/
+    UserDirs::new().map(|dirs| dirs.home_dir().join(".openprx/openclaw-skills"))
 }
 
 /// Ensure the openclaw-skills GitHub repo is cloned/up-to-date; returns the repo dir.
@@ -812,8 +812,8 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
              The agent will read it and follow the instructions.\n\n\
              ## Installing community skills\n\n\
              ```bash\n\
-             zeroclaw skills install <source>\n\
-             zeroclaw skills list\n\
+             openprx skills install <source>\n\
+             openprx skills list\n\
              ```\n",
         )?;
     }
@@ -892,10 +892,10 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             if skills.is_empty() {
                 println!("No skills installed.");
                 println!();
-                println!("  Create one: mkdir -p ~/.zeroclaw/workspace/skills/my-skill");
-                println!("              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md");
+                println!("  Create one: mkdir -p ~/.openprx/workspace/skills/my-skill");
+                println!("              echo '# My Skill' > ~/.openprx/workspace/skills/my-skill/SKILL.md");
                 println!();
-                println!("  Or install: zeroclaw skills install <source>");
+                println!("  Or install: openprx skills install <source>");
             } else {
                 println!("Installed skills ({}):", skills.len());
                 println!();
@@ -943,7 +943,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                         "  {} Skill installed successfully!",
                         console::style("✓").green().bold()
                     );
-                    println!("  Restart `zeroclaw channel start` to activate.");
+                    println!("  Restart `openprx channel start` to activate.");
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     anyhow::bail!("Git clone failed: {stderr}");
@@ -1420,9 +1420,9 @@ description = "Bare minimum"
 
     #[test]
     fn skills_dir_path() {
-        let base = std::path::Path::new("/home/user/.zeroclaw");
+        let base = std::path::Path::new("/home/user/.openprx");
         let dir = skills_dir(base);
-        assert_eq!(dir, PathBuf::from("/home/user/.zeroclaw/skills"));
+        assert_eq!(dir, PathBuf::from("/home/user/.openprx/skills"));
     }
 
     #[test]
@@ -1611,13 +1611,13 @@ description = "Bare minimum"
 
         // Default path when nothing is set.
         let result = resolve_openclaw_skills_dir(None);
-        // Must end with ".zeroclaw/openclaw-skills"
+        // Must end with ".openprx/openclaw-skills"
         assert!(
             result
                 .as_ref()
-                .map(|p| p.ends_with(".zeroclaw/openclaw-skills"))
+                .map(|p| p.ends_with(".openprx/openclaw-skills"))
                 .unwrap_or(false),
-            "default path should end with .zeroclaw/openclaw-skills, got: {result:?}"
+            "default path should end with .openprx/openclaw-skills, got: {result:?}"
         );
     }
 

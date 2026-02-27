@@ -97,7 +97,7 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
 
     let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
         auth_profile_override: None,
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };

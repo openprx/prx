@@ -15,15 +15,11 @@ keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
 
 [lib]
-name = "zeroclaw"
+name = "openprx"
 path = "src/lib.rs"
 
 [[bin]]
 name = "openprx"
-path = "src/main.rs"
-
-[[bin]]
-name = "zeroclaw"
 path = "src/main.rs"
 
 [dependencies]

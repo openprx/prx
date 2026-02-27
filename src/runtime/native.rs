@@ -31,7 +31,7 @@ impl RuntimeAdapter for NativeRuntime {
                 if primary.exists() {
                     primary
                 } else {
-                    let legacy = u.home_dir().join(".zeroclaw");
+                    let legacy = u.home_dir().join(".openprx");
                     if legacy.exists() {
                         legacy
                     } else {
@@ -90,7 +90,7 @@ mod tests {
     fn native_storage_path_contains_brand_dir() {
         let path = NativeRuntime::new().storage_path();
         let value = path.to_string_lossy();
-        assert!(value.contains("openprx") || value.contains("zeroclaw"));
+        assert!(value.contains("openprx") || value.contains("openprx"));
     }
 
     #[test]

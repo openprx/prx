@@ -579,9 +579,9 @@ impl SignalChannel {
             // Avoid double extension: if id already has the right extension, use it as-is
             let ext = mime_to_extension(content_type);
             let temp_path = if id.ends_with(&format!(".{ext}")) {
-                format!("/tmp/zeroclaw-att-{id}")
+                format!("/tmp/openprx-att-{id}")
             } else {
-                format!("/tmp/zeroclaw-att-{id}.{ext}")
+                format!("/tmp/openprx-att-{id}.{ext}")
             };
             std::fs::write(&temp_path, &bytes).ok()?;
 
@@ -620,7 +620,7 @@ impl SignalChannel {
 
         let bytes = response.bytes().await.ok()?;
         let ext = mime_to_extension(content_type);
-        let temp_path = format!("/tmp/zeroclaw-att-{id}.{ext}");
+        let temp_path = format!("/tmp/openprx-att-{id}.{ext}");
         std::fs::write(&temp_path, &bytes).ok()?;
 
         tracing::info!(

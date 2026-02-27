@@ -428,7 +428,7 @@ mod tests {
 
         let tool = ShellTool::new(security.clone(), test_runtime(), false);
         let denied = tool
-            .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
+            .execute(json!({"command": "touch openprx_shell_approval_test"}))
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
@@ -440,7 +440,7 @@ mod tests {
 
         let allowed = tool
             .execute(json!({
-                "command": "touch zeroclaw_shell_approval_test",
+                "command": "touch openprx_shell_approval_test",
                 "approved": true
             }))
             .await
@@ -448,7 +448,7 @@ mod tests {
         assert!(allowed.success);
 
         let _ =
-            tokio::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test")).await;
+            tokio::fs::remove_file(std::env::temp_dir().join("openprx_shell_approval_test")).await;
     }
 
     // ── §5.2 Shell timeout enforcement tests ─────────────────

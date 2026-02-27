@@ -209,7 +209,7 @@ Use `memory_store` and `memory_recall`.
     fn missing_tools_file_marks_registry_tools_as_missing_in_md() {
         let report = check_tools_alignment(
             vec!["shell".to_string(), "browser".to_string()],
-            Path::new("/tmp/zeroclaw-tools-md-not-found.md"),
+            Path::new("/tmp/openprx-tools-md-not-found.md"),
         );
 
         assert_eq!(

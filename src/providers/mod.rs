@@ -1056,7 +1056,7 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
 #[derive(Debug, Clone)]
 pub struct ProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
-    pub zeroclaw_dir: Option<PathBuf>,
+    pub openprx_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
 }
@@ -1065,7 +1065,7 @@ impl Default for ProviderRuntimeOptions {
     fn default() -> Self {
         Self {
             auth_profile_override: None,
-            zeroclaw_dir: None,
+            openprx_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
         }
@@ -1629,7 +1629,7 @@ fn create_provider_with_url_and_options(
         }
 
         _ => anyhow::bail!(
-            "Unknown provider: {name}. Check README for supported providers or run `zeroclaw onboard --interactive` to reconfigure.\n\
+            "Unknown provider: {name}. Check README for supported providers or run `openprx onboard --interactive` to reconfigure.\n\
              Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
              Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
         ),
@@ -1818,7 +1818,7 @@ pub struct ProviderInfo {
     pub local: bool,
 }
 
-/// Return the list of all known providers for display in `zeroclaw providers list`.
+/// Return the list of all known providers for display in `openprx providers list`.
 ///
 /// This is intentionally separate from the factory match in `create_provider`
 /// (display concern vs. construction concern).
@@ -2187,7 +2187,7 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_prefers_explicit_override() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}", std::process::id());
+        let fake_home = format!("/tmp/openprx-qwen-oauth-home-{}", std::process::id());
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
         let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, Some("oauth-token"));
         let _resource_guard = EnvGuard::set(
@@ -2204,7 +2204,7 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_uses_env_token_and_resource_url() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}-env", std::process::id());
+        let fake_home = format!("/tmp/openprx-qwen-oauth-home-{}-env", std::process::id());
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
         let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, Some("oauth-token"));
         let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
@@ -2226,7 +2226,7 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_reads_cached_credentials_file() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}-file", std::process::id());
+        let fake_home = format!("/tmp/openprx-qwen-oauth-home-{}-file", std::process::id());
         let creds_dir = PathBuf::from(&fake_home).join(".qwen");
         std::fs::create_dir_all(&creds_dir).unwrap();
         let creds_path = creds_dir.join("oauth_creds.json");
@@ -2255,7 +2255,7 @@ mod tests {
     fn resolve_qwen_oauth_context_placeholder_does_not_use_dashscope_fallback() {
         let _env_lock = env_lock();
         let fake_home = format!(
-            "/tmp/zeroclaw-qwen-oauth-home-{}-placeholder",
+            "/tmp/openprx-qwen-oauth-home-{}-placeholder",
             std::process::id()
         );
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
@@ -2272,7 +2272,7 @@ mod tests {
     #[test]
     fn resolve_claude_code_context_prefers_explicit_override() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/zeroclaw-claude-oauth-home-{}", std::process::id());
+        let fake_home = format!("/tmp/openprx-claude-oauth-home-{}", std::process::id());
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
         let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, Some("oauth-token"));
         let _refresh_guard = EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, Some("oauth-refresh"));
@@ -2287,7 +2287,7 @@ mod tests {
     #[test]
     fn resolve_claude_code_context_uses_env_access_token_before_file() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/zeroclaw-claude-oauth-home-{}-env", std::process::id());
+        let fake_home = format!("/tmp/openprx-claude-oauth-home-{}-env", std::process::id());
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
         let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, Some("env-access-token"));
         let _refresh_guard =
@@ -2304,7 +2304,7 @@ mod tests {
     fn resolve_claude_code_context_reads_cached_credentials_file() {
         let _env_lock = env_lock();
         let fake_home = format!(
-            "/tmp/zeroclaw-claude-oauth-home-{}-file",
+            "/tmp/openprx-claude-oauth-home-{}-file",
             std::process::id()
         );
         let creds_dir = PathBuf::from(&fake_home).join(".claude");
@@ -2330,7 +2330,7 @@ mod tests {
     fn resolve_claude_code_context_placeholder_does_not_use_anthropic_oauth_fallback() {
         let _env_lock = env_lock();
         let fake_home = format!(
-            "/tmp/zeroclaw-claude-oauth-home-{}-placeholder",
+            "/tmp/openprx-claude-oauth-home-{}-placeholder",
             std::process::id()
         );
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));

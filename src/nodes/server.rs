@@ -679,7 +679,7 @@ fn validate_hmac(headers: &HeaderMap, body: &str, config: &NodeServerConfig) -> 
     };
 
     let timestamp_raw = headers
-        .get("x-zeroclaw-timestamp")
+        .get("x-openprx-timestamp")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| anyhow!("missing X-ZeroClaw-Timestamp"))?;
 
@@ -693,7 +693,7 @@ fn validate_hmac(headers: &HeaderMap, body: &str, config: &NodeServerConfig) -> 
     }
 
     let signature = headers
-        .get("x-zeroclaw-signature")
+        .get("x-openprx-signature")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| anyhow!("missing X-ZeroClaw-Signature"))?;
 

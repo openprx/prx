@@ -4,7 +4,7 @@ use chrono::{Duration, Utc};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tempfile::tempdir;
-use zeroclaw::self_system::evolution::{
+use openprx::self_system::evolution::{
     with_trace, Actor, AnnotationPipeline, AsyncJsonlWriter, CandidatePriority, ChangeType,
     CircuitBreaker, CircuitBreakerState, DataBasis, DecisionLog, DecisionType, EngineCycleInput,
     EvolutionAnalyzer, EvolutionCandidate, EvolutionConfig, EvolutionEngine, EvolutionLayer,
@@ -12,7 +12,7 @@ use zeroclaw::self_system::evolution::{
     JsonlRetentionPolicy, JsonlStoragePaths, JsonlToSqliteIndexer, MemoryAccessLog, MemoryAction,
     MemoryEvolutionEngine, Outcome, RollbackManager, TaskType,
 };
-use zeroclaw::self_system::orchestrator::{
+use openprx::self_system::orchestrator::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
     EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
@@ -93,7 +93,7 @@ async fn trace_id_end_to_end_pipeline_to_evolution_log() -> Result<()> {
         .await?,
     );
 
-    let ctx = zeroclaw::self_system::evolution::TraceContext::new();
+    let ctx = openprx::self_system::evolution::TraceContext::new();
     let now = Utc::now();
     with_trace(ctx.clone(), || async {
         let ts = now.to_rfc3339();
@@ -111,7 +111,7 @@ async fn trace_id_end_to_end_pipeline_to_evolution_log() -> Result<()> {
     ));
     seed_three_day_digests(analyzer.as_ref(), now).await;
 
-    let shared = zeroclaw::self_system::evolution::new_shared_evolution_config(cfg);
+    let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let mut pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
     let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer));
 
@@ -172,7 +172,7 @@ async fn record_analyze_evolve_closed_loop_produces_candidate() -> Result<()> {
     ));
     seed_three_day_digests(analyzer.as_ref(), Utc::now()).await;
 
-    let shared = zeroclaw::self_system::evolution::new_shared_evolution_config(cfg);
+    let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let mut pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
     let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer));
 
@@ -224,7 +224,7 @@ async fn shadow_mode_generates_recommendation_without_applying_change() -> Resul
     ));
     seed_three_day_digests(analyzer.as_ref(), Utc::now()).await;
 
-    let shared = zeroclaw::self_system::evolution::new_shared_evolution_config(cfg);
+    let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let mut pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
     let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer));
 
@@ -255,7 +255,7 @@ async fn gate_rejects_candidate_when_threshold_not_met() -> Result<()> {
     cfg.gate.min_improvement = 1.0;
     tokio::fs::write(&cfg_path, toml::to_string_pretty(&cfg)?).await?;
 
-    let shared = zeroclaw::self_system::evolution::new_shared_evolution_config(cfg);
+    let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, None);
 
     let mut target = BTreeMap::new();
@@ -299,7 +299,7 @@ impl EvolutionEngine for RollbackTriggerEngine {
     async fn run_cycle(
         &mut self,
         input: EngineCycleInput,
-    ) -> Result<zeroclaw::self_system::evolution::CycleResult> {
+    ) -> Result<openprx::self_system::evolution::CycleResult> {
         let proposal = EvolutionProposal {
             id: "proposal-rb".to_string(),
             summary: "force rollback".to_string(),
@@ -313,7 +313,7 @@ impl EvolutionEngine for RollbackTriggerEngine {
             },
         };
 
-        Ok(zeroclaw::self_system::evolution::CycleResult {
+        Ok(openprx::self_system::evolution::CycleResult {
             layer: EvolutionLayer::Memory,
             proposal: Some(proposal),
             cycle: EvolutionCycle {
@@ -409,7 +409,7 @@ async fn rollback_triggers_when_judge_score_below_threshold() -> Result<()> {
     ));
     seed_three_day_digests(analyzer.as_ref(), Utc::now()).await;
 
-    let shared = zeroclaw::self_system::evolution::new_shared_evolution_config(cfg);
+    let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let mut pipeline = EvolutionPipeline::new(shared, analyzer, writer, dir.path());
     let mut engine = RollbackTriggerEngine {
         target_path: target.clone(),

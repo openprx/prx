@@ -329,7 +329,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
@@ -1667,7 +1667,7 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("zeroclaw_heartbeat_ticks_total 1"));
+        assert!(text.contains("openprx_heartbeat_ticks_total 1"));
     }
 
     #[test]

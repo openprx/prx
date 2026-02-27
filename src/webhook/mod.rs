@@ -725,7 +725,7 @@ mod tests {
                     "external_url": "https://example.com/issues/42",
                     "title": "Issue 42",
                     "content": "details",
-                    "actor": "zeroclaw_user",
+                    "actor": "openprx_user",
                     "timestamp": Utc::now().to_rfc3339()
                 })
                 .to_string(),
@@ -783,7 +783,7 @@ mod tests {
                         "external_id": "issue#42",
                         "title": format!("{project} issue"),
                         "content": "details",
-                        "actor": "zeroclaw_user",
+                        "actor": "openprx_user",
                         "timestamp": Utc::now().to_rfc3339()
                     })
                     .to_string(),
