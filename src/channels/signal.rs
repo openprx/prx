@@ -253,6 +253,20 @@ struct DataMessage {
     group_info: Option<GroupInfo>,
     #[serde(default)]
     attachments: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    mentions: Option<Vec<SignalMention>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SignalMention {
+    #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    start: Option<u64>,
+    #[serde(default)]
+    length: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -531,6 +545,7 @@ impl SignalChannel {
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
+            mentioned_uuids: data_msg.mentions.as_ref().map(|ms| ms.iter().filter_map(|m| m.uuid.clone()).collect()).unwrap_or_default(),
         })
     }
 

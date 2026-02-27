@@ -840,6 +840,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: None,
+            mentioned_uuids: vec![],
         })
     }
 

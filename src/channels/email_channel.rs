@@ -451,6 +451,7 @@ impl EmailChannel {
                 channel: "email".to_string(),
                 timestamp: email.timestamp,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             };
 
             if tx.send(msg).await.is_err() {

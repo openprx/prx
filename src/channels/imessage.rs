@@ -232,6 +232,7 @@ end tell"#
                                 .unwrap_or_default()
                                 .as_secs(),
                             thread_ts: None,
+                            mentioned_uuids: vec![],
                         };
 
                         if tx.send(msg).await.is_err() {

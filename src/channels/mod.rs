@@ -224,6 +224,7 @@ struct ChannelRuntimeContext {
     signal_inbound_policy: Option<InboundPolicyConfig>,
     whatsapp_inbound_policy: Option<InboundPolicyConfig>,
     bot_names: Vec<String>,
+    bot_uuids: Vec<String>,
     mention_only_by_channel: HashMap<String, bool>,
 }
 
@@ -426,6 +427,17 @@ fn collect_bot_names(config: &Config) -> Vec<String> {
         .collect()
 }
 
+fn collect_bot_uuids(config: &Config) -> Vec<String> {
+    let mut uuids: Vec<String> = Vec::new();
+    if let Some(signal) = config.channels_config.signal.as_ref() {
+        let account = signal.account.trim().to_string();
+        if !account.is_empty() {
+            uuids.push(account);
+        }
+    }
+    uuids
+}
+
 fn collect_mention_only_by_channel(config: &Config) -> HashMap<String, bool> {
     let mut mention_only = HashMap::new();
 
@@ -488,7 +500,14 @@ fn is_mention_only_enabled(ctx: &ChannelRuntimeContext, channel_name: &str) -> b
         .unwrap_or(false)
 }
 
-fn is_bot_mentioned(ctx: &ChannelRuntimeContext, content: &str) -> bool {
+fn is_bot_mentioned(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage, content: &str) -> bool {
+    // Check UUID-based mentions first (Signal @mentions)
+    for uuid in &ctx.bot_uuids {
+        if msg.mentioned_uuids.contains(uuid) {
+            return true;
+        }
+    }
+    // Fall back to text-based name matching
     let content_lower = content.to_lowercase();
     for name in &ctx.bot_names {
         let trimmed = name.trim();
@@ -1713,7 +1732,7 @@ async fn process_channel_message(
             // Strip metadata lines (e.g. [signal-meta ...]) before checking for mentions,
             // otherwise group names containing the bot name cause false positives.
             let user_text = strip_channel_metadata(&msg.content);
-            if !is_bot_mentioned(ctx.as_ref(), &user_text) {
+            if !is_bot_mentioned(ctx.as_ref(), &msg, &user_text) {
                 println!("  ⏭️ Group message stored but skipped (no mention)");
                 return;
             }
@@ -3596,6 +3615,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
     let bot_names = collect_bot_names(&config);
+    let bot_uuids = collect_bot_uuids(&config);
     let mention_only_by_channel = collect_mention_only_by_channel(&config);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -3629,6 +3649,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         signal_inbound_policy,
         whatsapp_inbound_policy,
         bot_names,
+        bot_uuids,
         mention_only_by_channel,
     });
 
@@ -3814,6 +3835,7 @@ mod tests {
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
         };
 
@@ -3851,6 +3873,7 @@ mod tests {
             channel: "signal".to_string(),
             timestamp: 1,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
         assert!(!evaluate_inbound_policy(&policy, &msg));
     }
@@ -3871,6 +3894,7 @@ mod tests {
             channel: "signal".to_string(),
             timestamp: 1,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
         assert!(evaluate_inbound_policy(&policy, &msg));
     }
@@ -3891,6 +3915,7 @@ mod tests {
             channel: "signal".to_string(),
             timestamp: 1,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
         assert!(!evaluate_inbound_policy(&policy, &msg));
     }
@@ -3911,6 +3936,7 @@ mod tests {
             channel: "signal".to_string(),
             timestamp: 1,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
         assert!(!evaluate_inbound_policy(&policy, &msg));
     }
@@ -3931,6 +3957,7 @@ mod tests {
             channel: "signal".to_string(),
             timestamp: 1,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
         assert!(evaluate_inbound_policy(&policy, &msg));
     }
@@ -4365,6 +4392,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -4384,6 +4412,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -4432,6 +4461,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -4451,6 +4481,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -4499,6 +4530,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -4518,6 +4550,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -4575,6 +4608,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -4594,6 +4628,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -4672,6 +4707,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -4691,6 +4727,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -4751,6 +4788,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -4770,6 +4808,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -4845,6 +4884,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -4864,6 +4904,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 4,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -4924,6 +4965,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -4943,6 +4985,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -4992,6 +5035,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -5011,6 +5055,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -5179,6 +5224,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -5197,6 +5243,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            mentioned_uuids: vec![],
         })
         .await
         .unwrap();
@@ -5208,6 +5255,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            mentioned_uuids: vec![],
         })
         .await
         .unwrap();
@@ -5267,6 +5315,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -5286,6 +5335,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             })
             .await
             .unwrap();
@@ -5298,6 +5348,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             })
             .await
             .unwrap();
@@ -5367,6 +5418,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -5386,6 +5438,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             })
             .await
             .unwrap();
@@ -5398,6 +5451,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             })
             .await
             .unwrap();
@@ -5449,6 +5503,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -5468,6 +5523,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -5802,6 +5858,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -5817,6 +5874,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -5826,6 +5884,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
 
         assert_ne!(
@@ -5847,6 +5906,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -5856,6 +5916,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
 
         mem.store(
@@ -5931,6 +5992,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -5950,6 +6012,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -5965,6 +6028,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -6024,6 +6088,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -6043,6 +6108,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
@@ -6117,6 +6183,7 @@ BTC is currently around $65,000 based on latest tool output."#
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
             bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -6136,6 +6203,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             },
             CancellationToken::new(),
         )
