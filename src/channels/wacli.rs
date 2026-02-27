@@ -449,6 +449,7 @@ impl WacliChannel {
             channel: "wacli".to_string(),
             timestamp,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
 
         tracing::debug!(

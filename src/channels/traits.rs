@@ -12,6 +12,9 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// UUIDs/identifiers of users mentioned in this message (e.g. Signal @mentions).
+    /// Used by mention_only filter to detect if the bot was explicitly mentioned.
+    pub mentioned_uuids: Vec<String>,
 }
 
 /// Message to send through a channel

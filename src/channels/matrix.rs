@@ -597,6 +597,7 @@ impl Channel for MatrixChannel {
                         .unwrap_or_default()
                         .as_secs(),
                     thread_ts: None,
+                    mentioned_uuids: vec![],
                 };
 
                 let _ = tx.send(msg).await;
