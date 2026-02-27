@@ -6,9 +6,17 @@ use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
+
+/// OAuth state for Claude Code token auto-refresh.
+struct OAuthState {
+    credential: Option<String>,
+    refresh_token: Option<String>,
+    expires_at: Option<i64>,
+}
 
 pub struct AnthropicProvider {
-    credential: Option<String>,
+    oauth: Mutex<OAuthState>,
     base_url: String,
 }
 
@@ -155,12 +163,149 @@ impl AnthropicProvider {
             .unwrap_or("https://api.anthropic.com")
             .to_string();
         Self {
-            credential: credential
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .map(ToString::to_string),
+            oauth: Mutex::new(OAuthState {
+                credential: credential
+                    .map(str::trim)
+                    .filter(|k| !k.is_empty())
+                    .map(ToString::to_string),
+                refresh_token: None,
+                expires_at: None,
+            }),
             base_url,
         }
+    }
+
+    pub fn with_oauth(
+        credential: Option<&str>,
+        refresh_token: Option<String>,
+        expires_at: Option<i64>,
+    ) -> Self {
+        Self {
+            oauth: Mutex::new(OAuthState {
+                credential: credential
+                    .map(str::trim)
+                    .filter(|k| !k.is_empty())
+                    .map(ToString::to_string),
+                refresh_token,
+                expires_at,
+            }),
+            base_url: "https://api.anthropic.com".to_string(),
+        }
+    }
+
+    /// 90-second buffer before expiry to proactively refresh.
+    const REFRESH_BUFFER_MS: i64 = 90_000;
+
+    /// Returns a fresh credential, refreshing the OAuth token if needed.
+    /// For plain API keys (no refresh_token), returns the credential as-is.
+    fn ensure_fresh_credential(&self) -> anyhow::Result<String> {
+        let mut state = self
+            .oauth
+            .lock()
+            .map_err(|_| anyhow::anyhow!("OAuth state lock poisoned"))?;
+
+        // If no refresh_token, this is a plain API key — just return it.
+        if state.refresh_token.is_none() {
+            return state.credential.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+                )
+            });
+        }
+
+        // Check whether the token is expired or within the buffer.
+        let needs_refresh = match state.expires_at {
+            Some(expires_at) => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| i64::try_from(d.as_millis()).ok())
+                    .unwrap_or(i64::MAX);
+                expires_at <= now_ms.saturating_add(Self::REFRESH_BUFFER_MS)
+            }
+            None => state.credential.is_none(),
+        };
+
+        if needs_refresh {
+            let refresh_token = state.refresh_token.clone().ok_or_else(|| {
+                anyhow::anyhow!("OAuth token expired but no refresh_token available")
+            })?;
+            tracing::info!("Proactively refreshing Claude Code OAuth token");
+            let refreshed =
+                super::refresh_claude_code_access_token(&refresh_token)?;
+
+            state.credential = refreshed.access_token.clone();
+            if let Some(new_expires) = refreshed.expires_at {
+                state.expires_at = Some(new_expires);
+            }
+            if let Some(new_refresh) = refreshed.refresh_token.as_ref() {
+                state.refresh_token = Some(new_refresh.clone());
+            }
+
+            // Persist refreshed credentials to the cached file.
+            let write_creds = super::ClaudeCodeCredentials {
+                access_token: refreshed.access_token,
+                refresh_token: Some(
+                    refreshed
+                        .refresh_token
+                        .unwrap_or_else(|| refresh_token.clone()),
+                ),
+                expires_at: refreshed.expires_at,
+                subscription_type: None,
+            };
+            if let Err(e) = super::write_claude_code_cached_credentials(&write_creds) {
+                tracing::warn!(error = %e, "Failed to write refreshed Claude Code credentials");
+            }
+        }
+
+        state.credential.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+            )
+        })
+    }
+
+    /// Try to refresh the token after a 401 response. Returns Ok(new_credential) if
+    /// refresh succeeded, Err if no refresh possible (plain API key or no refresh_token).
+    fn try_refresh_after_401(&self) -> anyhow::Result<String> {
+        let mut state = self
+            .oauth
+            .lock()
+            .map_err(|_| anyhow::anyhow!("OAuth state lock poisoned"))?;
+
+        let refresh_token = state
+            .refresh_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("No refresh_token available for 401 retry"))?;
+
+        tracing::info!("Refreshing Claude Code OAuth token after 401");
+        let refreshed = super::refresh_claude_code_access_token(&refresh_token)?;
+
+        state.credential = refreshed.access_token.clone();
+        if let Some(new_expires) = refreshed.expires_at {
+            state.expires_at = Some(new_expires);
+        }
+        if let Some(new_refresh) = refreshed.refresh_token.as_ref() {
+            state.refresh_token = Some(new_refresh.clone());
+        }
+
+        let write_creds = super::ClaudeCodeCredentials {
+            access_token: refreshed.access_token.clone(),
+            refresh_token: Some(
+                refreshed
+                    .refresh_token
+                    .unwrap_or_else(|| refresh_token.clone()),
+            ),
+            expires_at: refreshed.expires_at,
+            subscription_type: None,
+        };
+        if let Err(e) = super::write_claude_code_cached_credentials(&write_creds) {
+            tracing::warn!(error = %e, "Failed to write refreshed Claude Code credentials");
+        }
+
+        refreshed.access_token.ok_or_else(|| {
+            anyhow::anyhow!("OAuth refresh succeeded but returned no access_token")
+        })
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -413,13 +558,9 @@ impl Provider for AnthropicProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
-            )
-        })?;
+        let credential = self.ensure_fresh_credential()?;
 
-        let request = ChatRequest {
+        let body = ChatRequest {
             model: model.to_string(),
             max_tokens: 4096,
             system: system_prompt.map(ToString::to_string),
@@ -430,16 +571,33 @@ impl Provider for AnthropicProvider {
             temperature,
         };
 
-        let mut request = self
+        let req = self
             .http_client()
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&request);
+            .json(&body);
 
-        request = self.apply_auth(request, credential);
+        let response = self.apply_auth(req, &credential).send().await?;
 
-        let response = request.send().await?;
+        // Handle 401: try one refresh + retry before failing.
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Ok(new_credential) = self.try_refresh_after_401() {
+                let retry_req = self
+                    .http_client()
+                    .post(format!("{}/v1/messages", self.base_url))
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&body);
+                let retry_response = self.apply_auth(retry_req, &new_credential).send().await?;
+                if !retry_response.status().is_success() {
+                    return Err(super::api_error("Anthropic", retry_response).await);
+                }
+                let chat_response: ChatResponse = retry_response.json().await?;
+                return Self::parse_text_response(chat_response);
+            }
+            return Err(super::api_error("Anthropic", response).await);
+        }
 
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
@@ -455,11 +613,7 @@ impl Provider for AnthropicProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
-            )
-        })?;
+        let credential = self.ensure_fresh_credential()?;
 
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
 
@@ -484,7 +638,28 @@ impl Provider for AnthropicProvider {
             .header("content-type", "application/json")
             .json(&native_request);
 
-        let response = self.apply_auth(req, credential).send().await?;
+        let response = self.apply_auth(req, &credential).send().await?;
+
+        // Handle 401: try one refresh + retry before failing.
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Ok(new_credential) = self.try_refresh_after_401() {
+                let retry_req = self
+                    .http_client()
+                    .post(format!("{}/v1/messages", self.base_url))
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&native_request);
+                let retry_response =
+                    self.apply_auth(retry_req, &new_credential).send().await?;
+                if !retry_response.status().is_success() {
+                    return Err(super::api_error("Anthropic", retry_response).await);
+                }
+                let native_response: NativeChatResponse = retry_response.json().await?;
+                return Ok(Self::parse_native_response(native_response));
+            }
+            return Err(super::api_error("Anthropic", response).await);
+        }
+
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
@@ -553,17 +728,29 @@ impl Provider for AnthropicProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(credential) = self.credential.as_ref() {
+        let credential = self
+            .oauth
+            .lock()
+            .ok()
+            .and_then(|state| state.credential.clone());
+        if let Some(credential) = credential {
             let mut request = self
                 .http_client()
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("anthropic-version", "2023-06-01");
-            request = self.apply_auth(request, credential);
+            request = self.apply_auth(request, &credential);
             // Send a minimal request; the goal is TLS + HTTP/2 setup, not a valid response.
             // Anthropic has no lightweight GET endpoint, so we accept any non-network error.
             let _ = request.send().await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl AnthropicProvider {
+    fn credential(&self) -> Option<String> {
+        self.oauth.lock().ok().and_then(|s| s.credential.clone())
     }
 }
 
@@ -575,29 +762,29 @@ mod tests {
     #[test]
     fn creates_with_key() {
         let p = AnthropicProvider::new(Some("anthropic-test-credential"));
-        assert!(p.credential.is_some());
-        assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
+        assert!(p.credential().is_some());
+        assert_eq!(p.credential().as_deref(), Some("anthropic-test-credential"));
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[test]
     fn creates_without_key() {
         let p = AnthropicProvider::new(None);
-        assert!(p.credential.is_none());
+        assert!(p.credential().is_none());
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[test]
     fn creates_with_empty_key() {
         let p = AnthropicProvider::new(Some(""));
-        assert!(p.credential.is_none());
+        assert!(p.credential().is_none());
     }
 
     #[test]
     fn creates_with_whitespace_key() {
         let p = AnthropicProvider::new(Some("  anthropic-test-credential  "));
-        assert!(p.credential.is_some());
-        assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
+        assert!(p.credential().is_some());
+        assert_eq!(p.credential().as_deref(), Some("anthropic-test-credential"));
     }
 
     #[test]
@@ -607,7 +794,7 @@ mod tests {
             Some("https://api.example.com"),
         );
         assert_eq!(p.base_url, "https://api.example.com");
-        assert_eq!(p.credential.as_deref(), Some("anthropic-credential"));
+        assert_eq!(p.credential().as_deref(), Some("anthropic-credential"));
     }
 
     #[test]
@@ -1234,10 +1421,10 @@ mod tests {
         });
 
         // Create provider pointing at mock server
-        let provider = AnthropicProvider {
-            credential: Some("test-key".to_string()),
-            base_url: format!("http://{addr}"),
-        };
+        let provider = AnthropicProvider::with_base_url(
+            Some("test-key"),
+            Some(&format!("http://{addr}")),
+        );
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
         let messages = vec![
