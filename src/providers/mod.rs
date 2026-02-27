@@ -274,15 +274,15 @@ struct QwenOauthTokenResponse {
 }
 
 #[derive(Clone, Deserialize, Serialize, Default)]
-struct ClaudeCodeCredentials {
+pub(crate) struct ClaudeCodeCredentials {
     #[serde(rename = "accessToken", default)]
-    access_token: Option<String>,
+    pub(crate) access_token: Option<String>,
     #[serde(rename = "refreshToken", default)]
-    refresh_token: Option<String>,
+    pub(crate) refresh_token: Option<String>,
     #[serde(rename = "expiresAt", default)]
-    expires_at: Option<i64>,
+    pub(crate) expires_at: Option<i64>,
     #[serde(rename = "subscriptionType", default)]
-    subscription_type: Option<String>,
+    pub(crate) subscription_type: Option<String>,
 }
 
 impl std::fmt::Debug for ClaudeCodeCredentials {
@@ -325,6 +325,8 @@ struct ClaudeCodeOauthTokenResponse {
 #[derive(Clone, Default)]
 struct ClaudeCodeProviderContext {
     credential: Option<String>,
+    refresh_token: Option<String>,
+    expires_at: Option<i64>,
 }
 
 impl std::fmt::Debug for ClaudeCodeProviderContext {
@@ -334,6 +336,11 @@ impl std::fmt::Debug for ClaudeCodeProviderContext {
                 "credential",
                 &self.credential.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_at", &self.expires_at)
             .finish()
     }
 }
@@ -443,7 +450,7 @@ fn read_claude_code_cached_credentials() -> Option<ClaudeCodeCredentials> {
     parsed.claude_ai_oauth
 }
 
-fn write_claude_code_cached_credentials(credentials: &ClaudeCodeCredentials) -> anyhow::Result<()> {
+pub(crate) fn write_claude_code_cached_credentials(credentials: &ClaudeCodeCredentials) -> anyhow::Result<()> {
     let Some(path) = claude_code_credentials_file_path() else {
         return Ok(());
     };
@@ -629,7 +636,7 @@ fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOa
     })
 }
 
-fn refresh_claude_code_access_token(refresh_token: &str) -> anyhow::Result<ClaudeCodeCredentials> {
+pub(crate) fn refresh_claude_code_access_token(refresh_token: &str) -> anyhow::Result<ClaudeCodeCredentials> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -806,6 +813,8 @@ fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeP
         if !placeholder_requested {
             return ClaudeCodeProviderContext {
                 credential: Some(explicit.to_string()),
+                refresh_token: None,
+                expires_at: None,
             };
         }
     }
@@ -866,12 +875,21 @@ fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeP
         .filter(|token| !token.is_empty())
         .map(ToString::to_string);
 
+    let refresh_token = env_refresh_token.or_else(|| {
+        cached
+            .as_ref()
+            .and_then(|credentials| credentials.refresh_token.clone())
+    });
+    let expires_at = cached.as_ref().and_then(|credentials| credentials.expires_at);
+
     ClaudeCodeProviderContext {
         credential: if placeholder_requested {
             credential
         } else {
             credential.or_else(|| read_non_empty_env("ANTHROPIC_OAUTH_TOKEN"))
         },
+        refresh_token,
+        expires_at,
     }
 }
 
@@ -1352,8 +1370,30 @@ fn create_provider_with_url_and_options(
     match name {
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
-        "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
-        name if is_claude_code_alias(name) => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
+        "anthropic" => {
+            if let Some(ctx) = claude_code_context.as_ref() {
+                if ctx.refresh_token.is_some() {
+                    return Ok(Box::new(anthropic::AnthropicProvider::with_oauth(
+                        key,
+                        ctx.refresh_token.clone(),
+                        ctx.expires_at,
+                    )));
+                }
+            }
+            Ok(Box::new(anthropic::AnthropicProvider::new(key)))
+        }
+        name if is_claude_code_alias(name) => {
+            if let Some(ctx) = claude_code_context.as_ref() {
+                if ctx.refresh_token.is_some() {
+                    return Ok(Box::new(anthropic::AnthropicProvider::with_oauth(
+                        key,
+                        ctx.refresh_token.clone(),
+                        ctx.expires_at,
+                    )));
+                }
+            }
+            Ok(Box::new(anthropic::AnthropicProvider::new(key)))
+        }
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
