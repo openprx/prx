@@ -23,10 +23,9 @@ pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
-pub use principal::{ChatType, MemoryWriteContext, Principal, Role, Sensitivity, Visibility};
+pub use principal::MemoryWriteContext;
 pub use response_cache::ResponseCache;
 pub use sqlite::SqliteMemory;
-pub use topic::{Topic, TopicMemory};
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{LifecycleState, VerificationStatus};

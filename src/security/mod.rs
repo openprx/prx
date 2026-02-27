@@ -40,7 +40,7 @@ pub use detect::create_sandbox;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
 pub use policy::{AutonomyLevel, SecurityPolicy};
-pub use policy_pipeline::{EvalContext, PolicyDecision, PolicyLayer, PolicyPipeline};
+pub use policy_pipeline::{EvalContext, PolicyPipeline};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
 #[allow(unused_imports)]

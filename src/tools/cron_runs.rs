@@ -4,7 +4,6 @@ use crate::cron;
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::json;
-use std::sync::Arc;
 
 const MAX_RUN_OUTPUT_CHARS: usize = 500;
 

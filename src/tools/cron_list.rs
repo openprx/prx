@@ -3,7 +3,6 @@ use crate::config::SharedConfig;
 use crate::cron;
 use async_trait::async_trait;
 use serde_json::json;
-use std::sync::Arc;
 
 pub struct CronListTool {
     config: SharedConfig,

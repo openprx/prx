@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::{Config, SharedConfig};
+use crate::config::SharedConfig;
 use crate::cron;
 use crate::security::SecurityPolicy;
 use anyhow::Result;
