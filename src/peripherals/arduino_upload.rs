@@ -70,8 +70,8 @@ impl Tool for ArduinoUploadTool {
             });
         }
 
-        let sketch_name = "zeroclaw_sketch";
-        let temp_dir = std::env::temp_dir().join(format!("zeroclaw_{}", uuid::Uuid::new_v4()));
+        let sketch_name = "openprx_sketch";
+        let temp_dir = std::env::temp_dir().join(format!("openprx_{}", uuid::Uuid::new_v4()));
         let sketch_dir = temp_dir.join(sketch_name);
         let ino_path = sketch_dir.join(format!("{}.ino", sketch_name));
 

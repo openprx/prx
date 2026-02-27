@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
-use zeroclaw::config::{NodeServerConfig, NodesConfig};
+use openprx::config::{NodeServerConfig, NodesConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "prx-node")]
@@ -125,5 +125,5 @@ async fn main() -> Result<()> {
         bail!("bearer token is required (set --token or config nodes.server.bearer_token)");
     }
 
-    zeroclaw::nodes::run_node_server(cfg).await
+    openprx::nodes::run_node_server(cfg).await
 }

@@ -20,8 +20,8 @@ use std::sync::Arc;
 /// The caller is responsible for cleaning up the file after sending.
 pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Result<String> {
     let id = uuid::Uuid::new_v4().simple().to_string();
-    let mp3_path = format!("/tmp/zeroclaw-tts-{id}.mp3");
-    let m4a_path = format!("/tmp/zeroclaw-tts-{id}.m4a");
+    let mp3_path = format!("/tmp/openprx-tts-{id}.mp3");
+    let m4a_path = format!("/tmp/openprx-tts-{id}.m4a");
 
     // Sanitise text for embedding inside a JS single-quoted string.
     let safe_text = text

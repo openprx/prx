@@ -380,12 +380,12 @@ impl TelegramChannel {
         let home = UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
             .context("Could not find home directory")?;
-        let zeroclaw_dir = {
+        let openprx_dir = {
             let primary = home.join(".openprx");
             if primary.exists() {
                 primary
             } else {
-                let legacy = home.join(".zeroclaw");
+                let legacy = home.join(".openprx");
                 if legacy.exists() {
                     legacy
                 } else {
@@ -393,7 +393,7 @@ impl TelegramChannel {
                 }
             }
         };
-        let config_path = zeroclaw_dir.join("config.toml");
+        let config_path = openprx_dir.join("config.toml");
 
         let contents = fs::read_to_string(&config_path)
             .await
@@ -402,7 +402,7 @@ impl TelegramChannel {
             "Failed to parse config.toml — check [channels.telegram] section for syntax errors",
         )?;
         config.config_path = config_path;
-        config.workspace_dir = zeroclaw_dir.join("workspace");
+        config.workspace_dir = openprx_dir.join("workspace");
         Ok(config)
     }
 
@@ -1770,7 +1770,7 @@ impl Channel for TelegramChannel {
                 if error_code == 409 {
                     tracing::warn!(
                         "Telegram polling conflict (409): {description}. \
-Ensure only one `zeroclaw` process is using this bot token."
+Ensure only one `openprx` process is using this bot token."
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 } else {
@@ -2082,7 +2082,7 @@ mod tests {
     #[test]
     fn telegram_extract_bind_code_supports_bot_mention() {
         assert_eq!(
-            TelegramChannel::extract_bind_code("/bind@zeroclaw_bot 654321"),
+            TelegramChannel::extract_bind_code("/bind@openprx_bot 654321"),
             Some("654321")
         );
     }

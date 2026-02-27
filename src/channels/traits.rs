@@ -209,7 +209,7 @@ pub struct ChannelCapabilities {
 ///
 /// # Example
 /// ```
-/// use zeroclaw::channels::traits::extract_outgoing_media;
+/// use openprx::channels::traits::extract_outgoing_media;
 /// let (text, media) = extract_outgoing_media("Here you go [IMAGE:/tmp/cat.png] enjoy!");
 /// assert_eq!(text, "Here you go  enjoy!");
 /// assert_eq!(media, vec![("IMAGE".to_string(), "/tmp/cat.png".to_string())]);

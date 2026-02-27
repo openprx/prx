@@ -187,8 +187,8 @@ fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "openprx.service"];
 const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "openprx.service"];
-const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
-const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
+const OPENRC_STATUS_ARGS: [&str; 2] = ["openprx", "status"];
+const OPENRC_RESTART_ARGS: [&str; 2] = ["openprx", "restart"];
 
 #[derive(Clone)]
 struct ChannelRuntimeContext {
@@ -541,7 +541,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
 
 fn runtime_config_path(ctx: &ChannelRuntimeContext) -> Option<PathBuf> {
     ctx.provider_runtime_options
-        .zeroclaw_dir
+        .openprx_dir
         .as_ref()
         .map(|dir| dir.join("config.toml"))
 }
@@ -600,8 +600,8 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
         toml::from_str(&contents).with_context(|| format!("Failed to parse {}", path.display()))?;
     parsed.config_path = path.to_path_buf();
 
-    if let Some(zeroclaw_dir) = path.parent() {
-        let store = crate::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt);
+    if let Some(openprx_dir) = path.parent() {
+        let store = crate::security::SecretStore::new(openprx_dir, parsed.secrets.encrypt);
         decrypt_optional_secret_for_runtime_reload(&store, &mut parsed.api_key, "config.api_key")?;
     }
 
@@ -2358,7 +2358,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
 
     if cfg!(target_os = "linux") {
         // OpenRC (system-wide) takes precedence over systemd (user-level)
-        let openrc_init_script = PathBuf::from("/etc/init.d/zeroclaw");
+        let openrc_init_script = PathBuf::from("/etc/init.d/openprx");
         if openrc_init_script.exists() {
             if let Ok(status_output) = Command::new("rc-service").args(OPENRC_STATUS_ARGS).output()
             {
@@ -2764,7 +2764,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
@@ -4620,7 +4620,7 @@ BTC is currently around $65,000 based on latest tool output."#
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions {
-                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                openprx_dir: Some(temp.path().to_path_buf()),
                 ..providers::ProviderRuntimeOptions::default()
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -6326,7 +6326,7 @@ This is an example JSON object for profile settings."#;
 
     #[test]
     fn maybe_restart_daemon_openrc_args_regression() {
-        assert_eq!(OPENRC_STATUS_ARGS, ["zeroclaw", "status"]);
-        assert_eq!(OPENRC_RESTART_ARGS, ["zeroclaw", "restart"]);
+        assert_eq!(OPENRC_STATUS_ARGS, ["openprx", "status"]);
+        assert_eq!(OPENRC_RESTART_ARGS, ["openprx", "restart"]);
     }
 }

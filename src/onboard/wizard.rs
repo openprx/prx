@@ -374,9 +374,9 @@ async fn run_quick_setup_with_home(
     );
     println!();
 
-    let zeroclaw_dir = default_user_config_dir(home);
-    let workspace_dir = zeroclaw_dir.join("workspace");
-    let config_path = zeroclaw_dir.join("config.toml");
+    let openprx_dir = default_user_config_dir(home);
+    let workspace_dir = openprx_dir.join("workspace");
+    let config_path = openprx_dir.join("config.toml");
 
     fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
@@ -1625,7 +1625,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
         .default(true)
         .interact()?;
 
-    let zeroclaw_dir = if use_default {
+    let openprx_dir = if use_default {
         default_dir
     } else {
         let custom: String = Input::new()
@@ -1635,8 +1635,8 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
         PathBuf::from(expanded)
     };
 
-    let workspace_dir = zeroclaw_dir.join("workspace");
-    let config_path = zeroclaw_dir.join("config.toml");
+    let workspace_dir = openprx_dir.join("workspace");
+    let config_path = openprx_dir.join("config.toml");
 
     fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
 
@@ -1654,7 +1654,7 @@ fn default_user_config_dir(home: &Path) -> PathBuf {
     if primary.exists() {
         return primary;
     }
-    let legacy = home.join(".zeroclaw");
+    let legacy = home.join(".openprx");
     if legacy.exists() {
         return legacy;
     }
@@ -4890,7 +4890,7 @@ fn print_summary(config: &Config) {
     );
     println!(
         "       {}",
-        style("ln -s \"$(command -v openprx)\" \"$HOME/.local/bin/zeroclaw\"").yellow()
+        style("ln -s \"$(command -v openprx)\" \"$HOME/.local/bin/openprx\"").yellow()
     );
 
     println!();

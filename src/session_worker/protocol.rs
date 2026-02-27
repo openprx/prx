@@ -59,12 +59,12 @@ mod tests {
             max_iterations: 24,
             system_prompt: None,
             identity_dir: Some("identity/worker".into()),
-            scope_sender: Some("zeroclaw_user".into()),
+            scope_sender: Some("openprx_user".into()),
             scope_channel: Some("telegram".into()),
             scope_chat_type: Some("direct".into()),
             scope_chat_id: Some("chat-1".into()),
             spawn_depth: 1,
-            session_scope_key: "telegram:chat-1:zeroclaw_user".into(),
+            session_scope_key: "telegram:chat-1:openprx_user".into(),
             parent_run_id: Some("run-0".into()),
             compaction_config: Some(crate::config::AgentCompactionConfig::default()),
         };
@@ -75,11 +75,11 @@ mod tests {
         assert_eq!(parsed.run_id, "run-1");
         assert_eq!(parsed.allowed_tools.len(), 2);
         assert_eq!(parsed.identity_dir.as_deref(), Some("identity/worker"));
-        assert_eq!(parsed.scope_sender.as_deref(), Some("zeroclaw_user"));
+        assert_eq!(parsed.scope_sender.as_deref(), Some("openprx_user"));
         assert_eq!(parsed.spawn_depth, 1);
         assert_eq!(
             parsed.session_scope_key,
-            "telegram:chat-1:zeroclaw_user".to_string()
+            "telegram:chat-1:openprx_user".to_string()
         );
         assert_eq!(parsed.parent_run_id.as_deref(), Some("run-0"));
         assert!(parsed.compaction_config.is_some());

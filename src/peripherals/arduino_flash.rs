@@ -7,10 +7,10 @@ use anyhow::{Context, Result};
 use std::process::Command;
 
 /// ZeroClaw Arduino Uno base firmware (capabilities, gpio_read, gpio_write).
-const FIRMWARE_INO: &str = include_str!("../../firmware/zeroclaw-arduino/zeroclaw-arduino.ino");
+const FIRMWARE_INO: &str = include_str!("../../firmware/openprx-arduino/openprx-arduino.ino");
 
 const FQBN: &str = "arduino:avr:uno";
-const SKETCH_NAME: &str = "zeroclaw-arduino";
+const SKETCH_NAME: &str = "openprx-arduino";
 
 /// Check if arduino-cli is available.
 pub fn arduino_cli_available() -> bool {
@@ -90,7 +90,7 @@ pub fn flash_arduino_firmware(port: &str) -> Result<()> {
     ensure_arduino_cli()?;
     ensure_avr_core()?;
 
-    let temp_dir = std::env::temp_dir().join(format!("zeroclaw_flash_{}", uuid::Uuid::new_v4()));
+    let temp_dir = std::env::temp_dir().join(format!("openprx_flash_{}", uuid::Uuid::new_v4()));
     let sketch_dir = temp_dir.join(SKETCH_NAME);
     let ino_path = sketch_dir.join(format!("{}.ino", SKETCH_NAME));
 

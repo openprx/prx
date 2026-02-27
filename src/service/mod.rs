@@ -145,7 +145,7 @@ fn start_linux(init_system: InitSystem) -> Result<()> {
             run_checked(Command::new("systemctl").args(["--user", "start", "openprx.service"]))?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["zeroclaw", "start"]))?;
+            run_checked(Command::new("rc-service").args(["openprx", "start"]))?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -187,7 +187,7 @@ fn stop_linux(init_system: InitSystem) -> Result<()> {
                 run_checked(Command::new("systemctl").args(["--user", "stop", "openprx.service"]));
         }
         InitSystem::Openrc => {
-            let _ = run_checked(Command::new("rc-service").args(["zeroclaw", "stop"]));
+            let _ = run_checked(Command::new("rc-service").args(["openprx", "stop"]));
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -225,7 +225,7 @@ fn restart_linux(init_system: InitSystem) -> Result<()> {
             run_checked(Command::new("systemctl").args(["--user", "restart", "openprx.service"]))?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["zeroclaw", "restart"]))?;
+            run_checked(Command::new("rc-service").args(["openprx", "restart"]))?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -295,10 +295,10 @@ fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             println!("Unit: {}", linux_service_file(config)?.display());
         }
         InitSystem::Openrc => {
-            let out = run_capture(Command::new("rc-service").args(["zeroclaw", "status"]))
+            let out = run_capture(Command::new("rc-service").args(["openprx", "status"]))
                 .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
-            println!("Unit: /etc/init.d/zeroclaw");
+            println!("Unit: /etc/init.d/openprx");
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -355,19 +355,19 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             println!("✅ Service uninstalled ({})", file.display());
         }
         InitSystem::Openrc => {
-            let init_script = Path::new("/etc/init.d/zeroclaw");
+            let init_script = Path::new("/etc/init.d/openprx");
             if init_script.exists() {
                 if let Err(err) =
-                    run_checked(Command::new("rc-update").args(["del", "zeroclaw", "default"]))
+                    run_checked(Command::new("rc-update").args(["del", "openprx", "default"]))
                 {
                     eprintln!(
-                        "⚠️  Warning: Could not remove zeroclaw from OpenRC default runlevel: {err}"
+                        "⚠️  Warning: Could not remove openprx from OpenRC default runlevel: {err}"
                     );
                 }
                 fs::remove_file(init_script)
                     .with_context(|| format!("Failed to remove {}", init_script.display()))?;
             }
-            println!("✅ Service uninstalled (/etc/init.d/zeroclaw)");
+            println!("✅ Service uninstalled (/etc/init.d/openprx)");
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -465,20 +465,20 @@ fn is_root() -> bool {
     false
 }
 
-/// Check if the zeroclaw user exists and has expected properties.
+/// Check if the openprx user exists and has expected properties.
 /// Returns Ok if user doesn't exist (OpenRC will handle creation or fail gracefully).
 /// Returns error if user exists but has unexpected properties.
-fn check_zeroclaw_user() -> Result<()> {
-    let output = Command::new("getent").args(["passwd", "zeroclaw"]).output();
+fn check_openprx_user() -> Result<()> {
+    let output = Command::new("getent").args(["passwd", "openprx"]).output();
     let is_alpine = Path::new("/etc/alpine-release").exists();
 
     let (del_cmd, add_cmd) = if is_alpine {
         (
-            "deluser zeroclaw && delgroup zeroclaw",
-            "addgroup -S zeroclaw && adduser -S -s /sbin/nologin -H -D -G zeroclaw zeroclaw",
+            "deluser openprx && delgroup openprx",
+            "addgroup -S openprx && adduser -S -s /sbin/nologin -H -D -G openprx openprx",
         )
     } else {
-        ("userdel zeroclaw", "useradd -r -s /sbin/nologin zeroclaw")
+        ("userdel openprx", "useradd -r -s /sbin/nologin openprx")
     };
 
     match output {
@@ -493,7 +493,7 @@ fn check_zeroclaw_user() -> Result<()> {
 
                 if uid.parse::<u32>().unwrap_or(999) >= 1000 {
                     bail!(
-                        "User 'zeroclaw' exists but has unexpected UID {} (expected system UID < 1000).\n\
+                        "User 'openprx' exists but has unexpected UID {} (expected system UID < 1000).\n\
                          Recreate with: sudo {} && sudo {}",
                         uid, del_cmd, add_cmd
                     );
@@ -501,7 +501,7 @@ fn check_zeroclaw_user() -> Result<()> {
 
                 if !shell.contains("nologin") && !shell.contains("false") {
                     bail!(
-                        "User 'zeroclaw' exists but has unexpected shell '{}'.\n\
+                        "User 'openprx' exists but has unexpected shell '{}'.\n\
                          Expected nologin/false for security. Fix with: sudo {} && sudo {}",
                         shell,
                         del_cmd,
@@ -509,9 +509,9 @@ fn check_zeroclaw_user() -> Result<()> {
                     );
                 }
 
-                if home != "/var/lib/zeroclaw" && home != "/nonexistent" {
+                if home != "/var/lib/openprx" && home != "/nonexistent" {
                     eprintln!(
-                        "⚠️  Warning: zeroclaw user has home directory '{}' (expected /var/lib/zeroclaw or /nonexistent)",
+                        "⚠️  Warning: openprx user has home directory '{}' (expected /var/lib/openprx or /nonexistent)",
                         home
                     );
                 }
@@ -524,31 +524,31 @@ fn check_zeroclaw_user() -> Result<()> {
     }
 }
 
-fn ensure_zeroclaw_user() -> Result<()> {
-    let output = Command::new("getent").args(["passwd", "zeroclaw"]).output();
+fn ensure_openprx_user() -> Result<()> {
+    let output = Command::new("getent").args(["passwd", "openprx"]).output();
     if let Ok(output) = output {
         if output.status.success() {
-            return check_zeroclaw_user();
+            return check_openprx_user();
         }
     }
 
     let is_alpine = Path::new("/etc/alpine-release").exists();
 
     if is_alpine {
-        let group_output = Command::new("getent").args(["group", "zeroclaw"]).output();
+        let group_output = Command::new("getent").args(["group", "openprx"]).output();
         let group_exists = group_output.map(|o| o.status.success()).unwrap_or(false);
 
         if !group_exists {
             let output = Command::new("addgroup")
-                .args(["-S", "zeroclaw"])
+                .args(["-S", "openprx"])
                 .output()
-                .context("Failed to create zeroclaw group")?;
+                .context("Failed to create openprx group")?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!("Failed to create zeroclaw group: {}", stderr.trim());
+                bail!("Failed to create openprx group: {}", stderr.trim());
             }
-            println!("✅ Created system group: zeroclaw");
+            println!("✅ Created system group: openprx");
         }
 
         let output = Command::new("adduser")
@@ -559,44 +559,44 @@ fn ensure_zeroclaw_user() -> Result<()> {
                 "-H",
                 "-D",
                 "-G",
-                "zeroclaw",
-                "zeroclaw",
+                "openprx",
+                "openprx",
             ])
             .output()
-            .context("Failed to create zeroclaw user")?;
+            .context("Failed to create openprx user")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to create zeroclaw user: {}", stderr.trim());
+            bail!("Failed to create openprx user: {}", stderr.trim());
         }
     } else {
         let output = Command::new("useradd")
-            .args(["-r", "-s", "/sbin/nologin", "zeroclaw"])
+            .args(["-r", "-s", "/sbin/nologin", "openprx"])
             .output()
-            .context("Failed to create zeroclaw user")?;
+            .context("Failed to create openprx user")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to create zeroclaw user: {}", stderr.trim());
+            bail!("Failed to create openprx user: {}", stderr.trim());
         }
     }
 
-    println!("✅ Created system user: zeroclaw");
+    println!("✅ Created system user: openprx");
     Ok(())
 }
 
-/// Change ownership of a path to zeroclaw:zeroclaw
+/// Change ownership of a path to openprx:openprx
 #[cfg(unix)]
-fn chown_to_zeroclaw(path: &Path) -> Result<()> {
+fn chown_to_openprx(path: &Path) -> Result<()> {
     let output = Command::new("chown")
-        .args(["zeroclaw:zeroclaw", &path.to_string_lossy()])
+        .args(["openprx:openprx", &path.to_string_lossy()])
         .output()
         .context("Failed to run chown")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "Failed to change ownership of {} to zeroclaw:zeroclaw: {}",
+            "Failed to change ownership of {} to openprx:openprx: {}",
             path.display(),
             stderr.trim(),
         );
@@ -605,21 +605,21 @@ fn chown_to_zeroclaw(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn chown_to_zeroclaw(_path: &Path) -> Result<()> {
+fn chown_to_openprx(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn chown_recursive_to_zeroclaw(path: &Path) -> Result<()> {
+fn chown_recursive_to_openprx(path: &Path) -> Result<()> {
     let output = Command::new("chown")
-        .args(["-R", "zeroclaw:zeroclaw", &path.to_string_lossy()])
+        .args(["-R", "openprx:openprx", &path.to_string_lossy()])
         .output()
         .context("Failed to run recursive chown")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "Failed to recursively change ownership of {} to zeroclaw:zeroclaw: {}",
+            "Failed to recursively change ownership of {} to openprx:openprx: {}",
             path.display(),
             stderr.trim(),
         );
@@ -629,7 +629,7 @@ fn chown_recursive_to_zeroclaw(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn chown_recursive_to_zeroclaw(_path: &Path) -> Result<()> {
+fn chown_recursive_to_openprx(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -672,7 +672,7 @@ fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
         if primary.exists() {
             return primary;
         }
-        let legacy = home.join(".zeroclaw");
+        let legacy = home.join(".openprx");
         if legacy.exists() {
             return legacy;
         }
@@ -743,7 +743,7 @@ fn build_openrc_writability_probe_command(path: &Path, has_runuser: bool) -> (St
             "runuser".to_string(),
             vec![
                 "-u".to_string(),
-                "zeroclaw".to_string(),
+                "openprx".to_string(),
                 "--".to_string(),
                 "sh".to_string(),
                 "-c".to_string(),
@@ -758,7 +758,7 @@ fn build_openrc_writability_probe_command(path: &Path, has_runuser: bool) -> (St
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 probe,
-                "zeroclaw".to_string(),
+                "openprx".to_string(),
             ],
         )
     }
@@ -786,8 +786,8 @@ fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
             stderr.trim()
         };
         bail!(
-            "OpenRC runtime user 'zeroclaw' cannot write {} ({details}). \
-             Re-run `sudo openprx service install` and ensure ownership is zeroclaw:zeroclaw.",
+            "OpenRC runtime user 'openprx' cannot write {} ({details}). \
+             Re-run `sudo openprx service install` and ensure ownership is openprx:openprx.",
             path.display(),
         );
     }
@@ -835,17 +835,17 @@ fn generate_openrc_script(exe_path: &Path, config_dir: &Path) -> String {
     format!(
         r#"#!/sbin/openrc-run
 
-name="zeroclaw"
+name="openprx"
 description="OpenPRX daemon"
 
 command="{}"
 command_args="--config-dir {} daemon"
 command_background="yes"
-command_user="zeroclaw:zeroclaw"
+command_user="openprx:openprx"
 pidfile="/run/${{RC_SVCNAME}}.pid"
 umask 027
-output_log="/var/log/zeroclaw/access.log"
-error_log="/var/log/zeroclaw/error.log"
+output_log="/var/log/openprx/access.log"
+error_log="/var/log/openprx/error.log"
 
 depend() {{
     need net
@@ -875,14 +875,14 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         );
     }
 
-    ensure_zeroclaw_user()?;
+    ensure_openprx_user()?;
 
     let exe = resolve_openrc_executable()?;
     warn_if_binary_in_home(&exe);
 
-    let config_dir = Path::new("/etc/zeroclaw");
+    let config_dir = Path::new("/etc/openprx");
     let workspace_dir = config_dir.join("workspace");
-    let log_dir = Path::new("/var/log/zeroclaw");
+    let log_dir = Path::new("/var/log/openprx");
 
     if !config_dir.exists() {
         fs::create_dir_all(config_dir)
@@ -909,9 +909,9 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
                 || format!("Failed to set permissions on {}", workspace_dir.display()),
             )?;
         }
-        chown_to_zeroclaw(&workspace_dir)?;
+        chown_to_openprx(&workspace_dir)?;
         println!(
-            "✅ Created directory: {} (owned by zeroclaw:zeroclaw)",
+            "✅ Created directory: {} (owned by openprx:openprx)",
             workspace_dir.display()
         );
     }
@@ -942,7 +942,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         }
     }
 
-    chown_recursive_to_zeroclaw(config_dir)?;
+    chown_recursive_to_openprx(config_dir)?;
 
     let created_log_dir = !log_dir.exists();
     if created_log_dir {
@@ -956,19 +956,19 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         }
     }
 
-    chown_to_zeroclaw(log_dir)?;
+    chown_to_openprx(log_dir)?;
 
     ensure_openrc_runtime_dirs_writable(config_dir, &workspace_dir, log_dir)?;
 
     if created_log_dir {
         println!(
-            "✅ Created directory: {} (owned by zeroclaw:zeroclaw)",
+            "✅ Created directory: {} (owned by openprx:openprx)",
             log_dir.display()
         );
     }
 
     let init_script = generate_openrc_script(&exe, config_dir);
-    let init_path = Path::new("/etc/init.d/zeroclaw");
+    let init_path = Path::new("/etc/init.d/openprx");
     fs::write(init_path, init_script)
         .with_context(|| format!("Failed to write {}", init_path.display()))?;
 
@@ -979,9 +979,9 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
             .with_context(|| format!("Failed to set permissions on {}", init_path.display()))?;
     }
 
-    run_checked(Command::new("rc-update").args(["add", "zeroclaw", "default"]))?;
-    println!("✅ Installed OpenRC service: /etc/init.d/zeroclaw");
-    println!("   Config path: /etc/zeroclaw/config.toml");
+    run_checked(Command::new("rc-update").args(["add", "openprx", "default"]))?;
+    println!("✅ Installed OpenRC service: /etc/init.d/openprx");
+    println!("   Config path: /etc/openprx/config.toml");
     println!("   Start with: sudo openprx service start");
     let _ = config;
     Ok(())
@@ -1188,21 +1188,21 @@ mod tests {
         use std::path::PathBuf;
 
         let exe_path = PathBuf::from("/usr/local/bin/openprx");
-        let script = generate_openrc_script(&exe_path, Path::new("/etc/zeroclaw"));
+        let script = generate_openrc_script(&exe_path, Path::new("/etc/openprx"));
 
         assert!(script.starts_with("#!/sbin/openrc-run"));
-        assert!(script.contains("name=\"zeroclaw\""));
+        assert!(script.contains("name=\"openprx\""));
         assert!(script.contains("description=\"OpenPRX daemon\""));
         assert!(script.contains("command=\"/usr/local/bin/openprx\""));
-        assert!(script.contains("command_args=\"--config-dir /etc/zeroclaw daemon\""));
+        assert!(script.contains("command_args=\"--config-dir /etc/openprx daemon\""));
         assert!(!script.contains("env ZEROCLAW_CONFIG_DIR"));
         assert!(!script.contains("env ZEROCLAW_WORKSPACE"));
         assert!(script.contains("command_background=\"yes\""));
-        assert!(script.contains("command_user=\"zeroclaw:zeroclaw\""));
+        assert!(script.contains("command_user=\"openprx:openprx\""));
         assert!(script.contains("pidfile=\"/run/${RC_SVCNAME}.pid\""));
         assert!(script.contains("umask 027"));
-        assert!(script.contains("output_log=\"/var/log/zeroclaw/access.log\""));
-        assert!(script.contains("error_log=\"/var/log/zeroclaw/error.log\""));
+        assert!(script.contains("output_log=\"/var/log/openprx/access.log\""));
+        assert!(script.contains("error_log=\"/var/log/openprx/error.log\""));
         assert!(script.contains("depend()"));
         assert!(script.contains("need net"));
         assert!(script.contains("after firewall"));
@@ -1237,17 +1237,17 @@ mod tests {
     #[test]
     fn openrc_writability_probe_prefers_runuser_when_available() {
         let (program, args) =
-            build_openrc_writability_probe_command(Path::new("/etc/zeroclaw"), true);
+            build_openrc_writability_probe_command(Path::new("/etc/openprx"), true);
         assert_eq!(program, "runuser");
         assert_eq!(
             args,
             vec![
                 "-u".to_string(),
-                "zeroclaw".to_string(),
+                "openprx".to_string(),
                 "--".to_string(),
                 "sh".to_string(),
                 "-c".to_string(),
-                "test -w '/etc/zeroclaw'".to_string()
+                "test -w '/etc/openprx'".to_string()
             ]
         );
     }
@@ -1256,7 +1256,7 @@ mod tests {
     #[test]
     fn openrc_writability_probe_falls_back_to_su() {
         let (program, args) =
-            build_openrc_writability_probe_command(Path::new("/etc/zeroclaw/workspace"), false);
+            build_openrc_writability_probe_command(Path::new("/etc/openprx/workspace"), false);
         assert_eq!(program, "su");
         assert_eq!(
             args,
@@ -1264,8 +1264,8 @@ mod tests {
                 "-s".to_string(),
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "test -w '/etc/zeroclaw/workspace'".to_string(),
-                "zeroclaw".to_string()
+                "test -w '/etc/openprx/workspace'".to_string(),
+                "openprx".to_string()
             ]
         );
     }

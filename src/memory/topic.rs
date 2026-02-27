@@ -333,7 +333,7 @@ pub fn infer_project(content: &str) -> Option<String> {
     if lower.contains("sm") || lower.contains("量表") || lower.contains("心理") {
         return Some("sm".to_string());
     }
-    if lower.contains("prx") || lower.contains("zeroclaw") || lower.contains("vano") {
+    if lower.contains("prx") || lower.contains("openprx") || lower.contains("vano") {
         return Some("prx".to_string());
     }
     None
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(infer_project("openpr 治理优化"), Some("openpr".to_string()));
         assert_eq!(infer_project("彩票风控 lc"), Some("lc".to_string()));
         assert_eq!(infer_project("心理量表 sm"), Some("sm".to_string()));
-        assert_eq!(infer_project("zeroclaw prx vano"), Some("prx".to_string()));
+        assert_eq!(infer_project("openprx prx vano"), Some("prx".to_string()));
         assert_eq!(infer_project("unknown project"), None);
     }
 

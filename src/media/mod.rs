@@ -168,7 +168,7 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
     }
 
     let max_frames = config.video_max_frames.clamp(1, 10);
-    let output_dir = format!("/tmp/zeroclaw-video-{}", uuid::Uuid::new_v4());
+    let output_dir = format!("/tmp/openprx-video-{}", uuid::Uuid::new_v4());
     std::fs::create_dir_all(&output_dir).ok()?;
 
     // Get video duration via ffprobe

@@ -2087,7 +2087,7 @@ mod tests {
                 "task": "child",
                 "_zc_scope_trusted": true,
                 "_zc_scope": {
-                    "sender": "zeroclaw_user",
+                    "sender": "openprx_user",
                     "channel": "signal",
                     "chat_type": "direct",
                     "chat_id": "+15551234567"

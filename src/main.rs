@@ -119,7 +119,7 @@ mod approval;
 mod auth;
 mod channels;
 mod rag {
-    pub use zeroclaw::rag::*;
+    pub use openprx::rag::*;
 }
 mod config;
 mod cost;
@@ -158,7 +158,7 @@ mod webhook;
 use config::Config;
 
 // Re-export so binary's hardware/peripherals modules can use crate::HardwareCommands etc.
-pub use zeroclaw::{HardwareCommands, PeripheralCommands};
+pub use openprx::{HardwareCommands, PeripheralCommands};
 
 /// `OpenPRX` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
@@ -433,7 +433,7 @@ Examples:
   openprx hardware info --chip STM32F401RETx")]
     Hardware {
         #[command(subcommand)]
-        hardware_command: zeroclaw::HardwareCommands,
+        hardware_command: openprx::HardwareCommands,
     },
 
     /// Manage hardware peripherals (STM32, RPi GPIO, etc.)
@@ -452,7 +452,7 @@ Examples:
   openprx peripheral flash-nucleo")]
     Peripheral {
         #[command(subcommand)]
-        peripheral_command: zeroclaw::PeripheralCommands,
+        peripheral_command: openprx::PeripheralCommands,
     },
 
     /// Manage configuration

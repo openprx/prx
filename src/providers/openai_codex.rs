@@ -79,9 +79,9 @@ struct ResponsesContent {
 impl OpenAiCodexProvider {
     pub fn new(options: &ProviderRuntimeOptions) -> Self {
         let state_dir = options
-            .zeroclaw_dir
+            .openprx_dir
             .clone()
-            .unwrap_or_else(default_zeroclaw_dir);
+            .unwrap_or_else(default_openprx_dir);
         let auth = AuthService::new(&state_dir, options.secrets_encrypt);
 
         Self {
@@ -96,7 +96,7 @@ impl OpenAiCodexProvider {
     }
 }
 
-fn default_zeroclaw_dir() -> PathBuf {
+fn default_openprx_dir() -> PathBuf {
     directories::UserDirs::new().map_or_else(
         || PathBuf::from(".openprx"),
         |dirs| {
@@ -104,7 +104,7 @@ fn default_zeroclaw_dir() -> PathBuf {
             if primary.exists() {
                 primary
             } else {
-                let legacy = dirs.home_dir().join(".zeroclaw");
+                let legacy = dirs.home_dir().join(".openprx");
                 if legacy.exists() {
                     legacy
                 } else {
@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn default_state_dir_is_non_empty() {
-        let path = default_zeroclaw_dir();
+        let path = default_openprx_dir();
         assert!(!path.as_os_str().is_empty());
     }
 

@@ -19,7 +19,7 @@ pub fn probe_rs_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Flash ZeroClaw Nucleo firmware. Builds from firmware/zeroclaw-nucleo.
+/// Flash ZeroClaw Nucleo firmware. Builds from firmware/openprx-nucleo.
 pub fn flash_nucleo_firmware() -> Result<()> {
     if !probe_rs_available() {
         anyhow::bail!(
@@ -29,12 +29,12 @@ pub fn flash_nucleo_firmware() -> Result<()> {
         );
     }
 
-    // CARGO_MANIFEST_DIR = repo root (zeroclaw's Cargo.toml)
+    // CARGO_MANIFEST_DIR = repo root (openprx's Cargo.toml)
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let firmware_dir = repo_root.join("firmware").join("zeroclaw-nucleo");
+    let firmware_dir = repo_root.join("firmware").join("openprx-nucleo");
     if !firmware_dir.join("Cargo.toml").exists() {
         anyhow::bail!(
-            "Nucleo firmware not found at {}. Run from zeroclaw repo root.",
+            "Nucleo firmware not found at {}. Run from openprx repo root.",
             firmware_dir.display()
         );
     }
@@ -55,7 +55,7 @@ pub fn flash_nucleo_firmware() -> Result<()> {
         .join("target")
         .join(TARGET)
         .join("release")
-        .join("zeroclaw-nucleo");
+        .join("openprx-nucleo");
 
     if !elf_path.exists() {
         anyhow::bail!("Built binary not found at {}", elf_path.display());

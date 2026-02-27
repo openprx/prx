@@ -36,7 +36,7 @@ impl OtelObserver {
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
     pub fn new(endpoint: Option<&str>, service_name: Option<&str>) -> Result<Self, String> {
         let endpoint = endpoint.unwrap_or("http://localhost:4318");
-        let service_name = service_name.unwrap_or("zeroclaw");
+        let service_name = service_name.unwrap_or("openprx");
 
         // ── Trace exporter ──────────────────────────────────────
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -79,74 +79,74 @@ impl OtelObserver {
         global::set_meter_provider(meter_provider);
 
         // ── Create metric instruments ────────────────────────────
-        let meter = global::meter("zeroclaw");
+        let meter = global::meter("openprx");
 
         let agent_starts = meter
-            .u64_counter("zeroclaw.agent.starts")
+            .u64_counter("openprx.agent.starts")
             .with_description("Total agent invocations")
             .build();
 
         let agent_duration = meter
-            .f64_histogram("zeroclaw.agent.duration")
+            .f64_histogram("openprx.agent.duration")
             .with_description("Agent invocation duration in seconds")
             .with_unit("s")
             .build();
 
         let llm_calls = meter
-            .u64_counter("zeroclaw.llm.calls")
+            .u64_counter("openprx.llm.calls")
             .with_description("Total LLM provider calls")
             .build();
 
         let llm_duration = meter
-            .f64_histogram("zeroclaw.llm.duration")
+            .f64_histogram("openprx.llm.duration")
             .with_description("LLM provider call duration in seconds")
             .with_unit("s")
             .build();
 
         let tool_calls = meter
-            .u64_counter("zeroclaw.tool.calls")
+            .u64_counter("openprx.tool.calls")
             .with_description("Total tool calls")
             .build();
 
         let tool_duration = meter
-            .f64_histogram("zeroclaw.tool.duration")
+            .f64_histogram("openprx.tool.duration")
             .with_description("Tool execution duration in seconds")
             .with_unit("s")
             .build();
 
         let channel_messages = meter
-            .u64_counter("zeroclaw.channel.messages")
+            .u64_counter("openprx.channel.messages")
             .with_description("Total channel messages")
             .build();
 
         let heartbeat_ticks = meter
-            .u64_counter("zeroclaw.heartbeat.ticks")
+            .u64_counter("openprx.heartbeat.ticks")
             .with_description("Total heartbeat ticks")
             .build();
 
         let errors = meter
-            .u64_counter("zeroclaw.errors")
+            .u64_counter("openprx.errors")
             .with_description("Total errors by component")
             .build();
 
         let request_latency = meter
-            .f64_histogram("zeroclaw.request.latency")
+            .f64_histogram("openprx.request.latency")
             .with_description("Request latency in seconds")
             .with_unit("s")
             .build();
 
         let tokens_used = meter
-            .u64_counter("zeroclaw.tokens.used")
+            .u64_counter("openprx.tokens.used")
             .with_description("Total tokens consumed (monotonic)")
             .build();
 
         let active_sessions = meter
-            .u64_gauge("zeroclaw.sessions.active")
+            .u64_gauge("openprx.sessions.active")
             .with_description("Current number of active sessions")
             .build();
 
         let queue_depth = meter
-            .u64_gauge("zeroclaw.queue.depth")
+            .u64_gauge("openprx.queue.depth")
             .with_description("Current message queue depth")
             .build();
 
@@ -172,7 +172,7 @@ impl OtelObserver {
 
 impl Observer for OtelObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        let tracer = global::tracer("zeroclaw");
+        let tracer = global::tracer("openprx");
 
         match event {
             ObserverEvent::AgentStart { provider, model } => {
@@ -383,7 +383,7 @@ mod tests {
     fn test_observer() -> OtelObserver {
         // Create with a dummy endpoint — exports will silently fail
         // but the observer itself works fine for recording
-        OtelObserver::new(Some("http://127.0.0.1:19999"), Some("zeroclaw-test"))
+        OtelObserver::new(Some("http://127.0.0.1:19999"), Some("openprx-test"))
             .expect("observer creation should not fail with valid endpoint format")
     }
 
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn otel_observer_creation_with_valid_endpoint_succeeds() {
         // Even though endpoint is unreachable, creation should succeed
-        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("zeroclaw-test"));
+        let result = OtelObserver::new(Some("http://127.0.0.1:12345"), Some("openprx-test"));
         assert!(
             result.is_ok(),
             "observer creation must succeed even with unreachable endpoint"

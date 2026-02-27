@@ -986,7 +986,7 @@ mod tests {
     use super::*;
 
     fn test_workspace_dir() -> PathBuf {
-        std::env::temp_dir().join("zeroclaw-test-identity")
+        std::env::temp_dir().join("openprx-test-identity")
     }
 
     #[test]
