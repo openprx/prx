@@ -262,6 +262,8 @@ struct SignalMention {
     #[serde(default)]
     uuid: Option<String>,
     #[serde(default)]
+    number: Option<String>,
+    #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     start: Option<u64>,
@@ -545,7 +547,14 @@ impl SignalChannel {
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
-            mentioned_uuids: data_msg.mentions.as_ref().map(|ms| ms.iter().filter_map(|m| m.uuid.clone()).collect()).unwrap_or_default(),
+            mentioned_uuids: data_msg.mentions.as_ref().map(|ms| {
+                ms.iter().flat_map(|m| {
+                    let mut ids = Vec::new();
+                    if let Some(ref uuid) = m.uuid { ids.push(uuid.clone()); }
+                    if let Some(ref number) = m.number { ids.push(number.clone()); }
+                    ids
+                }).collect()
+            }).unwrap_or_default(),
         })
     }
 
