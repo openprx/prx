@@ -502,17 +502,46 @@ fn is_bot_mentioned(ctx: &ChannelRuntimeContext, content: &str) -> bool {
     false
 }
 
-/// Strip channel metadata lines (e.g. `[signal-meta ...]`, `[wacli-meta ...]`)
-/// from message content, returning only the user-authored text.
+/// Strip channel metadata from message content, returning only the user-authored text.
 /// This prevents group names or sender IDs embedded in metadata from
 /// triggering false-positive mention detection.
+///
+/// Strips:
+/// - Entire lines matching `[xxx-meta ...]` (e.g. `[signal-meta sender=... group=...]`)
+/// - Inline prefixes like `[Signal Group: groupname] sender:` at the start of lines
 fn strip_channel_metadata(content: &str) -> String {
     content
         .lines()
-        .filter(|line| {
+        .filter_map(|line| {
             let trimmed = line.trim();
-            // Skip lines that look like channel metadata tags
-            !(trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.contains("-meta "))
+            // Skip entire lines that are metadata tags (e.g. [signal-meta ...])
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.contains("-meta ") {
+                return None;
+            }
+            // Strip inline group prefixes like "[Signal Group: name] sender: "
+            // These contain group names that could false-positive on bot name matching.
+            let cleaned = if let Some(rest) = trimmed.strip_prefix('[') {
+                if let Some(bracket_end) = rest.find(']') {
+                    let tag = &rest[..bracket_end];
+                    if tag.contains("Group") || tag.contains("group") {
+                        // Skip past the "] sender: " part
+                        let after_bracket = &rest[bracket_end + 1..];
+                        // Skip "sender_id: " prefix after the bracket
+                        if let Some(colon_pos) = after_bracket.find(": ") {
+                            after_bracket[colon_pos + 2..].to_string()
+                        } else {
+                            after_bracket.trim_start().to_string()
+                        }
+                    } else {
+                        line.to_string()
+                    }
+                } else {
+                    line.to_string()
+                }
+            } else {
+                line.to_string()
+            };
+            Some(cleaned)
         })
         .collect::<Vec<_>>()
         .join("\n")
