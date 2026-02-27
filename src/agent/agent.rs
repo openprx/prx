@@ -11,7 +11,6 @@ use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Prov
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
-use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
