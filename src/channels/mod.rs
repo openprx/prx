@@ -502,6 +502,22 @@ fn is_bot_mentioned(ctx: &ChannelRuntimeContext, content: &str) -> bool {
     false
 }
 
+/// Strip channel metadata lines (e.g. `[signal-meta ...]`, `[wacli-meta ...]`)
+/// from message content, returning only the user-authored text.
+/// This prevents group names or sender IDs embedded in metadata from
+/// triggering false-positive mention detection.
+fn strip_channel_metadata(content: &str) -> String {
+    content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            // Skip lines that look like channel metadata tags
+            !(trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.contains("-meta "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn warn_open_policy_allowlist_alignment(
     channel_name: &str,
     dm_policy: crate::config::DmPolicy,
@@ -1664,9 +1680,14 @@ async fn process_channel_message(
         || msg.reply_target.contains("@g.us");
     if is_group {
         let mention_only = is_mention_only_enabled(ctx.as_ref(), &msg.channel);
-        if mention_only && !is_bot_mentioned(ctx.as_ref(), &msg.content) {
-            println!("  ⏭️ Group message stored but skipped (no mention)");
-            return;
+        if mention_only {
+            // Strip metadata lines (e.g. [signal-meta ...]) before checking for mentions,
+            // otherwise group names containing the bot name cause false positives.
+            let user_text = strip_channel_metadata(&msg.content);
+            if !is_bot_mentioned(ctx.as_ref(), &user_text) {
+                println!("  ⏭️ Group message stored but skipped (no mention)");
+                return;
+            }
         }
     }
 
