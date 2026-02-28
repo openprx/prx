@@ -55,8 +55,8 @@ pub use judge::{
 };
 #[allow(unused_imports)]
 pub use memory_compressor::{
-    CompressionLimits, CompressionResult, DefaultSimilarityDetector, FidelityReport,
-    MemoryCompressor, SimilarityDetector,
+    CompressionLimits, CompressionResult, DefaultSimilarityDetector, EmbeddingSimilarityDetector,
+    FidelityReport, MemoryCompressor, SimilarityDetector,
 };
 pub use memory_evolution::MemoryEvolutionEngine;
 #[allow(unused_imports)]

@@ -1,7 +1,7 @@
 use crate::memory::{LifecycleState, MemoryCategory, MemoryEntry};
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -12,7 +12,7 @@ pub struct CompressionLimits {
     pub max_tokens: usize,
 }
 
-/// Similarity detector extension point reserved for future implementation.
+/// Similarity detector extension point for memory redundancy detection.
 #[async_trait]
 pub trait SimilarityDetector: Send + Sync {
     async fn detect_redundant_ids(&self, _entries: &[MemoryEntry]) -> Result<Vec<String>>;
@@ -25,6 +25,57 @@ pub struct DefaultSimilarityDetector;
 impl SimilarityDetector for DefaultSimilarityDetector {
     async fn detect_redundant_ids(&self, _entries: &[MemoryEntry]) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+}
+
+/// Embedding-first redundancy detector with conservative fallback similarity.
+pub struct EmbeddingSimilarityDetector {
+    threshold: f64,
+}
+
+impl EmbeddingSimilarityDetector {
+    pub fn new(threshold: f64) -> Self {
+        Self {
+            threshold: threshold.clamp(0.8, 0.99),
+        }
+    }
+}
+
+impl Default for EmbeddingSimilarityDetector {
+    fn default() -> Self {
+        Self::new(0.92)
+    }
+}
+
+#[async_trait]
+impl SimilarityDetector for EmbeddingSimilarityDetector {
+    async fn detect_redundant_ids(&self, entries: &[MemoryEntry]) -> Result<Vec<String>> {
+        let mut redundant = HashSet::new();
+        for i in 0..entries.len() {
+            if redundant.contains(&entries[i].id) {
+                continue;
+            }
+            for j in (i + 1)..entries.len() {
+                if redundant.contains(&entries[j].id) {
+                    continue;
+                }
+
+                let similarity = entry_similarity(&entries[i], &entries[j]);
+                if similarity <= self.threshold {
+                    continue;
+                }
+
+                if should_keep_left(&entries[i], &entries[j]) {
+                    redundant.insert(entries[j].id.clone());
+                } else {
+                    redundant.insert(entries[i].id.clone());
+                }
+            }
+        }
+
+        let mut ids = redundant.into_iter().collect::<Vec<_>>();
+        ids.sort();
+        Ok(ids)
     }
 }
 
@@ -66,7 +117,7 @@ impl<D: SimilarityDetector> MemoryCompressor<D> {
         tokens > limits.max_tokens
     }
 
-    /// Reserved redundancy detector hook.
+    /// Redundancy detector hook.
     pub async fn detect_redundancy(&self, entries: &[MemoryEntry]) -> Result<Vec<String>> {
         self.detector.detect_redundant_ids(entries).await
     }
@@ -177,17 +228,110 @@ fn extract_key_facts(entries: &[MemoryEntry]) -> HashSet<String> {
     facts
 }
 
+fn entry_similarity(left: &MemoryEntry, right: &MemoryEntry) -> f64 {
+    if let (Some(a), Some(b)) = (
+        extract_embedding_from_content(&left.content),
+        extract_embedding_from_content(&right.content),
+    ) {
+        if a.len() == b.len() && !a.is_empty() {
+            return f64::from(crate::memory::vector::cosine_similarity(&a, &b));
+        }
+    }
+    char_ngram_jaccard(&left.content, &right.content, 3)
+}
+
+fn extract_embedding_from_content(content: &str) -> Option<Vec<f32>> {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let items = parsed.get("embedding")?.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+
+    let mut vec = Vec::with_capacity(items.len());
+    for value in items {
+        let number = value.as_f64()?;
+        if !number.is_finite() {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        vec.push(number as f32);
+    }
+    Some(vec)
+}
+
+fn char_ngram_jaccard(left: &str, right: &str, n: usize) -> f64 {
+    let left_grams = char_ngrams(left, n);
+    let right_grams = char_ngrams(right, n);
+
+    if left_grams.is_empty() && right_grams.is_empty() {
+        return 1.0;
+    }
+
+    let intersection = left_grams.intersection(&right_grams).count();
+    let union = left_grams.union(&right_grams).count();
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+fn char_ngrams(content: &str, n: usize) -> HashSet<String> {
+    if n == 0 {
+        return HashSet::new();
+    }
+    let normalized = content.to_ascii_lowercase();
+    let chars = normalized.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return HashSet::new();
+    }
+    if chars.len() < n {
+        return HashSet::from([normalized]);
+    }
+
+    let mut grams = HashSet::new();
+    for window in chars.windows(n) {
+        grams.insert(window.iter().collect::<String>());
+    }
+    grams
+}
+
+fn should_keep_left(left: &MemoryEntry, right: &MemoryEntry) -> bool {
+    match (parse_ts(&left.timestamp), parse_ts(&right.timestamp)) {
+        (Some(left_ts), Some(right_ts)) => {
+            if left_ts == right_ts {
+                left.id <= right.id
+            } else {
+                left_ts > right_ts
+            }
+        }
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => left.id <= right.id,
+    }
+}
+
+fn parse_ts(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn entry(id: &str, content: &str) -> MemoryEntry {
+        entry_at(id, content, "2026-02-24T00:00:00Z")
+    }
+
+    fn entry_at(id: &str, content: &str, timestamp: &str) -> MemoryEntry {
         MemoryEntry {
             id: id.into(),
             key: id.into(),
             content: content.into(),
             category: MemoryCategory::Core,
-            timestamp: "2026-02-24T00:00:00Z".into(),
+            timestamp: timestamp.into(),
             session_id: None,
             score: None,
             tags: None,
@@ -249,5 +393,62 @@ mod tests {
             compressed.compressed_from,
             Some(vec!["src-1".to_string(), "src-2".to_string()])
         );
+    }
+
+    #[test]
+    fn embedding_similarity_detector_clamps_threshold() {
+        let low = EmbeddingSimilarityDetector::new(0.2);
+        let high = EmbeddingSimilarityDetector::new(1.5);
+        assert!((low.threshold - 0.8).abs() < f64::EPSILON);
+        assert!((high.threshold - 0.99).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn embedding_similarity_detector_marks_older_duplicate() {
+        let detector = EmbeddingSimilarityDetector::default();
+        let entries = vec![
+            entry_at(
+                "old",
+                "release validation completed with all checks passing",
+                "2026-02-24T01:00:00Z",
+            ),
+            entry_at(
+                "new",
+                "release validation completed with all checks passing",
+                "2026-02-25T01:00:00Z",
+            ),
+        ];
+        let redundant = detector.detect_redundant_ids(&entries).await.unwrap();
+        assert_eq!(redundant, vec!["old".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn embedding_similarity_detector_keeps_distinct_entries() {
+        let detector = EmbeddingSimilarityDetector::default();
+        let entries = vec![
+            entry("a", "network timeout while connecting to service"),
+            entry("b", "updated quarterly budget and forecast numbers"),
+        ];
+        let redundant = detector.detect_redundant_ids(&entries).await.unwrap();
+        assert!(redundant.is_empty());
+    }
+
+    #[tokio::test]
+    async fn embedding_similarity_detector_uses_embedding_payload_when_available() {
+        let detector = EmbeddingSimilarityDetector::new(0.98);
+        let entries = vec![
+            entry_at(
+                "older",
+                r#"{"embedding":[1.0,0.0,0.0],"payload":"alpha notes"}"#,
+                "2026-02-20T00:00:00Z",
+            ),
+            entry_at(
+                "newer",
+                r#"{"embedding":[1.0,0.0,0.0],"payload":"completely different text"}"#,
+                "2026-02-21T00:00:00Z",
+            ),
+        ];
+        let redundant = detector.detect_redundant_ids(&entries).await.unwrap();
+        assert_eq!(redundant, vec!["older".to_string()]);
     }
 }
