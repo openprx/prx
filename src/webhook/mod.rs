@@ -509,14 +509,16 @@ fn persist_event(db_path: &Path, event: &WebhookEvent, acl_enabled: bool) -> Res
     };
 
     // Persist via memory classification path to keep ACL policy consistent.
-    let memory = SqliteMemory::new_with_path_and_acl(db_path.to_path_buf(), acl_enabled)?;
-    futures::executor::block_on(memory.store_with_context(
-        &memory_key,
-        &content,
-        MemoryCategory::Conversation,
-        None,
-        Some(&memory_ctx),
-    ))?;
+    if crate::memory::should_autosave_content(&content) {
+        let memory = SqliteMemory::new_with_path_and_acl(db_path.to_path_buf(), acl_enabled)?;
+        futures::executor::block_on(memory.store_with_context(
+            &memory_key,
+            &content,
+            MemoryCategory::Conversation,
+            None,
+            Some(&memory_ctx),
+        ))?;
+    }
 
     conn.execute(
         "UPDATE memories

@@ -372,7 +372,8 @@ fn should_process_inbound_message(
 fn collect_bot_names(config: &Config) -> Vec<String> {
     let mut names: Vec<String> = vec!["openprx".to_string()];
 
-    if let Ok(Some(aieos_identity)) = identity::load_aieos_identity(&config.identity, &config.workspace_dir)
+    if let Ok(Some(aieos_identity)) =
+        identity::load_aieos_identity(&config.identity, &config.workspace_dir)
     {
         if let Some(identity) = aieos_identity.identity {
             if let Some(agent_names) = identity.names {
@@ -500,7 +501,11 @@ fn is_mention_only_enabled(ctx: &ChannelRuntimeContext, channel_name: &str) -> b
         .unwrap_or(false)
 }
 
-fn is_bot_mentioned(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage, content: &str) -> bool {
+fn is_bot_mentioned(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    content: &str,
+) -> bool {
     // Check UUID-based mentions first (Signal @mentions)
     for uuid in &ctx.bot_uuids {
         if msg.mentioned_uuids.contains(uuid) {
@@ -1672,7 +1677,10 @@ async fn process_channel_message(
             return;
         }
     };
-    if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+    if ctx.auto_save_memory
+        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && memory::should_autosave_content(&msg.content)
+    {
         let autosave_key = conversation_memory_key(&msg);
         let inferred_chat_type = if msg.reply_target.starts_with("group:") {
             "group".to_string()
@@ -1909,7 +1917,8 @@ async fn process_channel_message(
                 }
             }
             LlmExecutionResult::Completed(Ok(Err(e))) => {
-                if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()
+                if crate::agent::loop_::is_tool_loop_cancelled(&e)
+                    || cancellation_token.is_cancelled()
                 {
                     break LlmFinalOutcome::Cancelled;
                 }

@@ -547,14 +547,24 @@ impl SignalChannel {
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
-            mentioned_uuids: data_msg.mentions.as_ref().map(|ms| {
-                ms.iter().flat_map(|m| {
-                    let mut ids = Vec::new();
-                    if let Some(ref uuid) = m.uuid { ids.push(uuid.clone()); }
-                    if let Some(ref number) = m.number { ids.push(number.clone()); }
-                    ids
-                }).collect()
-            }).unwrap_or_default(),
+            mentioned_uuids: data_msg
+                .mentions
+                .as_ref()
+                .map(|ms| {
+                    ms.iter()
+                        .flat_map(|m| {
+                            let mut ids = Vec::new();
+                            if let Some(ref uuid) = m.uuid {
+                                ids.push(uuid.clone());
+                            }
+                            if let Some(ref number) = m.number {
+                                ids.push(number.clone());
+                            }
+                            ids
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -945,6 +955,10 @@ impl SignalChannel {
 
                     if line.is_empty() {
                         if !current_data.is_empty() {
+                            // DEBUG: dump ALL SSE data from AK for mention analysis
+                            if current_data.contains("d26c8bda") {
+                                // Debug line removed — was causing UTF-8 boundary panic on CJK text
+                            }
                             match serde_json::from_str::<SseEnvelope>(&current_data) {
                                 Ok(sse) => {
                                     if let Some(ref envelope) = sse.envelope {
@@ -1668,8 +1682,9 @@ mod tests {
         assert_eq!(msg.sender, uuid);
         assert_eq!(msg.reply_target, "group:testgroup");
         assert!(
-            msg.content
-                .starts_with(&format!("[Signal Group: Test Group] {uuid}: Group msg from privacy user")),
+            msg.content.starts_with(&format!(
+                "[Signal Group: Test Group] {uuid}: Group msg from privacy user"
+            )),
             "content: {}",
             msg.content
         );

@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod chunker;
 pub mod embeddings;
+pub mod filter;
 pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
@@ -19,6 +20,7 @@ pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
+pub use filter::should_autosave_content;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;

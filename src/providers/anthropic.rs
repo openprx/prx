@@ -231,8 +231,7 @@ impl AnthropicProvider {
                 anyhow::anyhow!("OAuth token expired but no refresh_token available")
             })?;
             tracing::info!("Proactively refreshing Claude Code OAuth token");
-            let refreshed =
-                super::refresh_claude_code_access_token(&refresh_token)?;
+            let refreshed = super::refresh_claude_code_access_token(&refresh_token)?;
 
             state.credential = refreshed.access_token.clone();
             if let Some(new_expires) = refreshed.expires_at {
@@ -303,9 +302,9 @@ impl AnthropicProvider {
             tracing::warn!(error = %e, "Failed to write refreshed Claude Code credentials");
         }
 
-        refreshed.access_token.ok_or_else(|| {
-            anyhow::anyhow!("OAuth refresh succeeded but returned no access_token")
-        })
+        refreshed
+            .access_token
+            .ok_or_else(|| anyhow::anyhow!("OAuth refresh succeeded but returned no access_token"))
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -649,8 +648,7 @@ impl Provider for AnthropicProvider {
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
                     .json(&native_request);
-                let retry_response =
-                    self.apply_auth(retry_req, &new_credential).send().await?;
+                let retry_response = self.apply_auth(retry_req, &new_credential).send().await?;
                 if !retry_response.status().is_success() {
                     return Err(super::api_error("Anthropic", retry_response).await);
                 }
@@ -1421,10 +1419,8 @@ mod tests {
         });
 
         // Create provider pointing at mock server
-        let provider = AnthropicProvider::with_base_url(
-            Some("test-key"),
-            Some(&format!("http://{addr}")),
-        );
+        let provider =
+            AnthropicProvider::with_base_url(Some("test-key"), Some(&format!("http://{addr}")));
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
         let messages = vec![

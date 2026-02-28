@@ -2009,7 +2009,10 @@ pub async fn run(
 
     if let Some(msg) = message {
         // Auto-save user message to memory (skip short/trivial messages)
-        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+        if config.memory.auto_save
+            && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+            && memory::should_autosave_content(&msg)
+        {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
                 .store(&user_key, &msg, MemoryCategory::Conversation, None)
@@ -2068,15 +2071,6 @@ pub async fn run(
                 }),
             )
             .await;
-
-        // Auto-save assistant response to daily log
-        if config.memory.auto_save {
-            let summary = truncate_with_ellipsis(&response, 100);
-            let response_key = autosave_memory_key("assistant_resp");
-            let _ = mem
-                .store(&response_key, &summary, MemoryCategory::Daily, None)
-                .await;
-        }
     } else {
         println!("🦀 OpenPRX Interactive Mode");
         println!("Type /help for commands.\n");
@@ -2152,7 +2146,10 @@ pub async fn run(
             }
 
             // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+            if config.memory.auto_save
+                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+                && memory::should_autosave_content(&user_input)
+            {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
                     .store(&user_key, &user_input, MemoryCategory::Conversation, None)

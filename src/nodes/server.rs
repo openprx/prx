@@ -506,9 +506,9 @@ async fn finalize_task(state: AppState, result: &ExecShellResult) -> Value {
 
     let status_result = {
         let mut task_results = state.task_results.write().await;
-        let entry = task_results.entry(result.task_id.clone()).or_insert_with(|| {
-            TaskResult::running(result.task_id.clone(), false)
-        });
+        let entry = task_results
+            .entry(result.task_id.clone())
+            .or_insert_with(|| TaskResult::running(result.task_id.clone(), false));
         entry.apply_exec_result(result, now);
         entry.to_status_result(now)
     };
@@ -539,7 +539,10 @@ async fn count_running_async_tasks(state: &AppState) -> usize {
         .count()
 }
 
-async fn handle_task_status(state: &AppState, params: TaskStatusParams) -> Result<TaskStatusResult> {
+async fn handle_task_status(
+    state: &AppState,
+    params: TaskStatusParams,
+) -> Result<TaskStatusResult> {
     cleanup_expired_task_results(state).await;
     let task_results = state.task_results.read().await;
     let now = Instant::now();

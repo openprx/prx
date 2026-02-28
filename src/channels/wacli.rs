@@ -492,7 +492,11 @@ impl WacliChannel {
         let mentioned_uuids: Vec<String> = payload
             .get("mentionedJids")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let channel_msg = ChannelMessage {

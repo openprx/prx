@@ -1,9 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
-use tempfile::tempdir;
 use openprx::self_system::evolution::{
     with_trace, Actor, AnnotationPipeline, AsyncJsonlWriter, CandidatePriority, ChangeType,
     CircuitBreaker, CircuitBreakerState, DataBasis, DecisionLog, DecisionType, EngineCycleInput,
@@ -16,6 +13,9 @@ use openprx::self_system::orchestrator::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
     EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use tempfile::tempdir;
 
 fn base_config(storage_root: &std::path::Path) -> EvolutionConfig {
     let mut cfg = EvolutionConfig::default();

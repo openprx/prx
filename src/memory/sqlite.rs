@@ -509,11 +509,15 @@ impl SqliteMemory {
         session_id: Option<&str>,
         context: Option<&MemoryWriteContext>,
     ) -> anyhow::Result<()> {
-        // Compute embedding (async, before blocking work)
-        let embedding_bytes = self
-            .get_or_compute_embedding(content)
-            .await?
-            .map(|emb| vector::vec_to_bytes(&emb));
+        // Only long-lived categories need vector embeddings.
+        let needs_embedding = matches!(&category, MemoryCategory::Core | MemoryCategory::Custom(_));
+        let embedding_bytes = if needs_embedding {
+            self.get_or_compute_embedding(content)
+                .await?
+                .map(|emb| vector::vec_to_bytes(&emb))
+        } else {
+            None
+        };
 
         let conn = self.conn.clone();
         let db_path = self.db_path.clone();
@@ -817,7 +821,7 @@ impl SqliteMemory {
             .await??;
         }
 
-        // Step 2: Re-embed all memories that lack embeddings
+        // Step 2: Re-embed eligible memories that lack embeddings
         if self.embedder.dimensions() == 0 {
             return Ok(0);
         }
@@ -825,8 +829,12 @@ impl SqliteMemory {
         let conn = self.conn.clone();
         let entries: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
-            let mut stmt =
-                conn.prepare("SELECT id, content FROM memories WHERE embedding IS NULL")?;
+            let mut stmt = conn.prepare(
+                "SELECT id, content
+                 FROM memories
+                 WHERE embedding IS NULL
+                 AND category NOT IN ('daily', 'conversation')",
+            )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -1226,12 +1234,34 @@ impl Memory for SqliteMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     fn temp_sqlite() -> (TempDir, SqliteMemory) {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
         (tmp, mem)
+    }
+
+    struct CountingEmbedding {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for CountingEmbedding {
+        fn name(&self) -> &str {
+            "counting"
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(texts.len(), Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
     }
 
     #[tokio::test]
@@ -1559,6 +1589,169 @@ mod tests {
         let h1 = SqliteMemory::content_hash("hello");
         let h2 = SqliteMemory::content_hash("world");
         assert_ne!(h1, h2);
+    }
+
+    #[tokio::test]
+    async fn store_only_embeds_core_and_custom_categories() {
+        let tmp = TempDir::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(CountingEmbedding {
+                calls: Arc::clone(&calls),
+            }),
+            0.7,
+            0.3,
+            0,
+            None,
+        )
+        .unwrap();
+
+        mem.store("core_key", "core content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("daily_key", "daily content", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        mem.store(
+            "conv_key",
+            "conversation content",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "custom_key",
+            "custom content",
+            MemoryCategory::Custom("project_notes".into()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let conn = mem.conn.lock();
+        let core_emb: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM memories WHERE key = ?1",
+                ["core_key"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let daily_emb: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM memories WHERE key = ?1",
+                ["daily_key"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let conv_emb: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM memories WHERE key = ?1",
+                ["conv_key"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let custom_emb: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM memories WHERE key = ?1",
+                ["custom_key"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(core_emb.is_some());
+        assert!(custom_emb.is_some());
+        assert!(daily_emb.is_none());
+        assert!(conv_emb.is_none());
+    }
+
+    #[tokio::test]
+    async fn reindex_only_backfills_core_and_custom_embeddings() {
+        let tmp = TempDir::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(CountingEmbedding {
+                calls: Arc::clone(&calls),
+            }),
+            0.7,
+            0.3,
+            0,
+            None,
+        )
+        .unwrap();
+
+        mem.store("core_key", "core content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("daily_key", "daily content", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        mem.store(
+            "conv_key",
+            "conversation content",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "custom_key",
+            "custom content",
+            MemoryCategory::Custom("project_notes".into()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        calls.store(0, Ordering::SeqCst);
+        {
+            let conn = mem.conn.lock();
+            conn.execute("UPDATE memories SET embedding = NULL", [])
+                .unwrap();
+        }
+
+        let reindexed = mem.reindex().await.unwrap();
+        assert_eq!(reindexed, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let conn = mem.conn.lock();
+        let core_emb: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM memories WHERE key = ?1",
+                ["core_key"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let daily_emb: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM memories WHERE key = ?1",
+                ["daily_key"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let conv_emb: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM memories WHERE key = ?1",
+                ["conv_key"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let custom_emb: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM memories WHERE key = ?1",
+                ["custom_key"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(core_emb.is_some());
+        assert!(custom_emb.is_some());
+        assert!(daily_emb.is_none());
+        assert!(conv_emb.is_none());
     }
 
     // ── Schema tests ─────────────────────────────────────────────

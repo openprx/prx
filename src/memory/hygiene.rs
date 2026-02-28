@@ -17,6 +17,8 @@ struct HygieneReport {
     purged_memory_archives: u64,
     purged_session_archives: u64,
     pruned_conversation_rows: u64,
+    pruned_daily_rows: u64,
+    closed_stale_topics: u64,
 }
 
 impl HygieneReport {
@@ -26,6 +28,8 @@ impl HygieneReport {
             + self.purged_memory_archives
             + self.purged_session_archives
             + self.pruned_conversation_rows
+            + self.pruned_daily_rows
+            + self.closed_stale_topics
     }
 }
 
@@ -59,18 +63,22 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
             workspace_dir,
             config.conversation_retention_days,
         )?,
+        pruned_daily_rows: prune_daily_rows(workspace_dir, config.daily_retention_days)?,
+        closed_stale_topics: close_stale_topics(workspace_dir)?,
     };
 
     write_state(workspace_dir, &report)?;
 
     if report.total_actions() > 0 {
         tracing::info!(
-            "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation_rows={}",
+            "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation_rows={} pruned_daily_rows={} closed_stale_topics={}",
             report.archived_memory_files,
             report.archived_session_files,
             report.purged_memory_archives,
             report.purged_session_archives,
             report.pruned_conversation_rows,
+            report.pruned_daily_rows,
+            report.closed_stale_topics,
         );
     }
 
@@ -318,6 +326,47 @@ fn prune_conversation_rows(workspace_dir: &Path, retention_days: u32) -> Result<
     Ok(u64::try_from(affected).unwrap_or(0))
 }
 
+fn prune_daily_rows(workspace_dir: &Path, retention_days: u32) -> Result<u64> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    if !db_path.exists() {
+        return Ok(0);
+    }
+
+    let conn = Connection::open(db_path)?;
+    // Use WAL so hygiene pruning doesn't block agent reads
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
+
+    let affected = conn.execute(
+        "DELETE FROM memories WHERE category = 'daily' AND updated_at < ?1",
+        params![cutoff],
+    )?;
+
+    Ok(u64::try_from(affected).unwrap_or(0))
+}
+
+fn close_stale_topics(workspace_dir: &Path) -> Result<u64> {
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    if !db_path.exists() {
+        return Ok(0);
+    }
+
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    let now = Local::now().to_rfc3339();
+    let cutoff = (Local::now() - Duration::hours(24)).to_rfc3339();
+    let affected = conn.execute(
+        "UPDATE topics SET status = 'closed', resolved_at = ?1 WHERE status = 'open' AND updated_at < ?2",
+        params![now, cutoff],
+    )?;
+
+    Ok(u64::try_from(affected).unwrap_or(0))
+}
+
 fn memory_date_from_filename(filename: &str) -> Option<NaiveDate> {
     let stem = filename.strip_suffix(".md")?;
     let date_part = stem.split('_').next().unwrap_or(stem);
@@ -536,5 +585,104 @@ mod tests {
             mem2.get("core_keep").await.unwrap().is_some(),
             "core memory should remain"
         );
+    }
+
+    #[tokio::test]
+    async fn prunes_old_daily_rows_in_sqlite_backend() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new(workspace).unwrap();
+        mem.store("daily_old", "obsolete summary", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        mem.store("core_keep", "durable", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        drop(mem);
+
+        let db_path = workspace.join("memory").join("brain.db");
+        let conn = Connection::open(&db_path).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(60)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'daily_old'",
+            params![old_cutoff],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = default_cfg();
+        cfg.archive_after_days = 0;
+        cfg.purge_after_days = 0;
+        cfg.daily_retention_days = 7;
+
+        run_if_due(&cfg, workspace).unwrap();
+
+        let mem2 = SqliteMemory::new(workspace).unwrap();
+        assert!(
+            mem2.get("daily_old").await.unwrap().is_none(),
+            "old daily rows should be pruned"
+        );
+        assert!(
+            mem2.get("core_keep").await.unwrap().is_some(),
+            "core memory should remain"
+        );
+    }
+
+    #[test]
+    fn closes_stale_open_topics() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let _ = SqliteMemory::new(workspace).unwrap();
+        let db_path = workspace.join("memory").join("brain.db");
+        let conn = Connection::open(&db_path).unwrap();
+
+        let old_ts = (Local::now() - Duration::hours(48)).to_rfc3339();
+        let fresh_ts = (Local::now() - Duration::hours(2)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO topics (id, title, status, created_at, updated_at) VALUES ('stale_open', 'stale', 'open', ?1, ?1)",
+            params![old_ts],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO topics (id, title, status, created_at, updated_at) VALUES ('fresh_open', 'fresh', 'open', ?1, ?1)",
+            params![fresh_ts],
+        )
+        .unwrap();
+        drop(conn);
+
+        let affected = close_stale_topics(workspace).unwrap();
+        assert_eq!(affected, 1, "only stale open topics should be closed");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let stale_status: String = conn
+            .query_row(
+                "SELECT status FROM topics WHERE id = 'stale_open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stale_resolved_at: Option<String> = conn
+            .query_row(
+                "SELECT resolved_at FROM topics WHERE id = 'stale_open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fresh_status: String = conn
+            .query_row(
+                "SELECT status FROM topics WHERE id = 'fresh_open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(stale_status, "closed");
+        assert!(
+            stale_resolved_at.is_some(),
+            "closed topic should be resolved"
+        );
+        assert_eq!(fresh_status, "open");
     }
 }
