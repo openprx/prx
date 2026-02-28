@@ -8,7 +8,7 @@ use crate::self_system::evolution::record::{
 use crate::self_system::evolution::rollback::RollbackManager;
 use crate::self_system::evolution::safety_utils::{atomic_write, validate_path_in_workspace};
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
-use crate::self_system::orchestrator::{
+use crate::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
     EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };

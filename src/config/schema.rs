@@ -644,13 +644,14 @@ fn default_sessions_spawn_max_children_per_agent() -> usize {
 /// Self-system experimental automation config (`[self_system]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SelfSystemConfig {
-    /// Enable periodic self-system jobs in daemon runtime.
+    /// Enable periodic self-system fitness worker in daemon runtime.
+    /// Deprecated as a global evolution switch: use `evolution_enabled` for scheduler control.
     #[serde(default)]
     pub enabled: bool,
     /// Fitness report interval in hours.
     #[serde(default = "default_self_system_fitness_interval_hours")]
     pub fitness_interval_hours: u64,
-    /// Enable evolution orchestrator cycles alongside fitness reports.
+    /// Enable evolution scheduler cycles in daemon runtime.
     #[serde(default)]
     pub evolution_enabled: bool,
     /// Evolution scheduler interval in hours (daemon mode).

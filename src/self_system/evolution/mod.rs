@@ -4,6 +4,7 @@ pub mod analyzer;
 pub mod annotation;
 pub mod anti_pattern;
 pub mod config;
+pub mod cycle_types;
 pub mod engine;
 pub mod gate;
 pub mod index;
@@ -43,7 +44,11 @@ pub use config::{
     EvolutionRuntimeConfig, EvolutionRuntimeConfigManager, MemoryEvolutionConfig,
     PromptEvolutionConfig, RetrievalFusionWeights, RollbackConfig, StrategyEvolutionConfig,
 };
-pub use engine::{CycleResult, EngineCycleInput, EvolutionEngine};
+pub use cycle_types::{
+    ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
+    EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
+};
+pub use engine::{run_engine_cycle, CycleResult, EngineCycleInput, EvolutionEngine};
 #[allow(unused_imports)]
 pub use gate::{EvolutionGate, GateMetrics, GateRejection, GateResult};
 #[allow(unused_imports)]
