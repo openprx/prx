@@ -1,3 +1,4 @@
+use crate::memory::{Memory, MemoryCategory, SqliteMemory};
 use crate::self_system::evolution::analyzer::{CandidatePriority, EvolutionCandidate};
 use crate::self_system::evolution::config::{
     EvolutionConfig, EvolutionMode, SharedEvolutionConfig,
@@ -5,6 +6,9 @@ use crate::self_system::evolution::config::{
 use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput, EvolutionEngine};
 use crate::self_system::evolution::gate::{EvolutionGate, GateMetrics, GateResult};
 use crate::self_system::evolution::judge::{JudgeConfig, JudgeEngine, MockJudgeModel};
+use crate::self_system::evolution::memory_compressor::{
+    EmbeddingSimilarityDetector, MemoryCompressor,
+};
 use crate::self_system::evolution::record::{
     ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult,
 };
@@ -182,6 +186,43 @@ impl MemoryEvolutionEngine {
             _ => {}
         }
     }
+
+    async fn prune_redundant_conversation_memories(&self) -> Result<u32> {
+        let db_path = self.workspace_root.join("memory").join("brain.db");
+        if !db_path.exists() {
+            return Ok(0);
+        }
+
+        let memory = SqliteMemory::new_with_path(db_path)?;
+        let entries = memory
+            .list(Some(&MemoryCategory::Conversation), None)
+            .await?;
+        if entries.len() < 2 {
+            return Ok(0);
+        }
+
+        let compressor = MemoryCompressor::new(EmbeddingSimilarityDetector::default());
+        let redundant_ids = compressor.detect_redundancy(&entries).await?;
+        if redundant_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let key_by_id = entries
+            .into_iter()
+            .map(|entry| (entry.id, entry.key))
+            .collect::<HashMap<_, _>>();
+        let mut removed = 0u32;
+        for redundant_id in redundant_ids {
+            let Some(key) = key_by_id.get(&redundant_id) else {
+                continue;
+            };
+            if memory.forget(key).await? {
+                removed = removed.saturating_add(1);
+            }
+        }
+
+        Ok(removed)
+    }
 }
 
 #[async_trait]
@@ -203,6 +244,17 @@ impl EvolutionEngine for MemoryEvolutionEngine {
         };
 
         let current = self.shared_config.load_full();
+        let deduplicated_conversation_memories =
+            match self.prune_redundant_conversation_memories().await {
+                Ok(count) => count,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "self_system",
+                        "memory redundancy cleanup skipped: {error}"
+                    );
+                    0
+                }
+            };
         let mode = current.runtime.mode.clone();
         let candidate = self
             .select_candidate(&input.analyzer_candidates)
@@ -279,6 +331,27 @@ impl EvolutionEngine for MemoryEvolutionEngine {
                 }
             }
         }
+        if deduplicated_conversation_memories > 0 {
+            notes.push_str(&format!(
+                "; deduplicated {} conversation memories",
+                deduplicated_conversation_memories
+            ));
+        }
+
+        let mut key_metrics = HashMap::from([
+            (
+                "average_improvement".to_string(),
+                gate_metrics.average_improvement,
+            ),
+            (
+                "token_degradation".to_string(),
+                gate_metrics.token_degradation,
+            ),
+        ]);
+        key_metrics.insert(
+            "deduplicated_conversation_memories".to_string(),
+            f64::from(deduplicated_conversation_memories),
+        );
 
         let evolution_log = EvolutionLog {
             experiment_id: proposal.id.clone(),
@@ -291,16 +364,7 @@ impl EvolutionEngine for MemoryEvolutionEngine {
             data_basis: DataBasis {
                 sample_count: candidate.evidence_ids.len() as u32,
                 time_range_days: candidate.backfill_after_days,
-                key_metrics: HashMap::from([
-                    (
-                        "average_improvement".to_string(),
-                        gate_metrics.average_improvement,
-                    ),
-                    (
-                        "token_degradation".to_string(),
-                        gate_metrics.token_degradation,
-                    ),
-                ]),
+                key_metrics,
                 patterns_found: vec![candidate.current_value.clone()],
             },
             result: Some(if applied {

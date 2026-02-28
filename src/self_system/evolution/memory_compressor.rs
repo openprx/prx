@@ -18,16 +18,6 @@ pub trait SimilarityDetector: Send + Sync {
     async fn detect_redundant_ids(&self, _entries: &[MemoryEntry]) -> Result<Vec<String>>;
 }
 
-/// Default placeholder detector with no-op behavior.
-pub struct DefaultSimilarityDetector;
-
-#[async_trait]
-impl SimilarityDetector for DefaultSimilarityDetector {
-    async fn detect_redundant_ids(&self, _entries: &[MemoryEntry]) -> Result<Vec<String>> {
-        Ok(Vec::new())
-    }
-}
-
 /// Embedding-first redundancy detector with conservative fallback similarity.
 pub struct EmbeddingSimilarityDetector {
     threshold: f64,
@@ -203,9 +193,9 @@ impl<D: SimilarityDetector> MemoryCompressor<D> {
     }
 }
 
-impl Default for MemoryCompressor<DefaultSimilarityDetector> {
+impl Default for MemoryCompressor<EmbeddingSimilarityDetector> {
     fn default() -> Self {
-        Self::new(DefaultSimilarityDetector)
+        Self::new(EmbeddingSimilarityDetector::default())
     }
 }
 

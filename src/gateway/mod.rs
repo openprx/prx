@@ -64,6 +64,17 @@ fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> S
     format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
 }
 
+fn is_group_reply_target(reply_target: &str) -> bool {
+    reply_target.contains("group:") || reply_target.contains("@g.us")
+}
+
+fn should_autosave_gateway_message(reply_target: Option<&str>, content: &str) -> bool {
+    if !memory::should_autosave_content(content) {
+        return false;
+    }
+    !reply_target.is_some_and(is_group_reply_target)
+}
+
 fn hash_webhook_secret(value: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -923,6 +934,8 @@ async fn run_gateway_chat_with_multimodal(
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    #[serde(default)]
+    pub reply_target: Option<String>,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -1031,7 +1044,9 @@ async fn handle_webhook(
 
     let message = &webhook_body.message;
 
-    if state.auto_save && memory::should_autosave_content(message) {
+    if state.auto_save
+        && should_autosave_gateway_message(webhook_body.reply_target.as_deref(), message)
+    {
         let key = webhook_memory_key();
         let _ = state
             .mem
@@ -1260,7 +1275,8 @@ async fn handle_whatsapp_message(
         );
 
         // Auto-save to memory
-        if state.auto_save && memory::should_autosave_content(&msg.content) {
+        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content)
+        {
             let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
@@ -1373,7 +1389,8 @@ async fn handle_linq_webhook(
         );
 
         // Auto-save to memory
-        if state.auto_save && memory::should_autosave_content(&msg.content) {
+        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content)
+        {
             let key = linq_memory_key(msg);
             let _ = state
                 .mem
@@ -1485,7 +1502,8 @@ async fn handle_nextcloud_talk_webhook(
             truncate_with_ellipsis(&msg.content, 50)
         );
 
-        if state.auto_save && memory::should_autosave_content(&msg.content) {
+        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content)
+        {
             let key = nextcloud_talk_memory_key(msg);
             let _ = state
                 .mem
@@ -2042,6 +2060,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            reply_target: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -2055,6 +2074,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            reply_target: None,
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body)
             .await
@@ -2105,6 +2125,7 @@ mod tests {
 
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
+            reply_target: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -2118,6 +2139,7 @@ mod tests {
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
+            reply_target: None,
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body2)
             .await
@@ -2130,6 +2152,56 @@ mod tests {
         assert!(keys[0].starts_with("webhook_msg_"));
         assert!(keys[1].starts_with("webhook_msg_"));
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn webhook_autosave_skips_group_reply_target() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let tracking_impl = Arc::new(TrackingMemory::default());
+        let memory: Arc<dyn Memory> = tracking_impl.clone();
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: true,
+            tools_registry: Arc::new(vec![]),
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            signal: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+        };
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "hello group".into(),
+                reply_target: Some("group:team-1".into()),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(tracking_impl.keys.lock().is_empty());
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2183,6 +2255,7 @@ mod tests {
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                reply_target: None,
             })),
         )
         .await
@@ -2237,6 +2310,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                reply_target: None,
             })),
         )
         .await
@@ -2287,6 +2361,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                reply_target: None,
             })),
         )
         .await

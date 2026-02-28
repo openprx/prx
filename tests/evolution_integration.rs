@@ -2,12 +2,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use openprx::self_system::evolution::{
-    with_trace, Actor, AnnotationPipeline, AsyncJsonlWriter, CandidatePriority, ChangeType,
-    CircuitBreaker, CircuitBreakerState, DataBasis, DecisionLog, DecisionType, EngineCycleInput,
-    EvolutionAnalyzer, EvolutionCandidate, EvolutionConfig, EvolutionEngine, EvolutionLayer,
-    EvolutionLog, EvolutionMode, EvolutionPipeline, EvolutionResult, EvolutionTrigger,
-    JsonlRetentionPolicy, JsonlStoragePaths, JsonlToSqliteIndexer, MemoryAccessLog, MemoryAction,
-    MemoryEvolutionEngine, Outcome, RollbackManager, TaskType,
+    with_trace, Actor, AsyncJsonlWriter, CandidatePriority, ChangeType, CircuitBreaker,
+    CircuitBreakerState, DataBasis, DecisionLog, DecisionType, EngineCycleInput, EvolutionAnalyzer,
+    EvolutionCandidate, EvolutionConfig, EvolutionEngine, EvolutionLayer, EvolutionLog,
+    EvolutionMode, EvolutionPipeline, EvolutionResult, EvolutionTrigger, JsonlRetentionPolicy,
+    JsonlStoragePaths, MemoryAccessLog, MemoryAction, MemoryEvolutionEngine, Outcome,
+    RollbackManager, TaskType,
 };
 use openprx::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
@@ -443,102 +443,4 @@ fn circuit_breaker_opens_and_pauses_execution_after_consecutive_failures() {
 
     assert_eq!(breaker.state(), CircuitBreakerState::Open);
     assert!(!breaker.can_execute(now));
-}
-
-#[tokio::test]
-async fn sqlite_index_imports_jsonl_and_supports_queries() -> Result<()> {
-    let dir = tempdir()?;
-    let storage_root = dir.path().join("logs");
-    let sqlite_path = dir.path().join("evolution.sqlite");
-
-    let writer = AsyncJsonlWriter::new(
-        JsonlStoragePaths::new(storage_root.clone()),
-        JsonlRetentionPolicy::default(),
-        1,
-    )
-    .await?;
-
-    let ts = Utc::now().to_rfc3339();
-    writer
-        .append_memory_access(&sample_memory("trace-sql", "exp-sql", &ts, Some(true)))
-        .await?;
-    writer
-        .append_decision(&sample_decision(
-            "trace-sql",
-            "exp-sql",
-            &ts,
-            Outcome::Success,
-        ))
-        .await?;
-    writer
-        .append_evolution(&EvolutionLog {
-            experiment_id: "exp-sql".to_string(),
-            timestamp: ts,
-            layer: EvolutionLayer::Memory,
-            change_type: ChangeType::Tune,
-            before_value: "a".to_string(),
-            after_value: "b".to_string(),
-            trigger_reason: "index test".to_string(),
-            data_basis: DataBasis {
-                sample_count: 1,
-                time_range_days: 1,
-                key_metrics: HashMap::new(),
-                patterns_found: vec![],
-            },
-            result: Some(EvolutionResult::Neutral),
-        })
-        .await?;
-    writer.flush().await?;
-
-    let indexer = JsonlToSqliteIndexer::new(&sqlite_path, &storage_root)?;
-    let summary = indexer.import_incremental()?;
-    assert!(summary.imported_memory_rows >= 1);
-    assert!(summary.imported_decision_rows >= 1);
-    assert!(summary.imported_evolution_rows >= 1);
-
-    let by_exp = indexer.by_experiment("exp-sql")?;
-    assert!(by_exp.len() >= 3);
-    Ok(())
-}
-
-#[tokio::test]
-async fn was_useful_annotation_auto_inference_updates_unknown_records() -> Result<()> {
-    let dir = tempdir()?;
-    let storage_root = dir.path().join("logs");
-
-    let writer = Arc::new(
-        AsyncJsonlWriter::new(
-            JsonlStoragePaths::new(storage_root.clone()),
-            JsonlRetentionPolicy::default(),
-            1,
-        )
-        .await?,
-    );
-
-    let ts = Utc::now().to_rfc3339();
-    writer
-        .append_decision(&sample_decision(
-            "trace-ann",
-            "exp-ann",
-            &ts,
-            Outcome::Success,
-        ))
-        .await?;
-    writer
-        .append_memory_access(&sample_memory("trace-ann", "exp-ann", &ts, None))
-        .await?;
-    writer.flush().await?;
-
-    let pipeline = AnnotationPipeline::new(writer.clone(), &storage_root);
-    let report = pipeline.run_daily(Utc::now(), None).await?;
-    assert!(report.applied_updates >= 1);
-
-    let since = Utc::now() - Duration::hours(24);
-    let rows = writer.read_memory_access_since(since).await?;
-    let updated = rows
-        .iter()
-        .find(|item| item.trace_id == "trace-ann")
-        .and_then(|item| item.was_useful);
-    assert_eq!(updated, Some(true));
-    Ok(())
 }

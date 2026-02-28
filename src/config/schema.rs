@@ -2156,20 +2156,6 @@ pub struct MemoryConfig {
     /// Max embedding cache entries before LRU eviction
     #[serde(default = "default_cache_size")]
     pub embedding_cache_size: usize,
-    /// Max tokens per chunk for document splitting
-    #[serde(default = "default_chunk_size")]
-    pub chunk_max_tokens: usize,
-
-    // ── Response Cache (saves tokens on repeated prompts) ──────
-    /// Enable LLM response caching to avoid paying for duplicate prompts
-    #[serde(default)]
-    pub response_cache_enabled: bool,
-    /// TTL in minutes for cached responses (default: 60)
-    #[serde(default = "default_response_cache_ttl")]
-    pub response_cache_ttl_minutes: u32,
-    /// Max number of cached responses before LRU eviction (default: 5000)
-    #[serde(default = "default_response_cache_max")]
-    pub response_cache_max_entries: usize,
 
     // ── Memory Snapshot (soul backup to Markdown) ─────────────
     /// Enable periodic export of core memories to MEMORY_SNAPSHOT.md
@@ -2225,15 +2211,6 @@ fn default_min_relevance_score() -> f64 {
 fn default_cache_size() -> usize {
     10_000
 }
-fn default_chunk_size() -> usize {
-    512
-}
-fn default_response_cache_ttl() -> u32 {
-    60
-}
-fn default_response_cache_max() -> usize {
-    5_000
-}
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -2253,10 +2230,6 @@ impl Default for MemoryConfig {
             keyword_weight: default_keyword_weight(),
             min_relevance_score: default_min_relevance_score(),
             embedding_cache_size: default_cache_size(),
-            chunk_max_tokens: default_chunk_size(),
-            response_cache_enabled: false,
-            response_cache_ttl_minutes: default_response_cache_ttl(),
-            response_cache_max_entries: default_response_cache_max(),
             snapshot_enabled: false,
             snapshot_on_hygiene: false,
             auto_hydrate: true,
