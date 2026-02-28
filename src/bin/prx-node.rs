@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use openprx::config::{NodeServerConfig, NodesConfig};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
-use openprx::config::{NodeServerConfig, NodesConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "prx-node")]

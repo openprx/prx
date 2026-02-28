@@ -21,7 +21,7 @@ struct ChangeOutcomeLog {
 
 /// Write a self-change proposal log entry into memory.
 ///
-/// Key format: `self/decisions/YYYY-MM-DD/proposal_N`, category `daily`.
+/// Key format: `self/decisions/YYYY-MM-DD/proposal_N`, category `core`.
 pub async fn log_change_proposal(
     memory: &dyn Memory,
     key: &str,
@@ -29,7 +29,7 @@ pub async fn log_change_proposal(
     expected_outcome: &str,
 ) -> Result<()> {
     let day = Utc::now().date_naive().to_string();
-    let index = next_daily_index(memory, &day, "proposal_").await?;
+    let index = next_core_index(memory, &day, "proposal_").await?;
     let log_key = format!("self/decisions/{day}/proposal_{index}");
 
     let payload = ChangeProposalLog {
@@ -43,7 +43,7 @@ pub async fn log_change_proposal(
         .store(
             &log_key,
             &serde_json::to_string_pretty(&payload)?,
-            MemoryCategory::Daily,
+            MemoryCategory::Core,
             None,
         )
         .await
@@ -51,7 +51,7 @@ pub async fn log_change_proposal(
 
 /// Write a self-change outcome log entry into memory.
 ///
-/// Key format: `self/decisions/YYYY-MM-DD/outcome_N`, category `daily`.
+/// Key format: `self/decisions/YYYY-MM-DD/outcome_N`, category `core`.
 pub async fn log_change_outcome(
     memory: &dyn Memory,
     key: &str,
@@ -59,7 +59,7 @@ pub async fn log_change_outcome(
     fitness_delta: f64,
 ) -> Result<()> {
     let day = Utc::now().date_naive().to_string();
-    let index = next_daily_index(memory, &day, "outcome_").await?;
+    let index = next_core_index(memory, &day, "outcome_").await?;
     let log_key = format!("self/decisions/{day}/outcome_{index}");
 
     let payload = ChangeOutcomeLog {
@@ -73,15 +73,15 @@ pub async fn log_change_outcome(
         .store(
             &log_key,
             &serde_json::to_string_pretty(&payload)?,
-            MemoryCategory::Daily,
+            MemoryCategory::Core,
             None,
         )
         .await
 }
 
-async fn next_daily_index(memory: &dyn Memory, day: &str, prefix: &str) -> Result<usize> {
+async fn next_core_index(memory: &dyn Memory, day: &str, prefix: &str) -> Result<usize> {
     let key_prefix = format!("self/decisions/{day}/{prefix}");
-    let entries = memory.list(Some(&MemoryCategory::Daily), None).await?;
+    let entries = memory.list(Some(&MemoryCategory::Core), None).await?;
     let count = entries
         .iter()
         .filter(|entry| entry.key.starts_with(&key_prefix))
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proposal_log_uses_daily_category_and_incrementing_index() {
+    async fn proposal_log_uses_core_category_and_incrementing_index() {
         let memory = TestMemory::new();
         log_change_proposal(
             &memory,
@@ -217,14 +217,14 @@ mod tests {
         let entry1 = memory.get(&key1).await.unwrap().unwrap();
         let entry2 = memory.get(&key2).await.unwrap().unwrap();
 
-        assert_eq!(entry1.category, MemoryCategory::Daily);
-        assert_eq!(entry2.category, MemoryCategory::Daily);
+        assert_eq!(entry1.category, MemoryCategory::Core);
+        assert_eq!(entry2.category, MemoryCategory::Core);
         assert!(entry1.content.contains("policy.rate_limit"));
         assert!(entry2.content.contains("policy.timeout"));
     }
 
     #[tokio::test]
-    async fn outcome_log_uses_separate_daily_index_space() {
+    async fn outcome_log_uses_separate_core_index_space() {
         let memory = TestMemory::new();
         log_change_proposal(&memory, "k1", "proposal", "expect")
             .await

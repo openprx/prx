@@ -450,7 +450,9 @@ fn read_claude_code_cached_credentials() -> Option<ClaudeCodeCredentials> {
     parsed.claude_ai_oauth
 }
 
-pub(crate) fn write_claude_code_cached_credentials(credentials: &ClaudeCodeCredentials) -> anyhow::Result<()> {
+pub(crate) fn write_claude_code_cached_credentials(
+    credentials: &ClaudeCodeCredentials,
+) -> anyhow::Result<()> {
     let Some(path) = claude_code_credentials_file_path() else {
         return Ok(());
     };
@@ -636,7 +638,9 @@ fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOa
     })
 }
 
-pub(crate) fn refresh_claude_code_access_token(refresh_token: &str) -> anyhow::Result<ClaudeCodeCredentials> {
+pub(crate) fn refresh_claude_code_access_token(
+    refresh_token: &str,
+) -> anyhow::Result<ClaudeCodeCredentials> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -880,7 +884,9 @@ fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeP
             .as_ref()
             .and_then(|credentials| credentials.refresh_token.clone())
     });
-    let expires_at = cached.as_ref().and_then(|credentials| credentials.expires_at);
+    let expires_at = cached
+        .as_ref()
+        .and_then(|credentials| credentials.expires_at);
 
     ClaudeCodeProviderContext {
         credential: if placeholder_requested {
@@ -2303,10 +2309,7 @@ mod tests {
     #[test]
     fn resolve_claude_code_context_reads_cached_credentials_file() {
         let _env_lock = env_lock();
-        let fake_home = format!(
-            "/tmp/openprx-claude-oauth-home-{}-file",
-            std::process::id()
-        );
+        let fake_home = format!("/tmp/openprx-claude-oauth-home-{}-file", std::process::id());
         let creds_dir = PathBuf::from(&fake_home).join(".claude");
         std::fs::create_dir_all(&creds_dir).unwrap();
         let creds_path = creds_dir.join(".credentials.json");

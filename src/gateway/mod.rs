@@ -1031,7 +1031,7 @@ async fn handle_webhook(
 
     let message = &webhook_body.message;
 
-    if state.auto_save {
+    if state.auto_save && memory::should_autosave_content(message) {
         let key = webhook_memory_key();
         let _ = state
             .mem
@@ -1260,7 +1260,7 @@ async fn handle_whatsapp_message(
         );
 
         // Auto-save to memory
-        if state.auto_save {
+        if state.auto_save && memory::should_autosave_content(&msg.content) {
             let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
@@ -1373,7 +1373,7 @@ async fn handle_linq_webhook(
         );
 
         // Auto-save to memory
-        if state.auto_save {
+        if state.auto_save && memory::should_autosave_content(&msg.content) {
             let key = linq_memory_key(msg);
             let _ = state
                 .mem
@@ -1485,7 +1485,7 @@ async fn handle_nextcloud_talk_webhook(
             truncate_with_ellipsis(&msg.content, 50)
         );
 
-        if state.auto_save {
+        if state.auto_save && memory::should_autosave_content(&msg.content) {
             let key = nextcloud_talk_memory_key(msg);
             let _ = state
                 .mem

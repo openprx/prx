@@ -9,8 +9,6 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::json;
-use std::sync::{Arc, Mutex};
 use openprx::agent::agent::Agent;
 use openprx::agent::dispatcher::NativeToolDispatcher;
 use openprx::config::MemoryConfig;
@@ -19,6 +17,8 @@ use openprx::memory::Memory;
 use openprx::observability::{NoopObserver, Observer};
 use openprx::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
 use openprx::tools::{Tool, ToolResult};
+use serde_json::json;
+use std::sync::{Arc, Mutex};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mock infrastructure

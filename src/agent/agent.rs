@@ -473,7 +473,7 @@ impl Agent {
                 )));
         }
 
-        if self.auto_save {
+        if self.auto_save && memory::should_autosave_content(user_message) {
             let _ = self
                 .memory
                 .store("user_msg", user_message, MemoryCategory::Conversation, None)
