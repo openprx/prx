@@ -653,9 +653,16 @@ pub struct SelfSystemConfig {
     /// Enable evolution orchestrator cycles alongside fitness reports.
     #[serde(default)]
     pub evolution_enabled: bool,
+    /// Evolution scheduler interval in hours (daemon mode).
+    #[serde(default = "default_self_system_evolution_interval_hours")]
+    pub evolution_interval_hours: u32,
 }
 
 fn default_self_system_fitness_interval_hours() -> u64 {
+    24
+}
+
+fn default_self_system_evolution_interval_hours() -> u32 {
     24
 }
 
@@ -664,7 +671,8 @@ impl Default for SelfSystemConfig {
         Self {
             enabled: false,
             fitness_interval_hours: default_self_system_fitness_interval_hours(),
-            evolution_enabled: false,
+            evolution_enabled: true,
+            evolution_interval_hours: default_self_system_evolution_interval_hours(),
         }
     }
 }
@@ -5058,6 +5066,21 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 3);
         assert_eq!(parsed.memory.daily_retention_days, 7);
+        assert_eq!(parsed.self_system.evolution_interval_hours, 24);
+    }
+
+    #[test]
+    async fn self_system_evolution_interval_hours_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[self_system]
+evolution_enabled = true
+evolution_interval_hours = 12
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert!(parsed.self_system.evolution_enabled);
+        assert_eq!(parsed.self_system.evolution_interval_hours, 12);
     }
 
     #[test]

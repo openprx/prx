@@ -1,8 +1,15 @@
 use crate::config::{new_shared, Config, HotReloadManager};
-use anyhow::Result;
+use crate::self_system::evolution::{
+    new_shared_evolution_config, AsyncJsonlWriter, EvolutionAnalyzer, EvolutionConfig,
+    EvolutionPipeline, EvolutionRetentionConfig, EvolutionRuntimeConfig, EvolutionScheduler,
+    JsonlRetentionPolicy, JsonlStoragePaths, MemoryEvolutionEngine, PromptEvolutionEngine,
+    StrategyEvolutionEngine,
+};
+use anyhow::{Context, Result};
 use chrono::{Timelike, Utc};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
@@ -94,6 +101,22 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
+    if config.self_system.evolution_enabled {
+        let evolution_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "evolution_scheduler",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = evolution_cfg.clone();
+                async move { run_evolution_scheduler_worker(cfg).await }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("evolution_scheduler");
+        tracing::info!("Evolution scheduler disabled; evolution supervisor not started");
+    }
+
     if config.webhook.enabled {
         let webhook_cfg = config.clone();
         handles.push(spawn_component_supervisor(
@@ -125,7 +148,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     println!("🧠 OpenPRX daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler, webhook_receiver");
+    println!(
+        "   Components: gateway, channels, heartbeat, scheduler, evolution_scheduler, webhook_receiver"
+    );
     println!("   Ctrl+C to stop");
 
     tokio::signal::ctrl_c().await?;
@@ -251,6 +276,159 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     }
 }
 
+async fn run_evolution_scheduler_worker(config: Config) -> Result<()> {
+    let (mut scheduler, interval_hours) = build_evolution_scheduler(&config).await?;
+    let mut interval = tokio::time::interval(Duration::from_secs(
+        interval_hours.max(1).saturating_mul(3600),
+    ));
+
+    loop {
+        interval.tick().await;
+        match scheduler.run_scheduled(Utc::now()).await {
+            Ok(summary) => {
+                if summary.digest_ran || summary.cycle_ran {
+                    tracing::info!(
+                        target: "self_system",
+                        digest_ran = summary.digest_ran,
+                        cycle_ran = summary.cycle_ran,
+                        layer_reports = summary.layer_reports.len(),
+                        "evolution scheduler tick completed"
+                    );
+                }
+                crate::health::mark_component_ok("evolution_scheduler");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "self_system",
+                    "evolution scheduler tick failed: {error}"
+                );
+            }
+        }
+    }
+}
+
+async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionScheduler, u64)> {
+    let (cfg, cfg_path) = load_evolution_config(config).await?;
+    tokio::fs::create_dir_all(&config.workspace_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to prepare workspace dir for evolution scheduler: {}",
+                config.workspace_dir.display()
+            )
+        })?;
+
+    let shared = new_shared_evolution_config(cfg.clone());
+    let storage_root = resolve_evolution_storage_root(config, &cfg.runtime);
+    let writer = Arc::new(
+        AsyncJsonlWriter::new(
+            JsonlStoragePaths::new(storage_root.clone()),
+            retention_from_runtime(&cfg.runtime.retention),
+            cfg.runtime.batch_size,
+        )
+        .await?,
+    );
+    let analyzer = Arc::new(EvolutionAnalyzer::new(
+        writer.clone(),
+        storage_root.join("analysis"),
+    ));
+    let pipeline = EvolutionPipeline::new(
+        shared.clone(),
+        analyzer.clone(),
+        writer.clone(),
+        &config.workspace_dir,
+    );
+
+    let memory_engine = Box::new(
+        MemoryEvolutionEngine::new(shared.clone(), &cfg_path, Some(writer.clone())).with_context(
+            || {
+                format!(
+                    "failed to initialize memory evolution engine: {}",
+                    cfg_path.display()
+                )
+            },
+        )?,
+    );
+    let prompt_engine = Box::new(PromptEvolutionEngine::new(
+        shared.clone(),
+        &config.workspace_dir,
+        Some(writer.clone()),
+    ));
+    let strategy_engine = Box::new(StrategyEvolutionEngine::new(
+        shared.clone(),
+        &config.workspace_dir,
+        writer,
+    )?);
+
+    let scheduler = EvolutionScheduler::new(
+        shared,
+        analyzer,
+        pipeline,
+        config.workspace_dir.join(".evolution/scheduler_state.json"),
+        memory_engine,
+        prompt_engine,
+        strategy_engine,
+    );
+
+    Ok((
+        scheduler,
+        u64::from(config.self_system.evolution_interval_hours.max(1)),
+    ))
+}
+
+async fn load_evolution_config(config: &Config) -> Result<(EvolutionConfig, PathBuf)> {
+    let path = discover_evolution_config_path(config);
+    if tokio::fs::metadata(&path).await.is_ok() {
+        let cfg = EvolutionConfig::load_from_path(&path)
+            .await
+            .with_context(|| format!("failed to load evolution config: {}", path.display()))?;
+        Ok((cfg, path))
+    } else {
+        Ok((EvolutionConfig::default(), path))
+    }
+}
+
+fn discover_evolution_config_path(config: &Config) -> PathBuf {
+    if let Ok(raw) = std::env::var("OPENPRX_EVOLUTION_CONFIG")
+        .or_else(|_| std::env::var("ZEROCLAW_EVOLUTION_CONFIG"))
+    {
+        let path = PathBuf::from(raw);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+
+    let candidates = [
+        config.workspace_dir.join("evolution_config.toml"),
+        PathBuf::from("evolution_config.toml"),
+        PathBuf::from("config/evolution_config.toml"),
+    ];
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return candidate.clone();
+        }
+    }
+    candidates[0].clone()
+}
+
+fn resolve_evolution_storage_root(config: &Config, runtime: &EvolutionRuntimeConfig) -> PathBuf {
+    let root = Path::new(&runtime.storage_dir);
+    if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        config.workspace_dir.join(root)
+    }
+}
+
+fn retention_from_runtime(retention: &EvolutionRetentionConfig) -> JsonlRetentionPolicy {
+    JsonlRetentionPolicy {
+        hot_days: retention.hot_days,
+        warm_days: retention.warm_days,
+        cold_days: retention.cold_days,
+    }
+}
+
 fn has_supervised_channels(config: &Config) -> bool {
     let crate::config::ChannelsConfig {
         cli: _,     // `cli` is used only when running the CLI manually
@@ -312,6 +490,42 @@ mod tests {
 
         let path = state_file_path(&config);
         assert_eq!(path, tmp.path().join("daemon_state.json"));
+    }
+
+    #[test]
+    fn resolve_evolution_storage_root_uses_workspace_for_relative_path() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut runtime = EvolutionRuntimeConfig::default();
+        runtime.storage_dir = "self/evolution-data".to_string();
+
+        let root = resolve_evolution_storage_root(&config, &runtime);
+        assert_eq!(root, config.workspace_dir.join("self/evolution-data"));
+    }
+
+    #[test]
+    fn resolve_evolution_storage_root_preserves_absolute_path() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut runtime = EvolutionRuntimeConfig::default();
+        let abs = tmp.path().join("absolute-storage");
+        runtime.storage_dir = abs.to_string_lossy().to_string();
+
+        let root = resolve_evolution_storage_root(&config, &runtime);
+        assert_eq!(root, abs);
+    }
+
+    #[tokio::test]
+    async fn load_evolution_config_defaults_when_file_missing() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (cfg, path) = load_evolution_config(&config).await.unwrap();
+        assert_eq!(
+            cfg.runtime.mode,
+            crate::self_system::evolution::EvolutionMode::Shadow
+        );
+        assert_eq!(path, config.workspace_dir.join("evolution_config.toml"));
     }
 
     #[tokio::test]
