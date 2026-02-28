@@ -84,6 +84,12 @@ fn next_id() -> u64 {
     REQUEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+fn parse_response_id(id: &Option<Value>) -> Option<u64> {
+    let id = id.as_ref()?;
+    id.as_u64()
+        .or_else(|| id.as_str().and_then(|s| s.parse::<u64>().ok()))
+}
+
 /// Configuration for the wacli channel.
 #[derive(Debug, Clone)]
 pub struct WacliChannelConfig {
@@ -148,10 +154,36 @@ impl WacliChannel {
             .with_context(|| format!("failed to connect to wacli daemon at {addr}"))
     }
 
+    async fn connect_with_retry(&self, max_attempts: usize) -> Result<TcpStream> {
+        let attempts = max_attempts.max(1);
+        let mut delay = Duration::from_millis(200);
+        let mut last_err = None;
+
+        for attempt in 1..=attempts {
+            match self.connect().await {
+                Ok(stream) => return Ok(stream),
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt == attempts {
+                        break;
+                    }
+                    tracing::warn!(
+                        "wacli: connect attempt {attempt}/{attempts} failed, retrying in {:?}",
+                        delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("wacli connection failed")))
+    }
+
     /// Send a JSON-RPC request and read the single-line response.
     /// Opens a fresh TCP connection for each call.
     async fn rpc_call<P: Serialize>(&self, method: &str, params: P) -> Result<Value> {
-        let stream = self.connect().await?;
+        let stream = self.connect_with_retry(4).await?;
         let (reader, mut writer) = stream.into_split();
 
         let id = next_id();
@@ -195,6 +227,9 @@ impl WacliChannel {
 
             // Try to parse as a response; skip notifications (no "id").
             if let Ok(resp) = serde_json::from_str::<RpcResponse>(trimmed) {
+                if parse_response_id(&resp.id) != Some(id) {
+                    continue;
+                }
                 if let Some(ref err) = resp.error {
                     anyhow::bail!(
                         "wacli RPC '{}' returned error {}: {}",
@@ -249,7 +284,7 @@ impl WacliChannel {
     async fn listen_loop(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         let addr = self.addr();
         tracing::info!("wacli: connecting to daemon at {addr}");
-        let stream = self.connect().await?;
+        let stream = self.connect_with_retry(6).await?;
         let (reader, mut writer) = stream.into_split();
         let mut buf_reader = BufReader::new(reader);
 
@@ -268,12 +303,21 @@ impl WacliChannel {
 
         // Wait for the subscribe response, then stream notifications.
         let mut line = String::new();
+        let mut subscribed = false;
+        let subscribe_ack_timeout = Duration::from_secs(10);
         loop {
             line.clear();
-            let n = buf_reader
-                .read_line(&mut line)
-                .await
-                .context("reading from wacli daemon")?;
+            let n = if subscribed {
+                buf_reader
+                    .read_line(&mut line)
+                    .await
+                    .context("reading from wacli daemon")?
+            } else {
+                timeout(subscribe_ack_timeout, buf_reader.read_line(&mut line))
+                    .await
+                    .context("timeout waiting for wacli subscribe ack")?
+                    .context("reading from wacli daemon")?
+            };
 
             if n == 0 {
                 anyhow::bail!("wacli daemon closed connection unexpectedly");
@@ -296,10 +340,14 @@ impl WacliChannel {
 
                 // Otherwise it's a response (subscribe ack or error).
                 if let Ok(rpc_resp) = serde_json::from_str::<RpcResponse>(trimmed) {
+                    if parse_response_id(&rpc_resp.id) != Some(subscribe_id) {
+                        continue;
+                    }
                     if let Some(ref err) = rpc_resp.error {
                         anyhow::bail!("wacli subscribe failed: {} ({})", err.message, err.code);
                     }
                     tracing::info!("wacli: subscribed, waiting for events");
+                    subscribed = true;
                 }
                 // Continue listening after subscribe ack.
                 continue;
