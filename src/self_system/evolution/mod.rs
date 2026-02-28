@@ -1,13 +1,10 @@
 //! Evolution subsystem record/storage/config/trace primitives.
 
 pub mod analyzer;
-pub mod annotation;
-pub mod anti_pattern;
 pub mod config;
 pub mod cycle_types;
 pub mod engine;
 pub mod gate;
-pub mod index;
 pub mod judge;
 pub mod memory_compressor;
 pub mod memory_evolution;
@@ -21,7 +18,6 @@ pub mod safety_utils;
 pub mod scheduler;
 pub mod storage;
 pub mod strategy_evolution;
-pub mod test_suite;
 pub mod trace;
 
 #[allow(unused_imports)]
@@ -30,10 +26,6 @@ pub use analyzer::{
     MetricShift, NoiseMemoryPattern, TaskTypeDigest, TaskTypeWeakness, TrendAnalysis,
     UserCorrectionCluster,
 };
-#[allow(unused_imports)]
-pub use annotation::{AnnotationPipeline, AnnotationReport, AnnotationUpdate};
-#[allow(unused_imports)]
-pub use anti_pattern::{AntiPattern, AntiPatternStore};
 #[allow(unused_imports)]
 pub use config::{
     new_shared_evolution_config, EvolutionRetrievalConfig, RetrievalScoreWeights,
@@ -52,16 +44,14 @@ pub use engine::{run_engine_cycle, CycleResult, EngineCycleInput, EvolutionEngin
 #[allow(unused_imports)]
 pub use gate::{EvolutionGate, GateMetrics, GateRejection, GateResult};
 #[allow(unused_imports)]
-pub use index::{ImportSummary, JsonlToSqliteIndexer, SearchHit};
-#[allow(unused_imports)]
 pub use judge::{
     JudgeConfig, JudgeDriftAlert, JudgeEngine, JudgeHealthMonitor, JudgeHealthReport, JudgeResult,
     JudgeScoringModel, MockJudgeModel, StructuredScores,
 };
 #[allow(unused_imports)]
 pub use memory_compressor::{
-    CompressionLimits, CompressionResult, DefaultSimilarityDetector, EmbeddingSimilarityDetector,
-    FidelityReport, MemoryCompressor, SimilarityDetector,
+    CompressionLimits, CompressionResult, EmbeddingSimilarityDetector, FidelityReport,
+    MemoryCompressor, SimilarityDetector,
 };
 pub use memory_evolution::MemoryEvolutionEngine;
 #[allow(unused_imports)]
@@ -83,8 +73,6 @@ pub use rollback::{CircuitBreaker, CircuitBreakerState, RollbackManager, Version
 pub use scheduler::{EvolutionScheduler, SchedulerRunSummary, SchedulerState};
 pub use storage::{AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths};
 pub use strategy_evolution::{StrategyEvolutionEngine, TaskDailySummary};
-#[allow(unused_imports)]
-pub use test_suite::{TestSplit, TestSuite, TestTask};
 pub use trace::{
     current_trace, generate_experiment_id, generate_trace_id, with_trace, TraceContext,
 };
