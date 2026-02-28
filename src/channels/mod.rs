@@ -1677,19 +1677,24 @@ async fn process_channel_message(
             return;
         }
     };
+    let inferred_chat_type = if msg.reply_target.starts_with("group:")
+        || msg.reply_target.ends_with("@g.us")
+        || msg.sender.ends_with("@g.us")
+    {
+        "group"
+    } else {
+        "dm"
+    };
+    // Only auto-save DM messages; group messages are noise unless explicitly stored by the agent.
     if ctx.auto_save_memory
+        && inferred_chat_type == "dm"
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && memory::should_autosave_content(&msg.content)
     {
         let autosave_key = conversation_memory_key(&msg);
-        let inferred_chat_type = if msg.reply_target.starts_with("group:") {
-            "group".to_string()
-        } else {
-            "dm".to_string()
-        };
         let write_ctx = MemoryWriteContext {
             channel: Some(msg.channel.clone()),
-            chat_type: Some(inferred_chat_type),
+            chat_type: Some(inferred_chat_type.to_string()),
             chat_id: Some(msg.reply_target.clone()),
             sender_id: None,
             raw_sender: Some(msg.sender.clone()),
