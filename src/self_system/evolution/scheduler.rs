@@ -335,7 +335,7 @@ mod tests {
     use crate::self_system::evolution::storage::{
         AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths,
     };
-    use crate::self_system::orchestrator::{
+    use crate::self_system::evolution::{
         CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals, EvolutionValidation,
         FitnessTrend, RiskLevel, ValidationStatus,
     };
@@ -363,10 +363,10 @@ mod tests {
                     summary: "noop".to_string(),
                     rationale: "noop".to_string(),
                     risk_level: RiskLevel::Low,
-                    target: crate::self_system::orchestrator::ChangeTarget::WorkspaceFile {
+                    target: crate::self_system::evolution::ChangeTarget::WorkspaceFile {
                         path: "README.md".to_string(),
                     },
-                    operation: crate::self_system::orchestrator::ChangeOperation::Append {
+                    operation: crate::self_system::evolution::ChangeOperation::Append {
                         content: "".to_string(),
                     },
                 }),

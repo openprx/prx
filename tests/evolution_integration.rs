@@ -9,7 +9,7 @@ use openprx::self_system::evolution::{
     JsonlRetentionPolicy, JsonlStoragePaths, JsonlToSqliteIndexer, MemoryAccessLog, MemoryAction,
     MemoryEvolutionEngine, Outcome, RollbackManager, TaskType,
 };
-use openprx::self_system::orchestrator::{
+use openprx::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
     EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };

@@ -101,6 +101,22 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
+    if config.self_system.enabled {
+        let fitness_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "self_system_fitness",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = fitness_cfg.clone();
+                async move { run_fitness_worker(cfg).await }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("self_system_fitness");
+        tracing::info!("Self-system fitness disabled; fitness supervisor not started");
+    }
+
     if config.self_system.evolution_enabled {
         let evolution_cfg = config.clone();
         handles.push(spawn_component_supervisor(
@@ -149,7 +165,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("🧠 OpenPRX daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!(
-        "   Components: gateway, channels, heartbeat, scheduler, evolution_scheduler, webhook_receiver"
+        "   Components: gateway, channels, heartbeat, scheduler, self_system_fitness, evolution_scheduler, webhook_receiver"
     );
     println!("   Ctrl+C to stop");
 
@@ -271,6 +287,35 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 tracing::warn!("Heartbeat task failed: {e}");
             } else {
                 crate::health::mark_component_ok("heartbeat");
+            }
+        }
+    }
+}
+
+async fn run_fitness_worker(config: Config) -> Result<()> {
+    let interval_hours = config.self_system.fitness_interval_hours.max(1);
+    let mut interval =
+        tokio::time::interval(Duration::from_secs(interval_hours.saturating_mul(3600)));
+
+    loop {
+        interval.tick().await;
+        match crate::self_system::run_fitness_report().await {
+            Ok(report) => {
+                crate::health::mark_component_ok("self_system_fitness");
+                tracing::info!(
+                    target: "self_system",
+                    "fitness report stored: score={:.3}, confidence={:.3}, date={}",
+                    report.final_score,
+                    report.confidence,
+                    report.window.date
+                );
+            }
+            Err(error) => {
+                crate::health::mark_component_error("self_system_fitness", error.to_string());
+                tracing::warn!(
+                    target: "self_system",
+                    "fitness report failed: {error}"
+                );
             }
         }
     }

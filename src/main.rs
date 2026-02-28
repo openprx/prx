@@ -37,7 +37,6 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -47,71 +46,6 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
         return Err("temperature must be between 0.0 and 2.0".to_string());
     }
     Ok(t)
-}
-
-fn spawn_self_system_runtime(config: &Config) -> Option<tokio::task::JoinHandle<()>> {
-    if !config.self_system.enabled {
-        return None;
-    }
-
-    let runtime_config = config.clone();
-    Some(tokio::spawn(async move {
-        let interval_hours = runtime_config.self_system.fitness_interval_hours.max(1);
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(interval_hours.saturating_mul(3600)));
-
-        loop {
-            interval.tick().await;
-
-            match crate::self_system::run_fitness_report().await {
-                Ok(report) => tracing::info!(
-                    target: "self_system",
-                    "fitness report stored: score={:.3}, confidence={:.3}, date={}",
-                    report.final_score,
-                    report.confidence,
-                    report.window.date
-                ),
-                Err(error) => tracing::error!(
-                    target: "self_system",
-                    "fitness report failed: {error}"
-                ),
-            }
-
-            if !runtime_config.self_system.evolution_enabled {
-                continue;
-            }
-
-            let storage_provider = Some(&runtime_config.storage.provider.config);
-            let memory = match crate::memory::create_memory_with_storage_and_routes_with_acl(
-                &runtime_config.memory,
-                &runtime_config.embedding_routes,
-                storage_provider,
-                &runtime_config.workspace_dir,
-                runtime_config.api_key.as_deref(),
-                &runtime_config.identity_bindings,
-                &runtime_config.user_policies,
-            ) {
-                Ok(memory) => memory,
-                Err(error) => {
-                    tracing::error!(target: "self_system", "evolution memory init failed: {error}");
-                    continue;
-                }
-            };
-
-            let health = crate::self_system::RuntimeHealth;
-            let cron_store = crate::self_system::RuntimeCronStore::new(runtime_config.clone());
-            let cycle =
-                crate::self_system::run_evolution_cycle(memory.as_ref(), &health, &cron_store)
-                    .await;
-            tracing::info!(
-                target: "self_system",
-                "evolution cycle finished: id={}, outcome={:?}, status={:?}",
-                cycle.id,
-                cycle.outcome,
-                cycle.validation.status
-            );
-        }
-    }))
 }
 
 mod agent;
@@ -940,7 +874,6 @@ async fn main() -> Result<()> {
             } else {
                 info!("🧠 Starting OpenPRX Daemon on {host}:{port}");
             }
-            let _self_system_task = spawn_self_system_runtime(&config);
             daemon::run(config, host, port).await
         }
 

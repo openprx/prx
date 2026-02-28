@@ -8,7 +8,7 @@ use crate::self_system::evolution::safety_utils::{
     atomic_write, is_raw_debug_enabled, sha256_hex, validate_path_in_workspace,
 };
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
-use crate::self_system::orchestrator::{
+use crate::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
     EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };

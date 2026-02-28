@@ -9,12 +9,12 @@ use crate::self_system::evolution::record::{
     ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult, Outcome,
 };
 use crate::self_system::evolution::rollback::RollbackManager;
+use crate::self_system::evolution::run_engine_cycle;
 use crate::self_system::evolution::safety_utils::{
     acquire_file_lock, atomic_write, validate_path_in_workspace,
 };
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::trace::generate_experiment_id;
-use crate::self_system::orchestrator::run_engine_cycle;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -214,12 +214,8 @@ impl EvolutionPipeline {
             evolution_log.result = Some(EvolutionResult::Regressed);
         } else {
             evolution_log.result = Some(match cycle_result.cycle.outcome {
-                crate::self_system::orchestrator::CycleOutcome::Applied => {
-                    EvolutionResult::Improved
-                }
-                crate::self_system::orchestrator::CycleOutcome::Failed => {
-                    EvolutionResult::Regressed
-                }
+                crate::self_system::evolution::CycleOutcome::Applied => EvolutionResult::Improved,
+                crate::self_system::evolution::CycleOutcome::Failed => EvolutionResult::Regressed,
                 _ => EvolutionResult::Neutral,
             });
         }
@@ -248,16 +244,16 @@ impl EvolutionPipeline {
     async fn rollback_cycle(
         &self,
         layer: EvolutionLayer,
-        proposal: Option<&crate::self_system::orchestrator::EvolutionProposal>,
+        proposal: Option<&crate::self_system::evolution::EvolutionProposal>,
     ) -> Result<()> {
         let Some(proposal) = proposal else {
             return Ok(());
         };
 
         let raw_target = match &proposal.target {
-            crate::self_system::orchestrator::ChangeTarget::ConfigFile { path }
-            | crate::self_system::orchestrator::ChangeTarget::CronFile { path }
-            | crate::self_system::orchestrator::ChangeTarget::WorkspaceFile { path } => path,
+            crate::self_system::evolution::ChangeTarget::ConfigFile { path }
+            | crate::self_system::evolution::ChangeTarget::CronFile { path }
+            | crate::self_system::evolution::ChangeTarget::WorkspaceFile { path } => path,
         };
         let target_rel = if Path::new(raw_target).is_absolute() {
             Path::new(raw_target).strip_prefix(&self.workspace_root)?
@@ -443,7 +439,7 @@ fn should_rollback(
     judge.scores.overall() < JUDGE_PASS_THRESHOLD
         || matches!(
             cycle_result.cycle.outcome,
-            crate::self_system::orchestrator::CycleOutcome::Failed
+            crate::self_system::evolution::CycleOutcome::Failed
         )
 }
 
@@ -488,7 +484,7 @@ mod tests {
     };
     use crate::self_system::evolution::safety_utils::acquire_file_lock;
     use crate::self_system::evolution::storage::{JsonlRetentionPolicy, JsonlStoragePaths};
-    use crate::self_system::orchestrator::{
+    use crate::self_system::evolution::{
         CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals, EvolutionValidation,
         FitnessTrend, RiskLevel, ValidationStatus,
     };
@@ -516,10 +512,10 @@ mod tests {
                     summary: "mock proposal".to_string(),
                     rationale: "mock rationale".to_string(),
                     risk_level: RiskLevel::Low,
-                    target: crate::self_system::orchestrator::ChangeTarget::ConfigFile {
+                    target: crate::self_system::evolution::ChangeTarget::ConfigFile {
                         path: "evolution_config.toml".to_string(),
                     },
-                    operation: crate::self_system::orchestrator::ChangeOperation::Write {
+                    operation: crate::self_system::evolution::ChangeOperation::Write {
                         content: "".to_string(),
                     },
                 }),
@@ -706,10 +702,10 @@ mod tests {
             summary: "s".to_string(),
             rationale: "r".to_string(),
             risk_level: RiskLevel::High,
-            target: crate::self_system::orchestrator::ChangeTarget::WorkspaceFile {
+            target: crate::self_system::evolution::ChangeTarget::WorkspaceFile {
                 path: "../escape.txt".to_string(),
             },
-            operation: crate::self_system::orchestrator::ChangeOperation::Write {
+            operation: crate::self_system::evolution::ChangeOperation::Write {
                 content: "x".to_string(),
             },
         };
