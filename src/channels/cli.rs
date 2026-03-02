@@ -77,7 +77,6 @@ mod tests {
                 recipient: "user".into(),
                 subject: None,
                 thread_ts: None,
-                mentioned_uuids: vec![],
                 quote_timestamp: None,
                 quote_author: None,
             })
@@ -94,7 +93,6 @@ mod tests {
                 recipient: String::new(),
                 subject: None,
                 thread_ts: None,
-                mentioned_uuids: vec![],
                 quote_timestamp: None,
                 quote_author: None,
             })

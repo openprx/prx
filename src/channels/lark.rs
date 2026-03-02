@@ -1327,6 +1327,7 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::default(),
             port: None,
+            mention_only: false,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -1348,6 +1349,7 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            mention_only: false,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -1380,6 +1382,7 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            mention_only: false,
         };
 
         let ch = LarkChannel::from_config(&cfg);

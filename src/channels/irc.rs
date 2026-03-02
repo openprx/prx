@@ -953,6 +953,7 @@ mod tests {
             username: Some("openprx".into()),
             channels: vec!["#test".into(), "#dev".into()],
             allowed_users: vec!["alice".into()],
+            mention_only: false,
             server_password: None,
             nickserv_password: Some("secret".into()),
             sasl_password: None,

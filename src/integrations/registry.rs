@@ -847,6 +847,7 @@ mod tests {
         let mut config = Config::default();
         config.channels_config.imessage = Some(IMessageConfig {
             allowed_contacts: vec!["*".into()],
+            mention_only: false,
         });
         let entries = all_integrations();
         let im = entries.iter().find(|e| e.name == "iMessage").unwrap();
@@ -874,6 +875,7 @@ mod tests {
             device_id: None,
             room_id: "!r:m".into(),
             allowed_users: vec![],
+            mention_only: false,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();

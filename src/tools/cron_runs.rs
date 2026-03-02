@@ -119,6 +119,7 @@ mod tests {
     use super::*;
     use crate::config::{new_shared, Config};
     use chrono::{Duration as ChronoDuration, Utc};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> SharedConfig {
