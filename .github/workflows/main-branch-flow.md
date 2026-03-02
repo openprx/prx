@@ -77,7 +77,7 @@ Notes:
 
 ### 2) PR from fork -> `main`
 
-1. External contributor opens PR from `fork/<branch>` into `zeroclaw:main`.
+1. External contributor opens PR from `fork/<branch>` into `openprx/prx:main`.
 2. Immediately on `opened`:
    - `pull_request_target` workflows start with base-repo context and base-repo token:
      - `pr-intake-checks.yml`
