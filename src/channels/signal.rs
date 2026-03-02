@@ -1347,6 +1347,12 @@ impl SignalChannel {
             content_with_meta.push_str(text);
             content_with_meta.push('\n');
         }
+        // Append human-readable quoted text so the LLM sees reply context inline.
+        if let Some(quote) = data_msg.and_then(|dm| dm.quote.as_ref()) {
+            if let Some(quoted_text) = Self::json_string(quote, &["text", "message", "body"]) {
+                content_with_meta.push_str(&format!("[quoted] {quoted_text}\n"));
+            }
+        }
         content_with_meta.push_str(&signal_meta);
 
         Some(ChannelMessage {
