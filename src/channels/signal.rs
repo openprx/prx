@@ -1272,14 +1272,34 @@ impl SignalChannel {
             .and_then(|dm| dm.attachments.as_ref())
             .is_some_and(|attachments| !attachments.is_empty());
         let text = data_msg.and_then(|dm| dm.message.as_deref()).unwrap_or("");
+        let has_typing_or_receipt_event =
+            envelope.typing_message.is_some() || envelope.receipt_message.is_some();
+        let has_other_event_payload = event_prefixes.iter().any(|prefix| {
+            !prefix.contains(r#""type":"typingMessage""#)
+                && !prefix.contains(r#""type":"receiptMessage""#)
+        });
 
         // Skip attachment-only messages when configured
         if self.ignore_attachments && has_attachments && text.is_empty() && !has_event_payload {
             return None;
         }
 
-        // Keep non-text signal events (reaction/delete/sticker/edit/expiration/typing/receipt/sync),
-        // but still drop truly empty envelopes.
+        // Keep non-text Signal events (reaction/delete/sticker/edit/expiration/sync),
+        // but avoid routing typing/receipt-only envelopes into the LLM reply path.
+        let is_non_user_message = text.is_empty()
+            && !has_attachments
+            && has_typing_or_receipt_event
+            && !has_other_event_payload;
+        if is_non_user_message {
+            tracing::debug!(
+                "Signal non-user event dropped (typing={}, receipt={})",
+                envelope.typing_message.is_some(),
+                envelope.receipt_message.is_some()
+            );
+            return None;
+        }
+
+        // Still drop truly empty envelopes.
         if text.is_empty() && !has_attachments && !has_event_payload {
             return None;
         }
@@ -2633,6 +2653,36 @@ mod tests {
             "content: {}",
             msg.content
         );
+    }
+
+    #[test]
+    fn process_envelope_typing_only_not_replyable() {
+        let ch = make_channel();
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            typing_message: Some(serde_json::json!({
+                "action": "STARTED"
+            })),
+            timestamp: Some(1_700_000_000_101),
+            ..Default::default()
+        };
+        assert!(ch.process_envelope(&env).is_none());
+    }
+
+    #[test]
+    fn process_envelope_receipt_only_not_replyable() {
+        let ch = make_channel();
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            receipt_message: Some(serde_json::json!({
+                "when": 1_700_000_000_102u64
+            })),
+            timestamp: Some(1_700_000_000_102),
+            ..Default::default()
+        };
+        assert!(ch.process_envelope(&env).is_none());
     }
 
     #[test]
