@@ -64,6 +64,7 @@ mod tests {
             use_feishu: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            mention_only: false,
         };
 
         let nextcloud_talk = NextcloudTalkConfig {
@@ -71,6 +72,7 @@ mod tests {
             app_token: "app-token".into(),
             webhook_secret: None,
             allowed_users: vec!["*".into()],
+            mention_only: false,
         };
 
         assert_eq!(telegram.allowed_users.len(), 1);

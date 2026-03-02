@@ -397,6 +397,7 @@ impl ScheduleTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 

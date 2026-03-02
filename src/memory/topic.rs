@@ -437,7 +437,8 @@ pub fn merge_topic_memories(memories: Vec<TopicMemory>) -> Vec<TopicMemory> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{ChatType, Role, SqliteMemory, Visibility};
+    use crate::memory::principal::{ChatType, Role, Visibility};
+    use crate::memory::SqliteMemory;
     use tempfile::TempDir;
 
     fn setup_conn() -> (TempDir, Connection) {

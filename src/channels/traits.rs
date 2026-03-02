@@ -288,6 +288,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                mentioned_uuids: vec![],
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -304,6 +305,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            mentioned_uuids: vec![],
         };
 
         let cloned = message.clone();

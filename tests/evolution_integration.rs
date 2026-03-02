@@ -113,7 +113,7 @@ async fn trace_id_end_to_end_pipeline_to_evolution_log() -> Result<()> {
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let mut pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer));
+    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer))?;
 
     let report = pipeline
         .run_for_layer(
@@ -174,7 +174,7 @@ async fn record_analyze_evolve_closed_loop_produces_candidate() -> Result<()> {
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let mut pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer));
+    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer))?;
 
     let report = pipeline
         .run_for_layer(
@@ -226,7 +226,7 @@ async fn shadow_mode_generates_recommendation_without_applying_change() -> Resul
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
     let mut pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer));
+    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer))?;
 
     let report = pipeline
         .run_for_layer(
@@ -256,7 +256,7 @@ async fn gate_rejects_candidate_when_threshold_not_met() -> Result<()> {
     tokio::fs::write(&cfg_path, toml::to_string_pretty(&cfg)?).await?;
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
-    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, None);
+    let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, None)?;
 
     let mut target = BTreeMap::new();
     target.insert("task_type".to_string(), "planning".to_string());
@@ -375,7 +375,7 @@ async fn rollback_triggers_when_judge_score_below_threshold() -> Result<()> {
     tokio::fs::write(&target, "value = 1\n").await?;
 
     let rollback_dir = dir.path().join(".evolution/rollback/memory");
-    let manager = RollbackManager::new(&target, &rollback_dir, 5);
+    let manager = RollbackManager::new(dir.path(), &target, &rollback_dir, 5)?;
     let _ = manager.backup_current_version().await?;
     tokio::fs::write(&target, "value = 2\n").await?;
 

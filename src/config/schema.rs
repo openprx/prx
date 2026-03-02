@@ -5423,6 +5423,7 @@ tool_dispatcher = "xml"
     async fn imessage_config_serde() {
         let ic = IMessageConfig {
             allowed_contacts: vec!["+1234567890".into(), "user@icloud.com".into()],
+            mention_only: false,
         };
         let json = serde_json::to_string(&ic).unwrap();
         let parsed: IMessageConfig = serde_json::from_str(&json).unwrap();
@@ -5434,6 +5435,7 @@ tool_dispatcher = "xml"
     async fn imessage_config_empty_contacts() {
         let ic = IMessageConfig {
             allowed_contacts: vec![],
+            mention_only: false,
         };
         let json = serde_json::to_string(&ic).unwrap();
         let parsed: IMessageConfig = serde_json::from_str(&json).unwrap();
@@ -5444,6 +5446,7 @@ tool_dispatcher = "xml"
     async fn imessage_config_wildcard() {
         let ic = IMessageConfig {
             allowed_contacts: vec!["*".into()],
+            mention_only: false,
         };
         let toml_str = toml::to_string(&ic).unwrap();
         let parsed: IMessageConfig = toml::from_str(&toml_str).unwrap();
@@ -5459,6 +5462,7 @@ tool_dispatcher = "xml"
             device_id: Some("DEVICE123".into()),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
+            mention_only: false,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -5479,6 +5483,7 @@ tool_dispatcher = "xml"
             device_id: None,
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
+            mention_only: false,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -5562,6 +5567,7 @@ allowed_users = ["@ops:matrix.org"]
             webhook: None,
             imessage: Some(IMessageConfig {
                 allowed_contacts: vec!["+1".into()],
+                mention_only: false,
             }),
             matrix: Some(MatrixConfig {
                 homeserver: "https://m.org".into(),
@@ -5570,6 +5576,7 @@ allowed_users = ["@ops:matrix.org"]
                 device_id: None,
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
+                mention_only: false,
             }),
             signal: None,
             whatsapp: None,
@@ -5682,6 +5689,7 @@ channel_id = "C123"
             dm_policy: DmPolicy::default(),
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
+            mention_only: false,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -5705,6 +5713,7 @@ channel_id = "C123"
             dm_policy: DmPolicy::default(),
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
+            mention_only: false,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -5733,6 +5742,7 @@ channel_id = "C123"
             dm_policy: DmPolicy::default(),
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
+            mention_only: false,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -5753,6 +5763,7 @@ channel_id = "C123"
             dm_policy: DmPolicy::default(),
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
+            mention_only: false,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -5772,6 +5783,7 @@ channel_id = "C123"
             dm_policy: DmPolicy::default(),
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
+            mention_only: false,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -5801,6 +5813,7 @@ channel_id = "C123"
                 dm_policy: DmPolicy::default(),
                 group_policy: GroupPolicy::default(),
                 group_allow_from: vec![],
+                mention_only: false,
             }),
             wacli: None,
             linq: None,
@@ -7085,6 +7098,7 @@ allowed_from = ["*"]
             use_feishu: true,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            mention_only: false,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -7107,6 +7121,7 @@ allowed_from = ["*"]
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            mention_only: false,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -7149,6 +7164,7 @@ allowed_from = ["*"]
             app_token: "app-token".into(),
             webhook_secret: Some("webhook-secret".into()),
             allowed_users: vec!["user_a".into(), "*".into()],
+            mention_only: false,
         };
 
         let json = serde_json::to_string(&nc).unwrap();
