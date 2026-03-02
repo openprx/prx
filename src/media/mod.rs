@@ -201,7 +201,7 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
         let timestamp = interval * (i as f64 + 1.0);
         let frame_path = format!("{output_dir}/frame_{i:03}.jpg");
 
-        let result = tokio::process::Command::new("ffmpeg")
+        let Ok(result) = tokio::process::Command::new("ffmpeg")
             .args([
                 "-y",
                 "-ss",
@@ -216,7 +216,10 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
             ])
             .output()
             .await
-            .ok()?;
+        else {
+            tracing::warn!("media: failed to spawn ffmpeg for frame {i} from {path}");
+            continue;
+        };
 
         if !result.status.success() {
             tracing::warn!("media: failed to extract frame {i} from {path}");

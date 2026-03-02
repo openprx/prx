@@ -575,6 +575,14 @@ impl SignalChannel {
     /// attachment JSON (signal-cli downloads attachments to its data directory).
     /// In REST mode: downloads via `GET /v1/attachments/{id}`.
     async fn download_attachment_as_marker(&self, att: &serde_json::Value) -> Option<String> {
+        let attachment_id = || {
+            att.get("id").and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
+        };
         let content_type = att
             .get("contentType")
             .and_then(|v| v.as_str())
@@ -595,7 +603,7 @@ impl SignalChannel {
                 .map(|s| s.to_string())
                 .or_else(|| {
                     // Construct path from data_dir + attachments/ + id
-                    let id = att.get("id").and_then(|v| v.as_str())?;
+                    let id = attachment_id()?;
                     let dir = self.data_dir.as_deref()?;
                     Some(format!("{}/attachments/{}", dir, id))
                 })?;
@@ -609,7 +617,7 @@ impl SignalChannel {
             let bytes = std::fs::read(&path).ok()?;
             // Copy to a temp path with a proper extension so media pipelines
             // can identify the format by filename.
-            let id = att.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+            let id = attachment_id().unwrap_or_else(|| "0".to_string());
             // Avoid double extension: if id already has the right extension, use it as-is
             let ext = mime_to_extension(content_type);
             let temp_path = if id.ends_with(&format!(".{ext}")) {
@@ -634,7 +642,7 @@ impl SignalChannel {
         }
 
         // ── REST mode: download via signal-cli-rest-api ───────────────────────
-        let id = att.get("id").and_then(|v| v.as_str())?;
+        let id = attachment_id()?;
         let url = format!("{}/v1/attachments/{}", self.http_url, id);
         let response = self
             .http_client()
@@ -707,9 +715,13 @@ impl SignalChannel {
         // Documents: attempt text extraction
         if let Some(text) = extract_document_text(temp_path, content_type, filename).await {
             let truncated = if text.len() > 8000 {
+                let mut boundary = 8000;
+                while !text.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
                 format!(
                     "{}...\n[truncated, {} total chars]",
-                    &text[..8000],
+                    &text[..boundary],
                     text.len()
                 )
             } else {
