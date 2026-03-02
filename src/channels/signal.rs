@@ -229,7 +229,7 @@ struct SseEnvelope {
     envelope: Option<Envelope>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct Envelope {
     #[serde(default)]
     source: Option<String>,
@@ -237,13 +237,21 @@ struct Envelope {
     source_number: Option<String>,
     #[serde(rename = "dataMessage", default)]
     data_message: Option<DataMessage>,
+    #[serde(rename = "editMessage", default)]
+    edit_message: Option<serde_json::Value>,
+    #[serde(rename = "typingMessage", default)]
+    typing_message: Option<serde_json::Value>,
+    #[serde(rename = "receiptMessage", default)]
+    receipt_message: Option<serde_json::Value>,
+    #[serde(rename = "syncMessage", default)]
+    sync_message: Option<serde_json::Value>,
     #[serde(rename = "storyMessage", default)]
     story_message: Option<serde_json::Value>,
     #[serde(default)]
     timestamp: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct DataMessage {
     #[serde(default)]
     message: Option<String>,
@@ -255,6 +263,36 @@ struct DataMessage {
     attachments: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     mentions: Option<Vec<SignalMention>>,
+    #[serde(default)]
+    contacts: Option<serde_json::Value>,
+    #[serde(rename = "contactMessage", alias = "contact", default)]
+    contact_message: Option<serde_json::Value>,
+    #[serde(default)]
+    quote: Option<serde_json::Value>,
+    #[serde(default)]
+    reaction: Option<serde_json::Value>,
+    #[serde(rename = "remoteDelete", default)]
+    remote_delete: Option<serde_json::Value>,
+    #[serde(default)]
+    sticker: Option<serde_json::Value>,
+    #[serde(rename = "expiresInSeconds", default)]
+    expires_in_seconds: Option<u64>,
+    #[serde(rename = "isExpirationUpdate", default)]
+    is_expiration_update: Option<bool>,
+    #[serde(
+        rename = "storyReply",
+        alias = "storyReplyMessage",
+        alias = "story_reply",
+        default
+    )]
+    story_reply: Option<serde_json::Value>,
+    #[serde(
+        rename = "storyContext",
+        alias = "storyReplyContext",
+        alias = "story_context",
+        default
+    )]
+    story_context: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -271,12 +309,22 @@ struct SignalMention {
     length: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct GroupInfo {
     #[serde(rename = "groupId", default)]
     group_id: Option<String>,
     #[serde(rename = "groupName", alias = "name", default)]
     group_name: Option<String>,
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    members: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(rename = "membersAdded", default)]
+    members_added: Option<Vec<serde_json::Value>>,
+    #[serde(rename = "membersRemoved", default)]
+    members_removed: Option<Vec<serde_json::Value>>,
 }
 
 impl SignalChannel {
@@ -405,6 +453,734 @@ impl SignalChannel {
         }
     }
 
+    fn parse_embedded_data_message(edit_message: &serde_json::Value) -> Option<DataMessage> {
+        let data_message = edit_message.get("dataMessage")?;
+        serde_json::from_value::<DataMessage>(data_message.clone()).ok()
+    }
+
+    fn value_to_u64(value: &serde_json::Value) -> Option<u64> {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+            .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
+    }
+
+    fn value_to_bool(value: &serde_json::Value) -> Option<bool> {
+        value.as_bool().or_else(|| {
+            value.as_str().and_then(|s| {
+                let normalized = s.trim().to_ascii_lowercase();
+                match normalized.as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                }
+            })
+        })
+    }
+
+    fn value_to_string(value: &serde_json::Value) -> Option<String> {
+        value
+            .as_str()
+            .map(|s| s.to_string())
+            .or_else(|| value.as_u64().map(|n| n.to_string()))
+            .or_else(|| value.as_i64().map(|n| n.to_string()))
+    }
+
+    fn json_u64(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+        keys.iter()
+            .filter_map(|key| value.get(*key))
+            .find_map(Self::value_to_u64)
+    }
+
+    fn json_bool(value: &serde_json::Value, keys: &[&str]) -> Option<bool> {
+        keys.iter()
+            .filter_map(|key| value.get(*key))
+            .find_map(Self::value_to_bool)
+    }
+
+    fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+        keys.iter()
+            .filter_map(|key| value.get(*key))
+            .find_map(Self::value_to_string)
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    fn story_reply_payload(data_msg: &DataMessage) -> Option<(&serde_json::Value, &'static str)> {
+        data_msg
+            .story_reply
+            .as_ref()
+            .map(|payload| (payload, "storyReply"))
+            .or_else(|| {
+                data_msg
+                    .story_context
+                    .as_ref()
+                    .map(|payload| (payload, "storyContext"))
+            })
+    }
+
+    fn has_story_payload(envelope: &Envelope, data_msg: Option<&DataMessage>) -> bool {
+        envelope.story_message.is_some() || data_msg.and_then(Self::story_reply_payload).is_some()
+    }
+
+    fn contact_payloads(data_msg: &DataMessage) -> Vec<&serde_json::Value> {
+        let mut payloads = Vec::new();
+
+        if let Some(contacts) = data_msg.contacts.as_ref() {
+            if let Some(entries) = contacts.as_array() {
+                payloads.extend(entries.iter());
+            } else {
+                payloads.push(contacts);
+            }
+        }
+
+        if let Some(contact_message) = data_msg.contact_message.as_ref() {
+            if let Some(entries) = contact_message.as_array() {
+                payloads.extend(entries.iter());
+            } else if let Some(entries) = contact_message.get("contacts").and_then(|v| v.as_array())
+            {
+                payloads.extend(entries.iter());
+            } else {
+                payloads.push(contact_message);
+            }
+        }
+
+        payloads
+    }
+
+    fn normalize_number_fragment(raw: &str) -> Option<String> {
+        let digits: String = raw.chars().filter(|ch| ch.is_ascii_digit()).collect();
+        if digits.len() < 4 {
+            return None;
+        }
+        Some(digits[digits.len().saturating_sub(4)..].to_string())
+    }
+
+    fn push_unique_limited(values: &mut Vec<String>, value: String, limit: usize) {
+        if value.is_empty() || values.len() >= limit || values.iter().any(|v| v == &value) {
+            return;
+        }
+        values.push(value);
+    }
+
+    fn collect_contact_number_fragments(
+        value: &serde_json::Value,
+        hinted_key: bool,
+        out: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::String(raw) => {
+                if hinted_key {
+                    if let Some(fragment) = Self::normalize_number_fragment(raw) {
+                        Self::push_unique_limited(out, fragment, 8);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    Self::collect_contact_number_fragments(item, hinted_key, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let key_lc = key.to_ascii_lowercase();
+                    let next_hinted = hinted_key
+                        || key_lc.contains("number")
+                        || key_lc.contains("phone")
+                        || key_lc == "e164"
+                        || key_lc == "value";
+                    Self::collect_contact_number_fragments(child, next_hinted, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn map_group_id(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+        map.get("groupId")
+            .and_then(Self::value_to_string)
+            .or_else(|| map.get("group_id").and_then(Self::value_to_string))
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    fn map_has_group_update_hint(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+        map.contains_key("type")
+            || map.contains_key("updateType")
+            || map.contains_key("changeType")
+            || map.contains_key("title")
+            || map.contains_key("groupTitle")
+            || map.contains_key("groupName")
+            || map.contains_key("name")
+            || map.contains_key("members")
+            || map.contains_key("membersAdded")
+            || map.contains_key("membersRemoved")
+            || map.contains_key("memberCount")
+            || map.contains_key("revision")
+    }
+
+    fn build_group_update_meta_from_map(
+        map: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let group_id = Self::map_group_id(map)?;
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "type".to_string(),
+            serde_json::Value::String("groupUpdate".to_string()),
+        );
+        meta.insert("group_id".to_string(), serde_json::Value::String(group_id));
+
+        let update_type = map
+            .get("type")
+            .and_then(Self::value_to_string)
+            .or_else(|| map.get("updateType").and_then(Self::value_to_string))
+            .or_else(|| map.get("changeType").and_then(Self::value_to_string))
+            .or_else(|| {
+                if map.contains_key("members") || map.contains_key("membersAdded") {
+                    Some("membersUpdate".to_string())
+                } else if map.contains_key("title")
+                    || map.contains_key("groupTitle")
+                    || map.contains_key("groupName")
+                    || map.contains_key("name")
+                {
+                    Some("titleUpdate".to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "groupUpdate".to_string());
+        meta.insert(
+            "update_type".to_string(),
+            serde_json::Value::String(update_type),
+        );
+
+        let member_count = map
+            .get("members")
+            .and_then(|v| v.as_array())
+            .and_then(|members| u64::try_from(members.len()).ok())
+            .or_else(|| map.get("memberCount").and_then(Self::value_to_u64));
+        if let Some(member_count) = member_count {
+            meta.insert(
+                "member_count".to_string(),
+                serde_json::Value::Number(member_count.into()),
+            );
+        }
+
+        let members_added = map
+            .get("membersAdded")
+            .or_else(|| map.get("addedMembers"))
+            .and_then(|v| v.as_array())
+            .and_then(|members| u64::try_from(members.len()).ok());
+        if let Some(members_added) = members_added {
+            meta.insert(
+                "members_added".to_string(),
+                serde_json::Value::Number(members_added.into()),
+            );
+        }
+
+        let members_removed = map
+            .get("membersRemoved")
+            .or_else(|| map.get("removedMembers"))
+            .and_then(|v| v.as_array())
+            .and_then(|members| u64::try_from(members.len()).ok());
+        if let Some(members_removed) = members_removed {
+            meta.insert(
+                "members_removed".to_string(),
+                serde_json::Value::Number(members_removed.into()),
+            );
+        }
+
+        let title = map
+            .get("title")
+            .or_else(|| map.get("groupTitle"))
+            .or_else(|| map.get("groupName"))
+            .or_else(|| map.get("name"))
+            .and_then(Self::value_to_string)
+            .filter(|title| !title.trim().is_empty());
+        if let Some(title) = title {
+            meta.insert("title".to_string(), serde_json::Value::String(title));
+            meta.insert("title_changed".to_string(), serde_json::Value::Bool(true));
+        }
+
+        Some(meta)
+    }
+
+    fn find_group_update_node<'a>(
+        value: &'a serde_json::Value,
+    ) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if Self::map_group_id(map).is_some() && Self::map_has_group_update_hint(map) {
+                    return Some(map);
+                }
+                map.values().find_map(Self::find_group_update_node)
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(Self::find_group_update_node),
+            _ => None,
+        }
+    }
+
+    fn sync_group_update_meta(
+        sync_message: &serde_json::Value,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let node = Self::find_group_update_node(sync_message)?;
+        Self::build_group_update_meta_from_map(node)
+    }
+
+    fn sync_group_id(sync_message: &serde_json::Value) -> Option<String> {
+        Self::sync_group_update_meta(sync_message).and_then(|meta| {
+            meta.get("group_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+    }
+
+    fn group_info_update_meta(
+        group_info: &GroupInfo,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let has_update_fields = group_info.r#type.is_some()
+            || group_info.members.is_some()
+            || group_info.title.is_some()
+            || group_info.members_added.is_some()
+            || group_info.members_removed.is_some();
+        if !has_update_fields {
+            return None;
+        }
+
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "type".to_string(),
+            serde_json::Value::String("groupUpdate".to_string()),
+        );
+        meta.insert(
+            "group_id".to_string(),
+            serde_json::Value::String(
+                group_info
+                    .group_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            ),
+        );
+        meta.insert(
+            "update_type".to_string(),
+            serde_json::Value::String(
+                group_info
+                    .r#type
+                    .clone()
+                    .unwrap_or_else(|| "groupInfo".to_string()),
+            ),
+        );
+
+        if let Some(member_count) = group_info
+            .members
+            .as_ref()
+            .and_then(|members| u64::try_from(members.len()).ok())
+        {
+            meta.insert(
+                "member_count".to_string(),
+                serde_json::Value::Number(member_count.into()),
+            );
+        }
+        if let Some(members_added) = group_info
+            .members_added
+            .as_ref()
+            .and_then(|members| u64::try_from(members.len()).ok())
+        {
+            meta.insert(
+                "members_added".to_string(),
+                serde_json::Value::Number(members_added.into()),
+            );
+        }
+        if let Some(members_removed) = group_info
+            .members_removed
+            .as_ref()
+            .and_then(|members| u64::try_from(members.len()).ok())
+        {
+            meta.insert(
+                "members_removed".to_string(),
+                serde_json::Value::Number(members_removed.into()),
+            );
+        }
+
+        if let Some(title) = group_info
+            .title
+            .clone()
+            .or_else(|| group_info.group_name.clone())
+            .filter(|title| !title.trim().is_empty())
+        {
+            meta.insert("title".to_string(), serde_json::Value::String(title));
+            meta.insert("title_changed".to_string(), serde_json::Value::Bool(true));
+        }
+
+        Some(meta)
+    }
+
+    fn build_event_prefixes(envelope: &Envelope, data_msg: Option<&DataMessage>) -> Vec<String> {
+        let mut prefixes: Vec<String> = Vec::new();
+
+        if let Some(data_msg) = data_msg {
+            let contacts = Self::contact_payloads(data_msg);
+            if !contacts.is_empty() {
+                let mut contacts_meta = serde_json::Map::new();
+                contacts_meta.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("contacts".to_string()),
+                );
+                contacts_meta.insert(
+                    "count".to_string(),
+                    serde_json::Value::Number(
+                        u64::try_from(contacts.len()).unwrap_or(u64::MAX).into(),
+                    ),
+                );
+                let mut fragments = Vec::new();
+                for contact in contacts {
+                    Self::collect_contact_number_fragments(contact, false, &mut fragments);
+                }
+                if !fragments.is_empty() {
+                    contacts_meta.insert(
+                        "number_fragments".to_string(),
+                        serde_json::Value::Array(
+                            fragments
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                prefixes.push(format!(
+                    "[signal-event {}]",
+                    serde_json::Value::Object(contacts_meta)
+                ));
+            }
+
+            if let Some((story_payload, source_field)) = Self::story_reply_payload(data_msg) {
+                let mut story_reply_meta = serde_json::Map::new();
+                story_reply_meta.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("storyReply".to_string()),
+                );
+                story_reply_meta.insert(
+                    "source_field".to_string(),
+                    serde_json::Value::String(source_field.to_string()),
+                );
+                if let Some(author) =
+                    Self::json_string(story_payload, &["author", "targetAuthor", "storyAuthor"])
+                {
+                    story_reply_meta.insert(
+                        "target_author".to_string(),
+                        serde_json::Value::String(author),
+                    );
+                }
+                if let Some(target_timestamp) = Self::json_u64(
+                    story_payload,
+                    &[
+                        "targetTimestamp",
+                        "targetSentTimestamp",
+                        "storyTimestamp",
+                        "timestamp",
+                        "messageId",
+                    ],
+                ) {
+                    story_reply_meta.insert(
+                        "target_timestamp".to_string(),
+                        serde_json::Value::Number(target_timestamp.into()),
+                    );
+                }
+                prefixes.push(format!(
+                    "[signal-event {}]",
+                    serde_json::Value::Object(story_reply_meta)
+                ));
+            }
+
+            if let Some(group_info) = data_msg.group_info.as_ref() {
+                if let Some(group_update_meta) = Self::group_info_update_meta(group_info) {
+                    prefixes.push(format!(
+                        "[signal-event {}]",
+                        serde_json::Value::Object(group_update_meta)
+                    ));
+                }
+            }
+
+            if let Some(mentions) = data_msg
+                .mentions
+                .as_ref()
+                .filter(|mentions| !mentions.is_empty())
+            {
+                let mut mentions_meta = serde_json::Map::new();
+                mentions_meta.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("mentions".to_string()),
+                );
+                mentions_meta.insert(
+                    "count".to_string(),
+                    serde_json::Value::Number(
+                        u64::try_from(mentions.len()).unwrap_or(u64::MAX).into(),
+                    ),
+                );
+                let mut mention_entries = Vec::new();
+                for mention in mentions {
+                    let mut mention_entry = serde_json::Map::new();
+                    if let Some(uuid) = mention.uuid.clone() {
+                        mention_entry.insert("uuid".to_string(), serde_json::Value::String(uuid));
+                    }
+                    if let Some(number) = mention.number.clone() {
+                        mention_entry
+                            .insert("number".to_string(), serde_json::Value::String(number));
+                    }
+                    if let Some(name) = mention.name.clone() {
+                        mention_entry.insert("name".to_string(), serde_json::Value::String(name));
+                    }
+                    if let Some(start) = mention.start {
+                        mention_entry
+                            .insert("start".to_string(), serde_json::Value::Number(start.into()));
+                    }
+                    if let Some(length) = mention.length {
+                        mention_entry.insert(
+                            "length".to_string(),
+                            serde_json::Value::Number(length.into()),
+                        );
+                    }
+                    if !mention_entry.is_empty() {
+                        mention_entries.push(serde_json::Value::Object(mention_entry));
+                    }
+                }
+                if !mention_entries.is_empty() {
+                    mentions_meta.insert(
+                        "mentions".to_string(),
+                        serde_json::Value::Array(mention_entries),
+                    );
+                    prefixes.push(format!(
+                        "[signal-event {}]",
+                        serde_json::Value::Object(mentions_meta)
+                    ));
+                }
+            }
+
+            if let Some(quote) = data_msg.quote.as_ref() {
+                let mut quote_meta = serde_json::Map::new();
+                quote_meta.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("quote".to_string()),
+                );
+                if let Some(author) =
+                    Self::json_string(quote, &["author", "quoteAuthor", "targetAuthor"])
+                {
+                    quote_meta.insert("author".to_string(), serde_json::Value::String(author));
+                }
+                if let Some(target_timestamp) = Self::json_u64(
+                    quote,
+                    &[
+                        "id",
+                        "quoteTimestamp",
+                        "targetSentTimestamp",
+                        "targetTimestamp",
+                        "timestamp",
+                    ],
+                ) {
+                    quote_meta.insert(
+                        "target_timestamp".to_string(),
+                        serde_json::Value::Number(target_timestamp.into()),
+                    );
+                }
+                if let Some(quoted_text) = Self::json_string(quote, &["text", "message", "body"]) {
+                    quote_meta.insert("text".to_string(), serde_json::Value::String(quoted_text));
+                }
+                prefixes.push(format!(
+                    "[signal-event {}]",
+                    serde_json::Value::Object(quote_meta)
+                ));
+            }
+
+            if let Some(reaction) = data_msg.reaction.as_ref() {
+                let mut reaction_meta = serde_json::Map::new();
+                reaction_meta.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("reaction".to_string()),
+                );
+                if let Some(emoji) = Self::json_string(reaction, &["emoji", "reaction"]) {
+                    reaction_meta.insert("emoji".to_string(), serde_json::Value::String(emoji));
+                }
+                if let Some(remove) = Self::json_bool(reaction, &["remove"]) {
+                    reaction_meta.insert("remove".to_string(), serde_json::Value::Bool(remove));
+                }
+                if let Some(target_author) =
+                    Self::json_string(reaction, &["targetAuthor", "target_author", "author"])
+                {
+                    reaction_meta.insert(
+                        "target_author".to_string(),
+                        serde_json::Value::String(target_author),
+                    );
+                }
+                if let Some(target_timestamp) = Self::json_u64(
+                    reaction,
+                    &["targetSentTimestamp", "targetTimestamp", "timestamp"],
+                ) {
+                    reaction_meta.insert(
+                        "target_timestamp".to_string(),
+                        serde_json::Value::Number(target_timestamp.into()),
+                    );
+                }
+                prefixes.push(format!(
+                    "[signal-event {}]",
+                    serde_json::Value::Object(reaction_meta)
+                ));
+            }
+
+            if let Some(remote_delete) = data_msg.remote_delete.as_ref() {
+                let mut remote_delete_meta = serde_json::Map::new();
+                remote_delete_meta.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("remoteDelete".to_string()),
+                );
+                if let Some(target_timestamp) = Self::json_u64(
+                    remote_delete,
+                    &["targetSentTimestamp", "targetTimestamp", "timestamp"],
+                ) {
+                    remote_delete_meta.insert(
+                        "target_timestamp".to_string(),
+                        serde_json::Value::Number(target_timestamp.into()),
+                    );
+                }
+                prefixes.push(format!(
+                    "[signal-event {}]",
+                    serde_json::Value::Object(remote_delete_meta)
+                ));
+            }
+
+            if let Some(sticker) = data_msg.sticker.as_ref() {
+                let mut sticker_meta = serde_json::Map::new();
+                sticker_meta.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("sticker".to_string()),
+                );
+                if let Some(sticker_id) = Self::json_u64(sticker, &["stickerId", "id"]) {
+                    sticker_meta.insert(
+                        "sticker_id".to_string(),
+                        serde_json::Value::Number(sticker_id.into()),
+                    );
+                }
+                prefixes.push(format!(
+                    "[signal-event {}]",
+                    serde_json::Value::Object(sticker_meta)
+                ));
+            }
+
+            if data_msg.is_expiration_update.unwrap_or(false)
+                || data_msg.expires_in_seconds.is_some()
+            {
+                let mut expiration_meta = serde_json::Map::new();
+                expiration_meta.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("expirationUpdate".to_string()),
+                );
+                expiration_meta.insert(
+                    "is_expiration_update".to_string(),
+                    serde_json::Value::Bool(data_msg.is_expiration_update.unwrap_or(false)),
+                );
+                if let Some(expires_in_seconds) = data_msg.expires_in_seconds {
+                    expiration_meta.insert(
+                        "expires_in_seconds".to_string(),
+                        serde_json::Value::Number(expires_in_seconds.into()),
+                    );
+                }
+                prefixes.push(format!(
+                    "[signal-event {}]",
+                    serde_json::Value::Object(expiration_meta)
+                ));
+            }
+        }
+
+        if let Some(edit) = envelope.edit_message.as_ref() {
+            let mut edit_meta = serde_json::Map::new();
+            edit_meta.insert(
+                "type".to_string(),
+                serde_json::Value::String("editMessage".to_string()),
+            );
+            if let Some(target_author) =
+                Self::json_string(edit, &["targetAuthor", "target_author", "author"])
+            {
+                edit_meta.insert(
+                    "target_author".to_string(),
+                    serde_json::Value::String(target_author),
+                );
+            }
+            if let Some(target_timestamp) = Self::json_u64(
+                edit,
+                &["targetSentTimestamp", "targetTimestamp", "timestamp"],
+            ) {
+                edit_meta.insert(
+                    "target_timestamp".to_string(),
+                    serde_json::Value::Number(target_timestamp.into()),
+                );
+            }
+            let edited_text = Self::json_string(edit, &["message"]).or_else(|| {
+                edit.get("dataMessage")
+                    .and_then(|data_message| Self::json_string(data_message, &["message"]))
+            });
+            if let Some(edited_text) = edited_text {
+                edit_meta.insert(
+                    "message".to_string(),
+                    serde_json::Value::String(edited_text),
+                );
+            }
+            prefixes.push(format!(
+                "[signal-event {}]",
+                serde_json::Value::Object(edit_meta)
+            ));
+        }
+
+        if envelope.typing_message.is_some() {
+            prefixes.push(r#"[signal-event {"type":"typingMessage"}]"#.to_string());
+        }
+        if envelope.receipt_message.is_some() {
+            prefixes.push(r#"[signal-event {"type":"receiptMessage"}]"#.to_string());
+        }
+        if let Some(story_message) = envelope.story_message.as_ref() {
+            let mut story_meta = serde_json::Map::new();
+            story_meta.insert(
+                "type".to_string(),
+                serde_json::Value::String("storyMessage".to_string()),
+            );
+            if let Some(author) = Self::json_string(
+                story_message,
+                &["author", "source", "sourceUuid", "sourceNumber"],
+            ) {
+                story_meta.insert("author".to_string(), serde_json::Value::String(author));
+            }
+            if let Some(story_timestamp) = Self::json_u64(
+                story_message,
+                &[
+                    "timestamp",
+                    "storyTimestamp",
+                    "sentTimestamp",
+                    "targetTimestamp",
+                ],
+            ) {
+                story_meta.insert(
+                    "story_timestamp".to_string(),
+                    serde_json::Value::Number(story_timestamp.into()),
+                );
+            }
+            prefixes.push(format!(
+                "[signal-event {}]",
+                serde_json::Value::Object(story_meta)
+            ));
+        }
+        if envelope.sync_message.is_some() {
+            if let Some(group_update_meta) = envelope
+                .sync_message
+                .as_ref()
+                .and_then(Self::sync_group_update_meta)
+            {
+                prefixes.push(format!(
+                    "[signal-event {}]",
+                    serde_json::Value::Object(group_update_meta)
+                ));
+            }
+            prefixes.push(r#"[signal-event {"type":"syncMessage"}]"#.to_string());
+        }
+
+        prefixes
+    }
+
     /// Send a JSON-RPC request to signal-cli daemon.
     async fn rpc_request(
         &self,
@@ -455,42 +1231,70 @@ impl SignalChannel {
 
     /// Process a single SSE envelope, returning a ChannelMessage if valid.
     fn process_envelope(&self, envelope: &Envelope) -> Option<ChannelMessage> {
-        // Skip story messages when configured
-        if self.ignore_stories && envelope.story_message.is_some() {
+        let edit_data_message = envelope
+            .edit_message
+            .as_ref()
+            .and_then(Self::parse_embedded_data_message);
+        let data_msg = envelope
+            .data_message
+            .as_ref()
+            .or(edit_data_message.as_ref());
+        let has_story_payload = Self::has_story_payload(envelope, data_msg);
+        if self.ignore_stories && has_story_payload {
             return None;
         }
 
-        let data_msg = envelope.data_message.as_ref()?;
-
-        // Skip attachment-only messages when configured
-        if self.ignore_attachments {
-            let has_attachments = data_msg.attachments.as_ref().is_some_and(|a| !a.is_empty());
-            if has_attachments && data_msg.message.is_none() {
-                return None;
-            }
-        }
-
-        // Allow attachment-only messages (voice, image, video) even without text
-        let has_attachments = data_msg.attachments.as_ref().is_some_and(|a| !a.is_empty());
-        let text = data_msg.message.as_deref().unwrap_or("");
-        if text.is_empty() && !has_attachments {
-            return None;
-        }
         let sender = Self::sender(envelope)?;
-        let is_group_message = data_msg.group_info.is_some();
+        let sync_group_id = envelope.sync_message.as_ref().and_then(Self::sync_group_id);
+        let is_group_message =
+            data_msg.and_then(|dm| dm.group_info.as_ref()).is_some() || sync_group_id.is_some();
 
         if !is_group_message && !self.is_sender_allowed(&sender) {
             return None;
         }
 
-        if !self.matches_group(data_msg) {
+        if let Some(data_msg) = data_msg {
+            if !self.matches_group(data_msg) {
+                return None;
+            }
+        } else if let Some(expected_group) = self.group_id.as_deref() {
+            if !expected_group.eq_ignore_ascii_case("dm")
+                && sync_group_id.as_deref() != Some(expected_group)
+            {
+                return None;
+            }
+        }
+
+        let event_prefixes = Self::build_event_prefixes(envelope, data_msg);
+        let has_event_payload = !event_prefixes.is_empty();
+
+        let has_attachments = data_msg
+            .and_then(|dm| dm.attachments.as_ref())
+            .is_some_and(|attachments| !attachments.is_empty());
+        let text = data_msg.and_then(|dm| dm.message.as_deref()).unwrap_or("");
+
+        // Skip attachment-only messages when configured
+        if self.ignore_attachments && has_attachments && text.is_empty() && !has_event_payload {
             return None;
         }
 
-        let target = self.reply_target(data_msg, &sender);
+        // Keep non-text signal events (reaction/delete/sticker/edit/expiration/typing/receipt/sync),
+        // but still drop truly empty envelopes.
+        if text.is_empty() && !has_attachments && !has_event_payload {
+            return None;
+        }
+
+        let target = data_msg
+            .map(|dm| self.reply_target(dm, &sender))
+            .or_else(|| {
+                sync_group_id
+                    .as_deref()
+                    .map(|group_id| format!("{GROUP_TARGET_PREFIX}{group_id}"))
+            })
+            .unwrap_or_else(|| sender.clone());
 
         let timestamp = data_msg
-            .timestamp
+            .and_then(|dm| dm.timestamp)
             .or(envelope.timestamp)
             .unwrap_or_else(|| {
                 u64::try_from(
@@ -502,13 +1306,15 @@ impl SignalChannel {
                 .unwrap_or(u64::MAX)
             });
 
-        let group_info = data_msg.group_info.as_ref();
-        let group_label = group_info.and_then(|g| {
-            g.group_name
-                .as_deref()
-                .filter(|name| !name.trim().is_empty())
-                .or(g.group_id.as_deref())
-        });
+        let group_info = data_msg.and_then(|dm| dm.group_info.as_ref());
+        let group_label = group_info
+            .and_then(|g| {
+                g.group_name
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                    .or(g.group_id.as_deref())
+            })
+            .or(sync_group_id.as_deref());
         let content_prefix = if is_group_message {
             if let Some(group_name) = group_info
                 .and_then(|g| g.group_name.as_deref())
@@ -533,6 +1339,10 @@ impl SignalChannel {
 
         let mut content_with_meta = String::new();
         content_with_meta.push_str(&content_prefix);
+        for event_prefix in &event_prefixes {
+            content_with_meta.push_str(event_prefix);
+            content_with_meta.push('\n');
+        }
         if !text.is_empty() {
             content_with_meta.push_str(text);
             content_with_meta.push('\n');
@@ -548,8 +1358,7 @@ impl SignalChannel {
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
             mentioned_uuids: data_msg
-                .mentions
-                .as_ref()
+                .and_then(|dm| dm.mentions.as_ref())
                 .map(|ms| {
                     ms.iter()
                         .flat_map(|m| {
@@ -1372,9 +2181,11 @@ mod tests {
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
                 attachments: None,
+                ..Default::default()
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
+            ..Default::default()
         }
     }
 
@@ -1449,6 +2260,7 @@ mod tests {
             timestamp: Some(1000),
             group_info: None,
             attachments: None,
+            ..Default::default()
         };
         assert!(ch.matches_group(&dm));
 
@@ -1458,8 +2270,10 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
                 group_name: None,
+                ..Default::default()
             }),
             attachments: None,
+            ..Default::default()
         };
         assert!(ch.matches_group(&group));
     }
@@ -1473,8 +2287,10 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
                 group_name: None,
+                ..Default::default()
             }),
             attachments: None,
+            ..Default::default()
         };
         assert!(ch.matches_group(&matching));
 
@@ -1484,8 +2300,10 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("other_group".to_string()),
                 group_name: None,
+                ..Default::default()
             }),
             attachments: None,
+            ..Default::default()
         };
         assert!(!ch.matches_group(&non_matching));
     }
@@ -1498,6 +2316,7 @@ mod tests {
             timestamp: Some(1000),
             group_info: None,
             attachments: None,
+            ..Default::default()
         };
         assert!(ch.matches_group(&dm));
 
@@ -1507,8 +2326,10 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
                 group_name: None,
+                ..Default::default()
             }),
             attachments: None,
+            ..Default::default()
         };
         assert!(!ch.matches_group(&group));
     }
@@ -1521,6 +2342,7 @@ mod tests {
             timestamp: Some(1000),
             group_info: None,
             attachments: None,
+            ..Default::default()
         };
         assert_eq!(ch.reply_target(&dm, "+1111111111"), "+1111111111");
     }
@@ -1534,8 +2356,10 @@ mod tests {
             group_info: Some(GroupInfo {
                 group_id: Some("group123".to_string()),
                 group_name: None,
+                ..Default::default()
             }),
             attachments: None,
+            ..Default::default()
         };
         assert_eq!(ch.reply_target(&group, "+1111111111"), "group:group123");
     }
@@ -1599,6 +2423,7 @@ mod tests {
             data_message: None,
             story_message: None,
             timestamp: Some(1000),
+            ..Default::default()
         };
         assert_eq!(SignalChannel::sender(&env), Some("+1111111111".to_string()));
     }
@@ -1611,6 +2436,7 @@ mod tests {
             data_message: None,
             story_message: None,
             timestamp: Some(1000),
+            ..Default::default()
         };
         assert_eq!(SignalChannel::sender(&env), Some("uuid-123".to_string()));
     }
@@ -1635,9 +2461,11 @@ mod tests {
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
                 attachments: None,
+                ..Default::default()
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
+            ..Default::default()
         };
         let msg = ch.process_envelope(&env).unwrap();
         assert_eq!(msg.sender, uuid);
@@ -1684,11 +2512,14 @@ mod tests {
                 group_info: Some(GroupInfo {
                     group_id: Some("testgroup".to_string()),
                     group_name: Some("Test Group".to_string()),
+                    ..Default::default()
                 }),
                 attachments: None,
+                ..Default::default()
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
+            ..Default::default()
         };
         let msg = ch.process_envelope(&env).unwrap();
         assert_eq!(msg.sender, uuid);
@@ -1719,6 +2550,7 @@ mod tests {
             data_message: None,
             story_message: None,
             timestamp: None,
+            ..Default::default()
         };
         assert_eq!(SignalChannel::sender(&env), None);
     }
@@ -1769,6 +2601,102 @@ mod tests {
     }
 
     #[test]
+    fn process_envelope_reaction_only_not_dropped() {
+        let ch = make_channel();
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: None,
+                timestamp: Some(1_700_000_000_100),
+                reaction: Some(serde_json::json!({
+                    "emoji": ":thumbsup:",
+                    "targetAuthor": "+2222222222",
+                    "targetTimestamp": 1_700_000_000_050u64
+                })),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000_100),
+            ..Default::default()
+        };
+        let msg = ch
+            .process_envelope(&env)
+            .expect("reaction-only should pass");
+        assert!(
+            msg.content.contains(r#""type":"reaction""#),
+            "content: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn process_envelope_remote_delete_only_not_dropped() {
+        let ch = make_channel();
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: None,
+                timestamp: Some(1_700_000_000_200),
+                remote_delete: Some(serde_json::json!({
+                    "targetTimestamp": 1_700_000_000_150u64
+                })),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000_200),
+            ..Default::default()
+        };
+        let msg = ch
+            .process_envelope(&env)
+            .expect("remoteDelete-only should pass");
+        assert!(
+            msg.content.contains(r#""type":"remoteDelete""#),
+            "content: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn process_envelope_top_level_edit_message_not_dropped() {
+        let ch = make_channel();
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: None,
+            edit_message: Some(serde_json::json!({
+                "targetAuthor": "+2222222222",
+                "targetSentTimestamp": 1_700_000_000_250u64,
+                "dataMessage": {
+                    "message": "edited text",
+                    "timestamp": 1_700_000_000_300u64
+                }
+            })),
+            timestamp: Some(1_700_000_000_300),
+            ..Default::default()
+        };
+        let msg = ch
+            .process_envelope(&env)
+            .expect("top-level editMessage should pass");
+        assert!(
+            msg.content.contains(r#""type":"editMessage""#),
+            "content: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn process_envelope_truly_empty_still_dropped() {
+        let ch = make_channel();
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage::default()),
+            ..Default::default()
+        };
+        assert!(ch.process_envelope(&env).is_none());
+    }
+
+    #[test]
     fn process_envelope_skips_stories() {
         let ch = make_channel_with_group("dm");
         let mut env = make_envelope(Some("+1111111111"), Some("story text"));
@@ -1787,11 +2715,213 @@ mod tests {
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
                 attachments: Some(vec![serde_json::json!({"contentType": "image/png"})]),
+                ..Default::default()
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
+            ..Default::default()
         };
         assert!(ch.process_envelope(&env).is_none());
+    }
+
+    #[test]
+    fn process_envelope_contacts_only_not_dropped() {
+        let ch = make_channel();
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: None,
+                timestamp: Some(1_700_000_000_500),
+                contacts: Some(serde_json::json!([{
+                    "name": "ZeroClawOperator",
+                    "number": [{"value": "+8613712345678"}]
+                }])),
+                contact_message: Some(serde_json::json!({
+                    "name": "ZeroClawAgent",
+                    "number": [{"value": "+12025550123"}]
+                })),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000_500),
+            ..Default::default()
+        };
+
+        let msg = ch
+            .process_envelope(&env)
+            .expect("contacts-only should pass");
+        assert!(
+            msg.content.contains(r#""type":"contacts""#),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(r#""count":2"#),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(r#""number_fragments":["#),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(r#""5678""#),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(r#""0123""#),
+            "content: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn process_envelope_story_reply_only_not_dropped() {
+        let ch = make_channel();
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: None,
+                timestamp: Some(1_700_000_000_550),
+                story_context: Some(serde_json::json!({
+                    "author": "+2222222222",
+                    "targetTimestamp": 1_700_000_000_540u64
+                })),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000_550),
+            ..Default::default()
+        };
+
+        let msg = ch
+            .process_envelope(&env)
+            .expect("storyReply-only should pass");
+        assert!(
+            msg.content.contains(r#""type":"storyReply""#),
+            "content: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn process_envelope_group_update_only_not_dropped() {
+        let ch = make_channel();
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            sync_message: Some(serde_json::json!({
+                "group": {
+                    "groupId": "group-v2-1",
+                    "updateType": "memberUpdate",
+                    "membersAdded": [{"uuid": "u1"}, {"uuid": "u2"}]
+                }
+            })),
+            timestamp: Some(1_700_000_000_600),
+            ..Default::default()
+        };
+
+        let msg = ch
+            .process_envelope(&env)
+            .expect("group update-only should pass");
+        assert_eq!(msg.reply_target, "group:group-v2-1");
+        assert!(
+            msg.content.contains(r#""type":"groupUpdate""#),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(r#""group_id":"group-v2-1""#),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(r#""update_type":"memberUpdate""#),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(r#""members_added":2"#),
+            "content: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn process_envelope_mentions_include_name_start_length_meta() {
+        let ch = make_channel();
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: Some("@zeroclaw_user ping".to_string()),
+                timestamp: Some(1_700_000_000_650),
+                mentions: Some(vec![SignalMention {
+                    uuid: Some("uuid-mention-1".to_string()),
+                    number: Some("+12223334444".to_string()),
+                    name: Some("zeroclaw_user".to_string()),
+                    start: Some(0),
+                    length: Some(14),
+                }]),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000_650),
+            ..Default::default()
+        };
+
+        let msg = ch
+            .process_envelope(&env)
+            .expect("mentions message should pass");
+        assert_eq!(
+            msg.mentioned_uuids,
+            vec!["uuid-mention-1".to_string(), "+12223334444".to_string()]
+        );
+        assert!(
+            msg.content.contains(r#""type":"mentions""#),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(r#""name":"zeroclaw_user""#),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(r#""start":0"#),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(r#""length":14"#),
+            "content: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn process_envelope_story_message_emits_event_prefix_when_not_ignored() {
+        let ch = make_channel();
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            story_message: Some(serde_json::json!({
+                "author": "+2222222222",
+                "timestamp": 1_700_000_000_700u64
+            })),
+            timestamp: Some(1_700_000_000_700),
+            ..Default::default()
+        };
+
+        let msg = ch
+            .process_envelope(&env)
+            .expect("storyMessage should pass when ignore_stories=false");
+        assert!(
+            msg.content.contains(r#""type":"storyMessage""#),
+            "content: {}",
+            msg.content
+        );
     }
 
     #[test]
@@ -1848,6 +2978,10 @@ mod tests {
         assert!(env.source.is_none());
         assert!(env.source_number.is_none());
         assert!(env.data_message.is_none());
+        assert!(env.edit_message.is_none());
+        assert!(env.typing_message.is_none());
+        assert!(env.receipt_message.is_none());
+        assert!(env.sync_message.is_none());
         assert!(env.story_message.is_none());
         assert!(env.timestamp.is_none());
     }
