@@ -73,6 +73,7 @@ impl SignalNativeChannel {
         ignore_attachments: bool,
         ignore_stories: bool,
         media_config: crate::config::MediaConfig,
+        storm_protection: crate::config::schema::SignalStormProtectionConfig,
     ) -> Self {
         let http_url = format!("http://127.0.0.1:{http_port}");
         let inner = SignalChannel::new_with_mode(
@@ -85,6 +86,7 @@ impl SignalNativeChannel {
             media_config,
             true, // is_native: use JSON-RPC API, not Docker REST API
             data_dir.clone(),
+            storm_protection,
         );
         Self {
             cli_path,

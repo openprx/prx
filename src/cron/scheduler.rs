@@ -406,7 +406,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .signal
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("signal channel not configured"))?;
-            let channel = SignalChannel::new(
+            let channel = SignalChannel::new_with_storm_protection(
                 sg.http_url.clone(),
                 sg.account.clone(),
                 sg.group_id.clone(),
@@ -414,6 +414,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 sg.ignore_attachments,
                 sg.ignore_stories,
                 config.media.clone(),
+                sg.storm_protection.clone(),
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }

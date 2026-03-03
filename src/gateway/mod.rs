@@ -431,6 +431,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 signal_media_config.clone(),
                 sg.is_native_mode(),
                 sg.data_dir.clone(),
+                sg.storm_protection.clone(),
             ))
         });
 
