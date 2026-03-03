@@ -2771,7 +2771,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref sg) = config.channels_config.signal {
         channels.push((
             "Signal",
-            Arc::new(SignalChannel::new(
+            Arc::new(SignalChannel::new_with_storm_protection(
                 sg.effective_http_url(),
                 sg.account.clone(),
                 sg.group_id.clone(),
@@ -2779,6 +2779,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 sg.ignore_attachments,
                 sg.ignore_stories,
                 config.media.clone(),
+                sg.storm_protection.clone(),
             )),
         ));
     }
@@ -2815,7 +2816,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref sig) = config.channels_config.signal {
         channels.push((
             "Signal",
-            Arc::new(SignalChannel::new(
+            Arc::new(SignalChannel::new_with_storm_protection(
                 sig.effective_http_url(),
                 sig.account.clone(),
                 sig.group_id.clone(),
@@ -2823,6 +2824,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 sig.ignore_attachments,
                 sig.ignore_stories,
                 config.media.clone(),
+                sig.storm_protection.clone(),
             )),
         ));
     }
@@ -3269,9 +3271,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 sig.ignore_attachments,
                 sig.ignore_stories,
                 config.media.clone(),
+                sig.storm_protection.clone(),
             ))
         } else {
-            Arc::new(SignalChannel::new(
+            Arc::new(SignalChannel::new_with_storm_protection(
                 sig.effective_http_url(),
                 sig.account.clone(),
                 sig.group_id.clone(),
@@ -3279,6 +3282,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 sig.ignore_attachments,
                 sig.ignore_stories,
                 config.media.clone(),
+                sig.storm_protection.clone(),
             ))
         };
         channels.push(signal_channel);
@@ -3423,6 +3427,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             config.media.clone(),
             is_native,
             sig.data_dir.clone(),
+            sig.storm_protection.clone(),
         ));
         let msg_send_tool = tools::MessageSendTool::new_signal(sig_chan.clone(), security.clone());
         let dr_handle = msg_send_tool.default_recipient_handle();

@@ -7,7 +7,10 @@ use base64::Engine as _;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
-use std::time::Duration;
+use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -219,6 +222,150 @@ pub struct SignalChannel {
     is_native: bool,
     /// signal-cli data directory (native mode). Used to resolve attachment paths.
     data_dir: Option<String>,
+    /// In-memory storm protection state for Signal ingress.
+    storm_guard: Arc<Mutex<SignalStormGuard>>,
+}
+
+#[derive(Clone, Debug)]
+struct SignalStormSettings {
+    dedupe_ttl: Duration,
+    min_reply_interval: Duration,
+    abnormal_threshold: usize,
+    abnormal_window: Duration,
+    breaker_duration: Duration,
+}
+
+impl From<crate::config::schema::SignalStormProtectionConfig> for SignalStormSettings {
+    fn from(value: crate::config::schema::SignalStormProtectionConfig) -> Self {
+        Self {
+            dedupe_ttl: Duration::from_secs(value.dedupe_ttl_secs),
+            min_reply_interval: Duration::from_secs(value.min_reply_interval_secs),
+            abnormal_threshold: value.abnormal_threshold,
+            abnormal_window: Duration::from_secs(value.abnormal_window_secs),
+            breaker_duration: Duration::from_secs(value.breaker_duration_secs),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SignalStormGuard {
+    settings: SignalStormSettings,
+    seen_fingerprints: HashMap<String, Instant>,
+    last_reply_by_target: HashMap<String, Instant>,
+    non_user_events: HashMap<String, VecDeque<Instant>>,
+    breaker_until: HashMap<String, Instant>,
+}
+
+impl SignalStormGuard {
+    fn new(config: crate::config::schema::SignalStormProtectionConfig) -> Self {
+        Self {
+            settings: config.into(),
+            seen_fingerprints: HashMap::new(),
+            last_reply_by_target: HashMap::new(),
+            non_user_events: HashMap::new(),
+            breaker_until: HashMap::new(),
+        }
+    }
+
+    fn is_breaker_open(&mut self, key: &str, now: Instant) -> bool {
+        if let Some(until) = self.breaker_until.get(key).copied() {
+            if until > now {
+                return true;
+            }
+            self.breaker_until.remove(key);
+        }
+        false
+    }
+
+    fn record_non_user_event(&mut self, key: &str, now: Instant) -> bool {
+        if self.settings.abnormal_threshold == 0
+            || self.settings.abnormal_window.is_zero()
+            || self.settings.breaker_duration.is_zero()
+        {
+            return false;
+        }
+
+        let events = self.non_user_events.entry(key.to_string()).or_default();
+        while let Some(front) = events.front().copied() {
+            if now.duration_since(front) > self.settings.abnormal_window {
+                let _ = events.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        events.push_back(now);
+        if events.len() >= self.settings.abnormal_threshold {
+            self.breaker_until
+                .insert(key.to_string(), now + self.settings.breaker_duration);
+            events.clear();
+            return true;
+        }
+
+        false
+    }
+
+    fn is_duplicate(&mut self, fingerprint: &str, now: Instant) -> bool {
+        if self.settings.dedupe_ttl.is_zero() {
+            return false;
+        }
+        self.seen_fingerprints
+            .get(fingerprint)
+            .is_some_and(|seen_at| now.duration_since(*seen_at) <= self.settings.dedupe_ttl)
+    }
+
+    fn within_min_reply_interval(&self, key: &str, now: Instant) -> bool {
+        if self.settings.min_reply_interval.is_zero() {
+            return false;
+        }
+        self.last_reply_by_target
+            .get(key)
+            .is_some_and(|last_at| now.duration_since(*last_at) < self.settings.min_reply_interval)
+    }
+
+    fn record_user_pass(&mut self, key: &str, fingerprint: &str, now: Instant) {
+        if !self.settings.dedupe_ttl.is_zero() {
+            self.seen_fingerprints.insert(fingerprint.to_string(), now);
+        }
+        if !self.settings.min_reply_interval.is_zero() {
+            self.last_reply_by_target.insert(key.to_string(), now);
+        }
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        if !self.settings.dedupe_ttl.is_zero() {
+            self.seen_fingerprints
+                .retain(|_, seen_at| now.duration_since(*seen_at) <= self.settings.dedupe_ttl);
+        } else {
+            self.seen_fingerprints.clear();
+        }
+
+        if !self.settings.min_reply_interval.is_zero() {
+            self.last_reply_by_target.retain(|_, last_at| {
+                now.duration_since(*last_at) <= self.settings.min_reply_interval
+            });
+        } else {
+            self.last_reply_by_target.clear();
+        }
+
+        self.breaker_until.retain(|_, until| *until > now);
+
+        if self.settings.abnormal_window.is_zero() {
+            self.non_user_events.clear();
+        } else {
+            self.non_user_events.retain(|_, events| {
+                while let Some(front) = events.front().copied() {
+                    if now.duration_since(front) > self.settings.abnormal_window {
+                        let _ = events.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                !events.is_empty()
+            });
+        }
+    }
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -337,6 +484,28 @@ impl SignalChannel {
         ignore_stories: bool,
         media_config: crate::config::MediaConfig,
     ) -> Self {
+        Self::new_with_storm_protection(
+            http_url,
+            account,
+            group_id,
+            allowed_from,
+            ignore_attachments,
+            ignore_stories,
+            media_config,
+            crate::config::schema::SignalStormProtectionConfig::default(),
+        )
+    }
+
+    pub fn new_with_storm_protection(
+        http_url: String,
+        account: String,
+        group_id: Option<String>,
+        allowed_from: Vec<String>,
+        ignore_attachments: bool,
+        ignore_stories: bool,
+        media_config: crate::config::MediaConfig,
+        storm_protection: crate::config::schema::SignalStormProtectionConfig,
+    ) -> Self {
         Self::new_with_mode(
             http_url,
             account,
@@ -347,6 +516,7 @@ impl SignalChannel {
             media_config,
             false,
             None,
+            storm_protection,
         )
     }
 
@@ -361,6 +531,7 @@ impl SignalChannel {
         media_config: crate::config::MediaConfig,
         is_native: bool,
         data_dir: Option<String>,
+        storm_protection: crate::config::schema::SignalStormProtectionConfig,
     ) -> Self {
         let http_url = http_url.trim_end_matches('/').to_string();
         Self {
@@ -373,6 +544,7 @@ impl SignalChannel {
             media_config,
             is_native,
             data_dir,
+            storm_guard: Arc::new(Mutex::new(SignalStormGuard::new(storm_protection))),
         }
     }
 
@@ -1181,6 +1353,118 @@ impl SignalChannel {
         prefixes
     }
 
+    fn extract_event_types(event_prefixes: &[String]) -> Vec<String> {
+        let mut types = Vec::new();
+        for prefix in event_prefixes {
+            let Some(type_idx) = prefix.find(r#""type":"#) else {
+                continue;
+            };
+            let start = type_idx + r#""type":"#.len();
+            let rest = &prefix[start..];
+            let Some(end) = rest.find('"') else {
+                continue;
+            };
+            let ty = rest[..end].trim();
+            if !ty.is_empty() && !types.iter().any(|existing| existing == ty) {
+                types.push(ty.to_string());
+            }
+        }
+        types
+    }
+
+    fn normalize_content_for_fingerprint(raw: &str) -> String {
+        raw.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+    }
+
+    fn build_event_type_for_fingerprint(
+        event_prefixes: &[String],
+        text: &str,
+        has_attachments: bool,
+    ) -> String {
+        let mut kinds = Self::extract_event_types(event_prefixes);
+        if !text.trim().is_empty() {
+            kinds.push("message".to_string());
+        }
+        if has_attachments {
+            kinds.push("attachment".to_string());
+        }
+        kinds.sort_unstable();
+        kinds.dedup();
+        if kinds.is_empty() {
+            "message".to_string()
+        } else {
+            kinds.join("+")
+        }
+    }
+
+    fn build_normalized_content_for_fingerprint(
+        text: &str,
+        event_prefixes: &[String],
+        has_attachments: bool,
+    ) -> String {
+        let mut basis = String::new();
+        if !text.trim().is_empty() {
+            basis.push_str(text);
+            basis.push('\n');
+        }
+        for prefix in event_prefixes {
+            basis.push_str(prefix);
+            basis.push('\n');
+        }
+        if has_attachments {
+            basis.push_str("[attachments]");
+        }
+        Self::normalize_content_for_fingerprint(&basis)
+    }
+
+    fn build_dedupe_fingerprint(
+        sender: &str,
+        event_type: &str,
+        normalized_content: &str,
+    ) -> String {
+        let mut hasher = DefaultHasher::new();
+        "signal".hash(&mut hasher);
+        sender.hash(&mut hasher);
+        event_type.hash(&mut hasher);
+        normalized_content.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    fn guard_check_breaker(&self, key: &str, now: Instant) -> bool {
+        let Ok(mut guard) = self.storm_guard.lock() else {
+            return false;
+        };
+        guard.is_breaker_open(key, now)
+    }
+
+    fn guard_record_non_user_and_maybe_trip(&self, key: &str, now: Instant) -> bool {
+        let Ok(mut guard) = self.storm_guard.lock() else {
+            return false;
+        };
+        guard.record_non_user_event(key, now)
+    }
+
+    fn guard_allow_user_event(&self, key: &str, fingerprint: &str, now: Instant) -> bool {
+        let Ok(mut guard) = self.storm_guard.lock() else {
+            return true;
+        };
+
+        if guard.is_breaker_open(key, now) {
+            return false;
+        }
+        if guard.is_duplicate(fingerprint, now) {
+            return false;
+        }
+        if guard.within_min_reply_interval(key, now) {
+            return false;
+        }
+        guard.record_user_pass(key, fingerprint, now);
+        true
+    }
+
     /// Send a JSON-RPC request to signal-cli daemon.
     async fn rpc_request(
         &self,
@@ -1265,6 +1549,16 @@ impl SignalChannel {
             }
         }
 
+        let target = data_msg
+            .map(|dm| self.reply_target(dm, &sender))
+            .or_else(|| {
+                sync_group_id
+                    .as_deref()
+                    .map(|group_id| format!("{GROUP_TARGET_PREFIX}{group_id}"))
+            })
+            .unwrap_or_else(|| sender.clone());
+        let storm_key = format!("signal:{target}");
+
         let event_prefixes = Self::build_event_prefixes(envelope, data_msg);
         let has_event_payload = !event_prefixes.is_empty();
 
@@ -1284,13 +1578,23 @@ impl SignalChannel {
             return None;
         }
 
+        let now = Instant::now();
+        if self.guard_check_breaker(&storm_key, now) {
+            tracing::debug!("Signal storm guard: breaker open for key={storm_key}");
+            return None;
+        }
+
         // Keep non-text Signal events (reaction/delete/sticker/edit/expiration/sync),
         // but avoid routing typing/receipt-only envelopes into the LLM reply path.
         let is_non_user_message = text.is_empty()
             && !has_attachments
             && has_typing_or_receipt_event
             && !has_other_event_payload;
-        if is_non_user_message {
+        let is_empty_non_user_message = text.is_empty() && !has_attachments && !has_event_payload;
+        if is_non_user_message || is_empty_non_user_message {
+            if self.guard_record_non_user_and_maybe_trip(&storm_key, now) {
+                tracing::warn!("Signal storm guard: breaker tripped for key={storm_key}");
+            }
             tracing::debug!(
                 "Signal non-user event dropped (typing={}, receipt={})",
                 envelope.typing_message.is_some(),
@@ -1299,19 +1603,17 @@ impl SignalChannel {
             return None;
         }
 
-        // Still drop truly empty envelopes.
-        if text.is_empty() && !has_attachments && !has_event_payload {
+        let event_type =
+            Self::build_event_type_for_fingerprint(&event_prefixes, text, has_attachments);
+        let normalized_content =
+            Self::build_normalized_content_for_fingerprint(text, &event_prefixes, has_attachments);
+        let fingerprint = Self::build_dedupe_fingerprint(&sender, &event_type, &normalized_content);
+        if !self.guard_allow_user_event(&storm_key, &fingerprint, now) {
+            tracing::debug!(
+                "Signal storm guard: dropped by dedupe/interval/breaker key={storm_key}"
+            );
             return None;
         }
-
-        let target = data_msg
-            .map(|dm| self.reply_target(dm, &sender))
-            .or_else(|| {
-                sync_group_id
-                    .as_deref()
-                    .map(|group_id| format!("{GROUP_TARGET_PREFIX}{group_id}"))
-            })
-            .unwrap_or_else(|| sender.clone());
 
         let timestamp = data_msg
             .and_then(|dm| dm.timestamp)
@@ -2198,6 +2500,22 @@ mod tests {
         )
     }
 
+    fn make_channel_with_storm(
+        allowed_from: Vec<String>,
+        storm: crate::config::schema::SignalStormProtectionConfig,
+    ) -> SignalChannel {
+        SignalChannel::new_with_storm_protection(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            None,
+            allowed_from,
+            false,
+            false,
+            crate::config::MediaConfig::default(),
+            storm,
+        )
+    }
+
     fn make_envelope(source_number: Option<&str>, message: Option<&str>) -> Envelope {
         Envelope {
             source: source_number.map(String::from),
@@ -2603,6 +2921,82 @@ mod tests {
         );
         assert_eq!(msg.sender, "+1111111111");
         assert_eq!(msg.channel, "signal");
+    }
+
+    #[test]
+    fn process_envelope_deduplicates_sender_event_content_fingerprint() {
+        let ch = make_channel_with_storm(
+            vec!["+1111111111".to_string()],
+            crate::config::schema::SignalStormProtectionConfig {
+                dedupe_ttl_secs: 60,
+                min_reply_interval_secs: 0,
+                abnormal_threshold: 10,
+                abnormal_window_secs: 60,
+                breaker_duration_secs: 300,
+            },
+        );
+        let first = make_envelope(Some("+1111111111"), Some("Hello dedupe"));
+        let duplicate = make_envelope(Some("+1111111111"), Some("Hello dedupe"));
+        let different = make_envelope(Some("+1111111111"), Some("Hello changed"));
+
+        assert!(ch.process_envelope(&first).is_some());
+        assert!(ch.process_envelope(&duplicate).is_none());
+        assert!(ch.process_envelope(&different).is_some());
+    }
+
+    #[test]
+    fn process_envelope_enforces_min_reply_interval_per_reply_target() {
+        let ch = make_channel_with_storm(
+            vec!["*".to_string()],
+            crate::config::schema::SignalStormProtectionConfig {
+                dedupe_ttl_secs: 0,
+                min_reply_interval_secs: 2,
+                abnormal_threshold: 10,
+                abnormal_window_secs: 60,
+                breaker_duration_secs: 300,
+            },
+        );
+
+        let first = make_envelope(Some("+1111111111"), Some("first"));
+        let second_same_target = make_envelope(Some("+1111111111"), Some("second"));
+        let third_other_target = make_envelope(Some("+2222222222"), Some("third"));
+
+        assert!(ch.process_envelope(&first).is_some());
+        assert!(ch.process_envelope(&second_same_target).is_none());
+        assert!(ch.process_envelope(&third_other_target).is_some());
+    }
+
+    #[test]
+    fn process_envelope_trips_breaker_after_repeated_non_user_events() {
+        let ch = make_channel_with_storm(
+            vec!["*".to_string()],
+            crate::config::schema::SignalStormProtectionConfig {
+                dedupe_ttl_secs: 0,
+                min_reply_interval_secs: 0,
+                abnormal_threshold: 3,
+                abnormal_window_secs: 60,
+                breaker_duration_secs: 300,
+            },
+        );
+
+        let typing = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            typing_message: Some(serde_json::json!({
+                "action": "STARTED"
+            })),
+            timestamp: Some(1_700_000_001_000),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            assert!(ch.process_envelope(&typing).is_none());
+        }
+
+        let blocked_user_event = make_envelope(Some("+1111111111"), Some("should be blocked"));
+        assert!(ch.process_envelope(&blocked_user_event).is_none());
+
+        let unaffected_other_sender = make_envelope(Some("+2222222222"), Some("allowed"));
+        assert!(ch.process_envelope(&unaffected_other_sender).is_some());
     }
 
     #[test]

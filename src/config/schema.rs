@@ -3155,6 +3155,57 @@ pub struct MatrixConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SignalStormProtectionConfig {
+    /// Deduplication TTL in seconds for `(channel + sender + event_type + normalized_content)`.
+    #[serde(default = "default_signal_storm_dedupe_ttl_secs")]
+    pub dedupe_ttl_secs: u64,
+    /// Minimum interval in seconds between replies for the same `(channel + reply_target)`.
+    #[serde(default = "default_signal_storm_min_reply_interval_secs")]
+    pub min_reply_interval_secs: u64,
+    /// Non-user event threshold within `abnormal_window_secs` before tripping the breaker.
+    #[serde(default = "default_signal_storm_abnormal_threshold")]
+    pub abnormal_threshold: usize,
+    /// Sliding window in seconds for non-user event counting.
+    #[serde(default = "default_signal_storm_abnormal_window_secs")]
+    pub abnormal_window_secs: u64,
+    /// Circuit breaker duration in seconds after threshold is reached.
+    #[serde(default = "default_signal_storm_breaker_duration_secs")]
+    pub breaker_duration_secs: u64,
+}
+
+fn default_signal_storm_dedupe_ttl_secs() -> u64 {
+    60
+}
+
+fn default_signal_storm_min_reply_interval_secs() -> u64 {
+    2
+}
+
+fn default_signal_storm_abnormal_threshold() -> usize {
+    10
+}
+
+fn default_signal_storm_abnormal_window_secs() -> u64 {
+    60
+}
+
+fn default_signal_storm_breaker_duration_secs() -> u64 {
+    300
+}
+
+impl Default for SignalStormProtectionConfig {
+    fn default() -> Self {
+        Self {
+            dedupe_ttl_secs: default_signal_storm_dedupe_ttl_secs(),
+            min_reply_interval_secs: default_signal_storm_min_reply_interval_secs(),
+            abnormal_threshold: default_signal_storm_abnormal_threshold(),
+            abnormal_window_secs: default_signal_storm_abnormal_window_secs(),
+            breaker_duration_secs: default_signal_storm_breaker_duration_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SignalConfig {
     /// Base URL for the signal-cli HTTP daemon (e.g. "http://127.0.0.1:8686").
     /// In "native" mode this is ignored; the daemon is spawned on `daemon_http_port`.
@@ -3194,6 +3245,9 @@ pub struct SignalConfig {
     /// Skip incoming story messages.
     #[serde(default)]
     pub ignore_stories: bool,
+    /// Signal ingress storm protection controls.
+    #[serde(default)]
+    pub storm_protection: SignalStormProtectionConfig,
     /// Startup readiness timeout in milliseconds for native `signal-cli` daemon mode.
     #[serde(default = "default_signal_startup_timeout_ms")]
     pub startup_timeout_ms: u64,
@@ -3233,6 +3287,7 @@ impl Default for SignalConfig {
             allowed_from: Vec::new(),
             ignore_attachments: false,
             ignore_stories: false,
+            storm_protection: SignalStormProtectionConfig::default(),
             startup_timeout_ms: default_signal_startup_timeout_ms(),
             dm_policy: DmPolicy::default(),
             group_policy: GroupPolicy::default(),
@@ -5515,6 +5570,13 @@ allowed_users = ["@ops:matrix.org"]
             allowed_from: vec!["+1111111111".into()],
             ignore_attachments: true,
             ignore_stories: false,
+            storm_protection: SignalStormProtectionConfig {
+                dedupe_ttl_secs: 90,
+                min_reply_interval_secs: 3,
+                abnormal_threshold: 12,
+                abnormal_window_secs: 45,
+                breaker_duration_secs: 120,
+            },
             ..Default::default()
         };
         let json = serde_json::to_string(&sc).unwrap();
@@ -5525,6 +5587,11 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(parsed.allowed_from.len(), 1);
         assert!(parsed.ignore_attachments);
         assert!(!parsed.ignore_stories);
+        assert_eq!(parsed.storm_protection.dedupe_ttl_secs, 90);
+        assert_eq!(parsed.storm_protection.min_reply_interval_secs, 3);
+        assert_eq!(parsed.storm_protection.abnormal_threshold, 12);
+        assert_eq!(parsed.storm_protection.abnormal_window_secs, 45);
+        assert_eq!(parsed.storm_protection.breaker_duration_secs, 120);
     }
 
     #[test]
@@ -5554,6 +5621,11 @@ allowed_users = ["@ops:matrix.org"]
         assert!(parsed.allowed_from.is_empty());
         assert!(!parsed.ignore_attachments);
         assert!(!parsed.ignore_stories);
+        assert_eq!(parsed.storm_protection.dedupe_ttl_secs, 60);
+        assert_eq!(parsed.storm_protection.min_reply_interval_secs, 2);
+        assert_eq!(parsed.storm_protection.abnormal_threshold, 10);
+        assert_eq!(parsed.storm_protection.abnormal_window_secs, 60);
+        assert_eq!(parsed.storm_protection.breaker_duration_secs, 300);
     }
 
     #[test]
