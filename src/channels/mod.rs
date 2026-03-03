@@ -68,7 +68,7 @@ use crate::hooks::HookManager;
 use crate::identity;
 use crate::memory::{self, Memory, MemoryWriteContext};
 use crate::observability::{self, Observer};
-use crate::providers::{self, ChatMessage, Provider};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -116,6 +116,9 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+const SIGNAL_IMAGE_UNCERTAINTY_FALLBACK: &str = "无法确认，请提供更清晰图片或补充说明";
+const SIGNAL_VISION_PREFLIGHT_CONFIDENCE_THRESHOLD: f64 = 0.60;
+const SIGNAL_VISION_PREFLIGHT_TIMEOUT_SECS: u64 = 45;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
@@ -1351,6 +1354,219 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     strip_isolated_tool_json_artifacts(response, &known_tool_names)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignalVisionPreflightOutcome {
+    NotRequired,
+    Ready { context: String },
+    Fallback,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SignalVisionPreflightReport {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    observation: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    result: Option<String>,
+}
+
+impl SignalVisionPreflightReport {
+    fn summary_text(&self) -> Option<&str> {
+        [
+            self.summary.as_deref(),
+            self.observation.as_deref(),
+            self.description.as_deref(),
+            self.result.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+    }
+}
+
+fn is_signal_image_message(msg: &traits::ChannelMessage) -> bool {
+    if msg.channel != "signal" {
+        return false;
+    }
+
+    let has_image_markers = !crate::multimodal::parse_image_markers(&msg.content)
+        .1
+        .is_empty();
+    let has_signal_image_meta =
+        msg.content.contains("vision_required=true") || msg.content.contains("image_attachments=");
+    has_image_markers || has_signal_image_meta
+}
+
+fn parse_signal_vision_preflight_report(raw: &str) -> Option<SignalVisionPreflightReport> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(report) = serde_json::from_str::<SignalVisionPreflightReport>(trimmed) {
+        return Some(report);
+    }
+
+    for fenced in [trimmed.strip_prefix("```json"), trimmed.strip_prefix("```")] {
+        let Some(inner) = fenced else {
+            continue;
+        };
+        let inner = inner.trim();
+        let inner = inner.strip_suffix("```").unwrap_or(inner).trim();
+        if let Ok(report) = serde_json::from_str::<SignalVisionPreflightReport>(inner) {
+            return Some(report);
+        }
+    }
+
+    let object_start = trimmed.find('{')?;
+    let object_end = trimmed.rfind('}')?;
+    if object_end <= object_start {
+        return None;
+    }
+
+    serde_json::from_str::<SignalVisionPreflightReport>(&trimmed[object_start..=object_end]).ok()
+}
+
+async fn run_signal_vision_preflight(
+    provider: &dyn Provider,
+    model: &str,
+    temperature: f64,
+    msg: &traits::ChannelMessage,
+    multimodal_config: &crate::config::MultimodalConfig,
+) -> SignalVisionPreflightOutcome {
+    if !is_signal_image_message(msg) {
+        return SignalVisionPreflightOutcome::NotRequired;
+    }
+
+    if !provider.supports_vision() {
+        tracing::warn!(
+            "Signal image guard: provider does not support vision, forcing uncertainty fallback"
+        );
+        return SignalVisionPreflightOutcome::Fallback;
+    }
+
+    let (cleaned_text, image_refs) = crate::multimodal::parse_image_markers(&msg.content);
+    if image_refs.is_empty() {
+        tracing::warn!(
+            "Signal image guard: image attachment metadata exists but no usable image markers"
+        );
+        return SignalVisionPreflightOutcome::Fallback;
+    }
+
+    let mut user_prompt = String::new();
+    if cleaned_text.trim().is_empty() {
+        user_prompt.push_str("Signal inbound image attachment.");
+    } else {
+        user_prompt.push_str(cleaned_text.trim());
+    }
+    user_prompt.push_str("\n\n[Analyze attached images first]");
+    for image_ref in image_refs {
+        user_prompt.push('\n');
+        user_prompt.push_str("[IMAGE:");
+        user_prompt.push_str(image_ref.trim());
+        user_prompt.push(']');
+    }
+
+    let preflight_messages = vec![
+        ChatMessage::system(
+            "You are a strict vision preflight validator. \
+Return JSON only with this schema: \
+{\"status\":\"ok\"|\"uncertain\",\"confidence\":0.0,\"summary\":\"...\",\"missing\":\"...\"}. \
+If any key detail is unreadable, uncertain, cropped, or ambiguous, set status=\"uncertain\" with confidence below 0.60. \
+Never guess brand, dosage, specification, or product identity.",
+        ),
+        ChatMessage::user(user_prompt),
+    ];
+
+    let prepared = match crate::multimodal::prepare_messages_for_provider(
+        &preflight_messages,
+        multimodal_config,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::warn!(
+                "Signal image guard: multimodal preflight normalization failed: {error}"
+            );
+            return SignalVisionPreflightOutcome::Fallback;
+        }
+    };
+
+    if !prepared.contains_images {
+        tracing::warn!(
+            "Signal image guard: preflight request did not retain image payloads after normalization"
+        );
+        return SignalVisionPreflightOutcome::Fallback;
+    }
+
+    let preflight_response = match tokio::time::timeout(
+        Duration::from_secs(SIGNAL_VISION_PREFLIGHT_TIMEOUT_SECS),
+        provider.chat(
+            ChatRequest {
+                messages: &prepared.messages,
+                tools: None,
+            },
+            model,
+            temperature,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            tracing::warn!("Signal image guard: vision preflight failed: {error}");
+            return SignalVisionPreflightOutcome::Fallback;
+        }
+        Err(_) => {
+            tracing::warn!("Signal image guard: vision preflight timed out");
+            return SignalVisionPreflightOutcome::Fallback;
+        }
+    };
+
+    let raw_report = preflight_response.text_or_empty().trim();
+    let Some(report) = parse_signal_vision_preflight_report(raw_report) else {
+        tracing::warn!(
+            "Signal image guard: preflight returned unparsable payload, forcing fallback"
+        );
+        return SignalVisionPreflightOutcome::Fallback;
+    };
+
+    let confidence = report.confidence.unwrap_or_default();
+    let summary = report
+        .summary_text()
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let status = report.status.trim().to_ascii_lowercase();
+    let status_uncertain = matches!(
+        status.as_str(),
+        "uncertain" | "unknown" | "unclear" | "insufficient" | "low_confidence"
+    );
+    if status_uncertain
+        || summary.is_empty()
+        || confidence < SIGNAL_VISION_PREFLIGHT_CONFIDENCE_THRESHOLD
+    {
+        tracing::warn!(
+            "Signal image guard: preflight confidence too low (status={status}, confidence={confidence:.2})"
+        );
+        return SignalVisionPreflightOutcome::Fallback;
+    }
+
+    SignalVisionPreflightOutcome::Ready {
+        context: format!(
+            "[signal-vision-preflight confidence={confidence:.2}]\n{summary}\n[/signal-vision-preflight]"
+        ),
+    }
+}
+
 fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
     let Some(object) = value.as_object() else {
         return false;
@@ -1752,6 +1968,44 @@ async fn process_channel_message(
         }
     }
 
+    let signal_vision_context = match run_signal_vision_preflight(
+        active_provider.as_ref(),
+        route.model.as_str(),
+        runtime_defaults.temperature,
+        &msg,
+        &ctx.multimodal,
+    )
+    .await
+    {
+        SignalVisionPreflightOutcome::NotRequired => None,
+        SignalVisionPreflightOutcome::Ready { context } => Some(context),
+        SignalVisionPreflightOutcome::Fallback => {
+            let fallback = SIGNAL_IMAGE_UNCERTAINTY_FALLBACK.to_string();
+            append_sender_turn(
+                ctx.as_ref(),
+                &history_key,
+                ChatMessage::assistant(&fallback),
+            );
+            println!(
+                "  🤖 Reply ({}ms): {}",
+                started_at.elapsed().as_millis(),
+                truncate_with_ellipsis(&fallback, 80)
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                if let Err(e) = channel
+                    .send(
+                        &SendMessage::new(fallback, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await
+                {
+                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                }
+            }
+            return;
+        }
+    };
+
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
     let memory_context = if had_prior_history {
@@ -1771,10 +2025,16 @@ async fn process_channel_message(
             .unwrap_or_default();
         let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
-        if !had_prior_history {
-            if let Some(last_turn) = prior_turns.last_mut() {
-                if last_turn.role == "user" && !memory_context.is_empty() {
-                    last_turn.content = format!("{memory_context}{}", msg.content);
+        if let Some(last_turn) = prior_turns.last_mut() {
+            if last_turn.role == "user" {
+                if !had_prior_history && !memory_context.is_empty() {
+                    last_turn.content = format!("{memory_context}{}", last_turn.content);
+                }
+                if let Some(preflight_context) = signal_vision_context.as_deref() {
+                    if !last_turn.content.ends_with('\n') {
+                        last_turn.content.push('\n');
+                    }
+                    last_turn.content.push_str(preflight_context);
                 }
             }
         }
@@ -4191,6 +4451,73 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    #[derive(Default)]
+    struct SignalVisionNoResultProvider {
+        call_count: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SignalVisionNoResultProvider {
+        fn capabilities(&self) -> providers::ProviderCapabilities {
+            providers::ProviderCapabilities {
+                native_tool_calling: false,
+                vision: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let call_index = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                Ok(String::new())
+            } else {
+                Ok("这是维生素C产品包装。".to_string())
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct SignalTextOnlyProvider {
+        call_count: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SignalTextOnlyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("signal text-only ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok("signal text-only ok".to_string())
+        }
+    }
+
     struct IterativeToolProvider {
         required_tool_iterations: usize,
     }
@@ -4581,6 +4908,146 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(sent_messages[0].contains("alias-tag flow resolved"));
         assert!(!sent_messages[0].contains("<toolcall>"));
         assert!(!sent_messages[0].contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_signal_image_without_vision_result_uses_uncertainty_fallback()
+    {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert("signal".to_string(), channel);
+
+        let provider_impl = Arc::new(SignalVisionNoResultProvider::default());
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "signal-image-no-vision".to_string(),
+                sender: "+10000000000".to_string(),
+                reply_target: "+10000000000".to_string(),
+                content: "[IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+                channel: "signal".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                mentioned_uuids: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("无法确认，请提供更清晰图片或补充说明"));
+        assert!(!sent_messages[0].contains("维生素C"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_signal_text_only_path_is_unchanged() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert("signal".to_string(), channel);
+
+        let provider_impl = Arc::new(SignalTextOnlyProvider::default());
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["openprx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "signal-text-only".to_string(),
+                sender: "+10000000000".to_string(),
+                reply_target: "+10000000000".to_string(),
+                content: "hello from signal text-only".to_string(),
+                channel: "signal".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+                mentioned_uuids: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("signal text-only ok"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
