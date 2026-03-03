@@ -1434,23 +1434,26 @@ impl SignalChannel {
     }
 
     fn guard_check_breaker(&self, key: &str, now: Instant) -> bool {
-        let Ok(mut guard) = self.storm_guard.lock() else {
-            return false;
-        };
+        let mut guard = self
+            .storm_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.is_breaker_open(key, now)
     }
 
     fn guard_record_non_user_and_maybe_trip(&self, key: &str, now: Instant) -> bool {
-        let Ok(mut guard) = self.storm_guard.lock() else {
-            return false;
-        };
+        let mut guard = self
+            .storm_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.record_non_user_event(key, now)
     }
 
     fn guard_allow_user_event(&self, key: &str, fingerprint: &str, now: Instant) -> bool {
-        let Ok(mut guard) = self.storm_guard.lock() else {
-            return true;
-        };
+        let mut guard = self
+            .storm_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if guard.is_breaker_open(key, now) {
             return false;
@@ -1897,11 +1900,31 @@ impl SignalChannel {
             return msg;
         }
 
+        let image_attachment_count = raw_attachments
+            .iter()
+            .filter(|att| {
+                att.get("contentType")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|content_type| content_type.starts_with("image/"))
+            })
+            .count();
+        let mut image_marker_count = 0usize;
+
         for att in raw_attachments {
             if let Some(marker) = self.download_attachment_as_marker(att).await {
                 msg.content.push('\n');
                 msg.content.push_str(&marker);
+                if marker.starts_with("[IMAGE:") {
+                    image_marker_count += 1;
+                }
             }
+        }
+
+        if image_attachment_count > 0 {
+            msg.content.push('\n');
+            msg.content.push_str(&format!(
+                "[signal-meta image_attachments={image_attachment_count} resolved_image_markers={image_marker_count} vision_required=true]"
+            ));
         }
 
         msg
