@@ -28,7 +28,7 @@ clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 
 # Async runtime - feature-optimized for size
-tokio = { version = "1.42", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
 tokio-util = { version = "0.7", default-features = false }
 
 # HTTP client - minimal features
@@ -63,7 +63,7 @@ base64 = "0.22"
 urlencoding = "2.1"
 
 # Optional Rust-native browser automation backend
-fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
+fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
 
 # Error handling
 anyhow = "1.0"
