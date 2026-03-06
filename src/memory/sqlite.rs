@@ -3,11 +3,13 @@ use super::principal::{
     classify_memory, resolve_principal, ChatType, MemoryWriteContext, Principal, Role, Visibility,
 };
 use super::topic::resolve_topic;
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{
+    ConversationSessionSummary, ConversationTurn, Memory, MemoryCategory, MemoryEntry,
+};
 use super::vector;
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use std::fmt::Write as _;
@@ -22,6 +24,10 @@ use uuid::Uuid;
 
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
+const DEFAULT_CONVERSATION_LIMIT: usize = 50;
+const MAX_CONVERSATION_QUERY_LIMIT: usize = 500;
+const MAX_HYDRATED_SESSIONS: usize = 100;
+const SESSION_PREVIEW_CHARS: usize = 120;
 
 /// SQLite-backed persistent memory — the brain
 ///
@@ -204,6 +210,53 @@ impl SqliteMemory {
         Ok(conn)
     }
 
+    fn sanitize_conversation_limit(limit: usize) -> i64 {
+        #[allow(clippy::cast_possible_wrap)]
+        let normalized = if limit == 0 {
+            DEFAULT_CONVERSATION_LIMIT
+        } else {
+            limit.min(MAX_CONVERSATION_QUERY_LIMIT)
+        };
+        normalized as i64
+    }
+
+    fn sanitize_conversation_offset(offset: usize) -> i64 {
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            offset.min(i64::MAX as usize) as i64
+        }
+    }
+
+    fn sanitize_hydrated_sessions_limit(limit: usize) -> i64 {
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            let normalized = if limit == 0 {
+                MAX_HYDRATED_SESSIONS
+            } else {
+                limit.min(MAX_HYDRATED_SESSIONS)
+            };
+            normalized as i64
+        }
+    }
+
+    fn normalize_conversation_timestamp(timestamp: Option<&str>) -> String {
+        if let Some(value) = timestamp.map(str::trim).filter(|value| !value.is_empty()) {
+            if DateTime::parse_from_rfc3339(value).is_ok() {
+                return value.to_string();
+            }
+        }
+        Utc::now().to_rfc3339()
+    }
+
+    fn conversation_preview(content: &str) -> String {
+        let preview: String = content.chars().take(SESSION_PREVIEW_CHARS).collect();
+        if content.chars().count() > SESSION_PREVIEW_CHARS {
+            format!("{preview}...")
+        } else {
+            preview
+        }
+    }
+
     /// Initialize all tables: memories, FTS5, `embedding_cache`
     fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
@@ -355,7 +408,31 @@ impl SqliteMemory {
                 result      TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_audit_time ON access_audit_log(timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_audit_requester ON access_audit_log(requester);",
+            CREATE INDEX IF NOT EXISTS idx_audit_requester ON access_audit_log(requester);
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_key          TEXT PRIMARY KEY,
+                channel              TEXT NOT NULL,
+                sender               TEXT NOT NULL,
+                created_at           TEXT NOT NULL,
+                updated_at           TEXT NOT NULL,
+                message_count        INTEGER NOT NULL DEFAULT 0,
+                last_message_preview TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_channel_updated_at ON sessions(channel, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS conversation_turns (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_key TEXT NOT NULL,
+                role        TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                timestamp   TEXT NOT NULL,
+                message_id  TEXT,
+                FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversation_turns_session_key ON conversation_turns(session_key);
+            CREATE INDEX IF NOT EXISTS idx_conversation_turns_timestamp ON conversation_turns(timestamp DESC);",
         )?;
 
         let mut column_stmt = conn.prepare("PRAGMA table_info(memories)")?;
@@ -1220,6 +1297,277 @@ impl Memory for SqliteMemory {
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(count as usize)
         })
+        .await?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_conversation_turn(
+        &self,
+        session_key: &str,
+        channel: &str,
+        sender: &str,
+        role: &str,
+        content: &str,
+        timestamp: Option<&str>,
+        message_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let session_key = session_key.to_string();
+        let channel = channel.to_string();
+        let sender = sender.to_string();
+        let role = role.to_string();
+        let content = content.to_string();
+        let timestamp = Self::normalize_conversation_timestamp(timestamp);
+        let message_id = message_id.map(str::to_string);
+        let preview = Self::conversation_preview(&content);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO sessions (
+                    session_key,
+                    channel,
+                    sender,
+                    created_at,
+                    updated_at,
+                    message_count,
+                    last_message_preview
+                 ) VALUES (?1, ?2, ?3, ?4, ?4, 1, ?5)
+                 ON CONFLICT(session_key) DO UPDATE SET
+                    channel = excluded.channel,
+                    sender = excluded.sender,
+                    updated_at = excluded.updated_at,
+                    message_count = COALESCE(sessions.message_count, 0) + 1,
+                    last_message_preview = excluded.last_message_preview",
+                params![&session_key, &channel, &sender, &timestamp, &preview],
+            )?;
+            tx.execute(
+                "INSERT INTO conversation_turns (session_key, role, content, timestamp, message_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &session_key,
+                    &role,
+                    &content,
+                    &timestamp,
+                    message_id.as_deref()
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn list_conversation_sessions(
+        &self,
+        limit: usize,
+        offset: usize,
+        channel: Option<&str>,
+    ) -> anyhow::Result<Vec<ConversationSessionSummary>> {
+        let conn = self.conn.clone();
+        let limit = Self::sanitize_conversation_limit(limit);
+        let offset = Self::sanitize_conversation_offset(offset);
+        let channel = channel.map(str::to_string);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ConversationSessionSummary>> {
+            let conn = conn.lock();
+            let mut sessions = Vec::new();
+
+            if let Some(channel_filter) = channel {
+                let mut stmt = conn.prepare(
+                    "SELECT session_key, channel, sender, created_at, updated_at, message_count, last_message_preview
+                     FROM sessions
+                     WHERE channel = ?1
+                     ORDER BY updated_at DESC
+                     LIMIT ?2 OFFSET ?3",
+                )?;
+                let rows = stmt.query_map(params![channel_filter, limit, offset], |row| {
+                    let message_count: i64 = row.get(5)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    let message_count = message_count.max(0) as u64;
+                    Ok(ConversationSessionSummary {
+                        session_key: row.get(0)?,
+                        channel: row.get(1)?,
+                        sender: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        message_count,
+                        last_message_preview: row.get(6)?,
+                    })
+                })?;
+                for row in rows {
+                    sessions.push(row?);
+                }
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT session_key, channel, sender, created_at, updated_at, message_count, last_message_preview
+                     FROM sessions
+                     ORDER BY updated_at DESC
+                     LIMIT ?1 OFFSET ?2",
+                )?;
+                let rows = stmt.query_map(params![limit, offset], |row| {
+                    let message_count: i64 = row.get(5)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    let message_count = message_count.max(0) as u64;
+                    Ok(ConversationSessionSummary {
+                        session_key: row.get(0)?,
+                        channel: row.get(1)?,
+                        sender: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        message_count,
+                        last_message_preview: row.get(6)?,
+                    })
+                })?;
+                for row in rows {
+                    sessions.push(row?);
+                }
+            }
+
+            Ok(sessions)
+        })
+        .await?
+    }
+
+    async fn get_conversation_session(
+        &self,
+        session_key: &str,
+    ) -> anyhow::Result<Option<ConversationSessionSummary>> {
+        let conn = self.conn.clone();
+        let session_key = session_key.to_string();
+
+        tokio::task::spawn_blocking(
+            move || -> anyhow::Result<Option<ConversationSessionSummary>> {
+                let conn = conn.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT session_key, channel, sender, created_at, updated_at, message_count, last_message_preview
+                     FROM sessions WHERE session_key = ?1",
+                )?;
+                let row = stmt.query_row(params![session_key], |row| {
+                    let message_count: i64 = row.get(5)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    let message_count = message_count.max(0) as u64;
+                    Ok(ConversationSessionSummary {
+                        session_key: row.get(0)?,
+                        channel: row.get(1)?,
+                        sender: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        message_count,
+                        last_message_preview: row.get(6)?,
+                    })
+                });
+
+                match row {
+                    Ok(summary) => Ok(Some(summary)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            },
+        )
+        .await?
+    }
+
+    async fn list_conversation_turns(
+        &self,
+        session_key: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<ConversationTurn>> {
+        let conn = self.conn.clone();
+        let session_key = session_key.to_string();
+        let limit = Self::sanitize_conversation_limit(limit);
+        let offset = Self::sanitize_conversation_offset(offset);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ConversationTurn>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, session_key, role, content, timestamp, message_id
+                 FROM conversation_turns
+                 WHERE session_key = ?1
+                 ORDER BY id DESC
+                 LIMIT ?2 OFFSET ?3",
+            )?;
+            let rows = stmt.query_map(params![session_key, limit, offset], |row| {
+                Ok(ConversationTurn {
+                    id: row.get(0)?,
+                    session_key: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    timestamp: row.get(4)?,
+                    message_id: row.get(5)?,
+                })
+            })?;
+
+            let mut turns = Vec::new();
+            for row in rows {
+                turns.push(row?);
+            }
+            turns.reverse();
+            Ok(turns)
+        })
+        .await?
+    }
+
+    async fn load_recent_conversation_histories(
+        &self,
+        max_turns_per_session: usize,
+        max_sessions: usize,
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<ConversationTurn>>> {
+        let conn = self.conn.clone();
+        let max_turns_per_session = Self::sanitize_conversation_limit(max_turns_per_session);
+        let max_sessions = Self::sanitize_hydrated_sessions_limit(max_sessions);
+
+        tokio::task::spawn_blocking(
+            move || -> anyhow::Result<std::collections::HashMap<String, Vec<ConversationTurn>>> {
+                let conn = conn.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT id, session_key, role, content, timestamp, message_id
+                     FROM (
+                         SELECT
+                             ct.id,
+                             ct.session_key,
+                             ct.role,
+                             ct.content,
+                             ct.timestamp,
+                             ct.message_id,
+                             ROW_NUMBER() OVER (PARTITION BY ct.session_key ORDER BY ct.id DESC) AS row_num
+                         FROM conversation_turns ct
+                         INNER JOIN (
+                             SELECT session_key
+                             FROM sessions
+                             ORDER BY updated_at DESC
+                             LIMIT ?2
+                         ) recent_sessions
+                         ON recent_sessions.session_key = ct.session_key
+                     )
+                     WHERE row_num <= ?1
+                     ORDER BY session_key ASC, id ASC",
+                )?;
+                let rows = stmt.query_map(params![max_turns_per_session, max_sessions], |row| {
+                    Ok(ConversationTurn {
+                        id: row.get(0)?,
+                        session_key: row.get(1)?,
+                        role: row.get(2)?,
+                        content: row.get(3)?,
+                        timestamp: row.get(4)?,
+                        message_id: row.get(5)?,
+                    })
+                })?;
+
+                let mut histories: std::collections::HashMap<String, Vec<ConversationTurn>> =
+                    std::collections::HashMap::new();
+                for row in rows {
+                    let turn = row?;
+                    histories
+                        .entry(turn.session_key.clone())
+                        .or_default()
+                        .push(turn);
+                }
+                Ok(histories)
+            },
+        )
         .await?
     }
 
@@ -2559,5 +2907,149 @@ mod tests {
         mem.reindex().await.unwrap();
 
         assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn append_conversation_turn_persists_session_and_turns() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.append_conversation_turn(
+            "signal_alice",
+            "signal",
+            "alice",
+            "user",
+            "first user message",
+            Some("2026-03-05T00:00:00Z"),
+            Some("msg-1"),
+        )
+        .await
+        .unwrap();
+        mem.append_conversation_turn(
+            "signal_alice",
+            "signal",
+            "alice",
+            "assistant",
+            "first assistant message",
+            Some("2026-03-05T00:00:01Z"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let sessions = mem.list_conversation_sessions(50, 0, None).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_key, "signal_alice");
+        assert_eq!(sessions[0].message_count, 2);
+        assert_eq!(sessions[0].created_at, "2026-03-05T00:00:00Z");
+        assert_eq!(sessions[0].updated_at, "2026-03-05T00:00:01Z");
+        assert_eq!(sessions[0].last_message_preview, "first assistant message");
+
+        let turns = mem
+            .list_conversation_turns("signal_alice", 50, 0)
+            .await
+            .unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].timestamp, "2026-03-05T00:00:00Z");
+        assert_eq!(turns[0].message_id.as_deref(), Some("msg-1"));
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].timestamp, "2026-03-05T00:00:01Z");
+    }
+
+    #[tokio::test]
+    async fn load_recent_conversation_histories_limits_per_session() {
+        let (_tmp, mem) = temp_sqlite();
+        for idx in 0..4 {
+            mem.append_conversation_turn(
+                "telegram_bob",
+                "telegram",
+                "bob",
+                "user",
+                &format!("turn-{idx}"),
+                Some(&format!("2026-03-05T00:00:0{idx}Z")),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let histories = mem
+            .load_recent_conversation_histories(2, MAX_HYDRATED_SESSIONS)
+            .await
+            .unwrap();
+        let bob_history = histories.get("telegram_bob").unwrap();
+        assert_eq!(bob_history.len(), 2);
+        assert_eq!(bob_history[0].content, "turn-2");
+        assert_eq!(bob_history[1].content, "turn-3");
+    }
+
+    #[tokio::test]
+    async fn list_conversation_turns_returns_latest_window_chronologically() {
+        let (_tmp, mem) = temp_sqlite();
+        for idx in 0..4 {
+            mem.append_conversation_turn(
+                "signal_latest_window",
+                "signal",
+                "tester",
+                "user",
+                &format!("turn-{idx}"),
+                Some(&format!("2026-03-05T00:00:0{idx}Z")),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let turns = mem
+            .list_conversation_turns("signal_latest_window", 2, 0)
+            .await
+            .unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].content, "turn-2");
+        assert_eq!(turns[1].content, "turn-3");
+    }
+
+    #[tokio::test]
+    async fn load_recent_conversation_histories_limits_sessions_by_updated_at() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.append_conversation_turn(
+            "session_a",
+            "signal",
+            "tester",
+            "user",
+            "turn-a",
+            Some("2026-03-05T00:00:00Z"),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.append_conversation_turn(
+            "session_b",
+            "signal",
+            "tester",
+            "user",
+            "turn-b",
+            Some("2026-03-05T00:00:01Z"),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.append_conversation_turn(
+            "session_c",
+            "signal",
+            "tester",
+            "user",
+            "turn-c",
+            Some("2026-03-05T00:00:02Z"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let histories = mem.load_recent_conversation_histories(2, 2).await.unwrap();
+        assert_eq!(histories.len(), 2);
+        assert!(histories.contains_key("session_b"));
+        assert!(histories.contains_key("session_c"));
+        assert!(!histories.contains_key("session_a"));
     }
 }

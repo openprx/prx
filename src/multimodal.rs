@@ -383,10 +383,15 @@ fn detect_mime(
     bytes: &[u8],
     header_content_type: Option<&str>,
 ) -> Option<String> {
-    if let Some(header_mime) = header_content_type.and_then(normalize_content_type) {
-        return Some(header_mime);
+    // Magic bytes have highest priority — they reflect the actual binary content
+    // regardless of the (potentially wrong) file extension or server-provided header.
+    // Signal attachments are commonly downloaded with mismatched extensions
+    // (e.g. a real JPEG saved as .png), so we must trust the bytes first.
+    if let Some(magic_mime) = mime_from_magic(bytes) {
+        return Some(magic_mime.to_string());
     }
 
+    // Fall back to file extension for local files where magic detection failed.
     if let Some(path) = path {
         if let Some(ext) = path.extension().and_then(|value| value.to_str()) {
             if let Some(mime) = mime_from_extension(ext) {
@@ -395,7 +400,8 @@ fn detect_mime(
         }
     }
 
-    mime_from_magic(bytes).map(ToString::to_string)
+    // Last resort: honour the HTTP Content-Type header from the server.
+    header_content_type.and_then(normalize_content_type)
 }
 
 fn normalize_content_type(content_type: &str) -> Option<String> {
@@ -464,6 +470,34 @@ mod tests {
 
         assert_eq!(cleaned, "hello [IMAGE:] world");
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn detect_mime_prefers_magic_bytes_over_extension() {
+        // JPEG magic bytes with a .png extension — magic should win
+        let jpeg_magic = &[0xff, 0xd8, 0xff, 0xe0];
+        let path = std::path::Path::new("photo.png");
+        let mime = super::detect_mime(Some(path), jpeg_magic, None)
+            .expect("should detect JPEG from magic bytes");
+        assert_eq!(mime, "image/jpeg", "magic bytes should override .png extension");
+    }
+
+    #[test]
+    fn detect_mime_falls_back_to_extension_when_magic_unknown() {
+        // Unknown magic bytes — should fall back to extension
+        let unknown_bytes = &[0x00, 0x01, 0x02, 0x03];
+        let path = std::path::Path::new("image.webp");
+        let mime = super::detect_mime(Some(path), unknown_bytes, None)
+            .expect("should detect WEBP from extension");
+        assert_eq!(mime, "image/webp");
+    }
+
+    #[test]
+    fn detect_mime_falls_back_to_header_when_magic_and_ext_unknown() {
+        let unknown_bytes = &[0x00, 0x01, 0x02, 0x03];
+        let mime = super::detect_mime(None, unknown_bytes, Some("image/gif; charset=utf-8"))
+            .expect("should detect from Content-Type header");
+        assert_eq!(mime, "image/gif");
     }
 
     #[tokio::test]

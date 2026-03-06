@@ -1,0 +1,146 @@
+{
+  "app": {
+    "title": "PRX Console",
+    "menu": "Menu",
+    "closeSidebar": "Close sidebar",
+    "language": "Language",
+    "notFound": "Not found",
+    "backToOverview": "Back to Overview"
+  },
+  "nav": {
+    "overview": "Overview",
+    "sessions": "Sessions",
+    "channels": "Channels",
+    "config": "Config",
+    "logs": "Logs"
+  },
+  "common": {
+    "logout": "Logout",
+    "loading": "Loading...",
+    "error": "Error",
+    "refresh": "Refresh",
+    "updatedAt": "Updated {time}",
+    "na": "N/A",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "yes": "Yes",
+    "no": "No",
+    "unknown": "Unknown",
+    "clipboardUnavailable": "Clipboard not available.",
+    "copied": "Copied",
+    "copyFailed": "Copy failed",
+    "empty": "Empty"
+  },
+  "overview": {
+    "title": "Overview",
+    "version": "Version",
+    "uptime": "Uptime",
+    "model": "Model",
+    "memoryBackend": "Memory Backend",
+    "gatewayPort": "Gateway Port",
+    "configuredChannels": "Configured Channels",
+    "loading": "Loading status...",
+    "loadFailed": "Failed to load status.",
+    "noChannelsConfigured": "No channels configured."
+  },
+  "sessions": {
+    "title": "Sessions",
+    "sessionId": "Session ID",
+    "sender": "Sender",
+    "channel": "Channel",
+    "messages": "Messages",
+    "lastMessage": "Last Message",
+    "loading": "Loading sessions...",
+    "loadFailed": "Failed to load sessions.",
+    "none": "No active sessions"
+  },
+  "chat": {
+    "title": "Chat",
+    "session": "Session",
+    "back": "Back to Sessions",
+    "loading": "Loading messages...",
+    "loadFailed": "Failed to load messages.",
+    "sendFailed": "Failed to send message.",
+    "empty": "No messages in this session.",
+    "inputPlaceholder": "Type a message...",
+    "send": "Send",
+    "sending": "Sending..."
+  },
+  "channels": {
+    "title": "Channels",
+    "type": "Type",
+    "loading": "Loading channels...",
+    "loadFailed": "Failed to load channel status.",
+    "noChannels": "No channels available.",
+    "names": {
+      "signal": "Signal",
+      "whatsapp": "WhatsApp",
+      "linq": "LINQ",
+      "nextcloud_talk": "Nextcloud Talk",
+      "telegram": "Telegram",
+      "discord": "Discord",
+      "slack": "Slack",
+      "mattermost": "Mattermost",
+      "webhook": "Webhook",
+      "imessage": "iMessage",
+      "matrix": "Matrix",
+      "wacli": "WA CLI",
+      "email": "Email",
+      "irc": "IRC",
+      "lark": "Lark",
+      "dingtalk": "DingTalk",
+      "qq": "QQ",
+      "cli": "CLI"
+    }
+  },
+  "config": {
+    "title": "Config",
+    "rawJson": "Raw JSON",
+    "structured": "Structured View",
+    "copy": "Copy",
+    "copyJson": "Copy JSON",
+    "loading": "Loading config...",
+    "loadFailed": "Failed to load config.",
+    "section": {
+      "general": "General",
+      "gateway": "Gateway",
+      "channels": "Channels",
+      "memory": "Memory",
+      "security": "Security",
+      "model": "Model",
+      "other": "Other"
+    },
+    "field": {
+      "version": "Version",
+      "runtimeModel": "Runtime Model",
+      "memoryBackend": "Memory Backend",
+      "configuredChannels": "Configured Channels",
+      "notConfigured": "Not configured",
+      "notSet": "Not set"
+    },
+    "channel": {
+      "settings": "settings",
+      "notConfigured": "Not configured"
+    },
+    "redacted": "Redacted",
+    "emptyObject": "No settings"
+  },
+  "logs": {
+    "title": "Logs",
+    "connected": "Connected",
+    "disconnected": "Disconnected",
+    "reconnecting": "Reconnecting",
+    "pause": "Pause",
+    "resume": "Resume",
+    "clear": "Clear",
+    "waiting": "Waiting for log stream..."
+  },
+  "login": {
+    "title": "PRX Console Login",
+    "accessToken": "Access Token",
+    "login": "Login",
+    "hint": "Enter your gateway auth token to continue.",
+    "placeholder": "Bearer token",
+    "tokenRequired": "Access token is required."
+  }
+}
