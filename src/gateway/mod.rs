@@ -7,6 +7,9 @@
 //! - Request timeouts (configurable) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+mod api;
+mod ui;
+
 use crate::agent::loop_::run_tool_call_loop;
 use crate::channels::{
     Channel, LinqChannel, NextcloudTalkChannel, SendMessage, SignalChannel, WhatsAppChannel,
@@ -35,12 +38,16 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
+/// Larger request body limit for `/api` routes to support media uploads
+/// (`10 * 20MB` files plus multipart overhead).
+pub const MAX_API_BODY_SIZE: usize = (10 * 20 * 1024 * 1024) + (1024 * 1024);
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -317,11 +324,18 @@ pub struct AppState {
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    /// Gateway boot instant used for uptime in Web Console status API.
+    pub start_time: Instant,
+    /// Actual bound gateway port (supports dynamic port assignment).
+    pub gateway_port: u16,
+    /// Web Console log stream broadcast channel.
+    pub logs_broadcast_tx: broadcast::Sender<String>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
+    let start_time = Instant::now();
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
@@ -655,6 +669,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Build shared state
     let observer: Arc<dyn crate::observability::Observer> =
         Arc::from(crate::observability::create_observer(&config.observability));
+    let (logs_broadcast_tx, _) = broadcast::channel(1024);
 
     let state = AppState {
         config: config_state,
@@ -679,12 +694,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
         observer,
+        start_time,
+        gateway_port: actual_port,
+        logs_broadcast_tx,
     };
 
-    // Build router with middleware
-    let app = Router::new()
-        .route("/health", get(handle_health))
-        .route("/metrics", get(handle_metrics))
+    let limited_public_routes = Router::new()
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
@@ -692,8 +707,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/linq", post(handle_linq_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/config/reload", post(handle_config_reload))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
+
+    let api_routes =
+        api::router(state.clone()).layer(RequestBodyLimitLayer::new(MAX_API_BODY_SIZE));
+
+    // Build router with middleware
+    let app = Router::new()
+        .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
+        .merge(limited_public_routes)
+        .nest("/api", api_routes)
+        .route("/", get(ui::index_handler))
+        .route("/assets/{*path}", get(ui::asset_handler))
+        .fallback(get(ui::index_handler))
         .with_state(state)
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(config.gateway.request_timeout_secs.max(1)),
@@ -1561,6 +1589,11 @@ mod tests {
     }
 
     #[test]
+    fn security_api_body_limit_supports_media_batch_uploads() {
+        assert!(MAX_API_BODY_SIZE >= (10 * 20 * 1024 * 1024));
+    }
+
+    #[test]
     fn security_timeout_uses_gateway_config_default() {
         assert_eq!(
             crate::config::GatewayConfig::default().request_timeout_secs,
@@ -1630,6 +1663,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1679,6 +1715,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer,
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2054,6 +2093,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2120,6 +2162,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
         };
 
         let headers = HeaderMap::new();
@@ -2186,6 +2231,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
         };
 
         let response = handle_webhook(
@@ -2248,6 +2296,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
         };
 
         let response = handle_webhook(
@@ -2297,6 +2348,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2351,6 +2405,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();
@@ -2410,6 +2467,9 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2464,6 +2524,9 @@ mod tests {
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
         };
 
         let mut headers = HeaderMap::new();

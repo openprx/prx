@@ -2,6 +2,7 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
+use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     Provider, StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
@@ -383,11 +384,32 @@ struct NativeChatRequest {
 struct NativeMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<NativeMessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum NativeMessageContent {
+    Text(String),
+    Parts(Vec<NativeContentPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum NativeContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: NativeImageUrl },
+}
+
+#[derive(Debug, Serialize)]
+struct NativeImageUrl {
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -777,7 +799,9 @@ impl OpenAiCompatibleProvider {
                                 let content = value
                                     .get("content")
                                     .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string);
+                                    .map(|content| {
+                                        NativeMessageContent::Text(content.to_string())
+                                    });
 
                                 return NativeMessage {
                                     role: "assistant".to_string(),
@@ -799,8 +823,10 @@ impl OpenAiCompatibleProvider {
                         let content = value
                             .get("content")
                             .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string)
-                            .or_else(|| Some(message.content.clone()));
+                            .map(|content| NativeMessageContent::Text(content.to_string()))
+                            .or_else(|| {
+                                Some(NativeMessageContent::Text(message.content.clone()))
+                            });
 
                         return NativeMessage {
                             role: "tool".to_string(),
@@ -811,14 +837,51 @@ impl OpenAiCompatibleProvider {
                     }
                 }
 
+                if message.role == "user" {
+                    let content = Self::convert_native_user_content(&message.content);
+                    return NativeMessage {
+                        role: "user".to_string(),
+                        content: Some(content),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    };
+                }
+
                 NativeMessage {
                     role: message.role.clone(),
-                    content: Some(message.content.clone()),
+                    content: Some(NativeMessageContent::Text(message.content.clone())),
                     tool_call_id: None,
                     tool_calls: None,
                 }
             })
             .collect()
+    }
+
+    fn convert_native_user_content(content: &str) -> NativeMessageContent {
+        let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return NativeMessageContent::Text(content.to_string());
+        }
+
+        let mut parts = Vec::new();
+        let trimmed_text = cleaned_text.trim();
+        if !trimmed_text.is_empty() {
+            parts.push(NativeContentPart::Text {
+                text: trimmed_text.to_string(),
+            });
+        }
+
+        for image_ref in image_refs {
+            parts.push(NativeContentPart::ImageUrl {
+                image_url: NativeImageUrl { url: image_ref },
+            });
+        }
+
+        if parts.is_empty() {
+            NativeMessageContent::Text(content.to_string())
+        } else {
+            NativeMessageContent::Parts(parts)
+        }
     }
 
     fn with_prompt_guided_tool_instructions(
@@ -1943,7 +2006,37 @@ mod tests {
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
-        assert_eq!(converted[0].content.as_deref(), Some("done"));
+        match converted[0].content.as_ref() {
+            Some(NativeMessageContent::Text(text)) => assert_eq!(text, "done"),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_messages_for_native_maps_user_images_to_content_parts() {
+        let input = vec![ChatMessage::user(
+            "describe this [IMAGE:data:image/png;base64,abcd==]",
+        )];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        match converted[0].content.as_ref() {
+            Some(NativeMessageContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2);
+                match &parts[0] {
+                    NativeContentPart::Text { text } => assert_eq!(text, "describe this"),
+                    other => panic!("expected text content part, got {other:?}"),
+                }
+                match &parts[1] {
+                    NativeContentPart::ImageUrl { image_url } => {
+                        assert_eq!(image_url.url, "data:image/png;base64,abcd==");
+                    }
+                    other => panic!("expected image content part, got {other:?}"),
+                }
+            }
+            other => panic!("expected multipart content, got {other:?}"),
+        }
     }
 
     #[test]

@@ -88,6 +88,8 @@ use tokio_util::sync::CancellationToken;
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
+/// Maximum number of persisted sessions to hydrate at startup.
+const MAX_HYDRATED_SESSIONS: usize = 100;
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Messages shorter than this (e.g. "ok", "thanks") are not stored,
 /// reducing noise in memory recall.
@@ -599,6 +601,20 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}", msg.channel, msg.sender)
 }
 
+fn to_rfc3339_timestamp(raw_timestamp: u64) -> Option<String> {
+    if raw_timestamp == 0 {
+        return None;
+    }
+
+    let raw_timestamp = i64::try_from(raw_timestamp).ok()?;
+    let timestamp = if raw_timestamp > 10_000_000_000 {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(raw_timestamp)
+    } else {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(raw_timestamp, 0)
+    }?;
+    Some(timestamp.to_rfc3339())
+}
+
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
 }
@@ -959,15 +975,70 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     true
 }
 
-fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
-    let mut histories = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let turns = histories.entry(sender_key.to_string()).or_default();
-    turns.push(turn);
-    while turns.len() > MAX_CHANNEL_HISTORY {
-        turns.remove(0);
+async fn append_sender_turn(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    channel: &str,
+    sender: &str,
+    turn: ChatMessage,
+    timestamp: Option<&str>,
+    message_id: Option<&str>,
+) {
+    let role = turn.role.clone();
+    let content = turn.content.clone();
+    {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories.entry(sender_key.to_string()).or_default();
+        turns.push(turn);
+        while turns.len() > MAX_CHANNEL_HISTORY {
+            turns.remove(0);
+        }
+    }
+
+    if let Err(error) = ctx
+        .memory
+        .append_conversation_turn(
+            sender_key, channel, sender, &role, &content, timestamp, message_id,
+        )
+        .await
+    {
+        tracing::warn!(
+            session_key = sender_key,
+            channel,
+            sender,
+            "Failed to persist channel conversation turn: {error}"
+        );
+    }
+}
+
+async fn load_persisted_histories(memory: &dyn Memory) -> HashMap<String, Vec<ChatMessage>> {
+    match memory
+        .load_recent_conversation_histories(MAX_CHANNEL_HISTORY, MAX_HYDRATED_SESSIONS)
+        .await
+    {
+        Ok(histories) => {
+            let mut hydrated: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+            for (session_key, turns) in histories {
+                let turns = turns
+                    .into_iter()
+                    .map(|turn| ChatMessage {
+                        role: turn.role,
+                        content: turn.content,
+                    })
+                    .collect::<Vec<_>>();
+                if !turns.is_empty() {
+                    hydrated.insert(session_key, normalize_cached_channel_turns(turns));
+                }
+            }
+            hydrated
+        }
+        Err(error) => {
+            tracing::warn!("Failed to hydrate channel histories from persistent store: {error}");
+            HashMap::new()
+        }
     }
 }
 
@@ -1949,7 +2020,17 @@ async fn process_channel_message(
         .is_some_and(|turns| !turns.is_empty());
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    let inbound_timestamp = to_rfc3339_timestamp(msg.timestamp);
+    append_sender_turn(
+        ctx.as_ref(),
+        &history_key,
+        &msg.channel,
+        &msg.sender,
+        ChatMessage::user(&msg.content),
+        inbound_timestamp.as_deref(),
+        Some(msg.id.as_str()),
+    )
+    .await;
 
     // Skip LLM call for group messages when mention_only is enabled and bot is not mentioned.
     let is_group = msg.reply_target.starts_with("group:")
@@ -2264,8 +2345,13 @@ async fn process_channel_message(
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
+                &msg.channel,
+                &msg.sender,
                 ChatMessage::assistant(&history_response),
-            );
+                None,
+                None,
+            )
+            .await;
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
@@ -3306,6 +3392,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    let conversation_histories = Arc::new(Mutex::new(load_persisted_histories(mem.as_ref()).await));
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -3911,7 +3998,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
-        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        conversation_histories,
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),
