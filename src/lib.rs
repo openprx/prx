@@ -69,6 +69,7 @@ pub(crate) mod security;
 pub mod self_system;
 pub(crate) mod service;
 pub mod session_worker;
+pub(crate) mod skillforge;
 pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod tunnel;

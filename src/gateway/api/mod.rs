@@ -39,6 +39,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/hooks", get(hooks::get_hooks))
         .route("/mcp/servers", get(mcp::get_mcp_servers))
         .route("/skills", get(skills::get_skills))
+        .route("/skills/discover", get(skills::discover_skills))
+        .route("/skills/install", post(skills::install_skill))
+        .route("/skills/{name}", delete(skills::uninstall_skill))
         // Phase 3: CRUD endpoints
         .route("/hooks", post(hooks::create_hook))
         .route("/hooks/{id}", put(hooks::update_hook))
