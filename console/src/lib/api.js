@@ -100,6 +100,11 @@ export const api = {
   },
   getChannelsStatus: () => request('/api/channels/status'),
   getConfig: () => request('/api/config'),
+  saveConfig: (data) =>
+    request('/api/config', {
+      method: 'POST',
+      body: JSON.stringify(data)
+    }),
   getHooks: () => request('/api/hooks'),
   getMcpServers: () => request('/api/mcp/servers'),
   getSkills: () => request('/api/skills')

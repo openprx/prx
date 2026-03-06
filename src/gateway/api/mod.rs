@@ -34,6 +34,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         // Phase 1: alias for frontend compatibility
         .route("/channels/status", get(channels::get_channels_status))
         .route("/config", get(config::get_config))
+        .route("/config", post(config::post_config))
         // Phase 2: read-only endpoints
         .route("/hooks", get(hooks::get_hooks))
         .route("/mcp/servers", get(mcp::get_mcp_servers))
