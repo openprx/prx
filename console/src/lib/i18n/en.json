@@ -12,6 +12,9 @@
     "sessions": "Sessions",
     "channels": "Channels",
     "config": "Config",
+    "hooks": "Hooks",
+    "mcp": "MCP",
+    "skills": "Skills",
     "logs": "Logs"
   },
   "common": {
@@ -134,6 +137,39 @@
     "resume": "Resume",
     "clear": "Clear",
     "waiting": "Waiting for log stream..."
+  },
+  "hooks": {
+    "title": "Hooks",
+    "loading": "Loading hooks...",
+    "noHooks": "No hooks configured.",
+    "addHook": "Add Hook",
+    "cancelAdd": "Cancel",
+    "newHook": "New Hook",
+    "event": "Event",
+    "command": "Command",
+    "commandPlaceholder": "e.g. /opt/scripts/on-event.sh",
+    "timeout": "Timeout (ms)",
+    "enabled": "Enabled",
+    "edit": "Edit",
+    "delete": "Delete",
+    "save": "Save",
+    "cancel": "Cancel"
+  },
+  "mcp": {
+    "title": "MCP Servers",
+    "loading": "Loading MCP servers...",
+    "noServers": "No MCP servers configured.",
+    "connected": "Connected",
+    "disconnected": "Disconnected",
+    "tools": "tools",
+    "availableTools": "Available Tools",
+    "noTools": "No tools available."
+  },
+  "skills": {
+    "title": "Skills",
+    "loading": "Loading skills...",
+    "noSkills": "No skills installed.",
+    "active": "active"
   },
   "login": {
     "title": "PRX Console Login",
