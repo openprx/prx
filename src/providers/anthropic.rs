@@ -1,9 +1,11 @@
+use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     Provider, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -91,6 +93,16 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    #[serde(rename = "image")]
+    Image { source: NativeImageSource },
+}
+
+#[derive(Debug, Serialize)]
+struct NativeImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,6 +165,8 @@ struct NativeContentIn {
 }
 
 impl AnthropicProvider {
+    const ANTHROPIC_BASE64_WARN_BYTES: usize = 20 * 1024 * 1024;
+
     pub fn new(credential: Option<&str>) -> Self {
         Self::with_base_url(credential, None)
     }
@@ -344,9 +358,107 @@ impl AnthropicProvider {
                     | NativeContentOut::ToolResult { cache_control, .. } => {
                         *cache_control = Some(CacheControl::ephemeral());
                     }
-                    NativeContentOut::ToolUse { .. } => {}
+                    NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
                 }
             }
+        }
+    }
+
+    fn parse_anthropic_image_source(image_ref: &str) -> Option<NativeImageSource> {
+        let rest = image_ref.strip_prefix("data:")?;
+        let (meta, data) = rest.split_once(',')?;
+        let media_type = meta.strip_suffix(";base64")?;
+        let cleaned_data: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        if media_type.is_empty() || cleaned_data.is_empty() {
+            return None;
+        }
+
+        let normalized_media_type = media_type.trim().to_ascii_lowercase();
+        let decoded_len = STANDARD.decode(&cleaned_data).ok().map(|bytes| bytes.len());
+        if let Some(decoded_len) = decoded_len {
+            if decoded_len > Self::ANTHROPIC_BASE64_WARN_BYTES {
+                tracing::warn!(
+                    media_type = normalized_media_type,
+                    size_bytes = decoded_len,
+                    limit_bytes = Self::ANTHROPIC_BASE64_WARN_BYTES,
+                    "Anthropic image payload exceeds recommended size limit"
+                );
+            }
+        } else {
+            tracing::warn!(
+                media_type = normalized_media_type,
+                "Anthropic image payload could not be base64-decoded during validation"
+            );
+        }
+
+        Some(NativeImageSource {
+            source_type: "base64".to_string(),
+            media_type: normalized_media_type,
+            data: cleaned_data,
+        })
+    }
+
+    fn push_text_block(blocks: &mut Vec<NativeContentOut>, text: &str) {
+        if !text.is_empty() {
+            blocks.push(NativeContentOut::Text {
+                text: text.to_string(),
+                cache_control: None,
+            });
+        }
+    }
+
+    fn convert_user_content(content: &str) -> Vec<NativeContentOut> {
+        let (_, image_refs) = multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return vec![NativeContentOut::Text {
+                text: content.to_string(),
+                cache_control: None,
+            }];
+        }
+
+        let mut blocks = Vec::new();
+        let mut cursor = 0usize;
+
+        while let Some(rel_start) = content[cursor..].find("[IMAGE:") {
+            let start = cursor + rel_start;
+            let marker_start = start + "[IMAGE:".len();
+
+            let Some(rel_end) = content[marker_start..].find(']') else {
+                Self::push_text_block(&mut blocks, &content[cursor..]);
+                return if blocks.is_empty() {
+                    vec![NativeContentOut::Text {
+                        text: content.to_string(),
+                        cache_control: None,
+                    }]
+                } else {
+                    blocks
+                };
+            };
+
+            let end = marker_start + rel_end;
+            let candidate = content[marker_start..end].trim();
+
+            if let Some(source) = Self::parse_anthropic_image_source(candidate) {
+                Self::push_text_block(&mut blocks, &content[cursor..start]);
+                blocks.push(NativeContentOut::Image { source });
+            } else {
+                Self::push_text_block(&mut blocks, &content[cursor..=end]);
+            }
+
+            cursor = end + 1;
+        }
+
+        if cursor < content.len() {
+            Self::push_text_block(&mut blocks, &content[cursor..]);
+        }
+
+        if blocks.is_empty() {
+            vec![NativeContentOut::Text {
+                text: content.to_string(),
+                cache_control: None,
+            }]
+        } else {
+            blocks
         }
     }
 
@@ -468,10 +580,7 @@ impl AnthropicProvider {
                 _ => {
                     native_messages.push(NativeMessage {
                         role: "user".to_string(),
-                        content: vec![NativeContentOut::Text {
-                            text: msg.content.clone(),
-                            cache_control: None,
-                        }],
+                        content: Self::convert_user_content(&msg.content),
                     });
                 }
             }
@@ -1376,6 +1485,45 @@ mod tests {
         assert_eq!(native_msgs[0].role, "user");
         assert_eq!(native_msgs[1].role, "assistant");
         assert_eq!(native_msgs[2].role, "user");
+    }
+
+    #[test]
+    fn convert_messages_splits_user_text_and_image_blocks() {
+        let messages = vec![ChatMessage::user(
+            "Look [IMAGE:data:image/png;base64,abcd==] now",
+        )];
+
+        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+
+        assert_eq!(native_msgs.len(), 1);
+        assert_eq!(native_msgs[0].role, "user");
+        assert_eq!(native_msgs[0].content.len(), 3);
+        match &native_msgs[0].content[0] {
+            NativeContentOut::Text { text, .. } => assert_eq!(text, "Look "),
+            other => panic!("expected text block, got {other:?}"),
+        }
+        match &native_msgs[0].content[1] {
+            NativeContentOut::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/png");
+                assert_eq!(source.data, "abcd==");
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+        match &native_msgs[0].content[2] {
+            NativeContentOut::Text { text, .. } => assert_eq!(text, " now"),
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_anthropic_image_source_strips_whitespace_from_base64_payload() {
+        let source =
+            AnthropicProvider::parse_anthropic_image_source("data:image/png;base64,Zm9v\n YmFy\t")
+                .expect("expected valid image source");
+
+        assert_eq!(source.media_type, "image/png");
+        assert_eq!(source.data, "Zm9vYmFy");
     }
 
     /// Integration test: spin up a mock Anthropic API server, call chat_with_tools

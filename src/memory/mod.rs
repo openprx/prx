@@ -28,9 +28,9 @@ pub use principal::MemoryWriteContext;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
-pub use traits::{LifecycleState, VerificationStatus};
+pub use traits::{ConversationSessionSummary, ConversationTurn, MemoryCategory, MemoryEntry};
 #[allow(unused_imports)]
-pub use traits::{MemoryCategory, MemoryEntry};
+pub use traits::{LifecycleState, VerificationStatus};
 
 use crate::config::{
     EmbeddingRouteConfig, IdentityBindingConfig, MemoryConfig, StorageProviderConfig,
