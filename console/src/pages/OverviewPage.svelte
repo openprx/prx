@@ -81,36 +81,36 @@
   <div class="flex items-center justify-between">
     <h2 class="text-2xl font-semibold">{t('overview.title')}</h2>
     {#if lastUpdated}
-      <span class="text-xs text-gray-400">{t('common.updatedAt', { time: lastUpdated })}</span>
+      <span class="text-xs text-gray-500 dark:text-gray-400">{t('common.updatedAt', { time: lastUpdated })}</span>
     {/if}
   </div>
 
   {#if loading}
-    <p class="text-sm text-gray-400">{t('overview.loading')}</p>
+    <p class="text-sm text-gray-500 dark:text-gray-400">{t('overview.loading')}</p>
   {:else if errorMessage}
-    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
       {errorMessage}
     </p>
   {:else}
     <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
       {#each cards as card}
-        <div class="rounded-xl border border-gray-700 bg-gray-800 p-4">
-          <p class="text-xs uppercase tracking-wide text-gray-400">{card.label}</p>
-          <p class="mt-2 text-lg font-semibold text-gray-100">{card.value}</p>
+        <div class="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
+          <p class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">{card.label}</p>
+          <p class="mt-2 text-lg font-semibold text-gray-900 dark:text-gray-100">{card.value}</p>
         </div>
       {/each}
     </div>
 
-    <div class="rounded-xl border border-gray-700 bg-gray-800 p-4">
-      <h3 class="text-sm font-semibold uppercase tracking-wide text-gray-300">
+    <div class="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
+      <h3 class="text-sm font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300">
         {t('overview.configuredChannels')}
       </h3>
       {#if channels.length === 0}
-        <p class="mt-3 text-sm text-gray-400">{t('overview.noChannelsConfigured')}</p>
+        <p class="mt-3 text-sm text-gray-500 dark:text-gray-400">{t('overview.noChannelsConfigured')}</p>
       {:else}
         <ul class="mt-3 flex flex-wrap gap-2">
           {#each channels as channel}
-            <li class="rounded-full border border-gray-600 bg-gray-900 px-3 py-1 text-sm text-gray-200">
+            <li class="rounded-full border border-gray-300 bg-gray-50 px-3 py-1 text-sm text-gray-700 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200">
               {channelLabel(channel)}
             </li>
           {/each}

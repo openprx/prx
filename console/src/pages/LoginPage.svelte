@@ -22,34 +22,34 @@
   }
 </script>
 
-<div class="flex min-h-screen items-center justify-center bg-gray-900 px-4 py-8 text-gray-100">
-  <div class="w-full max-w-md rounded-xl border border-gray-700 bg-gray-800 p-6 shadow-xl shadow-black/30">
+<div class="flex min-h-screen items-center justify-center bg-gray-50 px-4 py-8 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
+  <div class="w-full max-w-md rounded-xl border border-gray-200 bg-white p-6 shadow-xl shadow-black/10 dark:border-gray-700 dark:bg-gray-800 dark:shadow-black/30">
     <div class="flex items-center justify-between gap-3">
       <h1 class="text-2xl font-semibold tracking-tight">{t('login.title')}</h1>
       <button
         type="button"
         aria-label={t('app.language')}
         onclick={toggleLanguage}
-        class="rounded-lg border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-200 transition hover:bg-gray-700"
+        class="rounded-lg border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-700"
       >
         {i18n.lang === 'zh' ? '中文 / EN' : 'EN / 中文'}
       </button>
     </div>
-    <p class="mt-2 text-sm text-gray-400">{t('login.hint')}</p>
+    <p class="mt-2 text-sm text-gray-500 dark:text-gray-400">{t('login.hint')}</p>
 
     <form class="mt-6 space-y-4" onsubmit={submit}>
-      <label class="block text-sm font-medium text-gray-300" for="token">{t('login.accessToken')}</label>
+      <label class="block text-sm font-medium text-gray-600 dark:text-gray-300" for="token">{t('login.accessToken')}</label>
       <input
         id="token"
         type="password"
         bind:value={tokenInput}
-        class="w-full rounded-lg border border-gray-600 bg-gray-900 px-3 py-2 text-gray-100 outline-none ring-sky-500 transition focus:ring-2"
+        class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-gray-900 outline-none ring-sky-500 transition focus:ring-2 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100"
         placeholder={t('login.placeholder')}
         autocomplete="off"
       />
 
       {#if errorMessage}
-        <p class="text-sm text-red-400">{errorMessage}</p>
+        <p class="text-sm text-red-500 dark:text-red-400">{errorMessage}</p>
       {/if}
 
       <button
