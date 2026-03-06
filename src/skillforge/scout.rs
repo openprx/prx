@@ -103,6 +103,11 @@ impl GitHubScout {
         }
     }
 
+    /// Override the default search queries.
+    pub fn set_queries(&mut self, queries: Vec<String>) {
+        self.queries = queries;
+    }
+
     /// Parse the GitHub search/repositories JSON response.
     fn parse_items(body: &serde_json::Value) -> Vec<ScoutResult> {
         let items = match body.get("items").and_then(|v| v.as_array()) {

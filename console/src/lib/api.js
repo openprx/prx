@@ -107,7 +107,26 @@ export const api = {
     }),
   getHooks: () => request('/api/hooks'),
   getMcpServers: () => request('/api/mcp/servers'),
-  getSkills: () => request('/api/skills')
+  getSkills: () => request('/api/skills'),
+  discoverSkills: (source = 'github', query = '') => {
+    const params = new URLSearchParams();
+    if (source) params.set('source', source);
+    if (query) params.set('query', query);
+    return request(`/api/skills/discover?${params.toString()}`);
+  },
+  installSkill: (url, name) =>
+    request('/api/skills/install', {
+      method: 'POST',
+      body: JSON.stringify({ url, name })
+    }),
+  uninstallSkill: (name) =>
+    request(`/api/skills/${encodeURIComponent(name)}`, {
+      method: 'DELETE'
+    }),
+  toggleSkill: (id) =>
+    request(`/api/skills/${encodeURIComponent(id)}/toggle`, {
+      method: 'PATCH'
+    })
 };
 
 export { ApiError, apiBaseUrl };
