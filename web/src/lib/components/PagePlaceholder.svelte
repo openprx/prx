@@ -6,12 +6,11 @@
 		icon: Component;
 	}
 
-	let { title, icon }: Props = $props();
+	let { title, icon: Icon }: Props = $props();
 </script>
 
 <div class="placeholder">
 	<div class="placeholder-icon">
-		{@const Icon = icon}
 		<Icon size={32} strokeWidth={1.2} />
 	</div>
 	<h2>{title}</h2>

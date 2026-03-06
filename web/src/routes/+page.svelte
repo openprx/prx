@@ -42,10 +42,10 @@
 <div class="dashboard">
 	<div class="stats-grid">
 		{#each stats as card}
+			{@const Icon = card.icon}
 			<div class="stat-card">
 				<div class="stat-header">
 					<span class="stat-icon" style="color: {card.color}">
-						{@const Icon = card.icon}
 						<Icon size={18} strokeWidth={1.8} />
 					</span>
 					<span class="stat-label">{card.label}</span>
@@ -60,9 +60,9 @@
 		<h3 class="section-title">System</h3>
 		<div class="info-grid">
 			{#each infoRows as row}
+				{@const InfoIcon = row.icon}
 				<div class="info-row">
 					<div class="info-icon">
-						{@const InfoIcon = row.icon}
 						<InfoIcon size={15} strokeWidth={1.8} />
 					</div>
 					<span class="info-label">{row.label}</span>

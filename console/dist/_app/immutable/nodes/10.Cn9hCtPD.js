@@ -1,0 +1,1 @@
+import"../chunks/DbNN5fVb.js";import"../chunks/TIn0b6Wj.js";import{P as r}from"../chunks/DW0azDwt.js";import{S as t}from"../chunks/C_URp8tp.js";function m(o){r(o,{title:"Skills",get icon(){return t}})}export{m as component};

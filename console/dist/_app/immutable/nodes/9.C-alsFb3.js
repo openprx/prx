@@ -1,0 +1,1 @@
+import"../chunks/DbNN5fVb.js";import"../chunks/TIn0b6Wj.js";import{P as t}from"../chunks/DW0azDwt.js";import{M as r}from"../chunks/DUm8R7tb.js";function p(o){t(o,{title:"Sessions",get icon(){return r}})}export{p as component};

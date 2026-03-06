@@ -1,0 +1,1 @@
+import"../chunks/DbNN5fVb.js";import"../chunks/TIn0b6Wj.js";import{P as t}from"../chunks/DW0azDwt.js";import{W as e}from"../chunks/2cWn9RxA.js";function a(o){t(o,{title:"Hooks",get icon(){return e}})}export{a as component};
