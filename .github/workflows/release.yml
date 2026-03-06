@@ -61,9 +61,12 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Create swap (Linux)
-        if: runner.os == 'Linux' && !matrix.use_cross
+        if: runner.os == 'Linux'
+        continue-on-error: true
         run: |
-          sudo dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
