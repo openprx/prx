@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::memory::principal::MemoryWriteContext;
 
@@ -75,6 +76,29 @@ impl std::fmt::Display for MemoryCategory {
     }
 }
 
+/// Session metadata for persisted channel conversations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationSessionSummary {
+    pub session_key: String,
+    pub channel: String,
+    pub sender: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub message_count: u64,
+    pub last_message_preview: String,
+}
+
+/// A persisted conversation turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurn {
+    pub id: i64,
+    pub session_key: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
+    pub message_id: Option<String>,
+}
+
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -132,6 +156,73 @@ pub trait Memory: Send + Sync {
 
     /// Health check
     async fn health_check(&self) -> bool;
+
+    /// Append a persisted channel conversation turn.
+    ///
+    /// Backends without conversation persistence can no-op.
+    #[allow(clippy::too_many_arguments)]
+    async fn append_conversation_turn(
+        &self,
+        session_key: &str,
+        channel: &str,
+        sender: &str,
+        role: &str,
+        content: &str,
+        timestamp: Option<&str>,
+        message_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let _ = (
+            session_key,
+            channel,
+            sender,
+            role,
+            content,
+            timestamp,
+            message_id,
+        );
+        Ok(())
+    }
+
+    /// List persisted conversation sessions ordered by most recently updated.
+    async fn list_conversation_sessions(
+        &self,
+        limit: usize,
+        offset: usize,
+        channel: Option<&str>,
+    ) -> anyhow::Result<Vec<ConversationSessionSummary>> {
+        let _ = (limit, offset, channel);
+        Ok(Vec::new())
+    }
+
+    /// Get one persisted conversation session by key.
+    async fn get_conversation_session(
+        &self,
+        session_key: &str,
+    ) -> anyhow::Result<Option<ConversationSessionSummary>> {
+        let _ = session_key;
+        Ok(None)
+    }
+
+    /// List persisted turns for a conversation session (oldest first).
+    async fn list_conversation_turns(
+        &self,
+        session_key: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<ConversationTurn>> {
+        let _ = (session_key, limit, offset);
+        Ok(Vec::new())
+    }
+
+    /// Load recent turns per session for runtime history hydration.
+    async fn load_recent_conversation_histories(
+        &self,
+        max_turns_per_session: usize,
+        max_sessions: usize,
+    ) -> anyhow::Result<HashMap<String, Vec<ConversationTurn>>> {
+        let _ = (max_turns_per_session, max_sessions);
+        Ok(HashMap::new())
+    }
 }
 
 #[cfg(test)]
