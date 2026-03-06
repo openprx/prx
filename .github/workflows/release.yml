@@ -74,20 +74,22 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --bin openprx --target ${{ matrix.target }}
+        run: cross build --release --bin openprx --bin prx-node --target ${{ matrix.target }}
 
       - name: Build (native)
         if: "!matrix.use_cross"
-        run: cargo build --release --bin openprx --target ${{ matrix.target }}
+        run: cargo build --release --bin openprx --bin prx-node --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          chmod +x openprx
+          chmod +x openprx prx-node
           tar czf ../../../openprx-${{ matrix.suffix }}.tar.gz openprx
+          tar czf ../../../prx-node-${{ matrix.suffix }}.tar.gz prx-node
           cd ../../..
           sha256sum openprx-${{ matrix.suffix }}.tar.gz > openprx-${{ matrix.suffix }}.tar.gz.sha256
+          sha256sum prx-node-${{ matrix.suffix }}.tar.gz > prx-node-${{ matrix.suffix }}.tar.gz.sha256
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -95,8 +97,10 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path openprx.exe -DestinationPath ../../../openprx-${{ matrix.suffix }}.zip
+          Compress-Archive -Path prx-node.exe -DestinationPath ../../../prx-node-${{ matrix.suffix }}.zip
           cd ../../..
           Get-FileHash openprx-${{ matrix.suffix }}.zip -Algorithm SHA256 | Format-List Hash | Out-File openprx-${{ matrix.suffix }}.zip.sha256
+          Get-FileHash prx-node-${{ matrix.suffix }}.zip -Algorithm SHA256 | Format-List Hash | Out-File prx-node-${{ matrix.suffix }}.zip.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -104,6 +108,7 @@ jobs:
           name: openprx-${{ matrix.suffix }}
           path: |
             openprx-${{ matrix.suffix }}.*
+            prx-node-${{ matrix.suffix }}.*
           if-no-files-found: ignore
 
   release:
@@ -137,8 +142,20 @@ jobs:
 
             | Platform | Architecture | File |
             |----------|-------------|------|
+            ### openprx (AI daemon)
+            | Platform | Architecture | File |
+            |----------|-------------|------|
             | Linux | x86_64 | `openprx-linux-amd64.tar.gz` |
             | Linux | ARM64 | `openprx-linux-arm64.tar.gz` |
             | macOS | Intel | `openprx-macos-amd64.tar.gz` |
             | macOS | Apple Silicon | `openprx-macos-arm64.tar.gz` |
             | Windows | x86_64 | `openprx-windows-amd64.zip` |
+
+            ### prx-node (remote node agent)
+            | Platform | Architecture | File |
+            |----------|-------------|------|
+            | Linux | x86_64 | `prx-node-linux-amd64.tar.gz` |
+            | Linux | ARM64 | `prx-node-linux-arm64.tar.gz` |
+            | macOS | Intel | `prx-node-macos-amd64.tar.gz` |
+            | macOS | Apple Silicon | `prx-node-macos-arm64.tar.gz` |
+            | Windows | x86_64 | `prx-node-windows-amd64.zip` |
