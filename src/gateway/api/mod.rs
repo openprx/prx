@@ -5,14 +5,17 @@ use axum::{
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 
 mod channels;
 mod config;
+mod hooks;
 mod logs;
+mod mcp;
 mod sessions;
+mod skills;
 mod status;
 
 pub fn router(state: AppState) -> Router<AppState> {
@@ -28,11 +31,25 @@ pub fn router(state: AppState) -> Router<AppState> {
             post(sessions::post_session_message),
         )
         .route("/channels", get(channels::get_channels_status))
+        // Phase 1: alias for frontend compatibility
+        .route("/channels/status", get(channels::get_channels_status))
         .route("/config", get(config::get_config))
+        // Phase 2: read-only endpoints
+        .route("/hooks", get(hooks::get_hooks))
+        .route("/mcp/servers", get(mcp::get_mcp_servers))
+        .route("/skills", get(skills::get_skills))
+        // Phase 3: CRUD endpoints
+        .route("/hooks", post(hooks::create_hook))
+        .route("/hooks/{id}", put(hooks::update_hook))
+        .route("/hooks/{id}", delete(hooks::delete_hook))
+        .route("/hooks/{id}/toggle", patch(hooks::toggle_hook))
+        .route("/skills/{id}/toggle", patch(skills::toggle_skill))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware));
 
     Router::new()
         .route("/logs", get(logs::ws_handler))
+        // Phase 1: alias for frontend compatibility
+        .route("/logs/stream", get(logs::ws_handler))
         .route("/sessions/media", get(sessions::get_session_media))
         .merge(protected_routes)
 }

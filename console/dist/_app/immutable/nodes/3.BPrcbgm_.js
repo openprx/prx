@@ -1,1 +1,0 @@
-import"../chunks/DbNN5fVb.js";import"../chunks/TIn0b6Wj.js";import{P as t}from"../chunks/DW0azDwt.js";import{S as r}from"../chunks/BiM_rjMS.js";function m(o){t(o,{title:"Configuration",get icon(){return r}})}export{m as component};
