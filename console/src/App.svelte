@@ -3,6 +3,7 @@
   import { NAV_ITEMS } from './lib/constants';
   import { LANG_STORAGE_KEY, i18n, syncLanguageFromStorage, t, toggleLanguage } from './lib/i18n';
   import { currentPath, initRouter, navigate } from './lib/router';
+  import { Sun, Moon } from '@lucide/svelte';
 
   import LoginPage from './pages/LoginPage.svelte';
   import OverviewPage from './pages/OverviewPage.svelte';
@@ -18,6 +19,7 @@
   let path = $state(currentPath());
   let token = $state(getToken());
   let mobileSidebarOpen = $state(false);
+  let isDark = $state(true);
 
   const isAuthenticated = $derived(token.length > 0);
   const activePath = $derived(isAuthenticated && path === '/' ? '/overview' : path);
@@ -32,6 +34,30 @@
   const chatSessionId = $derived(
     activePath.startsWith('/chat/') ? safeDecodeSessionId(activePath.slice('/chat/'.length)) : ''
   );
+
+  function initTheme() {
+    const saved = localStorage.getItem('prx-console-theme');
+    if (saved === 'light') {
+      isDark = false;
+    } else {
+      isDark = true;
+    }
+    applyTheme();
+  }
+
+  function applyTheme() {
+    if (isDark) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }
+
+  function toggleTheme() {
+    isDark = !isDark;
+    localStorage.setItem('prx-console-theme', isDark ? 'dark' : 'light');
+    applyTheme();
+  }
 
   function refreshToken() {
     token = getToken();
@@ -58,6 +84,8 @@
   }
 
   $effect(() => {
+    initTheme();
+
     const stopRouter = initRouter(onRouteChange);
     const onStorage = (event) => {
       if (event.key === 'prx-console-token') {
@@ -67,6 +95,12 @@
 
       if (event.key === LANG_STORAGE_KEY) {
         syncLanguageFromStorage();
+      }
+
+      if (event.key === 'prx-console-theme') {
+        const saved = localStorage.getItem('prx-console-theme');
+        isDark = saved !== 'light';
+        applyTheme();
       }
     };
 
@@ -90,7 +124,7 @@
   });
 </script>
 
-<div class="min-h-screen bg-gray-900 text-gray-100">
+<div class="min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
   {#if !isAuthenticated}
     <LoginPage onLogin={onLogin} />
   {:else}
@@ -99,17 +133,17 @@
         <button
           type="button"
           aria-label={t('app.closeSidebar')}
-          class="fixed inset-0 z-30 bg-black/60 lg:hidden"
+          class="fixed inset-0 z-30 bg-black/30 dark:bg-black/60 lg:hidden"
           onclick={() => (mobileSidebarOpen = false)}
         ></button>
       {/if}
 
       <aside
-        class={`fixed inset-y-0 left-0 z-40 w-64 border-r border-gray-700 bg-gray-800 p-4 transition-transform lg:static lg:translate-x-0 ${
+        class={`fixed inset-y-0 left-0 z-40 w-64 border-r border-gray-200 bg-white p-4 transition-transform dark:border-gray-700 dark:bg-gray-800 lg:static lg:translate-x-0 ${
           mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
-        <div class="mb-4 border-b border-gray-700 pb-4">
+        <div class="mb-4 border-b border-gray-200 pb-4 dark:border-gray-700">
           <p class="text-lg font-semibold">{t('app.title')}</p>
         </div>
 
@@ -121,7 +155,7 @@
                 class={`w-full rounded-lg px-3 py-2 text-left text-sm transition ${
                 activeNavPath === item.path
                   ? 'bg-sky-600 text-white'
-                  : 'text-gray-300 hover:bg-gray-700 hover:text-gray-100'
+                  : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-gray-700 dark:hover:text-gray-100'
               }`}
             >
               {t(item.labelKey)}
@@ -131,11 +165,11 @@
       </aside>
 
       <div class="flex min-w-0 flex-1 flex-col">
-        <header class="sticky top-0 z-20 flex items-center justify-between border-b border-gray-700 bg-gray-900/95 px-4 py-3 backdrop-blur">
+        <header class="sticky top-0 z-20 flex items-center justify-between border-b border-gray-200 bg-white/95 px-4 py-3 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95">
           <div class="flex items-center gap-3">
             <button
               type="button"
-              class="rounded-lg border border-gray-700 px-2 py-1 text-sm text-gray-200 lg:hidden"
+              class="rounded-lg border border-gray-300 px-2 py-1 text-sm text-gray-700 dark:border-gray-700 dark:text-gray-200 lg:hidden"
               onclick={() => (mobileSidebarOpen = !mobileSidebarOpen)}
             >
               {t('app.menu')}
@@ -146,16 +180,28 @@
           <div class="flex items-center gap-2">
             <button
               type="button"
+              aria-label="Toggle theme"
+              onclick={toggleTheme}
+              class="rounded-lg border border-gray-300 bg-white p-2 text-gray-600 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
+            >
+              {#if isDark}
+                <Sun size={16} />
+              {:else}
+                <Moon size={16} />
+              {/if}
+            </button>
+            <button
+              type="button"
               aria-label={t('app.language')}
               onclick={toggleLanguage}
-              class="rounded-lg border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-200 transition hover:bg-gray-700"
+              class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
             >
               {i18n.lang === 'zh' ? '中文 / EN' : 'EN / 中文'}
             </button>
             <button
               type="button"
               onclick={logout}
-              class="rounded-lg border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-200 transition hover:bg-gray-700"
+              class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
             >
               {t('common.logout')}
             </button>

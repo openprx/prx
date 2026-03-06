@@ -66,24 +66,24 @@
   <div class="flex items-center justify-between">
     <h2 class="text-2xl font-semibold">{t('sessions.title')}</h2>
     {#if lastUpdated}
-      <span class="text-xs text-gray-400">{t('common.updatedAt', { time: lastUpdated })}</span>
+      <span class="text-xs text-gray-500 dark:text-gray-400">{t('common.updatedAt', { time: lastUpdated })}</span>
     {/if}
   </div>
 
   {#if loading}
-    <p class="text-sm text-gray-400">{t('sessions.loading')}</p>
+    <p class="text-sm text-gray-500 dark:text-gray-400">{t('sessions.loading')}</p>
   {:else if errorMessage}
-    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
       {errorMessage}
     </p>
   {:else if sessions.length === 0}
-    <p class="rounded-xl border border-gray-700 bg-gray-800 px-4 py-3 text-sm text-gray-300">
+    <p class="rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
       {t('sessions.none')}
     </p>
   {:else}
-    <div class="overflow-x-auto rounded-xl border border-gray-700 bg-gray-800">
-      <table class="min-w-full divide-y divide-gray-700 text-sm">
-        <thead class="bg-gray-900/50 text-left text-gray-300">
+    <div class="overflow-x-auto rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800">
+      <table class="min-w-full divide-y divide-gray-200 text-sm dark:divide-gray-700">
+        <thead class="bg-gray-50 text-left text-gray-600 dark:bg-gray-900/50 dark:text-gray-300">
           <tr>
             <th class="px-4 py-3 font-semibold">{t('sessions.sessionId')}</th>
             <th class="px-4 py-3 font-semibold">{t('sessions.sender')}</th>
@@ -92,10 +92,10 @@
             <th class="px-4 py-3 font-semibold">{t('sessions.lastMessage')}</th>
           </tr>
         </thead>
-        <tbody class="divide-y divide-gray-700 text-gray-200">
+        <tbody class="divide-y divide-gray-200 text-gray-700 dark:divide-gray-700 dark:text-gray-200">
           {#each sessions as session}
             <tr
-              class="cursor-pointer transition hover:bg-gray-700/40"
+              class="cursor-pointer transition hover:bg-gray-50 dark:hover:bg-gray-700/40"
               onclick={() => openSession(session.session_id)}
             >
               <td class="px-4 py-3 font-mono text-xs">{session.session_id}</td>

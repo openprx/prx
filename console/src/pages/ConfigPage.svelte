@@ -2,6 +2,11 @@
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
   import { highlightJson } from '../lib/jsonHighlight';
+  import {
+    Zap, Globe, MessageSquare, Bot, Brain, Shield, HeartPulse,
+    RefreshCw, Clock, GitBranch, BarChart3, Search, DollarSign,
+    Settings, Cable, BadgeCheck
+  } from '@lucide/svelte';
 
   // ── State ──────────────────────────────────────────────────────
   let config = $state(null);
@@ -15,11 +20,30 @@
   let showDiff = $state(false);
   let revealedFields = $state(new Set());
 
+  // ── Icon map ───────────────────────────────────────────────────
+  const ICON_MAP = {
+    provider: Zap,
+    gateway: Globe,
+    channels: MessageSquare,
+    agent: Bot,
+    memory: Brain,
+    security: Shield,
+    heartbeat: HeartPulse,
+    reliability: RefreshCw,
+    scheduler: Clock,
+    sessions_spawn: GitBranch,
+    observability: BarChart3,
+    web_search: Search,
+    cost: DollarSign,
+    runtime: Settings,
+    tunnel: Cable,
+    identity: BadgeCheck,
+  };
+
   // ── Schema Definition (hardcoded, Chinese descriptions) ────────
   const SCHEMA = {
     provider: {
       label: 'Provider 设置',
-      icon: '⚡',
       defaultOpen: true,
       fields: {
         api_key: { type: 'string', sensitive: true, label: 'API Key', desc: '当前 Provider 的 API 密钥。修改后需要重启生效', default: '' },
@@ -31,7 +55,6 @@
     },
     gateway: {
       label: 'Gateway 网关',
-      icon: '🌐',
       defaultOpen: true,
       fields: {
         'gateway.port': { type: 'number', label: '端口', desc: 'Gateway HTTP 服务端口号', default: 3000, min: 1, max: 65535 },
@@ -46,7 +69,6 @@
     },
     channels: {
       label: '消息通道',
-      icon: '💬',
       defaultOpen: true,
       fields: {
         'channels_config.message_timeout_secs': { type: 'number', label: '消息处理超时(秒)', desc: '单条消息处理的最大超时时间（LLM + 工具调用）', default: 300, min: 30, max: 3600 },
@@ -55,7 +77,6 @@
     },
     agent: {
       label: 'Agent 编排',
-      icon: '🤖',
       defaultOpen: false,
       fields: {
         'agent.max_tool_iterations': { type: 'number', label: '最大工具循环次数', desc: '每条用户消息最多执行多少轮工具调用。设 0 回退到默认 10', default: 10, min: 0, max: 100 },
@@ -70,7 +91,6 @@
     },
     memory: {
       label: '记忆存储',
-      icon: '🧠',
       defaultOpen: false,
       fields: {
         'memory.backend': { type: 'enum', label: '存储后端', desc: '记忆存储引擎类型', default: 'sqlite', options: ['sqlite', 'postgres', 'markdown', 'lucid', 'none'] },
@@ -91,7 +111,6 @@
     },
     security: {
       label: '安全策略',
-      icon: '🔒',
       defaultOpen: false,
       fields: {
         'autonomy.level': { type: 'enum', label: '自主级别', desc: 'read_only=只读，supervised=需审批（默认），full=完全自主', default: 'supervised', options: ['read_only', 'supervised', 'full'] },
@@ -105,7 +124,6 @@
     },
     heartbeat: {
       label: '心跳检测',
-      icon: '💓',
       defaultOpen: false,
       fields: {
         'heartbeat.enabled': { type: 'bool', label: '启用心跳', desc: '启用定期心跳检查', default: false },
@@ -116,7 +134,6 @@
     },
     reliability: {
       label: '可靠性',
-      icon: '🔄',
       defaultOpen: false,
       fields: {
         'reliability.provider_retries': { type: 'number', label: 'Provider 重试次数', desc: '调用 Provider 失败后的重试次数', default: 2, min: 0, max: 10 },
@@ -129,7 +146,6 @@
     },
     scheduler: {
       label: '调度器',
-      icon: '⏰',
       defaultOpen: false,
       fields: {
         'scheduler.enabled': { type: 'bool', label: '启用调度器', desc: '启用内置定时任务调度循环', default: true },
@@ -141,7 +157,6 @@
     },
     sessions_spawn: {
       label: '子进程管理',
-      icon: '🔀',
       defaultOpen: false,
       fields: {
         'sessions_spawn.default_mode': { type: 'enum', label: '默认模式', desc: '子进程默认执行模式', default: 'task', options: ['task', 'process'] },
@@ -153,7 +168,6 @@
     },
     observability: {
       label: '可观测性',
-      icon: '📊',
       defaultOpen: false,
       fields: {
         'observability.backend': { type: 'enum', label: '后端', desc: '可观测性后端类型', default: 'none', options: ['none', 'log', 'prometheus', 'otel'] },
@@ -163,7 +177,6 @@
     },
     web_search: {
       label: '网络搜索',
-      icon: '🔍',
       defaultOpen: false,
       fields: {
         'web_search.enabled': { type: 'bool', label: '启用搜索', desc: '启用网络搜索工具', default: false },
@@ -176,7 +189,6 @@
     },
     cost: {
       label: '成本控制',
-      icon: '💰',
       defaultOpen: false,
       fields: {
         'cost.enabled': { type: 'bool', label: '启用成本追踪', desc: '启用 API 调用成本追踪和预算控制', default: false },
@@ -187,7 +199,6 @@
     },
     runtime: {
       label: '运行时',
-      icon: '⚙️',
       defaultOpen: false,
       fields: {
         'runtime.kind': { type: 'enum', label: '运行时类型', desc: '命令执行环境：native=本机，docker=容器隔离', default: 'native', options: ['native', 'docker'] },
@@ -196,7 +207,6 @@
     },
     tunnel: {
       label: '隧道',
-      icon: '🚇',
       defaultOpen: false,
       fields: {
         'tunnel.provider': { type: 'enum', label: '隧道类型', desc: '将 Gateway 暴露到公网的隧道服务', default: 'none', options: ['none', 'cloudflare', 'tailscale', 'ngrok', 'custom'] },
@@ -204,7 +214,6 @@
     },
     identity: {
       label: '身份格式',
-      icon: '🪪',
       defaultOpen: false,
       fields: {
         'identity.format': { type: 'enum', label: '身份格式', desc: 'OpenClaw 或 AIEOS 身份文档格式', default: 'openclaw', options: ['openclaw', 'aieos'] },
@@ -409,14 +418,14 @@
       <button
         type="button"
         onclick={() => (showRawJson = !showRawJson)}
-        class="rounded-lg border border-gray-600 bg-gray-800 px-3 py-1.5 text-sm text-gray-300 transition hover:bg-gray-700"
+        class="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-600 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
       >
         {showRawJson ? '结构化编辑' : 'JSON 视图'}
       </button>
       <button
         type="button"
         onclick={copyToClipboard}
-        class="rounded-lg border border-gray-600 bg-gray-800 px-3 py-1.5 text-sm text-gray-300 transition hover:bg-gray-700"
+        class="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-600 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
       >
         复制 JSON
       </button>
@@ -424,44 +433,47 @@
   </div>
 
   {#if loading}
-    <p class="text-sm text-gray-400">加载配置中...</p>
+    <p class="text-sm text-gray-500 dark:text-gray-400">加载配置中...</p>
   {:else if errorMessage}
-    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
       {errorMessage}
     </p>
   {:else if showRawJson}
-    <div class="overflow-x-auto rounded-xl border border-gray-700 bg-gray-950 p-4">
-      <pre class="text-sm leading-6 text-gray-200"><code>{@html highlightedConfig}</code></pre>
+    <div class="overflow-x-auto rounded-xl border border-gray-200 bg-gray-50 p-4 dark:border-gray-700 dark:bg-gray-950">
+      <pre class="text-sm leading-6 text-gray-700 dark:text-gray-200"><code>{@html highlightedConfig}</code></pre>
     </div>
   {:else}
     <!-- Grouped config sections -->
     <div class="space-y-3">
       {#each Object.entries(SCHEMA) as [groupKey, group]}
-        <details class="group rounded-xl border border-gray-700 bg-gray-800" open={group.defaultOpen}>
-          <summary class="cursor-pointer select-none px-4 py-3 text-base font-semibold text-gray-100 flex items-center gap-2">
-            <span class="text-lg">{group.icon}</span>
+        {@const IconComponent = ICON_MAP[groupKey]}
+        <details class="group rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800" open={group.defaultOpen}>
+          <summary class="cursor-pointer select-none px-4 py-3 text-base font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+            {#if IconComponent}
+              <IconComponent size={18} class="text-gray-500 dark:text-gray-400" />
+            {/if}
             <span>{group.label}</span>
             {#if [...Object.keys(group.fields)].some(fp => changedFieldPaths.has(fp))}
               <span class="ml-2 inline-flex h-2 w-2 rounded-full bg-sky-500"></span>
             {/if}
           </summary>
 
-          <div class="border-t border-gray-700 px-4 py-3 space-y-3">
+          <div class="border-t border-gray-200 px-4 py-3 space-y-3 dark:border-gray-700">
             {#each Object.entries(group.fields) as [fieldPath, fieldDef]}
               {@const currentValue = getFieldValue(fieldPath)}
               {@const isChanged = changedFieldPaths.has(fieldPath)}
               {@const isRevealed = revealedFields.has(fieldPath)}
 
-              <div class="rounded-lg border p-3 transition-colors {isChanged ? 'border-sky-500/50 bg-sky-500/5' : 'border-gray-700 bg-gray-900/40'}">
+              <div class="rounded-lg border p-3 transition-colors {isChanged ? 'border-sky-500/50 bg-sky-500/5' : 'border-gray-200 bg-gray-50/40 dark:border-gray-700 dark:bg-gray-900/40'}">
                 <div class="flex items-start justify-between gap-3">
                   <div class="flex-1 min-w-0">
-                    <label class="block text-sm font-medium text-gray-200">
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-200">
                       {fieldDef.label}
                       {#if isChanged}
-                        <span class="ml-1.5 text-xs text-sky-400">已修改</span>
+                        <span class="ml-1.5 text-xs text-sky-500 dark:text-sky-400">已修改</span>
                       {/if}
                     </label>
-                    <p class="mt-0.5 text-xs text-gray-500">{fieldDef.desc}</p>
+                    <p class="mt-0.5 text-xs text-gray-400 dark:text-gray-500">{fieldDef.desc}</p>
                   </div>
 
                   <div class="flex-shrink-0 w-64">
@@ -470,7 +482,7 @@
                       <button
                         type="button"
                         onclick={() => updateField(fieldPath, !currentValue)}
-                        class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors {currentValue ? 'bg-sky-600' : 'bg-gray-600'}"
+                        class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors {currentValue ? 'bg-sky-600' : 'bg-gray-400 dark:bg-gray-600'}"
                       >
                         <span class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform {currentValue ? 'translate-x-6' : 'translate-x-1'}"></span>
                       </button>
@@ -480,7 +492,7 @@
                       <select
                         value={currentValue ?? fieldDef.default}
                         onchange={(e) => updateField(fieldPath, e.target.value)}
-                        class="w-full rounded-lg border border-gray-600 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-sky-500 focus:outline-none"
+                        class="w-full rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-700 focus:border-sky-500 focus:outline-none dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"
                       >
                         {#each fieldDef.options as option}
                           <option value={option}>{option || '(默认)'}</option>
@@ -501,7 +513,7 @@
                             : parseInt(e.target.value, 10);
                           if (!isNaN(v)) updateField(fieldPath, v);
                         }}
-                        class="w-full rounded-lg border border-gray-600 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-sky-500 focus:outline-none"
+                        class="w-full rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-700 focus:border-sky-500 focus:outline-none dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"
                         placeholder={String(fieldDef.default)}
                       />
 
@@ -515,12 +527,12 @@
                                 type="text"
                                 value={item}
                                 oninput={(e) => updateArrayItem(fieldPath, i, e.target.value)}
-                                class="flex-1 rounded border border-gray-600 bg-gray-900 px-2 py-1 text-sm text-gray-200 focus:border-sky-500 focus:outline-none"
+                                class="flex-1 rounded border border-gray-300 bg-white px-2 py-1 text-sm text-gray-700 focus:border-sky-500 focus:outline-none dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"
                               />
                               <button
                                 type="button"
                                 onclick={() => removeArrayItem(fieldPath, i)}
-                                class="rounded border border-gray-600 bg-gray-800 px-2 py-1 text-xs text-red-400 hover:bg-red-500/10"
+                                class="rounded border border-gray-300 bg-white px-2 py-1 text-xs text-red-500 hover:bg-red-500/10 dark:border-gray-600 dark:bg-gray-800 dark:text-red-400"
                               >×</button>
                             </div>
                           {/each}
@@ -528,7 +540,7 @@
                         <button
                           type="button"
                           onclick={() => addArrayItem(fieldPath)}
-                          class="rounded border border-dashed border-gray-600 px-2 py-1 text-xs text-gray-400 hover:border-sky-500 hover:text-sky-400"
+                          class="rounded border border-dashed border-gray-300 px-2 py-1 text-xs text-gray-500 hover:border-sky-500 hover:text-sky-500 dark:border-gray-600 dark:text-gray-400 dark:hover:border-sky-500 dark:hover:text-sky-400"
                         >+ 添加</button>
                       </div>
 
@@ -539,13 +551,13 @@
                           type={isRevealed ? 'text' : 'password'}
                           value={currentValue ?? ''}
                           oninput={(e) => updateField(fieldPath, e.target.value)}
-                          class="flex-1 rounded-lg border border-gray-600 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-sky-500 focus:outline-none"
+                          class="flex-1 rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-700 focus:border-sky-500 focus:outline-none dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"
                           placeholder={fieldDef.default || '未设置'}
                         />
                         <button
                           type="button"
                           onclick={() => toggleReveal(fieldPath)}
-                          class="rounded-lg border border-gray-600 bg-gray-800 px-2 text-xs text-gray-400 hover:text-gray-200"
+                          class="rounded-lg border border-gray-300 bg-white px-2 text-xs text-gray-500 hover:text-gray-700 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-400 dark:hover:text-gray-200"
                         >
                           {isRevealed ? '隐藏' : '显示'}
                         </button>
@@ -557,7 +569,7 @@
                         type="text"
                         value={currentValue ?? ''}
                         oninput={(e) => updateField(fieldPath, e.target.value)}
-                        class="w-full rounded-lg border border-gray-600 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-sky-500 focus:outline-none"
+                        class="w-full rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-700 focus:border-sky-500 focus:outline-none dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"
                         placeholder={fieldDef.default || '未设置'}
                       />
                     {/if}
@@ -573,14 +585,14 @@
 
   <!-- Save bar (fixed at bottom) -->
   {#if hasChanges && !loading && !showRawJson}
-    <div class="fixed bottom-0 left-0 right-0 z-50 border-t border-gray-700 bg-gray-900/95 px-6 py-3 backdrop-blur-sm">
+    <div class="fixed bottom-0 left-0 right-0 z-50 border-t border-gray-200 bg-white/95 px-6 py-3 backdrop-blur-sm dark:border-gray-700 dark:bg-gray-900/95">
       <div class="mx-auto flex max-w-5xl items-center justify-between gap-4">
         <div class="flex items-center gap-3">
-          <span class="text-sm text-sky-400">{changedFields.length} 项更改</span>
+          <span class="text-sm text-sky-600 dark:text-sky-400">{changedFields.length} 项更改</span>
           <button
             type="button"
             onclick={() => (showDiff = !showDiff)}
-            class="text-sm text-gray-400 underline hover:text-gray-200"
+            class="text-sm text-gray-500 underline hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
           >
             {showDiff ? '隐藏详情' : '查看详情'}
           </button>
@@ -589,7 +601,7 @@
           <button
             type="button"
             onclick={discardChanges}
-            class="rounded-lg border border-gray-600 bg-gray-800 px-4 py-2 text-sm text-gray-300 hover:bg-gray-700"
+            class="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
           >
             放弃修改
           </button>
@@ -606,16 +618,16 @@
 
       <!-- Diff panel -->
       {#if showDiff}
-        <div class="mx-auto mt-3 max-w-5xl rounded-lg border border-gray-700 bg-gray-950 p-3">
-          <p class="mb-2 text-xs font-medium text-gray-400">变更详情</p>
+        <div class="mx-auto mt-3 max-w-5xl rounded-lg border border-gray-200 bg-gray-50 p-3 dark:border-gray-700 dark:bg-gray-950">
+          <p class="mb-2 text-xs font-medium text-gray-500 dark:text-gray-400">变更详情</p>
           <div class="space-y-1.5 max-h-48 overflow-y-auto">
             {#each changedFields as change}
               <div class="flex items-start gap-2 text-xs">
-                <span class="flex-shrink-0 text-gray-500">{change.group}</span>
-                <span class="font-medium text-gray-300">{change.label}</span>
-                <span class="text-red-400 line-through">{formatValue(change.oldVal)}</span>
-                <span class="text-gray-600">→</span>
-                <span class="text-green-400">{formatValue(change.newVal)}</span>
+                <span class="flex-shrink-0 text-gray-400 dark:text-gray-500">{change.group}</span>
+                <span class="font-medium text-gray-600 dark:text-gray-300">{change.label}</span>
+                <span class="text-red-500 line-through dark:text-red-400">{formatValue(change.oldVal)}</span>
+                <span class="text-gray-400 dark:text-gray-600">→</span>
+                <span class="text-green-600 dark:text-green-400">{formatValue(change.newVal)}</span>
               </div>
             {/each}
           </div>
@@ -626,7 +638,7 @@
 
   <!-- Save message toast -->
   {#if saveMessage}
-    <div class="fixed bottom-20 left-1/2 z-50 -translate-x-1/2 rounded-lg border px-4 py-2 text-sm shadow-lg {saveMessage.startsWith('保存失败') ? 'border-red-500/30 bg-red-500/10 text-red-300' : 'border-green-500/30 bg-green-500/10 text-green-300'}">
+    <div class="fixed bottom-20 left-1/2 z-50 -translate-x-1/2 rounded-lg border px-4 py-2 text-sm shadow-lg {saveMessage.startsWith('保存失败') ? 'border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-300' : 'border-green-500/30 bg-green-500/10 text-green-700 dark:text-green-300'}">
       {saveMessage}
     </div>
   {/if}

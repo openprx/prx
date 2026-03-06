@@ -13,7 +13,6 @@
       servers = Array.isArray(response?.servers) ? response.servers : [];
       errorMessage = '';
     } catch {
-      // API not implemented yet - use mock data
       servers = [
         {
           name: 'filesystem',
@@ -68,26 +67,26 @@
     <button
       type="button"
       onclick={refreshServers}
-      class="rounded-lg border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-200 transition hover:bg-gray-700"
+      class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
     >
       {t('common.refresh')}
     </button>
   </div>
 
   {#if loading}
-    <p class="text-sm text-gray-400">{t('mcp.loading')}</p>
+    <p class="text-sm text-gray-500 dark:text-gray-400">{t('mcp.loading')}</p>
   {:else if errorMessage}
-    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
       {errorMessage}
     </p>
   {:else if servers.length === 0}
-    <p class="rounded-xl border border-gray-700 bg-gray-800 px-4 py-3 text-sm text-gray-300">
+    <p class="rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
       {t('mcp.noServers')}
     </p>
   {:else}
     <div class="space-y-4">
       {#each servers as server}
-        <article class="rounded-xl border border-gray-700 bg-gray-800">
+        <article class="rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800">
           <button
             type="button"
             onclick={() => toggleExpand(server.name)}
@@ -95,41 +94,41 @@
           >
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-3">
-                <h3 class="text-lg font-semibold text-gray-100">{server.name}</h3>
+                <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{server.name}</h3>
                 <span
                   class={`rounded-full px-2 py-1 text-xs font-medium ${
                     server.status === 'connected'
-                      ? 'border border-green-500/50 bg-green-500/20 text-green-300'
-                      : 'border border-red-500/50 bg-red-500/20 text-red-300'
+                      ? 'border border-green-500/50 bg-green-500/20 text-green-700 dark:text-green-300'
+                      : 'border border-red-500/50 bg-red-500/20 text-red-700 dark:text-red-300'
                   }`}
                 >
                   {server.status === 'connected' ? t('mcp.connected') : t('mcp.disconnected')}
                 </span>
               </div>
-              <p class="mt-1 font-mono text-sm text-gray-400">{server.url}</p>
+              <p class="mt-1 font-mono text-sm text-gray-500 dark:text-gray-400">{server.url}</p>
             </div>
-            <span class="text-xs text-gray-500">
+            <span class="text-xs text-gray-400 dark:text-gray-500">
               {server.tools?.length ?? 0} {t('mcp.tools')}
             </span>
           </button>
 
           {#if expandedServer === server.name && server.tools && server.tools.length > 0}
-            <div class="border-t border-gray-700 p-4">
-              <h4 class="mb-3 text-sm font-medium uppercase tracking-wide text-gray-400">{t('mcp.availableTools')}</h4>
+            <div class="border-t border-gray-200 p-4 dark:border-gray-700">
+              <h4 class="mb-3 text-sm font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">{t('mcp.availableTools')}</h4>
               <div class="grid gap-2">
                 {#each server.tools as tool}
-                  <div class="rounded-lg border border-gray-700 bg-gray-900/60 p-3">
-                    <p class="font-mono text-sm font-medium text-gray-200">{tool.name}</p>
+                  <div class="rounded-lg border border-gray-200 bg-gray-50/60 p-3 dark:border-gray-700 dark:bg-gray-900/60">
+                    <p class="font-mono text-sm font-medium text-gray-700 dark:text-gray-200">{tool.name}</p>
                     {#if tool.description}
-                      <p class="mt-1 text-xs text-gray-400">{tool.description}</p>
+                      <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{tool.description}</p>
                     {/if}
                   </div>
                 {/each}
               </div>
             </div>
           {:else if expandedServer === server.name && (!server.tools || server.tools.length === 0)}
-            <div class="border-t border-gray-700 p-4">
-              <p class="text-sm text-gray-400">{t('mcp.noTools')}</p>
+            <div class="border-t border-gray-200 p-4 dark:border-gray-700">
+              <p class="text-sm text-gray-500 dark:text-gray-400">{t('mcp.noTools')}</p>
             </div>
           {/if}
         </article>

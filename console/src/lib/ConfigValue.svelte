@@ -1,6 +1,7 @@
 <script>
   import ConfigValue from './ConfigValue.svelte';
   import { t } from './i18n';
+  import { Lock } from '@lucide/svelte';
 
   let { value } = $props();
 
@@ -89,32 +90,32 @@
 </script>
 
 {#if isRedacted(value)}
-  <span class="inline-flex items-center gap-2 rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-200">
-    <span aria-hidden="true">🔒</span>
+  <span class="inline-flex items-center gap-2 rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-700 dark:text-amber-200">
+    <Lock size={12} aria-hidden="true" />
     <span>•••</span>
   </span>
 {:else if typeof value === 'boolean'}
   <span
     class={`inline-flex rounded-full border px-2.5 py-1 text-xs font-medium ${
       value
-        ? 'border-green-500/50 bg-green-500/20 text-green-300'
-        : 'border-red-500/50 bg-red-500/20 text-red-300'
+        ? 'border-green-500/50 bg-green-500/20 text-green-700 dark:text-green-300'
+        : 'border-red-500/50 bg-red-500/20 text-red-700 dark:text-red-300'
     }`}
   >
     {value ? t('common.enabled') : t('common.disabled')}
   </span>
 {:else if value === null || value === undefined}
-  <span class="text-sm text-gray-500">{t('config.field.notSet')}</span>
+  <span class="text-sm text-gray-400 dark:text-gray-500">{t('config.field.notSet')}</span>
 {:else if Array.isArray(value)}
   {#if value.length === 0}
-    <span class="text-sm text-gray-500">{t('common.empty')}</span>
+    <span class="text-sm text-gray-400 dark:text-gray-500">{t('common.empty')}</span>
   {:else if primitiveArray}
-    <span class="text-sm text-gray-100 break-all">{value.map((item) => formatPrimitive(item)).join(', ')}</span>
+    <span class="text-sm text-gray-900 break-all dark:text-gray-100">{value.map((item) => formatPrimitive(item)).join(', ')}</span>
   {:else}
     <div class="space-y-2">
       {#each value as item, index}
-        <div class="rounded-lg border border-gray-700/80 bg-gray-900/70 p-2">
-          <p class="mb-1 text-xs text-gray-400">#{index + 1}</p>
+        <div class="rounded-lg border border-gray-200/80 bg-gray-50/70 p-2 dark:border-gray-700/80 dark:bg-gray-900/70">
+          <p class="mb-1 text-xs text-gray-500 dark:text-gray-400">#{index + 1}</p>
           <ConfigValue value={item} />
         </div>
       {/each}
@@ -122,13 +123,13 @@
   {/if}
 {:else if isPlainObject(value)}
   {#if objectEntries.length === 0}
-    <span class="text-sm text-gray-500">{t('config.emptyObject')}</span>
+    <span class="text-sm text-gray-400 dark:text-gray-500">{t('config.emptyObject')}</span>
   {:else}
     <div class="space-y-2">
       {#each objectEntries as [key, nestedValue]}
-        <div class="rounded-lg border border-gray-700/80 bg-gray-900/70 p-2">
-          <p class="text-xs font-medium uppercase tracking-wide text-gray-400">{humanizeKey(key)}</p>
-          <div class="mt-1 text-sm text-gray-100">
+        <div class="rounded-lg border border-gray-200/80 bg-gray-50/70 p-2 dark:border-gray-700/80 dark:bg-gray-900/70">
+          <p class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">{humanizeKey(key)}</p>
+          <div class="mt-1 text-sm text-gray-900 dark:text-gray-100">
             <ConfigValue value={nestedValue} />
           </div>
         </div>
@@ -136,5 +137,5 @@
     </div>
   {/if}
 {:else}
-  <span class="text-sm text-gray-100 break-all">{formatPrimitive(value)}</span>
+  <span class="text-sm text-gray-900 break-all dark:text-gray-100">{formatPrimitive(value)}</span>
 {/if}

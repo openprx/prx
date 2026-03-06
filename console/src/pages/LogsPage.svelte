@@ -19,10 +19,10 @@
 
   const statusTone = $derived(
     connectionStatus === 'connected'
-      ? 'border-green-500/50 bg-green-500/15 text-green-300'
+      ? 'border-green-500/50 bg-green-500/15 text-green-700 dark:text-green-300'
       : connectionStatus === 'reconnecting'
-        ? 'border-amber-500/50 bg-amber-500/15 text-amber-200'
-        : 'border-red-500/50 bg-red-500/15 text-red-300'
+        ? 'border-amber-500/50 bg-amber-500/15 text-amber-700 dark:text-amber-200'
+        : 'border-red-500/50 bg-red-500/15 text-red-700 dark:text-red-300'
   );
   const statusLabel = $derived(
     connectionStatus === 'connected'
@@ -184,14 +184,14 @@
       <button
         type="button"
         onclick={togglePause}
-        class="rounded-lg border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-200 transition hover:bg-gray-700"
+        class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
       >
         {paused ? t('logs.resume') : t('logs.pause')}
       </button>
       <button
         type="button"
         onclick={clearLines}
-        class="rounded-lg border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-200 transition hover:bg-gray-700"
+        class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
       >
         {t('logs.clear')}
       </button>
@@ -200,15 +200,15 @@
 
   <div
     bind:this={logViewport}
-    class="h-[65vh] overflow-y-auto rounded-xl border border-gray-700 bg-gray-950 p-4 font-mono text-xs leading-5 text-green-300"
+    class="h-[65vh] overflow-y-auto rounded-xl border border-gray-200 bg-gray-50 p-4 font-mono text-xs leading-5 text-green-800 dark:border-gray-700 dark:bg-gray-950 dark:text-green-300"
   >
     {#if lines.length === 0}
-      <p class="text-gray-500">{t('logs.waiting')}</p>
+      <p class="text-gray-400 dark:text-gray-500">{t('logs.waiting')}</p>
     {:else}
       <ol class="space-y-1">
         {#each lines as line, index}
           <li class="whitespace-pre-wrap break-words">
-            <span class="mr-3 select-none text-gray-600">{String(index + 1).padStart(4, '0')}</span>
+            <span class="mr-3 select-none text-gray-400 dark:text-gray-600">{String(index + 1).padStart(4, '0')}</span>
             <span>{line}</span>
           </li>
         {/each}

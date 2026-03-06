@@ -3,6 +3,7 @@
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
   import { navigate } from '../lib/router';
+  import { Paperclip } from '@lucide/svelte';
 
   const MAX_FILES = 10;
   const IMAGE_VIDEO_MARKER_REGEX =
@@ -31,10 +32,10 @@
     }
 
     if (role === 'assistant') {
-      return 'mr-auto max-w-[85%] rounded-2xl rounded-bl-md bg-gray-700 px-4 py-2 text-gray-100';
+      return 'mr-auto max-w-[85%] rounded-2xl rounded-bl-md bg-gray-200 px-4 py-2 text-gray-900 dark:bg-gray-700 dark:text-gray-100';
     }
 
-    return 'mx-auto max-w-[90%] rounded-lg bg-gray-800/60 px-3 py-1.5 text-center text-xs text-gray-400';
+    return 'mx-auto max-w-[90%] rounded-lg bg-gray-100/60 px-3 py-1.5 text-center text-xs text-gray-500 dark:bg-gray-800/60 dark:text-gray-400';
   }
 
   function isImageFile(file) {
@@ -328,11 +329,11 @@
   <div class="flex items-center justify-between">
     <div class="min-w-0">
       <h2 class="text-2xl font-semibold">{t('chat.title')}</h2>
-      <p class="truncate font-mono text-xs text-gray-400">{t('chat.session')}: {sessionId}</p>
+      <p class="truncate font-mono text-xs text-gray-500 dark:text-gray-400">{t('chat.session')}: {sessionId}</p>
     </div>
     <button
       type="button"
-      class="rounded-lg border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-200 hover:bg-gray-700"
+      class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
       onclick={goBack}
     >
       {t('chat.back')}
@@ -340,13 +341,13 @@
   </div>
 
   {#if errorMessage}
-    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+    <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
       {errorMessage}
     </p>
   {/if}
 
   <div
-    class="flex min-h-0 flex-1 flex-col rounded-xl border border-gray-700 bg-gray-800"
+    class="flex min-h-0 flex-1 flex-col rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800"
     role="region"
     aria-label="Chat messages"
     ondragenter={handleDragEnter}
@@ -359,14 +360,14 @@
       bind:this={scrollContainer}
     >
       {#if dragActive}
-        <p class="mb-3 rounded-lg border border-blue-500/40 bg-blue-500/15 px-3 py-2 text-sm text-blue-200">
+        <p class="mb-3 rounded-lg border border-blue-500/40 bg-blue-500/15 px-3 py-2 text-sm text-blue-700 dark:text-blue-200">
           Drop files to attach ({selectedFiles.length}/{MAX_FILES} selected)
         </p>
       {/if}
       {#if loading}
-        <p class="text-sm text-gray-400">{t('chat.loading')}</p>
+        <p class="text-sm text-gray-500 dark:text-gray-400">{t('chat.loading')}</p>
       {:else if messages.length === 0}
-        <p class="text-sm text-gray-400">{t('chat.empty')}</p>
+        <p class="text-sm text-gray-500 dark:text-gray-400">{t('chat.empty')}</p>
       {:else}
         <div class="space-y-3">
           {#each messages as message}
@@ -380,7 +381,7 @@
                   <img
                     src={resolveMediaSource(segment.value)}
                     alt="Attachment"
-                    class="mt-2 max-h-80 max-w-full rounded-lg border border-gray-600/40 object-contain"
+                    class="mt-2 max-h-80 max-w-full rounded-lg border border-gray-300/40 object-contain dark:border-gray-600/40"
                     loading="lazy"
                   />
                 {:else if segment.kind === 'video'}
@@ -388,7 +389,7 @@
                   <video
                     src={resolveMediaSource(segment.value)}
                     controls
-                    class="mt-2 max-h-80 max-w-full rounded-lg border border-gray-600/40"
+                    class="mt-2 max-h-80 max-w-full rounded-lg border border-gray-300/40 dark:border-gray-600/40"
                   ></video>
                 {/if}
               {/each}
@@ -398,7 +399,7 @@
       {/if}
     </div>
 
-    <form class="border-t border-gray-700 p-3" onsubmit={handleSubmit}>
+    <form class="border-t border-gray-200 p-3 dark:border-gray-700" onsubmit={handleSubmit}>
       <input
         bind:this={fileInput}
         type="file"
@@ -409,37 +410,37 @@
       />
 
       {#if selectedFiles.length > 0}
-        <div class="mb-3 space-y-2 rounded-lg border border-gray-700 bg-gray-900/70 p-2.5">
-          <p class="text-xs text-gray-300">Attachments ({selectedFiles.length}/{MAX_FILES})</p>
+        <div class="mb-3 space-y-2 rounded-lg border border-gray-200 bg-gray-50/70 p-2.5 dark:border-gray-700 dark:bg-gray-900/70">
+          <p class="text-xs text-gray-600 dark:text-gray-300">Attachments ({selectedFiles.length}/{MAX_FILES})</p>
           <div class="max-h-44 space-y-2 overflow-y-auto pr-1">
             {#each selectedFiles as record (record.id)}
-              <div class="flex items-center gap-2 rounded-md border border-gray-700 bg-gray-800/90 p-2">
+              <div class="flex items-center gap-2 rounded-md border border-gray-200 bg-white/90 p-2 dark:border-gray-700 dark:bg-gray-800/90">
                 {#if record.isImage}
                   <img
                     src={record.previewUrl}
                     alt={record.name}
-                    class="h-12 w-12 rounded border border-gray-600 object-cover"
+                    class="h-12 w-12 rounded border border-gray-300 object-cover dark:border-gray-600"
                   />
                 {:else if record.isVideo}
                   <video
                     src={record.previewUrl}
-                    class="h-12 w-12 rounded border border-gray-600 object-cover"
+                    class="h-12 w-12 rounded border border-gray-300 object-cover dark:border-gray-600"
                     muted
                   ></video>
                 {:else}
                   <div
-                    class="flex h-12 w-12 items-center justify-center rounded border border-gray-600 bg-gray-700 text-lg text-gray-200"
+                    class="flex h-12 w-12 items-center justify-center rounded border border-gray-300 bg-gray-100 text-lg text-gray-700 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
                   >
                     DOC
                   </div>
                 {/if}
                 <div class="min-w-0 flex-1">
-                  <p class="truncate text-sm text-gray-100">{record.name}</p>
-                  <p class="truncate text-xs text-gray-400">{record.type} · {formatFileSize(record.size)}</p>
+                  <p class="truncate text-sm text-gray-900 dark:text-gray-100">{record.name}</p>
+                  <p class="truncate text-xs text-gray-500 dark:text-gray-400">{record.type} · {formatFileSize(record.size)}</p>
                 </div>
                 <button
                   type="button"
-                  class="rounded px-2 py-1 text-xs text-gray-300 hover:bg-gray-700 hover:text-white"
+                  class="rounded px-2 py-1 text-xs text-gray-600 hover:bg-gray-200 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-gray-700 dark:hover:text-white"
                   onclick={() => removeFile(record.id)}
                 >
                   Remove
@@ -455,16 +456,16 @@
           bind:value={draftMessage}
           rows="2"
           placeholder={t('chat.inputPlaceholder')}
-          class="min-h-[2.75rem] flex-1 resize-y rounded-lg border border-gray-600 bg-gray-900 px-3 py-2 text-sm text-gray-100 outline-none focus:border-blue-500"
+          class="min-h-[2.75rem] flex-1 resize-y rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 outline-none focus:border-blue-500 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100"
         ></textarea>
         <button
           type="button"
           title="Attach files"
-          class="rounded-lg border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-200 hover:border-gray-500 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+          class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-600 hover:border-gray-400 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:border-gray-500 dark:hover:bg-gray-700"
           onclick={openFilePicker}
           disabled={sending || selectedFiles.length >= MAX_FILES}
         >
-          📎
+          <Paperclip size={16} />
         </button>
         <button
           type="submit"
