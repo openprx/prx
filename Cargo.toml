@@ -219,9 +219,15 @@ codegen-units = 8    # Parallel codegen — CI runners need this (codegen-units=
 strip = true          # Remove debug symbols
 panic = "abort"      # Reduce binary size
 
+[profile.ci]
+inherits = "release"
+lto = false           # No LTO — CI runners only have 7GB RAM
+codegen-units = 16    # More units = less memory per unit
+opt-level = 2         # Standard optimization (less memory than "z")
+
 [profile.release-fast]
 inherits = "release"
-codegen-units = 8    # Parallel codegen for faster builds on powerful machines (16GB+ RAM recommended)
+codegen-units = 8
                      # Use: cargo build --profile release-fast
 
 [profile.dist]

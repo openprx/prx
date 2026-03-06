@@ -14,10 +14,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: openprx
-  # Disable LTO in CI to prevent OOM on 7GB runners.
-  # Local builds still use thin LTO from Cargo.toml [profile.release].
-  CARGO_PROFILE_RELEASE_LTO: "off"
 
 jobs:
   build:
@@ -88,22 +84,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-ci
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --bin openprx --bin prx-node --target ${{ matrix.target }}
+        run: cross build --profile ci --bin openprx --bin prx-node --target ${{ matrix.target }}
 
       - name: Build (native)
         if: "!matrix.use_cross"
         env:
           CARGO_BUILD_JOBS: "2"
-        run: cargo build --release --bin openprx --bin prx-node --target ${{ matrix.target }}
+        run: cargo build --profile ci --bin openprx --bin prx-node --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
+          cd target/${{ matrix.target }}/ci
           chmod +x openprx prx-node
           tar czf ../../../openprx-${{ matrix.suffix }}.tar.gz openprx
           tar czf ../../../prx-node-${{ matrix.suffix }}.tar.gz prx-node
@@ -115,7 +111,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cd target/${{ matrix.target }}/release
+          cd target/${{ matrix.target }}/ci
           Compress-Archive -Path openprx.exe -DestinationPath ../../../openprx-${{ matrix.suffix }}.zip
           Compress-Archive -Path prx-node.exe -DestinationPath ../../../prx-node-${{ matrix.suffix }}.zip
           cd ../../..
@@ -160,8 +156,6 @@ jobs:
 
             Self-evolving AI assistant framework.
 
-            | Platform | Architecture | File |
-            |----------|-------------|------|
             ### openprx (AI daemon)
             | Platform | Architecture | File |
             |----------|-------------|------|
