@@ -68,8 +68,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev
           # Add swap for release builds (LTO + matrix-sdk is memory-hungry)
-          sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile
-          sudo mkswap /swapfile && sudo swapon /swapfile
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=4096 2>/dev/null
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
 
       - uses: Swatinem/rust-cache@v2
         with:
