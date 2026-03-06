@@ -53,25 +53,23 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: '25.x'
-
       - name: Install cross
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Install system deps (Linux native)
+      - name: Install system deps (Linux)
         if: runner.os == 'Linux' && !matrix.use_cross
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev
-          # Add swap for release builds (LTO + matrix-sdk is memory-hungry)
-          sudo dd if=/dev/zero of=/swapfile bs=1M count=4096 2>/dev/null
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install system deps (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc --yes
 
       - uses: Swatinem/rust-cache@v2
         with:
