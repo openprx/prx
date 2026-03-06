@@ -29,3 +29,7 @@ venv/
 *.pem
 credentials.json
 .worktrees/
+
+# Web console
+web/node_modules/
+web/.svelte-kit/

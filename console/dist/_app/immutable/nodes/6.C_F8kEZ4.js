@@ -1,0 +1,1 @@
+import"../chunks/DbNN5fVb.js";import"../chunks/TIn0b6Wj.js";import{P as o}from"../chunks/DW0azDwt.js";import{P as r}from"../chunks/BlR5lXlm.js";function a(e){o(e,{title:"MCP Servers",get icon(){return r}})}export{a as component};

@@ -58,8 +58,7 @@
 				class:active={isActive(item.href, $page.url.pathname)}
 				title={$sidebarCollapsed ? item.label : ''}
 			>
-				{@const Icon = item.icon}
-				<Icon size={18} strokeWidth={1.8} />
+				<item.icon size={18} strokeWidth={1.8} />
 				{#if !$sidebarCollapsed}
 					<span class="nav-label">{item.label}</span>
 				{/if}
