@@ -2065,8 +2065,13 @@ async fn process_channel_message(
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
+                &msg.channel,
+                &msg.sender,
                 ChatMessage::assistant(&fallback),
-            );
+                None,
+                None,
+            )
+            .await;
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),

@@ -61,6 +61,7 @@ pub struct SubAgentRun {
     pub task: String,
     pub started_at: DateTime<Utc>,
     pub status: SubAgentStatus,
+    pub recipient: Option<String>,
     /// Handle to abort the spawned tokio task (supports kill action).
     pub abort_handle: Option<tokio::task::AbortHandle>,
     /// Accumulated conversation history from the sub-agent's execution.
@@ -654,6 +655,7 @@ impl Tool for SessionsSpawnTool {
                     task: task.to_string(),
                     started_at: Utc::now(),
                     status: SubAgentStatus::Running,
+                    recipient: recipient.clone(),
                     abort_handle: None,
                     history: history_arc,
                     steer_tx: None,
@@ -759,6 +761,8 @@ impl Tool for SessionsSpawnTool {
                         }
                     };
 
+                    let announce = format_announce_message(&rid, &status, &result_text);
+
                     {
                         let mut runs = active_runs.write().await;
                         if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
@@ -768,7 +772,6 @@ impl Tool for SessionsSpawnTool {
                     }
 
                     if let Some(target) = recipient {
-                        let announce = format!("🤖 Sub-agent `{rid}` completed:\n\n{result_text}");
                         let msg = SendMessage::new(&announce, &target);
                         if let Err(error) = channel.send(&msg).await {
                             tracing::error!(
@@ -810,6 +813,7 @@ impl Tool for SessionsSpawnTool {
                 task: task.to_string(),
                 started_at: Utc::now(),
                 status: SubAgentStatus::Running,
+                recipient: recipient.clone(),
                 abort_handle: None,
                 history: history_arc.clone(),
                 steer_tx: Some(steer_tx),
@@ -929,6 +933,8 @@ impl Tool for SessionsSpawnTool {
                     }
                 };
 
+                let announce = format_announce_message(&rid, &status, &result_text);
+
                 // Update run status
                 {
                     let mut runs = active_runs.write().await;
@@ -940,7 +946,6 @@ impl Tool for SessionsSpawnTool {
 
                 // Announce result back to channel if we have a recipient
                 if let Some(target) = recipient {
-                    let announce = format!("🤖 Sub-agent `{rid}` completed:\n\n{result_text}");
                     let msg = SendMessage::new(&announce, &target);
                     if let Err(e) = channel.send(&msg).await {
                         tracing::error!(run_id = %rid, "Failed to announce sub-agent result: {e}");
@@ -1018,38 +1023,62 @@ impl SessionsSpawnTool {
 
     /// Kill a running sub-agent by its run ID.
     async fn execute_kill(&self, run_id: &str) -> anyhow::Result<ToolResult> {
-        let mut runs = self.active_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-            match &run.status {
-                SubAgentStatus::Running => {
-                    if let Some(ref ah) = run.abort_handle {
-                        ah.abort();
+        let (recipient_opt, rid) = {
+            let mut runs = self.active_runs.write().await;
+            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+                match &run.status {
+                    SubAgentStatus::Running => {
+                        if let Some(ah) = run.abort_handle.as_ref() {
+                            ah.abort();
+                        }
+                        let recipient = run.recipient.clone();
+                        let rid = run.id.clone();
+                        run.status = SubAgentStatus::Failed("killed by user".into());
+                        run.steer_tx = None;
+                        (recipient, rid)
                     }
-                    run.status = SubAgentStatus::Failed("killed by user".into());
-                    Ok(ToolResult {
-                        success: true,
-                        output: format!("Sub-agent `{run_id}` has been killed."),
-                        error: None,
-                    })
+                    SubAgentStatus::Completed(_) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Run `{run_id}` already completed.")),
+                        });
+                    }
+                    SubAgentStatus::Failed(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Run `{run_id}` already failed: {e}")),
+                        });
+                    }
                 }
-                SubAgentStatus::Completed(_) => Ok(ToolResult {
+            } else {
+                return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Run `{run_id}` already completed.")),
-                }),
-                SubAgentStatus::Failed(e) => Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Run `{run_id}` already failed: {e}")),
-                }),
+                    error: Some(format!("No run found with ID `{run_id}`.")),
+                });
+            }
+        };
+
+        if let Some(target) = recipient_opt {
+            let msg_text = format!("🤖 Sub-agent `{rid}` was killed by user.");
+            let msg = SendMessage::new(&msg_text, &target);
+            if let Err(error) = self.channel.send(&msg).await {
+                tracing::error!(run_id = %rid, "Failed to announce sub-agent kill: {error}");
             }
         } else {
-            Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("No run found with ID `{run_id}`.")),
-            })
+            tracing::warn!(
+                run_id = %rid,
+                "Sub-agent was killed but no recipient configured for announcement"
+            );
         }
+
+        Ok(ToolResult {
+            success: true,
+            output: format!("Sub-agent `{run_id}` has been killed."),
+            error: None,
+        })
     }
 
     /// Return the conversation history of a sub-agent run.
@@ -1175,6 +1204,15 @@ fn memory_key_prefix(agent_name: &str, key: &str) -> String {
         key.to_string()
     } else {
         format!("{agent_name}:{key}")
+    }
+}
+
+fn format_announce_message(rid: &str, status: &SubAgentStatus, result_text: &str) -> String {
+    match status {
+        SubAgentStatus::Completed(_) => {
+            format!("🤖 Sub-agent `{rid}` completed:\n\n{result_text}")
+        }
+        _ => format!("🤖 Sub-agent `{rid}` FAILED:\n\n{result_text}"),
     }
 }
 
