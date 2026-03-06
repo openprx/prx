@@ -12,6 +12,9 @@
     "sessions": "会话",
     "channels": "通道",
     "config": "配置",
+    "hooks": "Hooks",
+    "mcp": "MCP",
+    "skills": "Skills",
     "logs": "日志"
   },
   "common": {
@@ -134,6 +137,39 @@
     "resume": "继续",
     "clear": "清空",
     "waiting": "等待日志流..."
+  },
+  "hooks": {
+    "title": "Hooks",
+    "loading": "正在加载 Hooks...",
+    "noHooks": "尚未配置任何 Hook。",
+    "addHook": "添加 Hook",
+    "cancelAdd": "取消",
+    "newHook": "新建 Hook",
+    "event": "事件",
+    "command": "命令",
+    "commandPlaceholder": "例如 /opt/scripts/on-event.sh",
+    "timeout": "超时 (ms)",
+    "enabled": "启用",
+    "edit": "编辑",
+    "delete": "删除",
+    "save": "保存",
+    "cancel": "取消"
+  },
+  "mcp": {
+    "title": "MCP 服务",
+    "loading": "正在加载 MCP 服务...",
+    "noServers": "尚未配置任何 MCP 服务。",
+    "connected": "已连接",
+    "disconnected": "已断开",
+    "tools": "个工具",
+    "availableTools": "可用工具",
+    "noTools": "无可用工具。"
+  },
+  "skills": {
+    "title": "Skills",
+    "loading": "正在加载 Skills...",
+    "noSkills": "尚未安装任何 Skill。",
+    "active": "已启用"
   },
   "login": {
     "title": "PRX 控制台登录",

@@ -11,6 +11,9 @@
   import ChannelsPage from './pages/ChannelsPage.svelte';
   import ConfigPage from './pages/ConfigPage.svelte';
   import LogsPage from './pages/LogsPage.svelte';
+  import HooksPage from './pages/HooksPage.svelte';
+  import McpPage from './pages/McpPage.svelte';
+  import SkillsPage from './pages/SkillsPage.svelte';
 
   let path = $state(currentPath());
   let token = $state(getToken());
@@ -168,6 +171,12 @@
             <ChatPage sessionId={chatSessionId} />
           {:else if activePath === '/channels'}
             <ChannelsPage />
+          {:else if activePath === '/hooks'}
+            <HooksPage />
+          {:else if activePath === '/mcp'}
+            <McpPage />
+          {:else if activePath === '/skills'}
+            <SkillsPage />
           {:else if activePath === '/config'}
             <ConfigPage />
           {:else if activePath === '/logs'}

@@ -1,0 +1,177 @@
+<script lang="ts">
+	import {
+		Server,
+		Radio,
+		Monitor,
+		Brain,
+		Activity,
+		Clock,
+		Puzzle,
+		Network
+	} from 'lucide-svelte';
+
+	interface StatCard {
+		label: string;
+		value: string;
+		sub: string;
+		icon: any;
+		color: string;
+	}
+
+	const stats: StatCard[] = [
+		{ label: 'Providers', value: '0', sub: 'configured', icon: Server, color: 'var(--accent)' },
+		{ label: 'Channels', value: '0', sub: 'active', icon: Radio, color: 'var(--success)' },
+		{ label: 'Sessions', value: '0', sub: 'running', icon: Monitor, color: 'var(--warning)' },
+		{ label: 'Memory', value: '0', sub: 'entries', icon: Brain, color: '#a78bfa' }
+	];
+
+	interface InfoRow {
+		label: string;
+		value: string;
+		icon: any;
+	}
+
+	const infoRows: InfoRow[] = [
+		{ label: 'Uptime', value: '--', icon: Activity },
+		{ label: 'Cron Jobs', value: '0 active', icon: Clock },
+		{ label: 'MCP Servers', value: '0 connected', icon: Puzzle },
+		{ label: 'Nodes', value: '0 paired', icon: Network }
+	];
+</script>
+
+<div class="dashboard">
+	<div class="stats-grid">
+		{#each stats as card}
+			<div class="stat-card">
+				<div class="stat-header">
+					<span class="stat-icon" style="color: {card.color}">
+						{@const Icon = card.icon}
+						<Icon size={18} strokeWidth={1.8} />
+					</span>
+					<span class="stat-label">{card.label}</span>
+				</div>
+				<div class="stat-value">{card.value}</div>
+				<div class="stat-sub">{card.sub}</div>
+			</div>
+		{/each}
+	</div>
+
+	<div class="info-section">
+		<h3 class="section-title">System</h3>
+		<div class="info-grid">
+			{#each infoRows as row}
+				<div class="info-row">
+					<div class="info-icon">
+						{@const InfoIcon = row.icon}
+						<InfoIcon size={15} strokeWidth={1.8} />
+					</div>
+					<span class="info-label">{row.label}</span>
+					<span class="info-value">{row.value}</span>
+				</div>
+			{/each}
+		</div>
+	</div>
+</div>
+
+<style>
+	.dashboard {
+		max-width: 960px;
+	}
+
+	.stats-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+		gap: 12px;
+		margin-bottom: 24px;
+	}
+
+	.stat-card {
+		background: var(--bg-card);
+		border: 1px solid var(--border-color);
+		border-radius: 8px;
+		padding: 16px;
+	}
+
+	.stat-header {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-bottom: 12px;
+	}
+
+	.stat-icon {
+		display: flex;
+	}
+
+	.stat-label {
+		font-size: 12px;
+		color: var(--text-secondary);
+		font-weight: 500;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+	}
+
+	.stat-value {
+		font-size: 28px;
+		font-weight: 600;
+		color: var(--text-primary);
+		line-height: 1.2;
+	}
+
+	.stat-sub {
+		font-size: 12px;
+		color: var(--text-muted);
+		margin-top: 2px;
+	}
+
+	.info-section {
+		background: var(--bg-card);
+		border: 1px solid var(--border-color);
+		border-radius: 8px;
+		padding: 16px;
+	}
+
+	.section-title {
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--text-secondary);
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		margin-bottom: 12px;
+	}
+
+	.info-grid {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.info-row {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 8px 0;
+		border-bottom: 1px solid var(--border-color);
+	}
+
+	.info-row:last-child {
+		border-bottom: none;
+	}
+
+	.info-icon {
+		color: var(--text-muted);
+		display: flex;
+	}
+
+	.info-label {
+		font-size: 13px;
+		color: var(--text-secondary);
+		flex: 1;
+	}
+
+	.info-value {
+		font-size: 13px;
+		color: var(--text-primary);
+		font-weight: 500;
+	}
+</style>

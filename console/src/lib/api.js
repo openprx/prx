@@ -99,7 +99,10 @@ export const api = {
     return `${apiBaseUrl}/api/sessions/media?${params.toString()}`;
   },
   getChannelsStatus: () => request('/api/channels/status'),
-  getConfig: () => request('/api/config')
+  getConfig: () => request('/api/config'),
+  getHooks: () => request('/api/hooks'),
+  getMcpServers: () => request('/api/mcp/servers'),
+  getSkills: () => request('/api/skills')
 };
 
 export { ApiError, apiBaseUrl };
