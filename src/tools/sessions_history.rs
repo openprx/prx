@@ -142,6 +142,7 @@ mod tests {
             task: "test task".to_string(),
             started_at: Utc::now(),
             status,
+            recipient: None,
             abort_handle: None,
             history: Arc::new(RwLock::new(entries)),
             steer_tx: None,
