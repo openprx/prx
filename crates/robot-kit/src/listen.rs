@@ -71,7 +71,7 @@ impl ListenTool {
         let whisper_path = &self.config.audio.whisper_path;
         let model = &self.config.audio.whisper_model;
 
-        // whisper.cpp model path (typically in ~/.zeroclaw/models/)
+        // whisper.cpp model path (typically in ~/.openprx/models/)
         let model_path = directories::UserDirs::new()
             .map(|d| {
                 d.home_dir()

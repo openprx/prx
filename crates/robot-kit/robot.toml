@@ -1,5 +1,5 @@
-# ZeroClaw Robot Kit Configuration
-# Copy to ~/.zeroclaw/robot.toml
+# OpenPRX Kit Configuration
+# Copy to ~/.openprx/robot.toml
 
 # =============================================================================
 # DRIVE SYSTEM

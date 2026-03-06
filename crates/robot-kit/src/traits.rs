@@ -66,7 +66,7 @@ pub struct ToolSpec {
 /// # Example
 ///
 /// ```rust,ignore
-/// use zeroclaw_robot_kit::{Tool, ToolResult};
+/// use openprx_kit::{Tool, ToolResult};
 /// use async_trait::async_trait;
 /// use serde_json::{json, Value};
 ///

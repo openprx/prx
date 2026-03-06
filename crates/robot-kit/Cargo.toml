@@ -1,11 +1,11 @@
 [package]
-name = "zeroclaw-robot-kit"
+name = "openprx-kit"
 version = "0.1.0"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "MIT"
-description = "Robot control toolkit for ZeroClaw - drive, vision, speech, sensors, safety"
-repository = "https://github.com/zeroclaw-labs/zeroclaw"
+description = "Robot control toolkit for OpenPRX - drive, vision, speech, sensors, safety"
+repository = "https://github.com/openprx/prx"
 readme = "README.md"
 keywords = ["robotics", "raspberry-pi", "ai", "agent", "ros2"]
 categories = ["science::robotics", "embedded", "hardware-support"]
