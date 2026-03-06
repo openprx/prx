@@ -45,6 +45,29 @@ pub enum AuthStyle {
 }
 
 impl OpenAiCompatibleProvider {
+    fn requires_http1_only(&self) -> bool {
+        let normalized = self.base_url.to_ascii_lowercase();
+        normalized.contains("dashscope") || normalized.contains("coding-intl")
+    }
+
+    fn should_skip_warmup(&self) -> bool {
+        self.requires_http1_only()
+    }
+
+    fn http_client_builder(&self) -> reqwest::ClientBuilder {
+        let builder = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .user_agent("OpenPRX/0.1");
+        let builder = if self.requires_http1_only() {
+            builder.http1_only()
+        } else {
+            builder
+        };
+
+        crate::config::apply_runtime_proxy_to_builder(builder, "provider.compatible")
+    }
+
     pub fn new(
         name: &str,
         base_url: &str,
@@ -156,12 +179,7 @@ impl OpenAiCompatibleProvider {
                 headers.insert(USER_AGENT, value);
             }
 
-            let builder = Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .default_headers(headers);
-            let builder =
-                crate::config::apply_runtime_proxy_to_builder(builder, "provider.compatible");
+            let builder = self.http_client_builder().default_headers(headers);
 
             return builder.build().unwrap_or_else(|error| {
                 tracing::warn!("Failed to build proxied timeout client with user-agent: {error}");
@@ -169,7 +187,10 @@ impl OpenAiCompatibleProvider {
             });
         }
 
-        crate::config::build_runtime_proxy_client_with_timeouts("provider.compatible", 120, 10)
+        self.http_client_builder().build().unwrap_or_else(|error| {
+            tracing::warn!("Failed to build proxied timeout client: {error}");
+            Client::new()
+        })
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
@@ -1542,6 +1563,10 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
+        if self.should_skip_warmup() {
+            return Ok(());
+        }
+
         if let Some(credential) = self.credential.as_ref() {
             // Hit the chat completions URL with a GET to establish the connection pool.
             // The server will likely return 405 Method Not Allowed, which is fine -

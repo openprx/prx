@@ -1,0 +1,144 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: openprx
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            suffix: linux-amd64
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            suffix: linux-arm64
+            use_cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            suffix: macos-amd64
+            use_cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            suffix: macos-arm64
+            use_cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            suffix: windows-amd64
+            use_cross: false
+
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.use_cross }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: '25.x'
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install system deps (Linux native)
+        if: runner.os == 'Linux' && !matrix.use_cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --bin openprx --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release --bin openprx --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          chmod +x openprx
+          tar czf ../../../openprx-${{ matrix.suffix }}.tar.gz openprx
+          cd ../../..
+          sha256sum openprx-${{ matrix.suffix }}.tar.gz > openprx-${{ matrix.suffix }}.tar.gz.sha256
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path openprx.exe -DestinationPath ../../../openprx-${{ matrix.suffix }}.zip
+          cd ../../..
+          Get-FileHash openprx-${{ matrix.suffix }}.zip -Algorithm SHA256 | Format-List Hash | Out-File openprx-${{ matrix.suffix }}.zip.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openprx-${{ matrix.suffix }}
+          path: |
+            openprx-${{ matrix.suffix }}.*
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+      - name: Create or Update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: OpenPRX ${{ steps.tag.outputs.tag }}
+          files: artifacts/*
+          body: |
+            ## OpenPRX ${{ steps.tag.outputs.tag }}
+
+            Self-evolving AI assistant framework.
+
+            | Platform | Architecture | File |
+            |----------|-------------|------|
+            | Linux | x86_64 | `openprx-linux-amd64.tar.gz` |
+            | Linux | ARM64 | `openprx-linux-arm64.tar.gz` |
+            | macOS | Intel | `openprx-macos-amd64.tar.gz` |
+            | macOS | Apple Silicon | `openprx-macos-arm64.tar.gz` |
+            | Windows | x86_64 | `openprx-windows-amd64.zip` |
