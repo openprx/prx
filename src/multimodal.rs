@@ -479,7 +479,10 @@ mod tests {
         let path = std::path::Path::new("photo.png");
         let mime = super::detect_mime(Some(path), jpeg_magic, None)
             .expect("should detect JPEG from magic bytes");
-        assert_eq!(mime, "image/jpeg", "magic bytes should override .png extension");
+        assert_eq!(
+            mime, "image/jpeg",
+            "magic bytes should override .png extension"
+        );
     }
 
     #[test]
