@@ -130,8 +130,8 @@ bash ./models/download-ggml-model.sh base
 
 # Install
 sudo cp main /usr/local/bin/whisper-cpp
-mkdir -p ~/.zeroclaw/models
-cp models/ggml-base.bin ~/.zeroclaw/models/
+mkdir -p ~/.openprx/models
+cp models/ggml-base.bin ~/.openprx/models/
 ```
 
 ### 5. Install Piper TTS (Text-to-Speech)
@@ -143,13 +143,13 @@ tar -xzf piper_arm64.tar.gz
 sudo cp piper/piper /usr/local/bin/
 
 # Download voice model
-mkdir -p ~/.zeroclaw/models/piper
-cd ~/.zeroclaw/models/piper
+mkdir -p ~/.openprx/models/piper
+cd ~/.openprx/models/piper
 wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
 wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
 
 # Test
-echo "Hello, I am your robot!" | piper --model ~/.zeroclaw/models/piper/en_US-lessac-medium.onnx --output_file test.wav
+echo "Hello, I am your robot!" | piper --model ~/.openprx/models/piper/en_US-lessac-medium.onnx --output_file test.wav
 aplay test.wav
 ```
 
@@ -167,7 +167,7 @@ sudo usermod -aG dialout $USER
 # Logout and login for group change to take effect
 ```
 
-### 7. Build ZeroClaw Robot Kit
+### 7. Build OpenPRX Kit
 
 ```bash
 # Clone repo (or copy from USB)
@@ -175,7 +175,7 @@ git clone https://github.com/theonlyhennygod/zeroclaw
 cd zeroclaw
 
 # Build robot kit
-cargo build --release -p zeroclaw-robot-kit
+cargo build --release -p openprx-kit
 
 # Build main zeroclaw (optional, if using as agent)
 cargo build --release
@@ -186,12 +186,12 @@ cargo build --release
 ### Create robot.toml
 
 ```bash
-mkdir -p ~/.zeroclaw
-nano ~/.zeroclaw/robot.toml
+mkdir -p ~/.openprx
+nano ~/.openprx/robot.toml
 ```
 
 ```toml
-# ~/.zeroclaw/robot.toml - Real Hardware Configuration
+# ~/.openprx/robot.toml - Real Hardware Configuration
 
 # =============================================================================
 # DRIVE SYSTEM
@@ -292,7 +292,7 @@ arecord -D plughw:1,0 -f S16_LE -r 16000 -c 1 -d 3 test.wav
 aplay test.wav
 
 # Test speaker
-echo "Testing speaker" | piper --model ~/.zeroclaw/models/piper/en_US-lessac-medium.onnx --output_file - | aplay -D plughw:0,0
+echo "Testing speaker" | piper --model ~/.openprx/models/piper/en_US-lessac-medium.onnx --output_file - | aplay -D plughw:0,0
 
 # Test Ollama
 curl http://localhost:11434/api/generate -d '{"model":"llama3.2:3b","prompt":"Say hello"}'
@@ -358,7 +358,7 @@ nohup python3 ~/sensor_loop.py &
 
 ```bash
 # Configure ZeroClaw to use robot tools
-cat > ~/.zeroclaw/config.toml << 'EOF'
+cat > ~/.openprx/config.toml << 'EOF'
 api_key = ""  # Not needed for local Ollama
 default_provider = "ollama"
 default_model = "llama3.2:3b"
@@ -373,7 +373,7 @@ workspace_only = true
 EOF
 
 # Copy robot personality
-cp ~/zeroclaw/crates/robot-kit/SOUL.md ~/.zeroclaw/workspace/
+cp ~/zeroclaw/crates/robot-kit/SOUL.md ~/.openprx/workspace/
 
 # Start agent
 ./target/release/zeroclaw agent

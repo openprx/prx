@@ -1,4 +1,4 @@
-//! # ZeroClaw Robot Kit
+//! # OpenPRX Kit
 //!
 //! A standalone robotics toolkit that integrates with ZeroClaw for AI-powered robots.
 //!
@@ -22,7 +22,7 @@
 //!                       │ Tool calls
 //!                       ▼
 //! ┌─────────────────────────────────────────────────────────┐
-//! │  zeroclaw-robot-kit                                     │
+//! │  openprx-kit                                     │
 //! │  ┌─────────┐ ┌──────┐ ┌────────┐ ┌───────┐ ┌───────┐   │
 //! │  │ drive   │ │ look │ │ listen │ │ speak │ │ sense │   │
 //! │  └────┬────┘ └──┬───┘ └───┬────┘ └───┬───┘ └───┬───┘   │
@@ -46,7 +46,7 @@
 //! ## Quick Start
 //!
 //! ```rust,ignore
-//! use zeroclaw_robot_kit::{RobotConfig, DriveTool, SafetyMonitor, SafeDrive};
+//! use openprx_kit::{RobotConfig, DriveTool, SafetyMonitor, SafeDrive};
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]
