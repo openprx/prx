@@ -4021,6 +4021,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "openprx-kit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "directories",
+ "reqwest",
+ "rppal 0.19.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "toml 1.0.1+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7980,27 +8001,6 @@ dependencies = [
  "quote",
  "syn 2.0.116",
  "synstructure",
-]
-
-[[package]]
-name = "zeroclaw-robot-kit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "directories",
- "reqwest",
- "rppal 0.19.0",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "toml 1.0.1+spec-1.1.0",
- "tracing",
 ]
 
 [[package]]
