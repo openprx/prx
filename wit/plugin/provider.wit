@@ -1,0 +1,34 @@
+/// Provider capability interface for WASM plugins.
+///
+/// Plugins implementing this world can serve as LLM providers.
+/// The host delegates chat requests to the plugin when its provider name matches.
+interface provider-exports {
+    /// A chat message in a conversation.
+    record chat-message {
+        role: string,
+        content: string,
+    }
+
+    /// A tool call requested by the LLM.
+    record tool-call {
+        id: string,
+        name: string,
+        arguments: string,
+    }
+
+    /// Response from a chat completion.
+    record chat-response {
+        text: option<string>,
+        tool-calls: list<tool-call>,
+    }
+
+    /// Get the provider name.
+    name: func() -> string;
+
+    /// Execute a chat completion.
+    chat: func(
+        messages: list<chat-message>,
+        model: string,
+        temperature: f64,
+    ) -> result<chat-response, string>;
+}
