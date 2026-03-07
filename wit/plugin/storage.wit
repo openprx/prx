@@ -1,0 +1,42 @@
+/// Storage capability interface for WASM plugins.
+///
+/// Plugins implementing this world can serve as custom Memory backends
+/// (e.g., Pinecone, Qdrant, custom vector stores).
+interface storage-exports {
+    /// A memory entry returned from recall.
+    record memory-entry {
+        id: string,
+        key: string,
+        content: string,
+        category: string,
+        timestamp: string,
+        score: option<f64>,
+    }
+
+    /// Get the storage backend name.
+    name: func() -> string;
+
+    /// Store a memory entry.
+    store-memory: func(
+        key: string,
+        content: string,
+        category: string,
+        session-id: option<string>,
+    ) -> result<_, string>;
+
+    /// Recall memories matching a query.
+    recall-memory: func(
+        query: string,
+        limit: u32,
+        session-id: option<string>,
+    ) -> result<list<memory-entry>, string>;
+
+    /// Forget (delete) a memory by key.
+    forget-memory: func(key: string) -> result<bool, string>;
+
+    /// Count total memories.
+    count-memories: func() -> result<u32, string>;
+
+    /// Health check.
+    health-check: func() -> bool;
+}
