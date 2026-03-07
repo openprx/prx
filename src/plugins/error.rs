@@ -35,6 +35,9 @@ pub enum PluginError {
     #[error("resource limit exceeded: {0}")]
     ResourceLimit(String),
 
+    #[error("execution timeout after {0}ms")]
+    Timeout(u64),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -1,0 +1,26 @@
+/// Tool capability interface for WASM plugins.
+///
+/// Plugins implementing this world can be registered as LLM-callable tools.
+/// The host calls get-spec() once at load time and caches the result.
+/// execute() is called each time the LLM invokes the tool.
+interface tool-exports {
+    /// Tool specification for LLM registration.
+    record tool-spec {
+        name: string,
+        description: string,
+        parameters-schema: string,
+    }
+
+    /// Result of a tool execution.
+    record plugin-result {
+        success: bool,
+        output: string,
+        error: option<string>,
+    }
+
+    /// Get the tool specification (called once at load time).
+    get-spec: func() -> tool-spec;
+
+    /// Execute the tool with JSON arguments.
+    execute: func(args: string) -> plugin-result;
+}
