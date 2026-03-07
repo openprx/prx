@@ -1,0 +1,23 @@
+[plugin]
+name        = "{{.PluginName}}"
+version     = "0.1.0"
+description = "{{.Description}}"
+author      = "{{.Author}}"
+wasm        = "plugin.wasm"
+
+[[capabilities]]
+type        = "tool"
+name        = "{{.ToolName}}"
+description = "{{.Description}}"
+
+[permissions]
+required = ["log"]
+optional = ["kv", "http-outbound"]
+
+[resources]
+max_fuel              = 100_000_000
+max_memory_mb         = 8
+max_execution_time_ms = 1000
+
+[config]
+# Add your configuration keys here
