@@ -3,6 +3,8 @@
 //! Cron plugins declare a schedule in their manifest and export a `run`
 //! function that is called by the scheduler when the schedule fires.
 
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use wasmtime::AsContextMut;
@@ -146,124 +148,11 @@ impl WasmCronJob {
         &self.schedule
     }
 
-    /// Register minimal host functions for cron plugins.
+    /// Register host functions for cron plugins.
     fn register_host_functions(
         linker: &mut wasmtime::component::Linker<HostState>,
     ) -> PluginResult<()> {
-        // prx:host/log@0.1.0
-        let mut log_inst = linker
-            .instance("prx:host/log@0.1.0")
-            .map_err(|e| PluginError::Instantiation(format!("linker error (log): {e}")))?;
-        log_inst
-            .func_wrap(
-                "log",
-                |store: wasmtime::StoreContextMut<'_, HostState>,
-                 (level, message): (String, String)| {
-                    let name = store.data().plugin_name.clone();
-                    match level.as_str() {
-                        "trace" => tracing::trace!(plugin = %name, "{message}"),
-                        "debug" => tracing::debug!(plugin = %name, "{message}"),
-                        "info" => tracing::info!(plugin = %name, "{message}"),
-                        "warn" => tracing::warn!(plugin = %name, "{message}"),
-                        "error" => tracing::error!(plugin = %name, "{message}"),
-                        _ => tracing::info!(plugin = %name, level = %level, "{message}"),
-                    }
-                    Ok(())
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link log.log: {e}")))?;
-
-        // prx:host/config@0.1.0
-        let mut config_inst = linker
-            .instance("prx:host/config@0.1.0")
-            .map_err(|e| PluginError::Instantiation(format!("linker error (config): {e}")))?;
-        config_inst
-            .func_wrap(
-                "get",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
-                    let value = store.data().config.get(&key).cloned();
-                    Ok((value,))
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link config.get: {e}")))?;
-        config_inst
-            .func_wrap(
-                "get-all",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (): ()| {
-                    let pairs: Vec<(String, String)> = store
-                        .data()
-                        .config
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    Ok((pairs,))
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link config.get-all: {e}")))?;
-
-        // prx:host/kv@0.1.0
-        let mut kv_inst = linker
-            .instance("prx:host/kv@0.1.0")
-            .map_err(|e| PluginError::Instantiation(format!("linker error (kv): {e}")))?;
-        kv_inst
-            .func_wrap_async(
-                "get",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
-                    Box::new(async move {
-                        let kv = store.data().kv_store.clone();
-                        let guard = kv.read().await;
-                        let value = guard.get(&key).cloned();
-                        Ok((value,))
-                    })
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link kv.get: {e}")))?;
-        kv_inst
-            .func_wrap_async(
-                "set",
-                |store: wasmtime::StoreContextMut<'_, HostState>,
-                 (key, value): (String, Vec<u8>)| {
-                    Box::new(async move {
-                        let kv = store.data().kv_store.clone();
-                        let mut guard = kv.write().await;
-                        guard.insert(key, value);
-                        Ok(())
-                    })
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link kv.set: {e}")))?;
-        kv_inst
-            .func_wrap_async(
-                "delete",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
-                    Box::new(async move {
-                        let kv = store.data().kv_store.clone();
-                        let mut guard = kv.write().await;
-                        let existed = guard.remove(&key).is_some();
-                        Ok((existed,))
-                    })
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link kv.delete: {e}")))?;
-        kv_inst
-            .func_wrap_async(
-                "list-keys",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (prefix,): (String,)| {
-                    Box::new(async move {
-                        let kv = store.data().kv_store.clone();
-                        let guard = kv.read().await;
-                        let keys: Vec<String> = guard
-                            .keys()
-                            .filter(|k| k.starts_with(&prefix))
-                            .cloned()
-                            .collect();
-                        Ok((keys,))
-                    })
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link kv.list-keys: {e}")))?;
-
-        Ok(())
+        super::common::register_common_host_functions(linker)
     }
 }
 
@@ -304,4 +193,107 @@ impl WasmCronManager {
             name: plugin_name.to_string(),
         })
     }
+
+    /// Start the WASM cron scheduler loop.
+    ///
+    /// Spawns a background tokio task that polls every 30 seconds and fires
+    /// any jobs whose cron expression has a due occurrence since the last run.
+    /// The task runs until the returned `JoinHandle` is aborted or the process
+    /// exits.
+    ///
+    /// Cron expressions follow the same 5-field (`min hour dom mon dow`) or
+    /// 6-field (`sec min hour dom mon dow`) format used by the rest of PRX.
+    /// Expressions are normalized via [`crate::cron::normalize_expression`]
+    /// before being parsed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let manager = Arc::new(plugin_manager.create_cron_manager().await);
+    /// if !manager.is_empty() {
+    ///     let handle = WasmCronManager::start_scheduler(Arc::clone(&manager));
+    ///     // keep handle alive for the duration of the process
+    /// }
+    /// ```
+    pub fn start_scheduler(manager: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            const POLL_SECS: u64 = 30;
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(POLL_SECS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            // Track the last time each job was triggered so we don't double-fire.
+            let mut last_triggered: HashMap<String, chrono::DateTime<chrono::Utc>> =
+                HashMap::new();
+
+            loop {
+                ticker.tick().await;
+                let now = chrono::Utc::now();
+
+                for job in &manager.jobs {
+                    let name = job.plugin_name().to_string();
+                    let schedule_str = job.schedule();
+
+                    if schedule_str.is_empty() {
+                        continue;
+                    }
+
+                    let due = is_cron_due(schedule_str, last_triggered.get(&name).copied(), now);
+                    if !due {
+                        continue;
+                    }
+
+                    last_triggered.insert(name.clone(), now);
+                    tracing::debug!(plugin = %name, "firing WASM cron job");
+
+                    match job.run().await {
+                        Ok(output) => {
+                            tracing::info!(
+                                plugin = %name,
+                                output = %output,
+                                "WASM cron job completed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = %name,
+                                error = %e,
+                                "WASM cron job failed"
+                            );
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Return `true` if the cron expression has a due occurrence between
+/// `last_run` (exclusive) and `now` (inclusive).
+///
+/// On the very first run (`last_run` is `None`) we treat the window as
+/// the previous 60 seconds, meaning a job that would have fired in the
+/// last minute is considered due immediately on startup.
+fn is_cron_due(
+    schedule: &str,
+    last_run: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let normalized = match crate::cron::normalize_expression(schedule) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("WASM cron: invalid expression '{}': {e}", schedule);
+            return false;
+        }
+    };
+
+    let cron_sched = match cron::Schedule::from_str(&normalized) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("WASM cron: failed to parse '{}': {e}", schedule);
+            return false;
+        }
+    };
+
+    let check_from = last_run.unwrap_or_else(|| now - chrono::Duration::seconds(60));
+    matches!(cron_sched.after(&check_from).next(), Some(next) if next <= now)
 }

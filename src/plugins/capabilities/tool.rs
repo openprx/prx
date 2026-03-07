@@ -33,9 +33,7 @@ struct WasmToolInner {
     instance: wasmtime::component::Instance,
 }
 
-// wasmtime Store is Send but not Sync; the Mutex makes it safe.
-unsafe impl Send for WasmToolInner {}
-unsafe impl Sync for WasmToolInner {}
+
 
 impl WasmToolAdapter {
     /// Create a new WasmToolAdapter by instantiating the WASM component.
@@ -109,58 +107,14 @@ impl WasmToolAdapter {
     fn register_host_functions(
         linker: &mut wasmtime::component::Linker<HostState>,
     ) -> Result<(), PluginError> {
-        // prx:host/log@0.1.0
-        let mut log_inst = linker
-            .instance("prx:host/log@0.1.0")
-            .map_err(|e| PluginError::Instantiation(format!("linker error (log): {e}")))?;
-        log_inst
-            .func_wrap(
-                "log",
-                |store: wasmtime::StoreContextMut<'_, HostState>,
-                 (level, message): (String, String)| {
-                    let name = store.data().plugin_name.clone();
-                    match level.as_str() {
-                        "trace" => tracing::trace!(plugin = %name, "{message}"),
-                        "debug" => tracing::debug!(plugin = %name, "{message}"),
-                        "info" => tracing::info!(plugin = %name, "{message}"),
-                        "warn" => tracing::warn!(plugin = %name, "{message}"),
-                        "error" => tracing::error!(plugin = %name, "{message}"),
-                        _ => tracing::info!(plugin = %name, level = %level, "{message}"),
-                    }
-                    Ok(())
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link log.log: {e}")))?;
-
-        // prx:host/config@0.1.0
-        let mut config_inst = linker
-            .instance("prx:host/config@0.1.0")
-            .map_err(|e| PluginError::Instantiation(format!("linker error (config): {e}")))?;
-        config_inst
-            .func_wrap(
-                "get",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
-                    let val = store.data().config.get(&key).cloned();
-                    Ok((val,))
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link config.get: {e}")))?;
-        config_inst
-            .func_wrap(
-                "get-all",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (): ()| {
-                    let pairs: Vec<(String, String)> = store
-                        .data()
-                        .config
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    Ok((pairs,))
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link config.get-all: {e}")))?;
+        // log and config are identical across all capability types — use the
+        // shared helpers from `common` to avoid duplication.
+        super::common::register_log_host_functions(linker)?;
+        super::common::register_config_host_functions(linker)?;
 
         // prx:host/kv@0.1.0
+        // Tool plugins use result<T, string> return types, which differ from the
+        // simpler variants in middleware/hook/cron. We register kv manually here.
         let mut kv_inst = linker
             .instance("prx:host/kv@0.1.0")
             .map_err(|e| PluginError::Instantiation(format!("linker error (kv): {e}")))?;
