@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "prx-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tool for managing PRX WASM plugins"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/openprx/prx"
+
+[[bin]]
+name = "prx-plugin"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+colored = "2"
