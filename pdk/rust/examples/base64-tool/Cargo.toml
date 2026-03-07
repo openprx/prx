@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "base64-tool"
+version = "0.1.0"
+edition = "2021"
+description = "PRX base64 encode/decode tool plugin — Rust PDK example"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# cdylib: produces a .wasm file when building with cargo-component for wasm32-wasip2.
+# rlib: allows `cargo build` on the host without cargo-component, for dev/testing.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# PDK provides ergonomic host function wrappers
+prx-pdk = { path = "../../prx-pdk" }
+# wit-bindgen is needed for the Guest trait and export! macro on wasm32
+wit-bindgen = { version = "0.51", default-features = false, features = ["macros"] }
+
+# Workspace key — tells cargo-component this crate targets a specific WIT world.
+# Install: cargo install cargo-component
+# Build:   cargo component build --release
+# Target:  wasm32-wasip2 (WASIp2 component model)
+[package.metadata.component]
+package = "prx:plugin@0.1.0"

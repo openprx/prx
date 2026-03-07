@@ -1,0 +1,17 @@
+/// Logging interface for WASM plugins.
+///
+/// Allows plugins to emit structured log messages that integrate
+/// with the PRX tracing infrastructure.
+interface log {
+    /// Log severity level.
+    enum level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Emit a log message at the given level.
+    log: func(level: level, message: string);
+}

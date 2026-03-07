@@ -1,0 +1,24 @@
+[plugin]
+name = "audit-hook"
+version = "0.1.0"
+description = "Lifecycle event audit hook — records event counts in KV storage"
+author = "PRX Team"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "hook"
+name = "audit"
+description = "Observes lifecycle events and records event counts"
+
+[[capabilities.events]]
+pattern = "prx.lifecycle.*"
+description = "All PRX lifecycle events (agent_start, agent_stop, tool_call, error, etc.)"
+
+[permissions]
+required = ["log", "kv", "events"]
+optional = []
+
+[resources]
+max_fuel = 50_000_000
+max_memory_mb = 8
+max_execution_time_ms = 500

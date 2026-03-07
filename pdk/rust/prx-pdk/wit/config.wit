@@ -1,0 +1,11 @@
+/// Configuration interface for WASM plugins.
+///
+/// Provides read-only access to plugin-specific configuration
+/// values defined in plugin.toml [config] section.
+interface config {
+    /// Get a configuration value by key.
+    get: func(key: string) -> option<string>;
+
+    /// Get all configuration key-value pairs.
+    get-all: func() -> list<tuple<string, string>>;
+}

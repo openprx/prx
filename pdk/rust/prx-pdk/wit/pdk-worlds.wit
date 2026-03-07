@@ -1,0 +1,14 @@
+/// PRX PDK world — imports all host interfaces for prx-pdk binding generation.
+///
+/// This world belongs to the prx:host package and uses short-form imports
+/// (interface name only) since all interfaces are in the same package.
+/// It is NOT a plugin world; it is only used by the PDK library to generate
+/// host function call wrappers via wit-bindgen.
+world pdk-full {
+    import log;
+    import config;
+    import kv;
+    import events;
+    import http-outbound;
+    import memory;
+}

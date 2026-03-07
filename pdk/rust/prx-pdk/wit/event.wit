@@ -1,0 +1,18 @@
+/// Event bus interface for inter-plugin communication.
+///
+/// Provides fire-and-forget publish/subscribe messaging between plugins.
+/// All events flow through the host for auditing and access control.
+interface events {
+    /// Publish an event to a topic.
+    /// All subscribers matching the topic will receive the event asynchronously.
+    /// Payload is JSON-encoded, max 64KB.
+    publish: func(topic: string, payload: string) -> result<_, string>;
+
+    /// Subscribe to a topic pattern.
+    /// Supports exact match ("weather.update") and wildcard ("weather.*").
+    /// Returns a subscription ID for later unsubscription.
+    subscribe: func(topic-pattern: string) -> result<u64, string>;
+
+    /// Cancel a subscription by ID.
+    unsubscribe: func(subscription-id: u64) -> result<_, string>;
+}
