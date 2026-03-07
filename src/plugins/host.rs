@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::memory::traits::Memory;
+
 /// Per-plugin-instance state stored in the wasmtime `Store<HostState>`.
 ///
 /// Each loaded plugin gets its own `HostState` with isolated KV namespace,
@@ -33,9 +35,13 @@ pub struct HostState {
 
     /// Resource limits.
     pub timeout_ms: u64,
+
+    /// Memory backend reference for prx:host/memory host functions.
+    pub memory: Option<Arc<dyn Memory>>,
 }
 
 impl HostState {
+    /// Create a new `HostState` for a plugin.
     /// Create a new `HostState` for a plugin.
     pub fn new(
         plugin_name: String,
@@ -53,7 +59,14 @@ impl HostState {
             http_allowlist,
             kv_store: Arc::new(RwLock::new(HashMap::new())),
             timeout_ms,
+            memory: None,
         }
+    }
+
+    /// Create a new `HostState` with a memory backend reference.
+    pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
+        self.memory = Some(memory);
+        self
     }
 
     /// Check if a permission is granted. Returns an error if denied.

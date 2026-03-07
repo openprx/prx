@@ -335,6 +335,15 @@ pub struct AppState {
     /// WASM plugin manager (optional, enabled with `--features wasm-plugins`).
     #[cfg(feature = "wasm-plugins")]
     pub plugin_manager: Option<Arc<crate::plugins::PluginManager>>,
+    /// WASM middleware chain for message pipeline interception.
+    #[cfg(feature = "wasm-plugins")]
+    pub wasm_middleware: Option<Arc<crate::plugins::capabilities::middleware::MiddlewareChain>>,
+    /// WASM hook executor for lifecycle event observation.
+    #[cfg(feature = "wasm-plugins")]
+    pub wasm_hook_executor: Option<Arc<crate::plugins::capabilities::hook::WasmHookExecutor>>,
+    /// WASM cron manager for scheduled plugin tasks.
+    #[cfg(feature = "wasm-plugins")]
+    pub wasm_cron_manager: Option<Arc<crate::plugins::capabilities::cron::WasmCronManager>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -509,6 +518,45 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     tools_list.push(Box::new(tools::ConfigReloadTool::new(Arc::clone(
         &shared_config_for_reload,
     ))));
+
+    // ── Register WASM plugin tools and create plugin manager (if feature enabled) ──
+    #[cfg(feature = "wasm-plugins")]
+    let (wasm_plugin_manager, wasm_mw_chain, wasm_hook_exec, wasm_cron_mgr) = {
+        let pm = crate::plugins::init_plugin_manager(&config.workspace_dir).await;
+        let mut mw = None;
+        let mut he = None;
+        let mut cm = None;
+        if let Some(ref pm) = pm {
+            // Tool adapters
+            let wasm_tools = pm.create_tool_adapters_with_memory(Some(Arc::clone(&mem))).await;
+            if !wasm_tools.is_empty() {
+                tracing::info!(
+                    count = wasm_tools.len(),
+                    "registering WASM plugin tools in tools_registry"
+                );
+                tools_list.extend(wasm_tools);
+            }
+            // Middleware chain
+            let chain = pm.create_middleware_chain().await;
+            if !chain.is_empty() {
+                tracing::info!(count = chain.len(), "WASM middleware chain ready");
+                mw = Some(Arc::new(chain));
+            }
+            // Hook executor
+            let executor = pm.create_hook_executor().await;
+            if !executor.is_empty() {
+                tracing::info!("WASM hook executor ready");
+                he = Some(Arc::new(executor));
+            }
+            // Cron manager
+            let cron = pm.create_cron_manager().await;
+            if !cron.is_empty() {
+                tracing::info!(count = cron.jobs().len(), "WASM cron manager ready");
+                cm = Some(Arc::new(cron));
+            }
+        }
+        (pm, mw, he, cm)
+    };
 
     let tools_registry = Arc::new(tools_list);
 
@@ -706,17 +754,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         gateway_port: actual_port,
         logs_broadcast_tx,
         #[cfg(feature = "wasm-plugins")]
-        plugin_manager: None,
+        plugin_manager: wasm_plugin_manager,
+        #[cfg(feature = "wasm-plugins")]
+        wasm_middleware: wasm_mw_chain,
+        #[cfg(feature = "wasm-plugins")]
+        wasm_hook_executor: wasm_hook_exec,
+        #[cfg(feature = "wasm-plugins")]
+        wasm_cron_manager: wasm_cron_mgr,
     };
 
-    // ── Initialize WASM plugin manager (if feature enabled) ──
+    // Inject WASM hook executor into HookManager so .emit() triggers WASM hooks too.
     #[cfg(feature = "wasm-plugins")]
-    let state = {
-        let mut s = state;
-        s.plugin_manager =
-            crate::plugins::init_plugin_manager(&config.workspace_dir).await;
-        s
-    };
+    if let Some(ref exec) = state.wasm_hook_executor {
+        state.hooks.set_wasm_executor(Arc::clone(exec)).await;
+    }
 
     let limited_public_routes = Router::new()
         .route("/pair", post(handle_pair))

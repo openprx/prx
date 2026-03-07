@@ -126,6 +126,11 @@ export const api = {
   toggleSkill: (id) =>
     request(`/api/skills/${encodeURIComponent(id)}/toggle`, {
       method: 'PATCH'
+    }),
+  getPlugins: () => request('/api/plugins'),
+  reloadPlugin: (name) =>
+    request(`/api/plugins/${encodeURIComponent(name)}/reload`, {
+      method: 'POST'
     })
 };
 

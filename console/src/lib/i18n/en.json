@@ -15,6 +15,7 @@
     "hooks": "Hooks",
     "mcp": "MCP",
     "skills": "Skills",
+    "plugins": "Plugins",
     "logs": "Logs"
   },
   "common": {
@@ -191,6 +192,18 @@
     "installFailed": "Failed to install skill",
     "uninstallSuccess": "Skill uninstalled",
     "uninstallFailed": "Failed to uninstall skill"
+  },
+  "plugins": {
+    "title": "Plugins",
+    "loading": "Loading plugins...",
+    "loadFailed": "Failed to load plugins.",
+    "noPlugins": "No WASM plugins loaded.",
+    "capabilities": "Capabilities",
+    "permissions": "Permissions",
+    "statusActive": "Active",
+    "reload": "Reload",
+    "reloadSuccess": "Plugin \"{name}\" reloaded",
+    "reloadFailed": "Failed to reload plugin"
   },
   "login": {
     "title": "PRX Console Login",

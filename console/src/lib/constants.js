@@ -8,6 +8,7 @@ export const NAV_ITEMS = [
   { labelKey: 'nav.hooks', path: '/hooks' },
   { labelKey: 'nav.mcp', path: '/mcp' },
   { labelKey: 'nav.skills', path: '/skills' },
+  { labelKey: 'nav.plugins', path: '/plugins' },
   { labelKey: 'nav.config', path: '/config' },
   { labelKey: 'nav.logs', path: '/logs' }
 ];

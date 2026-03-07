@@ -41,7 +41,7 @@ pub struct PluginMeta {
     pub license: Option<String>,
 }
 
-/// A declared capability (tool, channel, hook, etc.).
+/// A declared capability (tool, middleware, hook, cron, etc.).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Capability {
     #[serde(rename = "type")]
@@ -49,6 +49,19 @@ pub struct Capability {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Priority for middleware ordering (lower = higher priority). Default: 100.
+    #[serde(default = "default_priority")]
+    pub priority: i32,
+    /// List of events this hook listens to (for hook capabilities).
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// Cron schedule expression (for cron capabilities), 5-field format.
+    #[serde(default)]
+    pub schedule: Option<String>,
+}
+
+fn default_priority() -> i32 {
+    100
 }
 
 /// Permission declarations (spec-aligned: interface-based, not boolean).

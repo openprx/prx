@@ -215,6 +215,15 @@ impl PluginManager {
     /// Returns a list of boxed `Tool` trait objects ready for registration
     /// in the tools_registry.
     pub async fn create_tool_adapters(&self) -> Vec<Box<dyn Tool>> {
+        self.create_tool_adapters_with_memory(None).await
+    }
+
+    /// Create tool adapters for all plugins with tool capabilities,
+    /// optionally injecting a memory backend into each adapter's host state.
+    pub async fn create_tool_adapters_with_memory(
+        &self,
+        memory: Option<Arc<dyn crate::memory::traits::Memory>>,
+    ) -> Vec<Box<dyn Tool>> {
         let plugins = self.registry.list().await;
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
 
@@ -270,8 +279,13 @@ impl PluginManager {
                 }
             };
 
-            match capabilities::tool::WasmToolAdapter::new(&self.engine, &component, &manifest)
-                .await
+            match capabilities::tool::WasmToolAdapter::new_with_memory(
+                &self.engine,
+                &component,
+                &manifest,
+                memory.clone(),
+            )
+            .await
             {
                 Ok(adapter) => {
                     tracing::info!(
@@ -292,6 +306,220 @@ impl PluginManager {
         }
 
         tools
+    }
+
+    /// Create middleware adapters for all plugins with middleware capabilities.
+    pub async fn create_middleware_chain(&self) -> capabilities::middleware::MiddlewareChain {
+        let plugins = self.registry.list().await;
+        let mut chain = capabilities::middleware::MiddlewareChain::new();
+
+        for info in &plugins {
+            let middleware_caps: Vec<_> = info
+                .capabilities
+                .iter()
+                .filter(|c| c.starts_with("middleware"))
+                .collect();
+            if middleware_caps.is_empty() {
+                continue;
+            }
+
+            let manifest = match self.registry.get_manifest(&info.name).await {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let source_dir = match self.registry.get_source_dir(&info.name).await {
+                Some(d) => d,
+                None => continue,
+            };
+
+            let wasm_path = source_dir.join(&manifest.plugin.wasm);
+            let wasm_bytes = match std::fs::read(&wasm_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to read WASM for middleware");
+                    continue;
+                }
+            };
+
+            let component = match wasmtime::component::Component::new(&self.engine, &wasm_bytes) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to compile WASM for middleware");
+                    continue;
+                }
+            };
+
+            let priority = manifest
+                .capabilities
+                .iter()
+                .find(|c| c.capability_type == "middleware")
+                .map(|c| c.priority)
+                .unwrap_or(100);
+
+            match capabilities::middleware::WasmMiddleware::new(
+                &self.engine,
+                &component,
+                &manifest,
+                priority,
+            )
+            .await
+            {
+                Ok(mw) => {
+                    tracing::info!(
+                        plugin = %info.name,
+                        priority,
+                        "WASM middleware adapter created"
+                    );
+                    chain.add(mw);
+                }
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to create middleware adapter");
+                }
+            }
+        }
+
+        chain
+    }
+
+    /// Create hook adapters for all plugins with hook capabilities.
+    pub async fn create_hook_executor(&self) -> capabilities::hook::WasmHookExecutor {
+        let plugins = self.registry.list().await;
+        let mut executor = capabilities::hook::WasmHookExecutor::new();
+
+        for info in &plugins {
+            let hook_caps: Vec<_> = info
+                .capabilities
+                .iter()
+                .filter(|c| c.starts_with("hook"))
+                .collect();
+            if hook_caps.is_empty() {
+                continue;
+            }
+
+            let manifest = match self.registry.get_manifest(&info.name).await {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let source_dir = match self.registry.get_source_dir(&info.name).await {
+                Some(d) => d,
+                None => continue,
+            };
+
+            let wasm_path = source_dir.join(&manifest.plugin.wasm);
+            let wasm_bytes = match std::fs::read(&wasm_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to read WASM for hook");
+                    continue;
+                }
+            };
+
+            let component = match wasmtime::component::Component::new(&self.engine, &wasm_bytes) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to compile WASM for hook");
+                    continue;
+                }
+            };
+
+            let events: std::collections::HashSet<String> = manifest
+                .capabilities
+                .iter()
+                .filter(|c| c.capability_type == "hook")
+                .flat_map(|c| c.events.iter().cloned())
+                .collect();
+
+            match capabilities::hook::WasmHook::new(&self.engine, &component, &manifest, events)
+                .await
+            {
+                Ok(hook) => {
+                    tracing::info!(plugin = %info.name, "WASM hook adapter created");
+                    executor.add(hook);
+                }
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to create hook adapter");
+                }
+            }
+        }
+
+        executor
+    }
+
+    /// Create cron adapters for all plugins with cron capabilities.
+    pub async fn create_cron_manager(&self) -> capabilities::cron::WasmCronManager {
+        let plugins = self.registry.list().await;
+        let mut manager = capabilities::cron::WasmCronManager::new();
+
+        for info in &plugins {
+            let cron_caps: Vec<_> = info
+                .capabilities
+                .iter()
+                .filter(|c| c.starts_with("cron"))
+                .collect();
+            if cron_caps.is_empty() {
+                continue;
+            }
+
+            let manifest = match self.registry.get_manifest(&info.name).await {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let source_dir = match self.registry.get_source_dir(&info.name).await {
+                Some(d) => d,
+                None => continue,
+            };
+
+            let wasm_path = source_dir.join(&manifest.plugin.wasm);
+            let wasm_bytes = match std::fs::read(&wasm_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to read WASM for cron");
+                    continue;
+                }
+            };
+
+            let component = match wasmtime::component::Component::new(&self.engine, &wasm_bytes) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to compile WASM for cron");
+                    continue;
+                }
+            };
+
+            let schedule = manifest
+                .capabilities
+                .iter()
+                .find(|c| c.capability_type == "cron")
+                .and_then(|c| c.schedule.clone())
+                .unwrap_or_default();
+
+            if schedule.is_empty() {
+                tracing::warn!(plugin = %info.name, "cron plugin has no schedule, skipping");
+                continue;
+            }
+
+            match capabilities::cron::WasmCronJob::new(
+                &self.engine,
+                &component,
+                &manifest,
+                schedule.clone(),
+            )
+            .await
+            {
+                Ok(job) => {
+                    tracing::info!(plugin = %info.name, schedule = %schedule, "WASM cron job created");
+                    manager.add(job);
+                }
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to create cron adapter");
+                }
+            }
+        }
+
+        manager
     }
 
     /// Get a reference to the wasmtime engine.

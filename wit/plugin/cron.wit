@@ -1,0 +1,10 @@
+/// Cron capability interface for WASM plugins.
+///
+/// Plugins implementing this world are called on a schedule defined
+/// in their manifest (cron expression).
+interface cron-exports {
+    /// Called when the cron schedule fires.
+    ///
+    /// Returns a result string (logged by the host) or an error.
+    run: func() -> result<string, string>;
+}

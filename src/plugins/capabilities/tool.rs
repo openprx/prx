@@ -48,12 +48,22 @@ impl WasmToolAdapter {
         component: &wasmtime::component::Component,
         manifest: &PluginManifest,
     ) -> Result<Self, PluginError> {
+        Self::new_with_memory(engine, component, manifest, None).await
+    }
+
+    /// Create a new WasmToolAdapter with an optional memory backend.
+    pub async fn new_with_memory(
+        engine: &wasmtime::Engine,
+        component: &wasmtime::component::Component,
+        manifest: &PluginManifest,
+        memory: Option<Arc<dyn crate::memory::traits::Memory>>,
+    ) -> Result<Self, PluginError> {
         let timeout_ms = manifest.resources.max_execution_time_ms;
 
         // Build HostState from manifest
         let granted: HashSet<String> = manifest.permissions.required.iter().cloned().collect();
         let optional: HashSet<String> = manifest.permissions.optional.iter().cloned().collect();
-        let host_state = HostState::new(
+        let mut host_state = HostState::new(
             manifest.plugin.name.clone(),
             manifest.config.clone(),
             granted,
@@ -61,6 +71,9 @@ impl WasmToolAdapter {
             manifest.permissions.http_allowlist.clone(),
             timeout_ms,
         );
+        if let Some(mem) = memory {
+            host_state = host_state.with_memory(mem);
+        }
 
         // Create store with fuel limit
         let mut store = wasmtime::Store::new(engine, host_state);
@@ -275,7 +288,7 @@ impl WasmToolAdapter {
             )
             .map_err(|e| PluginError::Instantiation(format!("link http.request: {e}")))?;
 
-        // prx:host/memory@0.1.0 — stub (full impl needs memory backend reference)
+        // prx:host/memory@0.1.0 — connected to real memory backend
         let mut mem_inst = linker
             .instance("prx:host/memory@0.1.0")
             .map_err(|e| PluginError::Instantiation(format!("linker error (memory): {e}")))?;
@@ -289,12 +302,26 @@ impl WasmToolAdapter {
                         if let Err(e) = store.data().check_permission("memory") {
                             return Ok((Err::<String, String>(e),));
                         }
-                        tracing::debug!(
-                            plugin = %store.data().plugin_name,
-                            "memory.store stub: category={category}, len={}",
-                            text.len()
-                        );
-                        Ok((Err("memory host function not yet connected to backend".to_string()),))
+                        let mem = match &store.data().memory {
+                            Some(m) => Arc::clone(m),
+                            None => {
+                                return Ok((Err::<String, String>(
+                                    "memory backend not configured".to_string(),
+                                ),));
+                            }
+                        };
+                        let plugin_name = store.data().plugin_name.clone();
+                        let key = format!("plugin:{plugin_name}:{}", uuid::Uuid::new_v4());
+                        let cat = match category.as_str() {
+                            "core" => crate::memory::traits::MemoryCategory::Core,
+                            "daily" => crate::memory::traits::MemoryCategory::Daily,
+                            "conversation" => crate::memory::traits::MemoryCategory::Conversation,
+                            other => crate::memory::traits::MemoryCategory::Custom(other.to_string()),
+                        };
+                        match mem.store(&key, &text, cat, None).await {
+                            Ok(()) => Ok((Ok::<String, String>(key),)),
+                            Err(e) => Ok((Err(format!("memory store failed: {e}")),)),
+                        }
                     })
                 },
             )
@@ -304,16 +331,29 @@ impl WasmToolAdapter {
             .func_wrap_async(
                 "recall",
                 |store: wasmtime::StoreContextMut<'_, HostState>,
-                 (_query, _limit): (String, u32)| {
+                 (query, limit): (String, u32)| {
                     Box::new(async move {
                         if let Err(e) = store.data().check_permission("memory") {
-                            tracing::warn!("{e}");
+                            return Ok((Err::<Vec<(String, String, String, f64)>, String>(e),));
                         }
-                        // Stub: WIT record types need bindgen for proper encoding.
-                        // Return error for now.
-                        Ok((Err::<Vec<(String, String, String, f64)>, String>(
-                            "memory recall not yet connected".to_string(),
-                        ),))
+                        let mem = match &store.data().memory {
+                            Some(m) => Arc::clone(m),
+                            None => {
+                                return Ok((Err::<Vec<(String, String, String, f64)>, String>(
+                                    "memory backend not configured".to_string(),
+                                ),));
+                            }
+                        };
+                        match mem.recall(&query, limit as usize, None).await {
+                            Ok(entries) => {
+                                let results: Vec<(String, String, String, f64)> = entries
+                                    .into_iter()
+                                    .map(|e| (e.id, e.content, e.category.to_string(), e.score.unwrap_or(0.0)))
+                                    .collect();
+                                Ok((Ok(results),))
+                            }
+                            Err(e) => Ok((Err(format!("memory recall failed: {e}")),)),
+                        }
                     })
                 },
             )
