@@ -2,7 +2,7 @@
 
 > **Version:** 0.1-draft  
 > **Date:** 2026-03-07  
-> **Status:** Planning  
+> **Status:** Implemented (P1-P5)  
 > **Author:** David (AI Architect)  
 > **Stack:** wasmtime + Component Model + WIT (不使用 Extism)
 

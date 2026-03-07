@@ -153,6 +153,14 @@ impl PluginRegistry {
         plugins.get(name).map(|p| p.source_dir.clone())
     }
 
+    /// Get the compiled component for a plugin, if available.
+    ///
+    /// `Component` is `Clone` (ref-counted internally), so this is cheap.
+    pub async fn get_component(&self, name: &str) -> Option<wasmtime::component::Component> {
+        let plugins = self.plugins.read().await;
+        plugins.get(name).and_then(|p| p.component.clone())
+    }
+
     /// Get the number of loaded plugins.
     pub async fn len(&self) -> usize {
         let plugins = self.plugins.read().await;

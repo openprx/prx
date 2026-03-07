@@ -6,10 +6,19 @@
 //! # Architecture
 //!
 //! - **Engine** (global, shared) — compiles WASM components, caches compilation
+//! - **PrecompileCache** — disk-based cache of native-compiled components
 //! - **PluginRegistry** — thread-safe map of loaded plugin instances
 //! - **HostState** — per-instance state (config, KV, permissions)
 //! - **PluginManifest** — parsed `plugin.toml` metadata
 //! - **WasmToolAdapter** — bridges WASM tool plugins to PRX `Tool` trait
+//!
+//! # Performance
+//!
+//! Components are compiled once and stored in the registry. Adapter-creation
+//! methods reuse the stored (already-compiled) `Component` instead of
+//! re-reading and re-compiling the WASM file. Between restarts the
+//! `PrecompileCache` persists the native artifact so Cranelift is skipped
+//! entirely.
 //!
 //! # Feature Gate
 //!
@@ -21,21 +30,79 @@ pub mod error;
 pub mod event_bus;
 pub mod host;
 pub mod manifest;
+pub mod precompile;
 pub mod registry;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use error::{PluginError, PluginResult};
 use manifest::PluginManifest;
+use precompile::PrecompileCache;
 use registry::{LoadedPlugin, PluginInfo, PluginRegistry};
 
 use crate::tools::Tool;
 
+/// Aggregated performance metrics for the plugin system.
+#[derive(Debug, Default)]
+pub struct PluginMetrics {
+    /// Total WASM compilation events (cache misses).
+    pub compilations: AtomicU64,
+    /// Total WASM precompile cache hits.
+    pub cache_hits: AtomicU64,
+    /// Total WASM precompile cache misses.
+    pub cache_misses: AtomicU64,
+    /// Cumulative compilation time in milliseconds.
+    pub total_compile_ms: AtomicU64,
+    /// Total adapter instantiation calls.
+    pub total_instantiations: AtomicU64,
+}
+
+impl PluginMetrics {
+    fn record_compilation(&self, compile_ms: u64) {
+        self.compilations.fetch_add(1, Ordering::Relaxed);
+        self.total_compile_ms.fetch_add(compile_ms, Ordering::Relaxed);
+    }
+
+    fn record_cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_cache_miss(&self) {
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_instantiation(&self) {
+        self.total_instantiations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot current counts as plain values.
+    pub fn snapshot(&self) -> PluginMetricsSnapshot {
+        PluginMetricsSnapshot {
+            compilations: self.compilations.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
+            total_compile_ms: self.total_compile_ms.load(Ordering::Relaxed),
+            total_instantiations: self.total_instantiations.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A non-atomic snapshot of `PluginMetrics` suitable for logging / reporting.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PluginMetricsSnapshot {
+    pub compilations: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub total_compile_ms: u64,
+    pub total_instantiations: u64,
+}
+
 /// Central manager for the WASM plugin system.
 ///
-/// Owns the wasmtime `Engine` (shared across all plugins) and the
-/// `PluginRegistry` that tracks loaded instances.
+/// Owns the wasmtime `Engine` (shared across all plugins), the disk-based
+/// `PrecompileCache`, and the `PluginRegistry` that tracks loaded instances.
 pub struct PluginManager {
     /// Shared wasmtime engine with async + component model support.
     engine: wasmtime::Engine,
@@ -43,6 +110,10 @@ pub struct PluginManager {
     registry: PluginRegistry,
     /// Base directory where plugin subdirectories live.
     plugins_dir: PathBuf,
+    /// Disk-based precompile cache for native WASM artifacts.
+    precompile_cache: PrecompileCache,
+    /// Runtime performance metrics.
+    pub metrics: Arc<PluginMetrics>,
 }
 
 impl PluginManager {
@@ -51,6 +122,9 @@ impl PluginManager {
     /// Initializes a wasmtime `Engine` with:
     /// - `async_support(true)` for tokio integration
     /// - `wasm_component_model(true)` for Component Model
+    ///
+    /// A `PrecompileCache` is created at `<plugins_dir>/.cwasm-cache/` to
+    /// avoid recompiling unchanged plugins on every restart.
     pub fn new(plugins_dir: PathBuf) -> PluginResult<Self> {
         let mut config = wasmtime::Config::new();
         config.async_support(true);
@@ -59,6 +133,9 @@ impl PluginManager {
         let engine = wasmtime::Engine::new(&config).map_err(|e| {
             PluginError::Compilation(format!("failed to create wasmtime engine: {e}"))
         })?;
+
+        let cache_dir = plugins_dir.join(".cwasm-cache");
+        let precompile_cache = PrecompileCache::new(cache_dir).map_err(PluginError::Io)?;
 
         tracing::info!(
             plugins_dir = %plugins_dir.display(),
@@ -69,6 +146,8 @@ impl PluginManager {
             engine,
             registry: PluginRegistry::new(),
             plugins_dir,
+            precompile_cache,
+            metrics: Arc::new(PluginMetrics::default()),
         })
     }
 
@@ -138,21 +217,35 @@ impl PluginManager {
             });
         }
 
-        // Compile WASM if file exists
+        // Compile WASM if file exists (using precompile cache to skip Cranelift
+        // on unchanged plugins).
         let wasm_path = plugin_dir.join(&manifest.plugin.wasm);
         let component = if wasm_path.exists() {
             let wasm_bytes = std::fs::read(&wasm_path).map_err(PluginError::Io)?;
-            let comp = wasmtime::component::Component::new(&self.engine, &wasm_bytes)
+            let comp = self
+                .precompile_cache
+                .get_or_compile(&self.engine, &wasm_bytes)
                 .map_err(|e| {
                     PluginError::Compilation(format!(
                         "failed to compile '{}': {e}",
                         wasm_path.display()
                     ))
                 })?;
+            // Update aggregated metrics from cache.
+            let cm = &self.precompile_cache.metrics;
+            self.metrics
+                .cache_hits
+                .store(cm.hits(), std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .cache_misses
+                .store(cm.misses(), std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .total_compile_ms
+                .store(cm.total_compile_ms(), std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 plugin = %plugin_name,
                 wasm = %wasm_path.display(),
-                "WASM component compiled successfully"
+                "WASM component ready"
             );
             Some(comp)
         } else {
@@ -235,51 +328,21 @@ impl PluginManager {
                 continue;
             }
 
-            // Get the manifest to access component
+            // Get the manifest and the already-compiled component from the registry.
             let manifest = match self.registry.get_manifest(&info.name).await {
                 Some(m) => m,
                 None => continue,
             };
 
-            // We need the compiled component from the registry
-            // For now, re-read and compile if needed
-            let source_dir = match self.registry.get_source_dir(&info.name).await {
-                Some(d) => d,
-                None => continue,
-            };
-
-            let wasm_path = source_dir.join(&manifest.plugin.wasm);
-            if !wasm_path.exists() {
-                tracing::debug!(
-                    plugin = %info.name,
-                    "skipping tool adapter — no WASM file"
-                );
-                continue;
-            }
-
-            let wasm_bytes = match std::fs::read(&wasm_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = %info.name,
-                        error = %e,
-                        "failed to read WASM file for tool adapter"
-                    );
+            let component = match self.registry.get_component(&info.name).await {
+                Some(c) => c,
+                None => {
+                    tracing::debug!(plugin = %info.name, "skipping tool adapter — no WASM component");
                     continue;
                 }
             };
 
-            let component = match wasmtime::component::Component::new(&self.engine, &wasm_bytes) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = %info.name,
-                        error = %e,
-                        "failed to compile WASM for tool adapter"
-                    );
-                    continue;
-                }
-            };
+            self.metrics.record_instantiation();
 
             match capabilities::tool::WasmToolAdapter::new_with_memory(
                 &self.engine,
@@ -334,27 +397,15 @@ impl PluginManager {
                 None => continue,
             };
 
-            let source_dir = match self.registry.get_source_dir(&info.name).await {
-                Some(d) => d,
-                None => continue,
-            };
-
-            let wasm_path = source_dir.join(&manifest.plugin.wasm);
-            let wasm_bytes = match std::fs::read(&wasm_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(plugin = %info.name, error = %e, "failed to read WASM for middleware");
+            let component = match self.registry.get_component(&info.name).await {
+                Some(c) => c,
+                None => {
+                    tracing::debug!(plugin = %info.name, "skipping middleware adapter — no WASM component");
                     continue;
                 }
             };
 
-            let component = match wasmtime::component::Component::new(&self.engine, &wasm_bytes) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(plugin = %info.name, error = %e, "failed to compile WASM for middleware");
-                    continue;
-                }
-            };
+            self.metrics.record_instantiation();
 
             let priority = manifest
                 .capabilities
@@ -412,27 +463,15 @@ impl PluginManager {
                 None => continue,
             };
 
-            let source_dir = match self.registry.get_source_dir(&info.name).await {
-                Some(d) => d,
-                None => continue,
-            };
-
-            let wasm_path = source_dir.join(&manifest.plugin.wasm);
-            let wasm_bytes = match std::fs::read(&wasm_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(plugin = %info.name, error = %e, "failed to read WASM for hook");
+            let component = match self.registry.get_component(&info.name).await {
+                Some(c) => c,
+                None => {
+                    tracing::debug!(plugin = %info.name, "skipping hook adapter — no WASM component");
                     continue;
                 }
             };
 
-            let component = match wasmtime::component::Component::new(&self.engine, &wasm_bytes) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(plugin = %info.name, error = %e, "failed to compile WASM for hook");
-                    continue;
-                }
-            };
+            self.metrics.record_instantiation();
 
             let events: std::collections::HashSet<String> = manifest
                 .capabilities
@@ -486,27 +525,15 @@ impl PluginManager {
                 None => continue,
             };
 
-            let source_dir = match self.registry.get_source_dir(&info.name).await {
-                Some(d) => d,
-                None => continue,
-            };
-
-            let wasm_path = source_dir.join(&manifest.plugin.wasm);
-            let wasm_bytes = match std::fs::read(&wasm_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(plugin = %info.name, error = %e, "failed to read WASM for cron");
+            let component = match self.registry.get_component(&info.name).await {
+                Some(c) => c,
+                None => {
+                    tracing::debug!(plugin = %info.name, "skipping cron adapter — no WASM component");
                     continue;
                 }
             };
 
-            let component = match wasmtime::component::Component::new(&self.engine, &wasm_bytes) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(plugin = %info.name, error = %e, "failed to compile WASM for cron");
-                    continue;
-                }
-            };
+            self.metrics.record_instantiation();
 
             let schedule = manifest
                 .capabilities
@@ -568,27 +595,15 @@ impl PluginManager {
                 None => continue,
             };
 
-            let source_dir = match self.registry.get_source_dir(&info.name).await {
-                Some(d) => d,
-                None => continue,
-            };
-
-            let wasm_path = source_dir.join(&manifest.plugin.wasm);
-            let wasm_bytes = match std::fs::read(&wasm_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(plugin = %info.name, error = %e, "failed to read WASM for provider");
+            let component = match self.registry.get_component(&info.name).await {
+                Some(c) => c,
+                None => {
+                    tracing::debug!(plugin = %info.name, "skipping provider adapter — no WASM component");
                     continue;
                 }
             };
 
-            let component = match wasmtime::component::Component::new(&self.engine, &wasm_bytes) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(plugin = %info.name, error = %e, "failed to compile WASM for provider");
-                    continue;
-                }
-            };
+            self.metrics.record_instantiation();
 
             match capabilities::provider::WasmProvider::new(
                 &self.engine,
@@ -641,27 +656,15 @@ impl PluginManager {
                 None => continue,
             };
 
-            let source_dir = match self.registry.get_source_dir(&info.name).await {
-                Some(d) => d,
-                None => continue,
-            };
-
-            let wasm_path = source_dir.join(&manifest.plugin.wasm);
-            let wasm_bytes = match std::fs::read(&wasm_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(plugin = %info.name, error = %e, "failed to read WASM for storage");
+            let component = match self.registry.get_component(&info.name).await {
+                Some(c) => c,
+                None => {
+                    tracing::debug!(plugin = %info.name, "skipping storage adapter — no WASM component");
                     continue;
                 }
             };
 
-            let component = match wasmtime::component::Component::new(&self.engine, &wasm_bytes) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(plugin = %info.name, error = %e, "failed to compile WASM for storage");
-                    continue;
-                }
-            };
+            self.metrics.record_instantiation();
 
             match capabilities::storage::WasmStorage::new(
                 &self.engine,
@@ -696,6 +699,16 @@ impl PluginManager {
     /// Get the plugins directory path.
     pub fn plugins_dir(&self) -> &Path {
         &self.plugins_dir
+    }
+
+    /// Get a reference to the precompile cache.
+    pub fn precompile_cache(&self) -> &PrecompileCache {
+        &self.precompile_cache
+    }
+
+    /// Snapshot of current performance metrics.
+    pub fn metrics_snapshot(&self) -> PluginMetricsSnapshot {
+        self.metrics.snapshot()
     }
 }
 
