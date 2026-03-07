@@ -65,9 +65,10 @@ func wasmString(ptr *uint8, length uint32) string {
 
 // toolSpecJSON returns the ToolSpec as a JSON string.
 // Hand-built to avoid encoding/json (which uses reflect).
+// Field names match the WIT record field names (kebab-case) for clarity.
 func toolSpecJSON() string {
 	schema := `{"type":"object","properties":{"input":{"type":"string","description":"Text to hash"}},"required":["input"]}`
-	return `{"name":"hash","description":"Compute SHA-256 hash of input text","parameters_schema":` +
+	return `{"name":"hash","description":"Compute SHA-256 hash of input text","parameters-schema":` +
 		`"` + jsonEscape(schema) + `"` +
 		`}`
 }

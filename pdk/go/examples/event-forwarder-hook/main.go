@@ -6,7 +6,7 @@
 //	tinygo build -target wasm32-wasip2 -o plugin.wasm .
 //
 // The plugin implements the prx:plugin/hook-exports interface:
-//   - on-event(event_json: string) → called when a subscribed event arrives
+//   - on-event(event: string, payload-json: string) -> result<_, string>
 package main
 
 import (
@@ -20,30 +20,33 @@ import (
 // ── Plugin exports ────────────────────────────────────────────────────────────
 
 // onEvent is called by the PRX host when a matching event arrives.
-// It reads the source event JSON, prepends forwarding metadata, and
+// It reads the event name and payload, prepends forwarding metadata, and
 // publishes to the configured target topic.
 //
+// WIT: on-event(event: string, payload-json: string) -> result<_, string>
+//
 //go:wasmexport on-event
-func onEvent(eventPtr *uint8, eventLen uint32) {
-	eventJSON := wasmString(eventPtr, eventLen)
-	log.Debug("on-event: received " + itoa(len(eventJSON)) + " bytes")
+func onEvent(eventPtr *uint8, eventLen uint32, payloadPtr *uint8, payloadLen uint32) {
+	event := wasmString(eventPtr, eventLen)
+	payloadJSON := wasmString(payloadPtr, payloadLen)
+	log.Debug("on-event: received '" + event + "' (" + itoa(len(payloadJSON)) + " bytes)")
 
 	targetTopic := config.GetOr("forward_topic", "events.forwarded")
 	addMeta := config.GetOr("add_metadata", "false") == "true"
 
 	var payload string
 	if addMeta {
-		// Wrap the original event with forwarding metadata.
-		payload = `{"forwarded_by":"event-forwarder-hook","original":` + eventJSON + `}`
+		// Wrap the original event payload with forwarding metadata.
+		payload = `{"forwarded_by":"event-forwarder-hook","event":"` + event + `","original":` + payloadJSON + `}`
 	} else {
-		payload = eventJSON
+		payload = payloadJSON
 	}
 
 	if err := events.Publish(targetTopic, payload); err != nil {
-		log.Error("failed to forward event: " + err.Error())
+		log.Error("failed to forward event '" + event + "': " + err.Error())
 		return
 	}
-	log.Info("forwarded event to " + targetTopic)
+	log.Info("forwarded event '" + event + "' to " + targetTopic)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
