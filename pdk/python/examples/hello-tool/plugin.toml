@@ -1,0 +1,15 @@
+[plugin]
+name        = "json-formatter"
+version     = "0.1.0"
+description = "Format JSON with configurable indentation"
+capability  = "tool"
+author      = "PRX Example"
+
+[permissions]
+required = []
+
+[config]
+# No configuration required for this plugin.
+
+[http_allowlist]
+# No outbound HTTP needed.

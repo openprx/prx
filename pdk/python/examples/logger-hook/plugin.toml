@@ -1,0 +1,15 @@
+[plugin]
+name        = "logger-hook"
+version     = "0.1.0"
+description = "Log and count all PRX lifecycle events"
+capability  = "hook"
+author      = "PRX Example"
+
+[permissions]
+required = ["kv", "events"]
+
+[config]
+# No configuration required for this plugin.
+
+[http_allowlist]
+# No outbound HTTP needed.

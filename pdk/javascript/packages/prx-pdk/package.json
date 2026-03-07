@@ -1,0 +1,41 @@
+{
+  "name": "@prx/pdk",
+  "version": "0.1.0",
+  "description": "PRX WASM Plugin Development Kit for JavaScript/TypeScript",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/openprx/openprx"
+  },
+  "keywords": ["wasm", "plugin", "prx", "agent", "pdk", "componentize-js", "jco"],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@bytecodealliance/jco": ">=1.6.0",
+    "@bytecodealliance/componentize-js": ">=0.12.0"
+  },
+  "peerDependenciesMeta": {
+    "@bytecodealliance/jco": { "optional": true },
+    "@bytecodealliance/componentize-js": { "optional": true }
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

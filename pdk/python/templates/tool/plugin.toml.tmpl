@@ -1,0 +1,25 @@
+[plugin]
+name        = "{{plugin_name}}"
+version     = "0.1.0"
+description = "{{plugin_description}}"
+capability  = "tool"
+author      = "{{author}}"
+
+[permissions]
+# Declare required host capabilities.
+# Available: "kv", "events", "http-outbound", "memory"
+required = []
+
+[config]
+# Operator-supplied configuration values.
+# Access in Python: host.config.get("my_key")
+#
+# Example:
+# timeout_ms = "5000"
+# api_base_url = "https://api.example.com"
+
+[http_allowlist]
+# List allowed outbound HTTP URL prefixes (requires "http-outbound" permission).
+#
+# Example:
+# urls = ["https://api.example.com/"]

@@ -1,0 +1,72 @@
+"""
+{{plugin_name}} — PRX Tool Plugin
+
+Replace this docstring with a description of what your tool does.
+
+Build:
+    componentize-py --wit-path ../../wit --world tool componentize plugin.py -o plugin.wasm
+"""
+
+from __future__ import annotations
+
+from prx_pdk import ToolResult, host, prx_tool
+
+
+@prx_tool(
+    name="{{tool_name}}",
+    description="{{tool_description}}",
+    params={
+        "type": "object",
+        "properties": {
+            # Define your input parameters here.
+            # Example:
+            # "input": {
+            #     "type": "string",
+            #     "description": "The input text to process.",
+            # },
+        },
+        "required": [
+            # List required parameter names here.
+            # "input",
+        ],
+    },
+)
+def execute(args: dict) -> ToolResult:
+    """Execute the tool with the given arguments.
+
+    :param args: Validated arguments from the LLM (matches the params schema).
+    :returns: A :class:`~prx_pdk.ToolResult` with the tool's output.
+    """
+    host.log.info("{{tool_name}}: execute called")
+
+    # ── Your implementation here ──────────────────────────────────────────────
+    #
+    # Access arguments:
+    #   value = args.get("input", "")
+    #
+    # Read configuration (set in plugin.toml [config]):
+    #   timeout = host.config.get_or("timeout_ms", "5000")
+    #
+    # Persistent storage:
+    #   host.kv.set_str("last_run", "2025-01-01")
+    #   last = host.kv.get_str("last_run")
+    #
+    # Outbound HTTP (requires http-outbound permission + http_allowlist):
+    #   resp = host.http.get("https://api.example.com/data")
+    #   data = resp.json()
+    #
+    # Return success:
+    #   return ToolResult.ok("Your output here")
+    #
+    # Return failure:
+    #   return ToolResult.err("Something went wrong")
+
+    return ToolResult.ok("Hello from {{tool_name}}!")
+
+
+# ── Local smoke-test (not executed inside WASM) ───────────────────────────────
+
+if __name__ == "__main__":
+    result = execute({})
+    print("success:", result["success"])
+    print(result["output"])

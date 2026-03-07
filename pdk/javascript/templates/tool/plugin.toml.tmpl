@@ -1,0 +1,24 @@
+[plugin]
+name = "{{PLUGIN_NAME}}"
+version = "0.1.0"
+description = "{{PLUGIN_DESCRIPTION}}"
+author = "{{AUTHOR}}"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "tool"
+name = "{{TOOL_NAME}}"
+description = "{{TOOL_DESCRIPTION}}"
+
+[permissions]
+required = ["log", "kv"]
+optional = ["config", "http-outbound", "memory", "events"]
+
+[resources]
+max_fuel = 100_000_000
+max_memory_mb = 16
+max_execution_time_ms = 5000
+
+[config]
+# Add your plugin's configuration keys here
+# output_prefix = ""

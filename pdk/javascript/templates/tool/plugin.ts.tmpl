@@ -1,0 +1,65 @@
+/**
+ * {{PLUGIN_NAME}} — PRX Tool Plugin
+ *
+ * Replace this comment with a description of what your plugin does.
+ *
+ * ## Build
+ *
+ * ```sh
+ * npm install
+ * npm run build:wasm
+ * ```
+ */
+
+import { log, kv, config, resultOk, resultErr } from "@prx/pdk";
+import type { ToolSpec, PluginResult } from "@prx/pdk";
+
+// ── Tool specification ────────────────────────────────────────────────────────
+
+export function getSpec(): ToolSpec {
+  return {
+    name: "{{TOOL_NAME}}",
+    description: "{{TOOL_DESCRIPTION}}",
+    parametersSchema: JSON.stringify({
+      type: "object",
+      properties: {
+        // TODO: define your tool's parameters here
+        input: {
+          type: "string",
+          description: "Input value",
+        },
+      },
+      required: ["input"],
+    }),
+  };
+}
+
+// ── Tool execute ──────────────────────────────────────────────────────────────
+
+export function execute(argsJson: string): PluginResult {
+  // Parse arguments
+  let args: Record<string, unknown>;
+  try {
+    args = JSON.parse(argsJson) as Record<string, unknown>;
+  } catch (e) {
+    return resultErr(`Invalid JSON args: ${String(e)}`);
+  }
+
+  const input = args["input"];
+  if (typeof input !== "string") {
+    return resultErr('Missing or invalid "input" parameter');
+  }
+
+  // Read optional config
+  const prefix = config.getOr("output_prefix", "");
+
+  log.info(`{{TOOL_NAME}}: processing input (${input.length} chars)`);
+
+  // TODO: implement your tool logic here
+  const output = `${prefix}${input}`;
+
+  // Example: track invocation count in KV storage
+  kv.increment("invocation_count", 1);
+
+  return resultOk(output);
+}

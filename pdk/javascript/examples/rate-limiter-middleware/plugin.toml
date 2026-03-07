@@ -1,0 +1,31 @@
+[plugin]
+name = "rate-limiter-middleware"
+version = "0.1.0"
+description = "Per-user sliding-window rate limiter — JavaScript/TypeScript PDK example"
+author = "PRX Team"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "middleware"
+name = "rate_limiter"
+description = "Limits inbound requests per user using a sliding time window"
+
+[permissions]
+required = ["log", "config", "kv"]
+optional = []
+
+[resources]
+max_fuel = 50_000_000
+max_memory_mb = 8
+max_execution_time_ms = 100
+
+[config]
+# Maximum requests allowed per window (default: 60)
+max_requests = "60"
+# Sliding window duration in seconds (default: 60)
+window_seconds = "60"
+# JSON field path to extract the user ID from inbound data (dot-notation supported)
+# Examples: "user_id", "metadata.user_id", "context.sender"
+user_id_field = "user_id"
+# Message returned to the user when they are rate-limited
+block_message = "Rate limit exceeded. Please wait before making more requests."
