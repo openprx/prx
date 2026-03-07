@@ -332,6 +332,9 @@ pub struct AppState {
     pub gateway_port: u16,
     /// Web Console log stream broadcast channel.
     pub logs_broadcast_tx: broadcast::Sender<String>,
+    /// WASM plugin manager (optional, enabled with `--features wasm-plugins`).
+    #[cfg(feature = "wasm-plugins")]
+    pub plugin_manager: Option<Arc<crate::plugins::PluginManager>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -702,6 +705,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         start_time,
         gateway_port: actual_port,
         logs_broadcast_tx,
+        #[cfg(feature = "wasm-plugins")]
+        plugin_manager: None,
+    };
+
+    // ── Initialize WASM plugin manager (if feature enabled) ──
+    #[cfg(feature = "wasm-plugins")]
+    let state = {
+        let mut s = state;
+        s.plugin_manager =
+            crate::plugins::init_plugin_manager(&config.workspace_dir).await;
+        s
     };
 
     let limited_public_routes = Router::new()
@@ -1672,6 +1686,8 @@ mod tests {
             start_time: Instant::now(),
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1725,6 +1741,8 @@ mod tests {
             start_time: Instant::now(),
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2104,6 +2122,8 @@ mod tests {
             start_time: Instant::now(),
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2174,6 +2194,8 @@ mod tests {
             start_time: Instant::now(),
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
         };
 
         let headers = HeaderMap::new();
@@ -2244,6 +2266,8 @@ mod tests {
             start_time: Instant::now(),
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
         };
 
         let response = handle_webhook(
@@ -2310,6 +2334,8 @@ mod tests {
             start_time: Instant::now(),
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
         };
 
         let response = handle_webhook(
@@ -2363,6 +2389,8 @@ mod tests {
             start_time: Instant::now(),
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2421,6 +2449,8 @@ mod tests {
             start_time: Instant::now(),
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2484,6 +2514,8 @@ mod tests {
             start_time: Instant::now(),
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2542,6 +2574,8 @@ mod tests {
             start_time: Instant::now(),
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
         };
 
         let mut headers = HeaderMap::new();

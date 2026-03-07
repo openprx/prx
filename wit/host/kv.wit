@@ -1,0 +1,17 @@
+/// Key-value storage interface for WASM plugins.
+///
+/// Each plugin gets an isolated namespace — plugins cannot read
+/// or write each other's keys.
+interface kv {
+    /// Retrieve a value by key. Returns `none` if the key does not exist.
+    get: func(key: string) -> option<list<u8>>;
+
+    /// Store a value. Overwrites any existing value for the key.
+    set: func(key: string, value: list<u8>) -> result<_, string>;
+
+    /// Delete a key. Returns `true` if the key existed.
+    delete: func(key: string) -> result<bool, string>;
+
+    /// List all keys matching a prefix.
+    list-keys: func(prefix: string) -> list<string>;
+}

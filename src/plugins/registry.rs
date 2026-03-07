@@ -1,0 +1,178 @@
+//! Plugin registry — manages all loaded plugin instances.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use super::manifest::PluginManifest;
+
+/// Status of a loaded plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginStatus {
+    /// Plugin is loaded and ready.
+    Active,
+    /// Plugin failed to load or crashed.
+    Error(String),
+    /// Plugin is being unloaded.
+    Unloading,
+}
+
+/// Summary information about a loaded plugin (returned by list operations).
+#[derive(Debug, Clone)]
+pub struct PluginInfo {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub capabilities: Vec<String>,
+    pub status: PluginStatus,
+}
+
+/// A loaded plugin instance.
+///
+/// In P1, this holds the manifest and status.
+/// P2 will add the wasmtime `Store` and `Instance` for live WASM execution.
+pub struct LoadedPlugin {
+    pub manifest: PluginManifest,
+    pub status: PluginStatus,
+    /// Directory path where the plugin was loaded from.
+    pub source_dir: std::path::PathBuf,
+}
+
+impl LoadedPlugin {
+    /// Create a new loaded plugin entry.
+    pub fn new(manifest: PluginManifest, source_dir: std::path::PathBuf) -> Self {
+        Self {
+            manifest,
+            status: PluginStatus::Active,
+            source_dir,
+        }
+    }
+
+    /// Convert to a summary `PluginInfo`.
+    pub fn info(&self) -> PluginInfo {
+        PluginInfo {
+            name: self.manifest.plugin.name.clone(),
+            version: self.manifest.plugin.version.clone(),
+            description: self.manifest.plugin.description.clone(),
+            capabilities: self
+                .manifest
+                .capabilities
+                .iter()
+                .map(|c| format!("{}:{}", c.capability_type, c.name))
+                .collect(),
+            status: self.status.clone(),
+        }
+    }
+}
+
+/// Thread-safe registry of all loaded plugins.
+///
+/// Uses `Arc<RwLock<...>>` so it can be shared across async tasks
+/// and support concurrent reads with exclusive writes (for hot-reload).
+#[derive(Clone)]
+pub struct PluginRegistry {
+    plugins: Arc<RwLock<HashMap<String, LoadedPlugin>>>,
+}
+
+impl PluginRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self {
+            plugins: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a loaded plugin. Returns an error if a plugin with the
+    /// same name is already loaded.
+    pub async fn register(&self, plugin: LoadedPlugin) -> Result<(), String> {
+        let name = plugin.manifest.plugin.name.clone();
+        let mut plugins = self.plugins.write().await;
+        if plugins.contains_key(&name) {
+            return Err(format!("plugin '{name}' already loaded"));
+        }
+        plugins.insert(name, plugin);
+        Ok(())
+    }
+
+    /// Remove a plugin from the registry. Returns `true` if it existed.
+    pub async fn unregister(&self, name: &str) -> bool {
+        let mut plugins = self.plugins.write().await;
+        plugins.remove(name).is_some()
+    }
+
+    /// List all loaded plugins.
+    pub async fn list(&self) -> Vec<PluginInfo> {
+        let plugins = self.plugins.read().await;
+        plugins.values().map(|p| p.info()).collect()
+    }
+
+    /// Check if a plugin with the given name is loaded.
+    pub async fn contains(&self, name: &str) -> bool {
+        let plugins = self.plugins.read().await;
+        plugins.contains_key(name)
+    }
+
+    /// Get plugin info by name.
+    pub async fn get_info(&self, name: &str) -> Option<PluginInfo> {
+        let plugins = self.plugins.read().await;
+        plugins.get(name).map(|p| p.info())
+    }
+
+    /// Get the number of loaded plugins.
+    pub async fn len(&self) -> usize {
+        let plugins = self.plugins.read().await;
+        plugins.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::manifest::{PluginManifest, PluginMeta, Permissions};
+
+    fn test_manifest(name: &str) -> PluginManifest {
+        PluginManifest {
+            plugin: PluginMeta {
+                name: name.to_string(),
+                version: "0.1.0".to_string(),
+                api_version: "1".to_string(),
+                description: "Test plugin".to_string(),
+                wasm: "plugin.wasm".to_string(),
+                author: None,
+                license: None,
+            },
+            capabilities: vec![],
+            permissions: Permissions::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_and_list() {
+        let registry = PluginRegistry::new();
+        let plugin = LoadedPlugin::new(test_manifest("test"), "/tmp".into());
+        registry.register(plugin).await.unwrap();
+
+        let list = registry.list().await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "test");
+    }
+
+    #[tokio::test]
+    async fn duplicate_register_fails() {
+        let registry = PluginRegistry::new();
+        let p1 = LoadedPlugin::new(test_manifest("test"), "/tmp".into());
+        let p2 = LoadedPlugin::new(test_manifest("test"), "/tmp".into());
+        registry.register(p1).await.unwrap();
+        assert!(registry.register(p2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unregister() {
+        let registry = PluginRegistry::new();
+        let plugin = LoadedPlugin::new(test_manifest("test"), "/tmp".into());
+        registry.register(plugin).await.unwrap();
+        assert!(registry.unregister("test").await);
+        assert!(!registry.unregister("test").await);
+        assert_eq!(registry.len().await, 0);
+    }
+}
