@@ -1,0 +1,13 @@
+/// Hook capability interface for WASM plugins.
+///
+/// Plugins implementing this world receive lifecycle event notifications.
+/// Unlike middleware, hooks observe events without modifying the data flow.
+interface hook-exports {
+    /// Handle a lifecycle event.
+    ///
+    /// - `event`: event name (e.g. "agent_start", "tool_call", "error")
+    /// - `payload-json`: JSON-encoded event payload
+    ///
+    /// Returns Ok(()) on success or an error message.
+    on-event: func(event: string, payload-json: string) -> result<_, string>;
+}

@@ -19,6 +19,42 @@ world tool {
     export prx:plugin/tool-exports;
 }
 
+/// Middleware world — plugins that intercept and transform messages.
+///
+/// Middleware plugins can modify data at various pipeline stages:
+/// inbound, outbound, llm_request, llm_response.
+world middleware {
+    import prx:host/log;
+    import prx:host/config;
+    import prx:host/kv;
+
+    export prx:plugin/middleware-exports;
+}
+
+/// Hook world — plugins that observe lifecycle events.
+///
+/// Hook plugins receive event notifications without modifying
+/// the data flow (read-only observation).
+world hook {
+    import prx:host/log;
+    import prx:host/config;
+    import prx:host/kv;
+
+    export prx:plugin/hook-exports;
+}
+
+/// Cron world — plugins that run on a schedule.
+///
+/// Cron plugins are invoked by the scheduler based on their
+/// declared cron expression in the manifest.
+world cron {
+    import prx:host/log;
+    import prx:host/config;
+    import prx:host/kv;
+
+    export prx:plugin/cron-exports;
+}
+
 /// Base world — minimal plugin with only logging and KV.
 world base-plugin {
     import prx:host/log;

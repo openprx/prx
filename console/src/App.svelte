@@ -15,6 +15,7 @@
   import HooksPage from './pages/HooksPage.svelte';
   import McpPage from './pages/McpPage.svelte';
   import SkillsPage from './pages/SkillsPage.svelte';
+  import PluginsPage from './pages/PluginsPage.svelte';
 
   let path = $state(currentPath());
   let token = $state(getToken());
@@ -223,6 +224,8 @@
             <McpPage />
           {:else if activePath === '/skills'}
             <SkillsPage />
+          {:else if activePath === '/plugins'}
+            <PluginsPage />
           {:else if activePath === '/config'}
             <ConfigPage />
           {:else if activePath === '/logs'}

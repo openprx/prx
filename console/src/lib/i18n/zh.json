@@ -15,6 +15,7 @@
     "hooks": "Hooks",
     "mcp": "MCP",
     "skills": "Skills",
+    "plugins": "插件",
     "logs": "日志"
   },
   "common": {
@@ -191,6 +192,18 @@
     "installFailed": "Skill 安装失败",
     "uninstallSuccess": "Skill 已卸载",
     "uninstallFailed": "Skill 卸载失败"
+  },
+  "plugins": {
+    "title": "插件",
+    "loading": "正在加载插件...",
+    "loadFailed": "加载插件失败。",
+    "noPlugins": "未加载任何 WASM 插件。",
+    "capabilities": "能力",
+    "permissions": "权限",
+    "statusActive": "运行中",
+    "reload": "重载",
+    "reloadSuccess": "插件 \"{name}\" 已重载",
+    "reloadFailed": "插件重载失败"
   },
   "login": {
     "title": "PRX 控制台登录",

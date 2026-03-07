@@ -94,6 +94,11 @@ pub struct HookManager {
     workspace_dir: PathBuf,
     hooks_json_path: PathBuf,
     state: RwLock<RuntimeState>,
+    /// Optional WASM hook executor for plugins with hook capability.
+    #[cfg(feature = "wasm-plugins")]
+    wasm_executor: tokio::sync::RwLock<
+        Option<std::sync::Arc<crate::plugins::capabilities::hook::WasmHookExecutor>>,
+    >,
 }
 
 impl HookManager {
@@ -102,41 +107,61 @@ impl HookManager {
             hooks_json_path: workspace_dir.join(HOOKS_JSON_FILE),
             workspace_dir,
             state: RwLock::new(RuntimeState::default()),
+            #[cfg(feature = "wasm-plugins")]
+            wasm_executor: tokio::sync::RwLock::new(None),
         }
+    }
+
+    /// Set the WASM hook executor for lifecycle event observation.
+    #[cfg(feature = "wasm-plugins")]
+    pub async fn set_wasm_executor(
+        &self,
+        executor: std::sync::Arc<crate::plugins::capabilities::hook::WasmHookExecutor>,
+    ) {
+        *self.wasm_executor.write().await = Some(executor);
     }
 
     pub async fn emit(&self, event: HookEvent, payload: serde_json::Value) {
         if let Err(err) = self.refresh_if_changed() {
             tracing::warn!(error = %err, "hooks refresh failed");
-            return;
+        } else {
+            let (enabled, timeout_ms, actions) = {
+                let state = self.state.read();
+                (
+                    state.config.enabled,
+                    state.config.timeout_ms,
+                    state
+                        .config
+                        .hooks
+                        .get(event.as_str())
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            };
+
+            if enabled && !actions.is_empty() {
+                for action in actions {
+                    if let Err(err) =
+                        self.run_action(event, &payload, timeout_ms, &action).await
+                    {
+                        tracing::warn!(
+                            event = event.as_str(),
+                            command = action.command,
+                            error = %err,
+                            "hook execution failed"
+                        );
+                    }
+                }
+            }
         }
 
-        let (enabled, timeout_ms, actions) = {
-            let state = self.state.read();
-            (
-                state.config.enabled,
-                state.config.timeout_ms,
-                state
-                    .config
-                    .hooks
-                    .get(event.as_str())
-                    .cloned()
-                    .unwrap_or_default(),
-            )
-        };
-
-        if !enabled || actions.is_empty() {
-            return;
-        }
-
-        for action in actions {
-            if let Err(err) = self.run_action(event, &payload, timeout_ms, &action).await {
-                tracing::warn!(
-                    event = event.as_str(),
-                    command = action.command,
-                    error = %err,
-                    "hook execution failed"
-                );
+        // Also fire WASM hook plugins (if feature enabled and executor configured).
+        #[cfg(feature = "wasm-plugins")]
+        {
+            let executor = self.wasm_executor.read().await;
+            if let Some(ref exec) = *executor {
+                let payload_str = payload.to_string();
+                exec.emit(event.as_str(), &payload_str).await;
             }
         }
     }

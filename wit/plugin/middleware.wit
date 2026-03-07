@@ -1,0 +1,13 @@
+/// Middleware capability interface for WASM plugins.
+///
+/// Plugins implementing this world can intercept and transform messages
+/// at various stages of the processing pipeline.
+interface middleware-exports {
+    /// Process data at a specific pipeline stage.
+    ///
+    /// - `stage`: one of "inbound", "outbound", "llm_request", "llm_response"
+    /// - `data-json`: JSON-encoded data for the stage
+    ///
+    /// Returns the (possibly modified) JSON data.
+    process: func(stage: string, data-json: string) -> result<string, string>;
+}
