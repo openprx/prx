@@ -615,6 +615,79 @@ impl PluginManager {
         providers
     }
 
+    /// Create storage adapters for all plugins with storage capabilities.
+    ///
+    /// Returns a list of `WasmStorage` instances, each implementing the
+    /// `Memory` trait and ready to serve as a custom memory backend.
+    pub async fn create_storage_adapters(
+        &self,
+        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
+    ) -> Vec<capabilities::storage::WasmStorage> {
+        let plugins = self.registry.list().await;
+        let mut storages = Vec::new();
+
+        for info in &plugins {
+            let storage_caps: Vec<_> = info
+                .capabilities
+                .iter()
+                .filter(|c| c.starts_with("storage"))
+                .collect();
+            if storage_caps.is_empty() {
+                continue;
+            }
+
+            let manifest = match self.registry.get_manifest(&info.name).await {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let source_dir = match self.registry.get_source_dir(&info.name).await {
+                Some(d) => d,
+                None => continue,
+            };
+
+            let wasm_path = source_dir.join(&manifest.plugin.wasm);
+            let wasm_bytes = match std::fs::read(&wasm_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to read WASM for storage");
+                    continue;
+                }
+            };
+
+            let component = match wasmtime::component::Component::new(&self.engine, &wasm_bytes) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to compile WASM for storage");
+                    continue;
+                }
+            };
+
+            match capabilities::storage::WasmStorage::new(
+                &self.engine,
+                &component,
+                &manifest,
+                event_bus.clone(),
+            )
+            .await
+            {
+                Ok(storage) => {
+                    tracing::info!(
+                        plugin = %info.name,
+                        storage = %storage.storage_name(),
+                        "WASM storage adapter created"
+                    );
+                    storages.push(storage);
+                }
+                Err(e) => {
+                    tracing::warn!(plugin = %info.name, error = %e, "failed to create storage adapter");
+                }
+            }
+        }
+
+        storages
+    }
+
     /// Get a reference to the wasmtime engine.
     pub fn engine(&self) -> &wasmtime::Engine {
         &self.engine

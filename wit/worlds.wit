@@ -72,6 +72,19 @@ world provider {
     export prx:plugin/provider-exports;
 }
 
+/// Storage world — plugins that serve as custom Memory backends.
+///
+/// Storage plugins receive memory store/recall/forget requests from the host
+/// and implement a custom persistence backend (e.g., Pinecone, Qdrant).
+world storage {
+    import prx:host/log;
+    import prx:host/config;
+    import prx:host/http-outbound;
+    import prx:host/events;
+
+    export prx:plugin/storage-exports;
+}
+
 /// Base world — minimal plugin with only logging and KV.
 world base-plugin {
     import prx:host/log;
