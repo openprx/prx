@@ -167,6 +167,125 @@ pub fn register_kv_host_functions(
     Ok(())
 }
 
+/// Register `prx:host/events@0.1.0` host functions into the linker.
+///
+/// Exposes `publish`, `subscribe`, and `unsubscribe` to WASM plugins.
+/// All calls require the `"events"` permission; violations return an error
+/// string to the plugin rather than panicking.
+pub fn register_event_host_functions(
+    linker: &mut wasmtime::component::Linker<HostState>,
+) -> PluginResult<()> {
+    use crate::plugins::event_bus::MAX_PAYLOAD_BYTES;
+
+    let mut inst = linker
+        .instance("prx:host/events@0.1.0")
+        .map_err(|e| PluginError::Instantiation(format!("linker error (events): {e}")))?;
+
+    // ── publish ──
+    inst.func_wrap_async(
+        "publish",
+        |store: wasmtime::StoreContextMut<'_, HostState>,
+         (topic, payload): (String, String)| {
+            Box::new(async move {
+                // Permission check.
+                if let Err(e) = store.data().check_permission("events") {
+                    tracing::warn!("{e}");
+                    return Ok((Err::<(), String>(e),));
+                }
+                // Payload size check.
+                if payload.len() > MAX_PAYLOAD_BYTES {
+                    let err = format!(
+                        "event bus: payload size {} exceeds maximum {} bytes",
+                        payload.len(),
+                        MAX_PAYLOAD_BYTES
+                    );
+                    return Ok((Err(err),));
+                }
+                match &store.data().event_bus {
+                    None => {
+                        // No event bus configured — silently succeed.
+                        tracing::debug!(topic = %topic, "event bus not configured, dropping publish");
+                        Ok((Ok(()),))
+                    }
+                    Some(bus) => {
+                        let bus = bus.clone();
+                        match bus.publish(&topic, &payload).await {
+                            Ok(()) => Ok((Ok(()),)),
+                            Err(e) => Ok((Err(e),)),
+                        }
+                    }
+                }
+            })
+        },
+    )
+    .map_err(|e| PluginError::Instantiation(format!("link events.publish: {e}")))?;
+
+    // ── subscribe ──
+    inst.func_wrap_async(
+        "subscribe",
+        |store: wasmtime::StoreContextMut<'_, HostState>, (pattern,): (String,)| {
+            Box::new(async move {
+                if let Err(e) = store.data().check_permission("events") {
+                    tracing::warn!("{e}");
+                    return Ok((Err::<u64, String>(e),));
+                }
+                match &store.data().event_bus {
+                    None => {
+                        tracing::debug!(pattern = %pattern, "event bus not configured, subscribe no-op");
+                        Ok((Ok(0u64),))
+                    }
+                    Some(bus) => {
+                        let plugin_name = store.data().plugin_name.clone();
+                        let bus = bus.clone();
+                        match bus.subscribe(&plugin_name, &pattern).await {
+                            Ok((id, _rx)) => {
+                                // Note: the receiver is intentionally dropped here for the
+                                // host-function path. Full receiver wiring (dispatching back
+                                // into guest on-event) is deferred to the PDK integration layer.
+                                tracing::debug!(
+                                    plugin = %plugin_name,
+                                    pattern = %pattern,
+                                    subscription_id = id,
+                                    "event bus: subscription registered"
+                                );
+                                Ok((Ok(id),))
+                            }
+                            Err(e) => Ok((Err(e),)),
+                        }
+                    }
+                }
+            })
+        },
+    )
+    .map_err(|e| PluginError::Instantiation(format!("link events.subscribe: {e}")))?;
+
+    // ── unsubscribe ──
+    inst.func_wrap_async(
+        "unsubscribe",
+        |store: wasmtime::StoreContextMut<'_, HostState>, (sub_id,): (u64,)| {
+            Box::new(async move {
+                if let Err(e) = store.data().check_permission("events") {
+                    tracing::warn!("{e}");
+                    return Ok((Err::<(), String>(e),));
+                }
+                match &store.data().event_bus {
+                    None => Ok((Ok(()),)),
+                    Some(bus) => {
+                        let bus = bus.clone();
+                        match bus.unsubscribe(sub_id).await {
+                            Ok(()) => Ok((Ok(()),)),
+                            Err(e) => Ok((Err(e),)),
+                        }
+                    }
+                }
+            })
+        },
+    )
+    .map_err(|e| PluginError::Instantiation(format!("link events.unsubscribe: {e}")))?;
+
+    Ok(())
+}
+
 /// Register all common host functions (log + config + kv) in a single call.
 ///
 /// Used by middleware, hook, and cron capability adapters. Tool adapters have
@@ -178,5 +297,6 @@ pub fn register_common_host_functions(
     register_log_host_functions(linker)?;
     register_config_host_functions(linker)?;
     register_kv_host_functions(linker)?;
+    register_event_host_functions(linker)?;
     Ok(())
 }

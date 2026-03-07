@@ -99,6 +99,11 @@ pub struct HookManager {
     wasm_executor: tokio::sync::RwLock<
         Option<std::sync::Arc<crate::plugins::capabilities::hook::WasmHookExecutor>>,
     >,
+    /// Optional event bus for bridging lifecycle events to inter-plugin messaging.
+    #[cfg(feature = "wasm-plugins")]
+    event_bus: tokio::sync::RwLock<
+        Option<std::sync::Arc<crate::plugins::event_bus::EventBus>>,
+    >,
 }
 
 impl HookManager {
@@ -109,6 +114,8 @@ impl HookManager {
             state: RwLock::new(RuntimeState::default()),
             #[cfg(feature = "wasm-plugins")]
             wasm_executor: tokio::sync::RwLock::new(None),
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -119,6 +126,15 @@ impl HookManager {
         executor: std::sync::Arc<crate::plugins::capabilities::hook::WasmHookExecutor>,
     ) {
         *self.wasm_executor.write().await = Some(executor);
+    }
+
+    /// Set the event bus to bridge lifecycle events into inter-plugin topics.
+    #[cfg(feature = "wasm-plugins")]
+    pub async fn set_event_bus(
+        &self,
+        bus: std::sync::Arc<crate::plugins::event_bus::EventBus>,
+    ) {
+        *self.event_bus.write().await = Some(bus);
     }
 
     pub async fn emit(&self, event: HookEvent, payload: serde_json::Value) {
@@ -162,6 +178,22 @@ impl HookManager {
             if let Some(ref exec) = *executor {
                 let payload_str = payload.to_string();
                 exec.emit(event.as_str(), &payload_str).await;
+            }
+        }
+
+        // Bridge lifecycle event to the event bus under `prx.lifecycle.<event>`.
+        #[cfg(feature = "wasm-plugins")]
+        {
+            let bus_guard = self.event_bus.read().await;
+            if let Some(ref bus) = *bus_guard {
+                let topic = format!("prx.lifecycle.{}", event.as_str());
+                let payload_str = payload.to_string();
+                let bus = bus.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = bus.publish(&topic, &payload_str).await {
+                        tracing::debug!(topic = %topic, error = %e, "event bus lifecycle bridge error");
+                    }
+                });
             }
         }
     }

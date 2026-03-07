@@ -18,6 +18,7 @@
 
 pub mod capabilities;
 pub mod error;
+pub mod event_bus;
 pub mod host;
 pub mod manifest;
 pub mod registry;

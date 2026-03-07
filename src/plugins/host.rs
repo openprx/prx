@@ -9,6 +9,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::memory::traits::Memory;
+#[cfg(feature = "wasm-plugins")]
+use crate::plugins::event_bus::EventBus;
 
 /// Per-plugin-instance state stored in the wasmtime `Store<HostState>`.
 ///
@@ -38,6 +40,10 @@ pub struct HostState {
 
     /// Memory backend reference for prx:host/memory host functions.
     pub memory: Option<Arc<dyn Memory>>,
+
+    /// Event bus reference for prx:host/events host functions.
+    #[cfg(feature = "wasm-plugins")]
+    pub event_bus: Option<Arc<EventBus>>,
 }
 
 impl HostState {
@@ -60,12 +66,21 @@ impl HostState {
             kv_store: Arc::new(RwLock::new(HashMap::new())),
             timeout_ms,
             memory: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
         }
     }
 
     /// Create a new `HostState` with a memory backend reference.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Inject an event bus reference into this host state.
+    #[cfg(feature = "wasm-plugins")]
+    pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
+        self.event_bus = Some(bus);
         self
     }
 
