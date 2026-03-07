@@ -286,6 +286,79 @@ pub fn register_event_host_functions(
     Ok(())
 }
 
+/// Register `prx:host/http-outbound@0.1.0` host functions into the linker.
+///
+/// Exposes an HTTP `request` function to WASM plugins. Calls are guarded by
+/// the `"http-outbound"` permission and the configured URL allowlist.
+pub fn register_http_host_functions(
+    linker: &mut wasmtime::component::Linker<HostState>,
+) -> PluginResult<()> {
+    let mut http_inst = linker
+        .instance("prx:host/http-outbound@0.1.0")
+        .map_err(|e| PluginError::Instantiation(format!("linker error (http): {e}")))?;
+
+    http_inst
+        .func_wrap_async(
+            "request",
+            |store: wasmtime::StoreContextMut<'_, HostState>,
+             (method, url, headers, body): (
+                String,
+                String,
+                Vec<(String, String)>,
+                Option<Vec<u8>>,
+            )| {
+                Box::new(async move {
+                    if let Err(e) = store.data().check_permission("http-outbound") {
+                        return Ok((Err::<(u16, Vec<(String, String)>, Vec<u8>), String>(e),));
+                    }
+                    if !store.data().check_url_allowed(&url) {
+                        return Ok((Err(format!("URL not in allowlist: {url}")),));
+                    }
+
+                    let client = reqwest::Client::new();
+                    let mut req = match method.to_uppercase().as_str() {
+                        "GET" => client.get(&url),
+                        "POST" => client.post(&url),
+                        "PUT" => client.put(&url),
+                        "DELETE" => client.delete(&url),
+                        "PATCH" => client.patch(&url),
+                        "HEAD" => client.head(&url),
+                        _ => return Ok((Err(format!("unsupported method: {method}")),)),
+                    };
+
+                    for (k, v) in &headers {
+                        req = req.header(k.as_str(), v.as_str());
+                    }
+
+                    if let Some(b) = body {
+                        req = req.body(b);
+                    }
+
+                    match req.send().await {
+                        Ok(resp) => {
+                            let status = resp.status().as_u16();
+                            let resp_headers: Vec<(String, String)> = resp
+                                .headers()
+                                .iter()
+                                .map(|(k, v)| {
+                                    (k.to_string(), v.to_str().unwrap_or("").to_string())
+                                })
+                                .collect();
+                            match resp.bytes().await {
+                                Ok(bytes) => Ok((Ok((status, resp_headers, bytes.to_vec())),)),
+                                Err(e) => Ok((Err(format!("body read error: {e}")),)),
+                            }
+                        }
+                        Err(e) => Ok((Err(format!("request failed: {e}")),)),
+                    }
+                })
+            },
+        )
+        .map_err(|e| PluginError::Instantiation(format!("link http.request: {e}")))?;
+
+    Ok(())
+}
+
 /// Register all common host functions (log + config + kv) in a single call.
 ///
 /// Used by middleware, hook, and cron capability adapters. Tool adapters have

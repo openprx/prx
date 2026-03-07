@@ -59,6 +59,19 @@ world cron {
     export prx:plugin/cron-exports;
 }
 
+/// Provider world — plugins that serve as LLM providers.
+///
+/// Provider plugins receive chat completion requests from the host
+/// and return responses, allowing WASM plugins to act as custom LLM backends.
+world provider {
+    import prx:host/log;
+    import prx:host/config;
+    import prx:host/http-outbound;
+    import prx:host/events;
+
+    export prx:plugin/provider-exports;
+}
+
 /// Base world — minimal plugin with only logging and KV.
 world base-plugin {
     import prx:host/log;
