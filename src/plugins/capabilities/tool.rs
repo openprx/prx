@@ -46,7 +46,7 @@ impl WasmToolAdapter {
         component: &wasmtime::component::Component,
         manifest: &PluginManifest,
     ) -> Result<Self, PluginError> {
-        Self::new_with_memory(engine, component, manifest, None).await
+        Self::new_with_memory(engine, component, manifest, None, None).await
     }
 
     /// Create a new WasmToolAdapter with an optional memory backend.
@@ -55,6 +55,7 @@ impl WasmToolAdapter {
         component: &wasmtime::component::Component,
         manifest: &PluginManifest,
         memory: Option<Arc<dyn crate::memory::traits::Memory>>,
+        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
     ) -> Result<Self, PluginError> {
         let timeout_ms = manifest.resources.max_execution_time_ms;
 
@@ -71,6 +72,9 @@ impl WasmToolAdapter {
         );
         if let Some(mem) = memory {
             host_state = host_state.with_memory(mem);
+        }
+        if let Some(bus) = event_bus {
+            host_state = host_state.with_event_bus(bus);
         }
 
         // Create store with fuel limit
