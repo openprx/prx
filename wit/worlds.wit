@@ -15,6 +15,7 @@ world tool {
     import prx:host/kv;
     import prx:host/http-outbound;
     import prx:host/memory;
+    import prx:host/events;
 
     export prx:plugin/tool-exports;
 }
@@ -27,6 +28,7 @@ world middleware {
     import prx:host/log;
     import prx:host/config;
     import prx:host/kv;
+    import prx:host/events;
 
     export prx:plugin/middleware-exports;
 }
@@ -39,6 +41,7 @@ world hook {
     import prx:host/log;
     import prx:host/config;
     import prx:host/kv;
+    import prx:host/events;
 
     export prx:plugin/hook-exports;
 }
@@ -51,6 +54,7 @@ world cron {
     import prx:host/log;
     import prx:host/config;
     import prx:host/kv;
+    import prx:host/events;
 
     export prx:plugin/cron-exports;
 }

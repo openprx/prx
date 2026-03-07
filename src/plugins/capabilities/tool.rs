@@ -331,6 +331,9 @@ impl WasmToolAdapter {
             )
             .map_err(|e| PluginError::Instantiation(format!("link memory.recall: {e}")))?;
 
+        // prx:host/events@0.1.0
+        super::common::register_event_host_functions(linker)?;
+
         Ok(())
     }
 

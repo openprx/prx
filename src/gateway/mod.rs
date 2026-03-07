@@ -344,6 +344,9 @@ pub struct AppState {
     /// WASM cron manager for scheduled plugin tasks.
     #[cfg(feature = "wasm-plugins")]
     pub wasm_cron_manager: Option<Arc<crate::plugins::capabilities::cron::WasmCronManager>>,
+    /// Shared event bus for inter-plugin communication.
+    #[cfg(feature = "wasm-plugins")]
+    pub event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -521,11 +524,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // ── Register WASM plugin tools and create plugin manager (if feature enabled) ──
     #[cfg(feature = "wasm-plugins")]
-    let (wasm_plugin_manager, wasm_mw_chain, wasm_hook_exec, wasm_cron_mgr) = {
+    let (wasm_plugin_manager, wasm_mw_chain, wasm_hook_exec, wasm_cron_mgr, wasm_event_bus) = {
         let pm = crate::plugins::init_plugin_manager(&config.workspace_dir).await;
         let mut mw = None;
         let mut he = None;
         let mut cm = None;
+        // Always create an event bus when the wasm-plugins feature is active.
+        let bus = Arc::new(crate::plugins::event_bus::EventBus::new());
         if let Some(ref pm) = pm {
             // Tool adapters
             let wasm_tools = pm.create_tool_adapters_with_memory(Some(Arc::clone(&mem))).await;
@@ -555,7 +560,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 cm = Some(Arc::new(cron));
             }
         }
-        (pm, mw, he, cm)
+        tracing::debug!("WASM event bus ready");
+        (pm, mw, he, cm, Some(bus))
     };
 
     let tools_registry = Arc::new(tools_list);
@@ -761,12 +767,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         wasm_hook_executor: wasm_hook_exec,
         #[cfg(feature = "wasm-plugins")]
         wasm_cron_manager: wasm_cron_mgr,
+        #[cfg(feature = "wasm-plugins")]
+        event_bus: wasm_event_bus,
     };
 
     // Inject WASM hook executor into HookManager so .emit() triggers WASM hooks too.
     #[cfg(feature = "wasm-plugins")]
     if let Some(ref exec) = state.wasm_hook_executor {
         state.hooks.set_wasm_executor(Arc::clone(exec)).await;
+    }
+
+    // Inject event bus into HookManager so lifecycle events bridge to inter-plugin topics.
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(ref bus) = state.event_bus {
+        state.hooks.set_event_bus(Arc::clone(bus)).await;
     }
 
     let limited_public_routes = Router::new()
@@ -1745,6 +1759,8 @@ mod tests {
             wasm_hook_executor: None,
             #[cfg(feature = "wasm-plugins")]
             wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1806,6 +1822,8 @@ mod tests {
             wasm_hook_executor: None,
             #[cfg(feature = "wasm-plugins")]
             wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2193,6 +2211,8 @@ mod tests {
             wasm_hook_executor: None,
             #[cfg(feature = "wasm-plugins")]
             wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2271,6 +2291,8 @@ mod tests {
             wasm_hook_executor: None,
             #[cfg(feature = "wasm-plugins")]
             wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
         };
 
         let headers = HeaderMap::new();
@@ -2349,6 +2371,8 @@ mod tests {
             wasm_hook_executor: None,
             #[cfg(feature = "wasm-plugins")]
             wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
         };
 
         let response = handle_webhook(
@@ -2423,6 +2447,8 @@ mod tests {
             wasm_hook_executor: None,
             #[cfg(feature = "wasm-plugins")]
             wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
         };
 
         let response = handle_webhook(
@@ -2484,6 +2510,8 @@ mod tests {
             wasm_hook_executor: None,
             #[cfg(feature = "wasm-plugins")]
             wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2550,6 +2578,8 @@ mod tests {
             wasm_hook_executor: None,
             #[cfg(feature = "wasm-plugins")]
             wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2621,6 +2651,8 @@ mod tests {
             wasm_hook_executor: None,
             #[cfg(feature = "wasm-plugins")]
             wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2687,6 +2719,8 @@ mod tests {
             wasm_hook_executor: None,
             #[cfg(feature = "wasm-plugins")]
             wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
         };
 
         let mut headers = HeaderMap::new();
