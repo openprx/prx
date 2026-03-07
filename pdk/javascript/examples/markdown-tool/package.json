@@ -1,0 +1,21 @@
+{
+  "name": "markdown-tool",
+  "version": "0.1.0",
+  "description": "PRX tool plugin: Markdown → HTML conversion (TypeScript PDK example)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "componentize": "jco componentize dist/plugin.js --wit ../../../../wit --world tool -o plugin.wasm",
+    "build:wasm": "npm run build && npm run componentize",
+    "clean": "rm -rf dist plugin.wasm"
+  },
+  "dependencies": {
+    "@prx/pdk": "file:../../packages/prx-pdk"
+  },
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "^0.12.0",
+    "@bytecodealliance/jco": "^1.6.0",
+    "typescript": "^5.0.0"
+  }
+}

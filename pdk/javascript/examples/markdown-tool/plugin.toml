@@ -1,0 +1,23 @@
+[plugin]
+name = "markdown-tool"
+version = "0.1.0"
+description = "Converts Markdown text to HTML — JavaScript/TypeScript PDK example"
+author = "PRX Team"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "tool"
+name = "markdown_to_html"
+description = "Convert Markdown text to HTML"
+
+[permissions]
+required = ["log", "kv"]
+optional = []
+
+[resources]
+max_fuel = 100_000_000
+max_memory_mb = 16
+max_execution_time_ms = 2000
+
+[config]
+# No configuration needed for this plugin

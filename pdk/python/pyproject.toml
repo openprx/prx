@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "prx-pdk"
+version = "0.1.0"
+description = "PRX WASM Plugin Development Kit for Python"
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.10"
+keywords = ["wasm", "plugin", "pdk", "prx", "webassembly"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+
+# No mandatory runtime dependencies — the WIT bindings are generated at
+# build time by componentize-py and are not needed for local development.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "componentize-py>=0.16",
+]
+
+[project.urls]
+Repository = "https://github.com/prx/prx"
+Documentation = "https://github.com/prx/prx/tree/main/pdk/python"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["prx_pdk*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

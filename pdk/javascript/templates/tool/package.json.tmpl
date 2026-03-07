@@ -1,0 +1,21 @@
+{
+  "name": "{{PLUGIN_NAME}}",
+  "version": "0.1.0",
+  "description": "{{PLUGIN_DESCRIPTION}}",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "componentize": "jco componentize dist/plugin.js --wit {{WIT_PATH}} --world tool -o plugin.wasm",
+    "build:wasm": "npm run build && npm run componentize",
+    "clean": "rm -rf dist plugin.wasm"
+  },
+  "dependencies": {
+    "@prx/pdk": "{{PDK_VERSION}}"
+  },
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "^0.12.0",
+    "@bytecodealliance/jco": "^1.6.0",
+    "typescript": "^5.0.0"
+  }
+}
