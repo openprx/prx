@@ -387,3 +387,134 @@ impl Provider for WasmProvider {
         }
     }
 }
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasmtime::component::Val;
+
+    fn str_val(s: &str) -> Val {
+        Val::String(s.into())
+    }
+
+    // --- parse_tool_call ---
+
+    #[test]
+    fn parse_tool_call_valid() {
+        let record = Val::Record(vec![
+            ("id".to_string(), str_val("call-1")),
+            ("name".to_string(), str_val("get_weather")),
+            ("arguments".to_string(), str_val(r#"{"city":"NYC"}"#)),
+        ]);
+        let tc = WasmProvider::parse_tool_call(&record).expect("should parse tool call");
+        assert_eq!(tc.id, "call-1");
+        assert_eq!(tc.name, "get_weather");
+        assert_eq!(tc.arguments, r#"{"city":"NYC"}"#);
+    }
+
+    #[test]
+    fn parse_tool_call_missing_fields_defaults_to_empty() {
+        let record = Val::Record(vec![
+            ("name".to_string(), str_val("my_tool")),
+            // id and arguments intentionally omitted — defaults to ""
+        ]);
+        let tc = WasmProvider::parse_tool_call(&record).expect("should parse with default empty strings");
+        assert_eq!(tc.name, "my_tool");
+        assert_eq!(tc.id, "");
+        assert_eq!(tc.arguments, "");
+    }
+
+    #[test]
+    fn parse_tool_call_not_a_record_returns_none() {
+        let val = Val::Bool(true);
+        assert!(WasmProvider::parse_tool_call(&val).is_none());
+    }
+
+    // --- parse_chat_response ---
+
+    #[test]
+    fn parse_chat_response_with_text() {
+        let record = Val::Record(vec![
+            (
+                "text".to_string(),
+                Val::Option(Some(Box::new(str_val("Hello from WASM!")))),
+            ),
+            ("tool-calls".to_string(), Val::List(vec![])),
+        ]);
+        let resp = WasmProvider::parse_chat_response(&record).expect("should parse");
+        assert_eq!(resp.text, Some("Hello from WASM!".to_string()));
+        assert!(resp.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_chat_response_text_none() {
+        let record = Val::Record(vec![
+            ("text".to_string(), Val::Option(None)),
+            ("tool-calls".to_string(), Val::List(vec![])),
+        ]);
+        let resp = WasmProvider::parse_chat_response(&record).expect("should parse");
+        assert!(resp.text.is_none());
+        assert!(resp.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_chat_response_with_tool_calls() {
+        let tool_call = Val::Record(vec![
+            ("id".to_string(), str_val("tc-1")),
+            ("name".to_string(), str_val("search")),
+            ("arguments".to_string(), str_val(r#"{"q":"rust"}"#)),
+        ]);
+        let record = Val::Record(vec![
+            ("text".to_string(), Val::Option(None)),
+            ("tool-calls".to_string(), Val::List(vec![tool_call])),
+        ]);
+        let resp = WasmProvider::parse_chat_response(&record).expect("should parse");
+        assert!(resp.text.is_none());
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "tc-1");
+        assert_eq!(resp.tool_calls[0].name, "search");
+        assert_eq!(resp.tool_calls[0].arguments, r#"{"q":"rust"}"#);
+    }
+
+    #[test]
+    fn parse_chat_response_multiple_tool_calls() {
+        let tc1 = Val::Record(vec![
+            ("id".to_string(), str_val("tc-1")),
+            ("name".to_string(), str_val("tool_a")),
+            ("arguments".to_string(), str_val("{}")),
+        ]);
+        let tc2 = Val::Record(vec![
+            ("id".to_string(), str_val("tc-2")),
+            ("name".to_string(), str_val("tool_b")),
+            ("arguments".to_string(), str_val("{}")),
+        ]);
+        let record = Val::Record(vec![
+            ("text".to_string(), Val::Option(Some(Box::new(str_val("also text"))))),
+            ("tool-calls".to_string(), Val::List(vec![tc1, tc2])),
+        ]);
+        let resp = WasmProvider::parse_chat_response(&record).expect("should parse");
+        assert_eq!(resp.text, Some("also text".to_string()));
+        assert_eq!(resp.tool_calls.len(), 2);
+        assert_eq!(resp.tool_calls[0].name, "tool_a");
+        assert_eq!(resp.tool_calls[1].name, "tool_b");
+    }
+
+    #[test]
+    fn parse_chat_response_not_a_record_returns_error() {
+        let val = Val::Bool(false);
+        assert!(WasmProvider::parse_chat_response(&val).is_err());
+    }
+
+    #[test]
+    fn parse_chat_response_missing_optional_fields() {
+        // Only 'text' field — tool-calls field absent → defaults to empty vec
+        let record = Val::Record(vec![
+            ("text".to_string(), Val::Option(Some(Box::new(str_val("hi"))))),
+        ]);
+        let resp = WasmProvider::parse_chat_response(&record).expect("should parse gracefully");
+        assert_eq!(resp.text, Some("hi".to_string()));
+        assert!(resp.tool_calls.is_empty());
+    }
+}

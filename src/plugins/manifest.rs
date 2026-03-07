@@ -273,4 +273,199 @@ name = "my_hook"
         assert!(manifest.has_capability("hook"));
         assert!(!manifest.has_capability("channel"));
     }
+
+    #[test]
+    fn parse_provider_capability_manifest() {
+        let toml_str = r#"
+[plugin]
+name = "my-llm-provider"
+version = "0.2.0"
+description = "Custom LLM provider"
+author = "team"
+
+[[capabilities]]
+type = "provider"
+name = "my-llm"
+description = "My custom LLM backend"
+
+[permissions]
+required = ["log", "http-outbound"]
+http_allowlist = ["https://api.example.com/*"]
+
+[resources]
+max_execution_time_ms = 60000
+
+[config]
+api_endpoint = "https://api.example.com/v1"
+"#;
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.plugin.name, "my-llm-provider");
+        assert!(manifest.has_capability("provider"));
+        let providers = manifest.capabilities_of_type("provider");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "my-llm");
+        assert_eq!(manifest.resources.max_execution_time_ms, 60000);
+        assert_eq!(
+            manifest.config.get("api_endpoint"),
+            Some(&"https://api.example.com/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_storage_capability_manifest() {
+        let toml_str = r#"
+[plugin]
+name = "redis-storage"
+version = "1.0.0"
+description = "Redis memory backend"
+
+[[capabilities]]
+type = "storage"
+name = "redis"
+description = "Redis-backed persistent memory"
+
+[permissions]
+required = ["log", "config", "http-outbound"]
+
+[resources]
+max_execution_time_ms = 5000
+max_kv_storage_mb = 100
+
+[config]
+redis_url = "redis://localhost:6379"
+"#;
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.plugin.name, "redis-storage");
+        assert!(manifest.has_capability("storage"));
+        let storage_caps = manifest.capabilities_of_type("storage");
+        assert_eq!(storage_caps.len(), 1);
+        assert_eq!(storage_caps[0].name, "redis");
+        assert_eq!(manifest.resources.max_execution_time_ms, 5000);
+        assert_eq!(manifest.resources.max_kv_storage_mb, 100);
+        assert_eq!(
+            manifest.config.get("redis_url"),
+            Some(&"redis://localhost:6379".to_string())
+        );
+    }
+
+    #[test]
+    fn invalid_manifest_missing_name_fails_validation() {
+        let toml_str = r#"
+[plugin]
+name = ""
+version = "0.1.0"
+"#;
+        // Parse succeeds, but validate() should reject empty name.
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        let result = manifest.validate();
+        assert!(result.is_err(), "empty plugin name should fail validation");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("name"), "error should mention name: {err}");
+    }
+
+    #[test]
+    fn invalid_manifest_missing_version_fails_validation() {
+        let toml_str = r#"
+[plugin]
+name = "my-plugin"
+version = ""
+"#;
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        let result = manifest.validate();
+        assert!(result.is_err(), "empty plugin version should fail validation");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("version"), "error should mention version: {err}");
+    }
+
+    #[test]
+    fn pool_size_field_parsing() {
+        let toml_str = r#"
+[plugin]
+name = "pooled-plugin"
+version = "0.1.0"
+
+[resources]
+pool_size = 4
+"#;
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.resources.pool_size, 4);
+    }
+
+    #[test]
+    fn pool_size_defaults_to_zero() {
+        let toml_str = r#"
+[plugin]
+name = "no-pool"
+version = "0.1.0"
+"#;
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.resources.pool_size, 0, "pool_size should default to 0");
+    }
+
+    #[test]
+    fn capabilities_of_type_filters_correctly() {
+        let toml_str = r#"
+[plugin]
+name = "multi-cap"
+version = "0.1.0"
+
+[[capabilities]]
+type = "tool"
+name = "tool-a"
+
+[[capabilities]]
+type = "tool"
+name = "tool-b"
+
+[[capabilities]]
+type = "middleware"
+name = "auth-middleware"
+"#;
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        let tools = manifest.capabilities_of_type("tool");
+        assert_eq!(tools.len(), 2);
+        let middlewares = manifest.capabilities_of_type("middleware");
+        assert_eq!(middlewares.len(), 1);
+        assert_eq!(middlewares[0].name, "auth-middleware");
+        let hooks = manifest.capabilities_of_type("hook");
+        assert!(hooks.is_empty());
+    }
+
+    #[test]
+    fn cron_capability_with_schedule() {
+        let toml_str = r#"
+[plugin]
+name = "scheduler"
+version = "0.1.0"
+
+[[capabilities]]
+type = "cron"
+name = "daily-cleanup"
+description = "Run cleanup daily"
+schedule = "0 0 * * *"
+"#;
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        let cron_caps = manifest.capabilities_of_type("cron");
+        assert_eq!(cron_caps.len(), 1);
+        assert_eq!(cron_caps[0].schedule.as_deref(), Some("0 0 * * *"));
+    }
+
+    #[test]
+    fn hook_capability_with_events() {
+        let toml_str = r#"
+[plugin]
+name = "hook-plugin"
+version = "0.1.0"
+
+[[capabilities]]
+type = "hook"
+name = "message-hook"
+events = ["message.received", "message.sent"]
+"#;
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        let hooks = manifest.capabilities_of_type("hook");
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].events.len(), 2);
+        assert!(hooks[0].events.contains(&"message.received".to_string()));
+    }
 }

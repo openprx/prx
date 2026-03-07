@@ -213,4 +213,104 @@ mod tests {
         assert!(tmp.join("keep.txt").exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    // --- Metrics tests ---
+
+    #[test]
+    fn metrics_record_hit_increments_counter() {
+        let metrics = CacheMetrics::default();
+        assert_eq!(metrics.hits(), 0);
+        metrics.record_hit();
+        metrics.record_hit();
+        assert_eq!(metrics.hits(), 2);
+    }
+
+    #[test]
+    fn metrics_record_miss_increments_counter_and_time() {
+        let metrics = CacheMetrics::default();
+        assert_eq!(metrics.misses(), 0);
+        assert_eq!(metrics.total_compile_ms(), 0);
+        metrics.record_miss(150);
+        metrics.record_miss(200);
+        assert_eq!(metrics.misses(), 2);
+        assert_eq!(metrics.total_compile_ms(), 350);
+    }
+
+    #[test]
+    fn metrics_hits_and_misses_independent() {
+        let metrics = CacheMetrics::default();
+        metrics.record_hit();
+        metrics.record_hit();
+        metrics.record_miss(100);
+        assert_eq!(metrics.hits(), 2);
+        assert_eq!(metrics.misses(), 1);
+        assert_eq!(metrics.total_compile_ms(), 100);
+    }
+
+    #[test]
+    fn metrics_shared_via_arc() {
+        let cache = PrecompileCache::new(std::env::temp_dir().join("prx_metrics_arc_test")).unwrap();
+        let metrics_ref = Arc::clone(&cache.metrics);
+        metrics_ref.record_hit();
+        assert_eq!(cache.metrics.hits(), 1);
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("prx_metrics_arc_test"));
+    }
+
+    // --- Hash-based invalidation ---
+
+    #[test]
+    fn hash_changes_with_single_byte_difference() {
+        let data1 = b"hello wasm world";
+        let data2 = b"hello WASM world"; // uppercase 'W'
+        let h1 = PrecompileCache::hash_bytes(data1);
+        let h2 = PrecompileCache::hash_bytes(data2);
+        assert_ne!(h1, h2, "single-byte change must produce different cache key");
+    }
+
+    #[test]
+    fn hash_includes_length_in_key() {
+        // Even if hashes collide (unlikely), length suffix distinguishes files.
+        let h1 = PrecompileCache::hash_bytes(b"a");
+        let h2 = PrecompileCache::hash_bytes(b"aa");
+        assert_ne!(h1, h2);
+        // The hash format encodes length: "XXXXXXXXXXXXXXXX-YYYYYYYY"
+        let len_suffix_1 = h1.split('-').nth(1).unwrap();
+        let len_suffix_2 = h2.split('-').nth(1).unwrap();
+        assert_ne!(len_suffix_1, len_suffix_2, "length component should differ");
+    }
+
+    #[test]
+    fn cached_count_after_multiple_writes() {
+        let tmp = std::env::temp_dir().join("prx_precompile_test_count");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cache = PrecompileCache::new(tmp.clone()).unwrap();
+        assert_eq!(cache.cached_count(), 0);
+
+        std::fs::write(tmp.join("one.cwasm"), b"a").unwrap();
+        assert_eq!(cache.cached_count(), 1);
+
+        std::fs::write(tmp.join("two.cwasm"), b"b").unwrap();
+        assert_eq!(cache.cached_count(), 2);
+
+        // .txt file should not be counted.
+        std::fs::write(tmp.join("ignore.txt"), b"c").unwrap();
+        assert_eq!(cache.cached_count(), 2);
+
+        cache.clear().unwrap();
+        assert_eq!(cache.cached_count(), 0);
+        // Non-.cwasm file survives clear.
+        assert!(tmp.join("ignore.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn new_creates_nested_dir() {
+        let tmp = std::env::temp_dir().join("prx_precompile_nested").join("deep").join("dir");
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("prx_precompile_nested"));
+        let cache = PrecompileCache::new(tmp.clone()).unwrap();
+        assert!(tmp.exists(), "nested cache directory should be created");
+        assert_eq!(cache.cached_count(), 0);
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("prx_precompile_nested"));
+    }
 }
