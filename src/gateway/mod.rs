@@ -22,7 +22,7 @@ use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::tools::{self, Tool};
+use crate::tools::{self, McpTool, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -304,6 +304,8 @@ pub struct AppState {
     pub auto_save: bool,
     /// Tools available to the agent loop (shell, file I/O, memory, etc.)
     pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    /// Shared reference to the MCP tool for runtime introspection (discovered tools, etc.).
+    pub mcp_tool: Option<Arc<McpTool>>,
     /// Hook manager for lifecycle events.
     pub hooks: Arc<HookManager>,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
@@ -393,7 +395,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     };
 
     // Build the base tool list (mutable so we can append channel-aware tools below)
-    let mut tools_list = tools::all_tools_with_runtime(
+    let tools_result = tools::all_tools_with_runtime_ext(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -407,6 +409,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     );
+    let mut tools_list = tools_result.tools;
+    let mcp_tool = tools_result.mcp_tool;
     let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
@@ -680,6 +684,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         mem,
         auto_save: config.memory.auto_save,
         tools_registry,
+        mcp_tool,
         hooks,
         webhook_secret_hash,
         pairing,
@@ -1649,6 +1654,7 @@ mod tests {
             mem: Arc::new(MockMemory),
             auto_save: false,
             tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -1701,6 +1707,7 @@ mod tests {
             mem: Arc::new(MockMemory),
             auto_save: false,
             tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -2079,6 +2086,7 @@ mod tests {
             mem: memory,
             auto_save: false,
             tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -2148,6 +2156,7 @@ mod tests {
             mem: memory,
             auto_save: true,
             tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -2217,6 +2226,7 @@ mod tests {
             mem: memory,
             auto_save: true,
             tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -2282,6 +2292,7 @@ mod tests {
             mem: memory,
             auto_save: false,
             tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -2334,6 +2345,7 @@ mod tests {
             mem: memory,
             auto_save: false,
             tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -2391,6 +2403,7 @@ mod tests {
             mem: memory,
             auto_save: false,
             tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -2453,6 +2466,7 @@ mod tests {
             mem: memory,
             auto_save: false,
             tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -2510,6 +2524,7 @@ mod tests {
             mem: memory,
             auto_save: false,
             tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),

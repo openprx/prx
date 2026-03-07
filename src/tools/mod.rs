@@ -206,6 +206,15 @@ pub fn all_tools(
     )
 }
 
+/// Result of building the full tool registry, including optional side-channel
+/// references to specific tool instances that the gateway needs direct access to.
+pub struct ToolsRegistryResult {
+    pub tools: Vec<Box<dyn Tool>>,
+    /// If MCP is enabled, holds a shared reference to the `McpTool` so the
+    /// gateway can query runtime-discovered tools without downcasting.
+    pub mcp_tool: Option<Arc<McpTool>>,
+}
+
 /// Create full tool registry including memory tools and optional Composio.
 #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools_with_runtime(
@@ -222,6 +231,40 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let result = all_tools_with_runtime_ext(
+        config,
+        security,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+    );
+    result.tools
+}
+
+/// Like [`all_tools_with_runtime`] but also returns side-channel references
+/// (e.g. `Arc<McpTool>`) for gateway introspection.
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+pub fn all_tools_with_runtime_ext(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &crate::config::BrowserConfig,
+    http_config: &crate::config::HttpRequestConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, DelegateAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &crate::config::Config,
+) -> ToolsRegistryResult {
     // Wrap Arc<Config> into a SharedConfig (ArcSwap) for tools that support hot-reload.
     let shared_config: crate::config::SharedConfig =
         Arc::new(arc_swap::ArcSwap::from(config.clone()));
@@ -277,13 +320,18 @@ pub fn all_tools_with_runtime(
         )),
     ];
 
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        tool_arcs.push(Arc::new(McpTool::new(
-            security.clone(),
-            config.mcp.clone(),
-            workspace_dir.to_path_buf(),
-        )));
-    }
+    let mcp_tool_ref: Option<Arc<McpTool>> =
+        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+            let mcp = Arc::new(McpTool::new(
+                security.clone(),
+                config.mcp.clone(),
+                workspace_dir.to_path_buf(),
+            ));
+            tool_arcs.push(mcp.clone());
+            Some(mcp)
+        } else {
+            None
+        };
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
@@ -412,7 +460,10 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(delegate_tool));
     }
 
-    boxed_registry_from_arcs(tool_arcs)
+    ToolsRegistryResult {
+        tools: boxed_registry_from_arcs(tool_arcs),
+        mcp_tool: mcp_tool_ref,
+    }
 }
 
 #[cfg(test)]

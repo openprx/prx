@@ -25,6 +25,13 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
     let config = state.config.lock();
     let mcp = &config.mcp;
 
+    // Collect runtime-discovered tools if available.
+    let discovered = state
+        .mcp_tool
+        .as_ref()
+        .map(|t| t.list_discovered_tools())
+        .unwrap_or_default();
+
     let mut servers = Vec::new();
     for (name, server_config) in &mcp.servers {
         let url = match &server_config.url {
@@ -34,16 +41,34 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
                 .clone()
                 .unwrap_or_else(|| "stdio".to_string()),
         };
-        let status = if server_config.enabled && mcp.enabled {
+
+        let has_runtime_tools = discovered.contains_key(name);
+        let status = if !mcp.enabled || !server_config.enabled {
+            "disconnected"
+        } else if has_runtime_tools {
             "connected"
         } else {
-            "disconnected"
+            "connecting"
         };
+
+        let tools: Vec<McpToolInfo> = discovered
+            .get(name)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(tool_name, desc)| McpToolInfo {
+                        name: tool_name.clone(),
+                        description: desc.clone().unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         servers.push(McpServerInfo {
             name: name.clone(),
             url,
             status: status.to_string(),
-            tools: Vec::new(), // Runtime tool discovery not available from config alone
+            tools,
         });
     }
 

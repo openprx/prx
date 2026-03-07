@@ -101,6 +101,21 @@ impl McpTool {
         }
     }
 
+    /// Return runtime-discovered tools grouped by server name.
+    /// Each entry is `(tool_name, description)`.
+    pub fn list_discovered_tools(&self) -> HashMap<String, Vec<(String, Option<String>)>> {
+        let state = self.state.read();
+        let mut result = HashMap::new();
+        for (server_name, tools) in &state.discovered_tools {
+            let entries: Vec<(String, Option<String>)> = tools
+                .iter()
+                .map(|(name, meta)| (name.clone(), meta.description.clone()))
+                .collect();
+            result.insert(server_name.clone(), entries);
+        }
+        result
+    }
+
     fn alias_name(prefix: &str, server: &str, tool: &str) -> String {
         format!("{prefix}__{server}__{tool}")
     }
