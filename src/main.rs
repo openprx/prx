@@ -86,6 +86,8 @@ mod skillforge;
 mod skills;
 mod tools;
 mod tunnel;
+#[cfg(feature = "wasm-plugins")]
+mod plugins;
 mod util;
 mod webhook;
 

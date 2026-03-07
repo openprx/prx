@@ -1,0 +1,17 @@
+/// PRX Plugin System — World definitions.
+///
+/// Each world represents a plugin capability type (tool, channel, hook, etc.).
+/// P1 defines the basic structure; full worlds will be added in P2+.
+
+package prx:plugin@0.1.0;
+
+/// Minimal world for P1 validation.
+/// Full tool/channel/hook worlds will be defined in later phases.
+world base-plugin {
+    /// Basic host interfaces available to all plugins.
+    import log: self.log;
+    import kv: self.kv;
+}
+
+// Note: tool, channel, provider, middleware, hook, api, storage, cron
+// worlds will be added in P2 as capability adapters are implemented.

@@ -138,6 +138,10 @@ rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
 
+# WASM Plugin System (optional)
+wasmtime = { version = "31", optional = true, default-features = false, features = ["async", "component-model", "cranelift", "cache"] }
+wasmtime-wasi = { version = "31", optional = true }
+
 # email
 lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 mail-parser = "0.11.2"
@@ -211,6 +215,8 @@ probe = ["dep:probe-rs"]
 rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "serde-big-array"]
+# WASM plugin system (wasmtime + Component Model)
+wasm-plugins = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size
