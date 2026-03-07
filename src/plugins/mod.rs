@@ -216,14 +216,15 @@ impl PluginManager {
     /// Returns a list of boxed `Tool` trait objects ready for registration
     /// in the tools_registry.
     pub async fn create_tool_adapters(&self) -> Vec<Box<dyn Tool>> {
-        self.create_tool_adapters_with_memory(None).await
+        self.create_tool_adapters_with_memory(None, None).await
     }
 
     /// Create tool adapters for all plugins with tool capabilities,
-    /// optionally injecting a memory backend into each adapter's host state.
+    /// optionally injecting a memory backend and/or event bus into each adapter's host state.
     pub async fn create_tool_adapters_with_memory(
         &self,
         memory: Option<Arc<dyn crate::memory::traits::Memory>>,
+        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
     ) -> Vec<Box<dyn Tool>> {
         let plugins = self.registry.list().await;
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
@@ -285,6 +286,7 @@ impl PluginManager {
                 &component,
                 &manifest,
                 memory.clone(),
+                event_bus.clone(),
             )
             .await
             {
@@ -310,7 +312,10 @@ impl PluginManager {
     }
 
     /// Create middleware adapters for all plugins with middleware capabilities.
-    pub async fn create_middleware_chain(&self) -> capabilities::middleware::MiddlewareChain {
+    pub async fn create_middleware_chain(
+        &self,
+        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
+    ) -> capabilities::middleware::MiddlewareChain {
         let plugins = self.registry.list().await;
         let mut chain = capabilities::middleware::MiddlewareChain::new();
 
@@ -363,6 +368,7 @@ impl PluginManager {
                 &component,
                 &manifest,
                 priority,
+                event_bus.clone(),
             )
             .await
             {
@@ -384,7 +390,10 @@ impl PluginManager {
     }
 
     /// Create hook adapters for all plugins with hook capabilities.
-    pub async fn create_hook_executor(&self) -> capabilities::hook::WasmHookExecutor {
+    pub async fn create_hook_executor(
+        &self,
+        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
+    ) -> capabilities::hook::WasmHookExecutor {
         let plugins = self.registry.list().await;
         let mut executor = capabilities::hook::WasmHookExecutor::new();
 
@@ -432,8 +441,14 @@ impl PluginManager {
                 .flat_map(|c| c.events.iter().cloned())
                 .collect();
 
-            match capabilities::hook::WasmHook::new(&self.engine, &component, &manifest, events)
-                .await
+            match capabilities::hook::WasmHook::new(
+                &self.engine,
+                &component,
+                &manifest,
+                events,
+                event_bus.clone(),
+            )
+            .await
             {
                 Ok(hook) => {
                     tracing::info!(plugin = %info.name, "WASM hook adapter created");
@@ -449,7 +464,10 @@ impl PluginManager {
     }
 
     /// Create cron adapters for all plugins with cron capabilities.
-    pub async fn create_cron_manager(&self) -> capabilities::cron::WasmCronManager {
+    pub async fn create_cron_manager(
+        &self,
+        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
+    ) -> capabilities::cron::WasmCronManager {
         let plugins = self.registry.list().await;
         let mut manager = capabilities::cron::WasmCronManager::new();
 
@@ -507,6 +525,7 @@ impl PluginManager {
                 &component,
                 &manifest,
                 schedule.clone(),
+                event_bus.clone(),
             )
             .await
             {

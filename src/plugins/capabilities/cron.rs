@@ -33,12 +33,13 @@ impl WasmCronJob {
         component: &wasmtime::component::Component,
         manifest: &PluginManifest,
         schedule: String,
+        event_bus: Option<std::sync::Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginResult<Self> {
         let timeout_ms = manifest.resources.max_execution_time_ms;
 
         let granted = manifest.permissions.required.iter().cloned().collect();
         let optional = manifest.permissions.optional.iter().cloned().collect();
-        let host_state = HostState::new(
+        let mut host_state = HostState::new(
             manifest.plugin.name.clone(),
             manifest.config.clone(),
             granted,
@@ -46,6 +47,9 @@ impl WasmCronJob {
             manifest.permissions.http_allowlist.clone(),
             timeout_ms,
         );
+        if let Some(bus) = event_bus {
+            host_state = host_state.with_event_bus(bus);
+        }
 
         let mut store = wasmtime::Store::new(engine, host_state);
         store.set_fuel(manifest.resources.max_fuel).map_err(|e| {

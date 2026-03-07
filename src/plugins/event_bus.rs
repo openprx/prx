@@ -8,7 +8,7 @@
 //! - Payload size is capped at `MAX_PAYLOAD_BYTES` (64 KB).
 //! - Recursive publish depth is capped at `MAX_RECURSION_DEPTH` (8) to prevent
 //!   cycles.
-//! - Each subscription receives events only once even if multiple patterns match.
+//! - Each subscription ID is dispatched to at most once per publish call (ID-level dedup).
 
 #[cfg(feature = "wasm-plugins")]
 use std::collections::HashMap;
@@ -86,8 +86,8 @@ impl EventBus {
     /// - `depth` exceeds `MAX_RECURSION_DEPTH`
     ///
     /// Otherwise, delivers the event fire-and-forget to all matching
-    /// subscribers (exact match + prefix wildcard).  Duplicates (same plugin
-    /// receiving via both an exact and a wildcard sub) are deduplicated.
+    /// subscribers (exact match + prefix wildcard). Each subscription ID
+    /// is dispatched to at most once, regardless of how many patterns match it.
     pub async fn publish(&self, topic: &str, payload: &str) -> Result<(), String> {
         self.publish_with_depth(topic, payload, 0).await
     }

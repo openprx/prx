@@ -533,7 +533,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         let bus = Arc::new(crate::plugins::event_bus::EventBus::new());
         if let Some(ref pm) = pm {
             // Tool adapters
-            let wasm_tools = pm.create_tool_adapters_with_memory(Some(Arc::clone(&mem))).await;
+            let wasm_tools = pm
+                .create_tool_adapters_with_memory(Some(Arc::clone(&mem)), Some(Arc::clone(&bus)))
+                .await;
             if !wasm_tools.is_empty() {
                 tracing::info!(
                     count = wasm_tools.len(),
@@ -542,19 +544,19 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 tools_list.extend(wasm_tools);
             }
             // Middleware chain
-            let chain = pm.create_middleware_chain().await;
+            let chain = pm.create_middleware_chain(Some(Arc::clone(&bus))).await;
             if !chain.is_empty() {
                 tracing::info!(count = chain.len(), "WASM middleware chain ready");
                 mw = Some(Arc::new(chain));
             }
             // Hook executor
-            let executor = pm.create_hook_executor().await;
+            let executor = pm.create_hook_executor(Some(Arc::clone(&bus))).await;
             if !executor.is_empty() {
                 tracing::info!("WASM hook executor ready");
                 he = Some(Arc::new(executor));
             }
             // Cron manager
-            let cron = pm.create_cron_manager().await;
+            let cron = pm.create_cron_manager(Some(Arc::clone(&bus))).await;
             if !cron.is_empty() {
                 tracing::info!(count = cron.jobs().len(), "WASM cron manager ready");
                 cm = Some(Arc::new(cron));
