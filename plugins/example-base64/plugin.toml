@@ -1,0 +1,23 @@
+[plugin]
+name = "example-base64"
+version = "0.1.0"
+description = "Base64 encoding/decoding tool — demonstrates the PRX WASM plugin system"
+author = "PRX Team"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "tool"
+name = "base64"
+description = "Encode or decode base64 strings"
+
+[permissions]
+required = ["log", "config"]
+optional = []
+
+[resources]
+max_fuel = 100000000
+max_memory_mb = 16
+max_execution_time_ms = 5000
+
+[config]
+default_mode = "encode"

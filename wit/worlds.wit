@@ -1,17 +1,27 @@
 /// PRX Plugin System — World definitions.
 ///
-/// Each world represents a plugin capability type (tool, channel, hook, etc.).
-/// P1 defines the basic structure; full worlds will be added in P2+.
+/// Each world represents a plugin capability type.
+/// Plugins target a specific world to declare their capability.
 
 package prx:plugin@0.1.0;
 
-/// Minimal world for P1 validation.
-/// Full tool/channel/hook worlds will be defined in later phases.
-world base-plugin {
-    /// Basic host interfaces available to all plugins.
-    import log: self.log;
-    import kv: self.kv;
+/// Tool world — plugins that provide LLM-callable tools.
+///
+/// Imports: host functions the plugin can call.
+/// Exports: functions the host calls to use the tool.
+world tool {
+    import prx:host/log;
+    import prx:host/config;
+    import prx:host/kv;
+    import prx:host/http-outbound;
+    import prx:host/memory;
+
+    export prx:plugin/tool-exports;
 }
 
-// Note: tool, channel, provider, middleware, hook, api, storage, cron
-// worlds will be added in P2 as capability adapters are implemented.
+/// Base world — minimal plugin with only logging and KV.
+world base-plugin {
+    import prx:host/log;
+    import prx:host/config;
+    import prx:host/kv;
+}

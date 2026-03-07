@@ -1,4 +1,4 @@
-//! WASM Plugin System — P1 Framework.
+//! WASM Plugin System.
 //!
 //! Provides `PluginManager` for loading, unloading, and managing WASM plugins
 //! using wasmtime with Component Model support.
@@ -9,12 +9,14 @@
 //! - **PluginRegistry** — thread-safe map of loaded plugin instances
 //! - **HostState** — per-instance state (config, KV, permissions)
 //! - **PluginManifest** — parsed `plugin.toml` metadata
+//! - **WasmToolAdapter** — bridges WASM tool plugins to PRX `Tool` trait
 //!
 //! # Feature Gate
 //!
 //! This entire module is behind `#[cfg(feature = "wasm-plugins")]`.
 //! Default builds do not include wasmtime.
 
+pub mod capabilities;
 pub mod error;
 pub mod host;
 pub mod manifest;
@@ -23,11 +25,11 @@ pub mod registry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use wasmtime;
-
 use error::{PluginError, PluginResult};
 use manifest::PluginManifest;
 use registry::{LoadedPlugin, PluginInfo, PluginRegistry};
+
+use crate::tools::Tool;
 
 /// Central manager for the WASM plugin system.
 ///
@@ -48,9 +50,6 @@ impl PluginManager {
     /// Initializes a wasmtime `Engine` with:
     /// - `async_support(true)` for tokio integration
     /// - `wasm_component_model(true)` for Component Model
-    ///
-    /// `plugins_dir` is the directory containing plugin subdirectories,
-    /// each with a `plugin.toml` and `.wasm` file.
     pub fn new(plugins_dir: PathBuf) -> PluginResult<Self> {
         let mut config = wasmtime::Config::new();
         config.async_support(true);
@@ -124,12 +123,8 @@ impl PluginManager {
     ///
     /// Steps:
     /// 1. Parse `plugin.toml` manifest
-    /// 2. Validate WASM file exists
-    /// 3. Compile the WASM component (validates it's valid WASM)
-    /// 4. Register in the plugin registry
-    ///
-    /// In P1, we parse the manifest and validate the WASM but don't
-    /// instantiate (no Tool adapter yet — that's P2).
+    /// 2. Compile the WASM component (if present)
+    /// 3. Register in the plugin registry
     pub async fn load_plugin(&self, plugin_dir: &Path) -> PluginResult<()> {
         let manifest_path = plugin_dir.join("plugin.toml");
         let manifest = PluginManifest::from_file(&manifest_path)?;
@@ -142,12 +137,11 @@ impl PluginManager {
             });
         }
 
-        // Validate WASM file exists
+        // Compile WASM if file exists
         let wasm_path = plugin_dir.join(&manifest.plugin.wasm);
-        if wasm_path.exists() {
-            // Compile the component to validate it's valid WASM
+        let component = if wasm_path.exists() {
             let wasm_bytes = std::fs::read(&wasm_path).map_err(PluginError::Io)?;
-            let _component = wasmtime::component::Component::new(&self.engine, &wasm_bytes)
+            let comp = wasmtime::component::Component::new(&self.engine, &wasm_bytes)
                 .map_err(|e| {
                     PluginError::Compilation(format!(
                         "failed to compile '{}': {e}",
@@ -159,16 +153,18 @@ impl PluginManager {
                 wasm = %wasm_path.display(),
                 "WASM component compiled successfully"
             );
+            Some(comp)
         } else {
             tracing::debug!(
                 plugin = %plugin_name,
                 wasm = %wasm_path.display(),
-                "WASM file not found — manifest-only load (no runtime execution)"
+                "WASM file not found — manifest-only load"
             );
-        }
+            None
+        };
 
         // Register the plugin
-        let loaded = LoadedPlugin::new(manifest, plugin_dir.to_path_buf());
+        let loaded = LoadedPlugin::new(manifest, plugin_dir.to_path_buf(), component);
         self.registry
             .register(loaded)
             .await
@@ -176,6 +172,20 @@ impl PluginManager {
 
         tracing::info!(plugin = %plugin_name, "plugin loaded");
         Ok(())
+    }
+
+    /// Reload a plugin by name (unload + load from its original directory).
+    pub async fn reload_plugin(&self, name: &str) -> PluginResult<()> {
+        let source_dir = self
+            .registry
+            .get_source_dir(name)
+            .await
+            .ok_or_else(|| PluginError::NotFound {
+                name: name.to_string(),
+            })?;
+
+        self.registry.unregister(name).await;
+        self.load_plugin(&source_dir).await
     }
 
     /// Unload a plugin by name.
@@ -200,6 +210,90 @@ impl PluginManager {
         self.registry.get_info(name).await
     }
 
+    /// Create WasmToolAdapter instances for all plugins that declare tool capabilities.
+    ///
+    /// Returns a list of boxed `Tool` trait objects ready for registration
+    /// in the tools_registry.
+    pub async fn create_tool_adapters(&self) -> Vec<Box<dyn Tool>> {
+        let plugins = self.registry.list().await;
+        let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        for info in &plugins {
+            // Check if this plugin has tool capabilities
+            if !info.capabilities.iter().any(|c| c.starts_with("tool:")) {
+                continue;
+            }
+
+            // Get the manifest to access component
+            let manifest = match self.registry.get_manifest(&info.name).await {
+                Some(m) => m,
+                None => continue,
+            };
+
+            // We need the compiled component from the registry
+            // For now, re-read and compile if needed
+            let source_dir = match self.registry.get_source_dir(&info.name).await {
+                Some(d) => d,
+                None => continue,
+            };
+
+            let wasm_path = source_dir.join(&manifest.plugin.wasm);
+            if !wasm_path.exists() {
+                tracing::debug!(
+                    plugin = %info.name,
+                    "skipping tool adapter — no WASM file"
+                );
+                continue;
+            }
+
+            let wasm_bytes = match std::fs::read(&wasm_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %info.name,
+                        error = %e,
+                        "failed to read WASM file for tool adapter"
+                    );
+                    continue;
+                }
+            };
+
+            let component = match wasmtime::component::Component::new(&self.engine, &wasm_bytes) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %info.name,
+                        error = %e,
+                        "failed to compile WASM for tool adapter"
+                    );
+                    continue;
+                }
+            };
+
+            match capabilities::tool::WasmToolAdapter::new(&self.engine, &component, &manifest)
+                .await
+            {
+                Ok(adapter) => {
+                    tracing::info!(
+                        plugin = %info.name,
+                        tool = %adapter.name(),
+                        "WASM tool adapter created"
+                    );
+                    tools.push(Box::new(adapter));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %info.name,
+                        error = %e,
+                        "failed to create tool adapter"
+                    );
+                }
+            }
+        }
+
+        tools
+    }
+
     /// Get a reference to the wasmtime engine.
     pub fn engine(&self) -> &wasmtime::Engine {
         &self.engine
@@ -210,11 +304,6 @@ impl PluginManager {
         &self.plugins_dir
     }
 }
-
-// Allow PluginManager to be shared across threads.
-// wasmtime::Engine is Send + Sync, PluginRegistry uses Arc<RwLock>.
-unsafe impl Send for PluginManager {}
-unsafe impl Sync for PluginManager {}
 
 /// Initialize the plugin manager if configured.
 ///

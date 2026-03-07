@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use super::manifest::PluginManifest;
 
 /// Status of a loaded plugin.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PluginStatus {
     /// Plugin is loaded and ready.
     Active,
@@ -18,33 +18,47 @@ pub enum PluginStatus {
 }
 
 /// Summary information about a loaded plugin (returned by list operations).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PluginInfo {
     pub name: String,
     pub version: String,
     pub description: String,
     pub capabilities: Vec<String>,
     pub status: PluginStatus,
+    pub permissions_required: Vec<String>,
+    pub permissions_granted: Vec<String>,
 }
 
 /// A loaded plugin instance.
 ///
-/// In P1, this holds the manifest and status.
-/// P2 will add the wasmtime `Store` and `Instance` for live WASM execution.
+/// Holds the manifest, compiled component, and runtime status.
 pub struct LoadedPlugin {
     pub manifest: PluginManifest,
     pub status: PluginStatus,
     /// Directory path where the plugin was loaded from.
     pub source_dir: std::path::PathBuf,
+    /// Compiled wasmtime component (if WASM file was present).
+    pub component: Option<wasmtime::component::Component>,
+    /// Permissions that were granted to this plugin.
+    pub granted_permissions: Vec<String>,
 }
 
 impl LoadedPlugin {
     /// Create a new loaded plugin entry.
-    pub fn new(manifest: PluginManifest, source_dir: std::path::PathBuf) -> Self {
+    pub fn new(
+        manifest: PluginManifest,
+        source_dir: std::path::PathBuf,
+        component: Option<wasmtime::component::Component>,
+    ) -> Self {
+        // Auto-grant all required permissions in P2
+        // (full approval flow deferred to P3).
+        let granted = manifest.permissions.required.clone();
         Self {
             manifest,
             status: PluginStatus::Active,
             source_dir,
+            component,
+            granted_permissions: granted,
         }
     }
 
@@ -61,6 +75,8 @@ impl LoadedPlugin {
                 .map(|c| format!("{}:{}", c.capability_type, c.name))
                 .collect(),
             status: self.status.clone(),
+            permissions_required: self.manifest.permissions.required.clone(),
+            permissions_granted: self.granted_permissions.clone(),
         }
     }
 }
@@ -100,6 +116,13 @@ impl PluginRegistry {
         plugins.remove(name).is_some()
     }
 
+    /// Replace an existing plugin (for hot-reload).
+    pub async fn replace(&self, plugin: LoadedPlugin) {
+        let name = plugin.manifest.plugin.name.clone();
+        let mut plugins = self.plugins.write().await;
+        plugins.insert(name, plugin);
+    }
+
     /// List all loaded plugins.
     pub async fn list(&self) -> Vec<PluginInfo> {
         let plugins = self.plugins.read().await;
@@ -118,6 +141,18 @@ impl PluginRegistry {
         plugins.get(name).map(|p| p.info())
     }
 
+    /// Get a reference to a plugin's manifest (read lock held).
+    pub async fn get_manifest(&self, name: &str) -> Option<PluginManifest> {
+        let plugins = self.plugins.read().await;
+        plugins.get(name).map(|p| p.manifest.clone())
+    }
+
+    /// Get a plugin's source directory.
+    pub async fn get_source_dir(&self, name: &str) -> Option<std::path::PathBuf> {
+        let plugins = self.plugins.read().await;
+        plugins.get(name).map(|p| p.source_dir.clone())
+    }
+
     /// Get the number of loaded plugins.
     pub async fn len(&self) -> usize {
         let plugins = self.plugins.read().await;
@@ -128,7 +163,7 @@ impl PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::manifest::{PluginManifest, PluginMeta, Permissions};
+    use crate::plugins::manifest::{PluginManifest, PluginMeta, Permissions, Resources};
 
     fn test_manifest(name: &str) -> PluginManifest {
         PluginManifest {
@@ -143,13 +178,15 @@ mod tests {
             },
             capabilities: vec![],
             permissions: Permissions::default(),
+            resources: Resources::default(),
+            config: std::collections::HashMap::new(),
         }
     }
 
     #[tokio::test]
     async fn register_and_list() {
         let registry = PluginRegistry::new();
-        let plugin = LoadedPlugin::new(test_manifest("test"), "/tmp".into());
+        let plugin = LoadedPlugin::new(test_manifest("test"), "/tmp".into(), None);
         registry.register(plugin).await.unwrap();
 
         let list = registry.list().await;
@@ -160,8 +197,8 @@ mod tests {
     #[tokio::test]
     async fn duplicate_register_fails() {
         let registry = PluginRegistry::new();
-        let p1 = LoadedPlugin::new(test_manifest("test"), "/tmp".into());
-        let p2 = LoadedPlugin::new(test_manifest("test"), "/tmp".into());
+        let p1 = LoadedPlugin::new(test_manifest("test"), "/tmp".into(), None);
+        let p2 = LoadedPlugin::new(test_manifest("test"), "/tmp".into(), None);
         registry.register(p1).await.unwrap();
         assert!(registry.register(p2).await.is_err());
     }
@@ -169,7 +206,7 @@ mod tests {
     #[tokio::test]
     async fn unregister() {
         let registry = PluginRegistry::new();
-        let plugin = LoadedPlugin::new(test_manifest("test"), "/tmp".into());
+        let plugin = LoadedPlugin::new(test_manifest("test"), "/tmp".into(), None);
         registry.register(plugin).await.unwrap();
         assert!(registry.unregister("test").await);
         assert!(!registry.unregister("test").await);

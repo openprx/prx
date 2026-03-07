@@ -1,0 +1,19 @@
+/// Memory (recall/store) interface for WASM plugins.
+///
+/// Provides access to PRX's memory system for storing and
+/// retrieving information. Requires "memory" permission.
+interface memory {
+    /// A memory entry returned by recall.
+    record memory-entry {
+        id: string,
+        text: string,
+        category: string,
+        importance: f64,
+    }
+
+    /// Store text in memory. Returns the entry ID.
+    store: func(text: string, category: string) -> result<string, string>;
+
+    /// Recall memories matching a query. Returns up to `limit` entries.
+    recall: func(query: string, limit: u32) -> result<list<memory-entry>, string>;
+}

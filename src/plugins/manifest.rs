@@ -1,4 +1,7 @@
 //! Plugin manifest (`plugin.toml`) parsing.
+//!
+//! Aligned with spec: supports `[permissions]` with `required`/`optional` lists,
+//! `http_allowlist`, and `[resources]` for execution limits.
 
 use serde::Deserialize;
 use std::path::Path;
@@ -13,6 +16,11 @@ pub struct PluginManifest {
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub permissions: Permissions,
+    #[serde(default)]
+    pub resources: Resources,
+    /// Plugin-specific config key-value pairs, injected via `prx:host/config`.
+    #[serde(default)]
+    pub config: std::collections::HashMap<String, String>,
 }
 
 /// Core plugin metadata.
@@ -43,21 +51,53 @@ pub struct Capability {
     pub description: String,
 }
 
-/// Permission declarations.
+/// Permission declarations (spec-aligned: interface-based, not boolean).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Permissions {
+    /// Required host interfaces (must be granted for plugin to load).
     #[serde(default)]
-    pub network: bool,
+    pub required: Vec<String>,
+    /// Optional host interfaces (can be requested at runtime).
     #[serde(default)]
-    pub filesystem: Vec<String>,
+    pub optional: Vec<String>,
+    /// HTTP outbound URL whitelist patterns.
     #[serde(default)]
-    pub memory: bool,
+    pub http_allowlist: Vec<String>,
+    /// Filesystem path whitelist patterns.
     #[serde(default)]
-    pub browser: bool,
+    pub filesystem_allowlist: Vec<String>,
+}
+
+/// Resource limits for the plugin sandbox.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Resources {
+    /// wasmtime fuel upper bound.
+    #[serde(default = "default_max_fuel")]
+    pub max_fuel: u64,
+    /// Linear memory cap in MB.
     #[serde(default = "default_max_memory_mb")]
     pub max_memory_mb: u64,
+    /// Per-call timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
-    pub timeout_ms: u64,
+    pub max_execution_time_ms: u64,
+    /// Max HTTP requests per single call.
+    #[serde(default = "default_max_http_requests")]
+    pub max_http_requests_per_call: u32,
+    /// KV storage cap in MB.
+    #[serde(default = "default_max_kv_storage_mb")]
+    pub max_kv_storage_mb: u64,
+}
+
+impl Default for Resources {
+    fn default() -> Self {
+        Self {
+            max_fuel: default_max_fuel(),
+            max_memory_mb: default_max_memory_mb(),
+            max_execution_time_ms: default_timeout_ms(),
+            max_http_requests_per_call: default_max_http_requests(),
+            max_kv_storage_mb: default_max_kv_storage_mb(),
+        }
+    }
 }
 
 fn default_api_version() -> String {
@@ -68,12 +108,24 @@ fn default_wasm_path() -> String {
     "plugin.wasm".to_string()
 }
 
+fn default_max_fuel() -> u64 {
+    1_000_000_000
+}
+
 fn default_max_memory_mb() -> u64 {
     64
 }
 
 fn default_timeout_ms() -> u64 {
-    5000
+    30_000
+}
+
+fn default_max_http_requests() -> u32 {
+    10
+}
+
+fn default_max_kv_storage_mb() -> u64 {
+    10
 }
 
 impl PluginManifest {
@@ -103,6 +155,21 @@ impl PluginManifest {
         }
         Ok(())
     }
+
+    /// Check if this manifest declares a specific capability type.
+    pub fn has_capability(&self, cap_type: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c.capability_type == cap_type)
+    }
+
+    /// Get all capabilities of a specific type.
+    pub fn capabilities_of_type(&self, cap_type: &str) -> Vec<&Capability> {
+        self.capabilities
+            .iter()
+            .filter(|c| c.capability_type == cap_type)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -115,8 +182,6 @@ mod tests {
 [plugin]
 name = "example"
 version = "0.1.0"
-
-[permissions]
 "#;
         let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
         assert_eq!(manifest.plugin.name, "example");
@@ -129,31 +194,65 @@ version = "0.1.0"
     fn parse_full_manifest() {
         let toml_str = r#"
 [plugin]
-name = "example"
-version = "0.1.0"
-api_version = "1"
-description = "Example plugin"
-wasm = "plugin.wasm"
+name = "weather-tool"
+version = "1.0.0"
+description = "Get weather forecasts"
+author = "community"
 
 [[capabilities]]
 type = "tool"
-name = "example_tool"
-description = "An example tool"
+name = "weather_lookup"
+description = "Look up weather by city"
 
 [permissions]
-network = false
-filesystem = []
-memory = false
-browser = false
+required = ["log", "config", "kv", "http-outbound", "clock"]
+optional = ["messaging", "llm"]
+http_allowlist = ["https://api.openweathermap.org/*", "https://wttr.in/*"]
+
+[resources]
+max_fuel = 1000000000
 max_memory_mb = 64
-timeout_ms = 5000
+max_execution_time_ms = 30000
+max_http_requests_per_call = 10
+max_kv_storage_mb = 10
+
+[config]
+api_key = "test-key"
+default_units = "metric"
 "#;
         let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
-        assert_eq!(manifest.plugin.name, "example");
+        assert_eq!(manifest.plugin.name, "weather-tool");
         assert_eq!(manifest.capabilities.len(), 1);
         assert_eq!(manifest.capabilities[0].capability_type, "tool");
-        assert_eq!(manifest.capabilities[0].name, "example_tool");
-        assert!(!manifest.permissions.network);
-        assert_eq!(manifest.permissions.max_memory_mb, 64);
+        assert_eq!(manifest.permissions.required.len(), 5);
+        assert!(manifest.permissions.required.contains(&"log".to_string()));
+        assert_eq!(manifest.permissions.optional.len(), 2);
+        assert_eq!(manifest.permissions.http_allowlist.len(), 2);
+        assert_eq!(manifest.resources.max_fuel, 1_000_000_000);
+        assert_eq!(
+            manifest.config.get("api_key"),
+            Some(&"test-key".to_string())
+        );
+    }
+
+    #[test]
+    fn has_capability_works() {
+        let toml_str = r#"
+[plugin]
+name = "multi"
+version = "0.1.0"
+
+[[capabilities]]
+type = "tool"
+name = "my_tool"
+
+[[capabilities]]
+type = "hook"
+name = "my_hook"
+"#;
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.has_capability("tool"));
+        assert!(manifest.has_capability("hook"));
+        assert!(!manifest.has_capability("channel"));
     }
 }
