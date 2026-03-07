@@ -177,6 +177,10 @@ impl WasmToolAdapter {
                 "list-keys",
                 |store: wasmtime::StoreContextMut<'_, HostState>, (prefix,): (String,)| {
                     Box::new(async move {
+                        if let Err(e) = store.data().check_permission("kv") {
+                            tracing::warn!("{e}");
+                            return Ok((vec![],));
+                        }
                         let kv = store.data().kv_store.clone();
                         let guard = kv.read().await;
                         let keys: Vec<String> = guard
