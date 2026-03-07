@@ -1,0 +1,116 @@
+// {{.PluginName}} is a PRX tool plugin.
+//
+// Build:
+//
+//	tinygo build -target wasm32-wasip2 -o plugin.wasm .
+package main
+
+import (
+	"unsafe"
+
+	"github.com/openprx/prx-pdk-go/host/log"
+)
+
+// get-spec returns the ToolSpec JSON describing this tool's name,
+// description, and JSON Schema for its input parameters.
+//
+//go:wasmexport get-spec
+func getSpec() (ptr *uint8, length uint32) {
+	log.Debug("get-spec called")
+	b := []byte(toolSpecJSON())
+	return &b[0], uint32(len(b))
+}
+
+// execute receives input JSON, performs the tool's action, and returns
+// a PluginResult JSON ({"success":bool,"output":"...","error":null|"..."}).
+//
+//go:wasmexport execute
+func execute(inputPtr *uint8, inputLen uint32) (outPtr *uint8, outLen uint32) {
+	log.Info("execute called")
+
+	input := wasmString(inputPtr, inputLen)
+	_ = input // TODO: parse input fields with extractStringField()
+
+	// TODO: implement tool logic here.
+	result := okJSON("Hello from {{.PluginName}}!")
+	b := []byte(result)
+	return &b[0], uint32(len(b))
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+func toolSpecJSON() string {
+	schema := `{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}`
+	return `{"name":"{{.ToolName}}","description":"{{.Description}}","parameters_schema":"` +
+		jsonEscape(schema) + `"}`
+}
+
+func okJSON(output string) string {
+	return `{"success":true,"output":"` + jsonEscape(output) + `","error":null}`
+}
+
+func failJSON(errMsg string) string {
+	return `{"success":false,"output":"","error":"` + jsonEscape(errMsg) + `"}`
+}
+
+func wasmString(ptr *uint8, length uint32) string {
+	if length == 0 || ptr == nil {
+		return ""
+	}
+	return string(unsafe.Slice(ptr, length))
+}
+
+func extractStringField(jsonStr, field string) string {
+	needle := `"` + field + `":"`
+	i := 0
+	for i+len(needle) <= len(jsonStr) {
+		match := true
+		for j := 0; j < len(needle); j++ {
+			if jsonStr[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			start := i + len(needle)
+			end := start
+			for end < len(jsonStr) {
+				if jsonStr[end] == '\\' {
+					end += 2
+					continue
+				}
+				if jsonStr[end] == '"' {
+					break
+				}
+				end++
+			}
+			return jsonStr[start:end]
+		}
+		i++
+	}
+	return ""
+}
+
+func jsonEscape(s string) string {
+	buf := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '"':
+			buf = append(buf, '\\', '"')
+		case '\\':
+			buf = append(buf, '\\', '\\')
+		case '\n':
+			buf = append(buf, '\\', 'n')
+		case '\r':
+			buf = append(buf, '\\', 'r')
+		case '\t':
+			buf = append(buf, '\\', 't')
+		default:
+			buf = append(buf, c)
+		}
+	}
+	return string(buf)
+}
+
+func main() {}

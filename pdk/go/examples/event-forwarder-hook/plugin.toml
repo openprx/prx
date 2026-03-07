@@ -1,0 +1,25 @@
+[plugin]
+name        = "event-forwarder-hook"
+version     = "0.1.0"
+description = "Hook plugin that forwards events to a configurable target topic"
+author      = "PRX Team"
+wasm        = "plugin.wasm"
+
+[[capabilities]]
+type    = "hook"
+trigger = "events.*"
+
+[permissions]
+required = ["log", "events"]
+optional = []
+
+[resources]
+max_fuel              = 10_000_000
+max_memory_mb         = 4
+max_execution_time_ms = 200
+
+[config]
+# Target topic for forwarded events (default: events.forwarded)
+forward_topic = "events.forwarded"
+# Set to "true" to wrap the original event with forwarding metadata
+add_metadata  = "false"
