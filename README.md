@@ -65,6 +65,8 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 | [Web Console](docs/web-console.md) | Browser-based management (planned) |
 | [Evolution](docs/evolution.md) | Self-improvement pipeline |
 | [Configuration](docs/configuration.md) | Config reference, workspace files, security |
+| [WASM Plugins](docs/plugin-developer-guide.md) | Plugin developer guide (Rust/Python/JS/Go) |
+| [Host Function Reference](docs/host-function-reference.md) | WASM plugin host API reference |
 
 ## Related Projects
 

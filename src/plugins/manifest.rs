@@ -99,6 +99,10 @@ pub struct Resources {
     /// KV storage cap in MB.
     #[serde(default = "default_max_kv_storage_mb")]
     pub max_kv_storage_mb: u64,
+    /// Instance pool size — number of warm instances to maintain.
+    /// 0 means no pooling (default). Reserved for future use.
+    #[serde(default)]
+    pub pool_size: usize,
 }
 
 impl Default for Resources {
@@ -109,6 +113,7 @@ impl Default for Resources {
             max_execution_time_ms: default_timeout_ms(),
             max_http_requests_per_call: default_max_http_requests(),
             max_kv_storage_mb: default_max_kv_storage_mb(),
+            pool_size: 0,
         }
     }
 }
