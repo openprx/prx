@@ -1,0 +1,21 @@
+/// HTTP outbound interface for WASM plugins.
+///
+/// Allows plugins to make controlled HTTP requests.
+/// Requires "http-outbound" permission. URLs are checked
+/// against the plugin's http_allowlist.
+interface http-outbound {
+    /// An HTTP response.
+    record http-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// Make an HTTP request.
+    request: func(
+        method: string,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    ) -> result<http-response, string>;
+}

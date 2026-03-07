@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "audit-hook"
+version = "0.1.0"
+edition = "2021"
+description = "PRX audit hook plugin — observes lifecycle events and records counts in KV"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+prx-pdk = { path = "../../prx-pdk" }
+wit-bindgen = { version = "0.51", default-features = false, features = ["macros"] }
+
+[package.metadata.component]
+package = "prx:plugin@0.1.0"

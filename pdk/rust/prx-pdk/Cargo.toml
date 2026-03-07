@@ -1,0 +1,31 @@
+[workspace]
+
+[package]
+name = "prx-pdk"
+version = "0.1.0"
+edition = "2021"
+description = "PRX WASM Plugin Development Kit for Rust — ergonomic wrappers for host functions"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/openprx/openprx"
+documentation = "https://docs.rs/prx-pdk"
+keywords = ["wasm", "plugin", "prx", "agent", "pdk"]
+categories = ["wasm", "api-bindings"]
+readme = "../README.md"
+
+[lib]
+# rlib: usable as a Rust library dependency from plugin crates
+# cdylib: not needed here; plugin crates themselves declare cdylib
+crate-type = ["rlib"]
+
+[dependencies]
+# wit-bindgen 0.51 — compatible with wasmtime 31 (as used in the main PRX runtime)
+# On wasm32 targets (cargo-component builds): generates real host call bindings
+# On other targets: generates stub implementations for testing/development
+wit-bindgen = { version = "0.51", default-features = false, features = ["macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[features]
+default = []
+# Enable memory interface (requires "memory" permission in plugin manifest)
+memory = []

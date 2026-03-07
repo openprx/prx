@@ -1,0 +1,23 @@
+[plugin]
+name = "base64-tool"
+version = "0.1.0"
+description = "Base64 encoding/decoding tool — Rust PDK example"
+author = "PRX Team"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "tool"
+name = "base64"
+description = "Encode or decode base64 strings"
+
+[permissions]
+required = ["log", "config", "kv"]
+optional = []
+
+[resources]
+max_fuel = 100_000_000
+max_memory_mb = 8
+max_execution_time_ms = 1000
+
+[config]
+# No configuration needed for this tool
