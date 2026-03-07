@@ -220,4 +220,115 @@ mod tests {
         assert!(!registry.unregister("test").await);
         assert_eq!(registry.len().await, 0);
     }
+
+    #[tokio::test]
+    async fn get_component_returns_none_for_unregistered() {
+        let registry = PluginRegistry::new();
+        let component = registry.get_component("not-registered").await;
+        assert!(component.is_none(), "unregistered plugin should have no component");
+    }
+
+    #[tokio::test]
+    async fn get_component_returns_none_when_no_component() {
+        // LoadedPlugin created with component=None
+        let registry = PluginRegistry::new();
+        let plugin = LoadedPlugin::new(test_manifest("no-wasm"), "/tmp".into(), None);
+        registry.register(plugin).await.unwrap();
+        let component = registry.get_component("no-wasm").await;
+        assert!(component.is_none(), "plugin loaded without component should return None");
+    }
+
+    #[tokio::test]
+    async fn get_info_returns_none_for_unregistered() {
+        let registry = PluginRegistry::new();
+        let info = registry.get_info("ghost").await;
+        assert!(info.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_info_returns_correct_fields() {
+        let registry = PluginRegistry::new();
+        let mut manifest = test_manifest("info-test");
+        manifest.plugin.description = "A test plugin".to_string();
+        manifest.permissions.required = vec!["log".to_string(), "config".to_string()];
+
+        let plugin = LoadedPlugin::new(manifest, "/opt/plugins/info-test".into(), None);
+        registry.register(plugin).await.unwrap();
+
+        let info = registry.get_info("info-test").await.expect("should find plugin");
+        assert_eq!(info.name, "info-test");
+        assert_eq!(info.version, "0.1.0");
+        assert_eq!(info.description, "A test plugin");
+        assert_eq!(info.status, PluginStatus::Active);
+        assert!(info.permissions_required.contains(&"log".to_string()));
+        assert!(info.permissions_granted.contains(&"log".to_string()));
+    }
+
+    #[tokio::test]
+    async fn contains_returns_false_for_missing() {
+        let registry = PluginRegistry::new();
+        assert!(!registry.contains("absent").await);
+    }
+
+    #[tokio::test]
+    async fn contains_returns_true_after_register() {
+        let registry = PluginRegistry::new();
+        let plugin = LoadedPlugin::new(test_manifest("present"), "/tmp".into(), None);
+        registry.register(plugin).await.unwrap();
+        assert!(registry.contains("present").await);
+    }
+
+    #[tokio::test]
+    async fn replace_overwrites_existing_plugin() {
+        let registry = PluginRegistry::new();
+        let p1 = LoadedPlugin::new(test_manifest("hot-reload"), "/tmp/v1".into(), None);
+        registry.register(p1).await.unwrap();
+
+        // Replace with a new version (different source_dir to distinguish).
+        let p2 = LoadedPlugin::new(test_manifest("hot-reload"), "/tmp/v2".into(), None);
+        registry.replace(p2).await;
+
+        // Should still have exactly 1 plugin.
+        assert_eq!(registry.len().await, 1);
+
+        // Source dir should reflect the new plugin.
+        let source_dir = registry.get_source_dir("hot-reload").await.unwrap();
+        assert_eq!(source_dir, std::path::PathBuf::from("/tmp/v2"));
+    }
+
+    #[tokio::test]
+    async fn list_returns_all_registered_plugins() {
+        let registry = PluginRegistry::new();
+        for name in ["alpha", "beta", "gamma"] {
+            let plugin = LoadedPlugin::new(test_manifest(name), "/tmp".into(), None);
+            registry.register(plugin).await.unwrap();
+        }
+        let list = registry.list().await;
+        assert_eq!(list.len(), 3);
+        let names: std::collections::HashSet<_> = list.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains("alpha"));
+        assert!(names.contains("beta"));
+        assert!(names.contains("gamma"));
+    }
+
+    #[tokio::test]
+    async fn loaded_plugin_info_reflects_capabilities() {
+        let registry = PluginRegistry::new();
+        let mut manifest = test_manifest("cap-plugin");
+        manifest.capabilities = vec![
+            crate::plugins::manifest::Capability {
+                capability_type: "tool".to_string(),
+                name: "my_tool".to_string(),
+                description: "A tool".to_string(),
+                priority: 100,
+                events: vec![],
+                schedule: None,
+            },
+        ];
+        let plugin = LoadedPlugin::new(manifest, "/tmp".into(), None);
+        registry.register(plugin).await.unwrap();
+
+        let info = registry.get_info("cap-plugin").await.unwrap();
+        assert_eq!(info.capabilities, vec!["tool:my_tool"]);
+    }
 }

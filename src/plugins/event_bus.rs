@@ -401,4 +401,79 @@ mod tests {
             "error should mention recursion limit: {err}"
         );
     }
+
+    // 9. Stress test — N tasks publish concurrently, no panics, all deliveries complete.
+    #[tokio::test]
+    async fn stress_concurrent_publish() {
+        const NUM_PUBLISHERS: usize = 50;
+        const EVENTS_PER_PUBLISHER: usize = 20;
+
+        let bus = Arc::new(EventBus::new());
+
+        // Subscribe to all events so we can count deliveries.
+        let (_sub_id, mut rx) = bus.subscribe("stress-consumer", "stress.event").await.unwrap();
+
+        // Spawn NUM_PUBLISHERS tasks, each publishing EVENTS_PER_PUBLISHER events.
+        let mut handles = Vec::with_capacity(NUM_PUBLISHERS);
+        for i in 0..NUM_PUBLISHERS {
+            let bus_clone = Arc::clone(&bus);
+            let handle = tokio::spawn(async move {
+                for j in 0..EVENTS_PER_PUBLISHER {
+                    let payload = format!(r#"{{"publisher":{i},"seq":{j}}}"#);
+                    bus_clone
+                        .publish("stress.event", &payload)
+                        .await
+                        .expect("publish should not fail under load");
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all publishers to finish.
+        for h in handles {
+            h.await.expect("publisher task should not panic");
+        }
+
+        // Drain all received events with a short timeout between reads.
+        let expected = NUM_PUBLISHERS * EVENTS_PER_PUBLISHER;
+        let mut received = 0usize;
+        while let Ok(Some(_)) = timeout(Duration::from_millis(200), rx.recv()).await {
+            received += 1;
+            if received >= expected {
+                break;
+            }
+        }
+
+        assert_eq!(
+            received, expected,
+            "stress test: expected {expected} events but received {received}"
+        );
+    }
+
+    // 10. subscription_count reflects add/remove correctly.
+    #[tokio::test]
+    async fn subscription_count_tracking() {
+        let bus = Arc::new(EventBus::new());
+        assert_eq!(bus.subscription_count().await, 0);
+
+        let (id1, _rx1) = bus.subscribe("p1", "topic.a").await.unwrap();
+        assert_eq!(bus.subscription_count().await, 1);
+
+        let (id2, _rx2) = bus.subscribe("p2", "topic.*").await.unwrap();
+        assert_eq!(bus.subscription_count().await, 2);
+
+        bus.unsubscribe(id1).await.unwrap();
+        assert_eq!(bus.subscription_count().await, 1);
+
+        bus.unsubscribe(id2).await.unwrap();
+        assert_eq!(bus.subscription_count().await, 0);
+    }
+
+    // 11. Unsubscribe with unknown ID returns error.
+    #[tokio::test]
+    async fn unsubscribe_unknown_id_returns_error() {
+        let bus = EventBus::new();
+        let result = bus.unsubscribe(99999).await;
+        assert!(result.is_err(), "unknown subscription ID should return error");
+    }
 }
