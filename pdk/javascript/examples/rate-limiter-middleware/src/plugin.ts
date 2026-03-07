@@ -21,8 +21,7 @@
  * ```
  */
 
-import { log, config, kv, clock, resultErr, middlewareContinue, middlewareBlock } from "@prx/pdk";
-import type { PluginResult } from "@prx/pdk";
+import { log, config, kv, clock, middlewareContinue, middlewareBlock } from "@prx/pdk";
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -84,10 +83,17 @@ function isRateLimited(userId: string, cfg: RateLimiterConfig): boolean {
 
 // ── Middleware process ─────────────────────────────────────────────────────────
 
-export function process(stage: string, dataJson: string): PluginResult {
+/**
+ * WIT: process(stage: string, data-json: string) -> result<string, string>
+ *
+ * Returns the (possibly modified) JSON string on success.
+ * Throws an Error to signal a block/error — the Component Model canonical ABI
+ * converts a thrown Error into the Err variant of result<string, string>.
+ */
+export function process(stage: string, dataJson: string): string {
   // Only apply rate limiting on inbound messages
   if (stage !== "inbound") {
-    return { success: true, output: dataJson };
+    return dataJson;
   }
 
   const cfg = loadConfig();
@@ -99,14 +105,14 @@ export function process(stage: string, dataJson: string): PluginResult {
   } catch (e) {
     // Cannot parse → pass through unchanged (do not block)
     log.warn(`rate-limiter: failed to parse data JSON: ${String(e)}`);
-    return { success: true, output: dataJson };
+    return dataJson;
   }
 
   const userId = extractUserId(data, cfg.userIdField);
   if (!userId) {
     // No user ID present → pass through (cannot rate-limit anonymous)
     log.debug("rate-limiter: no user_id found, passing through");
-    return { success: true, output: dataJson };
+    return dataJson;
   }
 
   if (isRateLimited(userId, cfg)) {
@@ -116,18 +122,18 @@ export function process(stage: string, dataJson: string): PluginResult {
     // Track total blocked requests
     kv.increment("blocked_total", 1);
 
-    // Return a "block" action as JSON in the output — the PRX middleware
-    // chain interprets this as a pipeline halt.
-    const action = middlewareBlock(cfg.blockMessage);
-    return { success: true, output: JSON.stringify(action) };
+    // Throw to signal the Err variant of result<string, string>.
+    // The PRX host interprets this as a pipeline block.
+    throw new Error(
+      JSON.stringify(middlewareBlock(cfg.blockMessage)),
+    );
   }
 
   log.debug(`rate-limiter: user "${userId}" allowed`);
   kv.increment("allowed_total", 1);
 
-  // Pass through the unchanged data
-  const action = middlewareContinue(dataJson);
-  return { success: true, output: JSON.stringify(action) };
+  // Return the (possibly modified) data string — maps to Ok variant.
+  return JSON.stringify(middlewareContinue(dataJson));
 }
 
 // ── Helper: extract user ID from arbitrary JSON ───────────────────────────────
@@ -166,21 +172,15 @@ export function getStats(): string {
   return JSON.stringify({ allowed, blocked });
 }
 
-// ── Unused export to satisfy the middleware WIT world ─────────────────────────
-// The `middleware` world only requires `process(stage, data-json) → result<string, string>`.
-// The actual WIT binding wiring is done in the wasm_exports block below (wasm32 only).
-
 // ── Type-level notes ─────────────────────────────────────────────────────────
 //
-// PluginResult is used here instead of the raw WIT `result<string, string>` because
-// @prx/pdk wraps the WIT middleware-exports in the same PluginResult pattern
-// (success=true → the output string is the possibly-modified data or a JSON-encoded
-// MiddlewareAction; success=false → error string).
+// `process` returns `string` to match the WIT `result<string, string>` signature:
+//   - Return a string → Ok variant (pass modified or unchanged data downstream)
+//   - Throw an Error  → Err variant (halt the pipeline)
 //
-// The PRX host runtime inspects the output for a JSON-encoded MiddlewareAction:
+// The PRX host runtime inspects the returned string for a JSON-encoded MiddlewareAction:
 //   { "action": "block",    "reason": "..." }  → halt pipeline, return error
 //   { "action": "continue", "data": "..."   }  → pass modified data downstream
-// Any other output is treated as raw "continue" data.
+// Any other string is treated as raw "continue" data (passed as-is).
 
-// Silence unused import warnings in non-WASM builds
-void (resultErr as unknown);
+

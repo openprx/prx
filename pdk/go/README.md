@@ -82,7 +82,7 @@ import (
 //go:wasmexport get-spec
 func getSpec() (ptr *uint8, length uint32) {
     log.Debug("get-spec called")
-    spec := `{"name":"hash","description":"SHA-256 hash","parameters_schema":"{}"}`
+    spec := `{"name":"hash","description":"SHA-256 hash","parameters-schema":"{}"}` 
     b := []byte(spec)
     return &b[0], uint32(len(b))
 }
@@ -131,7 +131,7 @@ tinygo build -target wasm32-wasip2 -scheduler none -o plugin.wasm .
 
 ## Package Reference
 
-### `host/log` — Structured Logging
+### `host/log` - Structured Logging
 
 ```go
 import "github.com/openprx/prx-pdk-go/host/log"
@@ -147,7 +147,7 @@ WIT: `prx:host/log@0.1.0`
 
 ---
 
-### `host/config` — Plugin Configuration
+### `host/config` - Plugin Configuration
 
 ```go
 import "github.com/openprx/prx-pdk-go/host/config"
@@ -168,7 +168,7 @@ WIT: `prx:host/config@0.1.0`
 
 ---
 
-### `host/kv` — Key-Value Storage
+### `host/kv` - Key-Value Storage
 
 ```go
 import "github.com/openprx/prx-pdk-go/host/kv"
@@ -197,7 +197,7 @@ WIT: `prx:host/kv@0.1.0`
 
 ---
 
-### `host/events` — Event Bus
+### `host/events` - Event Bus
 
 ```go
 import "github.com/openprx/prx-pdk-go/host/events"
@@ -219,7 +219,7 @@ WIT: `prx:host/events@0.1.0`
 
 ---
 
-### `host/http` — Outbound HTTP
+### `host/http` - Outbound HTTP
 
 ```go
 import "github.com/openprx/prx-pdk-go/host/http"
@@ -239,7 +239,7 @@ WIT: `prx:host/http-outbound@0.1.0`
 
 ---
 
-### `host/clock` — Current Time
+### `host/clock` - Current Time
 
 ```go
 import "github.com/openprx/prx-pdk-go/host/clock"
@@ -249,11 +249,11 @@ sec := clock.NowSec()  // Unix seconds (uint64)
 tz  := clock.Timezone() // "UTC"
 ```
 
-Implemented via TinyGo's WASI Preview 2 `time.Now()` — no custom host import required.
+Implemented via TinyGo's WASI Preview 2 `time.Now()` - no custom host import required.
 
 ---
 
-### `host/memory` — Long-Term Memory
+### `host/memory` - Long-Term Memory
 
 ```go
 import "github.com/openprx/prx-pdk-go/host/memory"
@@ -296,28 +296,47 @@ pdk.Block("rate limit exceeded")   // MiddlewareResult
 
 ---
 
+## Component Model ABI Caveat
+
+> **Important**: The Go PDK examples use `//go:wasmexport` with hand-rolled pointer passing
+> (returning `(ptr *uint8, len uint32)` from `get-spec` / `execute`).
+>
+> The PRX host uses the **Component Model canonical ABI** (wasmtime), which expects:
+> - `get-spec` to return a `tool-spec` record via an out-pointer parameter.
+> - `execute` to return a `plugin-result` record via an out-pointer parameter.
+> - `on-event` to receive **two** separate strings: `event` and `payload-json`.
+>
+> For production plugins, use `wit-bindgen-go` (or another compliant code-generator)
+> to produce correct Component Model bindings.  The examples in this PDK are useful
+> for learning the host function APIs (log, kv, config, events, …), but the plugin
+> export ABI should be regenerated with proper tooling before shipping.
+>
+> Tracked in: [#TODO — add wit-bindgen-go integration guide]
+
+---
+
 ## TinyGo Compatibility Notes
 
 | Feature | Status |
 |---------|--------|
-| Goroutines | ❌ Not supported — use `-scheduler none` |
-| `reflect` | ❌ Avoid — no `encoding/json` |
+| Goroutines | ❌ Not supported - use `-scheduler none` |
+| `reflect` | ❌ Avoid - no `encoding/json` |
 | `crypto/sha256` | ✅ Supported |
 | `encoding/hex` | ✅ Supported |
 | `time.Now()` | ✅ Supported (WASI clock) |
 | `unsafe.Slice` | ✅ Supported (Go ≥ 1.17) |
 | `fmt.Fprintf` | ✅ Supported (stub builds only) |
-| Standard lib | Partial — see [TinyGo docs](https://tinygo.org/docs/reference/lang-support/stdlib/) |
+| Standard lib | Partial - see [TinyGo docs](https://tinygo.org/docs/reference/lang-support/stdlib/) |
 
 ### JSON Without Reflect
 
 Since `encoding/json` requires reflect, encode/decode JSON manually:
 
 ```go
-// Encode — build JSON strings by hand.
+// Encode - build JSON strings by hand.
 json := `{"name":"` + name + `","value":` + itoa(n) + `}`
 
-// Decode — scan for field values.
+// Decode - scan for field values.
 func extractField(json, field string) string {
     needle := `"` + field + `":"`
     // ... linear scan ...
