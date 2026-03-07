@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use wasmtime::AsContextMut;
 
 use crate::plugins::error::{PluginError, PluginResult};
 use crate::plugins::host::HostState;
@@ -82,10 +83,29 @@ impl WasmHook {
         let mut inner = self.inner.lock().await;
         let WasmHookInner { store, instance } = &mut *inner;
 
-        let func = instance
-            .get_func(&mut *store, "on-event")
+        // Navigate to the exported interface: prx:plugin/hook-exports@0.1.0
+        let iface_idx = instance
+            .get_export(
+                store.as_context_mut(),
+                None,
+                "prx:plugin/hook-exports@0.1.0",
+            )
             .ok_or_else(|| {
-                PluginError::Runtime("hook does not export 'on-event'".to_string())
+                PluginError::Runtime(
+                    "plugin does not export prx:plugin/hook-exports@0.1.0".to_string(),
+                )
+            })?;
+
+        let func_idx = instance
+            .get_export(store.as_context_mut(), Some(&iface_idx), "on-event")
+            .ok_or_else(|| {
+                PluginError::Runtime("on-event not found in hook-exports".to_string())
+            })?;
+
+        let func = instance
+            .get_func(store.as_context_mut(), &func_idx)
+            .ok_or_else(|| {
+                PluginError::Runtime("on-event is not a function".to_string())
             })?;
 
         let params = [

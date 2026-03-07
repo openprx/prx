@@ -145,6 +145,20 @@ impl WasmToolAdapter {
                 },
             )
             .map_err(|e| PluginError::Instantiation(format!("link config.get: {e}")))?;
+        config_inst
+            .func_wrap(
+                "get-all",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (): ()| {
+                    let pairs: Vec<(String, String)> = store
+                        .data()
+                        .config
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    Ok((pairs,))
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link config.get-all: {e}")))?;
 
         // prx:host/kv@0.1.0
         let mut kv_inst = linker

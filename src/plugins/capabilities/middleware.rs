@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use wasmtime::AsContextMut;
 
 use crate::plugins::error::{PluginError, PluginResult};
 use crate::plugins::host::HostState;
@@ -95,11 +96,29 @@ impl WasmMiddleware {
         let mut inner = self.inner.lock().await;
         let WasmMiddlewareInner { store, instance } = &mut *inner;
 
-        // Find the exported `process` function
-        let func = instance
-            .get_func(&mut *store, "process")
+        // Navigate to the exported interface: prx:plugin/middleware-exports@0.1.0
+        let iface_idx = instance
+            .get_export(
+                store.as_context_mut(),
+                None,
+                "prx:plugin/middleware-exports@0.1.0",
+            )
             .ok_or_else(|| {
-                PluginError::Runtime("middleware does not export 'process'".to_string())
+                PluginError::Runtime(
+                    "plugin does not export prx:plugin/middleware-exports@0.1.0".to_string(),
+                )
+            })?;
+
+        let func_idx = instance
+            .get_export(store.as_context_mut(), Some(&iface_idx), "process")
+            .ok_or_else(|| {
+                PluginError::Runtime("process not found in middleware-exports".to_string())
+            })?;
+
+        let func = instance
+            .get_func(store.as_context_mut(), &func_idx)
+            .ok_or_else(|| {
+                PluginError::Runtime("process is not a function".to_string())
             })?;
 
         // Call with (stage, data_json) -> result<string, string>

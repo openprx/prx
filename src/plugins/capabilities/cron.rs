@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use wasmtime::AsContextMut;
 
 use crate::plugins::error::{PluginError, PluginResult};
 use crate::plugins::host::HostState;
@@ -72,10 +73,29 @@ impl WasmCronJob {
         let mut inner = self.inner.lock().await;
         let WasmCronInner { store, instance } = &mut *inner;
 
-        let func = instance
-            .get_func(&mut *store, "run")
+        // Navigate to the exported interface: prx:plugin/cron-exports@0.1.0
+        let iface_idx = instance
+            .get_export(
+                store.as_context_mut(),
+                None,
+                "prx:plugin/cron-exports@0.1.0",
+            )
             .ok_or_else(|| {
-                PluginError::Runtime("cron plugin does not export 'run'".to_string())
+                PluginError::Runtime(
+                    "plugin does not export prx:plugin/cron-exports@0.1.0".to_string(),
+                )
+            })?;
+
+        let func_idx = instance
+            .get_export(store.as_context_mut(), Some(&iface_idx), "run")
+            .ok_or_else(|| {
+                PluginError::Runtime("run not found in cron-exports".to_string())
+            })?;
+
+        let func = instance
+            .get_func(store.as_context_mut(), &func_idx)
+            .ok_or_else(|| {
+                PluginError::Runtime("run is not a function".to_string())
             })?;
 
         let params = [];

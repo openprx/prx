@@ -1739,6 +1739,12 @@ mod tests {
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1794,6 +1800,12 @@ mod tests {
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2175,6 +2187,12 @@ mod tests {
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2247,6 +2265,12 @@ mod tests {
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
         };
 
         let headers = HeaderMap::new();
@@ -2319,6 +2343,12 @@ mod tests {
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
         };
 
         let response = handle_webhook(
@@ -2387,6 +2417,12 @@ mod tests {
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
         };
 
         let response = handle_webhook(
@@ -2442,6 +2478,12 @@ mod tests {
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2502,6 +2544,12 @@ mod tests {
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2567,6 +2615,12 @@ mod tests {
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2627,6 +2681,12 @@ mod tests {
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
         };
 
         let mut headers = HeaderMap::new();
