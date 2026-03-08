@@ -35,6 +35,8 @@ pub fn router(state: AppState) -> Router<AppState> {
         // Phase 1: alias for frontend compatibility
         .route("/channels/status", get(channels::get_channels_status))
         .route("/config", get(config::get_config))
+        .route("/config/files", get(config::get_config_files))
+        .route("/config/files/{filename}", put(config::put_config_file))
         .route("/config/schema", get(config::get_config_schema))
         .route("/config", post(config::post_config))
         .route("/config", put(config::post_config))

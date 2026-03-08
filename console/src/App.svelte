@@ -23,6 +23,8 @@
   let path = $state(currentPath());
   let token = $state(getToken());
   let mobileSidebarOpen = $state(false);
+  const THEME_STORAGE_KEY = 'prx-console-theme';
+  let themePreference = $state('system');
   let isDark = $state(true);
   let configNavGroups = $state([]);
   let configNavLoading = $state(false);
@@ -48,27 +50,29 @@
     activePath.startsWith('/chat/') ? safeDecodeSessionId(activePath.slice('/chat/'.length)) : ''
   );
 
+  function resolvePreferredDark() {
+    if (themePreference === 'dark') return true;
+    if (themePreference === 'light') return false;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+
   function initTheme() {
-    const saved = localStorage.getItem('prx-console-theme');
-    if (saved === 'light') {
-      isDark = false;
-    } else {
-      isDark = true;
-    }
+    const saved = localStorage.getItem(THEME_STORAGE_KEY);
+    themePreference = saved === 'light' || saved === 'dark' ? saved : 'system';
     applyTheme();
   }
 
   function applyTheme() {
-    if (isDark) {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
+    const nextIsDark = resolvePreferredDark();
+    isDark = nextIsDark;
+    document.documentElement.classList.toggle('dark', nextIsDark);
+    document.documentElement.classList.toggle('light', !nextIsDark);
+    document.documentElement.style.colorScheme = nextIsDark ? 'dark' : 'light';
   }
 
   function toggleTheme() {
-    isDark = !isDark;
-    localStorage.setItem('prx-console-theme', isDark ? 'dark' : 'light');
+    themePreference = isDark ? 'light' : 'dark';
+    localStorage.setItem(THEME_STORAGE_KEY, themePreference);
     applyTheme();
   }
 
@@ -126,6 +130,7 @@
     syncTokenCookie();
 
     const stopRouter = initRouter(onRouteChange);
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
     const onStorage = (event) => {
       if (event.key === 'prx-console-token') {
         refreshToken();
@@ -136,20 +141,27 @@
         syncLanguageFromStorage();
       }
 
-      if (event.key === 'prx-console-theme') {
-        const saved = localStorage.getItem('prx-console-theme');
-        isDark = saved !== 'light';
+      if (event.key === THEME_STORAGE_KEY) {
+        const saved = localStorage.getItem(THEME_STORAGE_KEY);
+        themePreference = saved === 'light' || saved === 'dark' ? saved : 'system';
+        applyTheme();
+      }
+    };
+    const onThemeMediaChange = () => {
+      if (themePreference === 'system') {
         applyTheme();
       }
     };
 
     window.addEventListener('storage', onStorage);
     window.addEventListener('hashchange', onHashChange);
+    mediaQuery.addEventListener('change', onThemeMediaChange);
 
     return () => {
       stopRouter();
       window.removeEventListener('storage', onStorage);
       window.removeEventListener('hashchange', onHashChange);
+      mediaQuery.removeEventListener('change', onThemeMediaChange);
     };
   });
 
@@ -177,7 +189,7 @@
   });
 </script>
 
-<div class="min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
+<div class="console-shell min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
   {#if !isAuthenticated}
     <LoginPage onLogin={onLogin} />
   {:else}
@@ -192,7 +204,7 @@
       {/if}
 
       <aside
-        class={`fixed inset-y-0 left-0 z-40 w-64 border-r border-gray-200 bg-white p-4 transition-transform dark:border-gray-700 dark:bg-gray-800 lg:static lg:translate-x-0 ${
+        class={`console-sidebar fixed inset-y-0 left-0 z-40 w-64 border-r border-gray-200 bg-white p-4 transition-transform dark:border-gray-700 dark:bg-gray-800 lg:static lg:translate-x-0 ${
           mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
@@ -240,7 +252,7 @@
       </aside>
 
       <div class="flex min-w-0 flex-1 flex-col">
-        <header class="sticky top-0 z-20 flex items-center justify-between border-b border-gray-200 bg-white/95 px-4 py-3 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95">
+        <header class="console-header sticky top-0 z-20 flex items-center justify-between border-b border-gray-200 bg-white/95 px-4 py-3 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95">
           <div class="flex items-center gap-3">
             <button
               type="button"

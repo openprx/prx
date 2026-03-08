@@ -43,7 +43,10 @@ pub async fn get_channels_status(State(state): State<AppState>) -> Json<Channels
     push_channel("whatsapp", config.channels_config.whatsapp.is_some());
     push_channel("wacli", config.channels_config.wacli.is_some());
     push_channel("linq", config.channels_config.linq.is_some());
-    push_channel("nextcloud_talk", config.channels_config.nextcloud_talk.is_some());
+    push_channel(
+        "nextcloud_talk",
+        config.channels_config.nextcloud_talk.is_some(),
+    );
     push_channel("email", config.channels_config.email.is_some());
     push_channel("irc", config.channels_config.irc.is_some());
     push_channel("lark", config.channels_config.lark.is_some());

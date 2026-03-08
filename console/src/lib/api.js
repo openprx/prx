@@ -111,10 +111,16 @@ export const api = {
   },
   getChannelsStatus: () => request('/api/channels/status'),
   getConfig: () => request('/api/config'),
+  getConfigFiles: () => request('/api/config/files'),
   saveConfig: (data) =>
     request('/api/config', {
       method: 'POST',
       body: JSON.stringify(data)
+    }),
+  saveConfigFile: (filename, content) =>
+    request(`/api/config/files/${encodeURIComponent(filename)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ content })
     }),
   getHooks: () => request('/api/hooks'),
   createHook: (data) =>
