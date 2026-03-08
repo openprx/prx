@@ -804,9 +804,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/metrics", get(handle_metrics))
         .merge(limited_public_routes)
         .nest("/api", api_routes)
-        .route("/", get(ui::index_handler))
-        .route("/assets/{*path}", get(ui::asset_handler))
-        .fallback(get(ui::index_handler))
+        .merge(ui::router())
         .with_state(state)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
