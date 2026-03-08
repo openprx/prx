@@ -59,6 +59,10 @@ impl Memory for NoneMemory {
         Ok(0)
     }
 
+    async fn increment_useful_count(&self, _id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn health_check(&self) -> bool {
         true
     }

@@ -13,6 +13,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
@@ -114,6 +115,11 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 const MEMORY_FLUSH_MAX_CHARS: usize = 800;
+
+struct RecalledMemoryContext {
+    preamble: String,
+    ids: Vec<String>,
+}
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
@@ -409,8 +415,13 @@ async fn auto_compact_history(
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
-async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
+async fn build_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+) -> RecalledMemoryContext {
     let mut context = String::new();
+    let mut ids = Vec::new();
 
     // Pull relevant memories for this message
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
@@ -428,6 +439,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
                 if memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
+                ids.push(entry.id.clone());
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
             if context != "[Memory context]\n" {
@@ -438,7 +450,19 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
         }
     }
 
-    context
+    RecalledMemoryContext {
+        preamble: context,
+        ids,
+    }
+}
+
+async fn increment_recalled_useful_counts(mem: &dyn Memory, recalled_ids: &[String]) {
+    let unique_ids: BTreeSet<&str> = recalled_ids.iter().map(String::as_str).collect();
+    for id in unique_ids {
+        if let Err(error) = mem.increment_useful_count(id).await {
+            tracing::debug!(memory_id = id, error = %error, "failed to increment useful_count");
+        }
+    }
 }
 
 /// Build hardware datasheet context from RAG when peripherals are enabled.
@@ -2027,7 +2051,7 @@ pub async fn run(
             .as_ref()
             .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
             .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
+        let context = format!("{}{}", mem_context.preamble, hw_context);
         let enriched = if context.is_empty() {
             msg.clone()
         } else {
@@ -2059,6 +2083,7 @@ pub async fn run(
             None,
         )
         .await?;
+        increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
@@ -2164,7 +2189,7 @@ pub async fn run(
                 .as_ref()
                 .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
                 .unwrap_or_default();
-            let context = format!("{mem_context}{hw_context}");
+            let context = format!("{}{}", mem_context.preamble, hw_context);
             let enriched = if context.is_empty() {
                 user_input.clone()
             } else {
@@ -2206,6 +2231,7 @@ pub async fn run(
                     continue;
                 }
             };
+            increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
             final_output = response.clone();
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
@@ -2420,7 +2446,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .as_ref()
         .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
         .unwrap_or_default();
-    let context = format!("{mem_context}{hw_context}");
+    let context = format!("{}{}", mem_context.preamble, hw_context);
     let enriched = if context.is_empty() {
         message.to_string()
     } else {
@@ -2446,6 +2472,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.agent.max_tool_iterations,
     )
     .await?;
+    increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
     hooks
         .emit(
             HookEvent::TurnComplete,
@@ -3475,9 +3502,10 @@ Done."#;
         .unwrap();
 
         let context = build_context(&mem, "status updates", 0.0).await;
-        assert!(context.contains("user_msg_real"));
-        assert!(!context.contains("assistant_resp_poisoned"));
-        assert!(!context.contains("fabricated event"));
+        assert!(context.preamble.contains("user_msg_real"));
+        assert!(!context.preamble.contains("assistant_resp_poisoned"));
+        assert!(!context.preamble.contains("fabricated event"));
+        assert_eq!(context.ids.len(), 1);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

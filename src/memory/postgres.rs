@@ -93,12 +93,16 @@ impl PostgresMemory {
                 category TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL,
-                session_id TEXT
+                session_id TEXT,
+                useful_count INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_memories_category ON {qualified_table}(category);
             CREATE INDEX IF NOT EXISTS idx_memories_session_id ON {qualified_table}(session_id);
             CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
+
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS useful_count INTEGER NOT NULL DEFAULT 0;
             "
         ))?;
 
@@ -136,7 +140,7 @@ impl PostgresMemory {
             score: row.try_get(6).ok(),
             tags: None,
             access_count: None,
-            useful_count: None,
+            useful_count: row.try_get(7).ok(),
             source: None,
             source_confidence: None,
             verification_status: None,
@@ -236,7 +240,8 @@ impl Memory for PostgresMemory {
                        (
                          CASE WHEN key ILIKE '%' || $1 || '%' THEN 2.0 ELSE 0.0 END +
                          CASE WHEN content ILIKE '%' || $1 || '%' THEN 1.0 ELSE 0.0 END
-                       ) AS score
+                       ) AS score,
+                       useful_count
                 FROM {qualified_table}
                 WHERE ($2::TEXT IS NULL OR session_id = $2)
                   AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
@@ -265,7 +270,9 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT id, key, content, category, created_at, session_id
+                SELECT id, key, content, category, created_at, session_id,
+                       NULL::DOUBLE PRECISION AS score,
+                       useful_count
                 FROM {qualified_table}
                 WHERE key = $1
                 LIMIT 1
@@ -292,7 +299,9 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT id, key, content, category, created_at, session_id
+                SELECT id, key, content, category, created_at, session_id,
+                       NULL::DOUBLE PRECISION AS score,
+                       useful_count
                 FROM {qualified_table}
                 WHERE ($1::TEXT IS NULL OR category = $1)
                   AND ($2::TEXT IS NULL OR session_id = $2)
@@ -337,6 +346,10 @@ impl Memory for PostgresMemory {
             Ok(count)
         })
         .await?
+    }
+
+    async fn increment_useful_count(&self, _id: &str) -> Result<()> {
+        Ok(())
     }
 
     async fn health_check(&self) -> bool {
