@@ -111,6 +111,7 @@ export const api = {
   },
   getChannelsStatus: () => request('/api/channels/status'),
   getConfig: () => request('/api/config'),
+  getConfigSchema: () => request('/api/config/schema'),
   getConfigFiles: () => request('/api/config/files'),
   saveConfig: (data) =>
     request('/api/config', {
