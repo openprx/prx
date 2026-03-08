@@ -1,4 +1,5 @@
 use crate::auth::codex_auth::default_codex_auth_json_path;
+use crate::config::files::{build_split_tables, read_merged_toml};
 use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
@@ -4227,7 +4228,58 @@ fn config_dir_creation_error(path: &Path) -> String {
     )
 }
 
+fn decrypt_config_secrets(config: &mut Config, openprx_dir: &Path) -> Result<()> {
+    let store = crate::security::SecretStore::new(openprx_dir, config.secrets.encrypt);
+    decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
+    decrypt_optional_secret(
+        &store,
+        &mut config.composio.api_key,
+        "config.composio.api_key",
+    )?;
+
+    decrypt_optional_secret(
+        &store,
+        &mut config.browser.computer_use.api_key,
+        "config.browser.computer_use.api_key",
+    )?;
+
+    decrypt_optional_secret(
+        &store,
+        &mut config.web_search.brave_api_key,
+        "config.web_search.brave_api_key",
+    )?;
+
+    decrypt_optional_secret(
+        &store,
+        &mut config.storage.provider.config.db_url,
+        "config.storage.provider.config.db_url",
+    )?;
+
+    for agent in config.agents.values_mut() {
+        decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
+    }
+
+    Ok(())
+}
+
 impl Config {
+    pub(crate) fn load_from_path(config_path: &Path, workspace_dir: PathBuf) -> Result<Self> {
+        let merged = read_merged_toml(config_path)?;
+        let mut config: Config = merged
+            .try_into()
+            .context("Failed to deserialize merged config")?;
+        config.config_path = config_path.to_path_buf();
+        config.workspace_dir = workspace_dir;
+
+        let openprx_dir = config_path
+            .parent()
+            .context("Config path must have a parent directory")?;
+        decrypt_config_secrets(&mut config, openprx_dir)?;
+        config.apply_env_overrides();
+        config.validate()?;
+        Ok(config)
+    }
+
     pub async fn load_or_init() -> Result<Self> {
         let (default_openprx_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -4261,45 +4313,7 @@ impl Config {
                 }
             }
 
-            let contents = fs::read_to_string(&config_path)
-                .await
-                .context("Failed to read config file")?;
-            let mut config: Config =
-                toml::from_str(&contents).context("Failed to parse config file")?;
-            // Set computed paths that are skipped during serialization
-            config.config_path = config_path.clone();
-            config.workspace_dir = workspace_dir;
-            let store = crate::security::SecretStore::new(&openprx_dir, config.secrets.encrypt);
-            decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
-            decrypt_optional_secret(
-                &store,
-                &mut config.composio.api_key,
-                "config.composio.api_key",
-            )?;
-
-            decrypt_optional_secret(
-                &store,
-                &mut config.browser.computer_use.api_key,
-                "config.browser.computer_use.api_key",
-            )?;
-
-            decrypt_optional_secret(
-                &store,
-                &mut config.web_search.brave_api_key,
-                "config.web_search.brave_api_key",
-            )?;
-
-            decrypt_optional_secret(
-                &store,
-                &mut config.storage.provider.config.db_url,
-                "config.storage.provider.config.db_url",
-            )?;
-
-            for agent in config.agents.values_mut() {
-                decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
-            }
-            config.apply_env_overrides();
-            config.validate()?;
+            let config = Self::load_from_path(&config_path, workspace_dir)?;
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
@@ -4700,7 +4714,11 @@ impl Config {
     }
 
     pub async fn save(&self) -> Result<()> {
-        // Encrypt secrets before serialization
+        let toml_str = self.to_stored_toml_string()?;
+        write_toml_string_atomic(&self.config_path, &toml_str).await
+    }
+
+    pub(crate) fn to_stored_toml_value(&self) -> Result<toml::Value> {
         let mut config_to_save = self.clone();
         let openprx_dir = self
             .config_path
@@ -4737,80 +4755,96 @@ impl Config {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
         }
 
-        let toml_str =
-            toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
+        toml::Value::try_from(&config_to_save).context("Failed to convert config into TOML value")
+    }
 
-        let parent_dir = self
-            .config_path
-            .parent()
-            .context("Config path must have a parent directory")?;
+    pub(crate) fn to_stored_toml_string(&self) -> Result<String> {
+        let value = self.to_stored_toml_value()?;
+        toml::to_string_pretty(&value).context("Failed to serialize config")
+    }
 
-        fs::create_dir_all(parent_dir).await.with_context(|| {
+    pub(crate) fn to_split_toml_strings(&self) -> Result<(String, Vec<(String, String)>)> {
+        let value = self.to_stored_toml_value()?;
+        let (main_value, fragment_values) = build_split_tables(&value)?;
+        let main =
+            toml::to_string_pretty(&main_value).context("Failed to serialize main config")?;
+        let mut fragments = Vec::with_capacity(fragment_values.len());
+        for (name, value) in fragment_values {
+            let rendered = toml::to_string_pretty(&value)
+                .with_context(|| format!("Failed to serialize split fragment: {name}"))?;
+            fragments.push((name, rendered));
+        }
+        Ok((main, fragments))
+    }
+}
+
+pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Result<()> {
+    let parent_dir = path
+        .parent()
+        .context("Config path must have a parent directory")?;
+
+    fs::create_dir_all(parent_dir).await.with_context(|| {
+        format!(
+            "Failed to create config directory: {}",
+            parent_dir.display()
+        )
+    })?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("config.toml");
+    let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+    let backup_path = parent_dir.join(format!("{file_name}.bak"));
+
+    let mut temp_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .await
+        .with_context(|| {
             format!(
-                "Failed to create config directory: {}",
-                parent_dir.display()
+                "Failed to create temporary config file: {}",
+                temp_path.display()
             )
         })?;
+    temp_file
+        .write_all(toml_str.as_bytes())
+        .await
+        .context("Failed to write temporary config contents")?;
+    temp_file
+        .sync_all()
+        .await
+        .context("Failed to fsync temporary config file")?;
+    drop(temp_file);
 
-        let file_name = self
-            .config_path
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("config.toml");
-        let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
-        let backup_path = parent_dir.join(format!("{file_name}.bak"));
-
-        let mut temp_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to create temporary config file: {}",
-                    temp_path.display()
-                )
-            })?;
-        temp_file
-            .write_all(toml_str.as_bytes())
-            .await
-            .context("Failed to write temporary config contents")?;
-        temp_file
-            .sync_all()
-            .await
-            .context("Failed to fsync temporary config file")?;
-        drop(temp_file);
-
-        let had_existing_config = self.config_path.exists();
-        if had_existing_config {
-            fs::copy(&self.config_path, &backup_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to create config backup before atomic replace: {}",
-                        backup_path.display()
-                    )
-                })?;
-        }
-
-        if let Err(e) = fs::rename(&temp_path, &self.config_path).await {
-            let _ = fs::remove_file(&temp_path).await;
-            if had_existing_config && backup_path.exists() {
-                fs::copy(&backup_path, &self.config_path)
-                    .await
-                    .context("Failed to restore config backup")?;
-            }
-            anyhow::bail!("Failed to atomically replace config file: {e}");
-        }
-
-        sync_directory(parent_dir).await?;
-
-        if had_existing_config {
-            let _ = fs::remove_file(&backup_path).await;
-        }
-
-        Ok(())
+    let had_existing_config = path.exists();
+    if had_existing_config {
+        fs::copy(path, &backup_path).await.with_context(|| {
+            format!(
+                "Failed to create config backup before atomic replace: {}",
+                backup_path.display()
+            )
+        })?;
     }
+
+    if let Err(e) = fs::rename(&temp_path, path).await {
+        let _ = fs::remove_file(&temp_path).await;
+        if had_existing_config && backup_path.exists() {
+            fs::copy(&backup_path, path)
+                .await
+                .context("Failed to restore config backup")?;
+        }
+        anyhow::bail!("Failed to atomically replace config file: {e}");
+    }
+
+    sync_directory(parent_dir).await?;
+
+    if had_existing_config {
+        let _ = fs::remove_file(&backup_path).await;
+    }
+
+    Ok(())
 }
 
 async fn sync_directory(path: &Path) -> Result<()> {
@@ -5353,6 +5387,164 @@ tool_dispatcher = "xml"
         assert_eq!(decrypted, "sk-roundtrip");
         assert_eq!(loaded.default_model.as_deref(), Some("test-model"));
         assert!((loaded.default_temperature - 0.9).abs() < f64::EPSILON);
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn config_load_from_path_supports_single_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "openprx_test_single_file_load_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let config_path = dir.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+default_model = "single-file"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = Config::load_from_path(&config_path, dir.join("workspace")).unwrap();
+        assert_eq!(loaded.default_model.as_deref(), Some("single-file"));
+        assert_eq!(loaded.memory.backend, "sqlite");
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn config_load_from_path_merges_config_dir_and_replaces_arrays() {
+        let dir = std::env::temp_dir().join(format!(
+            "openprx_test_config_merge_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = dir.join("config.d");
+        fs::create_dir_all(&config_dir).await.unwrap();
+
+        let config_path = dir.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+default_model = "base-model"
+
+[[model_routes]]
+hint = "alpha"
+provider = "openrouter"
+model = "base-alpha"
+
+[memory]
+backend = "sqlite"
+auto_save = true
+acl_enabled = false
+hygiene_enabled = true
+archive_after_days = 7
+purge_after_days = 30
+conversation_retention_days = 3
+daily_retention_days = 7
+embedding_provider = "base"
+embedding_model = "text-embedding-3-small"
+embedding_dimensions = 1536
+vector_weight = 0.7
+keyword_weight = 0.3
+min_relevance_score = 0.4
+embedding_cache_size = 1000
+snapshot_enabled = false
+snapshot_on_hygiene = false
+auto_hydrate = true
+"#,
+        )
+        .await
+        .unwrap();
+        fs::write(
+            config_dir.join("00-memory.toml"),
+            r#"
+[memory]
+embedding_provider = "override"
+"#,
+        )
+        .await
+        .unwrap();
+        fs::write(
+            config_dir.join("10-routes.toml"),
+            r#"
+default_model = "fragment-model"
+
+[[model_routes]]
+hint = "beta"
+provider = "anthropic"
+model = "override-beta"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = Config::load_from_path(&config_path, dir.join("workspace")).unwrap();
+        assert_eq!(loaded.default_model.as_deref(), Some("fragment-model"));
+        assert_eq!(loaded.model_routes.len(), 1);
+        assert_eq!(loaded.model_routes[0].hint, "beta");
+        assert_eq!(loaded.memory.embedding_provider, "override");
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn config_split_and_reload_roundtrip_matches_original() {
+        let dir = std::env::temp_dir().join(format!(
+            "openprx_test_split_reload_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.default_model = Some("roundtrip-model".into());
+        config.channels_config.telegram = Some(TelegramConfig {
+            bot_token: "roundtrip-token".into(),
+            allowed_users: vec!["zeroclaw_user".into()],
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        config.memory.backend = "markdown".into();
+        config.storage.provider.config.provider = "postgres".into();
+        config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
+        config.security.resources.max_cpu_time_seconds = 120;
+        config.autonomy.max_actions_per_hour = 42;
+        config.agents.insert(
+            "worker".into(),
+            DelegateAgentConfig {
+                provider: "openrouter".into(),
+                model: "test-model".into(),
+                system_prompt: Some("delegate".into()),
+                api_key: Some("agent-secret".into()),
+                temperature: Some(0.2),
+                max_depth: 4,
+                agentic: true,
+                allowed_tools: vec!["shell".into()],
+                max_iterations: 7,
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: Some(true),
+            },
+        );
+
+        let expected = serde_json::to_value(&config).unwrap();
+        crate::config::files::write_split_config(&config, false)
+            .await
+            .unwrap();
+
+        let reloaded =
+            Config::load_from_path(&config.config_path, config.workspace_dir.clone()).unwrap();
+        let actual = serde_json::to_value(&reloaded).unwrap();
+        assert_eq!(actual, expected);
 
         let _ = fs::remove_dir_all(&dir).await;
     }

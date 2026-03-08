@@ -1,0 +1,318 @@
+use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use tokio::fs;
+use toml::{map::Map, Value};
+
+pub(crate) const SPLIT_FILE_LAYOUT: &[(&str, &[&str])] = &[
+    ("channels.toml", &["channels_config"]),
+    ("memory.toml", &["memory", "storage"]),
+    ("security.toml", &["security", "autonomy"]),
+    ("agents.toml", &["agents", "sessions_spawn"]),
+    (
+        "identity.toml",
+        &["identity", "identity_bindings", "user_policies"],
+    ),
+    ("network.toml", &["gateway", "tunnel", "proxy"]),
+    ("scheduler.toml", &["scheduler", "cron", "heartbeat"]),
+];
+
+pub(crate) fn config_dir_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("config.d")
+}
+
+pub(crate) fn is_relevant_config_path(config_path: &Path, candidate: &Path) -> bool {
+    let config_dir = config_dir_path(config_path);
+    candidate == config_path || candidate == config_dir || candidate.starts_with(&config_dir)
+}
+
+pub(crate) fn list_config_fragment_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
+    let config_dir = config_dir_path(config_path);
+    if !config_dir.exists() {
+        return Ok(Vec::new());
+    }
+    if !config_dir.is_dir() {
+        bail!("config.d path is not a directory: {}", config_dir.display());
+    }
+
+    let mut fragments = Vec::new();
+    for entry in std::fs::read_dir(&config_dir)
+        .with_context(|| format!("Failed to read config directory: {}", config_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("Failed to enumerate {}", config_dir.display()))?;
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+            fragments.push(path);
+        }
+    }
+
+    fragments.sort_by(|left, right| {
+        left.file_name()
+            .cmp(&right.file_name())
+            .then_with(|| left.cmp(right))
+    });
+    Ok(fragments)
+}
+
+pub(crate) fn read_merged_toml(config_path: &Path) -> Result<Value> {
+    let mut merged = read_toml_file(config_path)?;
+    for fragment in list_config_fragment_paths(config_path)? {
+        let value = read_toml_file(&fragment)?;
+        deep_merge_toml(&mut merged, value);
+    }
+
+    if !merged.is_table() {
+        bail!(
+            "Config root must be a TOML table after merge: {}",
+            config_path.display()
+        );
+    }
+
+    Ok(merged)
+}
+
+pub(crate) fn compute_config_fingerprint(config_path: &Path) -> Result<Vec<u8>> {
+    let mut hasher = Sha256::new();
+    for path in config_layer_paths(config_path)? {
+        hasher.update(path.to_string_lossy().as_bytes());
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("Failed to read config layer: {}", path.display()))?;
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
+pub(crate) fn build_split_tables(root: &Value) -> Result<(Value, Vec<(String, Value)>)> {
+    let table = root
+        .as_table()
+        .context("Config split expects a TOML table at the root")?;
+
+    let mut main_table = table.clone();
+    let mut split_tables = Vec::new();
+
+    for (file_name, keys) in SPLIT_FILE_LAYOUT {
+        let mut fragment = Map::new();
+        for key in *keys {
+            if let Some(value) = main_table.remove(*key) {
+                fragment.insert((*key).to_string(), value);
+            }
+        }
+        if !fragment.is_empty() {
+            split_tables.push(((*file_name).to_string(), Value::Table(fragment)));
+        }
+    }
+
+    Ok((Value::Table(main_table), split_tables))
+}
+
+pub(crate) fn render_toml(value: &Value) -> Result<String> {
+    toml::to_string_pretty(value).context("Failed to serialize TOML")
+}
+
+pub(crate) async fn write_split_config(
+    config: &crate::config::schema::Config,
+    dry_run: bool,
+) -> Result<String> {
+    let (main_toml, fragment_tomls) = config.to_split_toml_strings()?;
+    let config_dir = config_dir_path(&config.config_path);
+    let preview = render_preview(&main_toml, &fragment_tomls);
+
+    if dry_run {
+        return Ok(preview);
+    }
+
+    crate::config::schema::write_toml_string_atomic(&config.config_path, &main_toml).await?;
+    fs::create_dir_all(&config_dir)
+        .await
+        .with_context(|| format!("Failed to create {}", config_dir.display()))?;
+
+    let managed_names: Vec<&str> = fragment_tomls
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    remove_stale_fragment_files(&config_dir, &managed_names).await?;
+
+    for (name, contents) in &fragment_tomls {
+        crate::config::schema::write_toml_string_atomic(&config_dir.join(name), contents).await?;
+    }
+
+    Ok(preview)
+}
+
+pub(crate) async fn merge_split_config(config: &crate::config::schema::Config) -> Result<()> {
+    let merged = config.to_stored_toml_string()?;
+    crate::config::schema::write_toml_string_atomic(&config.config_path, &merged).await?;
+
+    let config_dir = config_dir_path(&config.config_path);
+    if config_dir.exists() {
+        let fragment_paths = list_config_fragment_paths(&config.config_path)?;
+        for path in fragment_paths {
+            fs::remove_file(&path)
+                .await
+                .with_context(|| format!("Failed to remove {}", path.display()))?;
+        }
+
+        if fs::read_dir(&config_dir).await.is_ok() {
+            let _ = fs::remove_dir(&config_dir).await;
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn deep_merge_toml(target: &mut Value, overlay: Value) {
+    match (target, overlay) {
+        (Value::Table(target_map), Value::Table(source_map)) => {
+            for (key, source_value) in source_map {
+                match target_map.get_mut(&key) {
+                    Some(target_value) => deep_merge_toml(target_value, source_value),
+                    None => {
+                        target_map.insert(key, source_value);
+                    }
+                }
+            }
+        }
+        (target_value, source_value) => {
+            *target_value = source_value;
+        }
+    }
+}
+
+fn config_layer_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
+    let mut layers = vec![config_path.to_path_buf()];
+    layers.extend(list_config_fragment_paths(config_path)?);
+    Ok(layers)
+}
+
+async fn remove_stale_fragment_files(config_dir: &Path, managed_names: &[&str]) -> Result<()> {
+    if !config_dir.exists() {
+        return Ok(());
+    }
+
+    let mut entries = fs::read_dir(config_dir)
+        .await
+        .with_context(|| format!("Failed to read {}", config_dir.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+            continue;
+        }
+
+        let keep = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| managed_names.iter().any(|managed| managed == &name));
+        if !keep {
+            fs::remove_file(&path)
+                .await
+                .with_context(|| format!("Failed to remove stale fragment {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn render_preview(main_toml: &str, fragment_tomls: &[(String, String)]) -> String {
+    let mut preview = String::new();
+    preview.push_str("== config.toml ==\n");
+    preview.push_str(main_toml);
+
+    for (name, contents) in fragment_tomls {
+        if !preview.ends_with('\n') {
+            preview.push('\n');
+        }
+        preview.push('\n');
+        preview.push_str(&format!("== config.d/{name} ==\n"));
+        preview.push_str(contents);
+    }
+
+    preview
+}
+
+fn read_toml_file(path: &Path) -> Result<Value> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+    let value: Value = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse TOML file: {}", path.display()))?;
+    if !value.is_table() {
+        bail!("Config layer must contain a TOML table: {}", path.display());
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_merge_recurses_and_replaces_arrays() {
+        let mut base: Value = toml::from_str(
+            r#"
+[memory]
+backend = "sqlite"
+paths = ["a", "b"]
+
+[memory.embeddings]
+enabled = false
+provider = "old"
+"#,
+        )
+        .unwrap();
+        let overlay: Value = toml::from_str(
+            r#"
+[memory]
+paths = ["override"]
+
+[memory.embeddings]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        deep_merge_toml(&mut base, overlay);
+
+        let memory = base.get("memory").and_then(Value::as_table).unwrap();
+        assert_eq!(
+            memory.get("paths").and_then(Value::as_array).unwrap().len(),
+            1
+        );
+        let embeddings = memory.get("embeddings").and_then(Value::as_table).unwrap();
+        assert_eq!(
+            embeddings.get("provider").and_then(Value::as_str),
+            Some("old")
+        );
+        assert_eq!(
+            embeddings.get("enabled").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn build_split_tables_moves_mapped_sections() {
+        let root: Value = toml::from_str(
+            r#"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+
+[storage]
+[scheduler]
+"#,
+        )
+        .unwrap();
+
+        let (main, fragments) = build_split_tables(&root).unwrap();
+        assert!(main.get("memory").is_none());
+        assert!(main.get("storage").is_none());
+        assert!(main.get("scheduler").is_none());
+        assert!(main.get("default_temperature").is_some());
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0].0, "memory.toml");
+        assert_eq!(fragments[1].0, "scheduler.toml");
+    }
+}
