@@ -990,11 +990,36 @@ async fn run_gateway_chat_with_multimodal(
 
     // Build system prompt with native_tools flag so the prompt instructs the
     // LLM to use tools rather than emit XML tags.
-    let (system_prompt, multimodal_config, max_tool_iterations) = {
+    let (config_snapshot, multimodal_config, max_tool_iterations) = {
         let config_guard = state.config.lock();
-        let native_tools = state.provider.supports_native_tools();
-        let skills =
-            crate::skills::load_skills_with_config(&config_guard.workspace_dir, &config_guard);
+        (
+            config_guard.clone(),
+            config_guard.multimodal.clone(),
+            config_guard.agent.max_tool_iterations,
+        )
+    };
+    let native_tools = state.provider.supports_native_tools();
+    let mut skills =
+        crate::skills::load_skills_with_config(&config_snapshot.workspace_dir, &config_snapshot);
+    let skill_embedder = crate::memory::create_embedder_from_config(
+        &config_snapshot,
+        config_snapshot.api_key.as_deref(),
+    );
+    if config_snapshot.skill_rag.enabled {
+        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
+    }
+    let selected_skills = if config_snapshot.skill_rag.enabled {
+        crate::skills::select_skills_by_relevance(
+            message,
+            &skills,
+            config_snapshot.skill_rag.top_k,
+            skill_embedder.as_ref(),
+        )
+        .await
+    } else {
+        skills.clone()
+    };
+    let system_prompt = {
         let tool_descs: Vec<(&str, &str)> = vec![
             ("shell", "Execute terminal commands"),
             ("file_read", "Read file contents"),
@@ -1003,18 +1028,15 @@ async fn run_gateway_chat_with_multimodal(
             ("memory_recall", "Search memory"),
             ("memory_forget", "Delete a memory entry"),
         ];
-        let sp = crate::channels::build_system_prompt_with_mode(
-            &config_guard.workspace_dir,
+        crate::channels::build_system_prompt_with_mode(
+            &config_snapshot.workspace_dir,
             &state.model,
             &tool_descs,
-            &skills,
-            Some(&config_guard.identity),
+            &selected_skills,
+            Some(&config_snapshot.identity),
             None,
             native_tools,
-        );
-        let mmc = config_guard.multimodal.clone();
-        let mti = config_guard.agent.max_tool_iterations;
-        (sp, mmc, mti)
+        )
     };
 
     let mut history = Vec::with_capacity(2 + user_messages.len());

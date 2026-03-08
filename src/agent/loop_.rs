@@ -13,6 +13,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
@@ -114,6 +115,11 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 const MEMORY_FLUSH_MAX_CHARS: usize = 800;
+
+struct RecalledMemoryContext {
+    preamble: String,
+    ids: Vec<String>,
+}
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
@@ -409,8 +415,13 @@ async fn auto_compact_history(
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
-async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
+async fn build_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+) -> RecalledMemoryContext {
     let mut context = String::new();
+    let mut ids = Vec::new();
 
     // Pull relevant memories for this message
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
@@ -428,6 +439,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
                 if memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
+                ids.push(entry.id.clone());
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
             if context != "[Memory context]\n" {
@@ -438,7 +450,62 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
         }
     }
 
-    context
+    RecalledMemoryContext {
+        preamble: context,
+        ids,
+    }
+}
+
+async fn increment_recalled_useful_counts(mem: &dyn Memory, recalled_ids: &[String]) {
+    let unique_ids: BTreeSet<&str> = recalled_ids.iter().map(String::as_str).collect();
+    for id in unique_ids {
+        if let Err(error) = mem.increment_useful_count(id).await {
+            tracing::debug!(memory_id = id, error = %error, "failed to increment useful_count");
+        }
+    }
+}
+
+async fn select_prompt_skills(
+    query: &str,
+    skills: &[crate::skills::Skill],
+    config: &Config,
+    embedder: &dyn crate::memory::embeddings::EmbeddingProvider,
+) -> Vec<crate::skills::Skill> {
+    if !config.skill_rag.enabled {
+        return skills.to_vec();
+    }
+
+    crate::skills::select_skills_by_relevance(query, skills, config.skill_rag.top_k, embedder).await
+}
+
+fn build_runtime_system_prompt(
+    config: &Config,
+    model_name: &str,
+    tool_descs: &[(&str, &str)],
+    skills: &[crate::skills::Skill],
+    native_tools: bool,
+    tools_registry: &[Box<dyn Tool>],
+) -> String {
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+        &config.workspace_dir,
+        model_name,
+        tool_descs,
+        skills,
+        Some(&config.identity),
+        bootstrap_max_chars,
+        native_tools,
+    );
+
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(tools_registry));
+    }
+
+    system_prompt
 }
 
 /// Build hardware datasheet context from RAG when peripherals are enabled.
@@ -1873,7 +1940,6 @@ pub async fn run(
         .collect();
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",
@@ -1978,25 +2044,11 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
-    let bootstrap_max_chars = if config.agent.compact_context {
-        Some(6000)
-    } else {
-        None
-    };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
-        &config.workspace_dir,
-        model_name,
-        &tool_descs,
-        &skills,
-        Some(&config.identity),
-        bootstrap_max_chars,
-        native_tools,
-    );
-
-    // Append structured tool-use instructions with schemas (only for non-native providers)
-    if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
+    let mut skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    if config.skill_rag.enabled {
+        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
     }
 
     // ── Approval manager (supervised mode) ───────────────────────
@@ -2008,6 +2060,17 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
+        let selected_skills =
+            select_prompt_skills(&msg, &skills, &config, skill_embedder.as_ref()).await;
+        let system_prompt = build_runtime_system_prompt(
+            &config,
+            model_name,
+            &tool_descs,
+            &selected_skills,
+            native_tools,
+            &tools_registry,
+        );
+
         // Auto-save user message to memory (skip short/trivial messages)
         if config.memory.auto_save
             && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
@@ -2027,7 +2090,7 @@ pub async fn run(
             .as_ref()
             .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
             .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
+        let context = format!("{}{}", mem_context.preamble, hw_context);
         let enriched = if context.is_empty() {
             msg.clone()
         } else {
@@ -2059,6 +2122,7 @@ pub async fn run(
             None,
         )
         .await?;
+        increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
@@ -2077,7 +2141,18 @@ pub async fn run(
         let cli = crate::channels::CliChannel::new();
 
         // Persistent conversation history across turns
-        let mut history = vec![ChatMessage::system(&system_prompt)];
+        let mut history = if config.skill_rag.enabled {
+            Vec::new()
+        } else {
+            vec![ChatMessage::system(build_runtime_system_prompt(
+                &config,
+                model_name,
+                &tool_descs,
+                &skills,
+                native_tools,
+                &tools_registry,
+            ))]
+        };
 
         loop {
             print!("> ");
@@ -2124,7 +2199,16 @@ pub async fn run(
                     }
 
                     history.clear();
-                    history.push(ChatMessage::system(&system_prompt));
+                    if !config.skill_rag.enabled {
+                        history.push(ChatMessage::system(build_runtime_system_prompt(
+                            &config,
+                            model_name,
+                            &tool_descs,
+                            &skills,
+                            native_tools,
+                            &tools_registry,
+                        )));
+                    }
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2164,13 +2248,28 @@ pub async fn run(
                 .as_ref()
                 .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
                 .unwrap_or_default();
-            let context = format!("{mem_context}{hw_context}");
+            let context = format!("{}{}", mem_context.preamble, hw_context);
             let enriched = if context.is_empty() {
                 user_input.clone()
             } else {
                 format!("{context}{user_input}")
             };
 
+            let selected_skills =
+                select_prompt_skills(&user_input, &skills, &config, skill_embedder.as_ref()).await;
+            let system_prompt = build_runtime_system_prompt(
+                &config,
+                model_name,
+                &tool_descs,
+                &selected_skills,
+                native_tools,
+                &tools_registry,
+            );
+            if history.is_empty() {
+                history.push(ChatMessage::system(system_prompt));
+            } else {
+                history[0] = ChatMessage::system(system_prompt);
+            }
             history.push(ChatMessage::user(&enriched));
 
             let response = match run_tool_call_loop(
@@ -2206,6 +2305,7 @@ pub async fn run(
                     continue;
                 }
             };
+            increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
             final_output = response.clone();
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
@@ -2351,7 +2451,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .map(|b| b.board.clone())
         .collect();
 
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    let mut skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
@@ -2395,24 +2495,21 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
-    let bootstrap_max_chars = if config.agent.compact_context {
-        Some(6000)
-    } else {
-        None
-    };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
-        &config.workspace_dir,
+    let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
+    if config.skill_rag.enabled {
+        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
+    }
+    let selected_skills =
+        select_prompt_skills(message, &skills, &config, skill_embedder.as_ref()).await;
+    let system_prompt = build_runtime_system_prompt(
+        &config,
         &model_name,
         &tool_descs,
-        &skills,
-        Some(&config.identity),
-        bootstrap_max_chars,
+        &selected_skills,
         native_tools,
+        &tools_registry,
     );
-    if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
-    }
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -2420,7 +2517,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .as_ref()
         .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
         .unwrap_or_default();
-    let context = format!("{mem_context}{hw_context}");
+    let context = format!("{}{}", mem_context.preamble, hw_context);
     let enriched = if context.is_empty() {
         message.to_string()
     } else {
@@ -2446,6 +2543,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.agent.max_tool_iterations,
     )
     .await?;
+    increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
     hooks
         .emit(
             HookEvent::TurnComplete,
@@ -3475,9 +3573,10 @@ Done."#;
         .unwrap();
 
         let context = build_context(&mem, "status updates", 0.0).await;
-        assert!(context.contains("user_msg_real"));
-        assert!(!context.contains("assistant_resp_poisoned"));
-        assert!(!context.contains("fabricated event"));
+        assert!(context.preamble.contains("user_msg_real"));
+        assert!(!context.preamble.contains("assistant_resp_poisoned"));
+        assert!(!context.preamble.contains("fabricated event"));
+        assert_eq!(context.ids.len(), 1);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
