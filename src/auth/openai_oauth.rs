@@ -329,11 +329,7 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
 }
 
 pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
-    let payload = token.split('.').nth(1)?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let claims = decode_jwt_claims(token)?;
 
     for key in [
         "account_id",
@@ -350,6 +346,20 @@ pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
     }
 
     None
+}
+
+pub fn extract_expiry_from_jwt(token: &str) -> Option<chrono::DateTime<Utc>> {
+    let claims = decode_jwt_claims(token)?;
+    let exp = claims.get("exp")?.as_i64()?;
+    chrono::DateTime::<Utc>::from_timestamp(exp, 0)
+}
+
+fn decode_jwt_claims(token: &str) -> Option<serde_json::Value> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&decoded).ok()
 }
 
 async fn parse_token_response(response: reqwest::Response) -> Result<TokenSet> {
@@ -506,5 +516,16 @@ mod tests {
 
         let account = extract_account_id_from_jwt(&token);
         assert_eq!(account.as_deref(), Some("acct_123"));
+    }
+
+    #[test]
+    fn extract_expiry_from_jwt_payload() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{\"exp\":1900000000}");
+        let token = format!("{header}.{payload}.sig");
+
+        let expiry = extract_expiry_from_jwt(&token);
+        assert_eq!(expiry.map(|ts| ts.timestamp()), Some(1_900_000_000));
     }
 }

@@ -373,6 +373,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         auth_profile_override: None,
         openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
+        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
+        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(

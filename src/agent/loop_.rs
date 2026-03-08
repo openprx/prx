@@ -1892,6 +1892,8 @@ pub async fn run(
         auth_profile_override: None,
         openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
+        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
+        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
 
@@ -2424,6 +2426,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         auth_profile_override: None,
         openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
+        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
+        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(

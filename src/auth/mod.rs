@@ -1,7 +1,11 @@
 pub mod anthropic_token;
+pub mod codex_auth;
 pub mod openai_oauth;
 pub mod profiles;
 
+use crate::auth::codex_auth::{
+    default_codex_auth_json_path, load_openai_codex_profile_from_auth_json,
+};
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
     profile_id, AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore,
@@ -24,18 +28,41 @@ static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::n
 pub struct AuthService {
     store: AuthProfilesStore,
     client: reqwest::Client,
+    codex_auth_json_path: PathBuf,
+    codex_auth_json_auto_import: bool,
 }
 
 impl AuthService {
     pub fn from_config(config: &Config) -> Self {
         let state_dir = state_dir_from_config(config);
-        Self::new(&state_dir, config.secrets.encrypt)
+        Self::new_with_codex_import(
+            &state_dir,
+            config.secrets.encrypt,
+            Some(config.auth.codex_auth_json_path.clone()),
+            config.auth.codex_auth_json_auto_import,
+        )
     }
 
     pub fn new(state_dir: &Path, encrypt_secrets: bool) -> Self {
+        Self::new_with_codex_import(
+            state_dir,
+            encrypt_secrets,
+            Some(default_codex_auth_json_path()),
+            true,
+        )
+    }
+
+    pub fn new_with_codex_import(
+        state_dir: &Path,
+        encrypt_secrets: bool,
+        codex_auth_json_path: Option<PathBuf>,
+        codex_auth_json_auto_import: bool,
+    ) -> Self {
         Self {
             store: AuthProfilesStore::new(state_dir, encrypt_secrets),
             client: reqwest::Client::new(),
+            codex_auth_json_path: codex_auth_json_path.unwrap_or_else(default_codex_auth_json_path),
+            codex_auth_json_auto_import,
         }
     }
 
@@ -134,8 +161,9 @@ impl AuthService {
         profile_override: Option<&str>,
     ) -> Result<Option<String>> {
         let data = tokio::task::spawn_blocking({
-            let store = self.store.clone();
-            move || store.load()
+            let auth = self.clone();
+            let profile_override = profile_override.map(str::to_string);
+            move || auth.prepare_openai_profile_data(profile_override.as_deref())
         })
         .await
         .map_err(|err| anyhow::anyhow!("Auth profile load task failed: {err}"))??;
@@ -230,6 +258,47 @@ impl AuthService {
         .map_err(|err| anyhow::anyhow!("Auth profile update task failed: {err}"))??;
 
         Ok(updated.token_set.map(|t| t.access_token))
+    }
+
+    fn prepare_openai_profile_data(
+        &self,
+        profile_override: Option<&str>,
+    ) -> Result<AuthProfilesData> {
+        let data = self.store.load()?;
+        if !self.codex_auth_json_auto_import
+            || !should_attempt_codex_import(&data, profile_override)
+        {
+            return Ok(data);
+        }
+
+        let imported = match load_openai_codex_profile_from_auth_json(&self.codex_auth_json_path) {
+            Ok(imported) => imported,
+            Err(err) => {
+                tracing::debug!(
+                    path = %self.codex_auth_json_path.display(),
+                    error = %err,
+                    "Skipping Codex auth.json import"
+                );
+                return Ok(data);
+            }
+        };
+
+        let profile_name = select_profile_id(&data, OPENAI_CODEX_PROVIDER, profile_override)
+            .and_then(|profile_id| {
+                data.profiles
+                    .get(&profile_id)
+                    .map(|profile| profile.profile_name.clone())
+            })
+            .or_else(|| profile_override.map(str::to_string))
+            .unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string());
+
+        let mut profile =
+            AuthProfile::new_oauth(OPENAI_CODEX_PROVIDER, &profile_name, imported.token_set);
+        profile.account_id = Some(imported.account_id);
+
+        self.store
+            .upsert_profile(profile, profile_override.is_none())?;
+        self.store.load()
     }
 }
 
@@ -329,10 +398,35 @@ fn clear_refresh_backoff(profile_id: &str) {
     }
 }
 
+fn should_attempt_codex_import(data: &AuthProfilesData, profile_override: Option<&str>) -> bool {
+    let Some(profile_id) = select_profile_id(data, OPENAI_CODEX_PROVIDER, profile_override) else {
+        return true;
+    };
+
+    let Some(profile) = data.profiles.get(&profile_id) else {
+        return true;
+    };
+
+    let Some(token_set) = profile.token_set.as_ref() else {
+        return true;
+    };
+
+    token_set.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::profiles::{AuthProfile, AuthProfileKind};
+    use base64::Engine;
+    use tempfile::TempDir;
+
+    fn jwt_with_exp(exp: i64) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"exp":{exp},"account_id":"acct_jwt"}}"#));
+        format!("{header}.{payload}.sig")
+    }
 
     #[test]
     fn normalize_provider_aliases() {
@@ -390,6 +484,101 @@ mod tests {
         assert_eq!(
             select_profile_id(&data, "openai-codex", None),
             Some(id_active)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_valid_openai_access_token_prefers_valid_prx_profile() {
+        let tmp = TempDir::new().unwrap();
+        let imported_path = tmp.path().join("codex-auth.json");
+        std::fs::write(
+            &imported_path,
+            format!(
+                r#"{{
+  "auth_mode": "chatgpt",
+  "tokens": {{
+    "id_token": "imported-id",
+    "access_token": "{}",
+    "refresh_token": "imported-refresh",
+    "account_id": "acct_imported"
+  }}
+}}"#,
+                jwt_with_exp(1_900_000_000)
+            ),
+        )
+        .unwrap();
+
+        let auth = AuthService::new_with_codex_import(tmp.path(), false, Some(imported_path), true);
+        auth.store_openai_tokens(
+            "default",
+            crate::auth::profiles::TokenSet {
+                access_token: "local-access".into(),
+                refresh_token: Some("local-refresh".into()),
+                id_token: Some("local-id".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                token_type: Some("Bearer".into()),
+                scope: None,
+            },
+            Some("acct_local".into()),
+            true,
+        )
+        .unwrap();
+
+        let token = auth.get_valid_openai_access_token(None).await.unwrap();
+        assert_eq!(token.as_deref(), Some("local-access"));
+
+        let profile = auth.get_profile("openai-codex", None).unwrap().unwrap();
+        assert_eq!(profile.account_id.as_deref(), Some("acct_local"));
+    }
+
+    #[tokio::test]
+    async fn get_valid_openai_access_token_imports_when_local_profile_expired() {
+        let tmp = TempDir::new().unwrap();
+        let imported_path = tmp.path().join("codex-auth.json");
+        let imported_access = jwt_with_exp(1_900_000_123);
+        std::fs::write(
+            &imported_path,
+            format!(
+                r#"{{
+  "auth_mode": "chatgpt",
+  "tokens": {{
+    "id_token": "imported-id",
+    "access_token": "{imported_access}",
+    "refresh_token": "imported-refresh",
+    "account_id": "acct_imported"
+  }}
+}}"#
+            ),
+        )
+        .unwrap();
+
+        let auth = AuthService::new_with_codex_import(tmp.path(), false, Some(imported_path), true);
+        auth.store_openai_tokens(
+            "default",
+            crate::auth::profiles::TokenSet {
+                access_token: "expired-access".into(),
+                refresh_token: Some("expired-refresh".into()),
+                id_token: Some("expired-id".into()),
+                expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+                token_type: Some("Bearer".into()),
+                scope: None,
+            },
+            Some("acct_expired".into()),
+            true,
+        )
+        .unwrap();
+
+        let token = auth.get_valid_openai_access_token(None).await.unwrap();
+        assert_eq!(token.as_deref(), Some(imported_access.as_str()));
+
+        let profile = auth.get_profile("openai-codex", None).unwrap().unwrap();
+        assert_eq!(profile.account_id.as_deref(), Some("acct_imported"));
+        assert_eq!(
+            profile
+                .token_set
+                .as_ref()
+                .and_then(|tokens| tokens.refresh_token.as_deref()),
+            Some("imported-refresh")
         );
     }
 }

@@ -1064,6 +1064,8 @@ pub struct ProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
     pub openprx_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
+    pub codex_auth_json_path: Option<PathBuf>,
+    pub codex_auth_json_auto_import: bool,
     pub reasoning_enabled: Option<bool>,
 }
 
@@ -1073,6 +1075,8 @@ impl Default for ProviderRuntimeOptions {
             auth_profile_override: None,
             openprx_dir: None,
             secrets_encrypt: true,
+            codex_auth_json_path: None,
+            codex_auth_json_auto_import: true,
             reasoning_enabled: None,
         }
     }

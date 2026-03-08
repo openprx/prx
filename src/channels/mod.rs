@@ -3350,6 +3350,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auth_profile_override: None,
         openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
+        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
+        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
@@ -6300,6 +6302,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
+            embedding: None,
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
@@ -6335,6 +6338,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
+            embedding: None,
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
