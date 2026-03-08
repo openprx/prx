@@ -8,6 +8,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 const HOOKS_JSON_FILE: &str = "hooks.json";
+const DEFAULT_HOOK_TIMEOUT_MS: u64 = 5_000;
+const MIN_HOOK_TIMEOUT_MS: u64 = 1_000;
+const VALID_HOOK_EVENTS: &[&str] = &[
+    "agent_start",
+    "agent_end",
+    "llm_request",
+    "llm_response",
+    "tool_call_start",
+    "tool_call",
+    "turn_complete",
+    "error",
+];
 
 // ── Wire types ────────────────────────────────────────────
 
@@ -126,9 +138,55 @@ fn write_hooks_file(
     })
 }
 
+fn normalize_event_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn validate_hook_event(raw_event: &str) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let normalized = normalize_event_name(raw_event);
+    if VALID_HOOK_EVENTS.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Unsupported hook event '{raw_event}'")
+            })),
+        ))
+    }
+}
+
+fn validate_hook_command(
+    raw_command: &str,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let command = raw_command.trim().to_string();
+    if command.is_empty() {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Hook command must not be empty"})),
+        ))
+    } else {
+        Ok(command)
+    }
+}
+
+fn validate_hook_timeout(
+    timeout_ms: Option<u64>,
+) -> Result<Option<u64>, (StatusCode, Json<serde_json::Value>)> {
+    match timeout_ms {
+        Some(value) if value < MIN_HOOK_TIMEOUT_MS => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Hook timeout must be at least {MIN_HOOK_TIMEOUT_MS} ms")
+            })),
+        )),
+        other => Ok(other),
+    }
+}
+
 fn hooks_file_to_items(file: &HooksFile) -> Vec<HookItem> {
     let global_enabled = file.enabled.unwrap_or(true);
-    let global_timeout = file.timeout_ms.unwrap_or(5000);
+    let global_timeout = file.timeout_ms.unwrap_or(DEFAULT_HOOK_TIMEOUT_MS);
     let mut items = Vec::new();
 
     for (event, actions) in &file.hooks {
@@ -168,23 +226,23 @@ pub async fn create_hook(
     Json(req): Json<CreateHookRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     let mut file = read_hooks_file(&state)?;
+    let event = validate_hook_event(&req.event)?;
+    let command = validate_hook_command(&req.command)?;
+    let timeout_ms = validate_hook_timeout(req.timeout_ms)?;
     let action = HookActionEntry {
-        command: req.command.clone(),
+        command,
         args: req.args,
         env: HashMap::new(),
         cwd: None,
-        timeout_ms: req.timeout_ms,
+        timeout_ms,
         stdin_json: true,
     };
-    file.hooks
-        .entry(req.event.clone())
-        .or_default()
-        .push(action);
+    file.hooks.entry(event.clone()).or_default().push(action);
     write_hooks_file(&state, &file)?;
 
     Ok((
         StatusCode::CREATED,
-        Json(serde_json::json!({"status": "created", "event": req.event})),
+        Json(serde_json::json!({"status": "created", "event": event})),
     ))
 }
 
@@ -213,17 +271,18 @@ pub async fn update_hook(
     })?;
 
     if let Some(command) = req.command {
-        action.command = command;
+        action.command = validate_hook_command(&command)?;
     }
     if let Some(args) = req.args {
         action.args = args;
     }
     if let Some(timeout_ms) = req.timeout_ms {
-        action.timeout_ms = Some(timeout_ms);
+        action.timeout_ms = validate_hook_timeout(Some(timeout_ms))?;
     }
 
     // If event changed, move the action
     if let Some(new_event) = req.event {
+        let new_event = validate_hook_event(&new_event)?;
         if new_event != event_key {
             let action = actions.remove(action_idx);
             if actions.is_empty() {

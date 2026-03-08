@@ -1,5 +1,5 @@
+use super::extract_resource_auth_token;
 use super::AppState;
-use super::extract_auth_token;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -18,7 +18,7 @@ pub async fn ws_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let provided_token = extract_auth_token(&headers);
+    let provided_token = extract_resource_auth_token(&headers);
     if state.pairing.require_pairing() && !state.pairing.is_authenticated(&provided_token) {
         return (
             StatusCode::UNAUTHORIZED,

@@ -7,6 +7,7 @@
 
   const MAX_FILES = 10;
   const MESSAGES_PAGE_SIZE = 40;
+  const LOAD_MORE_SCROLL_THRESHOLD = 80;
   const IMAGE_VIDEO_MARKER_REGEX =
     /\[(IMAGE|VIDEO):([^\]]+)\]|(data:(?:image|video)\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=]+)/gi;
 
@@ -25,6 +26,30 @@
   let selectedFiles = $state([]);
   let dragActive = $state(false);
   let dragDepth = 0;
+
+  function messageIdentity(message) {
+    if (message?.message_id) {
+      return `id:${message.message_id}`;
+    }
+
+    return `fallback:${message?.timestamp ?? ''}:${message?.role ?? ''}:${message?.content ?? ''}`;
+  }
+
+  function mergeMessages(nextMessages) {
+    const seen = new Set();
+    const merged = [];
+
+    for (const message of nextMessages) {
+      const identity = messageIdentity(message);
+      if (seen.has(identity)) {
+        continue;
+      }
+      seen.add(identity);
+      merged.push(message);
+    }
+
+    return merged;
+  }
 
   function goBack() {
     navigate('/sessions');
@@ -169,6 +194,16 @@
     addFiles(event.dataTransfer?.files);
   }
 
+  function handleScroll() {
+    if (!scrollContainer || loading || sending || loadingMore || !hasMore) {
+      return;
+    }
+
+    if (scrollContainer.scrollTop <= LOAD_MORE_SCROLL_THRESHOLD) {
+      loadOlderMessages();
+    }
+  }
+
   function resolveMediaSource(value) {
     const source = (value || '').trim();
     if (!source) {
@@ -261,16 +296,16 @@
 
     if (appendOlder && scrollContainer) {
       const previousHeight = scrollContainer.scrollHeight;
-      messages = [...pageMessages, ...messages];
-      loadedCount += pageMessages.length;
+      messages = mergeMessages([...pageMessages, ...messages]);
+      loadedCount = messages.length;
       hasMore = nextHasMore;
       await tick();
       scrollContainer.scrollTop = scrollContainer.scrollHeight - previousHeight;
       return;
     }
 
-    messages = pageMessages;
-    loadedCount = pageMessages.length;
+    messages = mergeMessages(pageMessages);
+    loadedCount = messages.length;
     hasMore = nextHasMore;
   }
 
@@ -411,6 +446,7 @@
     <div
       class={`flex-1 overflow-y-auto p-4 ${dragActive ? 'bg-blue-500/10 ring-1 ring-inset ring-blue-500/40' : ''}`}
       bind:this={scrollContainer}
+      onscroll={handleScroll}
     >
       {#if dragActive}
         <p class="mb-3 rounded-lg border border-blue-500/40 bg-blue-500/15 px-3 py-2 text-sm text-blue-700 dark:text-blue-200">
