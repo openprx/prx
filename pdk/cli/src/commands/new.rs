@@ -499,7 +499,10 @@ fn try_copy_from_pdk_templates(
         let entry = entry?;
         let src = entry.path();
         if src.is_file() {
-            let fname = src.file_name().unwrap().to_string_lossy();
+            let fname = src
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("template file has no name: {}", src.display()))?
+                .to_string_lossy();
             // Strip .tmpl suffix for destination
             let dest_name = if fname.ends_with(".tmpl") {
                 fname.trim_end_matches(".tmpl").to_string()

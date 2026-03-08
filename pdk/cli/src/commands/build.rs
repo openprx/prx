@@ -71,7 +71,7 @@ fn build_rust(dir: &Path, release: bool) -> Result<()> {
     let check = Command::new("cargo")
         .args(["component", "--version"])
         .output();
-    if check.is_err() || !check.unwrap().status.success() {
+    if check.map_or(true, |o| !o.status.success()) {
         eprintln!(
             "{} cargo-component not found. Install with:\n  cargo install cargo-component",
             "Warning:".yellow().bold()
