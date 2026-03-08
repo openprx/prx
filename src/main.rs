@@ -447,6 +447,14 @@ Examples:
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout
     Schema,
+    /// Split config.toml into config.d/*.toml fragments
+    Split {
+        /// Preview the generated files without writing them
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Merge config.d/*.toml back into a single config.toml
+    Merge,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1071,6 +1079,24 @@ async fn main() -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
                 );
+                Ok(())
+            }
+            ConfigCommands::Split { dry_run } => {
+                let preview = config::files::write_split_config(&config, dry_run).await?;
+                if dry_run {
+                    println!("{preview}");
+                } else {
+                    println!(
+                        "Split configuration written to {} and {}",
+                        config.config_path.display(),
+                        config::files::config_dir_path(&config.config_path).display()
+                    );
+                }
+                Ok(())
+            }
+            ConfigCommands::Merge => {
+                config::files::merge_split_config(&config).await?;
+                println!("Merged configuration into {}", config.config_path.display());
                 Ok(())
             }
         },

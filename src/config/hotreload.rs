@@ -15,7 +15,7 @@
 //! - A monotonic `reload_version` counter is bumped only when file content
 //!   changes and reload succeeds.
 
-use super::schema::Config;
+use super::{files, schema::Config};
 use arc_swap::ArcSwap;
 use std::{
     path::PathBuf,
@@ -78,40 +78,40 @@ fn run_watcher(
 ) -> anyhow::Result<()> {
     use notify::RecursiveMode;
     use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
-    use sha2::{Digest, Sha256};
 
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
     let debounce_ms = std::time::Duration::from_secs(1);
+    let watch_root = config_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let mut debouncer = new_debouncer(debounce_ms, tx)?;
     debouncer
         .watcher()
-        .watch(&config_path, RecursiveMode::NonRecursive)?;
+        .watch(&watch_root, RecursiveMode::Recursive)?;
 
-    let mut last_content_hash = std::fs::read(&config_path).ok().map(|bytes| {
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        hasher.finalize().to_vec()
-    });
+    let mut last_content_hash = files::compute_config_fingerprint(&config_path).ok();
 
     tracing::info!(
         path = %config_path.display(),
+        watch_root = %watch_root.display(),
         "Config hot-reload watcher started (1 s debounce)"
     );
 
     for result in rx {
         match result {
             Ok(events) => {
-                // Only act on events targeting our path.
-                // notify_debouncer_mini uses DebouncedEvent with a single `path` field.
-                let relevant = events.iter().any(|ev| ev.path == config_path);
+                let relevant = events
+                    .iter()
+                    .any(|ev| files::is_relevant_config_path(&config_path, &ev.path));
 
                 if !relevant {
                     continue;
                 }
 
-                let contents = match std::fs::read(&config_path) {
-                    Ok(c) => c,
+                let content_hash = match files::compute_config_fingerprint(&config_path) {
+                    Ok(hash) => hash,
                     Err(e) => {
                         tracing::warn!(
                             path = %config_path.display(),
@@ -121,10 +121,6 @@ fn run_watcher(
                         continue;
                     }
                 };
-
-                let mut hasher = Sha256::new();
-                hasher.update(&contents);
-                let content_hash = hasher.finalize().to_vec();
 
                 if last_content_hash
                     .as_ref()
@@ -137,7 +133,7 @@ fn run_watcher(
                     continue;
                 }
 
-                match try_reload(&contents, &shared) {
+                match try_reload(&config_path, &shared) {
                     Ok(()) => {
                         last_content_hash = Some(content_hash);
                         let version = reload_version.fetch_add(1, Ordering::Relaxed) + 1;
@@ -166,14 +162,9 @@ fn run_watcher(
 }
 
 /// Parse config file and atomically store it.
-fn try_reload(contents: &[u8], shared: &SharedConfig) -> anyhow::Result<()> {
-    let contents = std::str::from_utf8(contents)?;
-    let mut fresh: Config = toml::from_str(contents)?;
-
-    // Preserve runtime-resolved paths from the current config
+fn try_reload(config_path: &std::path::Path, shared: &SharedConfig) -> anyhow::Result<()> {
     let old = shared.load_full();
-    fresh.config_path = old.config_path.clone();
-    fresh.workspace_dir = old.workspace_dir.clone();
+    let mut fresh = Config::load_from_path(config_path, old.workspace_dir.clone())?;
     // ACL mode is not hot-reloadable for already-initialized tool instances.
     // Keep runtime behavior deterministic until restart.
     if fresh.memory.acl_enabled != old.memory.acl_enabled {
