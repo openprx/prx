@@ -1,6 +1,8 @@
+import { t } from './i18n';
+
 export function formatUptime(totalSeconds) {
   if (!Number.isFinite(totalSeconds) || totalSeconds < 0) {
-    return '0s';
+    return `0${t('common.durationUnits.second')}`;
   }
 
   const days = Math.floor(totalSeconds / 86400);
@@ -10,15 +12,15 @@ export function formatUptime(totalSeconds) {
 
   const parts = [];
   if (days > 0) {
-    parts.push(`${days}d`);
+    parts.push(`${days}${t('common.durationUnits.day')}`);
   }
   if (hours > 0 || parts.length > 0) {
-    parts.push(`${hours}h`);
+    parts.push(`${hours}${t('common.durationUnits.hour')}`);
   }
   if (minutes > 0 || parts.length > 0) {
-    parts.push(`${minutes}m`);
+    parts.push(`${minutes}${t('common.durationUnits.minute')}`);
   }
-  parts.push(`${seconds}s`);
+  parts.push(`${seconds}${t('common.durationUnits.second')}`);
 
   return parts.join(' ');
 }

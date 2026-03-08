@@ -42,6 +42,12 @@
   }
 
   function humanizeEvent(event) {
+    const key = `hooks.events.${event}`;
+    const translated = t(key);
+    if (translated !== key) {
+      return translated;
+    }
+
     return event
       .split('_')
       .map((word) => word.charAt(0).toUpperCase() + word.slice(1))

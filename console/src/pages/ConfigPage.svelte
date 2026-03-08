@@ -199,15 +199,15 @@
   }
 
   function formatDefaultValue(value) {
-    if (value === undefined) return 'No default';
-    if (typeof value === 'string') return value.length > 0 ? value : '(empty)';
+    if (value === undefined) return t('config.noDefault');
+    if (typeof value === 'string') return value.length > 0 ? value : `(${t('common.empty').toLowerCase()})`;
     return JSON.stringify(value);
   }
 
   function formatValue(value) {
-    if (value === undefined) return '(unset)';
+    if (value === undefined) return `(${t('config.field.notSet').toLowerCase()})`;
     if (value === null) return 'null';
-    if (typeof value === 'string') return value.length > 0 ? value : '(empty)';
+    if (typeof value === 'string') return value.length > 0 ? value : `(${t('common.empty').toLowerCase()})`;
     return JSON.stringify(value);
   }
 
@@ -799,7 +799,7 @@
         {/each}
       </div>
       <button type="button" class="secondary-action" onclick={() => addStringArrayItem(node.path)}>
-        Add tag
+        {t('config.addListItem')}
       </button>
     </div>
   {:else if node.inputKind === 'json'}
@@ -825,7 +825,12 @@
         oninput={(event) => updateField(node.path, event.currentTarget.value)}
       />
       {#if node.sensitive}
-        <button type="button" class="icon-action" onclick={() => toggleReveal(node.path)} aria-label="Toggle visibility">
+        <button
+          type="button"
+          class="icon-action"
+          onclick={() => toggleReveal(node.path)}
+          aria-label={t('config.toggleVisibility')}
+        >
           {#if isRevealed}
             <EyeOff size={16} />
           {:else}
@@ -846,10 +851,10 @@
           <div class="config-field__title-row">
             <h4>{node.label}</h4>
             {#if node.modifiedFromDefault}
-              <span class="config-badge">Modified</span>
+              <span class="config-badge">{t('config.modified')}</span>
             {/if}
             {#if node.dirtyFromOriginal}
-              <span class="config-badge config-badge--muted">Unsaved</span>
+              <span class="config-badge config-badge--muted">{t('config.unsaved')}</span>
             {/if}
           </div>
           <p class="config-field__path">{node.path}</p>
@@ -857,7 +862,7 @@
         {#if node.defaultValue !== undefined}
           <button type="button" class="ghost-action" onclick={() => resetFieldToDefault(node.path, node.defaultValue)}>
             <RotateCcw size={14} />
-            Reset
+            {t('common.reset')}
           </button>
         {/if}
       </div>
@@ -865,9 +870,9 @@
         <p class="config-field__description">{node.description}</p>
       {/if}
       <div class="config-field__hint-row">
-        <span>Current: {formatValue(currentValue)}</span>
+        <span>{t('config.currentValue')}: {formatValue(currentValue)}</span>
         {#if node.defaultValue !== undefined}
-          <span>Default: {formatDefaultValue(node.defaultValue)}</span>
+          <span>{t('config.defaultValue')}: {formatDefaultValue(node.defaultValue)}</span>
         {/if}
       </div>
     </div>
@@ -889,10 +894,10 @@
         <div class="object-card__title-row">
           <h4>{node.label}</h4>
           {#if node.modifiedFromDefault}
-            <span class="config-badge">Modified</span>
+            <span class="config-badge">{t('config.modified')}</span>
           {/if}
           {#if node.dirtyFromOriginal}
-            <span class="config-badge config-badge--muted">Unsaved</span>
+            <span class="config-badge config-badge--muted">{t('config.unsaved')}</span>
           {/if}
         </div>
         <p class="object-card__path">{node.path}</p>
@@ -909,7 +914,7 @@
     {#if isObjectOpen(node)}
       <div class="object-card__body" transition:slide={{ duration: 180 }}>
         {#if node.visibleChildren.length === 0}
-          <p class="empty-state">No matching fields.</p>
+          <p class="empty-state">{t('config.noMatchingFields')}</p>
         {:else}
           <div class="object-card__grid">
             {#each node.visibleChildren as child (child.id)}
@@ -930,27 +935,27 @@
   <div class="config-header">
     <div>
       <h2>{t('config.title')}</h2>
-      <p>Schema-driven editor with defaults, search, and config file management.</p>
+      <p>{t('config.description')}</p>
     </div>
 
     <div class="config-header__actions">
       <label class="mode-switch">
         <input type="checkbox" bind:checked={advancedMode} />
-        <span>Advanced mode</span>
+        <span>{t('config.advancedMode')}</span>
       </label>
       <button type="button" class="secondary-action" onclick={() => copyToClipboard(prettyConfig)}>
         <Copy size={14} />
-        Copy JSON
+        {t('config.copyJson')}
       </button>
       <button type="button" class="secondary-action" onclick={() => loadConfigPage()}>
         <RefreshCw size={14} />
-        Reload
+        {t('common.reload')}
       </button>
     </div>
   </div>
 
   {#if loading}
-    <p class="loading-state">Loading config...</p>
+    <p class="loading-state">{t('config.loading')}</p>
   {:else if errorMessage}
     <p class="error-banner">{errorMessage}</p>
   {:else if advancedMode}
@@ -960,18 +965,18 @@
           <div>
             <div class="advanced-card__title">
               <FileJson2 size={18} />
-              <h3>Merged JSON</h3>
+              <h3>{t('config.mergedJsonTitle')}</h3>
             </div>
-            <p>Direct editor for the merged runtime config payload.</p>
+            <p>{t('config.mergedJsonDescription')}</p>
           </div>
           <div class="advanced-card__actions">
             <button type="button" class="secondary-action" onclick={() => { rawJsonDraft = prettyConfig; rawJsonDirty = false; rawJsonError = ''; }}>
               <RotateCcw size={14} />
-              Reset
+              {t('common.reset')}
             </button>
             <button type="button" class="primary-action" onclick={saveRawJsonConfig} disabled={savingConfig}>
               <Save size={14} />
-              {savingConfig ? 'Saving...' : 'Save JSON'}
+              {savingConfig ? t('common.saving') : t('config.saveJson')}
             </button>
           </div>
         </div>
@@ -994,9 +999,9 @@
           <div>
             <div class="advanced-card__title">
               <Files size={18} />
-              <h3>Config Files</h3>
+              <h3>{t('config.configFilesTitle')}</h3>
             </div>
-            <p>`config.toml` and `config.d/*.toml` are editable independently.</p>
+            <p>{t('config.configFilesDescription')}</p>
           </div>
         </div>
 
@@ -1008,7 +1013,9 @@
                 <div>
                   <div class="file-card__title-row">
                     <h4>{file.path}</h4>
-                    <span class="config-badge config-badge--muted">{file.source === 'main' ? 'config.toml' : 'config.d'}</span>
+                    <span class="config-badge config-badge--muted">
+                      {file.source === 'main' ? t('config.sourceMain') : t('config.sourceDirectory')}
+                    </span>
                   </div>
                   <p>{file.filename}</p>
                 </div>
@@ -1019,7 +1026,7 @@
                   disabled={saveState?.saving}
                 >
                   <Save size={14} />
-                  {saveState?.saving ? 'Saving...' : 'Save file'}
+                  {saveState?.saving ? t('common.saving') : t('config.saveFile')}
                 </button>
               </div>
               <textarea
@@ -1046,7 +1053,7 @@
       <div class="config-toolbar">
         <label class="search-box">
           <Search size={16} />
-          <input type="search" bind:value={searchQuery} placeholder="Search by field name or description" />
+          <input type="search" bind:value={searchQuery} placeholder={t('config.searchPlaceholder')} />
         </label>
 
         <div class="config-pills">
@@ -1066,7 +1073,7 @@
       </div>
 
       {#if visibleGroups.length === 0}
-        <p class="empty-state">No matching config items.</p>
+        <p class="empty-state">{t('config.noMatchingItems')}</p>
       {:else}
         <div class="group-list">
           {#each visibleGroups as group (group.groupKey)}
@@ -1093,10 +1100,10 @@
                 </div>
                 <div class="group-card__summary">
                   {#if group.node.modifiedFromDefault}
-                    <span class="config-badge">Modified</span>
+                    <span class="config-badge">{t('config.modified')}</span>
                   {/if}
                   {#if pathHasChanges(group.groupKey)}
-                    <span class="config-badge config-badge--muted">Unsaved</span>
+                    <span class="config-badge config-badge--muted">{t('config.unsaved')}</span>
                   {/if}
                   <ChevronDown
                     size={18}
@@ -1133,14 +1140,16 @@
     <div class="save-bar" transition:fade>
       <div class="save-bar__content">
         <div>
-          <p>{changedFields.length} unsaved change(s)</p>
-          <span>Save writes only changed keys back to the config API.</span>
+          <p>{t('config.unsavedChangesCount', { count: changedFields.length })}</p>
+          <span>{t('config.saveHint')}</span>
         </div>
         <div class="save-bar__actions">
-          <button type="button" class="secondary-action" onclick={discardStructuredChanges}>Discard</button>
+          <button type="button" class="secondary-action" onclick={discardStructuredChanges}>
+            {t('config.discard')}
+          </button>
           <button type="button" class="primary-action" onclick={saveStructuredConfig} disabled={savingConfig}>
             <Save size={14} />
-            {savingConfig ? 'Saving...' : 'Save config'}
+            {savingConfig ? t('common.saving') : t('config.saveConfig')}
           </button>
         </div>
       </div>

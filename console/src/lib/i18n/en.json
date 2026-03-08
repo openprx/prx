@@ -4,9 +4,15 @@
     "menu": "Menu",
     "closeSidebar": "Close sidebar",
     "language": "Language",
-    "languageToggle": "中文 / EN",
+    "theme": "Theme",
     "notFound": "Not found",
     "backToOverview": "Back to Overview"
+  },
+  "languages": {
+    "en": "English",
+    "zh": "中文",
+    "ka": "ქართული",
+    "ru": "Русский"
   },
   "nav": {
     "overview": "Overview",
@@ -34,7 +40,29 @@
     "clipboardUnavailable": "Clipboard not available.",
     "copied": "Copied",
     "copyFailed": "Copy failed",
-    "empty": "Empty"
+    "empty": "Empty",
+    "save": "Save",
+    "saving": "Saving...",
+    "reset": "Reset",
+    "reload": "Reload",
+    "discard": "Discard",
+    "add": "Add",
+    "visibilityToggle": "Toggle visibility",
+    "requestFailed": "Request failed ({status})",
+    "unauthorized": "Unauthorized",
+    "fileTypeUnknown": "Unknown",
+    "durationUnits": {
+      "day": "d",
+      "hour": "h",
+      "minute": "m",
+      "second": "s"
+    },
+    "fileSizeUnits": {
+      "b": "B",
+      "kb": "KB",
+      "mb": "MB",
+      "gb": "GB"
+    }
   },
   "overview": {
     "title": "Overview",
@@ -90,7 +118,8 @@
     "attachmentAlt": "Attachment",
     "inputPlaceholder": "Type a message...",
     "send": "Send",
-    "sending": "Sending..."
+    "sending": "Sending...",
+    "documentFallback": "DOC"
   },
   "channels": {
     "title": "Channels",
@@ -129,6 +158,30 @@
     "copyJson": "Copy JSON",
     "loading": "Loading config...",
     "loadFailed": "Failed to load config.",
+    "description": "Schema-driven editor with defaults, search, and config file management.",
+    "advancedMode": "Advanced mode",
+    "mergedJsonTitle": "Merged JSON",
+    "mergedJsonDescription": "Direct editor for the merged runtime config payload.",
+    "configFilesTitle": "Config Files",
+    "configFilesDescription": "`config.toml` and `config.d/*.toml` are editable independently.",
+    "sourceMain": "config.toml",
+    "sourceDirectory": "config.d",
+    "searchPlaceholder": "Search by field name or description",
+    "noMatchingFields": "No matching fields.",
+    "noMatchingItems": "No matching config items.",
+    "toggleVisibility": "Toggle visibility",
+    "modified": "Modified",
+    "unsaved": "Unsaved",
+    "currentValue": "Current",
+    "defaultValue": "Default",
+    "noDefault": "No default",
+    "addListItem": "Add item",
+    "saveJson": "Save JSON",
+    "saveFile": "Save file",
+    "saveConfig": "Save config",
+    "discard": "Discard",
+    "unsavedChangesCount": "{count} unsaved change(s)",
+    "saveHint": "Save writes only changed keys back to the config API.",
     "section": {
       "general": "General",
       "gateway": "Gateway",
@@ -191,7 +244,17 @@
     "timeoutInvalid": "Timeout must be at least 1000 ms.",
     "saveFailed": "Failed to save hook.",
     "deleteFailed": "Failed to delete hook.",
-    "toggleFailed": "Failed to update hook state."
+    "toggleFailed": "Failed to update hook state.",
+    "events": {
+      "agent_start": "Agent start",
+      "agent_end": "Agent end",
+      "llm_request": "LLM request",
+      "llm_response": "LLM response",
+      "tool_call_start": "Tool call start",
+      "tool_call": "Tool call",
+      "turn_complete": "Turn complete",
+      "error": "Error"
+    }
   },
   "mcp": {
     "title": "MCP Servers",
@@ -233,7 +296,10 @@
     "installSuccess": "Skill installed successfully",
     "installFailed": "Failed to install skill",
     "uninstallSuccess": "Skill uninstalled",
-    "uninstallFailed": "Failed to uninstall skill"
+    "uninstallFailed": "Failed to uninstall skill",
+    "sources": {
+      "github": "GitHub"
+    }
   },
   "plugins": {
     "title": "Plugins",

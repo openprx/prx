@@ -77,23 +77,23 @@
 
   function formatFileSize(size) {
     if (!Number.isFinite(size) || size <= 0) {
-      return '0 B';
+      return `0 ${t('common.fileSizeUnits.b')}`;
     }
-    const units = ['B', 'KB', 'MB', 'GB'];
+    const units = ['b', 'kb', 'mb', 'gb'];
     let value = size;
     let index = 0;
     while (value >= 1024 && index < units.length - 1) {
       value /= 1024;
       index += 1;
     }
-    return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+    return `${value.toFixed(index === 0 ? 0 : 1)} ${t(`common.fileSizeUnits.${units[index]}`)}`;
   }
 
   function sanitizeFileType(type) {
     if (typeof type === 'string' && type.trim().length > 0) {
       return type;
     }
-    return 'unknown';
+    return t('common.fileTypeUnknown');
   }
 
   function createSelectedFileRecord(file) {
@@ -533,7 +533,7 @@
                   <div
                     class="flex h-12 w-12 items-center justify-center rounded border border-gray-300 bg-gray-100 text-lg text-gray-700 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
                   >
-                    DOC
+                    {t('chat.documentFallback')}
                   </div>
                 {/if}
                 <div class="min-w-0 flex-1">

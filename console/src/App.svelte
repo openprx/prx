@@ -4,7 +4,14 @@
   import { buildConfigNavGroups, focusConfigSection } from './lib/config-nav';
   import { configStore, loadConfigStore } from './lib/config-store.svelte.js';
   import { NAV_ITEMS } from './lib/constants';
-  import { LANG_STORAGE_KEY, i18n, syncLanguageFromStorage, t, toggleLanguage } from './lib/i18n';
+  import {
+    LANG_STORAGE_KEY,
+    SUPPORTED_LANGUAGES,
+    i18n,
+    setLanguage,
+    syncLanguageFromStorage,
+    t
+  } from './lib/i18n';
   import { currentPath, initRouter, navigate } from './lib/router';
   import { Sun, Moon } from '@lucide/svelte';
 
@@ -34,6 +41,12 @@
   const activePath = $derived(isAuthenticated && path === '/' ? '/overview' : path);
   const activeNavPath = $derived(activePath.startsWith('/chat/') ? '/sessions' : activePath);
   const showConfigSubnav = $derived(activePath === '/config');
+  const languageOptions = $derived(
+    SUPPORTED_LANGUAGES.map((lang) => ({
+      value: lang,
+      label: t(`languages.${lang}`)
+    }))
+  );
   const activeConfigSection = $derived(
     activeConfigHash.startsWith('#config-section-')
       ? activeConfigHash.slice('#config-section-'.length)
@@ -267,7 +280,7 @@
           <div class="flex items-center gap-2">
             <button
               type="button"
-              aria-label="Toggle theme"
+              aria-label={t('app.theme')}
               onclick={toggleTheme}
               class="rounded-lg border border-gray-300 bg-white p-2 text-gray-600 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
             >
@@ -277,14 +290,18 @@
                 <Moon size={16} />
               {/if}
             </button>
-            <button
-              type="button"
+            <label class="sr-only" for="app-language-select">{t('app.language')}</label>
+            <select
+              id="app-language-select"
+              bind:value={i18n.lang}
               aria-label={t('app.language')}
-              onclick={toggleLanguage}
+              onchange={(event) => setLanguage(event.currentTarget.value)}
               class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
             >
-              {t('app.languageToggle')}
-            </button>
+              {#each languageOptions as option}
+                <option value={option.value}>{option.label}</option>
+              {/each}
+            </select>
             <button
               type="button"
               onclick={logout}
