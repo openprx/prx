@@ -191,14 +191,14 @@
 
   $effect(() => {
     if (showConfigSubnav) {
-      if (configStore.data) {
+      if (!configStore.data) {
+        loadConfigNavGroups();
+      } else {
         configNavGroups = buildConfigNavGroups(configStore.data);
       }
-      loadConfigNavGroups();
-      return;
+    } else {
+      configNavGroups = [];
     }
-
-    configNavGroups = [];
   });
 
   $effect(() => {
