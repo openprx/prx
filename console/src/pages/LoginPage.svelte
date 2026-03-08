@@ -1,11 +1,17 @@
 <script>
   import { setToken } from '../lib/auth';
-  import { i18n, t, toggleLanguage } from '../lib/i18n';
+  import { SUPPORTED_LANGUAGES, i18n, setLanguage, t } from '../lib/i18n';
 
   let { onLogin } = $props();
 
   let tokenInput = $state('');
   let errorMessage = $state('');
+  const languageOptions = $derived(
+    SUPPORTED_LANGUAGES.map((lang) => ({
+      value: lang,
+      label: t(`languages.${lang}`)
+    }))
+  );
 
   function submit(event) {
     event.preventDefault();
@@ -26,14 +32,18 @@
   <div class="w-full max-w-md rounded-xl border border-gray-200 bg-white p-6 shadow-xl shadow-black/10 dark:border-gray-700 dark:bg-gray-800 dark:shadow-black/30">
     <div class="flex items-center justify-between gap-3">
       <h1 class="text-2xl font-semibold tracking-tight">{t('login.title')}</h1>
-      <button
-        type="button"
+      <label class="sr-only" for="login-language-select">{t('app.language')}</label>
+      <select
+        id="login-language-select"
+        bind:value={i18n.lang}
         aria-label={t('app.language')}
-        onclick={toggleLanguage}
+        onchange={(event) => setLanguage(event.currentTarget.value)}
         class="rounded-lg border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-700"
       >
-        {t('app.languageToggle')}
-      </button>
+        {#each languageOptions as option}
+          <option value={option.value}>{option.label}</option>
+        {/each}
+      </select>
     </div>
     <p class="mt-2 text-sm text-gray-500 dark:text-gray-400">{t('login.hint')}</p>
 

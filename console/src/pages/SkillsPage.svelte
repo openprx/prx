@@ -240,7 +240,7 @@
         bind:value={discoverSource}
         class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200"
       >
-        <option value="github">GitHub</option>
+        <option value="github">{t('skills.sources.github')}</option>
       </select>
       <input
         type="text"

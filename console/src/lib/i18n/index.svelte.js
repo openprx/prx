@@ -1,10 +1,13 @@
 import en from './en.json';
+import ka from './ka.json';
+import ru from './ru.json';
 import zh from './zh.json';
 
 export const LANG_STORAGE_KEY = 'prx-console-lang';
+export const SUPPORTED_LANGUAGES = ['en', 'zh', 'ka', 'ru'];
 
 const FALLBACK_LANG = 'en';
-const dictionaries = { en, zh };
+const dictionaries = { en, zh, ka, ru };
 
 function normalizeLanguage(value) {
   if (typeof value !== 'string' || value.trim().length === 0) {
@@ -14,6 +17,16 @@ function normalizeLanguage(value) {
   const normalized = value.trim().toLowerCase();
   if (normalized.startsWith('zh')) {
     return 'zh';
+  }
+  if (normalized.startsWith('ka')) {
+    return 'ka';
+  }
+  if (normalized.startsWith('ru')) {
+    return 'ru';
+  }
+
+  if (SUPPORTED_LANGUAGES.includes(normalized)) {
+    return normalized;
   }
 
   return 'en';
@@ -47,7 +60,8 @@ function resolvePathValue(dictionary, key) {
 
 function applyDocumentLanguage(lang) {
   if (typeof document !== 'undefined') {
-    document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+    document.documentElement.lang =
+      lang === 'zh' ? 'zh-CN' : lang === 'ka' ? 'ka-GE' : lang === 'ru' ? 'ru-RU' : 'en';
   }
 }
 
@@ -75,7 +89,9 @@ export function setLanguage(nextLanguage) {
 }
 
 export function toggleLanguage() {
-  setLanguage(i18n.lang === 'en' ? 'zh' : 'en');
+  const currentIndex = SUPPORTED_LANGUAGES.indexOf(i18n.lang);
+  const nextIndex = currentIndex >= 0 ? (currentIndex + 1) % SUPPORTED_LANGUAGES.length : 0;
+  setLanguage(SUPPORTED_LANGUAGES[nextIndex]);
 }
 
 export function syncLanguageFromStorage() {

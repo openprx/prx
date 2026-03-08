@@ -1,4 +1,5 @@
 import { clearToken, getToken } from './auth';
+import { t } from './i18n';
 import { navigate } from './router';
 
 const configuredUrl = (import.meta.env.VITE_API_URL ?? '').trim();
@@ -26,7 +27,7 @@ function resolveErrorMessage(body, status) {
     return body.error;
   }
 
-  return `Request failed (${status})`;
+  return t('common.requestFailed', { status });
 }
 
 async function request(path, init = {}) {
@@ -55,7 +56,7 @@ async function request(path, init = {}) {
   if (response.status === 401) {
     clearToken();
     navigate('/', true);
-    throw new ApiError(401, 'Unauthorized');
+    throw new ApiError(401, t('common.unauthorized'));
   }
 
   if (!response.ok) {

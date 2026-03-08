@@ -1,4 +1,5 @@
 import { api } from './api';
+import { t } from './i18n';
 
 export const configStore = $state({
   data: null,
@@ -38,7 +39,7 @@ export async function loadConfigStore({ force = false } = {}) {
       configStore.loaded = true;
       return configStore.data;
     } catch (error) {
-      configStore.errorMessage = error instanceof Error ? error.message : 'Failed to load config';
+      configStore.errorMessage = error instanceof Error ? error.message : t('config.loadFailed');
       throw error;
     } finally {
       configStore.loading = false;
