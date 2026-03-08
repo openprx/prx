@@ -1,3 +1,4 @@
+use crate::auth::codex_auth::default_codex_auth_json_path;
 use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
@@ -172,6 +173,10 @@ pub struct Config {
     /// Secrets encryption configuration (`[secrets]`).
     #[serde(default)]
     pub mcp: McpConfig,
+
+    /// Auth profile and external credential import settings (`[auth]`).
+    #[serde(default)]
+    pub auth: AuthConfig,
 
     #[serde(default)]
     pub secrets: SecretsConfig,
@@ -1402,6 +1407,26 @@ pub struct SecretsConfig {
 impl Default for SecretsConfig {
     fn default() -> Self {
         Self { encrypt: true }
+    }
+}
+
+/// Authentication and external credential import configuration (`[auth]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AuthConfig {
+    /// Automatically import `openai-codex` OAuth credentials from Codex CLI auth.json.
+    #[serde(default = "default_true")]
+    pub codex_auth_json_auto_import: bool,
+    /// Source path for Codex CLI auth.json import.
+    #[serde(default = "default_codex_auth_json_path")]
+    pub codex_auth_json_path: PathBuf,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            codex_auth_json_auto_import: true,
+            codex_auth_json_path: default_codex_auth_json_path(),
+        }
     }
 }
 
@@ -3894,6 +3919,7 @@ impl Default for Config {
             webhook: MemoryWebhookConfig::default(),
             composio: ComposioConfig::default(),
             mcp: McpConfig::default(),
+            auth: AuthConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -5024,6 +5050,7 @@ default_temperature = 0.7
             sessions_spawn: SessionsSpawnConfig::default(),
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
+            skill_rag: SkillRagConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -5070,6 +5097,7 @@ default_temperature = 0.7
             webhook: MemoryWebhookConfig::default(),
             composio: ComposioConfig::default(),
             mcp: McpConfig::default(),
+            auth: AuthConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -5277,6 +5305,7 @@ tool_dispatcher = "xml"
             sessions_spawn: SessionsSpawnConfig::default(),
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
+            skill_rag: SkillRagConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -5292,6 +5321,7 @@ tool_dispatcher = "xml"
             webhook: MemoryWebhookConfig::default(),
             composio: ComposioConfig::default(),
             mcp: McpConfig::default(),
+            auth: AuthConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -6162,9 +6192,32 @@ default_temperature = 0.7
     }
 
     #[test]
+    async fn auth_config_defaults_enable_codex_import() {
+        let auth = AuthConfig::default();
+        assert!(auth.codex_auth_json_auto_import);
+        assert!(!auth.codex_auth_json_path.as_os_str().is_empty());
+    }
+
+    #[test]
+    async fn auth_config_serde_roundtrip() {
+        let auth = AuthConfig {
+            codex_auth_json_auto_import: false,
+            codex_auth_json_path: PathBuf::from("/tmp/custom-auth.json"),
+        };
+        let toml_str = toml::to_string(&auth).unwrap();
+        let parsed: AuthConfig = toml::from_str(&toml_str).unwrap();
+        assert!(!parsed.codex_auth_json_auto_import);
+        assert_eq!(
+            parsed.codex_auth_json_path,
+            PathBuf::from("/tmp/custom-auth.json")
+        );
+    }
+
+    #[test]
     async fn config_default_has_composio_and_secrets() {
         let c = Config::default();
         assert!(!c.composio.enabled);
+        assert!(c.auth.codex_auth_json_auto_import);
         assert!(c.composio.api_key.is_none());
         assert!(c.secrets.encrypt);
         assert!(!c.browser.enabled);

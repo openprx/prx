@@ -451,6 +451,8 @@ pub fn all_tools_with_runtime_ext(
                     .parent()
                     .map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
+                codex_auth_json_path: Some(root_config.auth.codex_auth_json_path.clone()),
+                codex_auth_json_auto_import: root_config.auth.codex_auth_json_auto_import,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
             },
         )

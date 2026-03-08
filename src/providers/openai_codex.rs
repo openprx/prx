@@ -82,7 +82,12 @@ impl OpenAiCodexProvider {
             .openprx_dir
             .clone()
             .unwrap_or_else(default_openprx_dir);
-        let auth = AuthService::new(&state_dir, options.secrets_encrypt);
+        let auth = AuthService::new_with_codex_import(
+            &state_dir,
+            options.secrets_encrypt,
+            options.codex_auth_json_path.clone(),
+            options.codex_auth_json_auto_import,
+        );
 
         Self {
             auth,
@@ -391,9 +396,6 @@ impl OpenAiCodexProvider {
         instructions: String,
         model: &str,
     ) -> anyhow::Result<String> {
-        let profile = self
-            .auth
-            .get_profile("openai-codex", self.auth_profile_override.as_deref())?;
         let access_token = self
             .auth
             .get_valid_openai_access_token(self.auth_profile_override.as_deref())
@@ -403,6 +405,9 @@ impl OpenAiCodexProvider {
                     "OpenAI Codex auth profile not found. Run `openprx auth login --provider openai-codex`."
                 )
             })?;
+        let profile = self
+            .auth
+            .get_profile("openai-codex", self.auth_profile_override.as_deref())?;
         let account_id = profile
             .and_then(|profile| profile.account_id)
             .or_else(|| extract_account_id_from_jwt(&access_token))
