@@ -1,0 +1,1 @@
+import"../chunks/DfZ_O-Cd.js";import"../chunks/BeaXuNgR.js";import{P as r}from"../chunks/mmL7kjF6.js";import{C as t}from"../chunks/DOSFIO90.js";function p(o){r(o,{title:"Cron Jobs",get icon(){return t}})}export{p as component};
