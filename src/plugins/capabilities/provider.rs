@@ -63,9 +63,9 @@ impl WasmProvider {
         }
 
         let mut store = wasmtime::Store::new(engine, host_state);
-        store.set_fuel(manifest.resources.max_fuel).map_err(|e| {
-            PluginError::Instantiation(format!("failed to set fuel: {e}"))
-        })?;
+        store
+            .set_fuel(manifest.resources.max_fuel)
+            .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
 
         let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
         Self::register_host_functions(&mut linker)?;
@@ -136,9 +136,7 @@ impl WasmProvider {
 
         let name_fn = instance
             .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| {
-                PluginError::Instantiation("name is not a function".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Instantiation("name is not a function".to_string()))?;
 
         let mut results = vec![wasmtime::component::Val::Bool(false)];
         name_fn
@@ -288,10 +286,8 @@ impl WasmProvider {
             .find(|(k, _)| k == "tool-calls")
             .and_then(|(_, v)| match v {
                 wasmtime::component::Val::List(items) => {
-                    let calls: Vec<ToolCall> = items
-                        .iter()
-                        .filter_map(Self::parse_tool_call)
-                        .collect();
+                    let calls: Vec<ToolCall> =
+                        items.iter().filter_map(Self::parse_tool_call).collect();
                     Some(calls)
                 }
                 _ => None,
@@ -420,7 +416,8 @@ mod tests {
             ("name".to_string(), str_val("my_tool")),
             // id and arguments intentionally omitted — defaults to ""
         ]);
-        let tc = WasmProvider::parse_tool_call(&record).expect("should parse with default empty strings");
+        let tc = WasmProvider::parse_tool_call(&record)
+            .expect("should parse with default empty strings");
         assert_eq!(tc.name, "my_tool");
         assert_eq!(tc.id, "");
         assert_eq!(tc.arguments, "");
@@ -491,7 +488,10 @@ mod tests {
             ("arguments".to_string(), str_val("{}")),
         ]);
         let record = Val::Record(vec![
-            ("text".to_string(), Val::Option(Some(Box::new(str_val("also text"))))),
+            (
+                "text".to_string(),
+                Val::Option(Some(Box::new(str_val("also text")))),
+            ),
             ("tool-calls".to_string(), Val::List(vec![tc1, tc2])),
         ]);
         let resp = WasmProvider::parse_chat_response(&record).expect("should parse");
@@ -510,9 +510,10 @@ mod tests {
     #[test]
     fn parse_chat_response_missing_optional_fields() {
         // Only 'text' field — tool-calls field absent → defaults to empty vec
-        let record = Val::Record(vec![
-            ("text".to_string(), Val::Option(Some(Box::new(str_val("hi"))))),
-        ]);
+        let record = Val::Record(vec![(
+            "text".to_string(),
+            Val::Option(Some(Box::new(str_val("hi")))),
+        )]);
         let resp = WasmProvider::parse_chat_response(&record).expect("should parse gracefully");
         assert_eq!(resp.text, Some("hi".to_string()));
         assert!(resp.tool_calls.is_empty());

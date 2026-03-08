@@ -62,6 +62,8 @@ pub mod nodes;
 pub mod observability;
 pub(crate) mod onboard;
 pub mod peripherals;
+#[cfg(feature = "wasm-plugins")]
+pub mod plugins;
 pub mod providers;
 pub mod rag;
 pub mod runtime;
@@ -71,8 +73,6 @@ pub(crate) mod service;
 pub mod session_worker;
 pub(crate) mod skillforge;
 pub(crate) mod skills;
-#[cfg(feature = "wasm-plugins")]
-pub mod plugins;
 pub mod tools;
 pub(crate) mod tunnel;
 pub(crate) mod util;

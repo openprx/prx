@@ -188,7 +188,11 @@ mod tests {
         HostState::new(
             "test-plugin".to_string(),
             config,
-            HashSet::from(["log".to_string(), "kv".to_string(), "http-outbound".to_string()]),
+            HashSet::from([
+                "log".to_string(),
+                "kv".to_string(),
+                "http-outbound".to_string(),
+            ]),
             HashSet::from(["llm".to_string()]),
             vec!["https://api.example.com/*".to_string()],
             30_000,

@@ -60,9 +60,9 @@ impl WasmStorage {
         }
 
         let mut store = wasmtime::Store::new(engine, host_state);
-        store.set_fuel(manifest.resources.max_fuel).map_err(|e| {
-            PluginError::Instantiation(format!("failed to set fuel: {e}"))
-        })?;
+        store
+            .set_fuel(manifest.resources.max_fuel)
+            .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
 
         let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
         Self::register_host_functions(&mut linker)?;
@@ -133,9 +133,7 @@ impl WasmStorage {
 
         let name_fn = instance
             .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| {
-                PluginError::Instantiation("name is not a function".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Instantiation("name is not a function".to_string()))?;
 
         let mut results = vec![wasmtime::component::Val::Bool(false)];
         name_fn
@@ -215,9 +213,7 @@ impl WasmStorage {
         store_fn
             .post_return_async(store.as_context_mut())
             .await
-            .map_err(|e| {
-                PluginError::Runtime(format!("store-memory() post_return failed: {e}"))
-            })?;
+            .map_err(|e| PluginError::Runtime(format!("store-memory() post_return failed: {e}")))?;
 
         // Parse result<_, string>
         match &results[0] {
@@ -518,9 +514,7 @@ impl WasmStorage {
         health_fn
             .post_return_async(store.as_context_mut())
             .await
-            .map_err(|e| {
-                PluginError::Runtime(format!("health-check() post_return failed: {e}"))
-            })?;
+            .map_err(|e| PluginError::Runtime(format!("health-check() post_return failed: {e}")))?;
 
         match &results[0] {
             wasmtime::component::Val::Bool(b) => Ok(*b),
@@ -800,7 +794,14 @@ mod tests {
 
     #[test]
     fn parse_memory_entry_core_category() {
-        let record = memory_entry_record("id-1", "my-key", "my content", "core", "2024-01-01T00:00:00Z", None);
+        let record = memory_entry_record(
+            "id-1",
+            "my-key",
+            "my content",
+            "core",
+            "2024-01-01T00:00:00Z",
+            None,
+        );
         let entry = WasmStorage::parse_memory_entry(&record).expect("should parse core entry");
         assert_eq!(entry.id, "id-1");
         assert_eq!(entry.key, "my-key");
@@ -829,7 +830,10 @@ mod tests {
     fn parse_memory_entry_custom_category() {
         let record = memory_entry_record("id-4", "k", "c", "my-custom-backend", "t", None);
         let entry = WasmStorage::parse_memory_entry(&record).expect("should parse");
-        assert_eq!(entry.category, MemoryCategory::Custom("my-custom-backend".to_string()));
+        assert_eq!(
+            entry.category,
+            MemoryCategory::Custom("my-custom-backend".to_string())
+        );
     }
 
     #[test]
@@ -855,9 +859,7 @@ mod tests {
     #[test]
     fn parse_memory_entry_missing_fields_defaults_to_empty() {
         // Partial record — missing fields default to empty string via get_str
-        let record = Val::Record(vec![
-            ("id".to_string(), str_val("only-id")),
-        ]);
+        let record = Val::Record(vec![("id".to_string(), str_val("only-id"))]);
         let entry = WasmStorage::parse_memory_entry(&record).expect("should parse partial record");
         assert_eq!(entry.id, "only-id");
         assert_eq!(entry.key, "");

@@ -10,10 +10,7 @@ use serde_json::Value;
 const REDACTION_MASK: &str = "***";
 
 /// POST /api/config — merge partial JSON into current config, save to disk.
-pub async fn post_config(
-    State(state): State<AppState>,
-    Json(incoming): Json<Value>,
-) -> Response {
+pub async fn post_config(State(state): State<AppState>, Json(incoming): Json<Value>) -> Response {
     if !incoming.is_object() {
         return (
             StatusCode::BAD_REQUEST,
@@ -90,9 +87,7 @@ fn merge_json(target: &mut Value, source: &Value) {
                 if source_val.as_str() == Some(REDACTION_MASK) {
                     continue;
                 }
-                let entry = target_map
-                    .entry(key.clone())
-                    .or_insert(Value::Null);
+                let entry = target_map.entry(key.clone()).or_insert(Value::Null);
                 merge_json(entry, source_val);
             }
         }

@@ -73,9 +73,9 @@ impl WasmMiddleware {
         }
 
         let mut store = wasmtime::Store::new(engine, host_state);
-        store.set_fuel(manifest.resources.max_fuel).map_err(|e| {
-            PluginError::Instantiation(format!("failed to set fuel: {e}"))
-        })?;
+        store
+            .set_fuel(manifest.resources.max_fuel)
+            .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
 
         let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
         Self::register_host_functions(&mut linker)?;
@@ -121,9 +121,7 @@ impl WasmMiddleware {
 
         let func = instance
             .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| {
-                PluginError::Runtime("process is not a function".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Runtime("process is not a function".to_string()))?;
 
         // Call with (stage, data_json) -> result<string, string>
         let stage_str = stage.as_str();
@@ -155,12 +153,9 @@ impl WasmMiddleware {
                             _ => Ok(data_json.to_string()),
                         },
                         Err(Some(b)) => match b.as_ref() {
-                            wasmtime::component::Val::String(e) => {
-                                Err(PluginError::Runtime(format!(
-                                    "middleware '{}' returned error: {e}",
-                                    self.plugin_name
-                                )))
-                            }
+                            wasmtime::component::Val::String(e) => Err(PluginError::Runtime(
+                                format!("middleware '{}' returned error: {e}", self.plugin_name),
+                            )),
                             _ => Ok(data_json.to_string()),
                         },
                         _ => Ok(data_json.to_string()),

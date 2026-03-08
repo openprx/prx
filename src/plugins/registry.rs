@@ -171,7 +171,7 @@ impl PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::manifest::{PluginManifest, PluginMeta, Permissions, Resources};
+    use crate::plugins::manifest::{Permissions, PluginManifest, PluginMeta, Resources};
 
     fn test_manifest(name: &str) -> PluginManifest {
         PluginManifest {
@@ -225,7 +225,10 @@ mod tests {
     async fn get_component_returns_none_for_unregistered() {
         let registry = PluginRegistry::new();
         let component = registry.get_component("not-registered").await;
-        assert!(component.is_none(), "unregistered plugin should have no component");
+        assert!(
+            component.is_none(),
+            "unregistered plugin should have no component"
+        );
     }
 
     #[tokio::test]
@@ -235,7 +238,10 @@ mod tests {
         let plugin = LoadedPlugin::new(test_manifest("no-wasm"), "/tmp".into(), None);
         registry.register(plugin).await.unwrap();
         let component = registry.get_component("no-wasm").await;
-        assert!(component.is_none(), "plugin loaded without component should return None");
+        assert!(
+            component.is_none(),
+            "plugin loaded without component should return None"
+        );
     }
 
     #[tokio::test]
@@ -255,7 +261,10 @@ mod tests {
         let plugin = LoadedPlugin::new(manifest, "/opt/plugins/info-test".into(), None);
         registry.register(plugin).await.unwrap();
 
-        let info = registry.get_info("info-test").await.expect("should find plugin");
+        let info = registry
+            .get_info("info-test")
+            .await
+            .expect("should find plugin");
         assert_eq!(info.name, "info-test");
         assert_eq!(info.version, "0.1.0");
         assert_eq!(info.description, "A test plugin");
@@ -315,16 +324,14 @@ mod tests {
     async fn loaded_plugin_info_reflects_capabilities() {
         let registry = PluginRegistry::new();
         let mut manifest = test_manifest("cap-plugin");
-        manifest.capabilities = vec![
-            crate::plugins::manifest::Capability {
-                capability_type: "tool".to_string(),
-                name: "my_tool".to_string(),
-                description: "A tool".to_string(),
-                priority: 100,
-                events: vec![],
-                schedule: None,
-            },
-        ];
+        manifest.capabilities = vec![crate::plugins::manifest::Capability {
+            capability_type: "tool".to_string(),
+            name: "my_tool".to_string(),
+            description: "A tool".to_string(),
+            priority: 100,
+            events: vec![],
+            schedule: None,
+        }];
         let plugin = LoadedPlugin::new(manifest, "/tmp".into(), None);
         registry.register(plugin).await.unwrap();
 

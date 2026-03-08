@@ -33,8 +33,6 @@ struct WasmToolInner {
     instance: wasmtime::component::Instance,
 }
 
-
-
 impl WasmToolAdapter {
     /// Create a new WasmToolAdapter by instantiating the WASM component.
     ///
@@ -79,9 +77,9 @@ impl WasmToolAdapter {
 
         // Create store with fuel limit
         let mut store = wasmtime::Store::new(engine, host_state);
-        store.set_fuel(manifest.resources.max_fuel).map_err(|e| {
-            PluginError::Instantiation(format!("failed to set fuel: {e}"))
-        })?;
+        store
+            .set_fuel(manifest.resources.max_fuel)
+            .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
 
         // Create linker and register host functions
         let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
@@ -251,9 +249,7 @@ impl WasmToolAdapter {
                                     })
                                     .collect();
                                 match resp.bytes().await {
-                                    Ok(bytes) => {
-                                        Ok((Ok((status, resp_headers, bytes.to_vec())),))
-                                    }
+                                    Ok(bytes) => Ok((Ok((status, resp_headers, bytes.to_vec())),)),
                                     Err(e) => Ok((Err(format!("body read error: {e}")),)),
                                 }
                             }
@@ -292,7 +288,9 @@ impl WasmToolAdapter {
                             "core" => crate::memory::traits::MemoryCategory::Core,
                             "daily" => crate::memory::traits::MemoryCategory::Daily,
                             "conversation" => crate::memory::traits::MemoryCategory::Conversation,
-                            other => crate::memory::traits::MemoryCategory::Custom(other.to_string()),
+                            other => {
+                                crate::memory::traits::MemoryCategory::Custom(other.to_string())
+                            }
                         };
                         match mem.store(&key, &text, cat, None).await {
                             Ok(()) => Ok((Ok::<String, String>(key),)),
@@ -306,8 +304,7 @@ impl WasmToolAdapter {
         mem_inst
             .func_wrap_async(
                 "recall",
-                |store: wasmtime::StoreContextMut<'_, HostState>,
-                 (query, limit): (String, u32)| {
+                |store: wasmtime::StoreContextMut<'_, HostState>, (query, limit): (String, u32)| {
                     Box::new(async move {
                         if let Err(e) = store.data().check_permission("memory") {
                             return Ok((Err::<Vec<(String, String, String, f64)>, String>(e),));
@@ -324,7 +321,14 @@ impl WasmToolAdapter {
                             Ok(entries) => {
                                 let results: Vec<(String, String, String, f64)> = entries
                                     .into_iter()
-                                    .map(|e| (e.id, e.content, e.category.to_string(), e.score.unwrap_or(0.0)))
+                                    .map(|e| {
+                                        (
+                                            e.id,
+                                            e.content,
+                                            e.category.to_string(),
+                                            e.score.unwrap_or(0.0),
+                                        )
+                                    })
                                     .collect();
                                 Ok((Ok(results),))
                             }
@@ -351,7 +355,11 @@ impl WasmToolAdapter {
     ) -> Result<ToolSpec, PluginError> {
         // Navigate to the exported interface: prx:plugin/tool-exports@0.1.0
         let iface_idx = instance
-            .get_export(store.as_context_mut(), None, "prx:plugin/tool-exports@0.1.0")
+            .get_export(
+                store.as_context_mut(),
+                None,
+                "prx:plugin/tool-exports@0.1.0",
+            )
             .ok_or_else(|| {
                 PluginError::Instantiation(
                     "plugin does not export prx:plugin/tool-exports@0.1.0".to_string(),
@@ -367,9 +375,7 @@ impl WasmToolAdapter {
 
         let get_spec_fn = instance
             .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| {
-                PluginError::Instantiation("get-spec is not a function".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Instantiation("get-spec is not a function".to_string()))?;
 
         // Call it using the untyped Func::call_async API for maximum compatibility
         let mut results = vec![wasmtime::component::Val::Bool(false); 3];
@@ -422,10 +428,8 @@ impl WasmToolAdapter {
             .await
             .map_err(|e| PluginError::Runtime(format!("get-spec post_return failed: {e}")))?;
 
-        let parameters: serde_json::Value =
-            serde_json::from_str(&params_schema).unwrap_or_else(|_| {
-                serde_json::json!({"type": "object", "properties": {}})
-            });
+        let parameters: serde_json::Value = serde_json::from_str(&params_schema)
+            .unwrap_or_else(|_| serde_json::json!({"type": "object", "properties": {}}));
 
         Ok(ToolSpec {
             name: name.to_string(),
@@ -468,10 +472,7 @@ impl Tool for WasmToolAdapter {
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "WASM plugin timed out after {}ms",
-                    self.timeout_ms
-                )),
+                error: Some(format!("WASM plugin timed out after {}ms", self.timeout_ms)),
             }),
         }
     }
@@ -487,7 +488,11 @@ impl WasmToolAdapter {
 
         // Navigate to execute function — reborrow store for each step
         let iface_idx = instance
-            .get_export(store.as_context_mut(), None, "prx:plugin/tool-exports@0.1.0")
+            .get_export(
+                store.as_context_mut(),
+                None,
+                "prx:plugin/tool-exports@0.1.0",
+            )
             .ok_or_else(|| {
                 PluginError::Runtime(
                     "plugin does not export prx:plugin/tool-exports@0.1.0".to_string(),
@@ -496,9 +501,7 @@ impl WasmToolAdapter {
 
         let func_idx = instance
             .get_export(store.as_context_mut(), Some(&iface_idx), "execute")
-            .ok_or_else(|| {
-                PluginError::Runtime("execute not found in tool-exports".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Runtime("execute not found in tool-exports".to_string()))?;
 
         let execute_fn = instance
             .get_func(store.as_context_mut(), &func_idx)
@@ -536,9 +539,7 @@ impl WasmToolAdapter {
                     .find(|(k, _)| k == "error")
                     .and_then(|(_, v)| match v {
                         wasmtime::component::Val::Option(opt) => match opt.as_deref() {
-                            Some(wasmtime::component::Val::String(s)) => {
-                                Some(Some(s.to_string()))
-                            }
+                            Some(wasmtime::component::Val::String(s)) => Some(Some(s.to_string())),
                             _ => Some(None),
                         },
                         _ => None,

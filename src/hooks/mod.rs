@@ -101,9 +101,7 @@ pub struct HookManager {
     >,
     /// Optional event bus for bridging lifecycle events to inter-plugin messaging.
     #[cfg(feature = "wasm-plugins")]
-    event_bus: tokio::sync::RwLock<
-        Option<std::sync::Arc<crate::plugins::event_bus::EventBus>>,
-    >,
+    event_bus: tokio::sync::RwLock<Option<std::sync::Arc<crate::plugins::event_bus::EventBus>>>,
 }
 
 impl HookManager {
@@ -130,10 +128,7 @@ impl HookManager {
 
     /// Set the event bus to bridge lifecycle events into inter-plugin topics.
     #[cfg(feature = "wasm-plugins")]
-    pub async fn set_event_bus(
-        &self,
-        bus: std::sync::Arc<crate::plugins::event_bus::EventBus>,
-    ) {
+    pub async fn set_event_bus(&self, bus: std::sync::Arc<crate::plugins::event_bus::EventBus>) {
         *self.event_bus.write().await = Some(bus);
     }
 
@@ -157,9 +152,7 @@ impl HookManager {
 
             if enabled && !actions.is_empty() {
                 for action in actions {
-                    if let Err(err) =
-                        self.run_action(event, &payload, timeout_ms, &action).await
-                    {
+                    if let Err(err) = self.run_action(event, &payload, timeout_ms, &action).await {
                         tracing::warn!(
                             event = event.as_str(),
                             command = action.command,

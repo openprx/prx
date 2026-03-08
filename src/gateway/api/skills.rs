@@ -22,8 +22,7 @@ pub(super) struct SkillsResponse {
 
 pub async fn get_skills(State(state): State<AppState>) -> Json<SkillsResponse> {
     let config = state.config.lock().clone();
-    let skills =
-        crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
     let items: Vec<SkillInfo> = skills
         .into_iter()
@@ -174,7 +173,9 @@ pub async fn install_skill(
     }
 
     // Validate URL
-    if !req.url.starts_with("https://github.com/") && !req.url.starts_with("https://huggingface.co/") {
+    if !req.url.starts_with("https://github.com/")
+        && !req.url.starts_with("https://huggingface.co/")
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Only GitHub and HuggingFace URLs are supported"})),
@@ -203,7 +204,13 @@ pub async fn install_skill(
 
     // Git clone
     let output = tokio::process::Command::new("git")
-        .args(["clone", "--depth", "1", &req.url, &target_dir.display().to_string()])
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            &req.url,
+            &target_dir.display().to_string(),
+        ])
         .output()
         .await;
 
@@ -226,7 +233,11 @@ pub async fn install_skill(
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            warn!(name = req.name.as_str(), stderr = stderr.as_str(), "git clone failed");
+            warn!(
+                name = req.name.as_str(),
+                stderr = stderr.as_str(),
+                "git clone failed"
+            );
             // Clean up partial clone
             let _ = std::fs::remove_dir_all(&target_dir);
             Err((

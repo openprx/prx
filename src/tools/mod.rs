@@ -320,18 +320,18 @@ pub fn all_tools_with_runtime_ext(
         )),
     ];
 
-    let mcp_tool_ref: Option<Arc<McpTool>> =
-        if config.mcp.enabled && !config.mcp.servers.is_empty() {
-            let mcp = Arc::new(McpTool::new(
-                security.clone(),
-                config.mcp.clone(),
-                workspace_dir.to_path_buf(),
-            ));
-            tool_arcs.push(mcp.clone());
-            Some(mcp)
-        } else {
-            None
-        };
+    let mcp_tool_ref: Option<Arc<McpTool>> = if config.mcp.enabled && !config.mcp.servers.is_empty()
+    {
+        let mcp = Arc::new(McpTool::new(
+            security.clone(),
+            config.mcp.clone(),
+            workspace_dir.to_path_buf(),
+        ));
+        tool_arcs.push(mcp.clone());
+        Some(mcp)
+    } else {
+        None
+    };
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening

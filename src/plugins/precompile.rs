@@ -32,7 +32,8 @@ impl CacheMetrics {
 
     pub fn record_miss(&self, compile_ms: u64) {
         self.misses.fetch_add(1, Ordering::Relaxed);
-        self.total_compile_ms.fetch_add(compile_ms, Ordering::Relaxed);
+        self.total_compile_ms
+            .fetch_add(compile_ms, Ordering::Relaxed);
     }
 
     pub fn hits(&self) -> u64 {
@@ -85,9 +86,7 @@ impl PrecompileCache {
             // SAFETY: We only write cache files from `engine.precompile_component`,
             // which produces platform-native artifacts for this exact engine
             // configuration.
-            match unsafe {
-                wasmtime::component::Component::deserialize_file(engine, &cache_path)
-            } {
+            match unsafe { wasmtime::component::Component::deserialize_file(engine, &cache_path) } {
                 Ok(component) => {
                     tracing::debug!(hash = %hash, "precompile cache hit");
                     self.metrics.record_hit();
@@ -149,9 +148,7 @@ impl PrecompileCache {
         std::fs::read_dir(&self.cache_dir)
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path().extension().map_or(false, |ex| ex == "cwasm")
-                    })
+                    .filter(|e| e.path().extension().map_or(false, |ex| ex == "cwasm"))
                     .count()
             })
             .unwrap_or(0)
@@ -254,7 +251,8 @@ mod tests {
 
     #[test]
     fn metrics_shared_via_arc() {
-        let cache = PrecompileCache::new(std::env::temp_dir().join("prx_metrics_arc_test")).unwrap();
+        let cache =
+            PrecompileCache::new(std::env::temp_dir().join("prx_metrics_arc_test")).unwrap();
         let metrics_ref = Arc::clone(&cache.metrics);
         metrics_ref.record_hit();
         assert_eq!(cache.metrics.hits(), 1);
@@ -269,7 +267,10 @@ mod tests {
         let data2 = b"hello WASM world"; // uppercase 'W'
         let h1 = PrecompileCache::hash_bytes(data1);
         let h2 = PrecompileCache::hash_bytes(data2);
-        assert_ne!(h1, h2, "single-byte change must produce different cache key");
+        assert_ne!(
+            h1, h2,
+            "single-byte change must produce different cache key"
+        );
     }
 
     #[test]
@@ -311,7 +312,10 @@ mod tests {
 
     #[test]
     fn new_creates_nested_dir() {
-        let tmp = std::env::temp_dir().join("prx_precompile_nested").join("deep").join("dir");
+        let tmp = std::env::temp_dir()
+            .join("prx_precompile_nested")
+            .join("deep")
+            .join("dir");
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("prx_precompile_nested"));
         let cache = PrecompileCache::new(tmp.clone()).unwrap();
         assert!(tmp.exists(), "nested cache directory should be created");
