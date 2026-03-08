@@ -76,6 +76,8 @@ mod nodes;
 mod observability;
 mod onboard;
 mod peripherals;
+#[cfg(feature = "wasm-plugins")]
+mod plugins;
 mod providers;
 mod runtime;
 mod security;
@@ -86,8 +88,6 @@ mod skillforge;
 mod skills;
 mod tools;
 mod tunnel;
-#[cfg(feature = "wasm-plugins")]
-mod plugins;
 mod util;
 mod webhook;
 

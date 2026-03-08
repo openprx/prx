@@ -51,9 +51,9 @@ impl WasmHook {
         }
 
         let mut store = wasmtime::Store::new(engine, host_state);
-        store.set_fuel(manifest.resources.max_fuel).map_err(|e| {
-            PluginError::Instantiation(format!("failed to set fuel: {e}"))
-        })?;
+        store
+            .set_fuel(manifest.resources.max_fuel)
+            .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
 
         let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
         Self::register_host_functions(&mut linker)?;
@@ -61,9 +61,7 @@ impl WasmHook {
         let instance = linker
             .instantiate_async(&mut store, component)
             .await
-            .map_err(|e| {
-                PluginError::Instantiation(format!("failed to instantiate hook: {e}"))
-            })?;
+            .map_err(|e| PluginError::Instantiation(format!("failed to instantiate hook: {e}")))?;
 
         Ok(Self {
             plugin_name: manifest.plugin.name.clone(),
@@ -108,9 +106,7 @@ impl WasmHook {
 
         let func = instance
             .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| {
-                PluginError::Runtime("on-event is not a function".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Runtime("on-event is not a function".to_string()))?;
 
         let params = [
             wasmtime::component::Val::String(event.into()),
@@ -136,12 +132,9 @@ impl WasmHook {
                 match &results[0] {
                     wasmtime::component::Val::Result(r) => match r.as_ref() {
                         Err(Some(b)) => match b.as_ref() {
-                            wasmtime::component::Val::String(e) => {
-                                Err(PluginError::Runtime(format!(
-                                    "hook '{}' returned error: {e}",
-                                    self.plugin_name
-                                )))
-                            }
+                            wasmtime::component::Val::String(e) => Err(PluginError::Runtime(
+                                format!("hook '{}' returned error: {e}", self.plugin_name),
+                            )),
                             _ => Ok(()),
                         },
                         _ => Ok(()),

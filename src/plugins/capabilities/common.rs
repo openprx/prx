@@ -108,8 +108,7 @@ pub fn register_kv_host_functions(
     kv_inst
         .func_wrap_async(
             "set",
-            |store: wasmtime::StoreContextMut<'_, HostState>,
-             (key, value): (String, Vec<u8>)| {
+            |store: wasmtime::StoreContextMut<'_, HostState>, (key, value): (String, Vec<u8>)| {
                 Box::new(async move {
                     if let Err(e) = store.data().check_permission("kv") {
                         tracing::warn!("{e}");
@@ -340,9 +339,7 @@ pub fn register_http_host_functions(
                             let resp_headers: Vec<(String, String)> = resp
                                 .headers()
                                 .iter()
-                                .map(|(k, v)| {
-                                    (k.to_string(), v.to_str().unwrap_or("").to_string())
-                                })
+                                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                                 .collect();
                             match resp.bytes().await {
                                 Ok(bytes) => Ok((Ok((status, resp_headers, bytes.to_vec())),)),

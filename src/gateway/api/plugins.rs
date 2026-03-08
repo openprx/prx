@@ -18,10 +18,13 @@ pub async fn list_plugins(State(state): State<AppState>) -> impl IntoResponse {
     {
         if let Some(ref pm) = state.plugin_manager {
             let plugins = pm.list_plugins().await;
-            return (StatusCode::OK, Json(serde_json::json!({
-                "plugins": plugins,
-                "count": plugins.len(),
-            })));
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "plugins": plugins,
+                    "count": plugins.len(),
+                })),
+            );
         }
     }
 

@@ -150,11 +150,10 @@ impl PluginManifest {
     /// Parse a `plugin.toml` from a file path.
     pub fn from_file(path: &Path) -> PluginResult<Self> {
         let content = std::fs::read_to_string(path).map_err(PluginError::Io)?;
-        let manifest: Self =
-            toml::from_str(&content).map_err(|e| PluginError::ManifestParse {
-                path: path.display().to_string(),
-                source: e,
-            })?;
+        let manifest: Self = toml::from_str(&content).map_err(|e| PluginError::ManifestParse {
+            path: path.display().to_string(),
+            source: e,
+        })?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -372,9 +371,15 @@ version = ""
 "#;
         let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
         let result = manifest.validate();
-        assert!(result.is_err(), "empty plugin version should fail validation");
+        assert!(
+            result.is_err(),
+            "empty plugin version should fail validation"
+        );
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("version"), "error should mention version: {err}");
+        assert!(
+            err.contains("version"),
+            "error should mention version: {err}"
+        );
     }
 
     #[test]
@@ -399,7 +404,10 @@ name = "no-pool"
 version = "0.1.0"
 "#;
         let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
-        assert_eq!(manifest.resources.pool_size, 0, "pool_size should default to 0");
+        assert_eq!(
+            manifest.resources.pool_size, 0,
+            "pool_size should default to 0"
+        );
     }
 
     #[test]

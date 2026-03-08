@@ -62,7 +62,8 @@ pub struct PluginMetrics {
 impl PluginMetrics {
     fn record_compilation(&self, compile_ms: u64) {
         self.compilations.fetch_add(1, Ordering::Relaxed);
-        self.total_compile_ms.fetch_add(compile_ms, Ordering::Relaxed);
+        self.total_compile_ms
+            .fetch_add(compile_ms, Ordering::Relaxed);
     }
 
     fn record_cache_hit(&self) {
@@ -212,9 +213,7 @@ impl PluginManager {
 
         // Check for duplicates
         if self.registry.contains(&plugin_name).await {
-            return Err(PluginError::AlreadyLoaded {
-                name: plugin_name,
-            });
+            return Err(PluginError::AlreadyLoaded { name: plugin_name });
         }
 
         // Compile WASM if file exists (using precompile cache to skip Cranelift
@@ -279,13 +278,13 @@ impl PluginManager {
 
     /// Reload a plugin by name (unload + load from its original directory).
     pub async fn reload_plugin(&self, name: &str) -> PluginResult<()> {
-        let source_dir = self
-            .registry
-            .get_source_dir(name)
-            .await
-            .ok_or_else(|| PluginError::NotFound {
-                name: name.to_string(),
-            })?;
+        let source_dir =
+            self.registry
+                .get_source_dir(name)
+                .await
+                .ok_or_else(|| PluginError::NotFound {
+                    name: name.to_string(),
+                })?;
 
         self.registry.unregister(name).await;
         self.load_plugin(&source_dir).await
@@ -725,9 +724,7 @@ impl PluginManager {
 ///
 /// Called during gateway startup. Returns `None` if the plugins directory
 /// doesn't exist or no plugins are found (non-fatal).
-pub async fn init_plugin_manager(
-    workspace_dir: &Path,
-) -> Option<Arc<PluginManager>> {
+pub async fn init_plugin_manager(workspace_dir: &Path) -> Option<Arc<PluginManager>> {
     let plugins_dir = workspace_dir.join("plugins");
 
     // Create the plugins directory if it doesn't exist

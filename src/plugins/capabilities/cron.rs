@@ -52,9 +52,9 @@ impl WasmCronJob {
         }
 
         let mut store = wasmtime::Store::new(engine, host_state);
-        store.set_fuel(manifest.resources.max_fuel).map_err(|e| {
-            PluginError::Instantiation(format!("failed to set fuel: {e}"))
-        })?;
+        store
+            .set_fuel(manifest.resources.max_fuel)
+            .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
 
         let mut linker = wasmtime::component::Linker::<HostState>::new(engine);
         Self::register_host_functions(&mut linker)?;
@@ -62,9 +62,7 @@ impl WasmCronJob {
         let instance = linker
             .instantiate_async(&mut store, component)
             .await
-            .map_err(|e| {
-                PluginError::Instantiation(format!("failed to instantiate cron: {e}"))
-            })?;
+            .map_err(|e| PluginError::Instantiation(format!("failed to instantiate cron: {e}")))?;
 
         Ok(Self {
             plugin_name: manifest.plugin.name.clone(),
@@ -94,15 +92,11 @@ impl WasmCronJob {
 
         let func_idx = instance
             .get_export(store.as_context_mut(), Some(&iface_idx), "run")
-            .ok_or_else(|| {
-                PluginError::Runtime("run not found in cron-exports".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Runtime("run not found in cron-exports".to_string()))?;
 
         let func = instance
             .get_func(store.as_context_mut(), &func_idx)
-            .ok_or_else(|| {
-                PluginError::Runtime("run is not a function".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Runtime("run is not a function".to_string()))?;
 
         let params = [];
         let mut results = [wasmtime::component::Val::Bool(false)];
@@ -128,12 +122,9 @@ impl WasmCronJob {
                             _ => Ok(String::new()),
                         },
                         Err(Some(b)) => match b.as_ref() {
-                            wasmtime::component::Val::String(e) => {
-                                Err(PluginError::Runtime(format!(
-                                    "cron '{}' returned error: {e}",
-                                    self.plugin_name
-                                )))
-                            }
+                            wasmtime::component::Val::String(e) => Err(PluginError::Runtime(
+                                format!("cron '{}' returned error: {e}", self.plugin_name),
+                            )),
                             _ => Ok(String::new()),
                         },
                         _ => Ok(String::new()),
@@ -226,8 +217,7 @@ impl WasmCronManager {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             // Track the last time each job was triggered so we don't double-fire.
-            let mut last_triggered: HashMap<String, chrono::DateTime<chrono::Utc>> =
-                HashMap::new();
+            let mut last_triggered: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
 
             loop {
                 ticker.tick().await;
