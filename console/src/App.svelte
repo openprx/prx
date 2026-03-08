@@ -1,7 +1,11 @@
 <script>
   import { api } from './lib/api';
   import { clearToken, getToken, syncTokenCookie } from './lib/auth';
-  import { buildConfigNavGroups, focusConfigSection } from './lib/config-nav';
+  import {
+    buildConfigNavGroups,
+    focusConfigSection,
+    normalizeConfigSectionHash
+  } from './lib/config-nav';
   import { configStore, loadConfigStore } from './lib/config-store.svelte.js';
   import { NAV_ITEMS } from './lib/constants';
   import {
@@ -47,11 +51,7 @@
       label: t(`languages.${lang}`)
     }))
   );
-  const activeConfigSection = $derived(
-    activeConfigHash.startsWith('#config-section-')
-      ? activeConfigHash.slice('#config-section-'.length)
-      : ''
-  );
+  const activeConfigSection = $derived(normalizeConfigSectionHash(activeConfigHash));
   function safeDecodeSessionId(rawValue) {
     try {
       return decodeURIComponent(rawValue);
@@ -200,6 +200,12 @@
 
     configNavGroups = [];
   });
+
+  $effect(() => {
+    if (!showConfigSubnav || configNavLoading || configNavGroups.length === 0) return;
+    if (activeConfigSection) return;
+    focusConfigSection(configNavGroups[0].groupKey);
+  });
 </script>
 
 <div class="console-shell min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
@@ -251,7 +257,7 @@
                         : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-gray-100'
                     }`}
                   >
-                    {group.label}
+                    {group.labelKey ? t(group.labelKey) : group.fallbackLabel}
                   </button>
                 {/each}
 
@@ -330,7 +336,7 @@
           {:else if activePath === '/plugins'}
             <PluginsPage />
           {:else if activePath === '/config'}
-            <ConfigPage />
+            <ConfigPage activeSection={activeConfigSection} />
           {:else if activePath === '/logs'}
             <LogsPage />
           {:else}

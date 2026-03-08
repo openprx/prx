@@ -1,11 +1,10 @@
 <script>
-  import { slide, fade } from 'svelte/transition';
+  import { fade } from 'svelte/transition';
   import {
     BadgeCheck,
     Bot,
     Brain,
     Cable,
-    ChevronDown,
     Clock,
     Code2,
     Copy,
@@ -29,22 +28,34 @@
     MessageSquare
   } from '@lucide/svelte';
   import {
-    SCHEMA,
     buildConfigNavGroups,
     configSectionId,
-    focusConfigSection,
+    getConfigSectionMeta,
+    GENERAL_SECTION_FIELDS,
+    GENERAL_SECTION_KEY,
     humanizeKey
   } from '../lib/config-nav';
-  import { configStore, loadConfigStore, updateConfigStore } from '../lib/config-store.svelte.js';
+  import {
+    buildSectionPayload,
+    configStore,
+    loadConfigBundle,
+    loadConfigStore,
+    readSectionValue,
+    updateConfigStore,
+    writeSectionValue
+  } from '../lib/config-store.svelte.js';
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
 
+  let { activeSection = '' } = $props();
+
   const REDACTION_MASK = '***';
   const EMPTY_FILE_SAVE_STATE = Object.freeze({});
+  const MAX_RENDER_DEPTH = 2;
+  const MAX_COLLAPSED_ARRAY_ITEMS = 10;
 
-  let config = $state({});
-  let originalConfig = $state({});
-  let schemaDocument = $state(null);
+  let fullConfig = $state({});
+  let fullSchema = $state({});
   let configFiles = $state([]);
   let loading = $state(true);
   let errorMessage = $state('');
@@ -53,33 +64,34 @@
   let savingConfig = $state(false);
   let advancedMode = $state(false);
   let searchQuery = $state('');
-  let activeNavGroup = $state('provider');
-  let openGroups = $state(new Set());
-  let openObjects = $state(new Set());
   let revealedFields = $state(new Set());
+  let expandedArrays = $state(new Set());
   let rawJsonDraft = $state('');
   let rawJsonError = $state('');
   let rawJsonDirty = $state(false);
   let fileDrafts = $state({});
   let fileSaveStates = $state(EMPTY_FILE_SAVE_STATE);
+  let sectionDrafts = $state({});
+  let sectionOriginals = $state({});
 
   const ICON_MAP = {
-    provider: Zap,
-    gateway: Globe,
-    channels: MessageSquare,
+    general: Zap,
     agent: Bot,
     memory: Brain,
+    channels_config: MessageSquare,
     security: Shield,
-    heartbeat: HeartPulse,
+    gateway: Globe,
+    runtime: Settings,
+    observability: BarChart3,
     reliability: RefreshCw,
     scheduler: Clock,
+    heartbeat: HeartPulse,
     sessions_spawn: GitBranch,
-    observability: BarChart3,
-    web_search: Search,
+    browser: Code2,
+    mcp: Cable,
     cost: DollarSign,
-    runtime: Settings,
-    tunnel: Cable,
-    identity: BadgeCheck
+    identity: BadgeCheck,
+    tunnel: Cable
   };
 
   function cloneValue(value) {
@@ -136,23 +148,6 @@
     delete cursor[parts[parts.length - 1]];
   }
 
-  function updateField(path, value) {
-    const nextConfig = cloneValue(config) ?? {};
-    setNestedValue(nextConfig, path, value);
-    config = nextConfig;
-  }
-
-  function resetFieldToDefault(path, defaultValue) {
-    if (defaultValue === undefined) return;
-    updateField(path, cloneValue(defaultValue));
-  }
-
-  function discardStructuredChanges() {
-    config = cloneValue(originalConfig) ?? {};
-    rawJsonDirty = false;
-    rawJsonError = '';
-  }
-
   function toggleSetMember(currentSet, id) {
     const next = new Set(currentSet);
     if (next.has(id)) {
@@ -167,35 +162,15 @@
     revealedFields = toggleSetMember(revealedFields, path);
   }
 
-  function toggleGroup(groupKey) {
-    openGroups = toggleSetMember(openGroups, groupKey);
-  }
-
-  function toggleObject(path) {
-    openObjects = toggleSetMember(openObjects, path);
-  }
-
-  function focusGroup(groupKey) {
-    activeNavGroup = groupKey;
-    if (!openGroups.has(groupKey)) {
-      const next = new Set(openGroups);
-      next.add(groupKey);
-      openGroups = next;
-    }
-    focusConfigSection(groupKey);
+  function toggleArrayExpansion(path) {
+    expandedArrays = toggleSetMember(expandedArrays, path);
   }
 
   function isSensitiveKey(key) {
     const lower = String(key).toLowerCase();
-    return [
-      'key',
-      'token',
-      'secret',
-      'password',
-      'auth',
-      'credential',
-      'private'
-    ].some((fragment) => lower.includes(fragment));
+    return ['key', 'token', 'secret', 'password', 'auth', 'credential', 'private'].some((part) =>
+      lower.includes(part)
+    );
   }
 
   function formatDefaultValue(value) {
@@ -207,6 +182,7 @@
   function formatValue(value) {
     if (value === undefined) return `(${t('config.field.notSet').toLowerCase()})`;
     if (value === null) return 'null';
+    if (value === REDACTION_MASK) return REDACTION_MASK;
     if (typeof value === 'string') return value.length > 0 ? value : `(${t('common.empty').toLowerCase()})`;
     return JSON.stringify(value);
   }
@@ -221,7 +197,7 @@
   }
 
   function resolveJsonPointer(root, pointer) {
-    if (!pointer.startsWith('#/')) return null;
+    if (!pointer?.startsWith?.('#/')) return null;
     const segments = pointer
       .slice(2)
       .split('/')
@@ -236,43 +212,73 @@
 
   function mergeSchemas(base, extension) {
     const merged = { ...base, ...extension };
+
     if (base?.properties || extension?.properties) {
       merged.properties = {
         ...(base?.properties ?? {}),
         ...(extension?.properties ?? {})
       };
     }
+
     if (base?.required || extension?.required) {
       merged.required = Array.from(new Set([...(base?.required ?? []), ...(extension?.required ?? [])]));
     }
+
     if (extension?.items !== undefined) {
       merged.items = extension.items;
     } else if (base?.items !== undefined) {
       merged.items = base.items;
     }
+
     return merged;
   }
 
-  function resolveSchema(schema) {
+  function resolveSchema(schema, rootSchema = fullSchema, depth = 0) {
     if (!schema || typeof schema !== 'object') return {};
+    if (depth > 12) return schema;
+
     let current = schema;
 
     if (current.$ref) {
-      const resolved = resolveJsonPointer(schemaDocument, current.$ref);
+      const resolved = resolveJsonPointer(rootSchema, current.$ref);
       if (resolved) {
-        current = mergeSchemas(resolved, { ...current, $ref: undefined });
+        current = mergeSchemas(resolveSchema(resolved, rootSchema, depth + 1), {
+          ...current,
+          $ref: undefined
+        });
       }
     }
 
     if (Array.isArray(current.allOf) && current.allOf.length > 0) {
       let merged = { ...current, allOf: undefined };
       for (const part of current.allOf) {
-        merged = mergeSchemas(merged, resolveSchema(part));
+        merged = mergeSchemas(merged, resolveSchema(part, rootSchema, depth + 1));
       }
       current = merged;
     }
 
     return current;
+  }
+
+  function inferSchemaFromValue(value) {
+    if (typeof value === 'boolean') return { type: 'boolean' };
+    if (typeof value === 'number') return { type: Number.isInteger(value) ? 'integer' : 'number' };
+    if (typeof value === 'string') return { type: 'string' };
+    if (Array.isArray(value)) {
+      if (value.every((item) => typeof item === 'string')) {
+        return { type: 'array', items: { type: 'string' }, default: [] };
+      }
+      return { type: 'array' };
+    }
+    if (isPlainObject(value)) {
+      return {
+        type: 'object',
+        properties: Object.fromEntries(
+          Object.entries(value).map(([key, entry]) => [key, inferSchemaFromValue(entry)])
+        )
+      };
+    }
+    return {};
   }
 
   function getNonNullVariants(schema) {
@@ -304,7 +310,7 @@
       return resolved.type;
     }
 
-    if (resolved.properties || value && isPlainObject(value)) {
+    if (resolved.properties || (value && isPlainObject(value))) {
       return 'object';
     }
 
@@ -348,28 +354,27 @@
     return [];
   }
 
-  function inferSchemaFromValue(value) {
-    if (typeof value === 'boolean') return { type: 'boolean' };
-    if (typeof value === 'number') return { type: Number.isInteger(value) ? 'integer' : 'number' };
-    if (typeof value === 'string') return { type: 'string' };
-    if (Array.isArray(value)) {
-      if (value.every((item) => typeof item === 'string')) {
-        return { type: 'array', items: { type: 'string' }, default: [] };
-      }
-      return { type: 'array' };
-    }
-    if (isPlainObject(value)) {
+  export function resolveSubSchema(schemaDocument, sectionKey) {
+    const rootSchema = schemaDocument ?? {};
+    const rootProperties = rootSchema.properties ?? {};
+
+    if (sectionKey === GENERAL_SECTION_KEY) {
       return {
         type: 'object',
+        title: getConfigSectionMeta(GENERAL_SECTION_KEY).fallbackLabel,
         properties: Object.fromEntries(
-          Object.entries(value).map(([key, entry]) => [key, inferSchemaFromValue(entry)])
+          GENERAL_SECTION_FIELDS.map((fieldKey) => [
+            fieldKey,
+            resolveSchema(rootProperties[fieldKey] ?? inferSchemaFromValue(fullConfig[fieldKey]), rootSchema)
+          ])
         )
       };
     }
-    return {};
+
+    return resolveSchema(rootProperties[sectionKey] ?? inferSchemaFromValue(fullConfig[sectionKey]), rootSchema);
   }
 
-  function getInputKind(schema, value) {
+  function getInputKind(schema, value, depth) {
     const resolved = resolveSchema(schema);
     const enumOptions = getEnumOptions(resolved);
     if (enumOptions.length > 0) return 'enum';
@@ -378,25 +383,23 @@
     if (type === 'boolean') return 'boolean';
     if (type === 'number' || type === 'integer') return 'number';
     if (type === 'string') return 'string';
-    if (type === 'object') return 'object';
     if (type === 'array') {
       const itemType = getSchemaType(resolved.items, Array.isArray(value) ? value[0] : undefined);
       return itemType === 'string' ? 'string-array' : 'json';
     }
-
-    const variants = getNonNullVariants(resolved);
-    if (
-      variants.length === 2 &&
-      variants.some((variant) => getSchemaType(variant) === 'boolean') &&
-      variants.some((variant) => getSchemaType(variant) === 'string')
-    ) {
-      return 'enum';
+    if (type === 'object') {
+      return depth < MAX_RENDER_DEPTH ? 'object-group' : 'json';
     }
-
     return 'json';
   }
 
-  function buildObjectChildren(path, schema, value, depth, query) {
+  function getAbsolutePath(sectionKey, relativePath) {
+    if (!relativePath) return sectionKey;
+    if (sectionKey === GENERAL_SECTION_KEY) return relativePath;
+    return `${sectionKey}.${relativePath}`;
+  }
+
+  function buildObjectChildren(sectionKey, path, schema, value, depth, query, originalSection) {
     const resolved = resolveSchema(schema);
     const propertyMap = resolved.properties ?? {};
     const schemaKeys = Object.keys(propertyMap);
@@ -410,27 +413,29 @@
         (resolved.additionalProperties && resolved.additionalProperties !== true
           ? resolved.additionalProperties
           : inferSchemaFromValue(value?.[key]));
-      return buildSchemaNode(childPath, key, childSchema, value?.[key], depth + 1, query);
+      return buildSchemaNode(sectionKey, childPath, key, childSchema, value?.[key], depth + 1, query, originalSection);
     });
   }
 
-  function buildSchemaNode(path, key, schema, value, depth, query) {
+  function buildSchemaNode(sectionKey, path, key, schema, value, depth, query, originalSection) {
     const resolved = resolveSchema(schema && Object.keys(schema).length > 0 ? schema : inferSchemaFromValue(value));
     const label = resolved.title ?? humanizeKey(key);
     const description = resolved.description ?? '';
     const defaultValue = hasOwn(resolved, 'default') ? cloneValue(resolved.default) : undefined;
-    const inputKind = getInputKind(resolved, value);
-    const dirtyFromOriginal = !valuesEqual(value, getNestedValue(originalConfig, path));
+    const inputKind = getInputKind(resolved, value, depth);
+    const dirtyFromOriginal = !valuesEqual(value, getNestedValue(originalSection, path));
     const modifiedFromDefault = defaultValue !== undefined && !valuesEqual(value, defaultValue);
-    const matchesSelf = isSearchMatch(query, key, label, description, path);
+    const absolutePath = getAbsolutePath(sectionKey, path);
+    const matchesSelf = isSearchMatch(query, key, label, description, absolutePath);
 
-    if (inputKind === 'object') {
-      const children = buildObjectChildren(path, resolved, value, depth, query);
+    if (inputKind === 'object-group') {
+      const children = buildObjectChildren(sectionKey, path, resolved, value, depth, query, originalSection);
       const visibleChildren = children.filter((child) => child.visible);
       const subtreeMatches = matchesSelf || visibleChildren.some((child) => child.subtreeMatches);
       return {
-        id: path,
+        id: absolutePath,
         path,
+        absolutePath,
         key,
         label,
         description,
@@ -438,20 +443,19 @@
         dirtyFromOriginal,
         modifiedFromDefault,
         inputKind,
-        depth,
         children,
         visibleChildren,
         visible: query ? subtreeMatches : true,
-        matchesSelf,
         subtreeMatches,
-        sensitive: false
+        matchesSelf
       };
     }
 
     const visible = query ? matchesSelf : true;
     return {
-      id: path,
+      id: absolutePath,
       path,
+      absolutePath,
       key,
       label,
       description,
@@ -460,9 +464,7 @@
       dirtyFromOriginal,
       modifiedFromDefault,
       inputKind,
-      depth,
       visible,
-      matchesSelf,
       subtreeMatches: visible,
       enumOptions: getEnumOptions(resolved),
       schema: resolved,
@@ -470,75 +472,133 @@
     };
   }
 
-  function buildGroupViewModels(query) {
-    const normalizedQuery = query.trim().toLowerCase();
-    const navGroups = buildConfigNavGroups(config);
-    const schemaProperties = schemaDocument?.properties ?? {};
-
-    return navGroups
-      .map((navGroup) => {
-        const groupKey = navGroup.groupKey;
-        const groupSchema = schemaProperties[groupKey] ?? inferSchemaFromValue(config[groupKey]);
-        const node = buildSchemaNode(groupKey, groupKey, groupSchema, config[groupKey], 0, normalizedQuery);
-        const meta = SCHEMA[groupKey];
-        return {
-          ...navGroup,
-          label: meta?.label ?? navGroup.label,
-          defaultOpen: meta?.defaultOpen ?? false,
-          icon: ICON_MAP[groupKey],
-          node
-        };
-      })
-      .filter((group) => group.node.visible);
+  function getCurrentSectionDraft() {
+    return sectionDrafts[resolvedSectionKey] ?? readSectionValue(fullConfig, resolvedSectionKey);
   }
 
-  const groupViewModels = $derived(buildGroupViewModels(searchQuery));
-  const hasSearchQuery = $derived(searchQuery.trim().length > 0);
-  const prettyConfig = $derived(JSON.stringify(config ?? {}, null, 2));
-  const hasChanges = $derived(!valuesEqual(config, originalConfig));
-  const visibleGroups = $derived(groupViewModels.filter((group) => group.node.visible));
-
-  function isGroupOpen(group) {
-    return hasSearchQuery ? group.node.subtreeMatches : openGroups.has(group.groupKey);
+  function getCurrentSectionOriginal() {
+    return sectionOriginals[resolvedSectionKey] ?? readSectionValue(fullConfig, resolvedSectionKey);
   }
 
-  function isObjectOpen(node) {
-    return hasSearchQuery ? node.subtreeMatches : openObjects.has(node.path);
+  function buildCurrentSectionNodes() {
+    if (!resolvedSectionKey) return [];
+
+    const draft = getCurrentSectionDraft();
+    const original = getCurrentSectionOriginal();
+    const query = searchQuery.trim().toLowerCase();
+    const sectionSchema = resolveSubSchema(fullSchema, resolvedSectionKey);
+    const propertyMap = resolveSchema(sectionSchema).properties ?? {};
+    const schemaKeys = Object.keys(propertyMap);
+    const valueKeys = isPlainObject(draft) ? Object.keys(draft) : [];
+    const orderedKeys = [...schemaKeys, ...valueKeys.filter((key) => !schemaKeys.includes(key))];
+
+    return orderedKeys
+      .map((key) =>
+        buildSchemaNode(
+          resolvedSectionKey,
+          key,
+          key,
+          propertyMap[key] ?? inferSchemaFromValue(draft?.[key]),
+          draft?.[key],
+          0,
+          query,
+          original
+        )
+      )
+      .filter((node) => node.visible);
   }
 
-  function getChangedFields() {
-    const diffs = [];
+  function collectSectionChanges(sectionKey) {
+    const current = sectionDrafts[sectionKey] ?? readSectionValue(fullConfig, sectionKey);
+    const baseline = sectionOriginals[sectionKey] ?? readSectionValue(fullConfig, sectionKey);
+    const changes = [];
 
-    function walk(current, baseline, prefix = '') {
-      const currentIsObject = isPlainObject(current);
-      const baselineIsObject = isPlainObject(baseline);
+    function walk(currentValue, baselineValue, prefix = '') {
+      const currentIsObject = isPlainObject(currentValue);
+      const baselineIsObject = isPlainObject(baselineValue);
+
       if (currentIsObject && baselineIsObject) {
-        const keys = Array.from(new Set([...Object.keys(current), ...Object.keys(baseline)]));
+        const keys = Array.from(new Set([...Object.keys(currentValue), ...Object.keys(baselineValue)]));
         for (const key of keys) {
-          const path = prefix ? `${prefix}.${key}` : key;
-          walk(current[key], baseline[key], path);
+          const nextPrefix = prefix ? `${prefix}.${key}` : key;
+          walk(currentValue[key], baselineValue[key], nextPrefix);
         }
         return;
       }
 
-      if (!valuesEqual(current, baseline)) {
-        diffs.push({
+      if (!valuesEqual(currentValue, baselineValue)) {
+        changes.push({
           path: prefix,
-          label: humanizeKey(prefix.split('.').at(-1) ?? prefix),
-          previous: baseline,
-          current
+          absolutePath: getAbsolutePath(sectionKey, prefix),
+          previous: baselineValue,
+          current: currentValue
         });
       }
     }
 
-    walk(config, originalConfig);
-    return diffs;
+    walk(current, baseline);
+    return changes;
   }
 
-  const changedFields = $derived(getChangedFields());
+  const navGroups = $derived(buildConfigNavGroups(fullConfig));
+  const resolvedSectionKey = $derived(
+    navGroups.some((group) => group.groupKey === activeSection) ? activeSection : (navGroups[0]?.groupKey ?? '')
+  );
+  const currentSectionMeta = $derived(getConfigSectionMeta(resolvedSectionKey || GENERAL_SECTION_KEY));
+  const currentSectionLabel = $derived(
+    currentSectionMeta.labelKey ? t(currentSectionMeta.labelKey) : currentSectionMeta.fallbackLabel
+  );
+  const currentSectionIcon = $derived(ICON_MAP[resolvedSectionKey] ?? Database);
+  const currentSectionSchema = $derived(resolveSubSchema(fullSchema, resolvedSectionKey));
+  const currentSectionDraft = $derived(getCurrentSectionDraft());
+  const currentSectionNodes = $derived(buildCurrentSectionNodes());
+  const changedFields = $derived(collectSectionChanges(resolvedSectionKey));
+  const hasChanges = $derived(changedFields.length > 0);
+  const prettyConfig = $derived(JSON.stringify(fullConfig ?? {}, null, 2));
 
-  function pathHasChanges(prefix) {
-    return changedFields.some((change) => change.path === prefix || change.path.startsWith(`${prefix}.`));
+  function ensureSectionState(sectionKey) {
+    if (!sectionKey || loading) return;
+    if (hasOwn(sectionDrafts, sectionKey) && hasOwn(sectionOriginals, sectionKey)) return;
+
+    const sectionValue = readSectionValue(fullConfig, sectionKey);
+    sectionDrafts = {
+      ...sectionDrafts,
+      [sectionKey]: cloneValue(sectionValue) ?? {}
+    };
+    sectionOriginals = {
+      ...sectionOriginals,
+      [sectionKey]: cloneValue(sectionValue) ?? {}
+    };
+  }
+
+  function setCurrentSectionDraft(nextSectionValue) {
+    sectionDrafts = {
+      ...sectionDrafts,
+      [resolvedSectionKey]: cloneValue(nextSectionValue) ?? {}
+    };
+    fullConfig = writeSectionValue(fullConfig, resolvedSectionKey, nextSectionValue);
+  }
+
+  function updateField(path, value) {
+    const nextSection = cloneValue(currentSectionDraft) ?? {};
+    setNestedValue(nextSection, path, value);
+    setCurrentSectionDraft(nextSection);
+  }
+
+  function resetFieldToDefault(path, defaultValue) {
+    if (defaultValue === undefined) return;
+    updateField(path, cloneValue(defaultValue));
+  }
+
+  function discardStructuredChanges() {
+    const originalSection = cloneValue(getCurrentSectionOriginal()) ?? {};
+    sectionDrafts = {
+      ...sectionDrafts,
+      [resolvedSectionKey]: originalSection
+    };
+    fullConfig = writeSectionValue(fullConfig, resolvedSectionKey, originalSection);
+    rawJsonDirty = false;
+    rawJsonError = '';
   }
 
   function syncRawJsonDraft() {
@@ -547,37 +607,22 @@
     rawJsonError = '';
   }
 
-  function initializeOpenGroups() {
-    const next = new Set();
-    for (const group of buildConfigNavGroups(config)) {
-      if (SCHEMA[group.groupKey]?.defaultOpen) {
-        next.add(group.groupKey);
-      }
-    }
-    openGroups = next;
-  }
-
   function syncFileDrafts(files) {
     fileDrafts = Object.fromEntries(files.map((file) => [file.path, file.content]));
     fileSaveStates = EMPTY_FILE_SAVE_STATE;
   }
 
-  async function loadConfigPage() {
+  async function loadConfigPage({ force = true } = {}) {
     loading = true;
     errorMessage = '';
     try {
-      const [schemaResponse, filesResponse] = await Promise.all([
-        api.getConfigSchema(),
-        api.getConfigFiles()
-      ]);
-      await loadConfigStore({ force: true });
-      config = cloneValue(configStore.data) ?? {};
-      originalConfig = cloneValue(configStore.data) ?? {};
-      schemaDocument = schemaResponse ?? {};
+      const [bundle, filesResponse] = await Promise.all([loadConfigBundle({ force }), api.getConfigFiles()]);
+      fullConfig = cloneValue(bundle.config) ?? {};
+      fullSchema = bundle.schema ?? {};
       configFiles = Array.isArray(filesResponse) ? filesResponse : [];
+      sectionDrafts = {};
+      sectionOriginals = {};
       syncFileDrafts(configFiles);
-      initializeOpenGroups();
-      openObjects = new Set();
       rawJsonDirty = false;
       syncRawJsonDraft();
     } catch (error) {
@@ -588,25 +633,31 @@
   }
 
   async function saveStructuredConfig() {
-    if (!hasChanges || savingConfig) return;
+    if (!resolvedSectionKey || !hasChanges || savingConfig) return;
     savingConfig = true;
     saveMessage = '';
     saveMessageTone = 'success';
+
     try {
-      const partial = {};
-      for (const change of changedFields) {
-        setNestedValue(partial, change.path, change.current);
-      }
-      const result = await api.saveConfig(partial);
-      updateConfigStore(cloneValue(config) ?? {});
-      originalConfig = cloneValue(config) ?? {};
+      const payload = buildSectionPayload(resolvedSectionKey, currentSectionDraft);
+      const result = await api.saveConfig(payload);
+      const refreshedConfig = cloneValue(await loadConfigStore({ force: true })) ?? {};
+      updateConfigStore(refreshedConfig);
+      fullConfig = refreshedConfig;
+
+      const refreshedSection = cloneValue(readSectionValue(refreshedConfig, resolvedSectionKey)) ?? {};
+      sectionDrafts = {
+        ...sectionDrafts,
+        [resolvedSectionKey]: refreshedSection
+      };
+      sectionOriginals = {
+        ...sectionOriginals,
+        [resolvedSectionKey]: cloneValue(refreshedSection) ?? {}
+      };
+
       rawJsonDirty = false;
       syncRawJsonDraft();
-      if (result?.restart_required) {
-        saveMessage = t('config.saveRestartRequired');
-      } else {
-        saveMessage = t('config.saveSuccess');
-      }
+      saveMessage = result?.restart_required ? t('config.saveRestartRequired') : t('config.saveSuccess');
       setTimeout(() => {
         saveMessage = '';
       }, 5000);
@@ -630,16 +681,14 @@
     try {
       const parsed = JSON.parse(rawJsonDraft);
       const result = await api.saveConfig(parsed);
-      config = cloneValue(parsed) ?? {};
-      originalConfig = cloneValue(parsed) ?? {};
-      updateConfigStore(cloneValue(parsed) ?? {});
+      const nextConfig = cloneValue(parsed) ?? {};
+      fullConfig = nextConfig;
+      updateConfigStore(nextConfig);
+      sectionDrafts = {};
+      sectionOriginals = {};
       rawJsonDirty = false;
       syncRawJsonDraft();
-      if (result?.restart_required) {
-        saveMessage = t('config.saveRestartRequired');
-      } else {
-        saveMessage = t('config.saveSuccess');
-      }
+      saveMessage = result?.restart_required ? t('config.saveRestartRequired') : t('config.saveSuccess');
       setTimeout(() => {
         saveMessage = '';
       }, 5000);
@@ -662,7 +711,7 @@
 
     try {
       const result = await api.saveConfigFile(file.filename, content);
-      await loadConfigPage();
+      await loadConfigPage({ force: true });
       saveMessageTone = 'success';
       saveMessage = result?.restart_required ? t('config.saveRestartRequired') : t('config.saveSuccess');
       setTimeout(() => {
@@ -693,31 +742,25 @@
   }
 
   function addStringArrayItem(path) {
-    const current = getNestedValue(config, path);
+    const current = getNestedValue(currentSectionDraft, path);
     const next = Array.isArray(current) ? [...current, ''] : [''];
     updateField(path, next);
   }
 
   function updateStringArrayItem(path, index, value) {
-    const current = getNestedValue(config, path);
+    const current = getNestedValue(currentSectionDraft, path);
     const next = Array.isArray(current) ? [...current] : [];
     next[index] = value;
     updateField(path, next);
   }
 
   function removeStringArrayItem(path, index) {
-    const current = getNestedValue(config, path);
+    const current = getNestedValue(currentSectionDraft, path);
     if (!Array.isArray(current)) return;
-    updateField(path, current.filter((_, itemIndex) => itemIndex !== index));
-  }
-
-  function focusHashTarget() {
-    if (typeof window === 'undefined') return;
-    const hash = window.location.hash.replace(/^#/, '');
-    if (!hash.startsWith('config-section-')) return;
-    const targetGroup = hash.replace(/^config-section-/, '');
-    if (!groupViewModels.some((group) => group.groupKey === targetGroup)) return;
-    focusGroup(targetGroup);
+    updateField(
+      path,
+      current.filter((_, itemIndex) => itemIndex !== index)
+    );
   }
 
   $effect(() => {
@@ -729,16 +772,13 @@
   });
 
   $effect(() => {
-    if (loading || advancedMode || groupViewModels.length === 0) return;
-    queueMicrotask(() => {
-      focusHashTarget();
-    });
+    ensureSectionState(resolvedSectionKey);
   });
 </script>
 
 {#snippet FieldControl(node)}
-  {@const currentValue = getNestedValue(config, node.path)}
-  {@const isRevealed = revealedFields.has(node.path)}
+  {@const currentValue = getNestedValue(currentSectionDraft, node.path)}
+  {@const isRevealed = revealedFields.has(node.absolutePath)}
 
   {#if node.inputKind === 'boolean'}
     <button
@@ -773,9 +813,9 @@
       oninput={(event) => {
         const raw = event.currentTarget.value;
         if (raw === '') {
-          const nextConfig = cloneValue(config) ?? {};
-          deleteNestedValue(nextConfig, node.path);
-          config = nextConfig;
+          const nextSection = cloneValue(currentSectionDraft) ?? {};
+          deleteNestedValue(nextSection, node.path);
+          setCurrentSectionDraft(nextSection);
           return;
         }
         const nextValue = node.schema.type === 'integer' ? parseInt(raw, 10) : parseFloat(raw);
@@ -785,9 +825,12 @@
       }}
     />
   {:else if node.inputKind === 'string-array'}
+    {@const items = Array.isArray(currentValue) ? currentValue : []}
+    {@const expanded = expandedArrays.has(node.absolutePath)}
+    {@const visibleItems = expanded ? items : items.slice(0, MAX_COLLAPSED_ARRAY_ITEMS)}
     <div class="tag-editor">
       <div class="tag-list">
-        {#each Array.isArray(currentValue) ? currentValue : [] as item, index}
+        {#each visibleItems as item, index}
           <label class="tag-chip">
             <input
               type="text"
@@ -798,6 +841,13 @@
           </label>
         {/each}
       </div>
+
+      {#if items.length > MAX_COLLAPSED_ARRAY_ITEMS}
+        <button type="button" class="ghost-action" onclick={() => toggleArrayExpansion(node.absolutePath)}>
+          {expanded ? t('common.reset') : t('config.showAll', { count: items.length })}
+        </button>
+      {/if}
+
       <button type="button" class="secondary-action" onclick={() => addStringArrayItem(node.path)}>
         {t('config.addListItem')}
       </button>
@@ -805,13 +855,17 @@
   {:else if node.inputKind === 'json'}
     <textarea
       class="config-editor"
-      rows="6"
+      rows="8"
       value={JSON.stringify(currentValue ?? node.defaultValue ?? null, null, 2)}
       onblur={(event) => {
         try {
           updateField(node.path, JSON.parse(event.currentTarget.value));
         } catch {
-          event.currentTarget.value = JSON.stringify(getNestedValue(config, node.path) ?? node.defaultValue ?? null, null, 2);
+          event.currentTarget.value = JSON.stringify(
+            getNestedValue(currentSectionDraft, node.path) ?? node.defaultValue ?? null,
+            null,
+            2
+          );
         }
       }}
     ></textarea>
@@ -828,7 +882,7 @@
         <button
           type="button"
           class="icon-action"
-          onclick={() => toggleReveal(node.path)}
+          onclick={() => toggleReveal(node.absolutePath)}
           aria-label={t('config.toggleVisibility')}
         >
           {#if isRevealed}
@@ -843,7 +897,7 @@
 {/snippet}
 
 {#snippet FieldNode(node)}
-  {@const currentValue = getNestedValue(config, node.path)}
+  {@const currentValue = getNestedValue(currentSectionDraft, node.path)}
   <article class="config-field {node.modifiedFromDefault ? 'is-modified' : ''} {node.dirtyFromOriginal ? 'is-dirty' : ''}">
     <div class="config-field__meta">
       <div class="config-field__heading">
@@ -857,7 +911,7 @@
               <span class="config-badge config-badge--muted">{t('config.unsaved')}</span>
             {/if}
           </div>
-          <p class="config-field__path">{node.path}</p>
+          <p class="config-field__path">{node.absolutePath}</p>
         </div>
         {#if node.defaultValue !== undefined}
           <button type="button" class="ghost-action" onclick={() => resetFieldToDefault(node.path, node.defaultValue)}>
@@ -884,12 +938,7 @@
 
 {#snippet ObjectNode(node)}
   <section class="object-card {node.modifiedFromDefault || node.dirtyFromOriginal ? 'is-emphasized' : ''}">
-    <button
-      type="button"
-      class="object-card__header"
-      onclick={() => toggleObject(node.path)}
-      aria-expanded={isObjectOpen(node)}
-    >
+    <div class="object-card__header">
       <div>
         <div class="object-card__title-row">
           <h4>{node.label}</h4>
@@ -900,34 +949,28 @@
             <span class="config-badge config-badge--muted">{t('config.unsaved')}</span>
           {/if}
         </div>
-        <p class="object-card__path">{node.path}</p>
+        <p class="object-card__path">{node.absolutePath}</p>
         {#if node.description}
           <p class="object-card__description">{node.description}</p>
         {/if}
       </div>
-      <ChevronDown
-        size={18}
-        style={`transform: rotate(${isObjectOpen(node) ? 180 : 0}deg); transition: transform 0.18s ease;`}
-      />
-    </button>
+    </div>
 
-    {#if isObjectOpen(node)}
-      <div class="object-card__body" transition:slide={{ duration: 180 }}>
-        {#if node.visibleChildren.length === 0}
-          <p class="empty-state">{t('config.noMatchingFields')}</p>
-        {:else}
-          <div class="object-card__grid">
-            {#each node.visibleChildren as child (child.id)}
-              {#if child.inputKind === 'object'}
-                {@render ObjectNode(child)}
-              {:else}
-                {@render FieldNode(child)}
-              {/if}
-            {/each}
-          </div>
-        {/if}
-      </div>
-    {/if}
+    <div class="object-card__body">
+      {#if node.visibleChildren.length === 0}
+        <p class="empty-state">{t('config.noMatchingFields')}</p>
+      {:else}
+        <div class="object-card__grid">
+          {#each node.visibleChildren as child (child.id)}
+            {#if child.inputKind === 'object-group'}
+              {@render ObjectNode(child)}
+            {:else}
+              {@render FieldNode(child)}
+            {/if}
+          {/each}
+        </div>
+      {/if}
+    </div>
   </section>
 {/snippet}
 
@@ -947,7 +990,7 @@
         <Copy size={14} />
         {t('config.copyJson')}
       </button>
-      <button type="button" class="secondary-action" onclick={() => loadConfigPage()}>
+      <button type="button" class="secondary-action" onclick={() => loadConfigPage({ force: true })}>
         <RefreshCw size={14} />
         {t('common.reload')}
       </button>
@@ -970,7 +1013,15 @@
             <p>{t('config.mergedJsonDescription')}</p>
           </div>
           <div class="advanced-card__actions">
-            <button type="button" class="secondary-action" onclick={() => { rawJsonDraft = prettyConfig; rawJsonDirty = false; rawJsonError = ''; }}>
+            <button
+              type="button"
+              class="secondary-action"
+              onclick={() => {
+                rawJsonDraft = prettyConfig;
+                rawJsonDirty = false;
+                rawJsonError = '';
+              }}
+            >
               <RotateCcw size={14} />
               {t('common.reset')}
             </button>
@@ -1050,89 +1101,47 @@
     </div>
   {:else}
     <div class="config-shell">
-      <div class="config-toolbar">
-        <label class="search-box">
-          <Search size={16} />
-          <input type="search" bind:value={searchQuery} placeholder={t('config.searchPlaceholder')} />
-        </label>
-
-        <div class="config-pills">
-          {#each visibleGroups as group (group.groupKey)}
-            <button
-              type="button"
-              class="pill {activeNavGroup === group.groupKey ? 'is-active' : ''}"
-              onclick={() => focusGroup(group.groupKey)}
-            >
-              <span>{group.label}</span>
-              {#if pathHasChanges(group.groupKey)}
-                <span class="pill__dot"></span>
-              {/if}
-            </button>
-          {/each}
+      <section id={configSectionId(resolvedSectionKey)} class="section-card">
+        <div class="section-card__header">
+          <div class="section-card__title">
+            <currentSectionIcon size={18}></currentSectionIcon>
+            <div>
+              <h3>{currentSectionLabel}</h3>
+              <p>{resolvedSectionKey}</p>
+            </div>
+          </div>
+          <div class="section-card__summary">
+            <span>{currentSectionNodes.length} field(s)</span>
+            {#if hasChanges}
+              <span class="config-badge config-badge--muted">{t('config.unsaved')}</span>
+            {/if}
+          </div>
         </div>
-      </div>
 
-      {#if visibleGroups.length === 0}
-        <p class="empty-state">{t('config.noMatchingItems')}</p>
-      {:else}
-        <div class="group-list">
-          {#each visibleGroups as group (group.groupKey)}
-            <section id={configSectionId(group.groupKey)} class="group-card">
-              <button
-                type="button"
-                class="group-card__header"
-                onclick={() => {
-                  toggleGroup(group.groupKey);
-                  activeNavGroup = group.groupKey;
-                }}
-                aria-expanded={isGroupOpen(group)}
-              >
-                <div class="group-card__title-row">
-                  {#if group.icon}
-                    <group.icon size={18} />
-                  {:else}
-                    <Database size={18} />
-                  {/if}
-                  <div>
-                    <h3>{group.label}</h3>
-                    <p>{group.groupKey}</p>
-                  </div>
-                </div>
-                <div class="group-card__summary">
-                  {#if group.node.modifiedFromDefault}
-                    <span class="config-badge">{t('config.modified')}</span>
-                  {/if}
-                  {#if pathHasChanges(group.groupKey)}
-                    <span class="config-badge config-badge--muted">{t('config.unsaved')}</span>
-                  {/if}
-                  <ChevronDown
-                    size={18}
-                    style={`transform: rotate(${isGroupOpen(group) ? 180 : 0}deg); transition: transform 0.18s ease;`}
-                  />
-                </div>
-              </button>
-
-              {#if isGroupOpen(group)}
-                <div class="group-card__body" transition:slide={{ duration: 200 }}>
-                  {#if group.node.inputKind === 'object'}
-                    <div class="group-card__grid">
-                      {#each group.node.visibleChildren as child (child.id)}
-                        {#if child.inputKind === 'object'}
-                          {@render ObjectNode(child)}
-                        {:else}
-                          {@render FieldNode(child)}
-                        {/if}
-                      {/each}
-                    </div>
-                  {:else}
-                    {@render FieldNode(group.node)}
-                  {/if}
-                </div>
-              {/if}
-            </section>
-          {/each}
+        <div class="config-toolbar">
+          <label class="search-box">
+            <Search size={16} />
+            <input type="search" bind:value={searchQuery} placeholder={t('config.searchPlaceholder')} />
+          </label>
+          <p class="section-card__hint">
+            {t('config.sectionHint', { section: currentSectionLabel })}
+          </p>
         </div>
-      {/if}
+
+        {#if currentSectionNodes.length === 0}
+          <p class="empty-state">{t('config.noMatchingItems')}</p>
+        {:else}
+          <div class="section-card__grid">
+            {#each currentSectionNodes as node (node.id)}
+              {#if node.inputKind === 'object-group'}
+                {@render ObjectNode(node)}
+              {:else}
+                {@render FieldNode(node)}
+              {/if}
+            {/each}
+          </div>
+        {/if}
+      </section>
     </div>
   {/if}
 
@@ -1154,9 +1163,9 @@
         </div>
       </div>
       <div class="save-bar__changes">
-        {#each changedFields as change (change.path)}
+        {#each changedFields as change (change.absolutePath)}
           <div class="change-row">
-            <span>{change.path}</span>
+            <span>{change.absolutePath}</span>
             <code>{formatValue(change.previous)}</code>
             <span>→</span>
             <code>{formatValue(change.current)}</code>
@@ -1183,7 +1192,7 @@
   .config-header,
   .config-toolbar,
   .advanced-card,
-  .group-card,
+  .section-card,
   .save-bar__content,
   .save-bar__changes,
   .file-card,
@@ -1194,26 +1203,41 @@
     border-radius: 1rem;
   }
 
-  .config-header {
+  .config-header,
+  .section-card__header,
+  .advanced-card__header,
+  .file-card__header,
+  .config-field__heading {
     display: flex;
     justify-content: space-between;
     gap: 1rem;
-    padding: 1.25rem 1.5rem;
     align-items: flex-start;
+  }
+
+  .config-header,
+  .advanced-card,
+  .section-card,
+  .file-card,
+  .object-card,
+  .config-field {
+    padding: 1.25rem 1.5rem;
   }
 
   .config-header h2,
   .advanced-card__title h3,
-  .group-card__title-row h3 {
+  .section-card__title h3 {
     margin: 0;
   }
 
   .config-header p,
   .advanced-card__header p,
-  .group-card__title-row p,
+  .section-card__title p,
+  .section-card__hint,
   .config-field__description,
   .object-card__description,
-  .file-card__header p {
+  .file-card__header p,
+  .config-field__path,
+  .object-card__path {
     margin: 0.35rem 0 0;
     color: var(--text-secondary);
     font-size: 0.92rem;
@@ -1222,17 +1246,19 @@
   .config-header__actions,
   .advanced-card__actions,
   .save-bar__actions,
-  .config-field__heading,
-  .file-card__header,
-  .group-card__summary {
+  .section-card__summary,
+  .config-field__title-row,
+  .object-card__title-row,
+  .file-card__title-row,
+  .config-field__hint-row {
     display: flex;
     align-items: center;
     gap: 0.75rem;
+    flex-wrap: wrap;
   }
 
   .mode-switch,
   .search-box,
-  .pill,
   .primary-action,
   .secondary-action,
   .ghost-action,
@@ -1308,200 +1334,111 @@
     cursor: not-allowed;
   }
 
-  .config-shell {
+  .config-shell,
+  .advanced-grid,
+  .file-list,
+  .object-card__grid,
+  .section-card__grid {
     display: grid;
     gap: 1rem;
   }
 
+  .advanced-grid {
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  }
+
+  .section-card__title,
+  .advanced-card__title {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
   .config-toolbar {
-    position: sticky;
-    top: 0;
-    z-index: 20;
     padding: 1rem;
-    backdrop-filter: blur(14px);
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    align-items: center;
+    margin-top: 1rem;
   }
 
   .search-box {
-    width: min(30rem, 100%);
-    padding: 0.85rem 1rem;
+    flex: 1;
+    min-width: 0;
+    padding: 0.8rem 1rem;
     border: 1px solid var(--border);
     background: var(--bg-elevated);
   }
 
-  .search-box input {
+  .search-box input,
+  .config-input,
+  .tag-chip input,
+  .config-editor {
     width: 100%;
-    border: 0;
+    border: none;
     background: transparent;
     color: inherit;
     font: inherit;
+    outline: none;
   }
 
-  .config-pills {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.65rem;
-    margin-top: 1rem;
-  }
-
-  .pill {
-    padding: 0.55rem 0.85rem;
-    border: 1px solid var(--border);
-    background: var(--bg-card);
-    color: var(--text-secondary);
-    cursor: pointer;
-  }
-
-  .pill.is-active,
-  .pill:hover {
-    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-    color: var(--accent);
-  }
-
-  .pill__dot {
-    width: 0.5rem;
-    height: 0.5rem;
-    border-radius: 999px;
-    background: var(--accent);
-  }
-
-  .group-list,
-  .group-card__grid,
-  .object-card__grid,
-  .file-list {
-    display: grid;
-    gap: 1rem;
-  }
-
-  .group-card__header,
-  .object-card__header {
-    width: 100%;
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 1rem;
-    padding: 1.1rem 1.2rem;
-    border: 0;
-    background: transparent;
-    color: inherit;
-    text-align: left;
-    cursor: pointer;
-  }
-
-  .group-card__title-row,
-  .advanced-card__title,
-  .file-card__title-row,
-  .object-card__title-row,
-  .config-field__title-row {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-  }
-
-  .group-card__title-row p,
-  .object-card__path,
-  .config-field__path {
-    font-family: "IBM Plex Mono", monospace;
-    font-size: 0.78rem;
-    color: var(--text-muted);
-  }
-
-  .group-card__body,
-  .object-card__body,
-  .advanced-card,
-  .file-card,
-  .config-field {
-    overflow: hidden;
-  }
-
-  .group-card__body,
-  .object-card__body,
-  .advanced-card,
-  .file-card {
-    padding: 0 1.2rem 1.2rem;
+  .section-card__hint {
+    min-width: 14rem;
+    text-align: right;
   }
 
   .config-field,
   .object-card {
-    position: relative;
-  }
-
-  .config-field {
     display: grid;
-    grid-template-columns: minmax(0, 1.15fr) minmax(16rem, 0.85fr);
     gap: 1rem;
-    padding: 1rem;
   }
 
-  .config-field.is-modified,
-  .object-card.is-emphasized,
-  .config-badge {
-    display: inline-flex;
-    align-items: center;
-    padding: 0.2rem 0.55rem;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-    color: var(--accent);
-    font-size: 0.75rem;
-    font-weight: 600;
-  }
-
-  .config-badge--muted {
-    background: var(--bg-elevated);
-    color: var(--text-secondary);
-  }
-
-  .config-field__meta {
+  .config-field__control,
+  .object-card__body {
     display: grid;
-    gap: 0.75rem;
+    gap: 0.85rem;
   }
 
-  .config-field__heading {
-    justify-content: space-between;
+  .config-field__title-row h4,
+  .object-card__title-row h4,
+  .file-card__title-row h4 {
+    margin: 0;
   }
 
   .config-field__hint-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.65rem 1rem;
-    color: var(--text-muted);
-    font-size: 0.8rem;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
   }
 
   .config-input,
   .config-editor,
-  .tag-chip input {
-    width: 100%;
-    border-radius: 0.9rem;
+  .tag-chip {
     border: 1px solid var(--border);
     background: var(--bg-elevated);
-    color: inherit;
-    padding: 0.8rem 0.95rem;
-    font: inherit;
+    border-radius: 0.9rem;
   }
 
-  .config-input:focus,
-  .config-editor:focus,
-  .tag-chip input:focus,
-  .search-box:focus-within {
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
+  .config-input,
+  .config-editor {
+    padding: 0.85rem 1rem;
   }
 
   .config-editor {
+    min-height: 10rem;
     resize: vertical;
-    font-family: "IBM Plex Mono", monospace;
+    font-family: 'IBM Plex Mono', monospace;
     line-height: 1.5;
   }
 
   .config-editor--full {
-    min-height: 24rem;
+    min-height: 28rem;
   }
 
   .field-input-row {
     display: flex;
+    gap: 0.75rem;
     align-items: center;
-    gap: 0.6rem;
   }
 
   .tag-editor {
@@ -1510,43 +1447,33 @@
   }
 
   .tag-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.65rem;
+    display: grid;
+    gap: 0.75rem;
   }
 
   .tag-chip {
-    display: inline-flex;
+    display: flex;
     align-items: center;
-    gap: 0.4rem;
-    padding: 0.3rem;
-    border-radius: 999px;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-  }
-
-  .tag-chip input {
-    min-width: 8rem;
-    border: 0;
-    padding: 0.35rem 0.55rem;
-    background: transparent;
+    gap: 0.75rem;
+    padding: 0.3rem 0.85rem;
   }
 
   .tag-chip button {
-    border: 0;
+    border: none;
     background: transparent;
     color: var(--text-secondary);
     cursor: pointer;
-    font-size: 1rem;
+    font-size: 1.2rem;
+    line-height: 1;
   }
 
   .config-toggle {
     position: relative;
     width: 3.25rem;
     height: 1.9rem;
-    border: 0;
+    border: none;
     border-radius: 999px;
-    background: var(--border-hover);
+    background: color-mix(in srgb, var(--text-secondary) 35%, transparent);
     cursor: pointer;
     transition: background 0.2s ease;
   }
@@ -1557,10 +1484,10 @@
 
   .config-toggle__thumb {
     position: absolute;
-    top: 0.22rem;
-    left: 0.22rem;
-    width: 1.45rem;
-    height: 1.45rem;
+    top: 0.2rem;
+    left: 0.2rem;
+    width: 1.5rem;
+    height: 1.5rem;
     border-radius: 999px;
     background: white;
     transition: transform 0.2s ease;
@@ -1570,144 +1497,135 @@
     transform: translateX(1.35rem);
   }
 
-  .advanced-grid {
-    display: grid;
-    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
-    gap: 1rem;
+  .config-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.28rem 0.55rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--accent);
+    font-size: 0.76rem;
+    font-weight: 600;
   }
 
-  .advanced-card {
-    padding: 1.2rem;
-  }
-
-  .advanced-card__header {
-    display: flex;
-    justify-content: space-between;
-    gap: 1rem;
-    margin-bottom: 1rem;
-  }
-
-  .file-card {
-    padding: 1rem;
+  .config-badge--muted {
+    background: color-mix(in srgb, var(--text-secondary) 16%, transparent);
+    color: var(--text-secondary);
   }
 
   .save-bar {
     position: fixed;
-    left: 1.25rem;
-    right: 1.25rem;
-    bottom: 1.25rem;
-    z-index: 40;
+    left: 18rem;
+    right: 1.5rem;
+    bottom: 1.5rem;
     display: grid;
     gap: 0.75rem;
+    z-index: 30;
   }
 
   .save-bar__content,
   .save-bar__changes {
-    padding: 1rem 1.1rem;
-    backdrop-filter: blur(16px);
+    padding: 1rem 1.25rem;
   }
 
   .save-bar__content {
     display: flex;
     justify-content: space-between;
     gap: 1rem;
+    align-items: center;
   }
 
   .save-bar__content p,
-  .save-bar__content span,
-  .change-row {
+  .save-bar__content span {
     margin: 0;
-    font-size: 0.92rem;
-  }
-
-  .save-bar__content span,
-  .inline-error,
-  .empty-state,
-  .loading-state {
-    color: var(--text-secondary);
   }
 
   .save-bar__changes {
-    max-height: 14rem;
-    overflow: auto;
     display: grid;
     gap: 0.55rem;
+    max-height: 12rem;
+    overflow: auto;
   }
 
   .change-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) auto minmax(0, 1fr);
+    gap: 0.75rem;
     align-items: center;
-    gap: 0.55rem;
-    flex-wrap: wrap;
+    font-size: 0.85rem;
   }
 
   .change-row code {
-    padding: 0.18rem 0.45rem;
-    border-radius: 0.45rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 0.25rem 0.45rem;
+    border-radius: 0.5rem;
     background: var(--bg-elevated);
-    font-family: "IBM Plex Mono", monospace;
   }
 
-  .toast,
-  .error-banner {
-    border-radius: 0.9rem;
-    padding: 0.9rem 1rem;
-    border: 1px solid color-mix(in srgb, var(--success) 30%, var(--border));
-    background: color-mix(in srgb, var(--success) 12%, transparent);
-    color: var(--text-primary);
-  }
-
-  .toast {
-    position: fixed;
-    left: 50%;
-    bottom: 10rem;
-    transform: translateX(-50%);
-    z-index: 50;
-    min-width: min(32rem, calc(100vw - 2rem));
-    text-align: center;
-  }
-
-  .toast.is-error,
+  .loading-state,
+  .empty-state,
   .error-banner,
   .inline-error {
-    border-color: color-mix(in srgb, var(--error) 30%, var(--border));
-    background: color-mix(in srgb, var(--error) 10%, transparent);
-    color: var(--error);
-  }
-
-  .inline-error {
-    margin: 0.6rem 0 0;
-    padding: 0.65rem 0.8rem;
-    border-radius: 0.8rem;
-    border: 1px solid color-mix(in srgb, var(--error) 30%, var(--border));
+    margin: 0;
+    padding: 1rem 1.25rem;
+    border-radius: 1rem;
   }
 
   .loading-state,
   .empty-state {
-    padding: 1rem;
+    border: 1px dashed var(--border);
+    color: var(--text-secondary);
+    background: color-mix(in srgb, var(--bg-card) 80%, transparent);
   }
 
-  @media (max-width: 960px) {
-    .advanced-grid,
-    .config-field {
-      grid-template-columns: 1fr;
-    }
+  .error-banner,
+  .inline-error,
+  .toast.is-error {
+    background: color-mix(in srgb, #ef4444 16%, transparent);
+    color: #fca5a5;
+  }
 
+  .toast {
+    position: fixed;
+    right: 1.5rem;
+    bottom: 1.5rem;
+    padding: 0.9rem 1.2rem;
+    border-radius: 0.9rem;
+    background: color-mix(in srgb, #10b981 16%, var(--bg-card));
+    color: #6ee7b7;
+    z-index: 35;
+  }
+
+  @media (max-width: 1024px) {
+    .save-bar {
+      left: 1rem;
+      right: 1rem;
+      bottom: 1rem;
+    }
+  }
+
+  @media (max-width: 720px) {
     .config-header,
+    .section-card__header,
     .advanced-card__header,
+    .file-card__header,
+    .config-toolbar,
     .save-bar__content,
-    .file-card__header {
-      flex-direction: column;
+    .change-row,
+    .field-input-row {
+      grid-template-columns: 1fr;
+      display: grid;
     }
 
-    .config-toolbar {
-      top: 0.5rem;
+    .section-card__hint {
+      min-width: 0;
+      text-align: left;
     }
 
     .save-bar {
-      left: 0.75rem;
-      right: 0.75rem;
-      bottom: 0.75rem;
+      position: static;
     }
   }
 </style>
