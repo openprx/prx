@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use schemars::schema_for;
 use serde_json::Value;
 
 const REDACTION_MASK: &str = "***";
@@ -112,6 +113,10 @@ pub async fn get_config(State(state): State<AppState>) -> Response {
 
     redact_config_value(None, &mut value);
     Json(value).into_response()
+}
+
+pub async fn get_config_schema() -> Response {
+    Json(schema_for!(crate::config::Config)).into_response()
 }
 
 fn redact_config_value(key: Option<&str>, value: &mut Value) {
