@@ -159,15 +159,20 @@ impl PrecompileCache {
 
     /// Fast, stable hash for cache keying.
     ///
-    /// Uses `DefaultHasher` with the length mixed in to further reduce
-    /// collision probability for small WASM changes.
+    /// Uses FNV-1a 64-bit — deterministic across Rust versions and platforms,
+    /// unlike `DefaultHasher` whose output is explicitly documented as unstable.
+    /// File size is appended as a suffix to further reduce cache collision
+    /// probability for small WASM changes.
     fn hash_bytes(data: &[u8]) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        data.hash(&mut hasher);
-        let h = hasher.finish();
-        format!("{:016x}-{:08x}", h, data.len() as u32)
+        // FNV-1a 64-bit constants (http://www.isthe.com/chongo/tech/comp/fnv/)
+        const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = FNV_OFFSET_BASIS;
+        for &byte in data {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        format!("{:016x}-{:08x}", hash, data.len() as u32)
     }
 }
 
