@@ -1,1 +1,0 @@
-import"../chunks/DfZ_O-Cd.js";import"../chunks/BeaXuNgR.js";import{P as t}from"../chunks/mmL7kjF6.js";import{N as e}from"../chunks/D7TTR6hv.js";function a(o){t(o,{title:"Nodes",get icon(){return e}})}export{a as component};

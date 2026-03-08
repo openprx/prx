@@ -1,1 +1,0 @@
-import"../chunks/DfZ_O-Cd.js";import"../chunks/BeaXuNgR.js";import{P as r}from"../chunks/mmL7kjF6.js";import{B as t}from"../chunks/DezfEXBk.js";function n(o){r(o,{title:"Memory",get icon(){return t}})}export{n as component};
