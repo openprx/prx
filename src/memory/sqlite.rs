@@ -278,7 +278,8 @@ impl SqliteMemory {
                 visibility   TEXT NOT NULL DEFAULT 'private',
                 sensitivity  TEXT NOT NULL DEFAULT 'normal',
                 risk_signals TEXT DEFAULT '[]',
-                policy_version INTEGER DEFAULT 1
+                policy_version INTEGER DEFAULT 1,
+                useful_count INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
@@ -478,6 +479,10 @@ impl SqliteMemory {
             (
                 "policy_version",
                 "ALTER TABLE memories ADD COLUMN policy_version INTEGER DEFAULT 1",
+            ),
+            (
+                "useful_count",
+                "ALTER TABLE memories ADD COLUMN useful_count INTEGER NOT NULL DEFAULT 0",
             ),
         ];
         for (name, alter_sql) in missing_columns {
@@ -1034,7 +1039,7 @@ impl Memory for SqliteMemory {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "SELECT id, key, content, category, created_at, session_id \
+                    "SELECT id, key, content, category, created_at, session_id, useful_count \
                      FROM memories WHERE id IN ({placeholders})"
                 );
                 let mut stmt = conn.prepare(&sql)?;
@@ -1052,17 +1057,20 @@ impl Memory for SqliteMemory {
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<u32>>(6)?,
                     ))
                 })?;
 
                 let mut entry_map = std::collections::HashMap::new();
                 for row in rows {
-                    let (id, key, content, cat, ts, sid) = row?;
-                    entry_map.insert(id, (key, content, cat, ts, sid));
+                    let (id, key, content, cat, ts, sid, useful_count) = row?;
+                    entry_map.insert(id, (key, content, cat, ts, sid, useful_count));
                 }
 
                 for scored in &merged {
-                    if let Some((key, content, cat, ts, sid)) = entry_map.remove(&scored.id) {
+                    if let Some((key, content, cat, ts, sid, useful_count)) =
+                        entry_map.remove(&scored.id)
+                    {
                         let entry = MemoryEntry {
                             id: scored.id.clone(),
                             key,
@@ -1073,7 +1081,7 @@ impl Memory for SqliteMemory {
                             score: Some(f64::from(scored.final_score)),
                             tags: None,
                             access_count: None,
-                            useful_count: None,
+                            useful_count,
                             source: None,
                             source_confidence: None,
                             verification_status: None,
@@ -1110,7 +1118,7 @@ impl Memory for SqliteMemory {
                         .collect();
                     let where_clause = conditions.join(" OR ");
                     let sql = format!(
-                        "SELECT id, key, content, category, created_at, session_id FROM memories
+                        "SELECT id, key, content, category, created_at, session_id, useful_count FROM memories
                          WHERE {where_clause}
                          ORDER BY updated_at DESC
                          LIMIT ?{}",
@@ -1137,7 +1145,7 @@ impl Memory for SqliteMemory {
                             score: Some(1.0),
                             tags: None,
                             access_count: None,
-                            useful_count: None,
+                            useful_count: row.get(6)?,
                             source: None,
                             source_confidence: None,
                             verification_status: None,
@@ -1170,7 +1178,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1",
+                "SELECT id, key, content, category, created_at, session_id, useful_count FROM memories WHERE key = ?1",
             )?;
 
             let mut rows = stmt.query_map(params![key], |row| {
@@ -1184,7 +1192,7 @@ impl Memory for SqliteMemory {
                     score: None,
                     tags: None,
                     access_count: None,
-                    useful_count: None,
+                    useful_count: row.get(6)?,
                     source: None,
                     source_confidence: None,
                     verification_status: None,
@@ -1228,7 +1236,7 @@ impl Memory for SqliteMemory {
                     score: None,
                     tags: None,
                     access_count: None,
-                    useful_count: None,
+                    useful_count: row.get(6)?,
                     source: None,
                     source_confidence: None,
                     verification_status: None,
@@ -1240,7 +1248,7 @@ impl Memory for SqliteMemory {
             if let Some(ref cat) = category {
                 let cat_str = Self::category_to_str(cat);
                 let mut stmt = conn.prepare(
-                    "SELECT id, key, content, category, created_at, session_id FROM memories
+                    "SELECT id, key, content, category, created_at, session_id, useful_count FROM memories
                      WHERE category = ?1 ORDER BY updated_at DESC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT], row_mapper)?;
@@ -1255,7 +1263,7 @@ impl Memory for SqliteMemory {
                 }
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT id, key, content, category, created_at, session_id FROM memories
+                    "SELECT id, key, content, category, created_at, session_id, useful_count FROM memories
                      ORDER BY updated_at DESC LIMIT ?1",
                 )?;
                 let rows = stmt.query_map(params![DEFAULT_LIST_LIMIT], row_mapper)?;
@@ -1283,6 +1291,24 @@ impl Memory for SqliteMemory {
             let conn = conn.lock();
             let affected = conn.execute("DELETE FROM memories WHERE key = ?1", params![key])?;
             Ok(affected > 0)
+        })
+        .await?
+    }
+
+    async fn increment_useful_count(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE memories
+                 SET useful_count = COALESCE(useful_count, 0) + 1,
+                     updated_at = ?1
+                 WHERE id = ?2",
+                params![Local::now().to_rfc3339(), id],
+            )?;
+            Ok(())
         })
         .await?
     }
@@ -2226,6 +2252,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(new, 1);
+    }
+
+    #[tokio::test]
+    async fn increment_useful_count_updates_row() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("memory_key", "useful fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let entry = mem.get("memory_key").await.unwrap().unwrap();
+        assert_eq!(entry.useful_count, Some(0));
+
+        mem.increment_useful_count(&entry.id).await.unwrap();
+
+        let updated = mem.get("memory_key").await.unwrap().unwrap();
+        assert_eq!(updated.useful_count, Some(1));
     }
 
     // ── Open timeout tests ────────────────────────────────────────

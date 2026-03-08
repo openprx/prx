@@ -383,6 +383,10 @@ impl Memory for LucidMemory {
         self.local.forget(key).await
     }
 
+    async fn increment_useful_count(&self, id: &str) -> anyhow::Result<()> {
+        self.local.increment_useful_count(id).await
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         self.local.count().await
     }

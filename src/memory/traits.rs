@@ -151,6 +151,14 @@ pub trait Memory: Send + Sync {
     /// Remove a memory by key
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;
 
+    /// Increment the usefulness feedback counter for a recalled memory entry.
+    ///
+    /// Backends that do not persist `useful_count` can safely no-op.
+    async fn increment_useful_count(&self, id: &str) -> anyhow::Result<()> {
+        let _ = id;
+        Ok(())
+    }
+
     /// Count total memories
     async fn count(&self) -> anyhow::Result<usize>;
 
