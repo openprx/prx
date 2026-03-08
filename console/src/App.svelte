@@ -1,5 +1,7 @@
 <script>
+  import { api } from './lib/api';
   import { clearToken, getToken } from './lib/auth';
+  import { buildConfigNavGroups, focusConfigSection } from './lib/config-nav';
   import { NAV_ITEMS } from './lib/constants';
   import { LANG_STORAGE_KEY, i18n, syncLanguageFromStorage, t, toggleLanguage } from './lib/i18n';
   import { currentPath, initRouter, navigate } from './lib/router';
@@ -21,10 +23,19 @@
   let token = $state(getToken());
   let mobileSidebarOpen = $state(false);
   let isDark = $state(true);
+  let configNavGroups = $state([]);
+  let configNavLoading = $state(false);
+  let activeConfigHash = $state(typeof window !== 'undefined' ? window.location.hash : '');
 
   const isAuthenticated = $derived(token.length > 0);
   const activePath = $derived(isAuthenticated && path === '/' ? '/overview' : path);
   const activeNavPath = $derived(activePath.startsWith('/chat/') ? '/sessions' : activePath);
+  const showConfigSubnav = $derived(activePath === '/config');
+  const activeConfigSection = $derived(
+    activeConfigHash.startsWith('#config-section-')
+      ? activeConfigHash.slice('#config-section-'.length)
+      : ''
+  );
   function safeDecodeSessionId(rawValue) {
     try {
       return decodeURIComponent(rawValue);
@@ -67,6 +78,7 @@
   function onRouteChange(nextPath) {
     path = nextPath;
     mobileSidebarOpen = false;
+    activeConfigHash = typeof window !== 'undefined' ? window.location.hash : '';
   }
 
   function onLogin(nextToken) {
@@ -82,6 +94,29 @@
 
   function goTo(targetPath) {
     navigate(targetPath);
+  }
+
+  function onHashChange() {
+    activeConfigHash = window.location.hash;
+  }
+
+  async function loadConfigNavGroups() {
+    if (!isAuthenticated || activePath !== '/config' || configNavLoading) return;
+
+    configNavLoading = true;
+    try {
+      const config = await api.getConfig();
+      configNavGroups = buildConfigNavGroups(config);
+    } catch {
+      configNavGroups = buildConfigNavGroups(null);
+    } finally {
+      configNavLoading = false;
+    }
+  }
+
+  function goToConfigSection(groupKey) {
+    focusConfigSection(groupKey);
+    mobileSidebarOpen = false;
   }
 
   $effect(() => {
@@ -106,10 +141,12 @@
     };
 
     window.addEventListener('storage', onStorage);
+    window.addEventListener('hashchange', onHashChange);
 
     return () => {
       stopRouter();
       window.removeEventListener('storage', onStorage);
+      window.removeEventListener('hashchange', onHashChange);
     };
   });
 
@@ -122,6 +159,15 @@
     if (!isAuthenticated && path !== '/') {
       navigate('/', true);
     }
+  });
+
+  $effect(() => {
+    if (showConfigSubnav) {
+      loadConfigNavGroups();
+      return;
+    }
+
+    configNavGroups = [];
   });
 </script>
 
@@ -153,7 +199,7 @@
             <button
               type="button"
               onclick={() => goTo(item.path)}
-                class={`w-full rounded-lg px-3 py-2 text-left text-sm transition ${
+              class={`w-full rounded-lg px-3 py-2 text-left text-sm transition ${
                 activeNavPath === item.path
                   ? 'bg-sky-600 text-white'
                   : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-gray-700 dark:hover:text-gray-100'
@@ -161,6 +207,28 @@
             >
               {t(item.labelKey)}
             </button>
+
+            {#if item.path === '/config' && showConfigSubnav}
+              <div class="ml-4 mt-1 space-y-1 border-l border-gray-200 pl-3 dark:border-gray-700">
+                {#each configNavGroups as group}
+                  <button
+                    type="button"
+                    onclick={() => goToConfigSection(group.groupKey)}
+                    class={`w-full rounded-md px-2 py-1.5 text-left text-xs transition ${
+                      activeConfigSection === group.groupKey
+                        ? 'bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300'
+                        : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-gray-100'
+                    }`}
+                  >
+                    {group.label}
+                  </button>
+                {/each}
+
+                {#if configNavLoading && configNavGroups.length === 0}
+                  <p class="px-2 py-1 text-xs text-gray-400 dark:text-gray-500">Loading...</p>
+                {/if}
+              </div>
+            {/if}
           {/each}
         </nav>
       </aside>
