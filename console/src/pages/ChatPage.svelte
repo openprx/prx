@@ -6,6 +6,7 @@
   import { Paperclip } from '@lucide/svelte';
 
   const MAX_FILES = 10;
+  const MESSAGES_PAGE_SIZE = 40;
   const IMAGE_VIDEO_MARKER_REGEX =
     /\[(IMAGE|VIDEO):([^\]]+)\]|(data:(?:image|video)\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=]+)/gi;
 
@@ -15,6 +16,9 @@
   let draftMessage = $state('');
   let loading = $state(true);
   let sending = $state(false);
+  let loadingMore = $state(false);
+  let hasMore = $state(false);
+  let loadedCount = $state(0);
   let errorMessage = $state('');
   let scrollContainer = $state(null);
   let fileInput = $state(null);
@@ -246,16 +250,65 @@
     }
   }
 
-  async function loadMessages() {
+  async function loadMessagesPage(offset, { appendOlder = false } = {}) {
+    const response = await api.getSessionMessages(sessionId, {
+      limit: MESSAGES_PAGE_SIZE + 1,
+      offset
+    });
+    const rawMessages = Array.isArray(response) ? response : [];
+    const nextHasMore = rawMessages.length > MESSAGES_PAGE_SIZE;
+    const pageMessages = nextHasMore ? rawMessages.slice(0, MESSAGES_PAGE_SIZE) : rawMessages;
+
+    if (appendOlder && scrollContainer) {
+      const previousHeight = scrollContainer.scrollHeight;
+      messages = [...pageMessages, ...messages];
+      loadedCount += pageMessages.length;
+      hasMore = nextHasMore;
+      await tick();
+      scrollContainer.scrollTop = scrollContainer.scrollHeight - previousHeight;
+      return;
+    }
+
+    messages = pageMessages;
+    loadedCount = pageMessages.length;
+    hasMore = nextHasMore;
+  }
+
+  async function loadInitialMessages() {
     try {
-      const response = await api.getSessionMessages(sessionId);
-      messages = Array.isArray(response) ? response : [];
+      await loadMessagesPage(0);
       errorMessage = '';
       await scrollToBottom();
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : t('chat.loadFailed');
     } finally {
       loading = false;
+    }
+  }
+
+  async function loadOlderMessages() {
+    if (loadingMore || !hasMore) {
+      return;
+    }
+
+    loadingMore = true;
+    try {
+      await loadMessagesPage(loadedCount, { appendOlder: true });
+      errorMessage = '';
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : t('chat.loadFailed');
+    } finally {
+      loadingMore = false;
+    }
+  }
+
+  async function refreshMessages() {
+    try {
+      await loadMessagesPage(0);
+      errorMessage = '';
+      await scrollToBottom();
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : t('chat.loadFailed');
     }
   }
 
@@ -281,14 +334,14 @@
         ? await api.sendMessageWithMedia(sessionId, message, files)
         : await api.sendMessage(sessionId, message);
       if (hasMedia) {
-        await loadMessages();
+        await refreshMessages();
       } else if (response && typeof response.reply === 'string' && response.reply.length > 0) {
         messages = [...messages, { role: 'assistant', content: response.reply }];
       }
       clearSelectedFiles();
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : t('chat.sendFailed');
-      await loadMessages();
+      await refreshMessages();
     } finally {
       sending = false;
       await scrollToBottom();
@@ -308,7 +361,7 @@
         return;
       }
       loading = true;
-      await loadMessages();
+      await loadInitialMessages();
     };
 
     refresh();
@@ -349,7 +402,7 @@
   <div
     class="flex min-h-0 flex-1 flex-col rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800"
     role="region"
-    aria-label="Chat messages"
+    aria-label={t('chat.messagesRegion')}
     ondragenter={handleDragEnter}
     ondragover={handleDragOver}
     ondragleave={handleDragLeave}
@@ -361,7 +414,7 @@
     >
       {#if dragActive}
         <p class="mb-3 rounded-lg border border-blue-500/40 bg-blue-500/15 px-3 py-2 text-sm text-blue-700 dark:text-blue-200">
-          Drop files to attach ({selectedFiles.length}/{MAX_FILES} selected)
+          {t('chat.dropFiles', { count: selectedFiles.length, max: MAX_FILES })}
         </p>
       {/if}
       {#if loading}
@@ -370,7 +423,20 @@
         <p class="text-sm text-gray-500 dark:text-gray-400">{t('chat.empty')}</p>
       {:else}
         <div class="space-y-3">
-          {#each messages as message}
+          {#if hasMore}
+            <div class="flex justify-center">
+              <button
+                type="button"
+                onclick={loadOlderMessages}
+                disabled={loadingMore}
+                class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-700"
+              >
+                {loadingMore ? t('chat.loadingMore') : t('chat.loadMore')}
+              </button>
+            </div>
+          {/if}
+
+          {#each messages as message, index (message.message_id ?? `${message.timestamp ?? 'local'}-${index}`)}
             <div class={messageClass(message.role)}>
               {#each parseMessageContent(message.content) as segment (segment.id)}
                 {#if segment.kind === 'text'}
@@ -380,7 +446,7 @@
                 {:else if segment.kind === 'image'}
                   <img
                     src={resolveMediaSource(segment.value)}
-                    alt="Attachment"
+                    alt={t('chat.attachmentAlt')}
                     class="mt-2 max-h-80 max-w-full rounded-lg border border-gray-300/40 object-contain dark:border-gray-600/40"
                     loading="lazy"
                   />
@@ -411,7 +477,7 @@
 
       {#if selectedFiles.length > 0}
         <div class="mb-3 space-y-2 rounded-lg border border-gray-200 bg-gray-50/70 p-2.5 dark:border-gray-700 dark:bg-gray-900/70">
-          <p class="text-xs text-gray-600 dark:text-gray-300">Attachments ({selectedFiles.length}/{MAX_FILES})</p>
+          <p class="text-xs text-gray-600 dark:text-gray-300">{t('chat.attachments', { count: selectedFiles.length, max: MAX_FILES })}</p>
           <div class="max-h-44 space-y-2 overflow-y-auto pr-1">
             {#each selectedFiles as record (record.id)}
               <div class="flex items-center gap-2 rounded-md border border-gray-200 bg-white/90 p-2 dark:border-gray-700 dark:bg-gray-800/90">
@@ -443,7 +509,7 @@
                   class="rounded px-2 py-1 text-xs text-gray-600 hover:bg-gray-200 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-gray-700 dark:hover:text-white"
                   onclick={() => removeFile(record.id)}
                 >
-                  Remove
+                  {t('chat.removeAttachment')}
                 </button>
               </div>
             {/each}
@@ -460,7 +526,7 @@
         ></textarea>
         <button
           type="button"
-          title="Attach files"
+          title={t('chat.attachFiles')}
           class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-600 hover:border-gray-400 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:border-gray-500 dark:hover:bg-gray-700"
           onclick={openFilePicker}
           disabled={sending || selectedFiles.length >= MAX_FILES}

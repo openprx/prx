@@ -14,6 +14,7 @@
   ];
 
   let hooks = $state([]);
+  let hooksEnabled = $state(true);
   let loading = $state(true);
   let errorMessage = $state('');
   let actionError = $state('');
@@ -67,10 +68,12 @@
     try {
       const response = await api.getHooks();
       hooks = Array.isArray(response?.hooks) ? response.hooks : [];
+      hooksEnabled = response?.enabled !== false;
       errorMessage = '';
       actionError = '';
     } catch (error) {
       hooks = [];
+      hooksEnabled = true;
       errorMessage = error instanceof Error ? error.message : t('hooks.loadFailed');
     } finally {
       loading = false;
@@ -186,6 +189,20 @@
     >
       {showAddForm ? t('hooks.cancelAdd') : t('hooks.addHook')}
     </button>
+  </div>
+
+  <div class="flex items-center gap-3 rounded-xl border border-gray-200 bg-white px-4 py-3 dark:border-gray-700 dark:bg-gray-800">
+    <span class="text-sm font-medium text-gray-700 dark:text-gray-200">{t('hooks.globalStatus')}</span>
+    <button
+      type="button"
+      onclick={() => toggleHook(hooks[0]?.id ?? '')}
+      disabled={hooks.length === 0 || togglingId !== ''}
+      aria-label={hooksEnabled ? t('common.disabled') : t('common.enabled')}
+      class={`relative inline-flex h-5 w-9 items-center rounded-full transition ${hooksEnabled ? 'bg-sky-600' : 'bg-gray-400 dark:bg-gray-600'}`}
+    >
+      <span class={`inline-block h-3.5 w-3.5 rounded-full bg-white transition ${hooksEnabled ? 'translate-x-4' : 'translate-x-1'}`}></span>
+    </button>
+    <span class="text-xs text-gray-500 dark:text-gray-400">{t('hooks.globalToggleHint')}</span>
   </div>
 
   {#if showAddForm}
@@ -361,27 +378,18 @@
                   <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{humanizeEvent(hook.event)}</h3>
                   <span
                     class={`rounded-full px-2 py-1 text-xs font-medium ${
-                      hook.enabled
+                      hooksEnabled
                         ? 'border border-green-500/50 bg-green-500/20 text-green-700 dark:text-green-300'
                         : 'border border-red-500/50 bg-red-500/20 text-red-700 dark:text-red-300'
                     }`}
                   >
-                    {hook.enabled ? t('common.enabled') : t('common.disabled')}
+                    {hooksEnabled ? t('common.enabled') : t('common.disabled')}
                   </span>
                 </div>
                 <p class="mt-2 font-mono text-sm text-gray-500 dark:text-gray-400">{hook.command}</p>
                 <p class="mt-1 text-xs text-gray-400 dark:text-gray-500">{t('hooks.timeout')}: {hook.timeout_ms}ms</p>
               </div>
               <div class="flex items-center gap-2">
-                <button
-                  type="button"
-                  onclick={() => toggleHook(hook.id)}
-                  disabled={togglingId === hook.id}
-                  aria-label={hook.enabled ? t('common.disabled') : t('common.enabled')}
-                  class={`relative inline-flex h-5 w-9 items-center rounded-full transition ${hook.enabled ? 'bg-sky-600' : 'bg-gray-400 dark:bg-gray-600'}`}
-                >
-                  <span class={`inline-block h-3.5 w-3.5 rounded-full bg-white transition ${hook.enabled ? 'translate-x-4' : 'translate-x-1'}`}></span>
-                </button>
                 <button
                   type="button"
                   onclick={() => startEdit(hook)}

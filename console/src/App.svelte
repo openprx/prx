@@ -1,7 +1,8 @@
 <script>
   import { api } from './lib/api';
-  import { clearToken, getToken } from './lib/auth';
+  import { clearToken, getToken, syncTokenCookie } from './lib/auth';
   import { buildConfigNavGroups, focusConfigSection } from './lib/config-nav';
+  import { configStore, loadConfigStore } from './lib/config-store.svelte.js';
   import { NAV_ITEMS } from './lib/constants';
   import { LANG_STORAGE_KEY, i18n, syncLanguageFromStorage, t, toggleLanguage } from './lib/i18n';
   import { currentPath, initRouter, navigate } from './lib/router';
@@ -73,6 +74,7 @@
 
   function refreshToken() {
     token = getToken();
+    syncTokenCookie();
   }
 
   function onRouteChange(nextPath) {
@@ -105,7 +107,7 @@
 
     configNavLoading = true;
     try {
-      const config = await api.getConfig();
+      const config = await loadConfigStore();
       configNavGroups = buildConfigNavGroups(config);
     } catch {
       configNavGroups = buildConfigNavGroups(null);
@@ -121,6 +123,7 @@
 
   $effect(() => {
     initTheme();
+    syncTokenCookie();
 
     const stopRouter = initRouter(onRouteChange);
     const onStorage = (event) => {
@@ -163,6 +166,9 @@
 
   $effect(() => {
     if (showConfigSubnav) {
+      if (configStore.data) {
+        configNavGroups = buildConfigNavGroups(configStore.data);
+      }
       loadConfigNavGroups();
       return;
     }
@@ -225,7 +231,7 @@
                 {/each}
 
                 {#if configNavLoading && configNavGroups.length === 0}
-                  <p class="px-2 py-1 text-xs text-gray-400 dark:text-gray-500">Loading...</p>
+                  <p class="px-2 py-1 text-xs text-gray-400 dark:text-gray-500">{t('common.loading')}</p>
                 {/if}
               </div>
             {/if}
@@ -265,7 +271,7 @@
               onclick={toggleLanguage}
               class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
             >
-              {i18n.lang === 'zh' ? '中文 / EN' : 'EN / 中文'}
+              {t('app.languageToggle')}
             </button>
             <button
               type="button"

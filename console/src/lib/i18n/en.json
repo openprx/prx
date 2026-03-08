@@ -4,6 +4,7 @@
     "menu": "Menu",
     "closeSidebar": "Close sidebar",
     "language": "Language",
+    "languageToggle": "中文 / EN",
     "notFound": "Not found",
     "backToOverview": "Back to Overview"
   },
@@ -49,6 +50,13 @@
   },
   "sessions": {
     "title": "Sessions",
+    "searchPlaceholder": "Search session ID, sender, or message",
+    "allChannels": "All channels",
+    "applyFilters": "Apply",
+    "statusLabel": "Status",
+    "previousPage": "Previous",
+    "nextPage": "Next",
+    "pageLabel": "Page {page}",
     "sessionId": "Session ID",
     "sender": "Sender",
     "channel": "Channel",
@@ -56,7 +64,13 @@
     "lastMessage": "Last Message",
     "loading": "Loading sessions...",
     "loadFailed": "Failed to load sessions.",
-    "none": "No active sessions"
+    "none": "No sessions found.",
+    "status": {
+      "all": "All statuses",
+      "active": "Active",
+      "pending": "Pending",
+      "empty": "Empty"
+    }
   },
   "chat": {
     "title": "Chat",
@@ -66,6 +80,14 @@
     "loadFailed": "Failed to load messages.",
     "sendFailed": "Failed to send message.",
     "empty": "No messages in this session.",
+    "loadMore": "Load older messages",
+    "loadingMore": "Loading older messages...",
+    "messagesRegion": "Chat messages",
+    "dropFiles": "Drop files to attach ({count}/{max} selected)",
+    "attachments": "Attachments ({count}/{max})",
+    "removeAttachment": "Remove",
+    "attachFiles": "Attach files",
+    "attachmentAlt": "Attachment",
     "inputPlaceholder": "Type a message...",
     "send": "Send",
     "sending": "Sending..."
@@ -129,7 +151,10 @@
       "notConfigured": "Not configured"
     },
     "redacted": "Redacted",
-    "emptyObject": "No settings"
+    "emptyObject": "No settings",
+    "saveSuccess": "Saved.",
+    "saveRestartRequired": "Saved. Some settings require a restart to take effect.",
+    "saveFailed": "Save failed: {message}"
   },
   "logs": {
     "title": "Logs",
@@ -146,6 +171,7 @@
     "loading": "Loading hooks...",
     "loadFailed": "Failed to load hooks.",
     "noHooks": "No hooks configured.",
+    "globalStatus": "Global enabled state",
     "addHook": "Add Hook",
     "cancelAdd": "Cancel",
     "newHook": "New Hook",

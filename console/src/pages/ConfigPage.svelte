@@ -1,6 +1,7 @@
 <script>
-  import { api } from '../lib/api';
   import { SCHEMA, SCHEMA_HANDLED_KEYS, buildConfigNavGroups, configSectionId, focusConfigSection, humanizeKey } from '../lib/config-nav';
+  import { configStore, loadConfigStore, updateConfigStore } from '../lib/config-store.svelte.js';
+  import { api } from '../lib/api';
   import { t } from '../lib/i18n';
   import { highlightJson } from '../lib/jsonHighlight';
   import {
@@ -17,6 +18,7 @@
   let saving = $state(false);
   let errorMessage = $state('');
   let saveMessage = $state('');
+  let saveMessageTone = $state('success');
   let showRawJson = $state(false);
   let showDiff = $state(false);
   let revealedFields = $state(new Set());
@@ -285,16 +287,13 @@
 
   async function loadConfig() {
     try {
-      const [configResponse, statusResponse] = await Promise.all([
-        api.getConfig(),
-        api.getStatus().catch(() => null)
-      ]);
-      config = typeof configResponse === 'object' && configResponse ? configResponse : {};
+      await loadConfigStore();
+      config = typeof configStore.data === 'object' && configStore.data ? deepClone(configStore.data) : {};
       originalConfig = deepClone(config);
-      status = statusResponse;
+      status = configStore.status;
       errorMessage = '';
     } catch (error) {
-      errorMessage = error instanceof Error ? error.message : 'Failed to load config';
+      errorMessage = error instanceof Error ? error.message : t('config.loadFailed');
     } finally {
       loading = false;
     }
@@ -304,6 +303,7 @@
     if (!hasChanges || saving) return;
     saving = true;
     saveMessage = '';
+    saveMessageTone = 'success';
     try {
       const partial = {};
       for (const change of changedFields) {
@@ -311,15 +311,19 @@
       }
       const result = await api.saveConfig(partial);
       originalConfig = deepClone(config);
+      updateConfigStore(deepClone(config));
       showDiff = false;
       if (result?.restart_required) {
-        saveMessage = '已保存，部分设置需要重启服务后生效';
+        saveMessage = t('config.saveRestartRequired');
       } else {
-        saveMessage = '已保存';
+        saveMessage = t('config.saveSuccess');
       }
       setTimeout(() => { saveMessage = ''; }, 5000);
     } catch (error) {
-      saveMessage = '保存失败: ' + (error instanceof Error ? error.message : String(error));
+      saveMessageTone = 'error';
+      saveMessage = t('config.saveFailed', {
+        message: error instanceof Error ? error.message : String(error)
+      });
     } finally {
       saving = false;
     }
@@ -867,7 +871,7 @@
 
   <!-- Save message toast -->
   {#if saveMessage}
-    <div class="fixed bottom-20 left-1/2 z-50 -translate-x-1/2 rounded-lg border px-4 py-2 text-sm shadow-lg {saveMessage.startsWith('保存失败') ? 'border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-300' : 'border-green-500/30 bg-green-500/10 text-green-700 dark:text-green-300'}">
+    <div class="fixed bottom-20 left-1/2 z-50 -translate-x-1/2 rounded-lg border px-4 py-2 text-sm shadow-lg {saveMessageTone === 'error' ? 'border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-300' : 'border-green-500/30 bg-green-500/10 text-green-700 dark:text-green-300'}">
       {saveMessage}
     </div>
   {/if}

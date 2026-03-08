@@ -4,6 +4,7 @@
     "menu": "菜单",
     "closeSidebar": "关闭侧边栏",
     "language": "语言",
+    "languageToggle": "中文 / EN",
     "notFound": "页面未找到",
     "backToOverview": "返回概览"
   },
@@ -49,6 +50,13 @@
   },
   "sessions": {
     "title": "会话",
+    "searchPlaceholder": "搜索会话 ID、发送方或消息内容",
+    "allChannels": "全部通道",
+    "applyFilters": "应用",
+    "statusLabel": "状态",
+    "previousPage": "上一页",
+    "nextPage": "下一页",
+    "pageLabel": "第 {page} 页",
     "sessionId": "会话 ID",
     "sender": "发送方",
     "channel": "通道",
@@ -56,7 +64,13 @@
     "lastMessage": "最后消息",
     "loading": "正在加载会话...",
     "loadFailed": "加载会话失败。",
-    "none": "当前没有活跃会话"
+    "none": "未找到会话。",
+    "status": {
+      "all": "全部状态",
+      "active": "活跃",
+      "pending": "待处理",
+      "empty": "空"
+    }
   },
   "chat": {
     "title": "聊天",
@@ -66,6 +80,14 @@
     "loadFailed": "加载消息失败。",
     "sendFailed": "发送消息失败。",
     "empty": "此会话暂无消息。",
+    "loadMore": "加载更早消息",
+    "loadingMore": "正在加载更早消息...",
+    "messagesRegion": "聊天消息",
+    "dropFiles": "拖放文件以上传（已选 {count}/{max}）",
+    "attachments": "附件（{count}/{max}）",
+    "removeAttachment": "移除",
+    "attachFiles": "添加附件",
+    "attachmentAlt": "附件",
     "inputPlaceholder": "输入消息...",
     "send": "发送",
     "sending": "发送中..."
@@ -129,7 +151,10 @@
       "notConfigured": "未配置"
     },
     "redacted": "已脱敏",
-    "emptyObject": "无配置项"
+    "emptyObject": "无配置项",
+    "saveSuccess": "已保存。",
+    "saveRestartRequired": "已保存，部分设置需要重启服务后生效。",
+    "saveFailed": "保存失败：{message}"
   },
   "logs": {
     "title": "日志",
@@ -146,6 +171,7 @@
     "loading": "正在加载 Hooks...",
     "loadFailed": "加载 Hooks 失败。",
     "noHooks": "尚未配置任何 Hook。",
+    "globalStatus": "全局启用状态",
     "addHook": "添加 Hook",
     "cancelAdd": "取消",
     "newHook": "新建 Hook",
