@@ -164,7 +164,7 @@ fn run_watcher(
 /// Parse config file and atomically store it.
 fn try_reload(config_path: &std::path::Path, shared: &SharedConfig) -> anyhow::Result<()> {
     let old = shared.load_full();
-    let mut fresh = Config::load_from_path(config_path, old.workspace_dir.clone())?;
+    let mut fresh = load_stable_config_snapshot(config_path, old.workspace_dir.clone())?;
     // ACL mode is not hot-reloadable for already-initialized tool instances.
     // Keep runtime behavior deterministic until restart.
     if fresh.memory.acl_enabled != old.memory.acl_enabled {
@@ -182,6 +182,34 @@ fn try_reload(config_path: &std::path::Path, shared: &SharedConfig) -> anyhow::R
     // Atomically publish new config
     shared.store(Arc::new(fresh));
     Ok(())
+}
+
+fn load_stable_config_snapshot(
+    config_path: &std::path::Path,
+    workspace_dir: PathBuf,
+) -> anyhow::Result<Config> {
+    const MAX_ATTEMPTS: usize = 3;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let before = files::compute_config_fingerprint(config_path)?;
+        let fresh = Config::load_from_path(config_path, workspace_dir.clone())?;
+        let after = files::compute_config_fingerprint(config_path)?;
+        if before == after {
+            return Ok(fresh);
+        }
+
+        tracing::debug!(
+            path = %config_path.display(),
+            attempt,
+            "Config changed during hot-reload snapshot; retrying"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    anyhow::bail!(
+        "Config changed repeatedly while reloading: {}",
+        config_path.display()
+    );
 }
 
 fn log_diff(old: &Config, fresh: &Config) {
