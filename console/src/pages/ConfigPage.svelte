@@ -19,6 +19,7 @@
   let showRawJson = $state(false);
   let showDiff = $state(false);
   let revealedFields = $state(new Set());
+  let activeNavGroup = $state('provider');
 
   // ── Icon map ───────────────────────────────────────────────────
   const ICON_MAP = {
@@ -299,6 +300,21 @@
       .sort();
   })());
 
+  const schemaGroups = Object.entries(SCHEMA);
+
+  const navGroups = $derived([
+    ...schemaGroups.map(([groupKey, group]) => ({
+      groupKey,
+      label: group.label,
+      dynamic: false,
+    })),
+    ...dynamicGroups.map(groupKey => ({
+      groupKey,
+      label: humanizeKey(groupKey),
+      dynamic: true,
+    })),
+  ]);
+
   // ── Nested value access ────────────────────────────────────────
 
   function getNestedValue(obj, path) {
@@ -394,6 +410,38 @@
       if (fp === prefix || fp.startsWith(prefix + '.')) return true;
     }
     return false;
+  }
+
+  function sectionId(groupKey) {
+    return `config-section-${groupKey}`;
+  }
+
+  function focusGroup(groupKey) {
+    activeNavGroup = groupKey;
+
+    if (typeof document === 'undefined') return;
+
+    const target = document.getElementById(sectionId(groupKey));
+    if (!target) return;
+
+    if (target instanceof HTMLDetailsElement) {
+      target.open = true;
+    }
+
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+    if (typeof history !== 'undefined') {
+      history.replaceState(null, '', `#${sectionId(groupKey)}`);
+    }
+  }
+
+  function focusHashTarget() {
+    if (typeof window === 'undefined') return;
+    const hash = window.location.hash.replace(/^#/, '');
+    if (!hash.startsWith('config-section-')) return;
+    const groupKey = hash.replace(/^config-section-/, '');
+    if (!navGroups.some(group => group.groupKey === groupKey)) return;
+    focusGroup(groupKey);
   }
 
   const prettyConfig = $derived(config ? JSON.stringify(config, null, 2) : '');
@@ -518,6 +566,13 @@
   }
 
   $effect(() => { loadConfig(); });
+
+  $effect(() => {
+    if (loading || showRawJson || navGroups.length === 0) return;
+    queueMicrotask(() => {
+      focusHashTarget();
+    });
+  });
 </script>
 
 <!--
@@ -870,15 +925,44 @@
     </div>
   {:else}
     <div class="space-y-3">
+      <div class="sticky top-0 z-20 -mx-1 overflow-x-auto rounded-xl border border-gray-200 bg-white/95 px-3 py-3 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95">
+        <div class="flex min-w-max items-center gap-2">
+          {#each navGroups as nav}
+            {@const navChanged = pathHasChanges(nav.groupKey)}
+            <button
+              type="button"
+              onclick={() => focusGroup(nav.groupKey)}
+              class="inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm transition {activeNavGroup === nav.groupKey ? 'border-sky-500 bg-sky-500/10 text-sky-700 dark:text-sky-300' : 'border-gray-300 bg-white text-gray-600 hover:border-sky-400 hover:text-sky-600 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-300 dark:hover:border-sky-500 dark:hover:text-sky-300'}"
+            >
+              <span>{nav.label}</span>
+              {#if nav.dynamic}
+                <span class="rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-gray-500 dark:bg-gray-700 dark:text-gray-300">Auto</span>
+              {/if}
+              {#if navChanged}
+                <span class="inline-flex h-2 w-2 rounded-full bg-sky-500"></span>
+              {/if}
+            </button>
+          {/each}
+        </div>
+      </div>
 
       <!-- ── SCHEMA groups ───────────────────────────────────────── -->
-      {#each Object.entries(SCHEMA) as [groupKey, group]}
+      {#each schemaGroups as [groupKey, group]}
         {@const IconComponent = ICON_MAP[groupKey]}
         {@const extraFields = getGroupExtraFields(group)}
         {@const schemaFieldPaths = Object.keys(group.fields)}
         {@const groupHasChanges = schemaFieldPaths.some(fp => changedFieldPaths.has(fp)) || extraFields.some(ef => pathHasChanges(ef.path))}
 
-        <details class="group rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800" open={group.defaultOpen}>
+        <details
+          id={sectionId(groupKey)}
+          class="group scroll-mt-24 rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800"
+          open={group.defaultOpen}
+          ontoggle={(event) => {
+            if (event.currentTarget.open) {
+              activeNavGroup = groupKey;
+            }
+          }}
+        >
           <summary class="cursor-pointer select-none px-4 py-3 text-base font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
             {#if IconComponent}
               <IconComponent size={18} class="text-gray-500 dark:text-gray-400" />
@@ -926,7 +1010,15 @@
               {@const groupChanged = pathHasChanges(groupKey)}
               {@const typeLabel = inferFieldType(groupValue)}
 
-              <details class="rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800">
+              <details
+                id={sectionId(groupKey)}
+                class="scroll-mt-24 rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800"
+                ontoggle={(event) => {
+                  if (event.currentTarget.open) {
+                    activeNavGroup = groupKey;
+                  }
+                }}
+              >
                 <summary class="cursor-pointer select-none px-4 py-3 flex items-center gap-2 dark:text-gray-100">
                   <Database size={18} class="flex-shrink-0 text-gray-400 dark:text-gray-500" />
                   <span class="font-mono text-sm font-semibold text-gray-800 dark:text-gray-100">{groupKey}</span>

@@ -1,1 +1,0 @@
-import"../chunks/DfZ_O-Cd.js";import"../chunks/BeaXuNgR.js";import{P as t}from"../chunks/mmL7kjF6.js";import{W as e}from"../chunks/CNspDETr.js";function a(o){t(o,{title:"Hooks",get icon(){return e}})}export{a as component};
