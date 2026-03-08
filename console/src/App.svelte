@@ -1,12 +1,7 @@
 <script>
   import { api } from './lib/api';
   import { clearToken, getToken, syncTokenCookie } from './lib/auth';
-  import {
-    buildConfigNavGroups,
-    focusConfigSection,
-    normalizeConfigSectionHash
-  } from './lib/config-nav';
-  import { configStore, loadConfigStore } from './lib/config-store.svelte.js';
+  // config-nav imports removed (ConfigPage is now a standalone file editor)
   import { NAV_ITEMS } from './lib/constants';
   import {
     LANG_STORAGE_KEY,
@@ -37,21 +32,17 @@
   const THEME_STORAGE_KEY = 'prx-console-theme';
   let themePreference = $state('system');
   let isDark = $state(true);
-  let configNavGroups = $state([]);
-  let configNavLoading = $state(false);
-  let activeConfigHash = $state(typeof window !== 'undefined' ? window.location.hash : '');
+
 
   const isAuthenticated = $derived(token.length > 0);
   const activePath = $derived(isAuthenticated && path === '/' ? '/overview' : path);
   const activeNavPath = $derived(activePath.startsWith('/chat/') ? '/sessions' : activePath);
-  const showConfigSubnav = $derived(activePath === '/config');
   const languageOptions = $derived(
     SUPPORTED_LANGUAGES.map((lang) => ({
       value: lang,
       label: t(`languages.${lang}`)
     }))
   );
-  const activeConfigSection = $derived(normalizeConfigSectionHash(activeConfigHash));
   function safeDecodeSessionId(rawValue) {
     try {
       return decodeURIComponent(rawValue);
@@ -97,7 +88,6 @@
   function onRouteChange(nextPath) {
     path = nextPath;
     mobileSidebarOpen = false;
-    activeConfigHash = typeof window !== 'undefined' ? window.location.hash : '';
   }
 
   function onLogin(nextToken) {
@@ -115,28 +105,6 @@
     navigate(targetPath);
   }
 
-  function onHashChange() {
-    activeConfigHash = window.location.hash;
-  }
-
-  async function loadConfigNavGroups() {
-    if (!isAuthenticated || activePath !== '/config' || configNavLoading) return;
-
-    configNavLoading = true;
-    try {
-      const config = await loadConfigStore();
-      configNavGroups = buildConfigNavGroups(config);
-    } catch {
-      configNavGroups = buildConfigNavGroups(null);
-    } finally {
-      configNavLoading = false;
-    }
-  }
-
-  function goToConfigSection(groupKey) {
-    focusConfigSection(groupKey);
-    mobileSidebarOpen = false;
-  }
 
   $effect(() => {
     initTheme();
@@ -167,13 +135,11 @@
     };
 
     window.addEventListener('storage', onStorage);
-    window.addEventListener('hashchange', onHashChange);
     mediaQuery.addEventListener('change', onThemeMediaChange);
 
     return () => {
       stopRouter();
       window.removeEventListener('storage', onStorage);
-      window.removeEventListener('hashchange', onHashChange);
       mediaQuery.removeEventListener('change', onThemeMediaChange);
     };
   });
@@ -189,23 +155,7 @@
     }
   });
 
-  $effect(() => {
-    if (showConfigSubnav) {
-      if (!configStore.data) {
-        loadConfigNavGroups();
-      } else {
-        configNavGroups = buildConfigNavGroups(configStore.data);
-      }
-    } else {
-      configNavGroups = [];
-    }
-  });
 
-  $effect(() => {
-    if (!showConfigSubnav || configNavLoading || configNavGroups.length === 0) return;
-    if (activeConfigSection) return;
-    focusConfigSection(configNavGroups[0].groupKey);
-  });
 </script>
 
 <div class="console-shell min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
@@ -245,27 +195,7 @@
               {t(item.labelKey)}
             </button>
 
-            {#if item.path === '/config' && showConfigSubnav}
-              <div class="ml-4 mt-1 space-y-1 border-l border-gray-200 pl-3 dark:border-gray-700">
-                {#each configNavGroups as group}
-                  <button
-                    type="button"
-                    onclick={() => goToConfigSection(group.groupKey)}
-                    class={`w-full rounded-md px-2 py-1.5 text-left text-xs transition ${
-                      activeConfigSection === group.groupKey
-                        ? 'bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300'
-                        : 'text-gray-500 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-gray-100'
-                    }`}
-                  >
-                    {group.labelKey ? t(group.labelKey) : group.fallbackLabel}
-                  </button>
-                {/each}
 
-                {#if configNavLoading && configNavGroups.length === 0}
-                  <p class="px-2 py-1 text-xs text-gray-400 dark:text-gray-500">{t('common.loading')}</p>
-                {/if}
-              </div>
-            {/if}
           {/each}
         </nav>
       </aside>
@@ -336,7 +266,7 @@
           {:else if activePath === '/plugins'}
             <PluginsPage />
           {:else if activePath === '/config'}
-            <ConfigPage activeSection={activeConfigSection} />
+            <ConfigPage />
           {:else if activePath === '/logs'}
             <LogsPage />
           {:else}
