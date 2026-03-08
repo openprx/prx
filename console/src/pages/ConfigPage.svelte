@@ -365,12 +365,12 @@
   <div class="rounded-lg border p-3 transition-colors {isChanged ? 'border-sky-500/50 bg-sky-500/5' : 'border-gray-200 bg-gray-50/40 dark:border-gray-700 dark:bg-gray-900/40'}">
     <div class="flex items-start justify-between gap-3">
       <div class="flex-1 min-w-0">
-        <label class="block text-sm font-medium text-gray-700 dark:text-gray-200">
+        <p class="block text-sm font-medium text-gray-700 dark:text-gray-200">
           {fieldDef.label}
           {#if isChanged}
             <span class="ml-1.5 text-xs text-sky-500 dark:text-sky-400">已修改</span>
           {/if}
-        </label>
+        </p>
         <p class="mt-0.5 text-xs text-gray-400 dark:text-gray-500">{fieldDef.desc}</p>
       </div>
 
@@ -379,6 +379,7 @@
           <button
             type="button"
             onclick={() => updateField(fieldPath, !currentValue)}
+            aria-label={`${fieldDef.label}: ${currentValue ? 'enabled' : 'disabled'}`}
             class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors {currentValue ? 'bg-sky-600' : 'bg-gray-400 dark:bg-gray-600'}"
           >
             <span class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform {currentValue ? 'translate-x-6' : 'translate-x-1'}"></span>
@@ -478,6 +479,7 @@
     <button
       type="button"
       onclick={() => updateField(path, !currentVal)}
+      aria-label={`${label}: ${currentVal ? 'enabled' : 'disabled'}`}
       class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors {currentVal ? 'bg-sky-600' : 'bg-gray-400 dark:bg-gray-600'}"
     >
       <span class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform {currentVal ? 'translate-x-6' : 'translate-x-1'}"></span>

@@ -1,14 +1,36 @@
 use super::AppState;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use schemars::schema_for;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{path::PathBuf, sync::Arc};
 
 const REDACTION_MASK: &str = "***";
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ConfigFileSource {
+    Main,
+    Fragment,
+}
+
+#[derive(Serialize)]
+struct ConfigFilePayload {
+    path: String,
+    filename: String,
+    content: String,
+    source: ConfigFileSource,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct UpdateConfigFileRequest {
+    content: String,
+}
 
 /// POST /api/config — merge partial JSON into current config, save to disk.
 pub async fn post_config(State(state): State<AppState>, Json(incoming): Json<Value>) -> Response {
@@ -70,7 +92,8 @@ pub async fn post_config(State(state): State<AppState>, Json(incoming): Json<Val
     }
 
     // 6. Update in-memory config
-    *state.config.lock() = merged_config;
+    *state.config.lock() = merged_config.clone();
+    state.shared_config.store(Arc::new(merged_config));
 
     Json(serde_json::json!({
         "status": "ok",
@@ -115,8 +138,169 @@ pub async fn get_config(State(state): State<AppState>) -> Response {
     Json(value).into_response()
 }
 
+pub async fn get_config_files(State(state): State<AppState>) -> Response {
+    let config = state.config.lock().clone();
+    match collect_config_files(&config.config_path) {
+        Ok(files) => Json(files).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to read config files: {error}")})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn put_config_file(
+    State(state): State<AppState>,
+    Path(filename): Path<String>,
+    Json(payload): Json<UpdateConfigFileRequest>,
+) -> Response {
+    let current = state.config.lock().clone();
+    let target_path = match resolve_config_file_path(&current.config_path, &filename) {
+        Ok(path) => path,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response();
+        }
+    };
+
+    let parsed: toml::Value = match payload.content.parse() {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid TOML content: {error}")})),
+            )
+                .into_response();
+        }
+    };
+    if !parsed.is_table() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Config file root must be a TOML table"})),
+        )
+            .into_response();
+    }
+
+    if let Some(parent) = target_path.parent() {
+        if target_path != current.config_path {
+            if let Ok(metadata) = std::fs::symlink_metadata(parent) {
+                if metadata.file_type().is_symlink() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("config.d path must not be a symlink: {}", parent.display())})),
+                    )
+                        .into_response();
+                }
+                if !metadata.is_dir() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("config.d path is not a directory: {}", parent.display())})),
+                    )
+                        .into_response();
+                }
+            } else if let Err(error) = tokio::fs::create_dir_all(parent).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to create config.d directory: {error}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Err(error) =
+        crate::config::schema::write_toml_string_atomic(&target_path, &payload.content).await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config file: {error}")})),
+        )
+            .into_response();
+    }
+
+    let refreshed = match crate::config::Config::load_from_path(
+        &current.config_path,
+        current.workspace_dir,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Saved file but merged config is invalid: {error}")})),
+                )
+                    .into_response();
+        }
+    };
+
+    *state.config.lock() = refreshed.clone();
+    state.shared_config.store(Arc::new(refreshed));
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "restart_required": true
+    }))
+    .into_response()
+}
+
 pub async fn get_config_schema() -> Response {
     Json(schema_for!(crate::config::Config)).into_response()
+}
+
+fn collect_config_files(config_path: &std::path::Path) -> anyhow::Result<Vec<ConfigFilePayload>> {
+    let mut files = vec![read_config_file(
+        config_path.to_path_buf(),
+        ConfigFileSource::Main,
+    )?];
+    for path in crate::config::files::list_config_fragment_paths(config_path)? {
+        files.push(read_config_file(path, ConfigFileSource::Fragment)?);
+    }
+    Ok(files)
+}
+
+fn read_config_file(path: PathBuf, source: ConfigFileSource) -> anyhow::Result<ConfigFilePayload> {
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid config filename: {}", path.display()))?
+        .to_string();
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("Failed to read {}: {error}", path.display()))?;
+    let relative_path = match source {
+        ConfigFileSource::Main => filename.clone(),
+        ConfigFileSource::Fragment => format!("config.d/{filename}"),
+    };
+
+    Ok(ConfigFilePayload {
+        path: relative_path,
+        filename,
+        content,
+        source,
+    })
+}
+
+fn resolve_config_file_path(
+    config_path: &std::path::Path,
+    filename: &str,
+) -> Result<PathBuf, String> {
+    if filename == "config.toml" {
+        return Ok(config_path.to_path_buf());
+    }
+
+    if filename.trim().is_empty() {
+        return Err("Filename must not be empty".to_string());
+    }
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return Err("Filename must not contain path separators".to_string());
+    }
+    if !filename.ends_with(".toml") {
+        return Err("Filename must end with .toml".to_string());
+    }
+
+    Ok(crate::config::files::config_dir_path(config_path).join(filename))
 }
 
 fn redact_config_value(key: Option<&str>, value: &mut Value) {
