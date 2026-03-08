@@ -229,6 +229,10 @@ impl Memory for MarkdownMemory {
         Ok(all.len())
     }
 
+    async fn increment_useful_count(&self, _id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn health_check(&self) -> bool {
         self.workspace_dir.exists()
     }

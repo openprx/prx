@@ -9,6 +9,7 @@ use std::time::{Duration as StdDuration, SystemTime};
 
 const HYGIENE_INTERVAL_HOURS: i64 = 12;
 const STATE_FILE: &str = "memory_hygiene_state.json";
+const USEFUL_COUNT_RETENTION_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct HygieneReport {
@@ -319,8 +320,11 @@ fn prune_conversation_rows(workspace_dir: &Path, retention_days: u32) -> Result<
     let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
 
     let affected = conn.execute(
-        "DELETE FROM memories WHERE category = 'conversation' AND updated_at < ?1",
-        params![cutoff],
+        "DELETE FROM memories
+         WHERE category = 'conversation'
+           AND updated_at < ?1
+           AND COALESCE(useful_count, 0) < ?2",
+        params![cutoff, USEFUL_COUNT_RETENTION_THRESHOLD],
     )?;
 
     Ok(u64::try_from(affected).unwrap_or(0))
@@ -342,8 +346,11 @@ fn prune_daily_rows(workspace_dir: &Path, retention_days: u32) -> Result<u64> {
     let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
 
     let affected = conn.execute(
-        "DELETE FROM memories WHERE category = 'daily' AND updated_at < ?1",
-        params![cutoff],
+        "DELETE FROM memories
+         WHERE category = 'daily'
+           AND updated_at < ?1
+           AND COALESCE(useful_count, 0) < ?2",
+        params![cutoff, USEFUL_COUNT_RETENTION_THRESHOLD],
     )?;
 
     Ok(u64::try_from(affected).unwrap_or(0))
@@ -588,6 +595,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keeps_old_conversation_rows_with_high_useful_count() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new(workspace).unwrap();
+        mem.store(
+            "conv_keep",
+            "high-signal context",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let db_path = workspace.join("memory").join("brain.db");
+        let conn = Connection::open(&db_path).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(60)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories
+             SET created_at = ?1, updated_at = ?1, useful_count = ?2
+             WHERE key = 'conv_keep'",
+            params![old_cutoff, USEFUL_COUNT_RETENTION_THRESHOLD],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = default_cfg();
+        cfg.archive_after_days = 0;
+        cfg.purge_after_days = 0;
+        cfg.conversation_retention_days = 30;
+
+        run_if_due(&cfg, workspace).unwrap();
+
+        let mem2 = SqliteMemory::new(workspace).unwrap();
+        assert!(
+            mem2.get("conv_keep").await.unwrap().is_some(),
+            "high-useful-count conversation rows should be retained"
+        );
+    }
+
+    #[tokio::test]
     async fn prunes_old_daily_rows_in_sqlite_backend() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path();
@@ -626,6 +675,48 @@ mod tests {
         assert!(
             mem2.get("core_keep").await.unwrap().is_some(),
             "core memory should remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_old_daily_rows_with_high_useful_count() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new(workspace).unwrap();
+        mem.store(
+            "daily_keep",
+            "important summary",
+            MemoryCategory::Daily,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let db_path = workspace.join("memory").join("brain.db");
+        let conn = Connection::open(&db_path).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(60)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories
+             SET created_at = ?1, updated_at = ?1, useful_count = ?2
+             WHERE key = 'daily_keep'",
+            params![old_cutoff, USEFUL_COUNT_RETENTION_THRESHOLD],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = default_cfg();
+        cfg.archive_after_days = 0;
+        cfg.purge_after_days = 0;
+        cfg.daily_retention_days = 7;
+
+        run_if_due(&cfg, workspace).unwrap();
+
+        let mem2 = SqliteMemory::new(workspace).unwrap();
+        assert!(
+            mem2.get("daily_keep").await.unwrap().is_some(),
+            "high-useful-count daily rows should be retained"
         );
     }
 
