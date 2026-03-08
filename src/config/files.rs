@@ -29,12 +29,28 @@ pub(crate) fn is_relevant_config_path(config_path: &Path, candidate: &Path) -> b
     candidate == config_path || candidate == config_dir || candidate.starts_with(&config_dir)
 }
 
+pub(crate) fn managed_fragment_names() -> Vec<&'static str> {
+    SPLIT_FILE_LAYOUT.iter().map(|(name, _)| *name).collect()
+}
+
 pub(crate) fn list_config_fragment_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
     let config_dir = config_dir_path(config_path);
     if !config_dir.exists() {
         return Ok(Vec::new());
     }
-    if !config_dir.is_dir() {
+    let config_dir_meta = std::fs::symlink_metadata(&config_dir).with_context(|| {
+        format!(
+            "Failed to inspect config directory: {}",
+            config_dir.display()
+        )
+    })?;
+    if config_dir_meta.file_type().is_symlink() {
+        bail!(
+            "config.d path must not be a symlink: {}",
+            config_dir.display()
+        );
+    }
+    if !config_dir_meta.is_dir() {
         bail!("config.d path is not a directory: {}", config_dir.display());
     }
 
@@ -45,7 +61,13 @@ pub(crate) fn list_config_fragment_paths(config_path: &Path) -> Result<Vec<PathB
         let entry =
             entry.with_context(|| format!("Failed to enumerate {}", config_dir.display()))?;
         let path = entry.path();
-        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("Failed to inspect config fragment: {}", path.display()))?;
+        if file_type.is_symlink() && path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+            bail!("config fragment must not be a symlink: {}", path.display());
+        }
+        if file_type.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
             fragments.push(path);
         }
     }
@@ -56,6 +78,21 @@ pub(crate) fn list_config_fragment_paths(config_path: &Path) -> Result<Vec<PathB
             .then_with(|| left.cmp(right))
     });
     Ok(fragments)
+}
+
+pub(crate) fn list_unmanaged_fragment_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
+    let managed_names = managed_fragment_names();
+    let mut unmanaged = Vec::new();
+    for path in list_config_fragment_paths(config_path)? {
+        let is_managed = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| managed_names.iter().any(|managed| managed == &name));
+        if !is_managed {
+            unmanaged.push(path);
+        }
+    }
+    Ok(unmanaged)
 }
 
 pub(crate) fn read_merged_toml(config_path: &Path) -> Result<Value> {
@@ -131,11 +168,11 @@ pub(crate) async fn write_split_config(
         .await
         .with_context(|| format!("Failed to create {}", config_dir.display()))?;
 
-    let managed_names: Vec<&str> = fragment_tomls
+    let desired_names: Vec<&str> = fragment_tomls
         .iter()
         .map(|(name, _)| name.as_str())
         .collect();
-    remove_stale_fragment_files(&config_dir, &managed_names).await?;
+    remove_stale_managed_fragment_files(&config_dir, &desired_names).await?;
 
     for (name, contents) in &fragment_tomls {
         crate::config::schema::write_toml_string_atomic(&config_dir.join(name), contents).await?;
@@ -145,13 +182,26 @@ pub(crate) async fn write_split_config(
 }
 
 pub(crate) async fn merge_split_config(config: &crate::config::schema::Config) -> Result<()> {
+    let unmanaged = list_unmanaged_fragment_paths(&config.config_path)?;
+    if !unmanaged.is_empty() {
+        let names = unmanaged
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("Refusing to merge while unmanaged config fragments exist in config.d: {names}");
+    }
+
     let merged = config.to_stored_toml_string()?;
     crate::config::schema::write_toml_string_atomic(&config.config_path, &merged).await?;
 
     let config_dir = config_dir_path(&config.config_path);
     if config_dir.exists() {
-        let fragment_paths = list_config_fragment_paths(&config.config_path)?;
-        for path in fragment_paths {
+        for name in managed_fragment_names() {
+            let path = config_dir.join(name);
+            if !path.exists() {
+                continue;
+            }
             fs::remove_file(&path)
                 .await
                 .with_context(|| format!("Failed to remove {}", path.display()))?;
@@ -189,25 +239,20 @@ fn config_layer_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(layers)
 }
 
-async fn remove_stale_fragment_files(config_dir: &Path, managed_names: &[&str]) -> Result<()> {
+async fn remove_stale_managed_fragment_files(
+    config_dir: &Path,
+    desired_names: &[&str],
+) -> Result<()> {
     if !config_dir.exists() {
         return Ok(());
     }
 
-    let mut entries = fs::read_dir(config_dir)
-        .await
-        .with_context(|| format!("Failed to read {}", config_dir.display()))?;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+    for managed_name in managed_fragment_names() {
+        if desired_names.iter().any(|desired| desired == &managed_name) {
             continue;
         }
-
-        let keep = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| managed_names.iter().any(|managed| managed == &name));
-        if !keep {
+        let path = config_dir.join(managed_name);
+        if path.exists() {
             fs::remove_file(&path)
                 .await
                 .with_context(|| format!("Failed to remove stale fragment {}", path.display()))?;
@@ -247,6 +292,8 @@ fn read_toml_file(path: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn deep_merge_recurses_and_replaces_arrays() {
@@ -314,5 +361,36 @@ backend = "sqlite"
         assert_eq!(fragments.len(), 2);
         assert_eq!(fragments[0].0, "memory.toml");
         assert_eq!(fragments[1].0, "scheduler.toml");
+    }
+
+    #[test]
+    fn managed_fragment_names_match_layout() {
+        assert_eq!(
+            managed_fragment_names(),
+            vec![
+                "channels.toml",
+                "memory.toml",
+                "security.toml",
+                "agents.toml",
+                "identity.toml",
+                "network.toml",
+                "scheduler.toml",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_config_fragment_paths_rejects_symlinked_config_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        symlink(&target_dir, tmp.path().join("config.d")).unwrap();
+
+        let error = list_config_fragment_paths(&tmp.path().join("config.toml")).unwrap_err();
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "unexpected error: {error}"
+        );
     }
 }

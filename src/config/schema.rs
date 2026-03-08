@@ -7,6 +7,10 @@ use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::fs::Permissions;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -4783,6 +4787,15 @@ pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Res
         .parent()
         .context("Config path must have a parent directory")?;
 
+    if let Ok(metadata) = fs::symlink_metadata(path).await {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "Refusing to replace config via symlink path: {}",
+                path.display()
+            );
+        }
+    }
+
     fs::create_dir_all(parent_dir).await.with_context(|| {
         format!(
             "Failed to create config directory: {}",
@@ -4797,17 +4810,17 @@ pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Res
     let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
     let backup_path = parent_dir.join(format!("{file_name}.bak"));
 
-    let mut temp_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp_path)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create temporary config file: {}",
-                temp_path.display()
-            )
-        })?;
+    let mut open_options = OpenOptions::new();
+    open_options.create_new(true).write(true);
+    #[cfg(unix)]
+    open_options.mode(0o600);
+
+    let mut temp_file = open_options.open(&temp_path).await.with_context(|| {
+        format!(
+            "Failed to create temporary config file: {}",
+            temp_path.display()
+        )
+    })?;
     temp_file
         .write_all(toml_str.as_bytes())
         .await
@@ -4840,6 +4853,11 @@ pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Res
 
     sync_directory(parent_dir).await?;
 
+    #[cfg(unix)]
+    fs::set_permissions(path, Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("Failed to restrict permissions on {}", path.display()))?;
+
     if had_existing_config {
         let _ = fs::remove_file(&backup_path).await;
     }
@@ -4869,9 +4887,9 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     #[cfg(unix)]
-    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
@@ -5547,6 +5565,60 @@ model = "override-beta"
         assert_eq!(actual, expected);
 
         let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn config_split_preserves_unmanaged_fragments() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path().join("config.d");
+        fs::create_dir_all(&config_dir).await.unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.path().join("workspace");
+        config.config_path = dir.path().join("config.toml");
+        config.default_model = Some("preserve-fragments".into());
+        config.memory.backend = "markdown".into();
+
+        fs::write(
+            config_dir.join("99-local.toml"),
+            "default_temperature = 0.9\n",
+        )
+        .await
+        .unwrap();
+
+        crate::config::files::write_split_config(&config, false)
+            .await
+            .unwrap();
+
+        assert!(config_dir.join("99-local.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn config_merge_refuses_unmanaged_fragments() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path().join("config.d");
+        fs::create_dir_all(&config_dir).await.unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.path().join("workspace");
+        config.config_path = dir.path().join("config.toml");
+        config.default_model = Some("merge-guard".into());
+        config.save().await.unwrap();
+
+        fs::write(
+            config_dir.join("99-local.toml"),
+            "default_temperature = 0.9\n",
+        )
+        .await
+        .unwrap();
+
+        let error = crate::config::files::merge_split_config(&config)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unmanaged config fragments"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -7546,16 +7618,31 @@ allowed_from = ["*"]
         config.config_path = config_path.clone();
         config.save().await.unwrap();
 
-        // Apply the same permission logic as load_or_init
-        fs::set_permissions(&config_path, Permissions::from_mode(0o600))
-            .await
-            .expect("Failed to set permissions");
-
         let meta = fs::metadata(&config_path).await.unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
             "New config file should be owner-only (0600), got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_toml_string_atomic_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real_path = tmp.path().join("real.toml");
+        let symlink_path = tmp.path().join("config.toml");
+        std::fs::write(&real_path, "default_temperature = 0.7\n").unwrap();
+        symlink(&real_path, &symlink_path).unwrap();
+
+        let error = write_toml_string_atomic(&symlink_path, "default_temperature = 1.0\n")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("symlink"),
+            "unexpected error: {error}"
         );
     }
 
