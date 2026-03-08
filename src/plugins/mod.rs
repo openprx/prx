@@ -231,14 +231,23 @@ impl PluginManager {
                         wasm_path.display()
                     ))
                 })?;
-            // Update aggregated metrics from cache.
+            // Mirror running totals from the precompile cache into aggregated
+            // PluginMetrics so callers can read one place for all stats.
+            // Using .store() is correct here because the precompile cache
+            // already keeps a cumulative total; we just project it into the
+            // outer PluginMetrics on each load.
             let cm = &self.precompile_cache.metrics;
+            let misses = cm.misses();
             self.metrics
                 .cache_hits
                 .store(cm.hits(), std::sync::atomic::Ordering::Relaxed);
             self.metrics
                 .cache_misses
-                .store(cm.misses(), std::sync::atomic::Ordering::Relaxed);
+                .store(misses, std::sync::atomic::Ordering::Relaxed);
+            // `compilations` == cache misses: every miss is one Cranelift run.
+            self.metrics
+                .compilations
+                .store(misses, std::sync::atomic::Ordering::Relaxed);
             self.metrics
                 .total_compile_ms
                 .store(cm.total_compile_ms(), std::sync::atomic::Ordering::Relaxed);
