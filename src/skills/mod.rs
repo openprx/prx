@@ -32,6 +32,8 @@ pub struct Skill {
     pub prompts: Vec<String>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+    #[serde(default, skip)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// A tool defined by a skill (shell command, HTTP call, etc.)
@@ -87,6 +89,132 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
         Some(config.skills.openclaw_skills_enabled),
         config.skills.openclaw_skills_dir.as_deref(),
     )
+}
+
+pub async fn hydrate_skill_embeddings(
+    skills: &mut [Skill],
+    embedder: &dyn crate::memory::embeddings::EmbeddingProvider,
+) -> Result<()> {
+    if skills.is_empty() || embedder.dimensions() == 0 {
+        return Ok(());
+    }
+
+    let pending: Vec<(usize, String)> = skills
+        .iter()
+        .enumerate()
+        .filter(|(_, skill)| skill.embedding.is_none() && !skill.description.trim().is_empty())
+        .map(|(idx, skill)| (idx, skill.description.clone()))
+        .collect();
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let descriptions: Vec<&str> = pending
+        .iter()
+        .map(|(_, description)| description.as_str())
+        .collect();
+    let embeddings = embedder.embed(&descriptions).await?;
+
+    for ((idx, _), embedding) in pending.into_iter().zip(embeddings.into_iter()) {
+        skills[idx].embedding = Some(embedding);
+    }
+
+    Ok(())
+}
+
+pub async fn select_skills_by_relevance(
+    query: &str,
+    skills: &[Skill],
+    top_k: usize,
+    embedder: &dyn crate::memory::embeddings::EmbeddingProvider,
+) -> Vec<Skill> {
+    if top_k == 0 || skills.is_empty() {
+        return Vec::new();
+    }
+
+    if embedder.dimensions() == 0 {
+        return lexical_skill_selection(query, skills, top_k);
+    }
+
+    let query_embedding = match embedder.embed_one(query).await {
+        Ok(embedding) => embedding,
+        Err(error) => {
+            tracing::debug!(error = %error, "skill RAG query embedding failed; falling back to lexical selection");
+            return lexical_skill_selection(query, skills, top_k);
+        }
+    };
+
+    let mut scored: Vec<(f32, usize)> = skills
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, skill)| {
+            skill.embedding.as_deref().map(|embedding| {
+                (
+                    crate::memory::vector::cosine_similarity(&query_embedding, embedding),
+                    idx,
+                )
+            })
+        })
+        .collect();
+
+    if scored.is_empty() {
+        return lexical_skill_selection(query, skills, top_k);
+    }
+
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| skills[a.1].name.cmp(&skills[b.1].name))
+    });
+
+    scored
+        .into_iter()
+        .take(top_k)
+        .map(|(_, idx)| skills[idx].clone())
+        .collect()
+}
+
+fn lexical_skill_selection(query: &str, skills: &[Skill], top_k: usize) -> Vec<Skill> {
+    let query_tokens: Vec<String> = query
+        .split_whitespace()
+        .map(|token| token.trim_matches(|ch: char| !ch.is_alphanumeric()))
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+
+    if query_tokens.is_empty() {
+        return skills.iter().take(top_k).cloned().collect();
+    }
+
+    let mut scored: Vec<(usize, usize)> = skills
+        .iter()
+        .enumerate()
+        .map(|(idx, skill)| {
+            let haystack = format!(
+                "{} {} {}",
+                skill.name,
+                skill.description,
+                skill.tags.join(" ")
+            )
+            .to_ascii_lowercase();
+            let score = query_tokens
+                .iter()
+                .filter(|token| haystack.contains(token.as_str()))
+                .count();
+            (score, idx)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| skills[a.1].name.cmp(&skills[b.1].name))
+    });
+    scored
+        .into_iter()
+        .take(top_k)
+        .map(|(_, idx)| skills[idx].clone())
+        .collect()
 }
 
 fn load_skills_with_open_skills_config(
@@ -385,6 +513,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tools: manifest.tools,
         prompts: manifest.prompts,
         location: Some(path.to_path_buf()),
+        embedding: None,
     })
 }
 
@@ -406,6 +535,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![content],
         location: Some(path.to_path_buf()),
+        embedding: None,
     })
 }
 
@@ -426,6 +556,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![content],
         location: Some(path.to_path_buf()),
+        embedding: None,
     })
 }
 
@@ -691,6 +822,7 @@ fn load_openclaw_skills_from_dir(skills_dir: &Path) -> Vec<Skill> {
             tools: Vec::new(),
             prompts: Vec::new(), // EMPTY — lazy mode: no content injected
             location: Some(md_path),
+            embedding: None,
         });
     }
     skills
@@ -1053,6 +1185,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
 #[allow(clippy::similar_names)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::fs;
     use std::sync::{Mutex, OnceLock};
 
@@ -1159,6 +1292,7 @@ command = "echo hello"
             tools: vec![],
             prompts: vec!["Do the thing.".to_string()],
             location: None,
+            embedding: None,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<available_skills>"));
@@ -1350,6 +1484,7 @@ description = "Bare minimum"
             }],
             prompts: vec![],
             location: None,
+            embedding: None,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
@@ -1369,6 +1504,7 @@ description = "Bare minimum"
             tools: vec![],
             prompts: vec!["Use <tool> & check \"quotes\".".to_string()],
             location: None,
+            embedding: None,
         }];
 
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
@@ -1703,6 +1839,85 @@ description = "Bare minimum"
         assert_eq!(skills[0].name, "my-oc-skill");
         assert_eq!(skills[0].description, "OpenClaw test skill");
         assert!(skills[0].prompts.is_empty(), "must be lazy (no prompts)");
+    }
+
+    struct TestEmbeddingProvider {
+        response: Vec<f32>,
+    }
+
+    #[async_trait]
+    impl crate::memory::embeddings::EmbeddingProvider for TestEmbeddingProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn dimensions(&self) -> usize {
+            self.response.len()
+        }
+
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| self.response.clone()).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_skill_embeddings_populates_missing_vectors() {
+        let mut skills = vec![Skill {
+            name: "ops".to_string(),
+            description: "Deployment and release workflows".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            location: None,
+            embedding: None,
+        }];
+
+        let embedder = TestEmbeddingProvider {
+            response: vec![0.25, 0.75],
+        };
+        hydrate_skill_embeddings(&mut skills, &embedder)
+            .await
+            .unwrap();
+
+        assert_eq!(skills[0].embedding, Some(vec![0.25, 0.75]));
+    }
+
+    #[tokio::test]
+    async fn select_skills_by_relevance_prefers_closest_embedding() {
+        let skills = vec![
+            Skill {
+                name: "deploy".to_string(),
+                description: "Deployment workflows".to_string(),
+                version: "1.0.0".to_string(),
+                author: None,
+                tags: vec![],
+                tools: vec![],
+                prompts: vec![],
+                location: None,
+                embedding: Some(vec![1.0, 0.0]),
+            },
+            Skill {
+                name: "docs".to_string(),
+                description: "Documentation workflows".to_string(),
+                version: "1.0.0".to_string(),
+                author: None,
+                tags: vec![],
+                tools: vec![],
+                prompts: vec![],
+                location: None,
+                embedding: Some(vec![0.0, 1.0]),
+            },
+        ];
+
+        let embedder = TestEmbeddingProvider {
+            response: vec![1.0, 0.0],
+        };
+        let selected = select_skills_by_relevance("ship release", &skills, 1, &embedder).await;
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "deploy");
     }
 }
 

@@ -465,6 +465,49 @@ async fn increment_recalled_useful_counts(mem: &dyn Memory, recalled_ids: &[Stri
     }
 }
 
+async fn select_prompt_skills(
+    query: &str,
+    skills: &[crate::skills::Skill],
+    config: &Config,
+    embedder: &dyn crate::memory::embeddings::EmbeddingProvider,
+) -> Vec<crate::skills::Skill> {
+    if !config.skill_rag.enabled {
+        return skills.to_vec();
+    }
+
+    crate::skills::select_skills_by_relevance(query, skills, config.skill_rag.top_k, embedder).await
+}
+
+fn build_runtime_system_prompt(
+    config: &Config,
+    model_name: &str,
+    tool_descs: &[(&str, &str)],
+    skills: &[crate::skills::Skill],
+    native_tools: bool,
+    tools_registry: &[Box<dyn Tool>],
+) -> String {
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
+        &config.workspace_dir,
+        model_name,
+        tool_descs,
+        skills,
+        Some(&config.identity),
+        bootstrap_max_chars,
+        native_tools,
+    );
+
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(tools_registry));
+    }
+
+    system_prompt
+}
+
 /// Build hardware datasheet context from RAG when peripherals are enabled.
 /// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
 fn build_hardware_context(
@@ -1897,7 +1940,6 @@ pub async fn run(
         .collect();
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",
@@ -2002,25 +2044,11 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
-    let bootstrap_max_chars = if config.agent.compact_context {
-        Some(6000)
-    } else {
-        None
-    };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
-        &config.workspace_dir,
-        model_name,
-        &tool_descs,
-        &skills,
-        Some(&config.identity),
-        bootstrap_max_chars,
-        native_tools,
-    );
-
-    // Append structured tool-use instructions with schemas (only for non-native providers)
-    if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
+    let mut skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    if config.skill_rag.enabled {
+        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
     }
 
     // ── Approval manager (supervised mode) ───────────────────────
@@ -2032,6 +2060,17 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
+        let selected_skills =
+            select_prompt_skills(&msg, &skills, &config, skill_embedder.as_ref()).await;
+        let system_prompt = build_runtime_system_prompt(
+            &config,
+            model_name,
+            &tool_descs,
+            &selected_skills,
+            native_tools,
+            &tools_registry,
+        );
+
         // Auto-save user message to memory (skip short/trivial messages)
         if config.memory.auto_save
             && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
@@ -2102,7 +2141,18 @@ pub async fn run(
         let cli = crate::channels::CliChannel::new();
 
         // Persistent conversation history across turns
-        let mut history = vec![ChatMessage::system(&system_prompt)];
+        let mut history = if config.skill_rag.enabled {
+            Vec::new()
+        } else {
+            vec![ChatMessage::system(build_runtime_system_prompt(
+                &config,
+                model_name,
+                &tool_descs,
+                &skills,
+                native_tools,
+                &tools_registry,
+            ))]
+        };
 
         loop {
             print!("> ");
@@ -2149,7 +2199,16 @@ pub async fn run(
                     }
 
                     history.clear();
-                    history.push(ChatMessage::system(&system_prompt));
+                    if !config.skill_rag.enabled {
+                        history.push(ChatMessage::system(build_runtime_system_prompt(
+                            &config,
+                            model_name,
+                            &tool_descs,
+                            &skills,
+                            native_tools,
+                            &tools_registry,
+                        )));
+                    }
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2196,6 +2255,21 @@ pub async fn run(
                 format!("{context}{user_input}")
             };
 
+            let selected_skills =
+                select_prompt_skills(&user_input, &skills, &config, skill_embedder.as_ref()).await;
+            let system_prompt = build_runtime_system_prompt(
+                &config,
+                model_name,
+                &tool_descs,
+                &selected_skills,
+                native_tools,
+                &tools_registry,
+            );
+            if history.is_empty() {
+                history.push(ChatMessage::system(system_prompt));
+            } else {
+                history[0] = ChatMessage::system(system_prompt);
+            }
             history.push(ChatMessage::user(&enriched));
 
             let response = match run_tool_call_loop(
@@ -2377,7 +2451,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .map(|b| b.board.clone())
         .collect();
 
-    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    let mut skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
@@ -2421,24 +2495,21 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
-    let bootstrap_max_chars = if config.agent.compact_context {
-        Some(6000)
-    } else {
-        None
-    };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
-        &config.workspace_dir,
+    let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
+    if config.skill_rag.enabled {
+        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
+    }
+    let selected_skills =
+        select_prompt_skills(message, &skills, &config, skill_embedder.as_ref()).await;
+    let system_prompt = build_runtime_system_prompt(
+        &config,
         &model_name,
         &tool_descs,
-        &skills,
-        Some(&config.identity),
-        bootstrap_max_chars,
+        &selected_skills,
         native_tools,
+        &tools_registry,
     );
-    if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
-    }
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
