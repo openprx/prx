@@ -174,6 +174,19 @@ fn resolve_embedding_config(
     }
 }
 
+pub fn create_embedder_from_config(
+    config: &crate::config::Config,
+    api_key: Option<&str>,
+) -> Arc<dyn embeddings::EmbeddingProvider> {
+    let resolved = resolve_embedding_config(&config.memory, &config.embedding_routes, api_key);
+    Arc::from(embeddings::create_embedding_provider(
+        &resolved.provider,
+        resolved.api_key.as_deref(),
+        &resolved.model,
+        resolved.dimensions,
+    ))
+}
+
 /// Factory: create the right memory backend from config
 pub fn create_memory(
     config: &MemoryConfig,

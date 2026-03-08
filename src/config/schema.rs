@@ -109,6 +109,10 @@ pub struct Config {
     #[serde(default)]
     pub skills: SkillsConfig,
 
+    /// Dynamic skill retrieval settings (`[skill_rag]`).
+    #[serde(default)]
+    pub skill_rag: SkillRagConfig,
+
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
@@ -743,6 +747,34 @@ impl Default for SkillsConfig {
             open_skills_dir: None,
             openclaw_skills_enabled: false,
             openclaw_skills_dir: None,
+        }
+    }
+}
+
+/// Dynamic skill retrieval configuration (`[skill_rag]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkillRagConfig {
+    /// Enable query-aware skill selection instead of full-skill injection.
+    #[serde(default = "default_skill_rag_enabled")]
+    pub enabled: bool,
+    /// Maximum number of relevant skills injected when skill RAG is enabled.
+    #[serde(default = "default_skill_rag_top_k")]
+    pub top_k: usize,
+}
+
+fn default_skill_rag_enabled() -> bool {
+    true
+}
+
+fn default_skill_rag_top_k() -> usize {
+    5
+}
+
+impl Default for SkillRagConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            top_k: default_skill_rag_top_k(),
         }
     }
 }
@@ -3847,6 +3879,7 @@ impl Default for Config {
             sessions_spawn: SessionsSpawnConfig::default(),
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
+            skill_rag: SkillRagConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
