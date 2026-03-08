@@ -73,6 +73,7 @@
   "channels": {
     "title": "Channels",
     "type": "Type",
+    "status": "Status",
     "loading": "Loading channels...",
     "loadFailed": "Failed to load channel status.",
     "noChannels": "No channels available.",
@@ -94,7 +95,8 @@
       "lark": "Lark",
       "dingtalk": "DingTalk",
       "qq": "QQ",
-      "cli": "CLI"
+      "cli": "CLI",
+      "configured": "Configured"
     }
   },
   "config": {
@@ -142,6 +144,7 @@
   "hooks": {
     "title": "Hooks",
     "loading": "Loading hooks...",
+    "loadFailed": "Failed to load hooks.",
     "noHooks": "No hooks configured.",
     "addHook": "Add Hook",
     "cancelAdd": "Cancel",
@@ -151,16 +154,26 @@
     "commandPlaceholder": "e.g. /opt/scripts/on-event.sh",
     "timeout": "Timeout (ms)",
     "enabled": "Enabled",
+    "globalToggleHint": "Enabled state is currently controlled globally by the backend.",
     "edit": "Edit",
     "delete": "Delete",
+    "deleting": "Deleting...",
     "save": "Save",
-    "cancel": "Cancel"
+    "saving": "Saving...",
+    "cancel": "Cancel",
+    "commandRequired": "Command is required.",
+    "timeoutInvalid": "Timeout must be at least 1000 ms.",
+    "saveFailed": "Failed to save hook.",
+    "deleteFailed": "Failed to delete hook.",
+    "toggleFailed": "Failed to update hook state."
   },
   "mcp": {
     "title": "MCP Servers",
     "loading": "Loading MCP servers...",
+    "loadFailed": "Failed to load MCP servers.",
     "noServers": "No MCP servers configured.",
     "connected": "Connected",
+    "connecting": "Connecting",
     "disconnected": "Disconnected",
     "tools": "tools",
     "availableTools": "Available Tools",
@@ -177,6 +190,8 @@
     "source": "Source",
     "searchBtn": "Search",
     "searching": "Searching...",
+    "loadFailed": "Failed to load skills.",
+    "searchFailed": "Failed to search skills.",
     "noResults": "No results found.",
     "install": "Install",
     "installing": "Installing...",
@@ -188,6 +203,7 @@
     "owner": "by",
     "licensed": "Licensed",
     "unlicensed": "No license",
+    "readOnlyState": "Enable state is read-only.",
     "installSuccess": "Skill installed successfully",
     "installFailed": "Failed to install skill",
     "uninstallSuccess": "Skill uninstalled",

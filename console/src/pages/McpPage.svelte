@@ -8,40 +8,15 @@
   let expandedServer = $state(null);
 
   async function loadServers() {
+    loading = true;
+
     try {
       const response = await api.getMcpServers();
       servers = Array.isArray(response?.servers) ? response.servers : [];
       errorMessage = '';
-    } catch {
-      servers = [
-        {
-          name: 'filesystem',
-          url: 'stdio:///usr/local/bin/mcp-filesystem',
-          status: 'connected',
-          tools: [
-            { name: 'read_file', description: 'Read contents of a file' },
-            { name: 'write_file', description: 'Write content to a file' },
-            { name: 'list_directory', description: 'List directory contents' }
-          ]
-        },
-        {
-          name: 'github',
-          url: 'https://mcp.github.com/sse',
-          status: 'connected',
-          tools: [
-            { name: 'search_repositories', description: 'Search GitHub repositories' },
-            { name: 'create_issue', description: 'Create a new issue' },
-            { name: 'list_pull_requests', description: 'List pull requests' }
-          ]
-        },
-        {
-          name: 'database',
-          url: 'stdio:///opt/mcp/db-server',
-          status: 'disconnected',
-          tools: []
-        }
-      ];
-      errorMessage = '';
+    } catch (error) {
+      servers = [];
+      errorMessage = error instanceof Error ? error.message : t('mcp.loadFailed');
     } finally {
       loading = false;
     }
@@ -52,7 +27,6 @@
   }
 
   async function refreshServers() {
-    loading = true;
     await loadServers();
   }
 
@@ -99,10 +73,16 @@
                   class={`rounded-full px-2 py-1 text-xs font-medium ${
                     server.status === 'connected'
                       ? 'border border-green-500/50 bg-green-500/20 text-green-700 dark:text-green-300'
-                      : 'border border-red-500/50 bg-red-500/20 text-red-700 dark:text-red-300'
+                      : server.status === 'connecting'
+                        ? 'border border-yellow-500/50 bg-yellow-500/20 text-yellow-700 dark:text-yellow-300'
+                        : 'border border-red-500/50 bg-red-500/20 text-red-700 dark:text-red-300'
                   }`}
                 >
-                  {server.status === 'connected' ? t('mcp.connected') : t('mcp.disconnected')}
+                  {server.status === 'connected'
+                    ? t('mcp.connected')
+                    : server.status === 'connecting'
+                      ? t('mcp.connecting')
+                      : t('mcp.disconnected')}
                 </span>
               </div>
               <p class="mt-1 font-mono text-sm text-gray-500 dark:text-gray-400">{server.url}</p>

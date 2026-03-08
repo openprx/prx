@@ -92,6 +92,7 @@
             </span>
           </div>
           <p class="mt-3 text-sm text-gray-500 dark:text-gray-400">{t('channels.type')}: {channelLabel(channel.type)}</p>
+          <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">{t('channels.status')}: {channelLabel(channel.status)}</p>
         </article>
       {/each}
     </div>

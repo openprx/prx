@@ -2,7 +2,6 @@
   import { api } from '../lib/api';
   import { t } from '../lib/i18n';
 
-  // --- State ---
   let activeTab = $state('installed');
   let skills = $state([]);
   let loading = $state(true);
@@ -10,49 +9,35 @@
   let toast = $state('');
   let toastType = $state('success');
 
-  // Discover state
   let discoverResults = $state([]);
   let discoverLoading = $state(false);
+  let discoverError = $state('');
   let discoverQuery = $state('');
   let discoverSource = $state('github');
   let discoverSearched = $state(false);
 
-  // Action state
   let installingUrl = $state('');
   let uninstallingName = $state('');
   let confirmUninstall = $state('');
 
-  // --- Toast ---
-  function showToast(msg, type = 'success') {
-    toast = msg;
+  function showToast(message, type = 'success') {
+    toast = message;
     toastType = type;
-    setTimeout(() => { toast = ''; }, 3000);
+    setTimeout(() => {
+      toast = '';
+    }, 3000);
   }
 
-  // --- Installed skills ---
   async function loadSkills() {
     try {
       const response = await api.getSkills();
       skills = Array.isArray(response?.skills) ? response.skills : [];
       errorMessage = '';
-    } catch {
+    } catch (error) {
       skills = [];
-      errorMessage = 'Failed to load skills.';
+      errorMessage = error instanceof Error ? error.message : t('skills.loadFailed');
     } finally {
       loading = false;
-    }
-  }
-
-  async function toggleSkill(skillName) {
-    try {
-      await api.toggleSkill(skillName);
-      skills = skills.map((s) =>
-        s.name === skillName ? { ...s, enabled: !s.enabled } : s
-      );
-    } catch {
-      skills = skills.map((s) =>
-        s.name === skillName ? { ...s, enabled: !s.enabled } : s
-      );
     }
   }
 
@@ -61,73 +46,76 @@
       confirmUninstall = name;
       return;
     }
+
     confirmUninstall = '';
     uninstallingName = name;
+
     try {
       await api.uninstallSkill(name);
-      skills = skills.filter((s) => s.name !== name);
+      skills = skills.filter((skill) => skill.name !== name);
       showToast(t('skills.uninstallSuccess'));
-    } catch (e) {
-      showToast(t('skills.uninstallFailed') + (e.message ? `: ${e.message}` : ''), 'error');
+    } catch (error) {
+      showToast(t('skills.uninstallFailed') + (error?.message ? `: ${error.message}` : ''), 'error');
     } finally {
       uninstallingName = '';
     }
   }
 
-  // Sorted: enabled first
   const sortedSkills = $derived(
     [...skills].sort((a, b) => (a.enabled === b.enabled ? 0 : a.enabled ? -1 : 1))
   );
-  const enabledCount = $derived(skills.filter((s) => s.enabled).length);
+  const enabledCount = $derived(skills.filter((skill) => skill.enabled).length);
 
-  // --- Discover ---
   async function searchSkills() {
     if (!discoverQuery.trim() && discoverSource === 'github') {
       discoverQuery = 'agent skill';
     }
+
     discoverLoading = true;
     discoverSearched = true;
+    discoverError = '';
+
     try {
       const response = await api.discoverSkills(discoverSource, discoverQuery);
       discoverResults = Array.isArray(response?.results) ? response.results : [];
-    } catch {
+    } catch (error) {
       discoverResults = [];
+      discoverError = error instanceof Error ? error.message : t('skills.searchFailed');
     } finally {
       discoverLoading = false;
     }
   }
 
   function isInstalled(name) {
-    return skills.some((s) => s.name === name);
+    return skills.some((skill) => skill.name === name);
   }
 
   async function installSkill(url, name) {
     installingUrl = url;
+
     try {
       const response = await api.installSkill(url, name);
       if (response?.skill) {
         skills = [...skills, { ...response.skill, enabled: true }];
       }
       showToast(t('skills.installSuccess'));
-    } catch (e) {
-      showToast(t('skills.installFailed') + (e.message ? `: ${e.message}` : ''), 'error');
+    } catch (error) {
+      showToast(t('skills.installFailed') + (error?.message ? `: ${error.message}` : ''), 'error');
     } finally {
       installingUrl = '';
     }
   }
 
-  function handleSearchKeydown(e) {
-    if (e.key === 'Enter') searchSkills();
+  function handleSearchKeydown(event) {
+    if (event.key === 'Enter') searchSkills();
   }
 
-  // --- Init ---
   $effect(() => {
     loadSkills();
   });
 </script>
 
 <section class="space-y-6">
-  <!-- Header -->
   <div class="flex items-center justify-between">
     <div class="flex items-center gap-3">
       <h2 class="text-2xl font-semibold">{t('skills.title')}</h2>
@@ -139,39 +127,43 @@
     </div>
     <button
       type="button"
-      onclick={() => { loading = true; loadSkills(); }}
+      onclick={() => {
+        loading = true;
+        loadSkills();
+      }}
       class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 transition hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
     >
       {t('common.refresh')}
     </button>
   </div>
 
-  <!-- Tabs -->
   <div class="flex gap-1 rounded-lg border border-gray-200 bg-gray-100/50 p-1 dark:border-gray-700 dark:bg-gray-800/50">
     <button
       type="button"
-      onclick={() => { activeTab = 'installed'; }}
+      onclick={() => {
+        activeTab = 'installed';
+      }}
       class="rounded-md px-4 py-2 text-sm font-medium transition {activeTab === 'installed' ? 'bg-white text-gray-900 shadow-sm dark:bg-gray-700 dark:text-white' : 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'}"
     >
       {t('skills.tabInstalled')}
     </button>
     <button
       type="button"
-      onclick={() => { activeTab = 'discover'; }}
+      onclick={() => {
+        activeTab = 'discover';
+      }}
       class="rounded-md px-4 py-2 text-sm font-medium transition {activeTab === 'discover' ? 'bg-white text-gray-900 shadow-sm dark:bg-gray-700 dark:text-white' : 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'}"
     >
       {t('skills.tabDiscover')}
     </button>
   </div>
 
-  <!-- Toast -->
   {#if toast}
     <div class="rounded-lg px-4 py-2 text-sm {toastType === 'error' ? 'border border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-300' : 'border border-green-500/30 bg-green-500/10 text-green-700 dark:text-green-300'}">
       {toast}
     </div>
   {/if}
 
-  <!-- Installed Tab -->
   {#if activeTab === 'installed'}
     {#if loading}
       <p class="text-sm text-gray-500 dark:text-gray-400">{t('skills.loading')}</p>
@@ -189,23 +181,22 @@
           <article class="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
             <div class="flex items-start justify-between gap-3">
               <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{skill.name}</h3>
-              <button type="button" onclick={() => toggleSkill(skill.name)}
-                class="relative inline-flex h-5 w-9 flex-shrink-0 items-center rounded-full transition {skill.enabled ? 'bg-sky-600' : 'bg-gray-400 dark:bg-gray-600'}">
-                <span class="inline-block h-3.5 w-3.5 rounded-full bg-white transition {skill.enabled ? 'translate-x-4' : 'translate-x-1'}"></span>
-              </button>
             </div>
             {#if skill.description}
               <p class="mt-2 text-sm text-gray-500 dark:text-gray-400">{skill.description}</p>
             {/if}
             <p class="mt-2 font-mono text-xs text-gray-400 dark:text-gray-500">{skill.location}</p>
-            <div class="mt-3 flex items-center justify-between">
-              <span
-                class="rounded-full px-2 py-1 text-xs font-medium {skill.enabled
-                  ? 'border border-green-500/50 bg-green-500/20 text-green-700 dark:text-green-300'
-                  : 'border border-red-500/50 bg-red-500/20 text-red-700 dark:text-red-300'}"
-              >
-                {skill.enabled ? t('common.enabled') : t('common.disabled')}
-              </span>
+            <div class="mt-3 flex items-center justify-between gap-3">
+              <div class="flex items-center gap-2">
+                <span
+                  class="rounded-full px-2 py-1 text-xs font-medium {skill.enabled
+                    ? 'border border-green-500/50 bg-green-500/20 text-green-700 dark:text-green-300'
+                    : 'border border-red-500/50 bg-red-500/20 text-red-700 dark:text-red-300'}"
+                >
+                  {skill.enabled ? t('common.enabled') : t('common.disabled')}
+                </span>
+                <span class="text-xs text-gray-400 dark:text-gray-500">{t('skills.readOnlyState')}</span>
+              </div>
               {#if confirmUninstall === skill.name}
                 <div class="flex items-center gap-2">
                   <span class="text-xs text-yellow-600 dark:text-yellow-400">{t('skills.confirmUninstall').replace('{name}', skill.name)}</span>
@@ -219,7 +210,9 @@
                   </button>
                   <button
                     type="button"
-                    onclick={() => { confirmUninstall = ''; }}
+                    onclick={() => {
+                      confirmUninstall = '';
+                    }}
                     class="rounded px-2 py-1 text-xs text-gray-500 transition hover:bg-gray-200 dark:text-gray-400 dark:hover:bg-gray-700"
                   >
                     {t('common.no')}
@@ -241,7 +234,6 @@
     {/if}
   {/if}
 
-  <!-- Discover Tab -->
   {#if activeTab === 'discover'}
     <div class="flex flex-col gap-3 sm:flex-row">
       <select
@@ -249,8 +241,6 @@
         class="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200"
       >
         <option value="github">GitHub</option>
-        <option value="clawhub">ClawHub</option>
-        <option value="huggingface">HuggingFace</option>
       </select>
       <input
         type="text"
@@ -271,6 +261,10 @@
 
     {#if discoverLoading}
       <p class="text-sm text-gray-500 dark:text-gray-400">{t('skills.searching')}</p>
+    {:else if discoverError}
+      <p class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
+        {discoverError}
+      </p>
     {:else if discoverSearched && discoverResults.length === 0}
       <p class="rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
         {t('skills.noResults')}
@@ -302,7 +296,7 @@
               {#if result.language}
                 <span class="rounded bg-gray-100 px-1.5 py-0.5 dark:bg-gray-700">{result.language}</span>
               {/if}
-              <span class="{result.has_license ? 'text-green-600 dark:text-green-400' : 'text-yellow-600 dark:text-yellow-400'}">
+              <span class={result.has_license ? 'text-green-600 dark:text-green-400' : 'text-yellow-600 dark:text-yellow-400'}>
                 {result.has_license ? t('skills.licensed') : t('skills.unlicensed')}
               </span>
             </div>

@@ -106,6 +106,24 @@ export const api = {
       body: JSON.stringify(data)
     }),
   getHooks: () => request('/api/hooks'),
+  createHook: (data) =>
+    request('/api/hooks', {
+      method: 'POST',
+      body: JSON.stringify(data)
+    }),
+  updateHook: (id, data) =>
+    request(`/api/hooks/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    }),
+  deleteHook: (id) =>
+    request(`/api/hooks/${encodeURIComponent(id)}`, {
+      method: 'DELETE'
+    }),
+  toggleHook: (id) =>
+    request(`/api/hooks/${encodeURIComponent(id)}/toggle`, {
+      method: 'PATCH'
+    }),
   getMcpServers: () => request('/api/mcp/servers'),
   getSkills: () => request('/api/skills'),
   discoverSkills: (source = 'github', query = '') => {
