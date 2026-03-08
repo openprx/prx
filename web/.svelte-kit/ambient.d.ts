@@ -38,6 +38,7 @@
  * The above values will be the same _even if_ different values for `ENVIRONMENT` or `PUBLIC_BASE_URL` are set at runtime, as they are statically replaced in your code with their build time values.
  */
 declare module '$env/static/private' {
+	export const CODEX_CI: string;
 	export const USER: string;
 	export const npm_config_user_agent: string;
 	export const OPENCLAW_SYSTEMD_UNIT: string;
@@ -49,13 +50,18 @@ declare module '$env/static/private' {
 	export const OPENCLAW_GATEWAY_TOKEN: string;
 	export const OLDPWD: string;
 	export const npm_package_json: string;
+	export const PAGER: string;
 	export const NODE_NO_WARNINGS: string;
 	export const MANAGERPID: string;
+	export const LC_CTYPE: string;
 	export const npm_config_userconfig: string;
 	export const npm_config_local_prefix: string;
 	export const SYSTEMD_EXEC_PID: string;
+	export const NO_COLOR: string;
 	export const DBUS_SESSION_BUS_ADDRESS: string;
+	export const COLORTERM: string;
 	export const COLOR: string;
+	export const npm_config_metrics_registry: string;
 	export const TMPDIR: string;
 	export const OPENCLAW_SERVICE_VERSION: string;
 	export const GTK_IM_MODULE: string;
@@ -63,8 +69,8 @@ declare module '$env/static/private' {
 	export const JOURNAL_STREAM: string;
 	export const _: string;
 	export const npm_config_prefix: string;
-	export const npm_config_npm_version: string;
 	export const MEMORY_PRESSURE_WATCH: string;
+	export const TERM: string;
 	export const npm_config_cache: string;
 	export const OPENCLAW_NODE_OPTIONS_READY: string;
 	export const npm_config_node_gyp: string;
@@ -74,28 +80,36 @@ declare module '$env/static/private' {
 	export const npm_package_name: string;
 	export const XDG_RUNTIME_DIR: string;
 	export const DISPLAY: string;
+	export const CODEX_SANDBOX_NETWORK_DISABLED: string;
 	export const LANG: string;
 	export const OPENCLAW_GATEWAY_PORT: string;
 	export const XMODIFIERS: string;
+	export const GH_PAGER: string;
 	export const npm_lifecycle_script: string;
 	export const SSH_AUTH_SOCK: string;
 	export const SHELL: string;
 	export const npm_package_version: string;
 	export const npm_lifecycle_event: string;
 	export const QT_ACCESSIBILITY: string;
+	export const CODEX_THREAD_ID: string;
+	export const DOCKER_HOST: string;
 	export const OPENCLAW_SERVICE_KIND: string;
 	export const GPG_AGENT_INFO: string;
 	export const OPENCLAW_SERVICE_MARKER: string;
+	export const GIT_PAGER: string;
 	export const QT_IM_MODULE: string;
 	export const npm_config_globalconfig: string;
 	export const npm_config_init_module: string;
 	export const PWD: string;
+	export const LC_ALL: string;
+	export const npm_config_globalignorefile: string;
 	export const npm_execpath: string;
 	export const XDG_DATA_DIRS: string;
 	export const npm_config_global_prefix: string;
 	export const OPENCLAW_SHELL: string;
 	export const npm_command: string;
 	export const MEMORY_PRESSURE_WRITE: string;
+	export const CODEX_MANAGED_BY_NPM: string;
 	export const OPENCLAW_PATH_BOOTSTRAPPED: string;
 	export const INIT_CWD: string;
 	export const EDITOR: string;
@@ -186,6 +200,7 @@ declare module '$env/static/public' {
  */
 declare module '$env/dynamic/private' {
 	export const env: {
+		CODEX_CI: string;
 		USER: string;
 		npm_config_user_agent: string;
 		OPENCLAW_SYSTEMD_UNIT: string;
@@ -197,13 +212,18 @@ declare module '$env/dynamic/private' {
 		OPENCLAW_GATEWAY_TOKEN: string;
 		OLDPWD: string;
 		npm_package_json: string;
+		PAGER: string;
 		NODE_NO_WARNINGS: string;
 		MANAGERPID: string;
+		LC_CTYPE: string;
 		npm_config_userconfig: string;
 		npm_config_local_prefix: string;
 		SYSTEMD_EXEC_PID: string;
+		NO_COLOR: string;
 		DBUS_SESSION_BUS_ADDRESS: string;
+		COLORTERM: string;
 		COLOR: string;
+		npm_config_metrics_registry: string;
 		TMPDIR: string;
 		OPENCLAW_SERVICE_VERSION: string;
 		GTK_IM_MODULE: string;
@@ -211,8 +231,8 @@ declare module '$env/dynamic/private' {
 		JOURNAL_STREAM: string;
 		_: string;
 		npm_config_prefix: string;
-		npm_config_npm_version: string;
 		MEMORY_PRESSURE_WATCH: string;
+		TERM: string;
 		npm_config_cache: string;
 		OPENCLAW_NODE_OPTIONS_READY: string;
 		npm_config_node_gyp: string;
@@ -222,28 +242,36 @@ declare module '$env/dynamic/private' {
 		npm_package_name: string;
 		XDG_RUNTIME_DIR: string;
 		DISPLAY: string;
+		CODEX_SANDBOX_NETWORK_DISABLED: string;
 		LANG: string;
 		OPENCLAW_GATEWAY_PORT: string;
 		XMODIFIERS: string;
+		GH_PAGER: string;
 		npm_lifecycle_script: string;
 		SSH_AUTH_SOCK: string;
 		SHELL: string;
 		npm_package_version: string;
 		npm_lifecycle_event: string;
 		QT_ACCESSIBILITY: string;
+		CODEX_THREAD_ID: string;
+		DOCKER_HOST: string;
 		OPENCLAW_SERVICE_KIND: string;
 		GPG_AGENT_INFO: string;
 		OPENCLAW_SERVICE_MARKER: string;
+		GIT_PAGER: string;
 		QT_IM_MODULE: string;
 		npm_config_globalconfig: string;
 		npm_config_init_module: string;
 		PWD: string;
+		LC_ALL: string;
+		npm_config_globalignorefile: string;
 		npm_execpath: string;
 		XDG_DATA_DIRS: string;
 		npm_config_global_prefix: string;
 		OPENCLAW_SHELL: string;
 		npm_command: string;
 		MEMORY_PRESSURE_WRITE: string;
+		CODEX_MANAGED_BY_NPM: string;
 		OPENCLAW_PATH_BOOTSTRAPPED: string;
 		INIT_CWD: string;
 		EDITOR: string;
