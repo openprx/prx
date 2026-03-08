@@ -64,17 +64,17 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(protected_routes)
 }
 
-pub(super) fn extract_auth_token(headers: &HeaderMap) -> String {
-    if let Some(token) = headers
+pub(super) fn extract_bearer_auth_token(headers: &HeaderMap) -> Option<String> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|auth| auth.strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        return token.to_string();
-    }
+        .map(ToString::to_string)
+}
 
+fn extract_cookie_auth_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -93,11 +93,73 @@ pub(super) fn extract_auth_token(headers: &HeaderMap) -> String {
                 .ok()
                 .map(|decoded| decoded.trim().to_string())
         })
+        .filter(|value| !value.is_empty())
+}
+
+fn header_matches_host_origin(headers: &HeaderMap, header_name: axum::http::HeaderName) -> bool {
+    let forwarded_host = headers
+        .get("x-forwarded-host")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let candidate = headers
+        .get(header_name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let (Some(host), Some(candidate)) = (host, candidate) else {
+        return false;
+    };
+
+    let authority = candidate
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(candidate)
+        .split('/')
+        .next()
+        .unwrap_or("");
+
+    authority.eq_ignore_ascii_case(host)
+        || forwarded_host.is_some_and(|value| authority.eq_ignore_ascii_case(value))
+}
+
+fn cookie_auth_allowed(headers: &HeaderMap) -> bool {
+    if header_matches_host_origin(headers, header::ORIGIN)
+        || header_matches_host_origin(headers, header::REFERER)
+    {
+        return true;
+    }
+
+    matches!(
+        headers
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim),
+        Some("same-origin")
+    )
+}
+
+pub(super) fn extract_resource_auth_token(headers: &HeaderMap) -> String {
+    extract_bearer_auth_token(headers)
+        .or_else(|| {
+            if cookie_auth_allowed(headers) {
+                extract_cookie_auth_token(headers)
+            } else {
+                None
+            }
+        })
         .unwrap_or_default()
 }
 
 async fn auth_middleware(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let provided_token = extract_auth_token(request.headers());
+    let provided_token = extract_bearer_auth_token(request.headers()).unwrap_or_default();
 
     if state.pairing.require_pairing() && !state.pairing.is_authenticated(&provided_token) {
         return (

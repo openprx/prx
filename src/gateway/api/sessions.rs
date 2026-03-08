@@ -1,4 +1,4 @@
-use super::{extract_auth_token, AppState};
+use super::{extract_resource_auth_token, AppState};
 use crate::providers::ChatMessage;
 use axum::{
     body::Body,
@@ -67,6 +67,32 @@ pub(super) struct SessionMediaQuery {
 pub(super) struct SendMessageResponse {
     status: String,
     reply: String,
+}
+
+fn matches_session_filters(
+    session: &crate::memory::ConversationSessionSummary,
+    status_filter: Option<&str>,
+    search_filter: Option<&str>,
+) -> bool {
+    let status = derive_session_status(&session.last_message_preview, session.message_count);
+    if let Some(filter) = status_filter {
+        if filter != status {
+            return false;
+        }
+    }
+
+    if let Some(filter) = search_filter {
+        let haystack = format!(
+            "{}\n{}\n{}\n{}",
+            session.session_key, session.sender, session.channel, session.last_message_preview
+        )
+        .to_ascii_lowercase();
+        if !haystack.contains(filter) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn derive_session_status(last_message_preview: &str, message_count: u64) -> &'static str {
@@ -325,51 +351,62 @@ pub async fn get_sessions(
 ) -> impl IntoResponse {
     let limit = normalize_limit(query.limit);
     let offset = normalize_offset(query.offset);
+    let status_filter = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let search_filter = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let fetch_batch = limit.clamp(DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT);
+    let mut response = Vec::with_capacity(limit);
+    let mut source_offset = 0usize;
+    let mut filtered_offset = 0usize;
 
-    let sessions = match state
-        .mem
-        .list_conversation_sessions(limit, offset, query.channel.as_deref())
-        .await
-    {
-        Ok(sessions) => sessions,
-        Err(error) => {
-            tracing::error!("Failed to list conversation sessions from DB: {error}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "Failed to load sessions" })),
-            )
-                .into_response();
-        }
-    };
-
-    let status_filter = query.status.as_deref().map(|value| value.trim().to_ascii_lowercase());
-    let search_filter = query.search.as_deref().map(|value| value.trim().to_ascii_lowercase());
-
-    let response: Vec<SessionSummary> = sessions
-        .into_iter()
-        .filter_map(|session| {
-            let status = derive_session_status(&session.last_message_preview, session.message_count);
-            if let Some(filter) = status_filter.as_deref() {
-                if filter != status {
-                    return None;
-                }
-            }
-
-            if let Some(filter) = search_filter.as_deref() {
-                let haystack = format!(
-                    "{}\n{}\n{}\n{}",
-                    session.session_key,
-                    session.sender,
-                    session.channel,
-                    session.last_message_preview
+    loop {
+        let sessions = match state
+            .mem
+            .list_conversation_sessions(fetch_batch, source_offset, query.channel.as_deref())
+            .await
+        {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::error!("Failed to list conversation sessions from DB: {error}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "Failed to load sessions" })),
                 )
-                .to_ascii_lowercase();
-                if !haystack.contains(filter) {
-                    return None;
-                }
+                    .into_response();
+            }
+        };
+
+        if sessions.is_empty() {
+            break;
+        }
+
+        let batch_len = sessions.len();
+        for session in sessions {
+            if !matches_session_filters(
+                &session,
+                status_filter.as_deref(),
+                search_filter.as_deref(),
+            ) {
+                continue;
             }
 
-            Some(SessionSummary {
+            if filtered_offset < offset {
+                filtered_offset += 1;
+                continue;
+            }
+
+            let status =
+                derive_session_status(&session.last_message_preview, session.message_count);
+            response.push(SessionSummary {
                 session_id: session.session_key,
                 sender: session.sender,
                 channel: session.channel,
@@ -378,9 +415,18 @@ pub async fn get_sessions(
                 updated_at: session.updated_at,
                 message_count: session.message_count,
                 last_message_preview: session.last_message_preview,
-            })
-        })
-        .collect();
+            });
+
+            if response.len() >= limit {
+                break;
+            }
+        }
+
+        if response.len() >= limit || batch_len < fetch_batch {
+            break;
+        }
+        source_offset += batch_len;
+    }
 
     Json(response).into_response()
 }
@@ -567,7 +613,7 @@ pub async fn get_session_media(
     Query(query): Query<SessionMediaQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let token = extract_auth_token(&headers);
+    let token = extract_resource_auth_token(&headers);
     if state.pairing.require_pairing() && !state.pairing.is_authenticated(&token) {
         return json_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     }

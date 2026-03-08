@@ -8,9 +8,9 @@
     'llm_request',
     'llm_response',
     'tool_call_start',
-    'tool_call_end',
-    'message_received',
-    'message_sent'
+    'tool_call',
+    'turn_complete',
+    'error'
   ];
 
   let hooks = $state([]);

@@ -47,12 +47,8 @@
     )
   );
 
-  async function loadSessions({ reset = false } = {}) {
-    if (reset) {
-      page = 0;
-    }
-
-    const nextPage = reset ? 0 : page;
+  async function loadSessions({ reset = false, targetPage } = {}) {
+    const nextPage = typeof targetPage === 'number' ? targetPage : reset ? 0 : page;
     if (reset) {
       loading = true;
     } else {
@@ -97,8 +93,7 @@
       return;
     }
 
-    page -= 1;
-    loadSessions();
+    loadSessions({ targetPage: page - 1 });
   }
 
   function goToNextPage() {
@@ -106,8 +101,7 @@
       return;
     }
 
-    page += 1;
-    loadSessions();
+    loadSessions({ targetPage: page + 1 });
   }
 
   $effect(() => {
