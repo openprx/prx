@@ -21,6 +21,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(index_handler))
         .route("/assets/{*path}", get(asset_handler))
+        .route("/_app/{*path}", get(app_asset_handler))
         .fallback(get(spa_fallback_handler))
 }
 
@@ -42,7 +43,30 @@ pub async fn asset_handler(Path(path): Path<String>) -> Response {
     serve_embedded(&embedded_path, CACHE_ASSET)
 }
 
-pub async fn spa_fallback_handler() -> Response {
+pub async fn app_asset_handler(Path(path): Path<String>) -> Response {
+    if path.is_empty()
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|segment| segment == ".." || segment.is_empty())
+    {
+        return not_found();
+    }
+
+    let embedded_path = format!("_app/{path}");
+    serve_embedded(&embedded_path, CACHE_ASSET)
+}
+
+pub async fn spa_fallback_handler(uri: axum::http::Uri) -> Response {
+    // Try serving the exact path as an embedded file first (e.g. /config → config.html)
+    let path = uri.path().trim_start_matches('/');
+    if !path.is_empty() && !path.contains('.') {
+        let html_path = format!("{path}.html");
+        if ConsoleDist::get(&html_path).is_some() {
+            return serve_embedded(&html_path, CACHE_INDEX);
+        }
+    }
+    // Fall back to index.html for SPA client-side routing
     serve_embedded(INDEX_HTML, CACHE_INDEX)
 }
 
