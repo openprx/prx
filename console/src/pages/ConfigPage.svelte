@@ -51,7 +51,7 @@
 
   const REDACTION_MASK = '***';
   const EMPTY_FILE_SAVE_STATE = Object.freeze({});
-  const MAX_RENDER_DEPTH = 2;
+  const MAX_RENDER_DEPTH = 1;
   const MAX_COLLAPSED_ARRAY_ITEMS = 10;
 
   let fullConfig = $state({});
@@ -235,7 +235,7 @@
 
   function resolveSchema(schema, rootSchema = fullSchema, depth = 0) {
     if (!schema || typeof schema !== 'object') return {};
-    if (depth > 12) return schema;
+    if (depth > 4) return schema;
 
     let current = schema;
 
@@ -400,6 +400,7 @@
   }
 
   function buildObjectChildren(sectionKey, path, schema, value, depth, query, originalSection) {
+    if (depth >= MAX_RENDER_DEPTH) return [];
     const resolved = resolveSchema(schema);
     const propertyMap = resolved.properties ?? {};
     const schemaKeys = Object.keys(propertyMap);
