@@ -1,9 +1,9 @@
-use super::AppState;
+use super::{extract_auth_token, AppState};
 use crate::providers::ChatMessage;
 use axum::{
     body::Body,
     extract::{FromRequest, Multipart, Path, Query, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -23,6 +23,7 @@ pub(super) struct SessionSummary {
     session_id: String,
     sender: String,
     channel: String,
+    status: String,
     created_at: String,
     updated_at: String,
     message_count: u64,
@@ -42,6 +43,8 @@ pub(super) struct SessionsQuery {
     limit: Option<usize>,
     offset: Option<usize>,
     channel: Option<String>,
+    status: Option<String>,
+    search: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -58,13 +61,22 @@ pub(super) struct SendMessageRequest {
 #[derive(Deserialize)]
 pub(super) struct SessionMediaQuery {
     path: String,
-    token: Option<String>,
 }
 
 #[derive(Serialize)]
 pub(super) struct SendMessageResponse {
     status: String,
     reply: String,
+}
+
+fn derive_session_status(last_message_preview: &str, message_count: u64) -> &'static str {
+    if message_count == 0 {
+        "empty"
+    } else if last_message_preview.trim().is_empty() {
+        "pending"
+    } else {
+        "active"
+    }
 }
 
 fn normalize_limit(limit: Option<usize>) -> usize {
@@ -330,16 +342,43 @@ pub async fn get_sessions(
         }
     };
 
+    let status_filter = query.status.as_deref().map(|value| value.trim().to_ascii_lowercase());
+    let search_filter = query.search.as_deref().map(|value| value.trim().to_ascii_lowercase());
+
     let response: Vec<SessionSummary> = sessions
         .into_iter()
-        .map(|session| SessionSummary {
-            session_id: session.session_key,
-            sender: session.sender,
-            channel: session.channel,
-            created_at: session.created_at,
-            updated_at: session.updated_at,
-            message_count: session.message_count,
-            last_message_preview: session.last_message_preview,
+        .filter_map(|session| {
+            let status = derive_session_status(&session.last_message_preview, session.message_count);
+            if let Some(filter) = status_filter.as_deref() {
+                if filter != status {
+                    return None;
+                }
+            }
+
+            if let Some(filter) = search_filter.as_deref() {
+                let haystack = format!(
+                    "{}\n{}\n{}\n{}",
+                    session.session_key,
+                    session.sender,
+                    session.channel,
+                    session.last_message_preview
+                )
+                .to_ascii_lowercase();
+                if !haystack.contains(filter) {
+                    return None;
+                }
+            }
+
+            Some(SessionSummary {
+                session_id: session.session_key,
+                sender: session.sender,
+                channel: session.channel,
+                status: status.to_string(),
+                created_at: session.created_at,
+                updated_at: session.updated_at,
+                message_count: session.message_count,
+                last_message_preview: session.last_message_preview,
+            })
         })
         .collect();
 
@@ -526,9 +565,10 @@ pub async fn post_session_message(
 pub async fn get_session_media(
     State(state): State<AppState>,
     Query(query): Query<SessionMediaQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let token = query.token.as_deref().map(str::trim).unwrap_or("");
-    if state.pairing.require_pairing() && !state.pairing.is_authenticated(token) {
+    let token = extract_auth_token(&headers);
+    if state.pairing.require_pairing() && !state.pairing.is_authenticated(&token) {
         return json_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
 

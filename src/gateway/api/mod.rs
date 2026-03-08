@@ -2,7 +2,7 @@ use super::AppState;
 use crate::config::Config;
 use axum::{
     extract::{Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -64,16 +64,42 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(protected_routes)
 }
 
-async fn auth_middleware(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let provided_token = request
-        .headers()
+pub(super) fn extract_auth_token(headers: &HeaderMap) -> String {
+    if let Some(token) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|auth| auth.strip_prefix("Bearer "))
         .map(str::trim)
-        .unwrap_or("");
+        .filter(|value| !value.is_empty())
+    {
+        return token.to_string();
+    }
 
-    if state.pairing.require_pairing() && !state.pairing.is_authenticated(provided_token) {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookie_header| {
+            cookie_header.split(';').find_map(|entry| {
+                let (name, value) = entry.trim().split_once('=')?;
+                if name == "prx_console_token" {
+                    Some(value.trim())
+                } else {
+                    None
+                }
+            })
+        })
+        .and_then(|value| {
+            urlencoding::decode(value)
+                .ok()
+                .map(|decoded| decoded.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+async fn auth_middleware(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let provided_token = extract_auth_token(request.headers());
+
+    if state.pairing.require_pairing() && !state.pairing.is_authenticated(&provided_token) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Unauthorized"})),

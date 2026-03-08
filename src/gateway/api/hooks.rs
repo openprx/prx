@@ -53,6 +53,7 @@ struct HookItem {
 
 #[derive(Serialize)]
 pub(super) struct HooksResponse {
+    enabled: bool,
     hooks: Vec<HookItem>,
 }
 
@@ -157,6 +158,7 @@ pub async fn get_hooks(
 ) -> Result<Json<HooksResponse>, (StatusCode, Json<serde_json::Value>)> {
     let file = read_hooks_file(&state)?;
     Ok(Json(HooksResponse {
+        enabled: file.enabled.unwrap_or(true),
         hooks: hooks_file_to_items(&file),
     }))
 }

@@ -1,5 +1,4 @@
 <script>
-  import { getToken } from '../lib/auth';
   import { apiBaseUrl } from '../lib/api';
   import { t } from '../lib/i18n';
 
@@ -32,14 +31,14 @@
         : t('logs.disconnected')
   );
 
-  function resolveLogsWsUrl(token) {
+  function resolveLogsWsUrl() {
     const baseUrl = apiBaseUrl
       ? new URL(apiBaseUrl, window.location.href)
       : new URL(window.location.href);
 
     baseUrl.protocol = baseUrl.protocol === 'https:' ? 'wss:' : 'ws:';
     baseUrl.pathname = '/api/logs/stream';
-    baseUrl.search = `token=${encodeURIComponent(token)}`;
+    baseUrl.search = '';
     baseUrl.hash = '';
     return baseUrl.toString();
   }
@@ -96,18 +95,12 @@
   function connectSocket() {
     clearReconnectTimer();
 
-    const token = getToken();
-    if (!token) {
-      connectionStatus = 'disconnected';
-      return;
-    }
-
     connectionStatus = 'reconnecting';
     closeSocket();
 
     let nextSocket;
     try {
-      nextSocket = new WebSocket(resolveLogsWsUrl(token));
+      nextSocket = new WebSocket(resolveLogsWsUrl());
     } catch {
       scheduleReconnect();
       return;

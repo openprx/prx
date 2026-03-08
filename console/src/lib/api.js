@@ -46,6 +46,7 @@ async function request(path, init = {}) {
 
   const response = await fetch(`${apiBaseUrl}${path}`, {
     ...init,
+    credentials: init.credentials ?? 'include',
     headers
   });
 
@@ -66,9 +67,23 @@ async function request(path, init = {}) {
 
 export const api = {
   getStatus: () => request('/api/status'),
-  getSessions: () => request('/api/sessions'),
-  getSessionMessages: (sessionId) =>
-    request(`/api/sessions/${encodeURIComponent(sessionId)}/messages`),
+  getSessions: ({ limit, offset, channel, status, search } = {}) => {
+    const params = new URLSearchParams();
+    if (limit) params.set('limit', String(limit));
+    if (offset) params.set('offset', String(offset));
+    if (channel) params.set('channel', channel);
+    if (status) params.set('status', status);
+    if (search) params.set('search', search);
+    const suffix = params.size > 0 ? `?${params.toString()}` : '';
+    return request(`/api/sessions${suffix}`);
+  },
+  getSessionMessages: (sessionId, { limit, offset } = {}) => {
+    const params = new URLSearchParams();
+    if (limit) params.set('limit', String(limit));
+    if (offset) params.set('offset', String(offset));
+    const suffix = params.size > 0 ? `?${params.toString()}` : '';
+    return request(`/api/sessions/${encodeURIComponent(sessionId)}/messages${suffix}`);
+  },
   sendMessage: (sessionId, message) =>
     request(`/api/sessions/${encodeURIComponent(sessionId)}/message`, {
       method: 'POST',
@@ -92,10 +107,6 @@ export const api = {
   },
   getSessionMediaUrl: (path) => {
     const params = new URLSearchParams({ path });
-    const token = getToken();
-    if (token) {
-      params.set('token', token);
-    }
     return `${apiBaseUrl}/api/sessions/media?${params.toString()}`;
   },
   getChannelsStatus: () => request('/api/channels/status'),
