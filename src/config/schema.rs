@@ -286,7 +286,7 @@ fn default_max_depth() -> u32 {
 }
 
 fn default_max_tool_iterations() -> usize {
-    10
+    50
 }
 
 // ── Hardware Config (wizard-driven) ─────────────────────────────
@@ -693,7 +693,7 @@ impl Default for SelfSystemConfig {
 }
 
 fn default_agent_max_tool_iterations() -> usize {
-    10
+    50
 }
 
 fn default_agent_max_history_messages() -> usize {

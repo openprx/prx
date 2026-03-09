@@ -1464,7 +1464,7 @@ pub(crate) async fn run_tool_call_loop(
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
-        max_tool_iterations
+        max_tool_iterations.min(100)
     };
 
     let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
