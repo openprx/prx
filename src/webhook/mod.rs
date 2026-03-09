@@ -168,6 +168,7 @@ async fn run_with_listener(listener: TcpListener, state: WebhookState) -> Result
 
 fn router(state: WebhookState) -> Router {
     Router::new()
+        .route("/webhook", post(handle_webhook_event))
         .route("/webhook/events", post(handle_webhook_event))
         .with_state(state)
 }
@@ -258,6 +259,17 @@ async fn handle_webhook_event(
 }
 
 fn is_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
+    // Try X-Webhook-Token first (preferred, matches gateway behavior)
+    if let Some(raw) = headers.get("X-Webhook-Token") {
+        if let Ok(token) = raw.to_str() {
+            return expected_token
+                .as_bytes()
+                .ct_eq(token.trim().as_bytes())
+                .into();
+        }
+    }
+
+    // Fallback to Authorization: Bearer <token>
     let Some(raw) = headers.get(AUTHORIZATION) else {
         return false;
     };
@@ -665,7 +677,7 @@ mod tests {
 
         let req = Request::builder()
             .method("POST")
-            .uri("/webhook/events")
+            .uri("/webhook")
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({
@@ -844,7 +856,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let response = client
-            .post(format!("http://{addr}/webhook/events"))
+            .post(format!("http://{addr}/webhook"))
             .bearer_auth("secret")
             .json(&json!({
                 "source": "custom",
