@@ -3211,7 +3211,7 @@ mod tests {
                     "number": [{"value": "+8613712345678"}]
                 }])),
                 contact_message: Some(serde_json::json!({
-                    "name": "ZeroClawAgent",
+                    "name": "OpenPRXAgent",
                     "number": [{"value": "+12025550123"}]
                 })),
                 ..Default::default()
@@ -3329,12 +3329,12 @@ mod tests {
             source: Some("+1111111111".to_string()),
             source_number: Some("+1111111111".to_string()),
             data_message: Some(DataMessage {
-                message: Some("@zeroclaw_user ping".to_string()),
+                message: Some("@openprx_user ping".to_string()),
                 timestamp: Some(1_700_000_000_650),
                 mentions: Some(vec![SignalMention {
                     uuid: Some("uuid-mention-1".to_string()),
                     number: Some("+12223334444".to_string()),
-                    name: Some("zeroclaw_user".to_string()),
+                    name: Some("openprx_user".to_string()),
                     start: Some(0),
                     length: Some(14),
                 }]),
@@ -3357,7 +3357,7 @@ mod tests {
             msg.content
         );
         assert!(
-            msg.content.contains(r#""name":"zeroclaw_user""#),
+            msg.content.contains(r#""name":"openprx_user""#),
             "content: {}",
             msg.content
         );

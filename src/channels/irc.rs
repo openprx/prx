@@ -18,7 +18,7 @@ static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
 /// IRC over TLS channel.
 ///
 /// Connects to an IRC server using TLS, joins configured channels,
-/// and forwards PRIVMSG messages to the `ZeroClaw` message bus.
+/// and forwards PRIVMSG messages to the `OpenPRX` message bus.
 /// Supports both channel messages and private messages (DMs).
 pub struct IrcChannel {
     server: String,
@@ -395,7 +395,7 @@ impl Channel for IrcChannel {
         Self::send_raw(&mut writer, &format!("NICK {current_nick}")).await?;
         Self::send_raw(
             &mut writer,
-            &format!("USER {} 0 * :ZeroClaw", self.username),
+            &format!("USER {} 0 * :OpenPRX", self.username),
         )
         .await?;
 

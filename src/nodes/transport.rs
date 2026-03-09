@@ -108,8 +108,8 @@ impl NodeTransport for H2Transport {
                 let ts = Utc::now().timestamp();
                 let signature = Self::sign(secret, ts, &body)?;
                 req = req
-                    .header("X-ZeroClaw-Timestamp", ts.to_string())
-                    .header("X-ZeroClaw-Signature", signature);
+                    .header("X-OpenPRX-Timestamp", ts.to_string())
+                    .header("X-OpenPRX-Signature", signature);
             }
 
             match req.send().await {

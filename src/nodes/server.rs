@@ -684,11 +684,11 @@ fn validate_hmac(headers: &HeaderMap, body: &str, config: &NodeServerConfig) -> 
     let timestamp_raw = headers
         .get("x-openprx-timestamp")
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| anyhow!("missing X-ZeroClaw-Timestamp"))?;
+        .ok_or_else(|| anyhow!("missing X-OpenPRX-Timestamp"))?;
 
     let timestamp = timestamp_raw
         .parse::<i64>()
-        .context("invalid X-ZeroClaw-Timestamp")?;
+        .context("invalid X-OpenPRX-Timestamp")?;
 
     let now = Utc::now().timestamp();
     if (now - timestamp).abs() > 300 {
@@ -698,7 +698,7 @@ fn validate_hmac(headers: &HeaderMap, body: &str, config: &NodeServerConfig) -> 
     let signature = headers
         .get("x-openprx-signature")
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| anyhow!("missing X-ZeroClaw-Signature"))?;
+        .ok_or_else(|| anyhow!("missing X-OpenPRX-Signature"))?;
 
     let payload = format!("{timestamp}.{body}");
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
