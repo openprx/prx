@@ -89,6 +89,25 @@ fn hash_webhook_secret(value: &str) -> String {
     hex::encode(digest)
 }
 
+fn verify_webhook_hmac_signature(secret: &str, body: &[u8], signature_header: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let signature_hex = signature_header
+        .trim()
+        .strip_prefix("sha256=")
+        .unwrap_or(signature_header.trim());
+    let Ok(provided) = hex::decode(signature_hex) else {
+        return false;
+    };
+
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+    mac.verify_slice(&provided).is_ok()
+}
+
 /// How often the rate limiter sweeps stale IP entries from its map.
 const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
 
@@ -308,8 +327,10 @@ pub struct AppState {
     pub mcp_tool: Option<Arc<McpTool>>,
     /// Hook manager for lifecycle events.
     pub hooks: Arc<HookManager>,
-    /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
-    pub webhook_secret_hash: Option<Arc<str>>,
+    /// SHA-256 hash of `webhook.token` for `X-Webhook-Token` auth.
+    pub webhook_token_hash: Option<Arc<str>>,
+    /// HMAC signing secret for `X-Webhook-Signature` verification.
+    pub webhook_signing_secret: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
@@ -429,13 +450,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let mut tools_list = tools_result.tools;
     let mcp_tool = tools_result.mcp_tool;
     let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
-    // Extract webhook secret for authentication
-    let webhook_secret_hash: Option<Arc<str>> =
+    // Generic /webhook auth can require a standalone token and/or HMAC signature.
+    let webhook_token_hash: Option<Arc<str>> =
+        config.webhook.token.as_ref().and_then(|raw_token| {
+            let trimmed_token = raw_token.trim();
+            (!trimmed_token.is_empty())
+                .then(|| Arc::<str>::from(hash_webhook_secret(trimmed_token)))
+        });
+    let webhook_signing_secret: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
             webhook.secret.as_ref().and_then(|raw_secret| {
                 let trimmed_secret = raw_secret.trim();
-                (!trimmed_secret.is_empty())
-                    .then(|| Arc::<str>::from(hash_webhook_secret(trimmed_secret)))
+                (!trimmed_secret.is_empty()).then(|| Arc::<str>::from(trimmed_secret.to_string()))
             })
         });
 
@@ -747,7 +773,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tools_registry,
         mcp_tool,
         hooks,
-        webhook_secret_hash,
+        webhook_token_hash,
+        webhook_signing_secret,
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
@@ -1080,7 +1107,7 @@ async fn handle_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+    body: Bytes,
 ) -> impl IntoResponse {
     let bearer_token = headers
         .get(header::AUTHORIZATION)
@@ -1088,8 +1115,13 @@ async fn handle_webhook(
         .and_then(|auth| auth.strip_prefix("Bearer "))
         .map(str::trim)
         .unwrap_or("");
-    let webhook_secret_header = headers
-        .get("X-Webhook-Secret")
+    let webhook_token_header = headers
+        .get("X-Webhook-Token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let webhook_signature_header = headers
+        .get("X-Webhook-Signature")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -1116,14 +1148,28 @@ async fn handle_webhook(
         }
     }
 
-    // ── Webhook secret auth (optional, additional layer) ──
-    if let Some(ref secret_hash) = state.webhook_secret_hash {
-        let header_hash = webhook_secret_header.map(hash_webhook_secret);
+    // ── Standalone webhook token auth (optional, additional layer) ──
+    if let Some(ref token_hash) = state.webhook_token_hash {
+        let header_hash = webhook_token_header.map(hash_webhook_secret);
         match header_hash {
-            Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+            Some(val) if constant_time_eq(&val, token_hash.as_ref()) => {}
             _ => {
-                tracing::warn!("Webhook: rejected request — invalid or missing X-Webhook-Secret");
-                let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
+                tracing::warn!("Webhook: rejected request — invalid or missing X-Webhook-Token");
+                let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Token header"});
+                return (StatusCode::UNAUTHORIZED, Json(err));
+            }
+        }
+    }
+
+    // ── Webhook HMAC auth (optional, additional layer) ──
+    if let Some(ref signing_secret) = state.webhook_signing_secret {
+        match webhook_signature_header {
+            Some(signature) if verify_webhook_hmac_signature(signing_secret, &body, signature) => {}
+            _ => {
+                tracing::warn!(
+                    "Webhook: rejected request — invalid or missing X-Webhook-Signature"
+                );
+                let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Signature header"});
                 return (StatusCode::UNAUTHORIZED, Json(err));
             }
         }
@@ -1132,8 +1178,10 @@ async fn handle_webhook(
     // Additional credential-based limiter reduces distributed IP rotation bypass.
     let credential_rate_key = if !bearer_token.is_empty() {
         format!("bearer:{}", hash_webhook_secret(bearer_token))
-    } else if let Some(secret) = webhook_secret_header {
-        format!("secret:{}", hash_webhook_secret(secret))
+    } else if let Some(token) = webhook_token_header {
+        format!("token:{}", hash_webhook_secret(token))
+    } else if let Some(signature) = webhook_signature_header {
+        format!("signature:{}", hash_webhook_secret(signature))
     } else {
         "public".to_string()
     };
@@ -1150,7 +1198,7 @@ async fn handle_webhook(
     }
 
     // ── Parse body ──
-    let Json(webhook_body) = match body {
+    let webhook_body: WebhookBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("Webhook JSON parse error: {e}");
@@ -1759,7 +1807,8 @@ mod tests {
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_secret_hash: None,
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -1822,7 +1871,8 @@ mod tests {
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_secret_hash: None,
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -2211,7 +2261,8 @@ mod tests {
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_secret_hash: None,
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -2242,27 +2293,24 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
 
-        let body = Ok(Json(WebhookBody {
-            message: "hello".into(),
-            reply_target: None,
-        }));
         let first = handle_webhook(
             State(state.clone()),
             test_connect_info(),
             headers.clone(),
-            body,
+            Bytes::from_static(br#"{"message":"hello"}"#),
         )
         .await
         .into_response();
         assert_eq!(first.status(), StatusCode::OK);
 
-        let body = Ok(Json(WebhookBody {
-            message: "hello".into(),
-            reply_target: None,
-        }));
-        let second = handle_webhook(State(state), test_connect_info(), headers, body)
-            .await
-            .into_response();
+        let second = handle_webhook(
+            State(state),
+            test_connect_info(),
+            headers,
+            Bytes::from_static(br#"{"message":"hello"}"#),
+        )
+        .await
+        .into_response();
         assert_eq!(second.status(), StatusCode::OK);
 
         let payload = second.into_body().collect().await.unwrap().to_bytes();
@@ -2292,7 +2340,8 @@ mod tests {
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_secret_hash: None,
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -2322,27 +2371,24 @@ mod tests {
 
         let headers = HeaderMap::new();
 
-        let body1 = Ok(Json(WebhookBody {
-            message: "hello one".into(),
-            reply_target: None,
-        }));
         let first = handle_webhook(
             State(state.clone()),
             test_connect_info(),
             headers.clone(),
-            body1,
+            Bytes::from_static(br#"{"message":"hello one"}"#),
         )
         .await
         .into_response();
         assert_eq!(first.status(), StatusCode::OK);
 
-        let body2 = Ok(Json(WebhookBody {
-            message: "hello two".into(),
-            reply_target: None,
-        }));
-        let second = handle_webhook(State(state), test_connect_info(), headers, body2)
-            .await
-            .into_response();
+        let second = handle_webhook(
+            State(state),
+            test_connect_info(),
+            headers,
+            Bytes::from_static(br#"{"message":"hello two"}"#),
+        )
+        .await
+        .into_response();
         assert_eq!(second.status(), StatusCode::OK);
 
         let keys = tracking_impl.keys.lock().clone();
@@ -2372,7 +2418,8 @@ mod tests {
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_secret_hash: None,
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -2404,10 +2451,7 @@ mod tests {
             State(state),
             test_connect_info(),
             HeaderMap::new(),
-            Ok(Json(WebhookBody {
-                message: "hello group".into(),
-                reply_target: Some("group:team-1".into()),
-            })),
+            Bytes::from_static(br#"{"message":"hello group","reply_target":"group:team-1"}"#),
         )
         .await
         .into_response();
@@ -2418,7 +2462,7 @@ mod tests {
     }
 
     #[test]
-    fn webhook_secret_hash_is_deterministic_and_nonempty() {
+    fn webhook_token_hash_is_deterministic_and_nonempty() {
         let secret_a = generate_test_secret();
         let secret_b = generate_test_secret();
         let one = hash_webhook_secret(&secret_a);
@@ -2431,7 +2475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_secret_hash_rejects_missing_header() {
+    async fn webhook_token_hash_rejects_missing_header() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
@@ -2448,7 +2492,8 @@ mod tests {
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            webhook_token_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -2480,10 +2525,7 @@ mod tests {
             State(state),
             test_connect_info(),
             HeaderMap::new(),
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-                reply_target: None,
-            })),
+            Bytes::from_static(br#"{"message":"hello"}"#),
         )
         .await
         .into_response();
@@ -2493,7 +2535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_secret_hash_rejects_invalid_header() {
+    async fn webhook_token_hash_rejects_invalid_header() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
@@ -2511,7 +2553,8 @@ mod tests {
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
+            webhook_token_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
+            webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -2541,7 +2584,7 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(
-            "X-Webhook-Secret",
+            "X-Webhook-Token",
             HeaderValue::from_str(&wrong_secret).unwrap(),
         );
 
@@ -2549,10 +2592,7 @@ mod tests {
             State(state),
             test_connect_info(),
             headers,
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-                reply_target: None,
-            })),
+            Bytes::from_static(br#"{"message":"hello"}"#),
         )
         .await
         .into_response();
@@ -2562,7 +2602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_secret_hash_accepts_valid_header() {
+    async fn webhook_token_hash_accepts_valid_header() {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
@@ -2579,7 +2619,8 @@ mod tests {
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            webhook_token_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -2608,16 +2649,144 @@ mod tests {
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
+        headers.insert("X-Webhook-Token", HeaderValue::from_str(&secret).unwrap());
 
         let response = handle_webhook(
             State(state),
             test_connect_info(),
             headers,
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-                reply_target: None,
-            })),
+            Bytes::from_static(br#"{"message":"hello"}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_signature_rejects_missing_header() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            webhook_token_hash: None,
+            webhook_signing_secret: Some(Arc::from(secret)),
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            signal: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
+        };
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"message":"hello"}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_signature_accepts_valid_hmac() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
+        let body = br#"{"message":"hello"}"#;
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            webhook_token_hash: None,
+            webhook_signing_secret: Some(Arc::from(secret.clone())),
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            signal: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!(
+                "sha256={}",
+                compute_whatsapp_signature_hex(&secret, body)
+            ))
+            .unwrap(),
+        );
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            headers,
+            Bytes::from_static(body),
         )
         .await
         .into_response();
@@ -2652,7 +2821,8 @@ mod tests {
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_secret_hash: None,
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -2720,7 +2890,8 @@ mod tests {
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
-            webhook_secret_hash: None,
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),

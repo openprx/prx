@@ -837,7 +837,10 @@ async fn main() -> Result<()> {
         }?;
         // Auto-start channels if user said yes during wizard
         if std::env::var("OPENPRX_AUTOSTART_CHANNELS")
-            .or_else(|_| std::env::var("OPENPRX_AUTOSTART_CHANNELS").or_else(|_| std::env::var("ZEROCLAW_AUTOSTART_CHANNELS")))
+            .or_else(|_| {
+                std::env::var("OPENPRX_AUTOSTART_CHANNELS")
+                    .or_else(|_| std::env::var("ZEROCLAW_AUTOSTART_CHANNELS"))
+            })
             .as_deref()
             == Ok("1")
         {
