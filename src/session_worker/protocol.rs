@@ -55,7 +55,7 @@ mod tests {
             workspace_dir: PathBuf::from("/tmp/ws"),
             memory_db_path: PathBuf::from("/tmp/ws/brain.db"),
             allowed_tools: vec!["shell".into(), "file_read".into()],
-            timeout_seconds: 120,
+            timeout_seconds: 0,
             max_iterations: 24,
             system_prompt: None,
             identity_dir: Some("identity/worker".into()),

@@ -207,13 +207,32 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
 
     let run_future = with_manifest_spawn_context(&manifest, run_future);
 
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(manifest.timeout_seconds),
-        run_future,
-    )
-    .await
-    {
-        Ok(Ok(output)) => Ok(WorkerResult {
+    let result = if manifest.timeout_seconds == 0 {
+        // No timeout — run until natural completion (rely on callback)
+        run_future.await
+    } else {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(manifest.timeout_seconds),
+            run_future,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return Ok(WorkerResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Sub-agent timed out after {}s",
+                        manifest.timeout_seconds
+                    )),
+                });
+            }
+        }
+    };
+
+    match result {
+        Ok(output) => Ok(WorkerResult {
             success: true,
             output: if output.trim().is_empty() {
                 "[Sub-agent produced no output]".to_string()
@@ -222,18 +241,10 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
             },
             error: None,
         }),
-        Ok(Err(error)) => Ok(WorkerResult {
+        Err(error) => Ok(WorkerResult {
             success: false,
             output: String::new(),
             error: Some(error.to_string()),
-        }),
-        Err(_) => Ok(WorkerResult {
-            success: false,
-            output: String::new(),
-            error: Some(format!(
-                "Sub-agent timed out after {}s",
-                manifest.timeout_seconds
-            )),
         }),
     }
 }

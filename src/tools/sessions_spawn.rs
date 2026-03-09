@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Default timeout for sub-agent runs (10 minutes).
-const DEFAULT_SUB_AGENT_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_SUB_AGENT_TIMEOUT_SECS: u64 = 0;
 const DEFAULT_SUB_AGENT_SYSTEM_PROMPT: &str = "\
 You are a sub-agent handling a specific delegated task. \
 Complete the task thoroughly and report results concisely. \
@@ -358,9 +358,8 @@ impl Tool for SessionsSpawnTool {
                 },
                 "timeout_seconds": {
                     "type": "integer",
-                    "minimum": 10,
-                    "maximum": 3600,
-                    "description": "Maximum runtime in seconds (default 600). Sub-agent is cancelled if exceeded."
+                    "minimum": 0,
+                    "description": "Maximum runtime in seconds. 0 or omitted = no timeout (sub-agent runs until completion). Set a value to enforce a deadline."
                 },
                 "mode": {
                     "type": "string",
