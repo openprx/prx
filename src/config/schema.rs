@@ -57,7 +57,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 /// Top-level OpenPRX configuration, loaded from `config.toml`.
 ///
-/// Resolution order: `OPENPRX_WORKSPACE`/`ZEROCLAW_WORKSPACE` env
+/// Resolution order: `OPENPRX_WORKSPACE` (legacy: `ZEROCLAW_WORKSPACE`) env
 /// → `active_workspace.toml` marker
 /// → `~/.openprx/config.toml` (fallback `~/.openprx/config.toml`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -68,7 +68,7 @@ pub struct Config {
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
     pub config_path: PathBuf,
-    /// API key for the selected provider. Overridden by `OPENPRX_API_KEY`, `ZEROCLAW_API_KEY`, or `API_KEY` env vars.
+    /// API key for the selected provider. Overridden by `OPENPRX_API_KEY`, `OPENPRX_API_KEY / ZEROCLAW_API_KEY`, or `API_KEY` env vars.
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
@@ -3394,7 +3394,7 @@ pub struct WhatsAppConfig {
     #[serde(default)]
     pub verify_token: Option<String>,
     /// App secret from Meta Business Suite (for webhook signature verification)
-    /// Can also be set via `ZEROCLAW_WHATSAPP_APP_SECRET` environment variable
+    /// Can also be set via `OPENPRX_WHATSAPP_APP_SECRET` (legacy: `ZEROCLAW_WHATSAPP_APP_SECRET`) environment variable
     /// Only used in Cloud API mode
     #[serde(default)]
     pub app_secret: Option<String>,
@@ -3454,7 +3454,7 @@ pub struct NextcloudTalkConfig {
     pub app_token: String,
     /// Shared secret for webhook signature verification.
     ///
-    /// Can also be set via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
+    /// Can also be set via `OPENPRX_NEXTCLOUD_TALK_WEBHOOK_SECRET` (legacy: `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`).
     #[serde(default)]
     pub webhook_secret: Option<String>,
     /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
@@ -4132,8 +4132,8 @@ enum ConfigResolutionSource {
 impl ConfigResolutionSource {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::EnvConfigDir => "OPENPRX_CONFIG_DIR/ZEROCLAW_CONFIG_DIR",
-            Self::EnvWorkspace => "OPENPRX_WORKSPACE/ZEROCLAW_WORKSPACE",
+            Self::EnvConfigDir => "OPENPRX_CONFIG_DIR (legacy: ZEROCLAW_CONFIG_DIR)",
+            Self::EnvWorkspace => "OPENPRX_WORKSPACE (legacy: ZEROCLAW_WORKSPACE)",
             Self::ActiveWorkspaceMarker => "active_workspace.toml",
             Self::DefaultConfigDir => "default",
         }
@@ -4430,7 +4430,7 @@ impl Config {
 
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
-        // API Key: ZEROCLAW_API_KEY or API_KEY (generic)
+        // API Key: OPENPRX_API_KEY / ZEROCLAW_API_KEY or API_KEY (generic)
         if let Ok(key) = env_openprx_or_openprx("API_KEY").or_else(|_| std::env::var("API_KEY")) {
             if !key.is_empty() {
                 self.api_key = Some(key);
@@ -4455,7 +4455,7 @@ impl Config {
         }
 
         // Provider override precedence:
-        // 1) ZEROCLAW_PROVIDER always wins when set.
+        // 1) OPENPRX_PROVIDER / ZEROCLAW_PROVIDER always wins when set.
         // 2) Legacy PROVIDER is only honored when config still uses the
         //    default provider (openrouter) or provider is unset. This prevents
         //    container defaults from overriding explicit custom providers.
@@ -4473,7 +4473,7 @@ impl Config {
             }
         }
 
-        // Model: ZEROCLAW_MODEL or MODEL
+        // Model: OPENPRX_MODEL / ZEROCLAW_MODEL or MODEL
         if let Ok(model) = env_openprx_or_openprx("MODEL").or_else(|_| std::env::var("MODEL")) {
             if !model.is_empty() {
                 self.default_model = Some(model);

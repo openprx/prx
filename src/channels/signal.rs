@@ -3207,7 +3207,7 @@ mod tests {
                 message: None,
                 timestamp: Some(1_700_000_000_500),
                 contacts: Some(serde_json::json!([{
-                    "name": "ZeroClawOperator",
+                    "name": "OpenPRXOperator",
                     "number": [{"value": "+8613712345678"}]
                 }])),
                 contact_message: Some(serde_json::json!({

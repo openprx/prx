@@ -96,7 +96,7 @@ use config::Config;
 // Re-export so binary's hardware/peripherals modules can use crate::HardwareCommands etc.
 pub use openprx::{HardwareCommands, PeripheralCommands};
 
-/// `OpenPRX` - Zero overhead. Zero compromise. 100% Rust.
+/// `OpenPRX` - 100% Rust. 100% Agnostic. Your AI, your rules.
 #[derive(Parser, Debug)]
 #[command(name = "openprx")]
 #[command(author = "theonlyhennygod")]
