@@ -42,22 +42,22 @@ impl LucidMemory {
             .unwrap_or(Self::DEFAULT_TOKEN_BUDGET);
 
         let recall_timeout = Self::read_env_duration_ms(
-            "ZEROCLAW_LUCID_RECALL_TIMEOUT_MS",
+            "OPENPRX_LUCID_RECALL_TIMEOUT_MS",
             Self::DEFAULT_RECALL_TIMEOUT_MS,
             20,
         );
         let store_timeout = Self::read_env_duration_ms(
-            "ZEROCLAW_LUCID_STORE_TIMEOUT_MS",
+            "OPENPRX_LUCID_STORE_TIMEOUT_MS",
             Self::DEFAULT_STORE_TIMEOUT_MS,
             50,
         );
         let local_hit_threshold = Self::read_env_usize(
-            "ZEROCLAW_LUCID_LOCAL_HIT_THRESHOLD",
+            "OPENPRX_LUCID_LOCAL_HIT_THRESHOLD",
             Self::DEFAULT_LOCAL_HIT_THRESHOLD,
             1,
         );
         let failure_cooldown = Self::read_env_duration_ms(
-            "ZEROCLAW_LUCID_FAILURE_COOLDOWN_MS",
+            "OPENPRX_LUCID_FAILURE_COOLDOWN_MS",
             Self::DEFAULT_FAILURE_COOLDOWN_MS,
             100,
         );

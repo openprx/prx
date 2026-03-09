@@ -1640,7 +1640,7 @@ impl Default for WebSearchConfig {
 pub enum ProxyScope {
     /// Use system environment proxy variables only.
     Environment,
-    /// Apply proxy to all ZeroClaw-managed HTTP traffic (default).
+    /// Apply proxy to all OpenPRX-managed HTTP traffic (default).
     #[default]
     Zeroclaw,
     /// Apply proxy only to explicitly listed service selectors.
@@ -3499,8 +3499,8 @@ impl WhatsAppConfig {
 
 /// wacli JSON-RPC daemon channel configuration.
 ///
-/// Connect ZeroClaw to WhatsApp via the `wacli` daemon (JSON-RPC over TCP).
-/// The daemon must be running before ZeroClaw starts.
+/// Connect OpenPRX to WhatsApp via the `wacli` daemon (JSON-RPC over TCP).
+/// The daemon must be running before OpenPRX starts.
 ///
 /// Example TOML:
 /// ```toml
@@ -3598,7 +3598,7 @@ fn default_irc_port() -> u16 {
     6697
 }
 
-/// How ZeroClaw receives events from Feishu / Lark.
+/// How OpenPRX receives events from Feishu / Lark.
 ///
 /// - `websocket` (default) — persistent WSS long-connection; no public URL required.
 /// - `webhook`             — HTTP callback server; requires a public HTTPS endpoint.

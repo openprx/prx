@@ -7,7 +7,7 @@
 //!
 //! The classic "rest" mode connects to an externally-managed `signal-cli` daemon
 //! (typically running inside a Docker container via `signal-cli-rest-api`).  Native
-//! mode eliminates that dependency by letting ZeroClaw manage the daemon lifecycle
+//! mode eliminates that dependency by letting OpenPRX manage the daemon lifecycle
 //! itself – no Docker, no REST-API wrapper.
 //!
 //! ## How it works

@@ -435,7 +435,7 @@ async fn load_evolution_config(config: &Config) -> Result<(EvolutionConfig, Path
 
 fn discover_evolution_config_path(config: &Config) -> PathBuf {
     if let Ok(raw) = std::env::var("OPENPRX_EVOLUTION_CONFIG")
-        .or_else(|_| std::env::var("ZEROCLAW_EVOLUTION_CONFIG"))
+        .or_else(|_| std::env::var("OPENPRX_EVOLUTION_CONFIG").or_else(|_| std::env::var("ZEROCLAW_EVOLUTION_CONFIG")))
     {
         let path = PathBuf::from(raw);
         if !path.as_os_str().is_empty() {
