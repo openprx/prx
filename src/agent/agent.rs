@@ -531,8 +531,11 @@ impl Agent {
 
         let run_id = run_id.or_else(|| {
             // Legacy text parsing — emit a warning so future regressions surface.
+            // Log only a bounded, sanitized summary to avoid leaking task content.
+            let preview: String = result.output.chars().take(80).collect();
             tracing::warn!(
-                output = result.output.as_str(),
+                output_preview = preview.as_str(),
+                output_len = result.output.len(),
                 "spawn_delegate_task: run_id not found in structured output; \
                  falling back to text parsing. Consider returning structured metadata \
                  from sessions_spawn."
@@ -547,11 +550,12 @@ impl Agent {
                 .map(str::to_string)
         });
 
+        // Return a generic error — do not embed raw tool output which may
+        // contain sensitive task content or internal details.
         run_id.ok_or_else(|| {
             anyhow::anyhow!(
-                "spawn_delegate_task: sessions_spawn succeeded but returned no run_id. \
-                 Output was: {}",
-                result.output
+                "spawn_delegate_task: sessions_spawn succeeded but returned no parseable \
+                 run_id. Check sessions_spawn output format."
             )
         })
     }
