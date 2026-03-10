@@ -65,6 +65,21 @@ pub enum MemoryCategory {
     Custom(String),
 }
 
+pub(crate) fn validate_memory_write_target(
+    key: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if key.starts_with("self/")
+        && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
+    {
+        anyhow::bail!(
+            "refusing to write reserved self-system memory namespace without self_system session"
+        );
+    }
+
+    Ok(())
+}
+
 impl std::fmt::Display for MemoryCategory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

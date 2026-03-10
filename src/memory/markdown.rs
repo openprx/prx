@@ -1,4 +1,4 @@
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{validate_memory_write_target, Memory, MemoryCategory, MemoryEntry};
 use async_trait::async_trait;
 use chrono::Local;
 use std::path::{Path, PathBuf};
@@ -151,8 +151,9 @@ impl Memory for MarkdownMemory {
         key: &str,
         content: &str,
         category: MemoryCategory,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        validate_memory_write_target(key, session_id)?;
         let entry = format!("- **{key}**: {content}");
         let path = match category {
             MemoryCategory::Core => self.core_path(),

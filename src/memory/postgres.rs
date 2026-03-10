@@ -1,4 +1,4 @@
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{validate_memory_write_target, Memory, MemoryCategory, MemoryEntry};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -190,6 +190,7 @@ impl Memory for PostgresMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> Result<()> {
+        validate_memory_write_target(key, session_id)?;
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();

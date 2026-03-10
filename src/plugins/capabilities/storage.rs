@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use wasmtime::AsContextMut;
 
-use crate::memory::traits::{MemoryCategory, MemoryEntry};
+use crate::memory::traits::{validate_memory_write_target, MemoryCategory, MemoryEntry};
 use crate::plugins::error::{PluginError, PluginResult};
 use crate::plugins::host::HostState;
 use crate::plugins::manifest::PluginManifest;
@@ -624,6 +624,7 @@ impl crate::memory::traits::Memory for WasmStorage {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        validate_memory_write_target(key, session_id)?;
         let category_str = category.to_string();
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(self.timeout_ms),
