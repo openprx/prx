@@ -135,6 +135,10 @@ pub struct Config {
     #[serde(default)]
     pub task_routing: TaskRoutingConfig,
 
+    /// Heuristic LLM router configuration (`[router]`).
+    #[serde(default)]
+    pub router: RouterConfig,
+
     /// Heartbeat configuration for periodic health pings (`[heartbeat]`).
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
@@ -291,6 +295,102 @@ fn default_max_depth() -> u32 {
 
 fn default_max_tool_iterations() -> usize {
     50
+}
+
+fn default_router_alpha() -> f32 {
+    0.0
+}
+
+fn default_router_beta() -> f32 {
+    0.5
+}
+
+fn default_router_gamma() -> f32 {
+    0.3
+}
+
+fn default_router_delta() -> f32 {
+    0.1
+}
+
+fn default_router_epsilon() -> f32 {
+    0.1
+}
+
+fn default_router_max_context() -> usize {
+    128_000
+}
+
+fn default_router_latency() -> u32 {
+    2_000
+}
+
+fn default_router_elo() -> f32 {
+    1_000.0
+}
+
+/// Heuristic LLM router configuration (`[router]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RouterConfig {
+    /// Enable heuristic routing. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Similarity score weight. Phase 1 keeps this at `0.0`.
+    #[serde(default = "default_router_alpha")]
+    pub alpha: f32,
+    /// Capability score weight.
+    #[serde(default = "default_router_beta")]
+    pub beta: f32,
+    /// Elo score weight.
+    #[serde(default = "default_router_gamma")]
+    pub gamma: f32,
+    /// Cost penalty coefficient.
+    #[serde(default = "default_router_delta")]
+    pub delta: f32,
+    /// Latency penalty coefficient.
+    #[serde(default = "default_router_epsilon")]
+    pub epsilon: f32,
+    /// Candidate model registry.
+    #[serde(default)]
+    pub models: Vec<RouterModelConfig>,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            alpha: default_router_alpha(),
+            beta: default_router_beta(),
+            gamma: default_router_gamma(),
+            delta: default_router_delta(),
+            epsilon: default_router_epsilon(),
+            models: Vec::new(),
+        }
+    }
+}
+
+/// Static router metadata for one model candidate.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RouterModelConfig {
+    /// Model identifier without provider prefix.
+    pub model_id: String,
+    /// Provider identifier.
+    pub provider: String,
+    /// USD cost per million tokens.
+    #[serde(default)]
+    pub cost_per_million_tokens: f32,
+    /// Maximum context window in tokens.
+    #[serde(default = "default_router_max_context")]
+    pub max_context: usize,
+    /// Average latency in milliseconds.
+    #[serde(default = "default_router_latency")]
+    pub latency_ms: u32,
+    /// Capability categories such as `conversation`, `code`, or `analysis`.
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Initial Elo rating.
+    #[serde(default = "default_router_elo")]
+    pub elo_rating: f32,
 }
 
 // ── Hardware Config (wizard-driven) ─────────────────────────────
@@ -3970,6 +4070,7 @@ impl Default for Config {
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             task_routing: TaskRoutingConfig::default(),
+            router: RouterConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
@@ -5165,6 +5266,7 @@ default_temperature = 0.7
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
             task_routing: TaskRoutingConfig::default(),
+            router: RouterConfig::default(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
@@ -5421,6 +5523,7 @@ tool_dispatcher = "xml"
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
             task_routing: TaskRoutingConfig::default(),
+            router: RouterConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),

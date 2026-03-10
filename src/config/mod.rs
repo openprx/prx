@@ -17,12 +17,12 @@ pub use schema::{
     MediaConfig, MemoryConfig, MemoryWebhookConfig, ModelRouteConfig, MultimodalConfig,
     NextcloudTalkConfig, NodeServerConfig, NodesConfig, ObservabilityConfig, PeripheralBoardConfig,
     PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig,
-    RemoteNodeConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
-    SchedulerConfig, ScopeConfig, ScopeRule, SecretsConfig, SecurityConfig, SelfSystemConfig,
-    SessionsSpawnConfig, SkillsConfig, SlackConfig, StorageConfig, StorageProviderConfig,
-    StorageProviderSection, StreamMode, TaskRoutingConfig, TaskRoutingIntentConfig,
-    TaskRoutingRule, TelegramConfig, ToolPolicyConfig, TunnelConfig, UserPolicyConfig,
-    WebSearchConfig, WebhookConfig,
+    RemoteNodeConfig, ResourceLimitsConfig, RouterConfig, RouterModelConfig, RuntimeConfig,
+    SandboxBackend, SandboxConfig, SchedulerConfig, ScopeConfig, ScopeRule, SecretsConfig,
+    SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig, SlackConfig,
+    StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, TaskRoutingConfig,
+    TaskRoutingIntentConfig, TaskRoutingRule, TelegramConfig, ToolPolicyConfig, TunnelConfig,
+    UserPolicyConfig, WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]

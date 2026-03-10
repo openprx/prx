@@ -573,7 +573,9 @@ mod tests {
                 Ok(self
                     .entries
                     .iter()
-                    .filter(|entry| session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid)))
+                    .filter(|entry| {
+                        session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid))
+                    })
                     .cloned()
                     .collect())
             }

@@ -8,6 +8,8 @@ use crate::hooks::{payload_error, HookEvent, HookManager};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
+#[cfg(feature = "llm-router")]
+use crate::router::RouterEngine;
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -36,6 +38,8 @@ pub struct Agent {
     classification_config: crate::config::QueryClassificationConfig,
     task_routing_config: crate::config::TaskRoutingConfig,
     available_hints: Vec<String>,
+    #[cfg(feature = "llm-router")]
+    router: Option<RouterEngine>,
 }
 
 pub struct AgentBuilder {
@@ -57,6 +61,8 @@ pub struct AgentBuilder {
     classification_config: Option<crate::config::QueryClassificationConfig>,
     task_routing_config: Option<crate::config::TaskRoutingConfig>,
     available_hints: Option<Vec<String>>,
+    #[cfg(feature = "llm-router")]
+    router: Option<RouterEngine>,
 }
 
 impl AgentBuilder {
@@ -80,6 +86,8 @@ impl AgentBuilder {
             classification_config: None,
             task_routing_config: None,
             available_hints: None,
+            #[cfg(feature = "llm-router")]
+            router: None,
         }
     }
 
@@ -179,6 +187,12 @@ impl AgentBuilder {
         self
     }
 
+    #[cfg(feature = "llm-router")]
+    pub fn router(mut self, router: RouterEngine) -> Self {
+        self.router = Some(router);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let tools = self
             .tools
@@ -224,6 +238,8 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             task_routing_config: self.task_routing_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
+            #[cfg(feature = "llm-router")]
+            router: self.router,
         })
     }
 }
@@ -316,7 +332,35 @@ impl Agent {
         let available_hints: Vec<String> =
             config.model_routes.iter().map(|r| r.hint.clone()).collect();
 
-        Agent::builder()
+        #[cfg(feature = "llm-router")]
+        let mut builder = Agent::builder()
+            .provider(provider)
+            .tools(tools)
+            .memory(memory)
+            .observer(observer)
+            .hooks(Arc::new(HookManager::new(config.workspace_dir.clone())))
+            .tool_dispatcher(tool_dispatcher)
+            .memory_loader(Box::new(DefaultMemoryLoader::new(
+                5,
+                config.memory.min_relevance_score,
+            )))
+            .prompt_builder(SystemPromptBuilder::with_defaults())
+            .config(config.agent.clone())
+            .model_name(model_name)
+            .temperature(config.default_temperature)
+            .workspace_dir(config.workspace_dir.clone())
+            .classification_config(config.query_classification.clone())
+            .task_routing_config(config.task_routing.clone())
+            .available_hints(available_hints.clone())
+            .identity_config(config.identity.clone())
+            .skills(crate::skills::load_skills_with_config(
+                &config.workspace_dir,
+                config,
+            ))
+            .auto_save(config.memory.auto_save);
+
+        #[cfg(not(feature = "llm-router"))]
+        let builder = Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
@@ -340,8 +384,18 @@ impl Agent {
                 &config.workspace_dir,
                 config,
             ))
-            .auto_save(config.memory.auto_save)
-            .build()
+            .auto_save(config.memory.auto_save);
+
+        #[cfg(feature = "llm-router")]
+        if config.router.enabled {
+            let router = futures::executor::block_on(RouterEngine::new(
+                config.router.clone(),
+                builder.memory.as_ref().expect("memory set").clone(),
+            ))?;
+            builder = builder.router(router);
+        }
+
+        builder.build()
     }
 
     fn trim_history(&mut self) {
@@ -561,6 +615,8 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        #[cfg(feature = "llm-router")]
+        let turn_started = Instant::now();
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
@@ -618,11 +674,55 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = classify_result
-            .model_hint
-            .as_deref()
-            .map(|target| self.resolve_model_target(target))
-            .unwrap_or_else(|| self.classify_model(user_message));
+        #[cfg(feature = "llm-router")]
+        let mut routed_model_for_metrics: Option<String> = None;
+        let effective_model = {
+            #[cfg(feature = "llm-router")]
+            {
+                if let Some(router) = &self.router {
+                    if classify_result.model_hint.is_none() {
+                        let result = router
+                            .select_model(user_message, &classify_result.intent)
+                            .await;
+                        if let (Some(provider), Some(model)) = (
+                            result.chosen_provider.as_deref(),
+                            result.chosen_model.as_deref(),
+                        ) {
+                            tracing::info!(
+                                chosen = model,
+                                provider = provider,
+                                score = result.score,
+                                "Router selected model"
+                            );
+                            routed_model_for_metrics = Some(model.to_string());
+                            format!("{provider}/{model}")
+                        } else {
+                            self.classify_model(user_message)
+                        }
+                    } else {
+                        classify_result
+                            .model_hint
+                            .as_deref()
+                            .map(|target| self.resolve_model_target(target))
+                            .unwrap()
+                    }
+                } else {
+                    classify_result
+                        .model_hint
+                        .as_deref()
+                        .map(|target| self.resolve_model_target(target))
+                        .unwrap_or_else(|| self.classify_model(user_message))
+                }
+            }
+            #[cfg(not(feature = "llm-router"))]
+            {
+                classify_result
+                    .model_hint
+                    .as_deref()
+                    .map(|target| self.resolve_model_target(target))
+                    .unwrap_or_else(|| self.classify_model(user_message))
+            }
+        };
         let max_tool_iterations = match classify_result.intent {
             // Simple: cap at configured limit but allow up to 5 — not a hard 3.
             // The previous hard-cap of 3 silently ignored higher configured values.
@@ -669,6 +769,14 @@ impl Agent {
             {
                 Ok(resp) => resp,
                 Err(err) => {
+                    #[cfg(feature = "llm-router")]
+                    if let (Some(router), Some(model)) =
+                        (&self.router, routed_model_for_metrics.as_deref())
+                    {
+                        let _ = router
+                            .record_outcome(model, false, turn_started.elapsed().as_millis() as u64)
+                            .await;
+                    }
                     self.hooks
                         .emit(HookEvent::Error, payload_error("llm", &err.to_string()))
                         .await;
@@ -712,6 +820,14 @@ impl Agent {
                         }),
                     )
                     .await;
+                #[cfg(feature = "llm-router")]
+                if let (Some(router), Some(model)) =
+                    (&self.router, routed_model_for_metrics.as_deref())
+                {
+                    let _ = router
+                        .record_outcome(model, true, turn_started.elapsed().as_millis() as u64)
+                        .await;
+                }
                 return Ok(final_text);
             }
 
@@ -735,6 +851,12 @@ impl Agent {
             self.trim_history();
         }
 
+        #[cfg(feature = "llm-router")]
+        if let (Some(router), Some(model)) = (&self.router, routed_model_for_metrics.as_deref()) {
+            let _ = router
+                .record_outcome(model, false, turn_started.elapsed().as_millis() as u64)
+                .await;
+        }
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
             max_tool_iterations
