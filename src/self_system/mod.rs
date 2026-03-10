@@ -3,6 +3,8 @@ pub mod evolution;
 pub mod experiment;
 pub mod fitness;
 
+pub const SELF_SYSTEM_SESSION_ID: &str = "self_system";
+
 #[allow(unused_imports)]
 pub use decision_log::{log_change_outcome, log_change_proposal};
 #[allow(unused_imports)]

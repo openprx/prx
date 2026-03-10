@@ -414,10 +414,7 @@ pub fn register_websocket_host_functions(
                         return Ok((Err::<(), String>(error),));
                     }
                     let result = crate::plugins::host::websocket_send_with(
-                        sessions,
-                        timeout_ms,
-                        session_id,
-                        message,
+                        sessions, timeout_ms, session_id, message,
                     )
                     .await;
                     Ok((result,))
@@ -437,9 +434,10 @@ pub fn register_websocket_host_functions(
                     if let Err(error) = permission {
                         return Ok((Err::<String, String>(error),));
                     }
-                    let result =
-                        crate::plugins::host::websocket_receive_with(sessions, timeout_ms, session_id)
-                            .await;
+                    let result = crate::plugins::host::websocket_receive_with(
+                        sessions, timeout_ms, session_id,
+                    )
+                    .await;
                     Ok((result,))
                 })
             },
@@ -457,9 +455,10 @@ pub fn register_websocket_host_functions(
                     if let Err(error) = permission {
                         return Ok((Err::<(), String>(error),));
                     }
-                    let result =
-                        crate::plugins::host::websocket_close_with(sessions, timeout_ms, session_id)
-                            .await;
+                    let result = crate::plugins::host::websocket_close_with(
+                        sessions, timeout_ms, session_id,
+                    )
+                    .await;
                     Ok((result,))
                 })
             },

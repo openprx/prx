@@ -1,4 +1,5 @@
 use crate::memory::{Memory, MemoryCategory};
+use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -44,7 +45,7 @@ pub async fn log_change_proposal(
             &log_key,
             &serde_json::to_string_pretty(&payload)?,
             MemoryCategory::Core,
-            None,
+            Some(SELF_SYSTEM_SESSION_ID),
         )
         .await
 }
@@ -74,14 +75,16 @@ pub async fn log_change_outcome(
             &log_key,
             &serde_json::to_string_pretty(&payload)?,
             MemoryCategory::Core,
-            None,
+            Some(SELF_SYSTEM_SESSION_ID),
         )
         .await
 }
 
 async fn next_core_index(memory: &dyn Memory, day: &str, prefix: &str) -> Result<usize> {
     let key_prefix = format!("self/decisions/{day}/{prefix}");
-    let entries = memory.list(Some(&MemoryCategory::Core), None).await?;
+    let entries = memory
+        .list(Some(&MemoryCategory::Core), Some(SELF_SYSTEM_SESSION_ID))
+        .await?;
     let count = entries
         .iter()
         .filter(|entry| entry.key.starts_with(&key_prefix))

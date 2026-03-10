@@ -3,6 +3,7 @@ use crate::cost::tracker::CostTracker;
 use crate::cron;
 use crate::health;
 use crate::memory::{self, Memory, MemoryCategory};
+use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use anyhow::Result;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -131,7 +132,12 @@ async fn build_and_store_fitness_report(
     let report_key = format!("self/fitness/daily/{}", window.day);
     let report_json = serde_json::to_string_pretty(&report)?;
     memory
-        .store(&report_key, &report_json, MemoryCategory::Core, None)
+        .store(
+            &report_key,
+            &report_json,
+            MemoryCategory::Core,
+            Some(SELF_SYSTEM_SESSION_ID),
+        )
         .await?;
 
     Ok(report)

@@ -60,7 +60,7 @@ async fn stream_logs(mut socket: WebSocket, mut receiver: broadcast::Receiver<St
             }
             inbound = socket.recv() => {
                 match inbound {
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                     Some(Ok(_)) => {}
                 }
             }

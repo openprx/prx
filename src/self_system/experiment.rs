@@ -1,4 +1,5 @@
 use crate::memory::{Memory, MemoryCategory};
+use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -106,7 +107,7 @@ async fn persist_experiment(memory: &dyn Memory, record: &ExperimentRecord) -> R
             &experiment_key(&record.id),
             &serde_json::to_string_pretty(record)?,
             MemoryCategory::Core,
-            None,
+            Some(SELF_SYSTEM_SESSION_ID),
         )
         .await
 }

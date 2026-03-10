@@ -2,8 +2,9 @@ use crate::memory::{LifecycleState, Memory, MemoryCategory, MemoryEntry};
 use crate::self_system::evolution::safety_utils::{is_raw_debug_enabled, sha256_hex};
 use crate::self_system::evolution::{
     current_trace, Actor, AsyncJsonlWriter, EvolutionConfig, MemoryAccessLog, MemoryAction,
-    SharedEvolutionConfig, TaskType, TraceContext,
+    SharedEvolutionConfig, TaskType,
 };
+use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -43,11 +44,12 @@ impl EvolutionMemoryRetriever {
             .filter(|term| !term.is_empty())
             .map(str::to_string)
             .collect();
-        let entries = self.memory.list(None, None).await?;
+        let entries = self.memory.list(None, Some(SELF_SYSTEM_SESSION_ID)).await?;
 
         Ok(entries
             .into_iter()
-            .filter(|entry| is_active(entry))
+            .filter(is_self_system_owned)
+            .filter(is_active)
             .filter(|entry| keyword_or_tag_match(entry, &query_terms))
             .collect())
     }
@@ -96,7 +98,7 @@ impl EvolutionMemoryRetriever {
             return Ok(());
         };
 
-        let trace = current_trace().unwrap_or_else(TraceContext::new);
+        let trace = current_trace().unwrap_or_default();
         for entry in selected {
             let consumed = estimate_tokens(&entry.content) as u32;
             let log = MemoryAccessLog {
@@ -167,8 +169,12 @@ impl EvolutionAwareRetrieval for EvolutionMemoryRetriever {
 fn is_active(entry: &MemoryEntry) -> bool {
     match entry.lifecycle_state {
         Some(LifecycleState::Active) | None => true,
-        Some(LifecycleState::Archived) | Some(LifecycleState::Tombstoned) => false,
+        Some(LifecycleState::Archived | LifecycleState::Tombstoned) => false,
     }
+}
+
+fn is_self_system_owned(entry: &MemoryEntry) -> bool {
+    entry.session_id.as_deref() == Some(SELF_SYSTEM_SESSION_ID) && entry.key.starts_with("self/")
 }
 
 fn keyword_or_tag_match(entry: &MemoryEntry, query_terms: &[String]) -> bool {
@@ -202,7 +208,7 @@ fn recency_score(timestamp: &str) -> f64 {
 }
 
 fn access_frequency_score(access_count: Option<u32>) -> f64 {
-    let count = access_count.unwrap_or(0) as f64;
+    let count = f64::from(access_count.unwrap_or(0));
     (count / 20.0).clamp(0.0, 1.0)
 }
 
@@ -212,7 +218,7 @@ fn useful_ratio_score(useful_count: Option<u32>, access_count: Option<u32>) -> f
         return 0.0;
     }
     let useful = useful_count.unwrap_or(0);
-    (useful as f64 / f64::from(access)).clamp(0.0, 1.0)
+    (f64::from(useful) / f64::from(access)).clamp(0.0, 1.0)
 }
 
 fn category_weight_score(category: &MemoryCategory) -> f64 {
@@ -299,6 +305,7 @@ mod tests {
     fn build_entry(
         id: &str,
         content: &str,
+        session_id: Option<&str>,
         lifecycle_state: Option<LifecycleState>,
         access_count: Option<u32>,
         useful_count: Option<u32>,
@@ -310,7 +317,7 @@ mod tests {
             content: content.into(),
             category: MemoryCategory::Core,
             timestamp: (Utc::now() - Duration::hours(1)).to_rfc3339(),
-            session_id: None,
+            session_id: session_id.map(str::to_string),
             score: None,
             tags: Some(vec!["alpha".into()]),
             access_count,
@@ -328,16 +335,18 @@ mod tests {
         let memory = Arc::new(MockMemory {
             entries: vec![
                 build_entry(
-                    "active",
+                    "self/active",
                     "alpha fact",
+                    Some(SELF_SYSTEM_SESSION_ID),
                     Some(LifecycleState::Active),
                     Some(4),
                     Some(2),
                     Some(0.8),
                 ),
                 build_entry(
-                    "archived",
+                    "self/archived",
                     "alpha archived fact",
+                    Some(SELF_SYSTEM_SESSION_ID),
                     Some(LifecycleState::Archived),
                     Some(100),
                     Some(100),
@@ -353,7 +362,7 @@ mod tests {
 
         let result = retriever.retrieve("alpha", 128).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].id, "active");
+        assert_eq!(result[0].id, "self/active");
     }
 
     #[tokio::test]
@@ -361,16 +370,18 @@ mod tests {
         let memory = Arc::new(MockMemory {
             entries: vec![
                 build_entry(
-                    "high-score",
+                    "self/high-score",
                     "alpha short",
+                    Some(SELF_SYSTEM_SESSION_ID),
                     Some(LifecycleState::Active),
                     Some(10),
                     Some(9),
                     Some(0.9),
                 ),
                 build_entry(
-                    "low-score",
+                    "self/low-score",
                     "alpha very long long long long long long long long long long",
+                    Some(SELF_SYSTEM_SESSION_ID),
                     Some(LifecycleState::Active),
                     Some(1),
                     Some(0),
@@ -386,7 +397,7 @@ mod tests {
 
         let result = retriever.retrieve("alpha", 6).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].id, "high-score");
+        assert_eq!(result[0].id, "self/high-score");
     }
 
     #[tokio::test]
@@ -403,8 +414,9 @@ mod tests {
         );
         let memory = Arc::new(MockMemory {
             entries: vec![build_entry(
-                "active",
+                "self/active",
                 "alpha fact",
+                Some(SELF_SYSTEM_SESSION_ID),
                 Some(LifecycleState::Active),
                 Some(1),
                 Some(1),
@@ -429,5 +441,50 @@ mod tests {
         assert!(!logs.is_empty());
         assert!(logs[0].task_context.contains("query_sha256="));
         assert!(!logs[0].task_context.contains("api_key=secret"));
+    }
+
+    #[tokio::test]
+    async fn retrieval_scopes_to_self_system_session_and_prefix() {
+        let memory = Arc::new(MockMemory {
+            entries: vec![
+                build_entry(
+                    "self/allowed",
+                    "alpha retained",
+                    Some(SELF_SYSTEM_SESSION_ID),
+                    Some(LifecycleState::Active),
+                    Some(2),
+                    Some(1),
+                    Some(0.9),
+                ),
+                build_entry(
+                    "user/private",
+                    "alpha leaked",
+                    Some(SELF_SYSTEM_SESSION_ID),
+                    Some(LifecycleState::Active),
+                    Some(10),
+                    Some(10),
+                    Some(1.0),
+                ),
+                build_entry(
+                    "self/wrong-session",
+                    "alpha wrong session",
+                    Some("other-session"),
+                    Some(LifecycleState::Active),
+                    Some(10),
+                    Some(10),
+                    Some(1.0),
+                ),
+            ],
+        });
+        let retriever = EvolutionMemoryRetriever::new(
+            memory,
+            new_shared_evolution_config(EvolutionConfig::default()),
+            None,
+        );
+
+        let result = retriever.retrieve("alpha", 128).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].key, "self/allowed");
     }
 }

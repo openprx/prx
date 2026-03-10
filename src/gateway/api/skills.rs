@@ -91,7 +91,14 @@ pub async fn discover_skills(
 ) -> Result<Json<DiscoverResponse>, (StatusCode, Json<serde_json::Value>)> {
     use crate::skillforge::scout::{GitHubScout, Scout, ScoutSource};
 
-    let source: ScoutSource = params.source.parse().unwrap(); // Infallible
+    let source: ScoutSource = params.source.parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Unsupported skill discovery source '{}'", params.source)
+            })),
+        )
+    })?;
 
     let results = match source {
         ScoutSource::GitHub => {

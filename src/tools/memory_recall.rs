@@ -8,11 +8,15 @@ use std::sync::Arc;
 /// Let the agent search its own memory
 pub struct MemoryRecallTool {
     memory: Arc<dyn Memory>,
+    acl_enabled: bool,
 }
 
 impl MemoryRecallTool {
-    pub fn new(memory: Arc<dyn Memory>) -> Self {
-        Self { memory }
+    pub fn new(memory: Arc<dyn Memory>, acl_enabled: bool) -> Self {
+        Self {
+            memory,
+            acl_enabled,
+        }
     }
 }
 
@@ -44,6 +48,16 @@ impl Tool for MemoryRecallTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if self.acl_enabled {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "memory_recall is disabled when memory ACL is enabled; use memory_search or memory_get with scoped access".to_string(),
+                ),
+            });
+        }
+
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
@@ -103,7 +117,7 @@ mod tests {
     #[tokio::test]
     async fn recall_empty() {
         let (_tmp, mem) = seeded_mem();
-        let tool = MemoryRecallTool::new(mem);
+        let tool = MemoryRecallTool::new(mem, false);
         let result = tool.execute(json!({"query": "anything"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No memories found"));
@@ -119,7 +133,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = MemoryRecallTool::new(mem);
+        let tool = MemoryRecallTool::new(mem, false);
         let result = tool.execute(json!({"query": "Rust"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("Rust"));
@@ -140,7 +154,7 @@ mod tests {
             .unwrap();
         }
 
-        let tool = MemoryRecallTool::new(mem);
+        let tool = MemoryRecallTool::new(mem, false);
         let result = tool
             .execute(json!({"query": "Rust", "limit": 3}))
             .await
@@ -152,15 +166,27 @@ mod tests {
     #[tokio::test]
     async fn recall_missing_query() {
         let (_tmp, mem) = seeded_mem();
-        let tool = MemoryRecallTool::new(mem);
+        let tool = MemoryRecallTool::new(mem, false);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn recall_rejects_acl_mode() {
+        let (_tmp, mem) = seeded_mem();
+        let tool = MemoryRecallTool::new(mem, true);
+        let result = tool.execute(json!({"query": "Rust"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("disabled when memory ACL is enabled")));
     }
 
     #[test]
     fn name_and_schema() {
         let (_tmp, mem) = seeded_mem();
-        let tool = MemoryRecallTool::new(mem);
+        let tool = MemoryRecallTool::new(mem, false);
         assert_eq!(tool.name(), "memory_recall");
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
     }

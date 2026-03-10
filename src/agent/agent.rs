@@ -600,16 +600,18 @@ impl Agent {
             // Record user message in history before delegating so follow-up
             // turns can see that delegation happened.
             self.history
-                .push(ConversationMessage::Chat(ChatMessage::user(enriched.clone())));
+                .push(ConversationMessage::Chat(ChatMessage::user(
+                    enriched.clone(),
+                )));
             let task_id = self
                 .spawn_delegate_task(user_message, classify_result.model_hint.as_deref())
                 .await?;
-            let ack = format!(
-                "已收到，正在后台处理（任务 {task_id}），完成后会回传结果。"
-            );
+            let ack = format!("已收到，正在后台处理（任务 {task_id}），完成后会回传结果。");
             // Record acknowledgment in history as well.
             self.history
-                .push(ConversationMessage::Chat(ChatMessage::assistant(ack.clone())));
+                .push(ConversationMessage::Chat(ChatMessage::assistant(
+                    ack.clone(),
+                )));
             return Ok(ack);
         }
 
