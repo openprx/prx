@@ -1,11 +1,13 @@
 use crate::config::RouterConfig;
 use crate::router::capability::ModelCapabilityEntry;
 use crate::router::intent::RouterIntent;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct ModelScore {
     pub model_id: String,
     pub provider: String,
+    pub similarity_score: f32,
     pub capability_score: f32,
     pub elo_score: f32,
     pub cost_penalty: f32,
@@ -51,11 +53,13 @@ pub fn compute_score(
     estimated_tokens: usize,
     model: &ModelCapabilityEntry,
     config: &RouterConfig,
+    similarity: f32,
 ) -> ModelScore {
     if estimated_tokens > model.config.max_context {
         return ModelScore {
             model_id: model.config.model_id.clone(),
             provider: model.config.provider.clone(),
+            similarity_score: 0.0,
             capability_score: 0.0,
             elo_score: 0.0,
             cost_penalty: 0.0,
@@ -73,13 +77,16 @@ pub fn compute_score(
     let elo_score = normalize_elo(model.dynamic_elo);
     let cost_penalty = model.config.cost_per_million_tokens * estimated_tokens as f32 / 1_000_000.0;
     let latency_penalty = model.recent_latency_ms.min(5_000) as f32 / 5_000.0;
-    let total_score = config.beta * capability + config.gamma * elo_score
+    let total_score = config.alpha * similarity
+        + config.beta * capability
+        + config.gamma * elo_score
         - config.delta * cost_penalty
         - config.epsilon * latency_penalty;
 
     ModelScore {
         model_id: model.config.model_id.clone(),
         provider: model.config.provider.clone(),
+        similarity_score: similarity,
         capability_score: capability,
         elo_score,
         cost_penalty,
@@ -95,10 +102,17 @@ pub fn rank_models(
     estimated_tokens: usize,
     models: &[ModelCapabilityEntry],
     config: &RouterConfig,
+    similarity_scores: Option<&HashMap<String, f32>>,
 ) -> RouterResult {
     let mut candidates: Vec<ModelScore> = models
         .iter()
-        .map(|model| compute_score(intent, estimated_tokens, model, config))
+        .map(|model| {
+            let similarity = similarity_scores
+                .and_then(|scores| scores.get(&model.config.model_id))
+                .copied()
+                .unwrap_or(0.0);
+            compute_score(intent, estimated_tokens, model, config, similarity)
+        })
         .collect();
 
     candidates.sort_by(|a, b| {
@@ -134,6 +148,9 @@ mod tests {
             gamma: 0.3,
             delta: 0.1,
             epsilon: 0.1,
+            knn_enabled: false,
+            knn_min_records: 10,
+            knn_k: 7,
             models: Vec::new(),
         }
     }
@@ -172,7 +189,7 @@ mod tests {
             model("coder", "openrouter", &["code"], 1.0, 128_000),
         ];
 
-        let result = rank_models(&RouterIntent::Code, 500, &models, &config);
+        let result = rank_models(&RouterIntent::Code, 500, &models, &config, None);
         assert_eq!(result.chosen_model.as_deref(), Some("coder"));
     }
 
@@ -184,7 +201,7 @@ mod tests {
             model("wide", "openrouter", &["code"], 1.0, 10_000),
         ];
 
-        let result = rank_models(&RouterIntent::Code, 500, &models, &config);
+        let result = rank_models(&RouterIntent::Code, 500, &models, &config, None);
         assert_eq!(result.chosen_model.as_deref(), Some("wide"));
         assert!(result.candidates.iter().any(|candidate| {
             candidate.model_id == "tiny" && candidate.filtered_reason.is_some()
@@ -199,14 +216,14 @@ mod tests {
             model("cheap", "openrouter", &["analysis"], 1.0, 128_000),
         ];
 
-        let result = rank_models(&RouterIntent::Analysis, 8_000, &models, &config);
+        let result = rank_models(&RouterIntent::Analysis, 8_000, &models, &config, None);
         assert_eq!(result.chosen_model.as_deref(), Some("cheap"));
     }
 
     #[test]
     fn test_no_models_fallback() {
         let config = make_router_config();
-        let result = rank_models(&RouterIntent::Conversation, 100, &[], &config);
+        let result = rank_models(&RouterIntent::Conversation, 100, &[], &config, None);
         assert!(result.chosen_model.is_none());
         assert!(result.chosen_provider.is_none());
         assert!(result.candidates.is_empty());

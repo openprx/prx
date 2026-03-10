@@ -317,6 +317,14 @@ fn default_router_epsilon() -> f32 {
     0.1
 }
 
+fn default_router_knn_min_records() -> usize {
+    10
+}
+
+fn default_router_knn_k() -> usize {
+    7
+}
+
 fn default_router_max_context() -> usize {
     128_000
 }
@@ -350,6 +358,15 @@ pub struct RouterConfig {
     /// Latency penalty coefficient.
     #[serde(default = "default_router_epsilon")]
     pub epsilon: f32,
+    /// Enable KNN-based semantic router history. Default: `false`.
+    #[serde(default)]
+    pub knn_enabled: bool,
+    /// Minimum history records before KNN affects routing. Default: `10`.
+    #[serde(default = "default_router_knn_min_records")]
+    pub knn_min_records: usize,
+    /// Number of nearest neighbors considered for voting. Default: `7`.
+    #[serde(default = "default_router_knn_k")]
+    pub knn_k: usize,
     /// Candidate model registry.
     #[serde(default)]
     pub models: Vec<RouterModelConfig>,
@@ -364,6 +381,9 @@ impl Default for RouterConfig {
             gamma: default_router_gamma(),
             delta: default_router_delta(),
             epsilon: default_router_epsilon(),
+            knn_enabled: false,
+            knn_min_records: default_router_knn_min_records(),
+            knn_k: default_router_knn_k(),
             models: Vec::new(),
         }
     }
