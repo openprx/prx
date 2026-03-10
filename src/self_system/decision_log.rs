@@ -82,17 +82,14 @@ pub async fn log_change_outcome(
 
 async fn next_core_index(memory: &dyn Memory, day: &str, prefix: &str) -> Result<usize> {
     let key_prefix = format!("self/decisions/{day}/{prefix}");
-    let scoped_entries = memory
-        .list(Some(&MemoryCategory::Core), Some(SELF_SYSTEM_SESSION_ID))
-        .await?;
-    let legacy_entries = memory.list(Some(&MemoryCategory::Core), None).await?;
-    let count = scoped_entries
-        .iter()
-        .chain(
-            legacy_entries
-                .iter()
-                .filter(|entry| entry.session_id.is_none() && entry.key.starts_with("self/decisions/")),
-        )
+    let count = memory
+        .list(Some(&MemoryCategory::Core), None)
+        .await?
+        .into_iter()
+        .filter(|entry| {
+            matches!(entry.session_id.as_deref(), Some(SELF_SYSTEM_SESSION_ID) | None)
+                && entry.key.starts_with("self/decisions/")
+        })
         .filter(|entry| entry.key.starts_with(&key_prefix))
         .count();
     Ok(count + 1)
@@ -274,5 +271,130 @@ mod tests {
 
         let new_key = format!("self/decisions/{day}/proposal_2");
         assert!(memory.get(&new_key).await.unwrap().is_some());
+    }
+
+    struct SessionIgnoringMemory {
+        entries: Mutex<HashMap<String, MemoryEntry>>,
+    }
+
+    impl SessionIgnoringMemory {
+        fn new() -> Self {
+            Self {
+                entries: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Memory for SessionIgnoringMemory {
+        fn name(&self) -> &str {
+            "session-ignoring-memory"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> Result<()> {
+            let mut entries = self.entries.lock().await;
+            entries.insert(
+                key.to_string(),
+                MemoryEntry {
+                    id: key.to_string(),
+                    key: key.to_string(),
+                    content: content.to_string(),
+                    category,
+                    timestamp: Utc::now().to_rfc3339(),
+                    session_id: session_id.map(str::to_string),
+                    score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: None,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
+                },
+            );
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
+            let entries = self.entries.lock().await;
+            Ok(entries.get(key).cloned())
+        }
+
+        async fn list(
+            &self,
+            category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            let entries = self.entries.lock().await;
+            Ok(entries
+                .values()
+                .filter(|entry| category.is_none_or(|c| &entry.category == c))
+                .cloned()
+                .collect())
+        }
+
+        async fn forget(&self, key: &str) -> Result<bool> {
+            let mut entries = self.entries.lock().await;
+            Ok(entries.remove(key).is_some())
+        }
+
+        async fn count(&self) -> Result<usize> {
+            let entries = self.entries.lock().await;
+            Ok(entries.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn proposal_log_does_not_double_count_when_backend_ignores_session_filter() {
+        let memory = SessionIgnoringMemory::new();
+        let day = Utc::now().date_naive().to_string();
+        memory
+            .store(
+                &format!("self/decisions/{day}/proposal_1"),
+                "legacy",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        log_change_proposal(&memory, "policy.window", "raise to 50", "match new default")
+            .await
+            .unwrap();
+
+        assert!(
+            memory
+                .get(&format!("self/decisions/{day}/proposal_2"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            memory
+                .get(&format!("self/decisions/{day}/proposal_3"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

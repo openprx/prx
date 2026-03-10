@@ -289,10 +289,6 @@ pub fn all_tools_with_runtime_ext(
         Arc::new(CronRunTool::new(shared_config.clone(), security.clone())),
         Arc::new(CronRunsTool::new(shared_config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryRecallTool::new(
-            memory.clone(),
-            config.memory.acl_enabled,
-        )),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemorySearchTool::new(
             workspace_dir.to_path_buf(),
@@ -322,6 +318,12 @@ pub fn all_tools_with_runtime_ext(
             workspace_dir.to_path_buf(),
         )),
     ];
+
+    if config.memory.acl_enabled {
+        tracing::warn!("memory_recall disabled because memory ACL is enabled; skipping tool registration");
+    } else {
+        tool_arcs.push(Arc::new(MemoryRecallTool::new(memory.clone(), false)));
+    }
 
     let mcp_tool_ref: Option<Arc<McpTool>> = if config.mcp.enabled && !config.mcp.servers.is_empty()
     {
@@ -579,6 +581,42 @@ mod tests {
         assert!(names.contains(&"browser_open"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    #[test]
+    fn all_tools_skips_memory_recall_when_acl_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            acl_enabled: true,
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = Config {
+            memory: mem_cfg.clone(),
+            ..test_config(&tmp)
+        };
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"memory_recall"));
     }
 
     #[test]
