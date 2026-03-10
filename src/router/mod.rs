@@ -59,8 +59,8 @@ impl RouterEngine {
                 candidate.filtered_reason.as_ref().map(|reason| {
                     serde_json::json!({
                         "model": candidate.model_id,
-                        "provider": candidate.provider,
                         "reason": reason,
+                        "detail": candidate.filtered_detail,
                     })
                 })
             })
@@ -297,6 +297,7 @@ mod tests {
             .await
             .unwrap()
             .expect("elo persisted");
+        assert_eq!(elo.session_id.as_deref(), Some(crate::self_system::SELF_SYSTEM_SESSION_ID));
         let elo_snapshot: serde_json::Value = serde_json::from_str(&elo.content).unwrap();
         let updated_elo = elo_snapshot["dynamic_elo"].as_f64().unwrap() as f32;
         assert!(updated_elo > 1_000.0);
@@ -306,6 +307,10 @@ mod tests {
             .await
             .unwrap()
             .expect("success_rate persisted");
+        assert_eq!(
+            stats.session_id.as_deref(),
+            Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
+        );
         let stats_snapshot: serde_json::Value =
             serde_json::from_str(&stats.content).unwrap();
         assert_eq!(
@@ -322,6 +327,10 @@ mod tests {
             .await
             .unwrap()
             .expect("latency persisted");
+        assert_eq!(
+            latency.session_id.as_deref(),
+            Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
+        );
         let latency_snapshot: serde_json::Value = serde_json::from_str(&latency.content).unwrap();
         assert_eq!(
             latency_snapshot["recent_latency_ms"].as_u64().unwrap(),

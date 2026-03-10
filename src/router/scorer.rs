@@ -12,6 +12,7 @@ pub struct ModelScore {
     pub latency_penalty: f32,
     pub total_score: f32,
     pub filtered_reason: Option<String>,
+    pub filtered_detail: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +61,8 @@ pub fn compute_score(
             cost_penalty: 0.0,
             latency_penalty: 0.0,
             total_score: f32::MIN,
-            filtered_reason: Some(format!(
+            filtered_reason: Some("context_exceeded".to_string()),
+            filtered_detail: Some(format!(
                 "estimated tokens {estimated_tokens} exceed max_context {}",
                 model.config.max_context
             )),
@@ -84,6 +86,7 @@ pub fn compute_score(
         latency_penalty,
         total_score,
         filtered_reason: None,
+        filtered_detail: None,
     }
 }
 
