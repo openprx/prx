@@ -3877,6 +3877,59 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
+    // ── Register WASM plugin tools (channel path) ──
+    // Mirror the gateway path: create an EventBus, initialise the PluginManager,
+    // then inject tool adapters (with memory + event bus) into tools_list.
+    #[cfg(feature = "wasm-plugins")]
+    {
+        let wasm_bus = Arc::new(crate::plugins::event_bus::EventBus::new());
+        let pm = crate::plugins::init_plugin_manager(&config.workspace_dir).await;
+        if let Some(ref pm) = pm {
+            // Tool adapters
+            let wasm_tools = pm
+                .create_tool_adapters_with_memory(
+                    Some(Arc::clone(&mem)),
+                    Some(Arc::clone(&wasm_bus)),
+                )
+                .await;
+            if !wasm_tools.is_empty() {
+                tracing::info!(
+                    count = wasm_tools.len(),
+                    "registering WASM plugin tools in channel tools_registry"
+                );
+                tools_list.extend(wasm_tools);
+            }
+            // Middleware chain (log only; channel path does not use it yet)
+            let mw_chain = pm
+                .create_middleware_chain(Some(Arc::clone(&wasm_bus)))
+                .await;
+            if !mw_chain.is_empty() {
+                tracing::info!(
+                    count = mw_chain.len(),
+                    "WASM middleware chain ready (channel path)"
+                );
+            }
+            // Hook executor (log only; channel path does not use it yet)
+            let hook_exec = pm
+                .create_hook_executor(Some(Arc::clone(&wasm_bus)))
+                .await;
+            if !hook_exec.is_empty() {
+                tracing::info!("WASM hook executor ready (channel path)");
+            }
+            // Cron manager (log only; channel path does not use it yet)
+            let cron_mgr = pm
+                .create_cron_manager(Some(Arc::clone(&wasm_bus)))
+                .await;
+            if !cron_mgr.is_empty() {
+                tracing::info!(
+                    count = cron_mgr.jobs().len(),
+                    "WASM cron manager ready (channel path)"
+                );
+            }
+        }
+        tracing::debug!("WASM event bus ready (channel path)");
+    }
+
     // Wrap the tool list in Arc now that all channel-aware tools have been appended.
     let tools_registry = Arc::new(tools_list);
 
