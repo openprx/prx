@@ -1,4 +1,30 @@
-use crate::config::schema::QueryClassificationConfig;
+use crate::config::schema::{
+    QueryClassificationConfig, TaskRoutingConfig, TaskRoutingIntentConfig,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskIntent {
+    Simple,
+    Delegate,
+    Stream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifyResult {
+    pub intent: TaskIntent,
+    pub model_hint: Option<String>,
+    pub reason: String,
+}
+
+impl From<TaskRoutingIntentConfig> for TaskIntent {
+    fn from(value: TaskRoutingIntentConfig) -> Self {
+        match value {
+            TaskRoutingIntentConfig::Simple => TaskIntent::Simple,
+            TaskRoutingIntentConfig::Delegate => TaskIntent::Delegate,
+            TaskRoutingIntentConfig::Stream => TaskIntent::Stream,
+        }
+    }
+}
 
 /// Classify a user message against the configured rules and return the
 /// matching hint string, if any.
@@ -47,10 +73,75 @@ pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<Str
     None
 }
 
+pub fn classify_intent(config: &TaskRoutingConfig, message: &str) -> ClassifyResult {
+    if !config.enabled {
+        return ClassifyResult {
+            intent: TaskIntent::Stream,
+            model_hint: None,
+            reason: "task_routing disabled".to_string(),
+        };
+    }
+
+    let lower = message.to_lowercase();
+    let mut rules: Vec<_> = config.rules.iter().collect();
+    rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+    for rule in rules {
+        let keyword_hit = rule
+            .keywords
+            .iter()
+            .map(|keyword| keyword.trim())
+            .filter(|keyword| !keyword.is_empty())
+            .any(|keyword| lower.contains(&keyword.to_lowercase()));
+
+        if !keyword_hit {
+            continue;
+        }
+
+        let intent = TaskIntent::from(rule.intent);
+        let model_hint = match intent {
+            TaskIntent::Delegate => rule
+                .sub_agent_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    rule.model_hint
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                }),
+            TaskIntent::Simple | TaskIntent::Stream => rule
+                .model_hint
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        };
+
+        return ClassifyResult {
+            intent,
+            model_hint,
+            reason: format!("matched keywords {:?} (priority {})", rule.keywords, rule.priority),
+        };
+    }
+
+    ClassifyResult {
+        intent: TaskIntent::from(config.default_intent),
+        model_hint: None,
+        reason: "no task_routing rule matched; using default intent".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{ClassificationRule, QueryClassificationConfig};
+    use crate::config::schema::{
+        ClassificationRule, QueryClassificationConfig, TaskRoutingConfig, TaskRoutingIntentConfig,
+        TaskRoutingRule,
+    };
 
     fn make_config(enabled: bool, rules: Vec<ClassificationRule>) -> QueryClassificationConfig {
         QueryClassificationConfig { enabled, rules }
@@ -168,5 +259,46 @@ mod tests {
             }],
         );
         assert_eq!(classify(&config, "something completely different"), None);
+    }
+
+    #[test]
+    fn task_routing_uses_priority_and_delegate_model() {
+        let config = TaskRoutingConfig {
+            enabled: true,
+            default_intent: TaskRoutingIntentConfig::Simple,
+            rules: vec![
+                TaskRoutingRule {
+                    keywords: vec!["分析".into()],
+                    intent: TaskRoutingIntentConfig::Stream,
+                    model_hint: Some("fast".into()),
+                    sub_agent_model: None,
+                    priority: 1,
+                },
+                TaskRoutingRule {
+                    keywords: vec!["分析".into(), "修复".into()],
+                    intent: TaskRoutingIntentConfig::Delegate,
+                    model_hint: None,
+                    sub_agent_model: Some("claude-opus-4-6".into()),
+                    priority: 10,
+                },
+            ],
+        };
+
+        let result = classify_intent(&config, "请分析并修复这个 bug");
+        assert_eq!(result.intent, TaskIntent::Delegate);
+        assert_eq!(result.model_hint.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn task_routing_falls_back_to_default_intent() {
+        let config = TaskRoutingConfig {
+            enabled: true,
+            default_intent: TaskRoutingIntentConfig::Simple,
+            rules: vec![],
+        };
+
+        let result = classify_intent(&config, "今天天气如何");
+        assert_eq!(result.intent, TaskIntent::Simple);
+        assert!(result.model_hint.is_none());
     }
 }

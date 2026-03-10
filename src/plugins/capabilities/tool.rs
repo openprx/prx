@@ -265,6 +265,8 @@ impl WasmToolAdapter {
             )
             .map_err(|e| PluginError::Instantiation(format!("link http.request: {e}")))?;
 
+        super::common::register_websocket_host_functions(linker)?;
+
         // prx:host/memory@0.1.0 — connected to real memory backend
         let mut mem_inst = linker
             .instance("prx:host/memory@0.1.0")

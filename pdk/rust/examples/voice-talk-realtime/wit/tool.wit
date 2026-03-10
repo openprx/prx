@@ -1,0 +1,18 @@
+package prx:plugin@0.1.0;
+
+interface tool-exports {
+    record tool-spec {
+        name: string,
+        description: string,
+        parameters-schema: string,
+    }
+
+    record plugin-result {
+        success: bool,
+        output: string,
+        error: option<string>,
+    }
+
+    get-spec: func() -> tool-spec;
+    execute: func(args: string) -> plugin-result;
+}

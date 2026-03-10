@@ -28,7 +28,9 @@ use crate::agent::agent::Agent;
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
-use crate::config::{AgentConfig, MemoryConfig};
+use crate::config::{
+    AgentConfig, MemoryConfig, TaskRoutingConfig, TaskRoutingIntentConfig, TaskRoutingRule,
+};
 use crate::memory::{self, Memory};
 use crate::observability::{NoopObserver, Observer};
 use crate::providers::{
@@ -225,6 +227,34 @@ impl CountingTool {
     }
 }
 
+struct MockSessionsSpawnTool {
+    calls: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait]
+impl Tool for MockSessionsSpawnTool {
+    fn name(&self) -> &str {
+        "sessions_spawn"
+    }
+
+    fn description(&self) -> &str {
+        "Delegates tasks"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+        self.calls.lock().unwrap().push(args);
+        Ok(ToolResult {
+            success: true,
+            output: "Sub-agent spawned in process mode (run_id: run-123). Will announce result when complete.".into(),
+            error: None,
+        })
+    }
+}
+
 #[async_trait]
 impl Tool for CountingTool {
     fn name(&self) -> &str {
@@ -367,6 +397,43 @@ async fn turn_returns_text_when_no_tools_called() {
         !response.is_empty(),
         "Expected non-empty text response from provider"
     );
+}
+
+#[tokio::test]
+async fn turn_delegates_heavy_task_to_sessions_spawn_tool() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = Box::new(FailingProvider);
+    let mut agent = Agent::builder()
+        .provider(provider)
+        .tools(vec![Box::new(MockSessionsSpawnTool {
+            calls: calls.clone(),
+        })])
+        .memory(make_memory())
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::env::temp_dir())
+        .task_routing_config(TaskRoutingConfig {
+            enabled: true,
+            default_intent: TaskRoutingIntentConfig::Simple,
+            rules: vec![TaskRoutingRule {
+                keywords: vec!["修复".into(), "部署".into()],
+                intent: TaskRoutingIntentConfig::Delegate,
+                model_hint: None,
+                sub_agent_model: Some("claude-opus-4-6".into()),
+                priority: 10,
+            }],
+        })
+        .build()
+        .unwrap();
+
+    let response = agent.turn("请帮我修复这个 bug").await.unwrap();
+
+    assert!(response.contains("任务 run-123"));
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["action"], "spawn");
+    assert_eq!(calls[0]["mode"], "process");
+    assert_eq!(calls[0]["model"], "claude-opus-4-6");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -643,17 +643,20 @@ impl Tool for SessionsSpawnTool {
                     .map(str::to_string)
             })
             .or_else(|| self.fallback_api_key.clone());
+        let configured_max = selected_agent
+            .as_ref()
+            .map(|(_, cfg)| cfg.max_iterations.max(1))
+            .unwrap_or(SUB_AGENT_MAX_ITERATIONS);
         let resolved_max_iterations = if let Some(dynamic_max) = args
             .get("max_iterations")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
         {
-            dynamic_max.max(1).min(1000)
+            // Treat the configured limit as a hard cap — callers cannot exceed
+            // the per-agent policy even if they explicitly request more.
+            dynamic_max.max(1).min(configured_max)
         } else {
-            selected_agent
-                .as_ref()
-                .map(|(_, cfg)| cfg.max_iterations.max(1))
-                .unwrap_or(SUB_AGENT_MAX_ITERATIONS)
+            configured_max
         };
 
         if mode == "process" {

@@ -33,3 +33,4 @@ credentials.json
 # Web console
 web/node_modules/
 web/.svelte-kit/
+pdk/rust/examples/voice-talk-realtime/target/

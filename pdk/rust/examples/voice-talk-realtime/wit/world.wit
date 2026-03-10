@@ -1,0 +1,12 @@
+package prx:plugin@0.1.0;
+
+world tool {
+    import prx:host/log@0.1.0;
+    import prx:host/config@0.1.0;
+    import prx:host/kv@0.1.0;
+    import prx:host/http-outbound@0.1.0;
+    import prx:host/memory@0.1.0;
+    import prx:host/events@0.1.0;
+
+    export tool-exports;
+}

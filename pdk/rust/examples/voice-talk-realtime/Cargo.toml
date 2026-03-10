@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "voicetalk"
+version = "0.1.0"
+edition = "2021"
+description = "PRX voice session tool plugin — real-time voice via xAI/OpenAI"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+prx-pdk = { path = "../../prx-pdk" }
+wit-bindgen = { version = "0.51", default-features = false, features = ["macros"] }
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[package.metadata.component]
+package = "prx:plugin"
+
+[package.metadata.component.target.dependencies]
+"prx:host" = { path = "wit/deps/prx-host" }

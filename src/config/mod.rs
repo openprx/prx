@@ -20,8 +20,9 @@ pub use schema::{
     RemoteNodeConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
     SchedulerConfig, ScopeConfig, ScopeRule, SecretsConfig, SecurityConfig, SelfSystemConfig,
     SessionsSpawnConfig, SkillsConfig, SlackConfig, StorageConfig, StorageProviderConfig,
-    StorageProviderSection, StreamMode, TelegramConfig, ToolPolicyConfig, TunnelConfig,
-    UserPolicyConfig, WebSearchConfig, WebhookConfig,
+    StorageProviderSection, StreamMode, TaskRoutingConfig, TaskRoutingIntentConfig,
+    TaskRoutingRule, TelegramConfig, ToolPolicyConfig, TunnelConfig, UserPolicyConfig,
+    WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]

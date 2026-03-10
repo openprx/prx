@@ -5,16 +5,92 @@
 //! KV storage, memory system, and HTTP requests.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::memory::traits::Memory;
+use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
 #[cfg(feature = "wasm-plugins")]
 use crate::plugins::event_bus::EventBus;
 #[cfg(feature = "wasm-plugins")]
 use wasmtime::component::ResourceTable;
 #[cfg(feature = "wasm-plugins")]
-use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
+
+pub(crate) type WebSocketSessionMap =
+    Arc<Mutex<HashMap<u64, Arc<Mutex<Box<dyn WebSocketConnection>>>>>>;
+
+#[async_trait]
+pub trait WebSocketConnection: Send + Sync {
+    async fn send_text(&mut self, message: String) -> Result<(), String>;
+    async fn recv_text(&mut self) -> Result<Option<String>, String>;
+    async fn close(&mut self) -> Result<(), String>;
+}
+
+#[async_trait]
+pub trait WebSocketConnector: Send + Sync {
+    async fn connect(&self, url: &str) -> Result<Box<dyn WebSocketConnection>, String>;
+}
+
+struct TungsteniteConnector;
+
+struct TungsteniteConnection {
+    stream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+}
+
+#[async_trait]
+impl WebSocketConnector for TungsteniteConnector {
+    async fn connect(&self, url: &str) -> Result<Box<dyn WebSocketConnection>, String> {
+        let (stream, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .map_err(|e| format!("websocket connect failed: {e}"))?;
+        Ok(Box::new(TungsteniteConnection { stream }))
+    }
+}
+
+#[async_trait]
+impl WebSocketConnection for TungsteniteConnection {
+    async fn send_text(&mut self, message: String) -> Result<(), String> {
+        self.stream
+            .send(tokio_tungstenite::tungstenite::Message::Text(message.into()))
+            .await
+            .map_err(|e| format!("websocket send failed: {e}"))
+    }
+
+    async fn recv_text(&mut self) -> Result<Option<String>, String> {
+        loop {
+            match self.stream.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                    return Ok(Some(text.to_string()));
+                }
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) => {
+                    let text = String::from_utf8(bytes.to_vec())
+                        .map_err(|e| format!("websocket binary payload is not utf-8: {e}"))?;
+                    return Ok(Some(text));
+                }
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
+                    return Ok(None);
+                }
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_)))
+                | Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_)))
+                | Some(Ok(tokio_tungstenite::tungstenite::Message::Frame(_))) => {}
+                Some(Err(e)) => return Err(format!("websocket receive failed: {e}")),
+            }
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), String> {
+        self.stream
+            .close(None)
+            .await
+            .map_err(|e| format!("websocket close failed: {e}"))
+    }
+}
 
 /// Per-plugin-instance state stored in the wasmtime `Store<HostState>`.
 ///
@@ -33,7 +109,7 @@ pub struct HostState {
     /// Optional permissions the plugin can request at runtime.
     pub optional_permissions: HashSet<String>,
 
-    /// HTTP URL allowlist patterns (for http-outbound permission).
+    /// Outbound URL allowlist patterns (used by HTTP and WebSocket host functions).
     pub http_allowlist: Vec<String>,
 
     /// Namespaced in-memory KV store (plugin-isolated).
@@ -41,6 +117,15 @@ pub struct HostState {
 
     /// Resource limits.
     pub timeout_ms: u64,
+
+    /// Active outbound WebSocket sessions owned by this plugin instance.
+    pub websocket_sessions: WebSocketSessionMap,
+
+    /// Monotonic session id generator for outbound WebSocket handles.
+    pub next_websocket_session_id: Arc<AtomicU64>,
+
+    /// Connector implementation, overridable in tests.
+    pub websocket_connector: Arc<dyn WebSocketConnector>,
 
     /// Memory backend reference for prx:host/memory host functions.
     pub memory: Option<Arc<dyn Memory>>,
@@ -75,6 +160,9 @@ impl HostState {
             http_allowlist,
             kv_store: Arc::new(RwLock::new(HashMap::new())),
             timeout_ms,
+            websocket_sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_websocket_session_id: Arc::new(AtomicU64::new(1)),
+            websocket_connector: Arc::new(TungsteniteConnector),
             memory: None,
             #[cfg(feature = "wasm-plugins")]
             event_bus: None,
@@ -88,6 +176,12 @@ impl HostState {
     /// Create a new `HostState` with a memory backend reference.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Override the websocket connector implementation.
+    pub fn with_websocket_connector(mut self, connector: Arc<dyn WebSocketConnector>) -> Self {
+        self.websocket_connector = connector;
         self
     }
 
@@ -137,6 +231,109 @@ impl HostState {
         }
         false
     }
+}
+
+fn websocket_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms.max(1))
+}
+
+async fn websocket_session(
+    sessions: &WebSocketSessionMap,
+    session_id: u64,
+) -> Result<Arc<Mutex<Box<dyn WebSocketConnection>>>, String> {
+    let sessions_guard = sessions.lock().await;
+    sessions_guard
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| format!("websocket session {session_id} not found"))
+}
+
+pub(crate) async fn drop_websocket_session(sessions: &WebSocketSessionMap, session_id: u64) {
+    let mut sessions_guard = sessions.lock().await;
+    sessions_guard.remove(&session_id);
+}
+
+pub(crate) async fn websocket_connect_with(
+    connector: Arc<dyn WebSocketConnector>,
+    sessions: WebSocketSessionMap,
+    next_session_id: Arc<AtomicU64>,
+    timeout_ms: u64,
+    url: String,
+) -> Result<u64, String> {
+    let timeout = websocket_timeout(timeout_ms);
+    let connection = tokio::time::timeout(timeout, connector.connect(&url))
+        .await
+        .map_err(|_| format!("websocket connect timed out after {timeout_ms}ms"))??;
+
+    let session_id = next_session_id.fetch_add(1, Ordering::Relaxed);
+    let mut sessions_guard = sessions.lock().await;
+    sessions_guard.insert(session_id, Arc::new(Mutex::new(connection)));
+    Ok(session_id)
+}
+
+pub(crate) async fn websocket_send_with(
+    sessions: WebSocketSessionMap,
+    timeout_ms: u64,
+    session_id: u64,
+    message: String,
+) -> Result<(), String> {
+    let session = websocket_session(&sessions, session_id).await?;
+    let timeout = websocket_timeout(timeout_ms);
+    let result = tokio::time::timeout(timeout, async {
+        let mut guard = session.lock().await;
+        guard.send_text(message).await
+    })
+    .await
+    .map_err(|_| format!("websocket send timed out after {timeout_ms}ms"))?;
+
+    if result.is_err() {
+        drop_websocket_session(&sessions, session_id).await;
+    }
+    result
+}
+
+pub(crate) async fn websocket_receive_with(
+    sessions: WebSocketSessionMap,
+    timeout_ms: u64,
+    session_id: u64,
+) -> Result<String, String> {
+    let session = websocket_session(&sessions, session_id).await?;
+    let timeout = websocket_timeout(timeout_ms);
+    let result = tokio::time::timeout(timeout, async {
+        let mut guard = session.lock().await;
+        guard.recv_text().await
+    })
+    .await
+    .map_err(|_| format!("websocket receive timed out after {timeout_ms}ms"))?;
+
+    match result {
+        Ok(Some(message)) => Ok(message),
+        Ok(None) => {
+            drop_websocket_session(&sessions, session_id).await;
+            Err(format!("websocket session {session_id} closed"))
+        }
+        Err(error) => {
+            drop_websocket_session(&sessions, session_id).await;
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn websocket_close_with(
+    sessions: WebSocketSessionMap,
+    timeout_ms: u64,
+    session_id: u64,
+) -> Result<(), String> {
+    let session = websocket_session(&sessions, session_id).await?;
+    let timeout = websocket_timeout(timeout_ms);
+    let result = tokio::time::timeout(timeout, async {
+        let mut guard = session.lock().await;
+        guard.close().await
+    })
+    .await
+    .map_err(|_| format!("websocket close timed out after {timeout_ms}ms"))?;
+    drop_websocket_session(&sessions, session_id).await;
+    result
 }
 
 // ── WASI trait implementations ──
@@ -208,9 +405,164 @@ pub async fn host_kv_list_keys(state: &HostState, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+/// Open a websocket-outbound connection and return an opaque session id.
+pub async fn host_websocket_connect(state: &HostState, url: &str) -> Result<u64, String> {
+    state.check_permission("websocket-outbound")?;
+    if !state.check_url_allowed(url) {
+        return Err(format!("URL not in allowlist: {url}"));
+    }
+
+    websocket_connect_with(
+        Arc::clone(&state.websocket_connector),
+        Arc::clone(&state.websocket_sessions),
+        Arc::clone(&state.next_websocket_session_id),
+        state.timeout_ms,
+        url.to_string(),
+    )
+    .await
+}
+
+/// Send a UTF-8 message on an open websocket session.
+pub async fn host_websocket_send(
+    state: &HostState,
+    session_id: u64,
+    message: String,
+) -> Result<(), String> {
+    state.check_permission("websocket-outbound")?;
+    websocket_send_with(
+        Arc::clone(&state.websocket_sessions),
+        state.timeout_ms,
+        session_id,
+        message,
+    )
+    .await
+}
+
+/// Receive a UTF-8 message from an open websocket session.
+pub async fn host_websocket_receive(state: &HostState, session_id: u64) -> Result<String, String> {
+    state.check_permission("websocket-outbound")?;
+    websocket_receive_with(Arc::clone(&state.websocket_sessions), state.timeout_ms, session_id).await
+}
+
+/// Close an open websocket session and release its host-side state.
+pub async fn host_websocket_close(state: &HostState, session_id: u64) -> Result<(), String> {
+    state.check_permission("websocket-outbound")?;
+    websocket_close_with(Arc::clone(&state.websocket_sessions), state.timeout_ms, session_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use tokio::time::sleep;
+
+    enum MockConnectBehavior {
+        Connect(Result<MockWebSocketConnection, String>),
+        DelayThenConnect {
+            delay_ms: u64,
+            result: Result<MockWebSocketConnection, String>,
+        },
+    }
+
+    enum MockReceiveBehavior {
+        Message(String),
+        Delay(u64),
+        Closed,
+        Error(String),
+    }
+
+    #[derive(Clone, Default)]
+    struct MockConnector {
+        plans: Arc<Mutex<HashMap<String, VecDeque<MockConnectBehavior>>>>,
+    }
+
+    struct MockWebSocketConnection {
+        sent_messages: Arc<Mutex<Vec<String>>>,
+        receive_plan: VecDeque<MockReceiveBehavior>,
+        close_error: Option<String>,
+        fail_send_after_close: bool,
+        is_closed: bool,
+    }
+
+    #[async_trait]
+    impl WebSocketConnector for MockConnector {
+        async fn connect(&self, url: &str) -> Result<Box<dyn WebSocketConnection>, String> {
+            let behavior = {
+                let mut plans = self.plans.lock().await;
+                plans.get_mut(url)
+                    .and_then(VecDeque::pop_front)
+                    .ok_or_else(|| format!("no mock plan for url: {url}"))?
+            };
+
+            match behavior {
+                MockConnectBehavior::Connect(result) => {
+                    result.map(|conn| Box::new(conn) as Box<dyn WebSocketConnection>)
+                }
+                MockConnectBehavior::DelayThenConnect { delay_ms, result } => {
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    result.map(|conn| Box::new(conn) as Box<dyn WebSocketConnection>)
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WebSocketConnection for MockWebSocketConnection {
+        async fn send_text(&mut self, message: String) -> Result<(), String> {
+            if self.is_closed && self.fail_send_after_close {
+                return Err("websocket already closed".to_string());
+            }
+            self.sent_messages.lock().await.push(message.clone());
+            if self.receive_plan.is_empty() {
+                self.receive_plan
+                    .push_back(MockReceiveBehavior::Message(message));
+            }
+            Ok(())
+        }
+
+        async fn recv_text(&mut self) -> Result<Option<String>, String> {
+            match self.receive_plan.pop_front() {
+                Some(MockReceiveBehavior::Message(message)) => Ok(Some(message)),
+                Some(MockReceiveBehavior::Delay(delay_ms)) => {
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    Ok(Some("delayed-message".to_string()))
+                }
+                Some(MockReceiveBehavior::Closed) | None => {
+                    self.is_closed = true;
+                    Ok(None)
+                }
+                Some(MockReceiveBehavior::Error(error)) => {
+                    self.is_closed = true;
+                    Err(error)
+                }
+            }
+        }
+
+        async fn close(&mut self) -> Result<(), String> {
+            self.is_closed = true;
+            match &self.close_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl MockConnector {
+        async fn push_plan(&self, url: &str, behavior: MockConnectBehavior) {
+            let mut plans = self.plans.lock().await;
+            plans.entry(url.to_string()).or_default().push_back(behavior);
+        }
+    }
+
+    fn mock_connection(receive_plan: Vec<MockReceiveBehavior>) -> MockWebSocketConnection {
+        MockWebSocketConnection {
+            sent_messages: Arc::new(Mutex::new(Vec::new())),
+            receive_plan: receive_plan.into(),
+            close_error: None,
+            fail_send_after_close: true,
+            is_closed: false,
+        }
+    }
 
     fn test_state() -> HostState {
         let mut config = HashMap::new();
@@ -222,9 +574,13 @@ mod tests {
                 "log".to_string(),
                 "kv".to_string(),
                 "http-outbound".to_string(),
+                "websocket-outbound".to_string(),
             ]),
             HashSet::from(["llm".to_string()]),
-            vec!["https://api.example.com/*".to_string()],
+            vec![
+                "https://api.example.com/*".to_string(),
+                "ws://mock.example/*".to_string(),
+            ],
             30_000,
         )
     }
@@ -249,6 +605,7 @@ mod tests {
         // Granted
         assert!(state.check_permission("kv").is_ok());
         assert!(state.check_permission("http-outbound").is_ok());
+        assert!(state.check_permission("websocket-outbound").is_ok());
         // Optional but not granted
         assert!(state.check_permission("llm").is_err());
         // Not declared at all
@@ -309,5 +666,110 @@ mod tests {
         let mut keys = host_kv_list_keys(&state, "weather:").await;
         keys.sort();
         assert_eq!(keys, vec!["weather:london", "weather:tokyo"]);
+    }
+
+    #[tokio::test]
+    async fn websocket_connect_send_receive_success() {
+        let connector = Arc::new(MockConnector::default());
+        connector
+            .push_plan(
+                "ws://mock.example/echo",
+                MockConnectBehavior::Connect(Ok(mock_connection(vec![]))),
+            )
+            .await;
+        let state = test_state().with_websocket_connector(connector);
+
+        let session_id = host_websocket_connect(&state, "ws://mock.example/echo")
+            .await
+            .unwrap();
+        host_websocket_send(&state, session_id, "hello".to_string())
+            .await
+            .unwrap();
+        let message = host_websocket_receive(&state, session_id).await.unwrap();
+        assert_eq!(message, "hello");
+        host_websocket_close(&state, session_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_connect_failure_invalid_url() {
+        let connector = Arc::new(MockConnector::default());
+        connector
+            .push_plan(
+                "ws://mock.example/bad",
+                MockConnectBehavior::Connect(Err("invalid websocket url".to_string())),
+            )
+            .await;
+        let state = test_state().with_websocket_connector(connector);
+
+        let error = host_websocket_connect(&state, "ws://mock.example/bad")
+            .await
+            .unwrap_err();
+        assert!(error.contains("invalid websocket url"));
+    }
+
+    #[tokio::test]
+    async fn websocket_connect_timeout() {
+        let connector = Arc::new(MockConnector::default());
+        connector
+            .push_plan(
+                "ws://mock.example/slow",
+                MockConnectBehavior::DelayThenConnect {
+                    delay_ms: 50,
+                    result: Ok(mock_connection(vec![])),
+                },
+            )
+            .await;
+        let state = HostState::new(
+            "test-plugin".to_string(),
+            HashMap::new(),
+            HashSet::from(["websocket-outbound".to_string()]),
+            HashSet::new(),
+            vec!["ws://mock.example/*".to_string()],
+            10,
+        )
+        .with_websocket_connector(connector);
+
+        let error = host_websocket_connect(&state, "ws://mock.example/slow")
+            .await
+            .unwrap_err();
+        assert!(error.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn websocket_reconnect_after_disconnect() {
+        let connector = Arc::new(MockConnector::default());
+        connector
+            .push_plan(
+                "ws://mock.example/retry",
+                MockConnectBehavior::Connect(Ok(mock_connection(vec![MockReceiveBehavior::Closed]))),
+            )
+            .await;
+        connector
+            .push_plan(
+                "ws://mock.example/retry",
+                MockConnectBehavior::Connect(Ok(mock_connection(vec![]))),
+            )
+            .await;
+        let state = test_state().with_websocket_connector(connector);
+
+        let first_session = host_websocket_connect(&state, "ws://mock.example/retry")
+            .await
+            .unwrap();
+        let first_error = host_websocket_receive(&state, first_session)
+            .await
+            .unwrap_err();
+        assert!(first_error.contains("closed"));
+        assert!(host_websocket_send(&state, first_session, "stale".to_string())
+            .await
+            .is_err());
+
+        let second_session = host_websocket_connect(&state, "ws://mock.example/retry")
+            .await
+            .unwrap();
+        host_websocket_send(&state, second_session, "retry-ok".to_string())
+            .await
+            .unwrap();
+        let message = host_websocket_receive(&state, second_session).await.unwrap();
+        assert_eq!(message, "retry-ok");
     }
 }
