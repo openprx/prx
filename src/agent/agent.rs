@@ -34,6 +34,7 @@ pub struct Agent {
     auto_save: bool,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
+    task_routing_config: crate::config::TaskRoutingConfig,
     available_hints: Vec<String>,
 }
 
@@ -54,6 +55,7 @@ pub struct AgentBuilder {
     skills: Option<Vec<crate::skills::Skill>>,
     auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
+    task_routing_config: Option<crate::config::TaskRoutingConfig>,
     available_hints: Option<Vec<String>>,
 }
 
@@ -76,6 +78,7 @@ impl AgentBuilder {
             skills: None,
             auto_save: None,
             classification_config: None,
+            task_routing_config: None,
             available_hints: None,
         }
     }
@@ -168,6 +171,14 @@ impl AgentBuilder {
         self
     }
 
+    pub fn task_routing_config(
+        mut self,
+        task_routing_config: crate::config::TaskRoutingConfig,
+    ) -> Self {
+        self.task_routing_config = Some(task_routing_config);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let tools = self
             .tools
@@ -211,6 +222,7 @@ impl AgentBuilder {
             auto_save: self.auto_save.unwrap_or(false),
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
+            task_routing_config: self.task_routing_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
         })
     }
@@ -321,6 +333,7 @@ impl Agent {
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
+            .task_routing_config(config.task_routing.clone())
             .available_hints(available_hints)
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills_with_config(
@@ -456,12 +469,84 @@ impl Agent {
 
     fn classify_model(&self, user_message: &str) -> String {
         if let Some(hint) = super::classifier::classify(&self.classification_config, user_message) {
-            if self.available_hints.contains(&hint) {
-                tracing::info!(hint = hint.as_str(), "Auto-classified query");
-                return format!("hint:{hint}");
-            }
+            return self.resolve_model_target(&hint);
         }
         self.model_name.clone()
+    }
+
+    fn resolve_model_target(&self, target: &str) -> String {
+        if self.available_hints.contains(&target.to_string()) {
+            tracing::info!(hint = target, "Auto-classified query");
+            return format!("hint:{target}");
+        }
+
+        target.to_string()
+    }
+
+    async fn spawn_delegate_task(
+        &self,
+        user_message: &str,
+        sub_agent_model: Option<&str>,
+    ) -> Result<String> {
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.supports_name("sessions_spawn"))
+            .ok_or_else(|| anyhow::anyhow!("sessions_spawn tool is not registered"))?;
+
+        let mut args = serde_json::json!({
+            "action": "spawn",
+            "task": user_message,
+            "mode": "process",
+        });
+
+        if let Some(model) = sub_agent_model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args["model"] = serde_json::Value::String(model.to_string());
+        }
+
+        let result = tool.execute_named("sessions_spawn", args).await?;
+        if !result.success {
+            anyhow::bail!(
+                "{}",
+                result
+                    .error
+                    .unwrap_or_else(|| "sessions_spawn delegation failed".to_string())
+            );
+        }
+
+        // Prefer structured run_id from JSON output; fall back to text parsing
+        // only if the tool does not return a machine-readable envelope.
+        let run_id = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&result.output) {
+            json.get("run_id")
+                .or_else(|| json.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            // Legacy text parsing — emit a warning so future regressions surface.
+            tracing::warn!(
+                output = result.output.as_str(),
+                "spawn_delegate_task: run_id not found in structured output; \
+                 falling back to text parsing. Consider returning structured metadata \
+                 from sessions_spawn."
+            );
+            result
+                .output
+                .split("(run_id: ")
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "unknown".to_string())
+        });
+
+        Ok(run_id)
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
@@ -492,12 +577,46 @@ impl Agent {
             format!("{context}{user_message}")
         };
 
+        let classify_result =
+            super::classifier::classify_intent(&self.task_routing_config, user_message);
+        tracing::info!(
+            intent = ?classify_result.intent,
+            reason = classify_result.reason.as_str(),
+            "Task routing classified incoming message"
+        );
+
+        if classify_result.intent == super::classifier::TaskIntent::Delegate {
+            // Record user message in history before delegating so follow-up
+            // turns can see that delegation happened.
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::user(enriched.clone())));
+            let task_id = self
+                .spawn_delegate_task(user_message, classify_result.model_hint.as_deref())
+                .await?;
+            let ack = format!(
+                "已收到，正在后台处理（任务 {task_id}），完成后会回传结果。"
+            );
+            // Record acknowledgment in history as well.
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::assistant(ack.clone())));
+            return Ok(ack);
+        }
+
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
+        let effective_model = classify_result
+            .model_hint
+            .as_deref()
+            .map(|target| self.resolve_model_target(target))
+            .unwrap_or_else(|| self.classify_model(user_message));
+        let max_tool_iterations = match classify_result.intent {
+            super::classifier::TaskIntent::Simple => self.config.max_tool_iterations.clamp(1, 3),
+            super::classifier::TaskIntent::Stream => self.config.max_tool_iterations.max(1),
+            super::classifier::TaskIntent::Delegate => unreachable!(),
+        };
 
-        for _ in 0..self.config.max_tool_iterations {
+        for _ in 0..max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             for tool in &self.tools {
                 let _ = tool.refresh().await;
@@ -603,7 +722,7 @@ impl Agent {
 
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
-            self.config.max_tool_iterations
+            max_tool_iterations
         )
     }
 

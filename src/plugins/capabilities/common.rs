@@ -10,6 +10,8 @@
 //! `result<T, string>` return types that differ from the simpler variants used
 //! by the other capability types.
 
+use std::sync::Arc;
+
 use crate::plugins::error::{PluginError, PluginResult};
 use crate::plugins::host::HostState;
 
@@ -356,6 +358,117 @@ pub fn register_http_host_functions(
     Ok(())
 }
 
+/// Register `prx:host/websocket-outbound@0.1.0` host functions into the linker.
+///
+/// Exposes websocket connect/send/receive/close operations to WASM plugins.
+/// Calls are guarded by the `"websocket-outbound"` permission and the
+/// configured outbound URL allowlist.
+pub fn register_websocket_host_functions(
+    linker: &mut wasmtime::component::Linker<HostState>,
+) -> PluginResult<()> {
+    let mut ws_inst = linker
+        .instance("prx:host/websocket-outbound@0.1.0")
+        .map_err(|e| PluginError::Instantiation(format!("linker error (websocket): {e}")))?;
+
+    ws_inst
+        .func_wrap_async(
+            "connect",
+            |store: wasmtime::StoreContextMut<'_, HostState>, (url,): (String,)| {
+                let permission = store.data().check_permission("websocket-outbound");
+                let is_allowed = store.data().check_url_allowed(&url);
+                let timeout_ms = store.data().timeout_ms;
+                let connector = Arc::clone(&store.data().websocket_connector);
+                let sessions = Arc::clone(&store.data().websocket_sessions);
+                let next_session_id = Arc::clone(&store.data().next_websocket_session_id);
+                Box::new(async move {
+                    if let Err(error) = permission {
+                        return Ok((Err::<u64, String>(error),));
+                    }
+                    if !is_allowed {
+                        return Ok((Err(format!("URL not in allowlist: {url}")),));
+                    }
+                    let result = crate::plugins::host::websocket_connect_with(
+                        connector,
+                        sessions,
+                        next_session_id,
+                        timeout_ms,
+                        url,
+                    )
+                    .await;
+                    Ok((result,))
+                })
+            },
+        )
+        .map_err(|e| PluginError::Instantiation(format!("link websocket.connect: {e}")))?;
+
+    ws_inst
+        .func_wrap_async(
+            "send",
+            |store: wasmtime::StoreContextMut<'_, HostState>,
+             (session_id, message): (u64, String)| {
+                let permission = store.data().check_permission("websocket-outbound");
+                let timeout_ms = store.data().timeout_ms;
+                let sessions = Arc::clone(&store.data().websocket_sessions);
+                Box::new(async move {
+                    if let Err(error) = permission {
+                        return Ok((Err::<(), String>(error),));
+                    }
+                    let result = crate::plugins::host::websocket_send_with(
+                        sessions,
+                        timeout_ms,
+                        session_id,
+                        message,
+                    )
+                    .await;
+                    Ok((result,))
+                })
+            },
+        )
+        .map_err(|e| PluginError::Instantiation(format!("link websocket.send: {e}")))?;
+
+    ws_inst
+        .func_wrap_async(
+            "receive",
+            |store: wasmtime::StoreContextMut<'_, HostState>, (session_id,): (u64,)| {
+                let permission = store.data().check_permission("websocket-outbound");
+                let timeout_ms = store.data().timeout_ms;
+                let sessions = Arc::clone(&store.data().websocket_sessions);
+                Box::new(async move {
+                    if let Err(error) = permission {
+                        return Ok((Err::<String, String>(error),));
+                    }
+                    let result =
+                        crate::plugins::host::websocket_receive_with(sessions, timeout_ms, session_id)
+                            .await;
+                    Ok((result,))
+                })
+            },
+        )
+        .map_err(|e| PluginError::Instantiation(format!("link websocket.receive: {e}")))?;
+
+    ws_inst
+        .func_wrap_async(
+            "close",
+            |store: wasmtime::StoreContextMut<'_, HostState>, (session_id,): (u64,)| {
+                let permission = store.data().check_permission("websocket-outbound");
+                let timeout_ms = store.data().timeout_ms;
+                let sessions = Arc::clone(&store.data().websocket_sessions);
+                Box::new(async move {
+                    if let Err(error) = permission {
+                        return Ok((Err::<(), String>(error),));
+                    }
+                    let result =
+                        crate::plugins::host::websocket_close_with(sessions, timeout_ms, session_id)
+                            .await;
+                    Ok((result,))
+                })
+            },
+        )
+        .map_err(|e| PluginError::Instantiation(format!("link websocket.close: {e}")))?;
+
+    Ok(())
+}
+
 /// Register all common host functions (log + config + kv) in a single call.
 ///
 /// Used by middleware, hook, and cron capability adapters. Tool adapters have
@@ -368,5 +481,6 @@ pub fn register_common_host_functions(
     register_config_host_functions(linker)?;
     register_kv_host_functions(linker)?;
     register_event_host_functions(linker)?;
+    register_websocket_host_functions(linker)?;
     Ok(())
 }

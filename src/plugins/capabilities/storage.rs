@@ -104,6 +104,7 @@ impl WasmStorage {
         super::common::register_log_host_functions(linker)?;
         super::common::register_config_host_functions(linker)?;
         super::common::register_http_host_functions(linker)?;
+        super::common::register_websocket_host_functions(linker)?;
         super::common::register_event_host_functions(linker)?;
         Ok(())
     }

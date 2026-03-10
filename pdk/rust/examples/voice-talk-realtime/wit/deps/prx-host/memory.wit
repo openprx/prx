@@ -1,0 +1,13 @@
+package prx:host@0.1.0;
+
+interface memory {
+    record memory-entry {
+        id: string,
+        text: string,
+        category: string,
+        importance: f64,
+    }
+
+    store: func(text: string, category: string) -> result<string, string>;
+    recall: func(query: string, limit: u32) -> result<list<memory-entry>, string>;
+}

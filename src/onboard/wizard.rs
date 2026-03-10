@@ -166,6 +166,8 @@ pub async fn run_wizard() -> Result<Config> {
         skill_rag: crate::config::schema::SkillRagConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
+        query_classification: crate::config::QueryClassificationConfig::default(),
+        task_routing: crate::config::TaskRoutingConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
         channels_config,
@@ -191,7 +193,6 @@ pub async fn run_wizard() -> Result<Config> {
         nodes: crate::config::NodesConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
-        query_classification: crate::config::QueryClassificationConfig::default(),
         media: crate::config::MediaConfig::default(),
         security: crate::config::SecurityConfig::default(),
     };
@@ -414,6 +415,8 @@ async fn run_quick_setup_with_home(
         skill_rag: crate::config::schema::SkillRagConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
+        query_classification: crate::config::QueryClassificationConfig::default(),
+        task_routing: crate::config::TaskRoutingConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
         channels_config: ChannelsConfig::default(),
@@ -439,7 +442,6 @@ async fn run_quick_setup_with_home(
         nodes: crate::config::NodesConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
-        query_classification: crate::config::QueryClassificationConfig::default(),
         media: crate::config::MediaConfig::default(),
         security: crate::config::SecurityConfig::default(),
     };

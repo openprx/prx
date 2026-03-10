@@ -131,6 +131,10 @@ pub struct Config {
     #[serde(default)]
     pub query_classification: QueryClassificationConfig,
 
+    /// Task routing configuration — classifies work by intent before the main agent loop.
+    #[serde(default)]
+    pub task_routing: TaskRoutingConfig,
+
     /// Heartbeat configuration for periodic health pings (`[heartbeat]`).
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
@@ -2830,6 +2834,50 @@ pub struct ClassificationRule {
     pub priority: i32,
 }
 
+/// Task-routing default and rule intent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskRoutingIntentConfig {
+    #[default]
+    Simple,
+    Delegate,
+    Stream,
+}
+
+/// Lightweight pre-LLM task routing.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+pub struct TaskRoutingConfig {
+    /// Enable task intent routing before entering the main tool loop.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fallback intent when no rule matches.
+    #[serde(default)]
+    pub default_intent: TaskRoutingIntentConfig,
+    /// Rules evaluated in descending priority order.
+    #[serde(default)]
+    pub rules: Vec<TaskRoutingRule>,
+}
+
+/// A single task-routing rule.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+pub struct TaskRoutingRule {
+    /// Case-insensitive substring matches.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Route intent to apply when a keyword matches.
+    #[serde(default)]
+    pub intent: TaskRoutingIntentConfig,
+    /// Optional model hint/raw model for non-delegated requests.
+    #[serde(default)]
+    pub model_hint: Option<String>,
+    /// Optional raw sub-agent model override for delegated tasks.
+    #[serde(default)]
+    pub sub_agent_model: Option<String>,
+    /// Higher priority rules are checked first.
+    #[serde(default)]
+    pub priority: i32,
+}
+
 // ── Heartbeat ────────────────────────────────────────────────────
 
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
@@ -3912,6 +3960,7 @@ impl Default for Config {
             skill_rag: SkillRagConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
+            task_routing: TaskRoutingConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
@@ -5106,6 +5155,7 @@ default_temperature = 0.7
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
+            task_routing: TaskRoutingConfig::default(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
@@ -5361,6 +5411,7 @@ tool_dispatcher = "xml"
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
+            task_routing: TaskRoutingConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
