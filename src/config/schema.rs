@@ -369,6 +369,20 @@ impl Default for AutomixConfig {
     }
 }
 
+impl AutomixConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !(0.0..=1.0).contains(&self.confidence_threshold) {
+            anyhow::bail!("automix.confidence_threshold must be in [0,1]");
+        }
+        if self.enabled && self.premium_model_id.trim().is_empty() {
+            anyhow::bail!(
+                "automix.premium_model_id must not be empty when automix.enabled=true"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Heuristic LLM router configuration (`[router]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RouterConfig {
@@ -422,6 +436,24 @@ impl Default for RouterConfig {
             automix: AutomixConfig::default(),
             models: Vec::new(),
         }
+    }
+}
+
+impl RouterConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.automix.validate()?;
+        for (name, weight) in [
+            ("alpha", self.alpha),
+            ("beta", self.beta),
+            ("gamma", self.gamma),
+            ("delta", self.delta),
+            ("epsilon", self.epsilon),
+        ] {
+            if weight < 0.0 {
+                anyhow::bail!("router.{name} must be non-negative");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -4622,6 +4654,10 @@ impl Config {
             if route.model.trim().is_empty() {
                 anyhow::bail!("model_routes[{i}].model must not be empty");
             }
+        }
+
+        if self.router.enabled {
+            self.router.validate()?;
         }
 
         // Embedding routes

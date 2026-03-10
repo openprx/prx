@@ -23,6 +23,8 @@ use chrono::Utc;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
+#[cfg(feature = "llm-router")]
+use uuid::Uuid;
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -44,6 +46,8 @@ pub struct Agent {
     classification_config: crate::config::QueryClassificationConfig,
     task_routing_config: crate::config::TaskRoutingConfig,
     available_hints: Vec<String>,
+    #[cfg(feature = "llm-router")]
+    model_routes: Vec<crate::config::ModelRouteConfig>,
     #[cfg(feature = "llm-router")]
     router: Option<RouterEngine>,
 }
@@ -67,6 +71,8 @@ pub struct AgentBuilder {
     classification_config: Option<crate::config::QueryClassificationConfig>,
     task_routing_config: Option<crate::config::TaskRoutingConfig>,
     available_hints: Option<Vec<String>>,
+    #[cfg(feature = "llm-router")]
+    model_routes: Option<Vec<crate::config::ModelRouteConfig>>,
     #[cfg(feature = "llm-router")]
     router: Option<RouterEngine>,
 }
@@ -92,6 +98,8 @@ impl AgentBuilder {
             classification_config: None,
             task_routing_config: None,
             available_hints: None,
+            #[cfg(feature = "llm-router")]
+            model_routes: None,
             #[cfg(feature = "llm-router")]
             router: None,
         }
@@ -185,6 +193,12 @@ impl AgentBuilder {
         self
     }
 
+    #[cfg(feature = "llm-router")]
+    pub fn model_routes(mut self, model_routes: Vec<crate::config::ModelRouteConfig>) -> Self {
+        self.model_routes = Some(model_routes);
+        self
+    }
+
     pub fn task_routing_config(
         mut self,
         task_routing_config: crate::config::TaskRoutingConfig,
@@ -244,6 +258,8 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             task_routing_config: self.task_routing_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
+            #[cfg(feature = "llm-router")]
+            model_routes: self.model_routes.unwrap_or_default(),
             #[cfg(feature = "llm-router")]
             router: self.router,
         })
@@ -339,6 +355,11 @@ impl Agent {
             config.model_routes.iter().map(|r| r.hint.clone()).collect();
 
         #[cfg(feature = "llm-router")]
+        if config.router.enabled {
+            config.router.validate()?;
+        }
+
+        #[cfg(feature = "llm-router")]
         let mut builder = Agent::builder()
             .provider(provider)
             .tools(tools)
@@ -358,6 +379,7 @@ impl Agent {
             .classification_config(config.query_classification.clone())
             .task_routing_config(config.task_routing.clone())
             .available_hints(available_hints.clone())
+            .model_routes(config.model_routes.clone())
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills_with_config(
                 &config.workspace_dir,
@@ -398,6 +420,8 @@ impl Agent {
                 memory::create_embedder_from_config(config, config.api_key.as_deref());
             let router = futures::executor::block_on(RouterEngine::new(
                 config.router.clone(),
+                provider_name.to_string(),
+                config.model_routes.clone(),
                 builder.memory.as_ref().expect("memory set").clone(),
                 Some(router_embedder),
             ))?;
@@ -548,6 +572,14 @@ impl Agent {
 
     #[cfg(feature = "llm-router")]
     fn resolve_router_target(&self, provider: &str, model: &str) -> String {
+        if let Some(route) = self
+            .model_routes
+            .iter()
+            .find(|route| route.provider == provider && route.model == model)
+        {
+            return format!("hint:{}", route.hint);
+        }
+
         if provider == "ollama" && model == "*" {
             if let Some(default_model) = self
                 .model_name
@@ -572,18 +604,9 @@ impl Agent {
         event: &RouterCostEvent,
     ) {
         let date = Utc::now().format("%Y-%m-%d").to_string();
-        let key = format!("router/cost/{date}");
-        let mut events = self
-            .memory
-            .get(&key)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|entry| serde_json::from_str::<Vec<RouterCostEvent>>(&entry.content).ok())
-            .unwrap_or_default();
-        events.push(event.clone());
+        let key = format!("router/cost/{date}/{}", Uuid::new_v4());
 
-        if let Ok(payload) = serde_json::to_string(&events) {
+        if let Ok(payload) = serde_json::to_string(event) {
             if let Err(err) = self
                 .memory
                 .store(
@@ -917,24 +940,28 @@ impl Agent {
                                     )
                                     .await
                                 {
-                                    Ok(resp) => resp,
+                                    Ok(resp) => {
+                                        cost_event.escalated = true;
+                                        cost_event.escalation_model = Some(premium_model.clone());
+                                        cost_event.escalation_prompt_tokens +=
+                                            Self::estimate_text_tokens(user_message);
+                                        let premium_text =
+                                            resp.text.clone().unwrap_or_default();
+                                        cost_event.escalation_completion_tokens +=
+                                            Self::estimate_text_tokens(&premium_text);
+                                        effective_model = premium_model;
+                                        resp
+                                    }
                                     Err(err) => {
                                         tracing::warn!(
                                             model = premium_model.as_str(),
-                                            "Automix premium escalation failed: {err}"
+                                            "Automix escalation failed, falling back to cheap response: {err}"
                                         );
+                                        cost_event.escalated = false;
+                                        cost_event.escalation_failed = true;
                                         response
                                     }
                                 };
-                                cost_event.escalated = true;
-                                cost_event.escalation_model = Some(premium_model.clone());
-                                cost_event.escalation_prompt_tokens +=
-                                    Self::estimate_text_tokens(user_message);
-                                let premium_text =
-                                    premium_response.text.clone().unwrap_or_default();
-                                cost_event.escalation_completion_tokens +=
-                                    Self::estimate_text_tokens(&premium_text);
-                                effective_model = premium_model;
                                 response = premium_response;
                                 parsed = self.tool_dispatcher.parse_response(&response);
                             } else {
@@ -1082,6 +1109,7 @@ impl Agent {
 struct RouterCostEvent {
     primary_model: String,
     escalated: bool,
+    escalation_failed: bool,
     escalation_model: Option<String>,
     confidence: f32,
     primary_prompt_tokens: usize,
@@ -1097,6 +1125,7 @@ impl RouterCostEvent {
         Self {
             primary_model: primary_model.to_string(),
             escalated: false,
+            escalation_failed: false,
             escalation_model: None,
             confidence: 1.0,
             primary_prompt_tokens: 0,
@@ -1411,6 +1440,7 @@ mod tests {
         models: Arc<Mutex<Vec<String>>>,
         cheap_response: String,
         premium_response: String,
+        fail_premium: bool,
     }
 
     #[cfg(feature = "llm-router")]
@@ -1433,6 +1463,9 @@ mod tests {
             _temperature: f64,
         ) -> Result<crate::providers::ChatResponse> {
             self.models.lock().push(model.to_string());
+            if self.fail_premium && model.contains("premium") {
+                anyhow::bail!("premium failure");
+            }
             let text = if model.contains("premium") {
                 self.premium_response.clone()
             } else {
@@ -1491,6 +1524,7 @@ mod tests {
         cheap_response: &str,
         premium_response: &str,
         automix_enabled: bool,
+        fail_premium: bool,
     ) -> (Agent, Arc<TestMemory>, Arc<Mutex<Vec<String>>>) {
         let memory = Arc::new(TestMemory::default());
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -1499,10 +1533,17 @@ mod tests {
             models: Arc::clone(&models),
             cheap_response: cheap_response.into(),
             premium_response: premium_response.into(),
+            fail_premium,
         });
-        let router = RouterEngine::new(automix_router_config(automix_enabled), memory.clone(), None)
-            .await
-            .unwrap();
+        let router = RouterEngine::new(
+            automix_router_config(automix_enabled),
+            "ollama".into(),
+            Vec::new(),
+            memory.clone(),
+            None,
+        )
+        .await
+        .unwrap();
 
         let agent = Agent::builder()
             .provider(provider)
@@ -1511,6 +1552,7 @@ mod tests {
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_routes(Vec::new())
             .router(router)
             .build()
             .unwrap();
@@ -1525,6 +1567,7 @@ mod tests {
             "I'm not sure, maybe this is the answer.",
             "This is the premium answer.",
             true,
+            false,
         )
         .await;
 
@@ -1544,6 +1587,7 @@ mod tests {
             "```rust\nfn main() {}\n```\nThis compiles cleanly.",
             "This should not be used.",
             true,
+            false,
         )
         .await;
 
@@ -1559,6 +1603,7 @@ mod tests {
         let (mut agent, _memory, models) = build_automix_agent(
             "I'm not sure, maybe this is the answer.",
             "This should not be used.",
+            false,
             false,
         )
         .await;
@@ -1576,18 +1621,66 @@ mod tests {
             "I'm not sure, maybe this is the answer.",
             "This is the premium answer.",
             true,
+            false,
         )
         .await;
 
         let _ = agent.turn("hello").await.unwrap();
 
-        let key = format!("router/cost/{}", chrono::Utc::now().format("%Y-%m-%d"));
-        let entry = memory.get(&key).await.unwrap().expect("cost entry");
-        let events: Vec<RouterCostEvent> = serde_json::from_str(&entry.content).unwrap();
+        let prefix = format!("router/cost/{}/", chrono::Utc::now().format("%Y-%m-%d"));
+        let entries: Vec<_> = memory
+            .list(
+                Some(&MemoryCategory::Custom("router".into())),
+                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.key.starts_with(&prefix))
+            .collect();
 
-        assert_eq!(entry.session_id.as_deref(), Some(crate::self_system::SELF_SYSTEM_SESSION_ID));
-        assert!(!events.is_empty());
-        assert!(events.last().unwrap().escalated);
-        assert!(events.last().unwrap().total_cost_usd > 0.0);
+        assert_eq!(entries.len(), 1);
+        let event: RouterCostEvent = serde_json::from_str(&entries[0].content).unwrap();
+        assert_eq!(
+            entries[0].session_id.as_deref(),
+            Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
+        );
+        assert!(event.escalated);
+        assert!(event.total_cost_usd > 0.0);
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn test_automix_escalation_failure_keeps_cheap_attribution() {
+        let (mut agent, memory, models) = build_automix_agent(
+            "I'm not sure, maybe this is the answer.",
+            "This should fail.",
+            true,
+            true,
+        )
+        .await;
+
+        let response = agent.turn("hello").await.unwrap();
+        assert_eq!(response, "I'm not sure, maybe this is the answer.");
+        assert_eq!(
+            models.lock().clone(),
+            vec!["ollama/*".to_string(), "openai/model-premium".to_string()]
+        );
+
+        let prefix = format!("router/cost/{}/", chrono::Utc::now().format("%Y-%m-%d"));
+        let entry = memory
+            .list(
+                Some(&MemoryCategory::Custom("router".into())),
+                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.key.starts_with(&prefix))
+            .expect("cost entry");
+        let event: RouterCostEvent = serde_json::from_str(&entry.content).unwrap();
+        assert_eq!(event.primary_model, "ollama/*");
+        assert!(!event.escalated);
+        assert!(event.escalation_failed);
     }
 }
