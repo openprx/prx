@@ -289,7 +289,10 @@ pub fn all_tools_with_runtime_ext(
         Arc::new(CronRunTool::new(shared_config.clone(), security.clone())),
         Arc::new(CronRunsTool::new(shared_config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryRecallTool::new(memory.clone())),
+        Arc::new(MemoryRecallTool::new(
+            memory.clone(),
+            config.memory.acl_enabled,
+        )),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemorySearchTool::new(
             workspace_dir.to_path_buf(),
@@ -400,12 +403,22 @@ pub fn all_tools_with_runtime_ext(
         }
     }
 
-    // Web fetch tool (enabled by default, no API key required)
+    // Web fetch tool — only register when both fetch_enabled AND allowed_domains
+    // are configured.  Registering without domains would expose the tool to the
+    // model while every call fails at runtime with a confusing error.
     if root_config.web_search.fetch_enabled {
-        tool_arcs.push(Arc::new(WebFetchTool::new(
-            root_config.web_search.fetch_max_chars,
-            root_config.web_search.timeout_secs,
-        )));
+        if browser_config.allowed_domains.is_empty() {
+            tracing::warn!(
+                "web_fetch is enabled but browser.allowed_domains is empty; \
+                 tool not registered. Set browser.allowed_domains to activate it."
+            );
+        } else {
+            tool_arcs.push(Arc::new(WebFetchTool::new(
+                browser_config.allowed_domains.clone(),
+                root_config.web_search.fetch_max_chars,
+                root_config.web_search.timeout_secs,
+            )));
+        }
     }
 
     // Vision tools are always available
