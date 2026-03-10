@@ -137,6 +137,8 @@ rustls = "0.23"
 rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
+skillratings = { version = "0.27", optional = true }
+tiktoken-rs = { version = "0.5", optional = true }
 
 # WASM Plugin System (optional)
 wasmtime = { version = "31", optional = true, default-features = false, features = ["async", "component-model", "cranelift", "cache"] }
@@ -217,6 +219,7 @@ rag-pdf = ["dep:pdf-extract"]
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "serde-big-array"]
 # WASM plugin system (wasmtime + Component Model)
 wasm-plugins = ["dep:wasmtime", "dep:wasmtime-wasi"]
+llm-router = ["dep:skillratings", "dep:tiktoken-rs"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size

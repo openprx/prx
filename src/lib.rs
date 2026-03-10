@@ -109,6 +109,8 @@ pub mod peripherals;
 pub mod plugins;
 pub mod providers;
 pub mod rag;
+#[cfg(feature = "llm-router")]
+pub mod router;
 pub mod runtime;
 pub(crate) mod security;
 pub mod self_system;

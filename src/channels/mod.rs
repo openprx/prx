@@ -3910,16 +3910,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 );
             }
             // Hook executor (log only; channel path does not use it yet)
-            let hook_exec = pm
-                .create_hook_executor(Some(Arc::clone(&wasm_bus)))
-                .await;
+            let hook_exec = pm.create_hook_executor(Some(Arc::clone(&wasm_bus))).await;
             if !hook_exec.is_empty() {
                 tracing::info!("WASM hook executor ready (channel path)");
             }
             // Cron manager (log only; channel path does not use it yet)
-            let cron_mgr = pm
-                .create_cron_manager(Some(Arc::clone(&wasm_bus)))
-                .await;
+            let cron_mgr = pm.create_cron_manager(Some(Arc::clone(&wasm_bus))).await;
             if !cron_mgr.is_empty() {
                 tracing::info!(
                     count = cron_mgr.jobs().len(),

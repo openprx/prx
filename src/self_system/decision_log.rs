@@ -87,8 +87,10 @@ async fn next_core_index(memory: &dyn Memory, day: &str, prefix: &str) -> Result
         .await?
         .into_iter()
         .filter(|entry| {
-            matches!(entry.session_id.as_deref(), Some(SELF_SYSTEM_SESSION_ID) | None)
-                && entry.key.starts_with("self/decisions/")
+            matches!(
+                entry.session_id.as_deref(),
+                Some(SELF_SYSTEM_SESSION_ID) | None
+            ) && entry.key.starts_with("self/decisions/")
         })
         .filter(|entry| entry.key.starts_with(&key_prefix))
         .count();
@@ -177,7 +179,9 @@ mod tests {
             Ok(entries
                 .values()
                 .filter(|entry| category.is_none_or(|c| &entry.category == c))
-                .filter(|entry| session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid)))
+                .filter(|entry| {
+                    session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid))
+                })
                 .cloned()
                 .collect())
         }
@@ -382,19 +386,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            memory
-                .get(&format!("self/decisions/{day}/proposal_2"))
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            memory
-                .get(&format!("self/decisions/{day}/proposal_3"))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(memory
+            .get(&format!("self/decisions/{day}/proposal_2"))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(memory
+            .get(&format!("self/decisions/{day}/proposal_3"))
+            .await
+            .unwrap()
+            .is_none());
     }
 }

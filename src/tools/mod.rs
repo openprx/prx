@@ -320,7 +320,9 @@ pub fn all_tools_with_runtime_ext(
     ];
 
     if config.memory.acl_enabled {
-        tracing::warn!("memory_recall disabled because memory ACL is enabled; skipping tool registration");
+        tracing::warn!(
+            "memory_recall disabled because memory ACL is enabled; skipping tool registration"
+        );
     } else {
         tool_arcs.push(Arc::new(MemoryRecallTool::new(memory.clone(), false)));
     }

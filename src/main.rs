@@ -124,6 +124,8 @@ mod peripherals;
 #[cfg(feature = "wasm-plugins")]
 mod plugins;
 mod providers;
+#[cfg(feature = "llm-router")]
+mod router;
 mod runtime;
 mod security;
 mod self_system;
