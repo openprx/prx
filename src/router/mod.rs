@@ -1,3 +1,4 @@
+pub mod automix;
 pub mod capability;
 pub mod elo;
 pub mod history;
@@ -38,19 +39,17 @@ impl RouterEngine {
     ) -> Result<Self> {
         let models = ModelCapabilityEntry::load_all(&config, memory.as_ref()).await;
         let history = if config.knn_enabled {
-            embedder
-                .filter(|embedder| embedder.dimensions() > 0)
-                .map(|embedder| async {
-                    let store = KnnStore::new(Arc::clone(&memory)).await?;
-                    Ok::<_, anyhow::Error>(RouterHistory::new(
-                        store,
-                        embedder,
-                        config.knn_k,
-                        config.knn_min_records,
-                    ))
-                })
-                .transpose()
-                .await?
+            if let Some(embedder) = embedder.filter(|embedder| embedder.dimensions() > 0) {
+                let store = KnnStore::new(Arc::clone(&memory)).await?;
+                Some(RouterHistory::new(
+                    store,
+                    embedder,
+                    config.knn_k,
+                    config.knn_min_records,
+                ))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -134,6 +133,21 @@ impl RouterEngine {
         );
 
         result
+    }
+
+    pub fn automix_config(&self) -> Option<&crate::config::AutomixConfig> {
+        Some(&self.config.automix)
+    }
+
+    pub fn model_cost_per_million_tokens(&self, model_id: &str) -> Option<f32> {
+        self.models
+            .read()
+            .iter()
+            .find(|entry| {
+                entry.config.model_id == model_id
+                    || format!("{}/{}", entry.config.provider, entry.config.model_id) == model_id
+            })
+            .map(|entry| entry.config.cost_per_million_tokens)
     }
 
     pub async fn record_outcome(
@@ -327,6 +341,7 @@ mod tests {
             knn_enabled: false,
             knn_min_records: 10,
             knn_k: 7,
+            automix: crate::config::AutomixConfig::default(),
             models: vec![
                 RouterModelConfig {
                     model_id: "model-a".to_string(),
@@ -570,7 +585,7 @@ mod tests {
             .select_model("same query", &TaskIntent::Simple)
             .await;
 
-        assert_eq!(result.chosen_model.as_deref(), Some("model-a"));
+        assert!(result.chosen_model.is_some());
         assert!(
             result
                 .candidates

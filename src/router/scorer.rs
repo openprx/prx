@@ -151,6 +151,7 @@ mod tests {
             knn_enabled: false,
             knn_min_records: 10,
             knn_k: 7,
+            automix: crate::config::AutomixConfig::default(),
             models: Vec::new(),
         }
     }

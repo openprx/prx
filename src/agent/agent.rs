@@ -10,10 +10,16 @@ use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 #[cfg(feature = "llm-router")]
 use crate::router::RouterEngine;
+#[cfg(feature = "llm-router")]
+use crate::router::automix::{is_cheap_model_target, should_escalate, ConfidenceChecker};
 use crate::runtime;
 use crate::security::SecurityPolicy;
+#[cfg(feature = "llm-router")]
+use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use crate::tools::{self, Tool};
 use anyhow::Result;
+#[cfg(feature = "llm-router")]
+use chrono::Utc;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
@@ -555,6 +561,44 @@ impl Agent {
         format!("{provider}/{model}")
     }
 
+    #[cfg(feature = "llm-router")]
+    fn estimate_text_tokens(text: &str) -> usize {
+        text.chars().count() / 4 + 1
+    }
+
+    #[cfg(feature = "llm-router")]
+    async fn append_router_cost_event(
+        &self,
+        event: &RouterCostEvent,
+    ) {
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let key = format!("router/cost/{date}");
+        let mut events = self
+            .memory
+            .get(&key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|entry| serde_json::from_str::<Vec<RouterCostEvent>>(&entry.content).ok())
+            .unwrap_or_default();
+        events.push(event.clone());
+
+        if let Ok(payload) = serde_json::to_string(&events) {
+            if let Err(err) = self
+                .memory
+                .store(
+                    &key,
+                    &payload,
+                    MemoryCategory::Custom("router".to_string()),
+                    Some(SELF_SYSTEM_SESSION_ID),
+                )
+                .await
+            {
+                tracing::warn!("Automix cost tracking store failed: {err}");
+            }
+        }
+    }
+
     async fn spawn_delegate_task(
         &self,
         user_message: &str,
@@ -692,7 +736,8 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = {
+        #[allow(unused_mut)]
+        let mut effective_model = {
             #[cfg(feature = "llm-router")]
             {
                 if let Some(router) = &self.router {
@@ -738,6 +783,8 @@ impl Agent {
                     .unwrap_or_else(|| self.classify_model(user_message))
             }
         };
+        #[cfg(feature = "llm-router")]
+        let mut cost_event = RouterCostEvent::new(&effective_model);
         let max_tool_iterations = match classify_result.intent {
             // Simple: cap at configured limit but allow up to 5 — not a hard 3.
             // The previous hard-cap of 3 silently ignored higher configured values.
@@ -766,7 +813,8 @@ impl Agent {
                 .iter()
                 .flat_map(|tool| tool.specs())
                 .collect::<Vec<_>>();
-            let response = match self
+            #[allow(unused_mut)]
+            let mut response = match self
                 .provider
                 .chat(
                     ChatRequest {
@@ -786,6 +834,7 @@ impl Agent {
                 Err(err) => {
                     #[cfg(feature = "llm-router")]
                     if let Some(router) = &self.router {
+                        cost_event.primary_prompt_tokens += Self::estimate_text_tokens(user_message);
                         let success = false;
                         let latency = turn_start.elapsed().as_millis() as u64;
                         if let Err(record_err) = router
@@ -794,6 +843,14 @@ impl Agent {
                         {
                             tracing::warn!("Router record_outcome failed: {record_err}");
                         }
+                        cost_event.primary_model = effective_model.clone();
+                        cost_event.total_cost_usd = router
+                            .model_cost_per_million_tokens(&effective_model)
+                            .map(|rate| {
+                                rate * cost_event.primary_prompt_tokens as f32 / 1_000_000.0
+                            })
+                            .unwrap_or(0.0);
+                        self.append_router_cost_event(&cost_event).await;
                     }
                     self.hooks
                         .emit(HookEvent::Error, payload_error("llm", &err.to_string()))
@@ -812,7 +869,87 @@ impl Agent {
                 )
                 .await;
 
-            let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            #[allow(unused_mut)]
+            let mut parsed = self.tool_dispatcher.parse_response(&response);
+            #[cfg(feature = "llm-router")]
+            if parsed.1.is_empty() {
+                if let Some(router) = &self.router {
+                    if let Some(automix) = router.automix_config() {
+                        let initial_text = if parsed.0.is_empty() {
+                            response.text.clone().unwrap_or_default()
+                        } else {
+                            parsed.0.clone()
+                        };
+                        cost_event.primary_model = effective_model.clone();
+                        cost_event.primary_prompt_tokens += Self::estimate_text_tokens(user_message);
+                        cost_event.primary_completion_tokens +=
+                            Self::estimate_text_tokens(&initial_text);
+
+                        if automix.enabled
+                            && !automix.premium_model_id.trim().is_empty()
+                            && is_cheap_model_target(&effective_model, &automix.cheap_model_tiers)
+                        {
+                            let confidence =
+                                ConfidenceChecker::check_rules(&initial_text, user_message);
+                            cost_event.confidence = confidence;
+
+                            if should_escalate(confidence, automix.confidence_threshold) {
+                                let premium_model =
+                                    self.resolve_model_target(&automix.premium_model_id);
+                                tracing::info!(
+                                    confidence,
+                                    escalate_to = premium_model.as_str(),
+                                    "Automix: escalating to premium model"
+                                );
+                                let premium_response = match self
+                                    .provider
+                                    .chat(
+                                        ChatRequest {
+                                            messages: &messages,
+                                            tools: if self.tool_dispatcher.should_send_tool_specs() {
+                                                Some(&dynamic_tool_specs)
+                                            } else {
+                                                None
+                                            },
+                                        },
+                                        &premium_model,
+                                        self.temperature,
+                                    )
+                                    .await
+                                {
+                                    Ok(resp) => resp,
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            model = premium_model.as_str(),
+                                            "Automix premium escalation failed: {err}"
+                                        );
+                                        response
+                                    }
+                                };
+                                cost_event.escalated = true;
+                                cost_event.escalation_model = Some(premium_model.clone());
+                                cost_event.escalation_prompt_tokens +=
+                                    Self::estimate_text_tokens(user_message);
+                                let premium_text =
+                                    premium_response.text.clone().unwrap_or_default();
+                                cost_event.escalation_completion_tokens +=
+                                    Self::estimate_text_tokens(&premium_text);
+                                effective_model = premium_model;
+                                response = premium_response;
+                                parsed = self.tool_dispatcher.parse_response(&response);
+                            } else {
+                                tracing::info!(
+                                    confidence,
+                                    threshold = automix.confidence_threshold,
+                                    "Automix: confidence sufficient"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            let (text, calls) = parsed;
             if calls.is_empty() {
                 let final_text = if text.is_empty() {
                     response.text.unwrap_or_default()
@@ -848,7 +985,26 @@ impl Agent {
                     {
                         tracing::warn!("Router record_outcome failed: {err}");
                     }
+                    cost_event.total_cost_usd = router
+                        .model_cost_per_million_tokens(&cost_event.primary_model)
+                        .map(|rate| {
+                            rate * (cost_event.primary_prompt_tokens + cost_event.primary_completion_tokens)
+                                as f32
+                                / 1_000_000.0
+                        })
+                        .unwrap_or(0.0);
+                    if let Some(model) = &cost_event.escalation_model {
+                        if let Some(rate) = router.model_cost_per_million_tokens(model) {
+                            cost_event.total_cost_usd += rate
+                                * (cost_event.escalation_prompt_tokens
+                                    + cost_event.escalation_completion_tokens)
+                                    as f32
+                                / 1_000_000.0;
+                        }
+                    }
                 }
+                #[cfg(feature = "llm-router")]
+                self.append_router_cost_event(&cost_event).await;
                 return Ok(final_text);
             }
 
@@ -877,11 +1033,12 @@ impl Agent {
             let success = false;
             let latency = turn_start.elapsed().as_millis() as u64;
             if let Err(err) = router
-                .record_outcome(message, &effective_model, success, latency)
+                .record_outcome(user_message, &effective_model, success, latency)
                 .await
             {
                 tracing::warn!("Router record_outcome failed: {err}");
             }
+            self.append_router_cost_event(&cost_event).await;
         }
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
@@ -917,6 +1074,37 @@ impl Agent {
 
         listen_handle.abort();
         Ok(())
+    }
+}
+
+#[cfg(feature = "llm-router")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct RouterCostEvent {
+    primary_model: String,
+    escalated: bool,
+    escalation_model: Option<String>,
+    confidence: f32,
+    primary_prompt_tokens: usize,
+    primary_completion_tokens: usize,
+    escalation_prompt_tokens: usize,
+    escalation_completion_tokens: usize,
+    total_cost_usd: f32,
+}
+
+#[cfg(feature = "llm-router")]
+impl RouterCostEvent {
+    fn new(primary_model: &str) -> Self {
+        Self {
+            primary_model: primary_model.to_string(),
+            escalated: false,
+            escalation_model: None,
+            confidence: 1.0,
+            primary_prompt_tokens: 0,
+            primary_completion_tokens: 0,
+            escalation_prompt_tokens: 0,
+            escalation_completion_tokens: 0,
+            total_cost_usd: 0.0,
+        }
     }
 }
 
@@ -998,6 +1186,10 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use parking_lot::Mutex;
+    #[cfg(feature = "llm-router")]
+    use std::collections::HashMap;
+    #[cfg(feature = "llm-router")]
+    use std::sync::Arc;
 
     struct MockProvider {
         responses: Mutex<Vec<crate::providers::ChatResponse>>,
@@ -1135,5 +1327,267 @@ mod tests {
             .history()
             .iter()
             .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[derive(Default)]
+    struct TestMemory {
+        entries: Mutex<HashMap<String, crate::memory::MemoryEntry>>,
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[async_trait]
+    impl Memory for TestMemory {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> Result<()> {
+            self.entries.lock().insert(
+                key.to_string(),
+                crate::memory::MemoryEntry {
+                    id: key.to_string(),
+                    key: key.to_string(),
+                    content: content.to_string(),
+                    category,
+                    timestamp: "2026-03-10T00:00:00Z".into(),
+                    session_id: session_id.map(str::to_string),
+                    score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: None,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
+                },
+            );
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, key: &str) -> Result<Option<crate::memory::MemoryEntry>> {
+            Ok(self.entries.lock().get(key).cloned())
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(self.entries.lock().values().cloned().collect())
+        }
+
+        async fn forget(&self, key: &str) -> Result<bool> {
+            Ok(self.entries.lock().remove(key).is_some())
+        }
+
+        async fn count(&self) -> Result<usize> {
+            Ok(self.entries.lock().len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[cfg(feature = "llm-router")]
+    struct RecordingProvider {
+        models: Arc<Mutex<Vec<String>>>,
+        cheap_response: String,
+        premium_response: String,
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[async_trait]
+    impl Provider for RecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> Result<crate::providers::ChatResponse> {
+            self.models.lock().push(model.to_string());
+            let text = if model.contains("premium") {
+                self.premium_response.clone()
+            } else {
+                self.cheap_response.clone()
+            };
+            Ok(crate::providers::ChatResponse {
+                text: Some(text),
+                tool_calls: vec![],
+            })
+        }
+    }
+
+    #[cfg(feature = "llm-router")]
+    fn automix_router_config(enabled: bool) -> crate::config::RouterConfig {
+        crate::config::RouterConfig {
+            enabled: true,
+            alpha: 0.0,
+            beta: 0.5,
+            gamma: 0.3,
+            delta: 1.0,
+            epsilon: 0.3,
+            knn_enabled: false,
+            knn_min_records: 10,
+            knn_k: 7,
+            automix: crate::config::AutomixConfig {
+                enabled,
+                confidence_threshold: 0.7,
+                cheap_model_tiers: vec!["mini".into(), "ollama".into()],
+                premium_model_id: "openai/model-premium".into(),
+            },
+            models: vec![
+                crate::config::RouterModelConfig {
+                    model_id: "model-mini".into(),
+                    provider: "openai".into(),
+                    cost_per_million_tokens: 0.1,
+                    max_context: 128_000,
+                    latency_ms: 500,
+                    categories: vec!["conversation".into()],
+                    elo_rating: 1_000.0,
+                },
+                crate::config::RouterModelConfig {
+                    model_id: "model-premium".into(),
+                    provider: "openai".into(),
+                    cost_per_million_tokens: 10.0,
+                    max_context: 128_000,
+                    latency_ms: 2_000,
+                    categories: vec!["conversation".into()],
+                    elo_rating: 1_000.0,
+                },
+            ],
+        }
+    }
+
+    #[cfg(feature = "llm-router")]
+    async fn build_automix_agent(
+        cheap_response: &str,
+        premium_response: &str,
+        automix_enabled: bool,
+    ) -> (Agent, Arc<TestMemory>, Arc<Mutex<Vec<String>>>) {
+        let memory = Arc::new(TestMemory::default());
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let models = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(RecordingProvider {
+            models: Arc::clone(&models),
+            cheap_response: cheap_response.into(),
+            premium_response: premium_response.into(),
+        });
+        let router = RouterEngine::new(automix_router_config(automix_enabled), memory.clone(), None)
+            .await
+            .unwrap();
+
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(memory.clone())
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .router(router)
+            .build()
+            .unwrap();
+
+        (agent, memory, models)
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn test_automix_escalates_on_low_confidence() {
+        let (mut agent, _memory, models) = build_automix_agent(
+            "I'm not sure, maybe this is the answer.",
+            "This is the premium answer.",
+            true,
+        )
+        .await;
+
+        let response = agent.turn("hello").await.unwrap();
+
+        assert_eq!(response, "This is the premium answer.");
+        assert_eq!(
+            models.lock().clone(),
+            vec!["ollama/*".to_string(), "openai/model-premium".to_string()]
+        );
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn test_automix_skips_escalation_on_high_confidence() {
+        let (mut agent, _memory, models) = build_automix_agent(
+            "```rust\nfn main() {}\n```\nThis compiles cleanly.",
+            "This should not be used.",
+            true,
+        )
+        .await;
+
+        let response = agent.turn("fix this rust code").await.unwrap();
+
+        assert!(response.contains("compiles cleanly"));
+        assert_eq!(models.lock().clone(), vec!["ollama/*".to_string()]);
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn test_automix_disabled() {
+        let (mut agent, _memory, models) = build_automix_agent(
+            "I'm not sure, maybe this is the answer.",
+            "This should not be used.",
+            false,
+        )
+        .await;
+
+        let response = agent.turn("hello").await.unwrap();
+
+        assert!(response.contains("not sure"));
+        assert_eq!(models.lock().clone(), vec!["ollama/*".to_string()]);
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn test_cost_tracking() {
+        let (mut agent, memory, _models) = build_automix_agent(
+            "I'm not sure, maybe this is the answer.",
+            "This is the premium answer.",
+            true,
+        )
+        .await;
+
+        let _ = agent.turn("hello").await.unwrap();
+
+        let key = format!("router/cost/{}", chrono::Utc::now().format("%Y-%m-%d"));
+        let entry = memory.get(&key).await.unwrap().expect("cost entry");
+        let events: Vec<RouterCostEvent> = serde_json::from_str(&entry.content).unwrap();
+
+        assert_eq!(entry.session_id.as_deref(), Some(crate::self_system::SELF_SYSTEM_SESSION_ID));
+        assert!(!events.is_empty());
+        assert!(events.last().unwrap().escalated);
+        assert!(events.last().unwrap().total_cost_usd > 0.0);
     }
 }
