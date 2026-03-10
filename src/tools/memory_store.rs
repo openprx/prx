@@ -55,6 +55,14 @@ impl Tool for MemoryStoreTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'key' parameter"))?;
 
+        if key.starts_with("self/") {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Refusing to write reserved self-system memory namespace".into()),
+            });
+        }
+
         let content = args
             .get("content")
             .and_then(|v| v.as_str())
@@ -162,6 +170,23 @@ mod tests {
         let entry = mem.get("proj_note").await.unwrap().unwrap();
         assert_eq!(entry.content, "Uses async runtime");
         assert_eq!(entry.category, MemoryCategory::Custom("project".into()));
+    }
+
+    #[tokio::test]
+    async fn store_rejects_reserved_self_namespace() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let result = tool
+            .execute(json!({"key": "self/config", "content": "override"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("reserved self-system memory namespace"));
+        assert!(mem.get("self/config").await.unwrap().is_none());
     }
 
     #[tokio::test]
