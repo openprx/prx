@@ -124,7 +124,10 @@ pub fn classify_intent(config: &TaskRoutingConfig, message: &str) -> ClassifyRes
         return ClassifyResult {
             intent,
             model_hint,
-            reason: format!("matched keywords {:?} (priority {})", rule.keywords, rule.priority),
+            reason: format!(
+                "matched keywords {:?} (priority {})",
+                rule.keywords, rule.priority
+            ),
         };
     }
 

@@ -1422,22 +1422,22 @@ async fn run_sub_agent_task(
 
         // Clone everything needed for the inner spawned task.
         // We move `history` into the task and get it back after completion.
-        let mut h = history;
-        let p = provider.clone();
-        let pn = provider_name.to_string();
-        let m = model.to_string();
-        let t = temperature;
-        let tr = tools_registry.clone();
-        let wd = workspace_dir.to_path_buf();
-        let mc = multimodal_config.clone();
-        let cc = compaction_config.clone();
-        let ct = cancel_token.clone();
+        let mut task_history = history;
+        let provider_instance = provider.clone();
+        let provider_name_owned = provider_name.to_string();
+        let model_name = model.to_string();
+        let temperature_value = temperature;
+        let tools_registry_owned = tools_registry.clone();
+        let workspace_dir_owned = workspace_dir.to_path_buf();
+        let multimodal_config_owned = multimodal_config.clone();
+        let compaction_config_owned = compaction_config.clone();
+        let cancel_token_owned = cancel_token.clone();
         let security = security.clone();
         let scope_owned = scope.clone();
 
         let mut loop_handle = tokio::spawn(async move {
             let observer = NoopObserver;
-            let hooks = HookManager::new(wd);
+            let hooks = HookManager::new(workspace_dir_owned);
             let scope_ctx = scope_owned.as_ref().map(|scope| ScopeContext {
                 policy: &security,
                 sender: scope.sender.as_str(),
@@ -1447,26 +1447,26 @@ async fn run_sub_agent_task(
                 policy_pipeline: None,
             });
             let result = run_tool_call_loop(
-                p.as_ref(),
-                &mut h,
-                tr.as_slice(),
+                provider_instance.as_ref(),
+                &mut task_history,
+                tools_registry_owned.as_slice(),
                 &observer,
                 &hooks,
-                &pn,
-                &m,
-                t,
+                &provider_name_owned,
+                &model_name,
+                temperature_value,
                 true, // silent — no streaming output
                 None, // no approval manager
                 "sessions_spawn",
-                &mc,
+                &multimodal_config_owned,
                 max_iterations,
-                Some(&cc),
-                Some(ct),
+                Some(&compaction_config_owned),
+                Some(cancel_token_owned),
                 None, // no streaming sender
                 scope_ctx.as_ref(),
             )
             .await;
-            (h, result)
+            (task_history, result)
         });
 
         // Race: loop completion vs steering message
@@ -1483,7 +1483,7 @@ async fn run_sub_agent_task(
                     } else {
                         text
                     }),
-                    Err(e) => Err(e),
+                    Err(error) => Err(error),
                 };
             },
             steer_opt = steer_rx.recv() => {
@@ -1514,7 +1514,7 @@ async fn run_sub_agent_task(
                             } else {
                                 text
                             }),
-                            Err(e) => Err(e),
+                            Err(error) => Err(error),
                         };
                     }
                 }

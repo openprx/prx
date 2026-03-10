@@ -11,10 +11,10 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::memory::traits::Memory;
-use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
 #[cfg(feature = "wasm-plugins")]
 use crate::plugins::event_bus::EventBus;
+use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
 #[cfg(feature = "wasm-plugins")]
 use wasmtime::component::ResourceTable;
 #[cfg(feature = "wasm-plugins")]
@@ -57,7 +57,9 @@ impl WebSocketConnector for TungsteniteConnector {
 impl WebSocketConnection for TungsteniteConnection {
     async fn send_text(&mut self, message: String) -> Result<(), String> {
         self.stream
-            .send(tokio_tungstenite::tungstenite::Message::Text(message.into()))
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                message.into(),
+            ))
             .await
             .map_err(|e| format!("websocket send failed: {e}"))
     }
@@ -452,13 +454,23 @@ pub async fn host_websocket_send(
 /// Receive a UTF-8 message from an open websocket session.
 pub async fn host_websocket_receive(state: &HostState, session_id: u64) -> Result<String, String> {
     state.check_permission("websocket-outbound")?;
-    websocket_receive_with(Arc::clone(&state.websocket_sessions), state.timeout_ms, session_id).await
+    websocket_receive_with(
+        Arc::clone(&state.websocket_sessions),
+        state.timeout_ms,
+        session_id,
+    )
+    .await
 }
 
 /// Close an open websocket session and release its host-side state.
 pub async fn host_websocket_close(state: &HostState, session_id: u64) -> Result<(), String> {
     state.check_permission("websocket-outbound")?;
-    websocket_close_with(Arc::clone(&state.websocket_sessions), state.timeout_ms, session_id).await
+    websocket_close_with(
+        Arc::clone(&state.websocket_sessions),
+        state.timeout_ms,
+        session_id,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -500,7 +512,8 @@ mod tests {
         async fn connect(&self, url: &str) -> Result<Box<dyn WebSocketConnection>, String> {
             let behavior = {
                 let mut plans = self.plans.lock().await;
-                plans.get_mut(url)
+                plans
+                    .get_mut(url)
                     .and_then(VecDeque::pop_front)
                     .ok_or_else(|| format!("no mock plan for url: {url}"))?
             };
@@ -561,7 +574,10 @@ mod tests {
     impl MockConnector {
         async fn push_plan(&self, url: &str, behavior: MockConnectBehavior) {
             let mut plans = self.plans.lock().await;
-            plans.entry(url.to_string()).or_default().push_back(behavior);
+            plans
+                .entry(url.to_string())
+                .or_default()
+                .push_back(behavior);
         }
     }
 
@@ -752,7 +768,9 @@ mod tests {
         connector
             .push_plan(
                 "ws://mock.example/retry",
-                MockConnectBehavior::Connect(Ok(mock_connection(vec![MockReceiveBehavior::Closed]))),
+                MockConnectBehavior::Connect(Ok(mock_connection(vec![
+                    MockReceiveBehavior::Closed,
+                ]))),
             )
             .await;
         connector
@@ -770,9 +788,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(first_error.contains("closed"));
-        assert!(host_websocket_send(&state, first_session, "stale".to_string())
-            .await
-            .is_err());
+        assert!(
+            host_websocket_send(&state, first_session, "stale".to_string())
+                .await
+                .is_err()
+        );
 
         let second_session = host_websocket_connect(&state, "ws://mock.example/retry")
             .await
@@ -780,7 +800,9 @@ mod tests {
         host_websocket_send(&state, second_session, "retry-ok".to_string())
             .await
             .unwrap();
-        let message = host_websocket_receive(&state, second_session).await.unwrap();
+        let message = host_websocket_receive(&state, second_session)
+            .await
+            .unwrap();
         assert_eq!(message, "retry-ok");
     }
 }

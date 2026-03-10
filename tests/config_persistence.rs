@@ -5,6 +5,7 @@
 //!
 //! Tests Config::load_or_init() with isolated temp directories, env var overrides,
 //! and config file round-trips to verify workspace discovery and persistence.
+#![allow(clippy::field_reassign_with_default)]
 
 use openprx::config::{AgentConfig, Config, MemoryConfig};
 use std::fs;
@@ -48,8 +49,8 @@ fn config_default_temperature_positive() {
 fn agent_config_default_max_tool_iterations() {
     let agent = AgentConfig::default();
     assert_eq!(
-        agent.max_tool_iterations, 10,
-        "default max_tool_iterations should be 10"
+        agent.max_tool_iterations, 50,
+        "default max_tool_iterations should be 50"
     );
 }
 
@@ -198,7 +199,10 @@ default_temperature = 0.7
     let parsed: Config = toml::from_str(minimal_toml).expect("minimal TOML should parse");
 
     // Agent config should use defaults
-    assert_eq!(parsed.agent.max_tool_iterations, 10);
+    assert_eq!(
+        parsed.agent.max_tool_iterations,
+        AgentConfig::default().max_tool_iterations
+    );
     assert_eq!(parsed.agent.max_history_messages, 50);
     assert!(!parsed.agent.compact_context);
 }

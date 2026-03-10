@@ -7,6 +7,7 @@ use crate::memory::Memory;
 use async_trait::async_trait;
 use rusqlite::{params_from_iter, types::Value, Connection};
 use serde_json::json;
+use std::fmt::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -348,43 +349,41 @@ impl Tool for MemoryGetTool {
                     output: format!("No memory entry found for key: '{path}'"),
                     error: None,
                 });
-            } else {
-                // Observe mode: evaluate ACL but still return unrestricted result.
-                let scoped =
-                    fetch_memory_by_key_with_scope(&conn, path, &scope_sql, &scope_params)?;
-                let filtered = post_filter(
-                    scoped.clone().into_iter().collect::<Vec<_>>(),
-                    &principal,
-                    |entry| entry.content.as_str(),
-                );
-                let unrestricted = fetch_memory_by_key_with_scope(&conn, path, "1=1", &[])?;
+            }
 
-                let would_deny =
-                    unrestricted.is_some() && (scoped.is_none() || filtered.is_empty());
-                observe_log_query(would_deny);
-                log_access(
-                    &conn,
-                    &principal,
-                    "get",
-                    None,
-                    Some(path),
-                    Some("observe_mode"),
-                    if would_deny {
-                        "would_deny"
-                    } else if unrestricted.is_some() {
-                        "allowed"
-                    } else {
-                        "no_results"
-                    },
-                );
+            // Observe mode: evaluate ACL but still return unrestricted result.
+            let scoped = fetch_memory_by_key_with_scope(&conn, path, &scope_sql, &scope_params)?;
+            let filtered = post_filter(
+                scoped.clone().into_iter().collect::<Vec<_>>(),
+                &principal,
+                |entry| entry.content.as_str(),
+            );
+            let unrestricted = fetch_memory_by_key_with_scope(&conn, path, "1=1", &[])?;
 
-                if let Some(entry) = unrestricted {
-                    return Ok(ToolResult {
-                        success: true,
-                        output: render_range(&entry.key, &entry.content, from, requested_lines),
-                        error: None,
-                    });
-                }
+            let would_deny = unrestricted.is_some() && (scoped.is_none() || filtered.is_empty());
+            observe_log_query(would_deny);
+            log_access(
+                &conn,
+                &principal,
+                "get",
+                None,
+                Some(path),
+                Some("observe_mode"),
+                if would_deny {
+                    "would_deny"
+                } else if unrestricted.is_some() {
+                    "allowed"
+                } else {
+                    "no_results"
+                },
+            );
+
+            if let Some(entry) = unrestricted {
+                return Ok(ToolResult {
+                    success: true,
+                    output: render_range(&entry.key, &entry.content, from, requested_lines),
+                    error: None,
+                });
             }
         } else if self.acl_enabled {
             return Ok(ToolResult {
@@ -453,7 +452,7 @@ fn render_range(label: &str, content: &str, from: usize, requested_lines: usize)
 
     let mut output = format!("{label} lines {}-{}:\n", start_idx + 1, end_idx);
     for (line_no, line_text) in lines[start_idx..end_idx].iter().enumerate() {
-        output.push_str(&format!("{:>6}: {}\n", start_idx + line_no + 1, line_text));
+        let _ = writeln!(output, "{:>6}: {}", start_idx + line_no + 1, line_text);
     }
     output
 }

@@ -11,7 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use openprx::agent::agent::Agent;
 use openprx::agent::dispatcher::NativeToolDispatcher;
-use openprx::config::MemoryConfig;
+use openprx::config::{AgentConfig, MemoryConfig};
 use openprx::memory;
 use openprx::memory::Memory;
 use openprx::observability::{NoopObserver, Observer};
@@ -337,9 +337,10 @@ async fn agent_respects_max_tool_iterations() {
     assert!(result.is_ok() || result.is_err());
 
     let invocations = *count.lock().unwrap();
+    let max_tool_iterations = AgentConfig::default().max_tool_iterations;
     assert!(
-        invocations <= 10,
-        "tool invocations ({invocations}) should not exceed default max_tool_iterations (10)"
+        invocations <= max_tool_iterations,
+        "tool invocations ({invocations}) should not exceed default max_tool_iterations ({max_tool_iterations})"
     );
 }
 

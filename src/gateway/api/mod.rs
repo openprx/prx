@@ -1,7 +1,7 @@
 use super::AppState;
 use crate::config::Config;
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -56,7 +56,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         // Phase 4: WASM plugins
         .route("/plugins", get(plugins::list_plugins))
         .route("/plugins/{name}/reload", post(plugins::reload_plugin))
-        .route_layer(middleware::from_fn_with_state(state, auth_middleware));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     Router::new()
         .route("/logs", get(logs::ws_handler))
@@ -64,6 +67,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/logs/stream", get(logs::ws_handler))
         .route("/sessions/media", get(sessions::get_session_media))
         .merge(protected_routes)
+        .route_layer(middleware::from_fn_with_state(
+            state,
+            api_rate_limit_middleware,
+        ))
 }
 
 pub(super) fn extract_bearer_auth_token(headers: &HeaderMap) -> Option<String> {
@@ -167,6 +174,36 @@ async fn auth_middleware(State(state): State<AppState>, request: Request, next: 
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Unauthorized"})),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
+async fn api_rate_limit_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let token = extract_resource_auth_token(request.headers());
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|value| value.0);
+    let rate_key = if token.is_empty() {
+        super::client_key_from_request(peer_addr, request.headers(), state.trust_forwarded_headers)
+    } else {
+        format!("token:{}", super::hash_webhook_secret(&token))
+    };
+
+    if !state.rate_limiter.allow_api(&rate_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many API requests. Please retry later.",
+                "retry_after": super::RATE_LIMIT_WINDOW_SECS,
+            })),
         )
             .into_response();
     }

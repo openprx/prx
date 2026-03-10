@@ -82,7 +82,7 @@ fn should_autosave_gateway_message(reply_target: Option<&str>, content: &str) ->
     !reply_target.is_some_and(is_group_reply_target)
 }
 
-fn hash_webhook_secret(value: &str) -> String {
+pub(super) fn hash_webhook_secret(value: &str) -> String {
     use sha2::{Digest, Sha256};
 
     let digest = Sha256::digest(value.as_bytes());
@@ -186,15 +186,22 @@ pub struct GatewayRateLimiter {
     pair: SlidingWindowRateLimiter,
     webhook: SlidingWindowRateLimiter,
     webhook_credential: SlidingWindowRateLimiter,
+    api: SlidingWindowRateLimiter,
 }
 
 impl GatewayRateLimiter {
-    fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
+    fn new(
+        pair_per_minute: u32,
+        webhook_per_minute: u32,
+        api_per_minute: u32,
+        max_keys: usize,
+    ) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
             webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
             webhook_credential: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
+            api: SlidingWindowRateLimiter::new(api_per_minute, window, max_keys),
         }
     }
 
@@ -208,6 +215,10 @@ impl GatewayRateLimiter {
 
     fn allow_webhook_credential(&self, key: &str) -> bool {
         self.webhook_credential.allow(key)
+    }
+
+    pub(super) fn allow_api(&self, key: &str) -> bool {
+        self.api.allow(key)
     }
 }
 
@@ -286,7 +297,7 @@ fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
         .and_then(parse_client_ip)
 }
 
-fn client_key_from_request(
+pub(super) fn client_key_from_request(
     peer_addr: Option<SocketAddr>,
     headers: &HeaderMap,
     trust_forwarded_headers: bool,
@@ -694,6 +705,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let rate_limiter = Arc::new(GatewayRateLimiter::new(
         config.gateway.pair_rate_limit_per_minute,
         config.gateway.webhook_rate_limit_per_minute,
+        config.gateway.api_rate_limit_per_minute,
         rate_limit_max_keys,
     ));
     let idempotency_max_keys = normalize_max_keys(
@@ -1811,7 +1823,7 @@ mod tests {
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,
@@ -1875,7 +1887,7 @@ mod tests {
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,
@@ -1910,7 +1922,7 @@ mod tests {
 
     #[test]
     fn gateway_rate_limiter_blocks_after_limit() {
-        let limiter = GatewayRateLimiter::new(2, 2, 100);
+        let limiter = GatewayRateLimiter::new(2, 2, 2, 100);
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(!limiter.allow_pair("127.0.0.1"));
@@ -1918,10 +1930,18 @@ mod tests {
 
     #[test]
     fn gateway_webhook_credential_limiter_blocks_after_limit() {
-        let limiter = GatewayRateLimiter::new(2, 2, 100);
+        let limiter = GatewayRateLimiter::new(2, 2, 2, 100);
         assert!(limiter.allow_webhook_credential("bearer:token-a"));
         assert!(limiter.allow_webhook_credential("bearer:token-a"));
         assert!(!limiter.allow_webhook_credential("bearer:token-a"));
+    }
+
+    #[test]
+    fn gateway_api_limiter_blocks_after_limit() {
+        let limiter = GatewayRateLimiter::new(2, 2, 2, 100);
+        assert!(limiter.allow_api("token:abc"));
+        assert!(limiter.allow_api("token:abc"));
+        assert!(!limiter.allow_api("token:abc"));
     }
 
     #[test]
@@ -2265,7 +2285,7 @@ mod tests {
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,
@@ -2344,7 +2364,7 @@ mod tests {
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,
@@ -2422,7 +2442,7 @@ mod tests {
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,
@@ -2496,7 +2516,7 @@ mod tests {
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,
@@ -2557,7 +2577,7 @@ mod tests {
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,
@@ -2623,7 +2643,7 @@ mod tests {
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,
@@ -2686,7 +2706,7 @@ mod tests {
             webhook_signing_secret: Some(Arc::from(secret)),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,
@@ -2747,7 +2767,7 @@ mod tests {
             webhook_signing_secret: Some(Arc::from(secret.clone())),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,
@@ -2825,7 +2845,7 @@ mod tests {
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,
@@ -2894,7 +2914,7 @@ mod tests {
             webhook_signing_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             signal: None,

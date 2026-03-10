@@ -1167,6 +1167,10 @@ pub struct GatewayConfig {
     #[serde(default = "default_webhook_rate_limit")]
     pub webhook_rate_limit_per_minute: u32,
 
+    /// Max `/api/*` requests per minute per authenticated token.
+    #[serde(default = "default_api_rate_limit")]
+    pub api_rate_limit_per_minute: u32,
+
     /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
     /// Disabled by default; enable only behind a trusted reverse proxy.
     #[serde(default)]
@@ -1204,6 +1208,10 @@ fn default_webhook_rate_limit() -> u32 {
     60
 }
 
+fn default_api_rate_limit() -> u32 {
+    60
+}
+
 fn default_idempotency_ttl_secs() -> u64 {
     300
 }
@@ -1234,6 +1242,7 @@ impl Default for GatewayConfig {
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
+            api_rate_limit_per_minute: default_api_rate_limit(),
             trust_forwarded_headers: false,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
@@ -5346,7 +5355,7 @@ reasoning_enabled = false
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
-        assert_eq!(cfg.max_tool_iterations, 10);
+        assert_eq!(cfg.max_tool_iterations, 50);
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
@@ -6323,6 +6332,7 @@ channel_id = "C123"
         );
         assert_eq!(g.pair_rate_limit_per_minute, 10);
         assert_eq!(g.webhook_rate_limit_per_minute, 60);
+        assert_eq!(g.api_rate_limit_per_minute, 60);
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_ttl_secs, 300);
@@ -6354,6 +6364,7 @@ channel_id = "C123"
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
+            api_rate_limit_per_minute: 90,
             trust_forwarded_headers: true,
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
@@ -6367,6 +6378,7 @@ channel_id = "C123"
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
+        assert_eq!(parsed.api_rate_limit_per_minute, 90);
         assert!(parsed.trust_forwarded_headers);
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);

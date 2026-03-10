@@ -77,9 +77,7 @@ impl WebFetchTool {
             anyhow::bail!("URL must start with http:// or https://");
         }
         if self.allowed_domains.is_empty() {
-            anyhow::bail!(
-                "web_fetch is enabled but no allowed browser domains are configured"
-            );
+            anyhow::bail!("web_fetch is enabled but no allowed browser domains are configured");
         }
 
         let host = extract_host(url)?;
@@ -172,15 +170,16 @@ impl Tool for WebFetchTool {
                     .ok_or_else(|| anyhow::anyhow!("Redirect with no Location header"))?
                     .to_string();
                 // Resolve relative redirects against the current URL.
-                let next_url = if location.starts_with("http://") || location.starts_with("https://") {
-                    location
-                } else {
-                    let base = reqwest::Url::parse(&current_url)
-                        .map_err(|e| anyhow::anyhow!("Invalid base URL: {e}"))?;
-                    base.join(&location)
-                        .map_err(|e| anyhow::anyhow!("Invalid redirect URL: {e}"))?
-                        .to_string()
-                };
+                let next_url =
+                    if location.starts_with("http://") || location.starts_with("https://") {
+                        location
+                    } else {
+                        let base = reqwest::Url::parse(&current_url)
+                            .map_err(|e| anyhow::anyhow!("Invalid base URL: {e}"))?;
+                        base.join(&location)
+                            .map_err(|e| anyhow::anyhow!("Invalid redirect URL: {e}"))?
+                            .to_string()
+                    };
                 // Re-validate the redirect target before following.
                 current_url = self.validate_url(&next_url)?;
                 redirect_count += 1;
