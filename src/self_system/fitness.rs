@@ -7,6 +7,7 @@ use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use anyhow::Result;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 const FITNESS_REPORT_VERSION: &str = "p0-1";
 const NO_REPEAT_FALLBACK_SCORE: f64 = 0.7;
@@ -317,7 +318,7 @@ async fn learning_from_memory(
     memory: &dyn Memory,
     window: WindowBounds,
 ) -> (f64, f64, serde_json::Value) {
-    let entries = match memory.list(None, Some(SELF_SYSTEM_SESSION_ID)).await {
+    let entries = match memory.list(None, None).await {
         Ok(entries) => entries,
         Err(error) => {
             return (
@@ -332,8 +333,14 @@ async fn learning_from_memory(
         }
     };
 
+    let mut seen = HashSet::new();
     let new_keys = entries
         .into_iter()
+        .filter(|entry| {
+            entry.session_id.as_deref() == Some(SELF_SYSTEM_SESSION_ID)
+                || (entry.session_id.is_none() && entry.key.starts_with("self/"))
+        })
+        .filter(|entry| seen.insert(entry.key.clone()))
         .filter(|entry| !entry.key.starts_with("self/fitness/daily/"))
         .filter_map(|entry| parse_rfc3339_utc(&entry.timestamp).map(|ts| (entry.key, ts)))
         .filter(|(_, ts)| *ts >= window.start && *ts < window.end)
@@ -672,5 +679,151 @@ mod tests {
         assert!(score > 0.0);
         assert_eq!(confidence, 0.8);
         assert_eq!(evidence["new_keys_in_window"], 1);
+    }
+
+    #[tokio::test]
+    async fn learning_score_includes_legacy_self_entries_and_deduplicates_keys() {
+        struct TestMemory {
+            entries: Vec<MemoryEntry>,
+        }
+
+        #[async_trait::async_trait]
+        impl Memory for TestMemory {
+            fn name(&self) -> &str {
+                "test-memory"
+            }
+
+            async fn store(
+                &self,
+                _key: &str,
+                _content: &str,
+                _category: MemoryCategory,
+                _session_id: Option<&str>,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            async fn recall(
+                &self,
+                _query: &str,
+                _limit: usize,
+                _session_id: Option<&str>,
+            ) -> Result<Vec<MemoryEntry>> {
+                Ok(Vec::new())
+            }
+
+            async fn get(&self, _key: &str) -> Result<Option<MemoryEntry>> {
+                Ok(None)
+            }
+
+            async fn list(
+                &self,
+                _category: Option<&MemoryCategory>,
+                _session_id: Option<&str>,
+            ) -> Result<Vec<MemoryEntry>> {
+                Ok(self.entries.clone())
+            }
+
+            async fn forget(&self, _key: &str) -> Result<bool> {
+                Ok(false)
+            }
+
+            async fn count(&self) -> Result<usize> {
+                Ok(self.entries.len())
+            }
+
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        let start = Utc.with_ymd_and_hms(2026, 2, 23, 0, 0, 0).unwrap();
+        let end = start + Duration::days(1);
+        let memory = TestMemory {
+            entries: vec![
+                MemoryEntry {
+                    id: "1".into(),
+                    key: "self/evolution/plan".into(),
+                    content: "new-format".into(),
+                    category: MemoryCategory::Core,
+                    timestamp: (start + Duration::hours(1)).to_rfc3339(),
+                    session_id: Some(SELF_SYSTEM_SESSION_ID.into()),
+                    score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: None,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
+                },
+                MemoryEntry {
+                    id: "2".into(),
+                    key: "self/retrospective/note".into(),
+                    content: "legacy".into(),
+                    category: MemoryCategory::Core,
+                    timestamp: (start + Duration::hours(2)).to_rfc3339(),
+                    session_id: None,
+                    score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: None,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
+                },
+                MemoryEntry {
+                    id: "3".into(),
+                    key: "self/retrospective/note".into(),
+                    content: "legacy-duplicate".into(),
+                    category: MemoryCategory::Core,
+                    timestamp: (start + Duration::hours(3)).to_rfc3339(),
+                    session_id: Some(SELF_SYSTEM_SESSION_ID.into()),
+                    score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: None,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
+                },
+                MemoryEntry {
+                    id: "4".into(),
+                    key: "user/k2".into(),
+                    content: "external".into(),
+                    category: MemoryCategory::Core,
+                    timestamp: (start + Duration::hours(4)).to_rfc3339(),
+                    session_id: None,
+                    score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: None,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
+                },
+            ],
+        };
+
+        let (score, confidence, evidence) = learning_from_memory(
+            &memory,
+            WindowBounds {
+                day: start.date_naive(),
+                start,
+                end,
+            },
+        )
+        .await;
+
+        assert!(score > 0.0);
+        assert_eq!(confidence, 0.8);
+        assert_eq!(evidence["new_keys_in_window"], 2);
     }
 }
