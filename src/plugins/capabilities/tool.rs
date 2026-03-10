@@ -109,6 +109,11 @@ impl WasmToolAdapter {
     fn register_host_functions(
         linker: &mut wasmtime::component::Linker<HostState>,
     ) -> Result<(), PluginError> {
+        // Add WASI interfaces to the linker so WASM components that import
+        // wasi:* (e.g. wasi:cli/environment) resolve correctly.
+        wasmtime_wasi::add_to_linker_async(linker)
+            .map_err(|e| PluginError::Instantiation(format!("WASI link: {e}")))?;
+
         // log and config are identical across all capability types — use the
         // shared helpers from `common` to avoid duplication.
         super::common::register_log_host_functions(linker)?;
@@ -378,7 +383,8 @@ impl WasmToolAdapter {
             .ok_or_else(|| PluginError::Instantiation("get-spec is not a function".to_string()))?;
 
         // Call it using the untyped Func::call_async API for maximum compatibility
-        let mut results = vec![wasmtime::component::Val::Bool(false); 3];
+        // get-spec returns a single record value (the tool-spec)
+        let mut results = vec![wasmtime::component::Val::Bool(false); 1];
         get_spec_fn
             .call_async(store.as_context_mut(), &[], &mut results)
             .await

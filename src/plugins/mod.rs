@@ -130,6 +130,7 @@ impl PluginManager {
         let mut config = wasmtime::Config::new();
         config.async_support(true);
         config.wasm_component_model(true);
+        config.consume_fuel(true);
 
         let engine = wasmtime::Engine::new(&config).map_err(|e| {
             PluginError::Compilation(format!("failed to create wasmtime engine: {e}"))

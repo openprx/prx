@@ -11,6 +11,10 @@ use tokio::sync::RwLock;
 use crate::memory::traits::Memory;
 #[cfg(feature = "wasm-plugins")]
 use crate::plugins::event_bus::EventBus;
+#[cfg(feature = "wasm-plugins")]
+use wasmtime::component::ResourceTable;
+#[cfg(feature = "wasm-plugins")]
+use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
 
 /// Per-plugin-instance state stored in the wasmtime `Store<HostState>`.
 ///
@@ -44,6 +48,12 @@ pub struct HostState {
     /// Event bus reference for prx:host/events host functions.
     #[cfg(feature = "wasm-plugins")]
     pub event_bus: Option<Arc<EventBus>>,
+    /// WASI resource table (required by WasiView).
+    #[cfg(feature = "wasm-plugins")]
+    pub wasi_table: ResourceTable,
+    /// WASI context (required by WasiView).
+    #[cfg(feature = "wasm-plugins")]
+    pub wasi_ctx: WasiCtx,
 }
 
 impl HostState {
@@ -68,6 +78,10 @@ impl HostState {
             memory: None,
             #[cfg(feature = "wasm-plugins")]
             event_bus: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasi_table: ResourceTable::new(),
+            #[cfg(feature = "wasm-plugins")]
+            wasi_ctx: WasiCtxBuilder::new().build(),
         }
     }
 
@@ -122,6 +136,22 @@ impl HostState {
             }
         }
         false
+    }
+}
+
+// ── WASI trait implementations ──
+
+#[cfg(feature = "wasm-plugins")]
+impl wasmtime_wasi::IoView for HostState {
+    fn table(&mut self) -> &mut wasmtime::component::ResourceTable {
+        &mut self.wasi_table
+    }
+}
+
+#[cfg(feature = "wasm-plugins")]
+impl wasmtime_wasi::WasiView for HostState {
+    fn ctx(&mut self) -> &mut wasmtime_wasi::WasiCtx {
+        &mut self.wasi_ctx
     }
 }
 
