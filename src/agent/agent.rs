@@ -519,15 +519,17 @@ impl Agent {
 
         // Prefer structured run_id from JSON output; fall back to text parsing
         // only if the tool does not return a machine-readable envelope.
-        let run_id = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&result.output) {
-            json.get("run_id")
-                .or_else(|| json.get("id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        } else {
-            None
-        }
-        .unwrap_or_else(|| {
+        let run_id: Option<String> =
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&result.output) {
+                json.get("run_id")
+                    .or_else(|| json.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            } else {
+                None
+            };
+
+        let run_id = run_id.or_else(|| {
             // Legacy text parsing — emit a warning so future regressions surface.
             tracing::warn!(
                 output = result.output.as_str(),
@@ -541,12 +543,17 @@ impl Agent {
                 .nth(1)
                 .and_then(|rest| rest.split(')').next())
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
+                .filter(|v| !v.is_empty())
                 .map(str::to_string)
-                .unwrap_or_else(|| "unknown".to_string())
         });
 
-        Ok(run_id)
+        run_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "spawn_delegate_task: sessions_spawn succeeded but returned no run_id. \
+                 Output was: {}",
+                result.output
+            )
+        })
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
@@ -611,7 +618,9 @@ impl Agent {
             .map(|target| self.resolve_model_target(target))
             .unwrap_or_else(|| self.classify_model(user_message));
         let max_tool_iterations = match classify_result.intent {
-            super::classifier::TaskIntent::Simple => self.config.max_tool_iterations.clamp(1, 3),
+            // Simple: cap at configured limit but allow up to 5 — not a hard 3.
+            // The previous hard-cap of 3 silently ignored higher configured values.
+            super::classifier::TaskIntent::Simple => self.config.max_tool_iterations.clamp(1, 5),
             super::classifier::TaskIntent::Stream => self.config.max_tool_iterations.max(1),
             super::classifier::TaskIntent::Delegate => unreachable!(),
         };
