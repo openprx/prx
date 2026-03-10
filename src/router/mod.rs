@@ -1,6 +1,8 @@
 pub mod capability;
 pub mod elo;
+pub mod history;
 pub mod intent;
+pub mod knn;
 pub mod models;
 pub mod scorer;
 
@@ -10,9 +12,12 @@ use std::sync::Arc;
 
 use crate::agent::classifier::TaskIntent;
 use crate::config::RouterConfig;
+use crate::memory::embeddings::EmbeddingProvider;
 use crate::memory::Memory;
 
 use self::capability::{load_recent_successes, ModelCapabilityEntry};
+use self::history::RouterHistory;
+use self::knn::KnnStore;
 use self::elo::update_elo;
 use self::intent::infer_router_intent;
 use self::scorer::rank_models;
@@ -22,23 +27,73 @@ pub struct RouterEngine {
     config: RouterConfig,
     models: RwLock<Vec<ModelCapabilityEntry>>,
     memory: Arc<dyn Memory>,
+    history: Option<RouterHistory>,
 }
 
 impl RouterEngine {
-    pub async fn new(config: RouterConfig, memory: Arc<dyn Memory>) -> Result<Self> {
+    pub async fn new(
+        config: RouterConfig,
+        memory: Arc<dyn Memory>,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Result<Self> {
         let models = ModelCapabilityEntry::load_all(&config, memory.as_ref()).await;
+        let history = if config.knn_enabled {
+            embedder
+                .filter(|embedder| embedder.dimensions() > 0)
+                .map(|embedder| async {
+                    let store = KnnStore::new(Arc::clone(&memory)).await?;
+                    Ok::<_, anyhow::Error>(RouterHistory::new(
+                        store,
+                        embedder,
+                        config.knn_k,
+                        config.knn_min_records,
+                    ))
+                })
+                .transpose()
+                .await?
+        } else {
+            None
+        };
         Ok(Self {
             config,
             models: RwLock::new(models),
             memory,
+            history,
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_history(
+        config: RouterConfig,
+        memory: Arc<dyn Memory>,
+        history: Option<RouterHistory>,
+    ) -> Self {
+        let models =
+            futures::executor::block_on(ModelCapabilityEntry::load_all(&config, memory.as_ref()));
+        Self {
+            config,
+            models: RwLock::new(models),
+            memory,
+            history,
+        }
     }
 
     pub async fn select_model(&self, message: &str, task_intent: &TaskIntent) -> RouterResult {
         let intent = infer_router_intent(task_intent, message);
         let estimated_tokens = estimate_tokens(message);
+        let similarity_scores = if let Some(history) = &self.history {
+            history.similarity_scores(message).await
+        } else {
+            std::collections::HashMap::new()
+        };
         let models = self.models.read();
-        let result = rank_models(&intent, estimated_tokens, &models, &self.config);
+        let result = rank_models(
+            &intent,
+            estimated_tokens,
+            &models,
+            &self.config,
+            Some(&similarity_scores),
+        );
 
         let candidates: Vec<_> = result
             .candidates
@@ -48,6 +103,7 @@ impl RouterEngine {
                 serde_json::json!({
                     "model": candidate.model_id,
                     "provider": candidate.provider,
+                    "similarity": candidate.similarity_score,
                     "score": candidate.total_score,
                 })
             })
@@ -82,6 +138,7 @@ impl RouterEngine {
 
     pub async fn record_outcome(
         &self,
+        message: &str,
         model_id: &str,
         success: bool,
         latency_ms: u64,
@@ -154,6 +211,11 @@ impl RouterEngine {
         models[chosen_index]
             .save_metrics(self.memory.as_ref(), recent_successes.make_contiguous())
             .await?;
+        if let Some(history) = &self.history {
+            if let Err(err) = history.record_query(message, model_id, success).await {
+                tracing::warn!("Router history record failed: {err}");
+            }
+        }
         tracing::info!(
             model = model_id,
             success,
@@ -172,10 +234,12 @@ fn estimate_tokens(text: &str) -> usize {
 mod tests {
     use super::*;
     use crate::config::{RouterConfig, RouterModelConfig};
+    use crate::memory::embeddings::EmbeddingProvider;
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[derive(Default)]
     struct TestMemory {
@@ -260,6 +324,9 @@ mod tests {
             gamma: 0.3,
             delta: 0.1,
             epsilon: 0.1,
+            knn_enabled: false,
+            knn_min_records: 10,
+            knn_k: 7,
             models: vec![
                 RouterModelConfig {
                     model_id: "model-a".to_string(),
@@ -286,11 +353,14 @@ mod tests {
     #[tokio::test]
     async fn test_record_outcome_updates_elo() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router = RouterEngine::new(router_config(), Arc::clone(&memory))
+        let router = RouterEngine::new(router_config(), Arc::clone(&memory), None)
             .await
             .unwrap();
 
-        router.record_outcome("model-a", true, 1_600).await.unwrap();
+        router
+            .record_outcome("hello analysis", "model-a", true, 1_600)
+            .await
+            .unwrap();
 
         let elo = memory
             .get("router/elo/model-a")
@@ -341,14 +411,20 @@ mod tests {
     #[tokio::test]
     async fn test_success_rate_window() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router = RouterEngine::new(router_config(), Arc::clone(&memory))
+        let router = RouterEngine::new(router_config(), Arc::clone(&memory), None)
             .await
             .unwrap();
 
         for _ in 0..100 {
-            router.record_outcome("model-a", true, 1_000).await.unwrap();
+            router
+                .record_outcome("hello analysis", "model-a", true, 1_000)
+                .await
+                .unwrap();
         }
-        router.record_outcome("model-a", false, 1_000).await.unwrap();
+        router
+            .record_outcome("hello analysis", "model-a", false, 1_000)
+            .await
+            .unwrap();
 
         let stats = memory
             .get("router/success_rate/model-a")
@@ -369,12 +445,18 @@ mod tests {
     #[tokio::test]
     async fn test_latency_ema() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router = RouterEngine::new(router_config(), Arc::clone(&memory))
+        let router = RouterEngine::new(router_config(), Arc::clone(&memory), None)
             .await
             .unwrap();
 
-        router.record_outcome("model-a", true, 1_600).await.unwrap();
-        router.record_outcome("model-a", true, 2_000).await.unwrap();
+        router
+            .record_outcome("hello analysis", "model-a", true, 1_600)
+            .await
+            .unwrap();
+        router
+            .record_outcome("hello analysis", "model-a", true, 2_000)
+            .await
+            .unwrap();
 
         let latency = memory
             .get("router/latency/model-a")
@@ -385,6 +467,115 @@ mod tests {
         assert_eq!(
             latency_snapshot["recent_latency_ms"].as_u64().unwrap(),
             1_426
+        );
+    }
+
+    struct FixedEmbeddingProvider;
+
+    #[async_trait]
+    impl EmbeddingProvider for FixedEmbeddingProvider {
+        fn name(&self) -> &str {
+            "test-fixed"
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|_| vec![1.0_f32, 0.0_f32, 0.0_f32])
+                .collect())
+        }
+    }
+
+    struct SlowEmbeddingProvider;
+
+    #[async_trait]
+    impl EmbeddingProvider for SlowEmbeddingProvider {
+        fn name(&self) -> &str {
+            "test-slow"
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(texts
+                .iter()
+                .map(|_| vec![1.0_f32, 0.0_f32, 0.0_f32])
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_knn_cold_start() {
+        let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
+        let store = KnnStore::new(Arc::clone(&memory)).await.unwrap();
+        let history = RouterHistory::new(store, Arc::new(FixedEmbeddingProvider), 7, 10);
+
+        for index in 0..9 {
+            history
+                .record_query("same query", &format!("model-{index}"), true)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(history.similarity_score("same query", "model-1").await, 0.0);
+    }
+
+    #[test]
+    fn test_majority_vote() {
+        let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
+        let store = futures::executor::block_on(KnnStore::new(memory)).unwrap();
+        let voted = store.majority_vote(&[
+            ("model-a".to_string(), 0.1),
+            ("model-a".to_string(), 0.2),
+            ("model-b".to_string(), 0.3),
+        ]);
+
+        assert_eq!(voted.map(|value| value.0), Some("model-a".to_string()));
+    }
+
+    #[test]
+    fn test_distance_weighted_vote() {
+        let neighbors = vec![
+            ("model-a".to_string(), 0.01),
+            ("model-b".to_string(), 0.20),
+            ("model-b".to_string(), 0.30),
+        ];
+
+        let model_a_score = super::knn::weighted_model_score(&neighbors, "model-a");
+        let model_b_score = super::knn::weighted_model_score(&neighbors, "model-b");
+
+        assert!(model_a_score > model_b_score);
+    }
+
+    #[tokio::test]
+    async fn test_knn_timeout_fallback() {
+        let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
+        let store = KnnStore::new(Arc::clone(&memory)).await.unwrap();
+        let history =
+            RouterHistory::new(store, Arc::new(SlowEmbeddingProvider), 7, 10)
+                .with_timeout(Duration::from_millis(10));
+        let mut config = router_config();
+        config.alpha = 1.0;
+        config.knn_enabled = true;
+        let router = RouterEngine::new_with_history(config, Arc::clone(&memory), Some(history));
+
+        let result = router
+            .select_model("same query", &TaskIntent::Simple)
+            .await;
+
+        assert_eq!(result.chosen_model.as_deref(), Some("model-a"));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| candidate.similarity_score == 0.0)
         );
     }
 }

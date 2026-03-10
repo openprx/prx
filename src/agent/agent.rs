@@ -388,9 +388,12 @@ impl Agent {
 
         #[cfg(feature = "llm-router")]
         if config.router.enabled {
+            let router_embedder =
+                memory::create_embedder_from_config(config, config.api_key.as_deref());
             let router = futures::executor::block_on(RouterEngine::new(
                 config.router.clone(),
                 builder.memory.as_ref().expect("memory set").clone(),
+                Some(router_embedder),
             ))?;
             builder = builder.router(router);
         }
@@ -786,7 +789,7 @@ impl Agent {
                         let success = false;
                         let latency = turn_start.elapsed().as_millis() as u64;
                         if let Err(record_err) = router
-                            .record_outcome(&effective_model, success, latency)
+                            .record_outcome(user_message, &effective_model, success, latency)
                             .await
                         {
                             tracing::warn!("Router record_outcome failed: {record_err}");
@@ -839,7 +842,9 @@ impl Agent {
                 if let Some(router) = &self.router {
                     let success = !final_text.is_empty();
                     let latency = turn_start.elapsed().as_millis() as u64;
-                    if let Err(err) = router.record_outcome(&effective_model, success, latency).await
+                    if let Err(err) = router
+                        .record_outcome(user_message, &effective_model, success, latency)
+                        .await
                     {
                         tracing::warn!("Router record_outcome failed: {err}");
                     }
@@ -871,7 +876,10 @@ impl Agent {
         if let Some(router) = &self.router {
             let success = false;
             let latency = turn_start.elapsed().as_millis() as u64;
-            if let Err(err) = router.record_outcome(&effective_model, success, latency).await {
+            if let Err(err) = router
+                .record_outcome(message, &effective_model, success, latency)
+                .await
+            {
                 tracing::warn!("Router record_outcome failed: {err}");
             }
         }
