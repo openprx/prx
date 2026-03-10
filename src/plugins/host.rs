@@ -283,13 +283,20 @@ pub(crate) async fn websocket_send_with(
         let mut guard = session.lock().await;
         guard.send_text(message).await
     })
-    .await
-    .map_err(|_| format!("websocket send timed out after {timeout_ms}ms"))?;
+    .await;
 
-    if result.is_err() {
-        drop_websocket_session(&sessions, session_id).await;
+    match result {
+        Err(_) => {
+            // Timeout — clean up stale session to prevent resource leak.
+            drop_websocket_session(&sessions, session_id).await;
+            Err(format!("websocket send timed out after {timeout_ms}ms"))
+        }
+        Ok(Err(e)) => {
+            drop_websocket_session(&sessions, session_id).await;
+            Err(e)
+        }
+        Ok(Ok(())) => Ok(()),
     }
-    result
 }
 
 pub(crate) async fn websocket_receive_with(
@@ -303,16 +310,20 @@ pub(crate) async fn websocket_receive_with(
         let mut guard = session.lock().await;
         guard.recv_text().await
     })
-    .await
-    .map_err(|_| format!("websocket receive timed out after {timeout_ms}ms"))?;
+    .await;
 
     match result {
-        Ok(Some(message)) => Ok(message),
-        Ok(None) => {
+        Err(_) => {
+            // Timeout — clean up stale session to prevent resource leak.
+            drop_websocket_session(&sessions, session_id).await;
+            Err(format!("websocket receive timed out after {timeout_ms}ms"))
+        }
+        Ok(Ok(Some(message))) => Ok(message),
+        Ok(Ok(None)) => {
             drop_websocket_session(&sessions, session_id).await;
             Err(format!("websocket session {session_id} closed"))
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             drop_websocket_session(&sessions, session_id).await;
             Err(error)
         }
