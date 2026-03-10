@@ -20,6 +20,8 @@ pub struct RouterResult {
     pub chosen_provider: Option<String>,
     pub score: f32,
     pub candidates: Vec<ModelScore>,
+    pub intent: String,
+    pub estimated_tokens: usize,
 }
 
 fn normalize_elo(elo: f32) -> f32 {
@@ -111,6 +113,8 @@ pub fn rank_models(
         chosen_provider: best.map(|candidate| candidate.provider.clone()),
         score: best.map_or(0.0, |candidate| candidate.total_score),
         candidates,
+        intent: intent.category_name().to_string(),
+        estimated_tokens,
     }
 }
 
