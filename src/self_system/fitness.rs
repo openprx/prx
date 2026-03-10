@@ -317,7 +317,7 @@ async fn learning_from_memory(
     memory: &dyn Memory,
     window: WindowBounds,
 ) -> (f64, f64, serde_json::Value) {
-    let entries = match memory.list(None, None).await {
+    let entries = match memory.list(None, Some(SELF_SYSTEM_SESSION_ID)).await {
         Ok(entries) => entries,
         Err(error) => {
             return (
@@ -561,9 +561,14 @@ mod tests {
             async fn list(
                 &self,
                 _category: Option<&MemoryCategory>,
-                _session_id: Option<&str>,
+                session_id: Option<&str>,
             ) -> Result<Vec<MemoryEntry>> {
-                Ok(self.entries.clone())
+                Ok(self
+                    .entries
+                    .iter()
+                    .filter(|entry| session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid)))
+                    .cloned()
+                    .collect())
             }
 
             async fn forget(&self, _key: &str) -> Result<bool> {
@@ -589,7 +594,7 @@ mod tests {
                     content: "v1".into(),
                     category: MemoryCategory::Core,
                     timestamp: (start + Duration::hours(1)).to_rfc3339(),
-                    session_id: None,
+                    session_id: Some(SELF_SYSTEM_SESSION_ID.into()),
                     score: None,
                     tags: None,
                     access_count: None,
@@ -606,7 +611,7 @@ mod tests {
                     content: "ignored".into(),
                     category: MemoryCategory::Core,
                     timestamp: (start + Duration::hours(2)).to_rfc3339(),
-                    session_id: None,
+                    session_id: Some(SELF_SYSTEM_SESSION_ID.into()),
                     score: None,
                     tags: None,
                     access_count: None,
@@ -623,6 +628,23 @@ mod tests {
                     content: "old".into(),
                     category: MemoryCategory::Core,
                     timestamp: (start - Duration::days(1)).to_rfc3339(),
+                    session_id: Some(SELF_SYSTEM_SESSION_ID.into()),
+                    score: None,
+                    tags: None,
+                    access_count: None,
+                    useful_count: None,
+                    source: None,
+                    source_confidence: None,
+                    verification_status: None,
+                    lifecycle_state: None,
+                    compressed_from: None,
+                },
+                MemoryEntry {
+                    id: "4".into(),
+                    key: "user/k2".into(),
+                    content: "external".into(),
+                    category: MemoryCategory::Core,
+                    timestamp: (start + Duration::hours(3)).to_rfc3339(),
                     session_id: None,
                     score: None,
                     tags: None,

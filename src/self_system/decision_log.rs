@@ -82,11 +82,17 @@ pub async fn log_change_outcome(
 
 async fn next_core_index(memory: &dyn Memory, day: &str, prefix: &str) -> Result<usize> {
     let key_prefix = format!("self/decisions/{day}/{prefix}");
-    let entries = memory
+    let scoped_entries = memory
         .list(Some(&MemoryCategory::Core), Some(SELF_SYSTEM_SESSION_ID))
         .await?;
-    let count = entries
+    let legacy_entries = memory.list(Some(&MemoryCategory::Core), None).await?;
+    let count = scoped_entries
         .iter()
+        .chain(
+            legacy_entries
+                .iter()
+                .filter(|entry| entry.session_id.is_none() && entry.key.starts_with("self/decisions/")),
+        )
         .filter(|entry| entry.key.starts_with(&key_prefix))
         .count();
     Ok(count + 1)
@@ -168,12 +174,13 @@ mod tests {
         async fn list(
             &self,
             category: Option<&MemoryCategory>,
-            _session_id: Option<&str>,
+            session_id: Option<&str>,
         ) -> Result<Vec<MemoryEntry>> {
             let entries = self.entries.lock().await;
             Ok(entries
                 .values()
                 .filter(|entry| category.is_none_or(|c| &entry.category == c))
+                .filter(|entry| session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid)))
                 .cloned()
                 .collect())
         }
@@ -245,5 +252,27 @@ mod tests {
 
         assert!(memory.get(&outcome1).await.unwrap().is_some());
         assert!(memory.get(&outcome2).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn proposal_log_counts_legacy_entries_without_session_id() {
+        let memory = TestMemory::new();
+        let day = Utc::now().date_naive().to_string();
+        memory
+            .store(
+                &format!("self/decisions/{day}/proposal_1"),
+                "legacy",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        log_change_proposal(&memory, "policy.window", "raise to 50", "match new default")
+            .await
+            .unwrap();
+
+        let new_key = format!("self/decisions/{day}/proposal_2");
+        assert!(memory.get(&new_key).await.unwrap().is_some());
     }
 }
