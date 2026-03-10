@@ -1,0 +1,20 @@
+[skill]
+name = "voice-talk-realtime"
+description = "Real-time voice conversation via OpenAI and xAI Realtime APIs. Returns WebSocket connection config for voice sessions."
+version = "0.1.0"
+author = "ZeroClaw"
+tags = ["voice", "realtime", "audio", "conversation"]
+
+[[tools]]
+name = "voice_session"
+description = "Create a real-time voice session. Returns WebSocket URL, auth headers, and session config JSON for the specified provider."
+kind = "shell"
+command = "bash skills/voice-talk-realtime/scripts/voice_session.sh"
+
+[tools.args]
+provider = "openai or xai (required)"
+voice = "Voice name (optional). OpenAI: alloy/ash/ballad/coral/echo/sage/shimmer/verse. xAI: eve/ara/rex/sal/leo"
+model = "Model override (optional). OpenAI default: gpt-4o-realtime-preview-2024-12-17. xAI default: grok-3-fast-realtime"
+instructions = "System instructions for the session (optional)"
+turn_detection = "Turn detection mode: server_vad or none/PTT (optional, default: server_vad)"
+api_key = "API key for the provider (required)"
