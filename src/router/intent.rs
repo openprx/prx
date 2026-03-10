@@ -55,7 +55,7 @@ impl RouterIntent {
             Self::Code => "code",
             Self::Analysis => "analysis",
             Self::Summary => "summary",
-            Self::LongDoc => "longdoc",
+            Self::LongDoc => "long_doc",
             Self::Tool => "tool",
             Self::Unknown => "unknown",
         }

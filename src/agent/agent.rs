@@ -537,6 +537,21 @@ impl Agent {
         target.to_string()
     }
 
+    #[cfg(feature = "llm-router")]
+    fn resolve_router_target(&self, provider: &str, model: &str) -> String {
+        if provider == "ollama" && model == "*" {
+            if let Some(default_model) = self
+                .model_name
+                .strip_prefix("ollama/")
+                .filter(|value| !value.is_empty())
+            {
+                return format!("{provider}/{default_model}");
+            }
+        }
+
+        format!("{provider}/{model}")
+    }
+
     async fn spawn_delegate_task(
         &self,
         user_message: &str,
@@ -616,7 +631,7 @@ impl Agent {
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
         #[cfg(feature = "llm-router")]
-        let turn_started = Instant::now();
+        let turn_start = Instant::now();
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
@@ -674,8 +689,6 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        #[cfg(feature = "llm-router")]
-        let mut routed_model_for_metrics: Option<String> = None;
         let effective_model = {
             #[cfg(feature = "llm-router")]
             {
@@ -694,8 +707,7 @@ impl Agent {
                                 score = result.score,
                                 "Router selected model"
                             );
-                            routed_model_for_metrics = Some(model.to_string());
-                            format!("{provider}/{model}")
+                            self.resolve_router_target(provider, model)
                         } else {
                             self.classify_model(user_message)
                         }
@@ -770,12 +782,15 @@ impl Agent {
                 Ok(resp) => resp,
                 Err(err) => {
                     #[cfg(feature = "llm-router")]
-                    if let (Some(router), Some(model)) =
-                        (&self.router, routed_model_for_metrics.as_deref())
-                    {
-                        let _ = router
-                            .record_outcome(model, false, turn_started.elapsed().as_millis() as u64)
-                            .await;
+                    if let Some(router) = &self.router {
+                        let success = false;
+                        let latency = turn_start.elapsed().as_millis() as u64;
+                        if let Err(record_err) = router
+                            .record_outcome(&effective_model, success, latency)
+                            .await
+                        {
+                            tracing::warn!("Router record_outcome failed: {record_err}");
+                        }
                     }
                     self.hooks
                         .emit(HookEvent::Error, payload_error("llm", &err.to_string()))
@@ -821,12 +836,13 @@ impl Agent {
                     )
                     .await;
                 #[cfg(feature = "llm-router")]
-                if let (Some(router), Some(model)) =
-                    (&self.router, routed_model_for_metrics.as_deref())
-                {
-                    let _ = router
-                        .record_outcome(model, true, turn_started.elapsed().as_millis() as u64)
-                        .await;
+                if let Some(router) = &self.router {
+                    let success = !final_text.is_empty();
+                    let latency = turn_start.elapsed().as_millis() as u64;
+                    if let Err(err) = router.record_outcome(&effective_model, success, latency).await
+                    {
+                        tracing::warn!("Router record_outcome failed: {err}");
+                    }
                 }
                 return Ok(final_text);
             }
@@ -852,10 +868,12 @@ impl Agent {
         }
 
         #[cfg(feature = "llm-router")]
-        if let (Some(router), Some(model)) = (&self.router, routed_model_for_metrics.as_deref()) {
-            let _ = router
-                .record_outcome(model, false, turn_started.elapsed().as_millis() as u64)
-                .await;
+        if let Some(router) = &self.router {
+            let success = false;
+            let latency = turn_start.elapsed().as_millis() as u64;
+            if let Err(err) = router.record_outcome(&effective_model, success, latency).await {
+                tracing::warn!("Router record_outcome failed: {err}");
+            }
         }
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
