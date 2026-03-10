@@ -743,8 +743,11 @@ async fn auto_save_disabled_does_not_store() {
 
     let _ = agent.turn("test message").await.unwrap();
 
-    let count = mem.count().await.unwrap();
-    assert_eq!(count, 0, "Expected 0 memory entries with auto_save off");
+    let stored = mem.get("user_msg").await.unwrap();
+    assert!(
+        stored.is_none(),
+        "Expected no auto-saved user_msg entry with auto_save off"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

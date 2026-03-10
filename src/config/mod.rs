@@ -9,6 +9,7 @@ pub use schema::{
     apply_runtime_proxy_to_builder, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
     AgentCompactionConfig, AgentCompactionMode, AgentConfig, AuditConfig, AuthConfig,
+    AutomixConfig,
     AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, ChannelsConfig, ClassificationRule,
     ComposioConfig, Config, CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig, DmPolicy,
     DockerRuntimeConfig, EmbeddingRouteConfig, GatewayConfig, GroupPolicy, HardwareConfig,

@@ -337,6 +337,38 @@ fn default_router_elo() -> f32 {
     1_000.0
 }
 
+fn default_automix_confidence_threshold() -> f32 {
+    0.7
+}
+
+/// Adaptive escalation policy for cheap-first routing.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AutomixConfig {
+    /// Enable Automix escalation. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Escalate when confidence falls below this threshold. Default: `0.7`.
+    #[serde(default = "default_automix_confidence_threshold")]
+    pub confidence_threshold: f32,
+    /// Tier markers that identify cheap-first models.
+    #[serde(default)]
+    pub cheap_model_tiers: Vec<String>,
+    /// Premium model target used for escalation.
+    #[serde(default)]
+    pub premium_model_id: String,
+}
+
+impl Default for AutomixConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            confidence_threshold: default_automix_confidence_threshold(),
+            cheap_model_tiers: Vec::new(),
+            premium_model_id: String::new(),
+        }
+    }
+}
+
 /// Heuristic LLM router configuration (`[router]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RouterConfig {
@@ -367,6 +399,9 @@ pub struct RouterConfig {
     /// Number of nearest neighbors considered for voting. Default: `7`.
     #[serde(default = "default_router_knn_k")]
     pub knn_k: usize,
+    /// Cheap-first adaptive escalation policy.
+    #[serde(default)]
+    pub automix: AutomixConfig,
     /// Candidate model registry.
     #[serde(default)]
     pub models: Vec<RouterModelConfig>,
@@ -384,6 +419,7 @@ impl Default for RouterConfig {
             knn_enabled: false,
             knn_min_records: default_router_knn_min_records(),
             knn_k: default_router_knn_k(),
+            automix: AutomixConfig::default(),
             models: Vec::new(),
         }
     }
