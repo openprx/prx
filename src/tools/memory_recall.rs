@@ -41,6 +41,10 @@ impl Tool for MemoryRecallTool {
                 "limit": {
                     "type": "integer",
                     "description": "Max results to return (default: 5)"
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional session scope; required as self_system for reserved router/ queries"
                 }
             },
             "required": ["query"]
@@ -62,6 +66,20 @@ impl Tool for MemoryRecallTool {
             .get("query")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'query' parameter"))?;
+        let session_id = args
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if query.starts_with("router/")
+            && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("router/ memory requires session_id=\"self_system\"".to_string()),
+            });
+        }
 
         #[allow(clippy::cast_possible_truncation)]
         let limit = args
@@ -69,7 +87,7 @@ impl Tool for MemoryRecallTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(5, |v| v as usize);
 
-        match self.memory.recall(query, limit, None).await {
+        match self.memory.recall(query, limit, session_id).await {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
                 success: true,
                 output: "No memories found matching that query.".into(),
@@ -189,5 +207,21 @@ mod tests {
         let tool = MemoryRecallTool::new(mem, false);
         assert_eq!(tool.name(), "memory_recall");
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
+        assert!(tool.parameters_schema()["properties"]["session_id"].is_object());
+    }
+
+    #[tokio::test]
+    async fn recall_rejects_reserved_router_query_without_self_system_session() {
+        let (_tmp, mem) = seeded_mem();
+        let tool = MemoryRecallTool::new(mem, false);
+        let result = tool
+            .execute(json!({"query": "router/elo/test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("session_id=\"self_system\"")));
     }
 }

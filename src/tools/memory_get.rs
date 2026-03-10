@@ -18,6 +18,25 @@ const MAX_LINE_COUNT: usize = 2000;
 static OBSERVE_TOTAL_QUERIES: AtomicU64 = AtomicU64::new(0);
 static OBSERVE_WOULD_DENY_QUERIES: AtomicU64 = AtomicU64::new(0);
 
+fn requested_session_id(args: &serde_json::Value) -> Option<&str> {
+    args.get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_reserved_router_access(
+    key: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if key.starts_with("router/")
+        && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
+    {
+        anyhow::bail!("router/ memory requires session_id=\"self_system\"");
+    }
+    Ok(())
+}
+
 /// Read selected lines from memory by key (ACL-aware), with file fallback.
 pub struct MemoryGetTool {
     workspace_dir: PathBuf,
@@ -250,6 +269,10 @@ impl Tool for MemoryGetTool {
                 "lines": {
                     "type": "integer",
                     "description": "Number of lines to return (default: 50, max: 2000)"
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional session scope; required as self_system for reserved router/ keys"
                 }
             },
             "required": ["path"]
@@ -262,6 +285,8 @@ impl Tool for MemoryGetTool {
             .or_else(|| args.get("key"))
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
+        let session_id = requested_session_id(&args);
+        validate_reserved_router_access(path, session_id)?;
 
         #[allow(clippy::cast_possible_truncation)]
         let from = args
@@ -753,5 +778,39 @@ mod tests {
         assert!(schema["properties"]["key"].is_object());
         assert!(schema["properties"]["from"].is_object());
         assert!(schema["properties"]["lines"].is_object());
+        assert!(schema["properties"]["session_id"].is_object());
+    }
+
+    #[tokio::test]
+    async fn reserved_router_key_requires_self_system_session() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        memory
+            .store(
+                "router/elo/test",
+                "{\"dynamic_elo\":1000}",
+                MemoryCategory::Custom("router".into()),
+                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+            )
+            .await
+            .unwrap();
+
+        let tool = test_tool(&tmp, false);
+        let denied = tool.execute(json!({"path": "router/elo/test"})).await;
+        assert!(denied.is_err());
+        assert!(denied
+            .unwrap_err()
+            .to_string()
+            .contains("session_id=\"self_system\""));
+
+        let allowed = tool
+            .execute(json!({
+                "path": "router/elo/test",
+                "session_id": crate::self_system::SELF_SYSTEM_SESSION_ID
+            }))
+            .await
+            .unwrap();
+        assert!(allowed.success);
+        assert!(allowed.output.contains("router/elo/test"));
     }
 }

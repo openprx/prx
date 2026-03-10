@@ -9,23 +9,29 @@ pub mod scorer;
 
 use anyhow::Result;
 use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::agent::classifier::TaskIntent;
-use crate::config::RouterConfig;
+use crate::config::{ModelRouteConfig, RouterConfig};
 use crate::memory::embeddings::EmbeddingProvider;
 use crate::memory::Memory;
 
-use self::capability::{load_recent_successes, ModelCapabilityEntry};
-use self::history::RouterHistory;
 use self::knn::KnnStore;
+use self::capability::{
+    append_success_event, filter_models_by_providers, is_model_reachable, load_recent_successes,
+    reachable_provider_names, ModelCapabilityEntry,
+};
 use self::elo::update_elo;
+use self::history::RouterHistory;
 use self::intent::infer_router_intent;
 use self::scorer::rank_models;
 pub use self::scorer::RouterResult;
 
 pub struct RouterEngine {
     config: RouterConfig,
+    default_provider: String,
+    model_routes: Vec<ModelRouteConfig>,
     models: RwLock<Vec<ModelCapabilityEntry>>,
     memory: Arc<dyn Memory>,
     history: Option<RouterHistory>,
@@ -33,10 +39,27 @@ pub struct RouterEngine {
 
 impl RouterEngine {
     pub async fn new(
-        config: RouterConfig,
+        mut config: RouterConfig,
+        default_provider: String,
+        model_routes: Vec<ModelRouteConfig>,
         memory: Arc<dyn Memory>,
         embedder: Option<Arc<dyn EmbeddingProvider>>,
     ) -> Result<Self> {
+        let reachable_providers = reachable_provider_names(&default_provider, &model_routes);
+        if config.models.is_empty() {
+            config.models =
+                filter_models_by_providers(self::models::builtin_model_capabilities(), &reachable_providers);
+        } else {
+            config.models = filter_models_by_providers(config.models.clone(), &reachable_providers);
+        }
+        if config.enabled && config.models.is_empty() {
+            tracing::warn!(
+                default_provider = default_provider.as_str(),
+                reachable_providers = ?reachable_providers,
+                "Router enabled but no reachable models remain after provider filtering; disabling router"
+            );
+            config.enabled = false;
+        }
         let models = ModelCapabilityEntry::load_all(&config, memory.as_ref()).await;
         let history = if config.knn_enabled {
             if let Some(embedder) = embedder.filter(|embedder| embedder.dimensions() > 0) {
@@ -55,6 +78,8 @@ impl RouterEngine {
         };
         Ok(Self {
             config,
+            default_provider,
+            model_routes,
             models: RwLock::new(models),
             memory,
             history,
@@ -64,13 +89,31 @@ impl RouterEngine {
     #[cfg(test)]
     fn new_with_history(
         config: RouterConfig,
+        default_provider: String,
+        model_routes: Vec<ModelRouteConfig>,
         memory: Arc<dyn Memory>,
         history: Option<RouterHistory>,
     ) -> Self {
-        let models =
-            futures::executor::block_on(ModelCapabilityEntry::load_all(&config, memory.as_ref()));
+        let reachable_providers = reachable_provider_names(&default_provider, &model_routes);
+        let filtered_config = RouterConfig {
+            models: if config.models.is_empty() {
+                filter_models_by_providers(
+                    self::models::builtin_model_capabilities(),
+                    &reachable_providers,
+                )
+            } else {
+                filter_models_by_providers(config.models.clone(), &reachable_providers)
+            },
+            ..config.clone()
+        };
+        let models = futures::executor::block_on(ModelCapabilityEntry::load_all(
+            &filtered_config,
+            memory.as_ref(),
+        ));
         Self {
-            config,
+            config: filtered_config,
+            default_provider,
+            model_routes,
             models: RwLock::new(models),
             memory,
             history,
@@ -78,6 +121,16 @@ impl RouterEngine {
     }
 
     pub async fn select_model(&self, message: &str, task_intent: &TaskIntent) -> RouterResult {
+        if !self.config.enabled {
+            return RouterResult {
+                chosen_model: None,
+                chosen_provider: None,
+                score: 0.0,
+                candidates: Vec::new(),
+                intent: infer_router_intent(task_intent, message).category_name().to_string(),
+                estimated_tokens: estimate_tokens(message),
+            };
+        }
         let intent = infer_router_intent(task_intent, message);
         let estimated_tokens = estimate_tokens(message);
         let similarity_scores = if let Some(history) = &self.history {
@@ -93,6 +146,22 @@ impl RouterEngine {
             &self.config,
             Some(&similarity_scores),
         );
+        let mut result = result;
+        if let (Some(provider), Some(model)) = (
+            result.chosen_provider.as_deref(),
+            result.chosen_model.as_deref(),
+        ) {
+            if !is_model_reachable(&self.default_provider, &self.model_routes, provider, model) {
+                tracing::warn!(
+                    provider,
+                    model,
+                    "Router selected unreachable model; falling back to default model"
+                );
+                result.chosen_provider = None;
+                result.chosen_model = None;
+                result.score = 0.0;
+            }
+        }
 
         let candidates: Vec<_> = result
             .candidates
@@ -162,6 +231,7 @@ impl RouterEngine {
             model.config.model_id == model_id
                 || format!("{}/{}", model.config.provider, model.config.model_id) == model_id
         }) else {
+            tracing::warn!(model = model_id, "Router outcome ignored for unknown model");
             return Ok(());
         };
 
@@ -211,20 +281,12 @@ impl RouterEngine {
             };
             models[chosen_index].dynamic_elo = winner_elo;
             models[other_index].dynamic_elo = loser_elo;
-            let mut other_recent_successes =
-                load_recent_successes(self.memory.as_ref(), &models[other_index].config.model_id)
-                    .await;
-            models[other_index]
-                .save_metrics(
-                    self.memory.as_ref(),
-                    other_recent_successes.make_contiguous(),
-                )
-                .await?;
+            models[other_index].save_metrics(self.memory.as_ref()).await?;
         }
 
-        models[chosen_index]
-            .save_metrics(self.memory.as_ref(), recent_successes.make_contiguous())
+        append_success_event(self.memory.as_ref(), &models[chosen_index].config.model_id, success)
             .await?;
+        models[chosen_index].save_metrics(self.memory.as_ref()).await?;
         if let Some(history) = &self.history {
             if let Err(err) = history.record_query(message, model_id, success).await {
                 tracing::warn!("Router history record failed: {err}");
@@ -368,9 +430,10 @@ mod tests {
     #[tokio::test]
     async fn test_record_outcome_updates_elo() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router = RouterEngine::new(router_config(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let router =
+            RouterEngine::new(router_config(), "openai".into(), Vec::new(), Arc::clone(&memory), None)
+                .await
+                .unwrap();
 
         router
             .record_outcome("hello analysis", "model-a", true, 1_600)
@@ -387,25 +450,17 @@ mod tests {
         let updated_elo = elo_snapshot["dynamic_elo"].as_f64().unwrap() as f32;
         assert!(updated_elo > 1_000.0);
 
-        let stats = memory
-            .get("router/success_rate/model-a")
+        let success_events: Vec<_> = memory
+            .list(
+                Some(&MemoryCategory::Custom("router".into())),
+                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+            )
             .await
             .unwrap()
-            .expect("success_rate persisted");
-        assert_eq!(
-            stats.session_id.as_deref(),
-            Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
-        );
-        let stats_snapshot: serde_json::Value =
-            serde_json::from_str(&stats.content).unwrap();
-        assert_eq!(
-            stats_snapshot["recent_successes"]
-                .as_array()
-                .expect("success window")
-                .len(),
-            1
-        );
-        assert_eq!(stats_snapshot["success_rate"].as_f64().unwrap(), 1.0);
+            .into_iter()
+            .filter(|entry| entry.key.starts_with("router/success/model-a/"))
+            .collect();
+        assert_eq!(success_events.len(), 1);
 
         let latency = memory
             .get("router/latency/model-a")
@@ -426,9 +481,10 @@ mod tests {
     #[tokio::test]
     async fn test_success_rate_window() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router = RouterEngine::new(router_config(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let router =
+            RouterEngine::new(router_config(), "openai".into(), Vec::new(), Arc::clone(&memory), None)
+                .await
+                .unwrap();
 
         for _ in 0..100 {
             router
@@ -441,28 +497,19 @@ mod tests {
             .await
             .unwrap();
 
-        let stats = memory
-            .get("router/success_rate/model-a")
-            .await
-            .unwrap()
-            .expect("success_rate persisted");
-        let stats_snapshot: serde_json::Value = serde_json::from_str(&stats.content).unwrap();
-        let recent_successes = stats_snapshot["recent_successes"]
-            .as_array()
-            .expect("success window");
-
+        let recent_successes = load_recent_successes(memory.as_ref(), "model-a").await;
         assert_eq!(recent_successes.len(), 100);
-        assert_eq!(recent_successes[0].as_bool(), Some(true));
-        assert_eq!(recent_successes[99].as_bool(), Some(false));
-        assert_eq!(stats_snapshot["success_rate"].as_f64().unwrap(), 0.99);
+        assert_eq!(recent_successes.front().copied(), Some(true));
+        assert_eq!(recent_successes.back().copied(), Some(false));
     }
 
     #[tokio::test]
     async fn test_latency_ema() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router = RouterEngine::new(router_config(), Arc::clone(&memory), None)
-            .await
-            .unwrap();
+        let router =
+            RouterEngine::new(router_config(), "openai".into(), Vec::new(), Arc::clone(&memory), None)
+                .await
+                .unwrap();
 
         router
             .record_outcome("hello analysis", "model-a", true, 1_600)
@@ -579,7 +626,13 @@ mod tests {
         let mut config = router_config();
         config.alpha = 1.0;
         config.knn_enabled = true;
-        let router = RouterEngine::new_with_history(config, Arc::clone(&memory), Some(history));
+        let router = RouterEngine::new_with_history(
+            config,
+            "openai".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            Some(history),
+        );
 
         let result = router
             .select_model("same query", &TaskIntent::Simple)
@@ -592,5 +645,50 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.similarity_score == 0.0)
         );
+    }
+
+    #[tokio::test]
+    async fn test_router_only_selects_reachable_models() {
+        let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
+        let config = RouterConfig {
+            enabled: true,
+            alpha: 0.0,
+            beta: 0.5,
+            gamma: 0.3,
+            delta: 0.1,
+            epsilon: 0.1,
+            knn_enabled: false,
+            knn_min_records: 10,
+            knn_k: 7,
+            automix: crate::config::AutomixConfig::default(),
+            models: vec![
+                RouterModelConfig {
+                    model_id: "claude-sonnet".into(),
+                    provider: "anthropic".into(),
+                    cost_per_million_tokens: 1.0,
+                    max_context: 128_000,
+                    latency_ms: 1_000,
+                    categories: vec!["analysis".into()],
+                    elo_rating: 1_100.0,
+                },
+                RouterModelConfig {
+                    model_id: "gpt-4.1".into(),
+                    provider: "openai".into(),
+                    cost_per_million_tokens: 1.0,
+                    max_context: 128_000,
+                    latency_ms: 1_000,
+                    categories: vec!["analysis".into()],
+                    elo_rating: 1_500.0,
+                },
+            ],
+        };
+        let router =
+            RouterEngine::new(config, "anthropic".into(), Vec::new(), Arc::clone(&memory), None)
+                .await
+                .unwrap();
+
+        let models = router.models.read();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].config.provider, "anthropic");
     }
 }

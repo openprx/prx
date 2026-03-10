@@ -3107,9 +3107,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("reserved self-system memory namespace"));
+        assert!(error.to_string().contains("reserved memory namespace"));
         assert!(mem.get("self/guarded").await.unwrap().is_none());
 
         mem.store(
@@ -3124,5 +3122,18 @@ mod tests {
         let entry = mem.get("self/guarded").await.unwrap().unwrap();
         assert_eq!(entry.content, "allowed");
         assert_eq!(entry.session_id.as_deref(), Some("self_system"));
+    }
+
+    #[tokio::test]
+    async fn store_rejects_reserved_router_namespace_without_self_system_session() {
+        let (_tmp, mem) = temp_sqlite();
+
+        let error = mem
+            .store("router/elo/test", "blocked", MemoryCategory::Core, None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("reserved memory namespace"));
+        assert!(mem.get("router/elo/test").await.unwrap().is_none());
     }
 }
