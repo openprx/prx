@@ -1,0 +1,23 @@
+[plugin]
+name = "voice-talk-realtime"
+version = "0.1.0"
+description = "Real-time voice conversation via OpenAI and xAI Realtime APIs"
+author = "OpenPRX Team"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "tool"
+name = "voice_session"
+description = "Create a real-time voice session configuration with WebSocket URL and auth details"
+
+[permissions]
+required = ["log", "config", "kv"]
+optional = []
+
+[resources]
+max_fuel = 100_000_000
+max_memory_mb = 8
+max_execution_time_ms = 1000
+
+[config]
+# API keys are passed as tool arguments, not stored in config
