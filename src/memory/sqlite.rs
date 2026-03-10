@@ -4,7 +4,8 @@ use super::principal::{
 };
 use super::topic::resolve_topic;
 use super::traits::{
-    ConversationSessionSummary, ConversationTurn, Memory, MemoryCategory, MemoryEntry,
+    validate_memory_write_target, ConversationSessionSummary, ConversationTurn, Memory,
+    MemoryCategory, MemoryEntry,
 };
 use super::vector;
 use anyhow::Context;
@@ -591,6 +592,8 @@ impl SqliteMemory {
         session_id: Option<&str>,
         context: Option<&MemoryWriteContext>,
     ) -> anyhow::Result<()> {
+        validate_memory_write_target(key, session_id)?;
+
         // Only long-lived categories need vector embeddings.
         let needs_embedding = matches!(&category, MemoryCategory::Core | MemoryCategory::Custom(_));
         let embedding_bytes = if needs_embedding {
@@ -3093,5 +3096,33 @@ mod tests {
         assert!(histories.contains_key("session_b"));
         assert!(histories.contains_key("session_c"));
         assert!(!histories.contains_key("session_a"));
+    }
+
+    #[tokio::test]
+    async fn store_rejects_reserved_self_namespace_without_self_system_session() {
+        let (_tmp, mem) = temp_sqlite();
+
+        let error = mem
+            .store("self/guarded", "blocked", MemoryCategory::Core, None)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("reserved self-system memory namespace"));
+        assert!(mem.get("self/guarded").await.unwrap().is_none());
+
+        mem.store(
+            "self/guarded",
+            "allowed",
+            MemoryCategory::Core,
+            Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+        )
+        .await
+        .unwrap();
+
+        let entry = mem.get("self/guarded").await.unwrap().unwrap();
+        assert_eq!(entry.content, "allowed");
+        assert_eq!(entry.session_id.as_deref(), Some("self_system"));
     }
 }
