@@ -8,6 +8,7 @@ This document covers OpenPRX LLM Router capabilities delivered on 2026-03-10 to 
 
 ## Feature Switches
 
+- Build-time: `llm-router` feature is enabled by default (`cargo build`).
 - `router.enabled`: enable heuristic routing
 - `router.knn_enabled`: enable KNN semantic similarity scoring
 - `router.automix.enabled`: enable confidence-based model escalation

@@ -26,7 +26,7 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 ```bash
 # Build
 git clone https://github.com/openprx/prx.git && cd prx
-cargo build --release
+cargo build --release --all-features
 
 # Setup
 cp target/release/openprx /usr/local/bin/
@@ -35,6 +35,8 @@ openprx onboard
 # Run
 openprx start
 ```
+
+Default build (`cargo build`) includes `llm-router`.
 
 Or download pre-built binaries from [Releases](https://github.com/openprx/prx/releases).
 
