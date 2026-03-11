@@ -98,3 +98,33 @@ These files are automatically injected into the agent context at startup.
 - **Path validation**: Workspace-scoped file access with symlink protection
 - **Memory ACL**: Per-user, per-project access control
 - **Encrypted secret store**: For API keys, OAuth tokens
+
+## LLM Router
+
+OpenPRX includes an adaptive LLM Router with three switches:
+
+- `router.enabled` — heuristic routing (capability + Elo + cost + latency)
+- `router.knn_enabled` — semantic KNN routing (cold-start guard + timeout fallback)
+- `router.automix.enabled` — low-confidence auto-upgrade to premium model
+
+Minimum router config (single reachable provider):
+
+```toml
+[general]
+default_provider = "openrouter"
+default_model = "openai/gpt-4o-mini"
+
+[router]
+enabled = true
+knn_enabled = false
+
+[router.automix]
+enabled = false
+
+[[router.models]]
+model_id = "gpt-4o-mini"
+provider = "openrouter"
+categories = ["conversation"]
+```
+
+For full examples, field-by-field reference, flow, and security boundaries, see [docs/router.md](router.md).
