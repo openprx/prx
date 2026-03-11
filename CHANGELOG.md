@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Telegram mention_only mode** — New config option `mention_only` for Telegram channel.
   When enabled, bot only responds to messages that @-mention the bot in group chats.
   Direct messages always work regardless of this setting. Default: `false`.
+- **LLM Router Phase 1** — Heuristic routing (`capability + Elo + cost + latency`) with weighted scoring (`router.alpha/beta/gamma/delta/epsilon`).
+- **LLM Router Phase 2** — Router model capability registry and seeded model metadata for score calculation.
+- **LLM Router Phase 3** — Outcome feedback loop (`record_outcome`) with Elo/success-rate updates and structured decision logging.
+- **LLM Router Phase 4** — KNN semantic routing with cold-start protection (`router.knn_min_records`) and timeout-safe fallback.
+- **LLM Router Phase 5** — Automix adaptive strategy (`router.automix.*`) for low-confidence escalation from cheap tiers to premium model.
 
 ### Deprecated
 - `enc:` prefix for encrypted secrets — Use `enc2:` (ChaCha20-Poly1305) instead.
@@ -32,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiler warnings in `src/onboard/wizard.rs`.
 - **OpenAI native tool spec parsing** now uses owned serializable/deserializable structs,
   fixing a compile-time type mismatch when validating tool schemas before API calls.
+- **Router (Critical/High)** — Enforced provider reachability filtering so router candidates are constrained to reachable provider/model routes.
+- **Router (High)** — Hardened `record_outcome` persistence path to keep async awaits outside lock scope (lock-free async persistence).
+- **Router (High)** — Reserved `router/` namespace now requires `session_id="self_system"` for memory write/read paths via backend and tool-level guards.
 
 ## [0.1.0] - 2026-02-13
 

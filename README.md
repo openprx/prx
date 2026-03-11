@@ -7,12 +7,19 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 ## Highlights
 
 - **14 LLM providers** — Anthropic, OpenAI, Google, DashScope, xAI, Ollama, and more
+- **LLM Router** — heuristic routing (capability + Elo + cost + latency), KNN semantic routing (cold-start guard + 100ms timeout fallback), and Automix low-confidence auto-upgrade
 - **19 messaging channels** — Signal, WhatsApp, Telegram, Discord, Slack, Matrix, and more
 - **45+ built-in tools** — shell, browser, MCP, memory, scheduling, remote nodes
 - **Web Console** — browser-based management interface (planned)
 - **Remote Nodes** — control macOS/Linux/Pi devices via `prx-node` agent
 - **Self-Evolution** — autonomous prompt/memory/strategy improvement (22 modules)
 - **Subagent Governance** — concurrency limits, depth control, config inheritance
+
+### LLM Router Flags
+
+- `router.enabled` — enable heuristic model routing
+- `router.knn_enabled` — enable semantic KNN scoring (with timeout-safe fallback)
+- `router.automix.enabled` — enable cheap-first, low-confidence upgrade to premium model
 
 ## Quick Start
 
@@ -65,6 +72,7 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 | [Web Console](docs/web-console.md) | Browser-based management (planned) |
 | [Evolution](docs/evolution.md) | Self-improvement pipeline |
 | [Configuration](docs/configuration.md) | Config reference, workspace files, security |
+| [Router](docs/router.md) | LLM Router config, flow, safety boundaries |
 | [WASM Plugins](docs/plugin-developer-guide.md) | Plugin developer guide (Rust/Python/JS/Go) |
 | [Host Function Reference](docs/host-function-reference.md) | WASM plugin host API reference |
 
