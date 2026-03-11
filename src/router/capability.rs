@@ -4,9 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use uuid::Uuid;
 
-use crate::config::{ModelRouteConfig, RouterConfig, RouterModelConfig};
+use crate::config::{ModelRouteConfig, RouterModelConfig};
 use crate::memory::{Memory, MemoryCategory};
-use crate::router::models::builtin_model_capabilities;
 use crate::self_system::SELF_SYSTEM_SESSION_ID;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,10 +46,9 @@ pub struct ModelCapabilityEntry {
 }
 
 impl ModelCapabilityEntry {
-    pub async fn load_all(config: &RouterConfig, memory: &dyn Memory) -> Vec<Self> {
-        let models = merged_router_models(config);
+    pub async fn load_all(models: &[RouterModelConfig], memory: &dyn Memory) -> Vec<Self> {
         let mut entries = Vec::with_capacity(models.len());
-        for model in &models {
+        for model in models {
             let metrics = load_metrics_snapshot(memory, &model.model_id).await;
             let stats = load_success_rate_snapshot(memory, &model.model_id).await;
             let latency = load_latency_snapshot(memory, &model.model_id).await;
@@ -110,22 +108,6 @@ impl ModelCapabilityEntry {
             )
             .await
     }
-}
-
-pub fn merged_router_models(config: &RouterConfig) -> Vec<RouterModelConfig> {
-    let mut models = builtin_model_capabilities();
-
-    for override_model in &config.models {
-        if let Some(existing) = models.iter_mut().find(|entry| {
-            entry.provider == override_model.provider && entry.model_id == override_model.model_id
-        }) {
-            *existing = override_model.clone();
-        } else {
-            models.push(override_model.clone());
-        }
-    }
-
-    models
 }
 
 pub fn reachable_provider_names(
