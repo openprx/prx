@@ -1725,7 +1725,7 @@ author = "PRX Community"
 license = "MIT"
 capability = "tool"
 wit_version = "0.1.0"
-min_prx_version = "0.2.0"
+min_prx_version = "0.2.1"
 
 [permissions]
 # 必需权限（加载时审批）
