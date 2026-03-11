@@ -3,6 +3,8 @@ use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChangeProposalLog {
@@ -82,6 +84,7 @@ pub async fn log_change_outcome(
 
 async fn next_core_index(memory: &dyn Memory, day: &str, prefix: &str) -> Result<usize> {
     let key_prefix = format!("self/decisions/{day}/{prefix}");
+    let mut seen = HashSet::new();
     let count = memory
         .list(Some(&MemoryCategory::Core), None)
         .await?
@@ -93,18 +96,27 @@ async fn next_core_index(memory: &dyn Memory, day: &str, prefix: &str) -> Result
             ) && entry.key.starts_with("self/decisions/")
         })
         .filter(|entry| entry.key.starts_with(&key_prefix))
+        .filter(|entry| seen.insert(entry_fingerprint((&entry.key, &entry.content))))
         .count();
     Ok(count + 1)
+}
+
+fn entry_fingerprint<T: Hash>(value: T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::MarkdownMemory;
     use crate::memory::MemoryEntry;
     use anyhow::Result;
     use async_trait::async_trait;
     use chrono::Utc;
     use std::collections::HashMap;
+    use tempfile::TempDir;
     use tokio::sync::Mutex;
 
     struct TestMemory {
@@ -379,6 +391,34 @@ mod tests {
                 MemoryCategory::Core,
                 None,
             )
+            .await
+            .unwrap();
+
+        log_change_proposal(&memory, "policy.window", "raise to 50", "match new default")
+            .await
+            .unwrap();
+
+        assert!(memory
+            .get(&format!("self/decisions/{day}/proposal_2"))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(memory
+            .get(&format!("self/decisions/{day}/proposal_3"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn proposal_log_deduplicates_markdown_legacy_entries() {
+        let tmp = TempDir::new().unwrap();
+        let memory = MarkdownMemory::new(tmp.path());
+        let day = Utc::now().date_naive().to_string();
+        let content = format!(
+            "# Long-Term Memory\n\n- **self/decisions/{day}/proposal_1**: legacy\n- **self/decisions/{day}/proposal_1**: legacy\n"
+        );
+        tokio::fs::write(tmp.path().join("MEMORY.md"), content)
             .await
             .unwrap();
 

@@ -1561,6 +1561,83 @@ mod tests {
     }
 
     #[cfg(feature = "llm-router")]
+    async fn build_named_automix_agent(
+        cheap_response: &str,
+        premium_response: &str,
+        fail_premium: bool,
+    ) -> (Agent, Arc<TestMemory>, Arc<Mutex<Vec<String>>>) {
+        let memory = Arc::new(TestMemory::default());
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let models = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(RecordingProvider {
+            models: Arc::clone(&models),
+            cheap_response: cheap_response.into(),
+            premium_response: premium_response.into(),
+            fail_premium,
+        });
+        let router = RouterEngine::new(
+            crate::config::RouterConfig {
+                enabled: true,
+                alpha: 0.0,
+                beta: 0.5,
+                gamma: 0.3,
+                delta: 1.0,
+                epsilon: 0.3,
+                knn_enabled: false,
+                knn_min_records: 10,
+                knn_k: 7,
+                automix: crate::config::AutomixConfig {
+                    enabled: true,
+                    confidence_threshold: 0.7,
+                    cheap_model_tiers: vec!["cheap".into()],
+                    premium_model_id: "openai/model-premium".into(),
+                },
+                models: vec![
+                    crate::config::RouterModelConfig {
+                        model_id: "model-cheap".into(),
+                        provider: "openai".into(),
+                        cost_per_million_tokens: 0.1,
+                        max_context: 128_000,
+                        latency_ms: 500,
+                        categories: vec!["conversation".into()],
+                        elo_rating: 1_000.0,
+                    },
+                    crate::config::RouterModelConfig {
+                        model_id: "model-premium".into(),
+                        provider: "openai".into(),
+                        cost_per_million_tokens: 10.0,
+                        max_context: 128_000,
+                        latency_ms: 2_000,
+                        categories: vec!["conversation".into()],
+                        elo_rating: 1_000.0,
+                    },
+                ],
+            },
+            "openai".into(),
+            Vec::new(),
+            memory.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(memory.clone())
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("openai/model-cheap".into())
+            .model_routes(Vec::new())
+            .router(router)
+            .build()
+            .unwrap();
+
+        (agent, memory, models)
+    }
+
+    #[cfg(feature = "llm-router")]
     #[tokio::test]
     async fn test_automix_escalates_on_low_confidence() {
         let (mut agent, _memory, models) = build_automix_agent(
@@ -1682,5 +1759,83 @@ mod tests {
         assert_eq!(event.primary_model, "ollama/*");
         assert!(!event.escalated);
         assert!(event.escalation_failed);
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn test_automix_failure_records_elo_on_cheap_model() {
+        let (mut agent, memory, models) = build_named_automix_agent(
+            "I'm not sure, maybe this is the answer.",
+            "This should fail.",
+            true,
+        )
+        .await;
+
+        let response = agent.turn("hello").await.unwrap();
+        assert_eq!(response, "I'm not sure, maybe this is the answer.");
+        assert_eq!(
+            models.lock().clone(),
+            vec![
+                "openai/model-cheap".to_string(),
+                "openai/model-premium".to_string()
+            ]
+        );
+
+        let cheap_elo = memory
+            .get("router/elo/model-cheap")
+            .await
+            .unwrap()
+            .expect("cheap elo persisted");
+        let cheap_snapshot: serde_json::Value = serde_json::from_str(&cheap_elo.content).unwrap();
+        assert!(cheap_snapshot["dynamic_elo"].as_f64().unwrap() > 1_000.0);
+
+        assert!(memory
+            .get("router/elo/model-premium")
+            .await
+            .unwrap()
+            .is_none());
+
+        let router_entries = memory
+            .list(
+                Some(&MemoryCategory::Custom("router".into())),
+                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+            )
+            .await
+            .unwrap();
+        assert!(router_entries
+            .iter()
+            .any(|entry| entry.key.starts_with("router/success/model-cheap/")));
+        assert!(router_entries
+            .iter()
+            .all(|entry| !entry.key.starts_with("router/success/model-premium/")));
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn test_multiple_cost_events_no_overwrite() {
+        let (agent, memory, _models) = build_named_automix_agent("cheap", "premium", false).await;
+
+        for index in 0..5 {
+            let mut event = RouterCostEvent::new("openai/model-cheap");
+            event.total_cost_usd = index as f32 + 0.1;
+            agent.append_router_cost_event(&event).await;
+        }
+
+        let prefix = format!("router/cost/{}/", chrono::Utc::now().format("%Y-%m-%d"));
+        let entries: Vec<_> = memory
+            .list(
+                Some(&MemoryCategory::Custom("router".into())),
+                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.key.starts_with(&prefix))
+            .collect();
+        let unique_keys: std::collections::HashSet<_> =
+            entries.iter().map(|entry| entry.key.clone()).collect();
+
+        assert_eq!(entries.len(), 5);
+        assert_eq!(unique_keys.len(), 5);
     }
 }

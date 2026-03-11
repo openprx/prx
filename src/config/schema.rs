@@ -7628,6 +7628,30 @@ default_model = "legacy-model"
         clear_proxy_env_test_vars();
     }
 
+    #[test]
+    async fn test_router_config_rejects_invalid_threshold() {
+        let mut config = RouterConfig::default();
+        config.automix.enabled = true;
+        config.automix.confidence_threshold = 1.5;
+        config.automix.premium_model_id = "openai/model-premium".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    async fn test_router_config_rejects_negative_weight() {
+        let mut config = RouterConfig::default();
+        config.alpha = -0.1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    async fn test_router_config_rejects_empty_premium_model() {
+        let mut config = RouterConfig::default();
+        config.automix.enabled = true;
+        config.automix.premium_model_id = String::new();
+        assert!(config.validate().is_err());
+    }
+
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
         match runtime_proxy_client_cache().read() {
             Ok(guard) => guard.contains_key(cache_key),
