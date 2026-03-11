@@ -1,6 +1,7 @@
 use super::traits::{validate_memory_write_target, Memory, MemoryCategory, MemoryEntry};
 use async_trait::async_trait;
 use chrono::Local;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -83,12 +84,15 @@ impl MarkdownMemory {
             .map(|(i, line)| {
                 let trimmed = line.trim();
                 let clean = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+                let (key, parsed_content) = parse_markdown_entry(clean)
+                    .unwrap_or_else(|| (format!("{filename}:{i}"), clean.to_string()));
+                let timestamp = normalized_entry_timestamp(filename, &parsed_content);
                 MemoryEntry {
                     id: format!("{filename}:{i}"),
-                    key: format!("{filename}:{i}"),
-                    content: clean.to_string(),
+                    key,
+                    content: parsed_content,
                     category: category.clone(),
-                    timestamp: filename.to_string(),
+                    timestamp,
                     session_id: None,
                     score: None,
                     tags: None,
@@ -138,6 +142,37 @@ impl MarkdownMemory {
         entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         Ok(entries)
     }
+}
+
+fn parse_markdown_entry(line: &str) -> Option<(String, String)> {
+    let stripped = line.strip_prefix("**")?;
+    let delimiter = stripped.find("**:")?;
+    let key = stripped[..delimiter].trim();
+    if key.is_empty() {
+        return None;
+    }
+
+    let content = stripped[delimiter + 3..].trim_start();
+    Some((key.to_string(), content.to_string()))
+}
+
+fn normalized_entry_timestamp(filename: &str, content: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(content) {
+        for field in ["logged_at", "timestamp", "created_at", "updated_at"] {
+            if let Some(raw) = value.get(field).and_then(Value::as_str) {
+                return raw.to_string();
+            }
+        }
+    }
+
+    if filename.len() == 10
+        && filename.as_bytes().get(4) == Some(&b'-')
+        && filename.as_bytes().get(7) == Some(&b'-')
+    {
+        return format!("{filename}T00:00:00Z");
+    }
+
+    filename.to_string()
 }
 
 #[async_trait]
@@ -364,5 +399,51 @@ mod tests {
     async fn markdown_empty_count() {
         let (_tmp, mem) = temp_workspace();
         assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn markdown_restores_structured_key_and_content() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store(
+            "self/fitness/daily/2026-03-10",
+            r#"{"score":0.9,"note":"legacy"}"#,
+            MemoryCategory::Core,
+            Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+        )
+        .await
+        .unwrap();
+
+        let entries = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.key == "self/fitness/daily/2026-03-10")
+            .expect("structured entry");
+
+        assert_eq!(entry.content, r#"{"score":0.9,"note":"legacy"}"#);
+        assert!(mem
+            .get("self/fitness/daily/2026-03-10")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn markdown_normalizes_structured_timestamps() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store(
+            "self/decisions/2026-03-10/proposal_1",
+            r#"{"logged_at":"2026-03-10T12:34:56Z","key":"router"}"#,
+            MemoryCategory::Core,
+            Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+        )
+        .await
+        .unwrap();
+
+        let entry = mem
+            .get("self/decisions/2026-03-10/proposal_1")
+            .await
+            .unwrap()
+            .expect("decision entry");
+        assert_eq!(entry.timestamp, "2026-03-10T12:34:56Z");
     }
 }

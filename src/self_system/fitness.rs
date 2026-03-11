@@ -318,7 +318,7 @@ async fn learning_from_memory(
     memory: &dyn Memory,
     window: WindowBounds,
 ) -> (f64, f64, serde_json::Value) {
-    let entries = match memory.list(None, None).await {
+    let mut entries = match memory.list(None, Some(SELF_SYSTEM_SESSION_ID)).await {
         Ok(entries) => entries,
         Err(error) => {
             return (
@@ -332,6 +332,26 @@ async fn learning_from_memory(
             )
         }
     };
+
+    let legacy_entries = match memory.list(None, None).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            return (
+                0.3,
+                0.2,
+                serde_json::json!({
+                    "source": "memory_list",
+                    "error": error.to_string(),
+                    "fallback": true
+                }),
+            )
+        }
+    };
+    entries.extend(
+        legacy_entries
+            .into_iter()
+            .filter(|entry| entry.session_id.is_none() && entry.key.starts_with("self/")),
+    );
 
     let mut seen = HashSet::new();
     let new_keys = entries
@@ -460,7 +480,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::cron;
-    use crate::memory::{MemoryEntry, SqliteMemory};
+    use crate::memory::{MarkdownMemory, MemoryEntry, SqliteMemory};
     use chrono::TimeZone;
     use tempfile::TempDir;
 
@@ -827,5 +847,37 @@ mod tests {
         assert!(score > 0.0);
         assert_eq!(confidence, 0.8);
         assert_eq!(evidence["new_keys_in_window"], 2);
+    }
+
+    #[tokio::test]
+    async fn learning_score_reads_markdown_legacy_self_entries() {
+        let tmp = TempDir::new().unwrap();
+        let memory = MarkdownMemory::new(tmp.path());
+        let day = "2026-02-23";
+        let content = concat!(
+            "# Long-Term Memory\n\n",
+            "- **self/decisions/2026-02-23/proposal_1**: ",
+            "{\"logged_at\":\"2026-02-23T02:00:00Z\",\"key\":\"router\",\"proposal_text\":\"p\",\"expected_outcome\":\"o\"}\n",
+            "- **user/note**: external\n"
+        );
+        tokio::fs::write(tmp.path().join("MEMORY.md"), content)
+            .await
+            .unwrap();
+
+        let start = Utc.with_ymd_and_hms(2026, 2, 23, 0, 0, 0).unwrap();
+        let end = start + Duration::days(1);
+        let (score, confidence, evidence) = learning_from_memory(
+            &memory,
+            WindowBounds {
+                day: day.parse().unwrap(),
+                start,
+                end,
+            },
+        )
+        .await;
+
+        assert!(score > 0.0);
+        assert_eq!(confidence, 0.8);
+        assert_eq!(evidence["new_keys_in_window"], 1);
     }
 }

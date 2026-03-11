@@ -9,7 +9,6 @@ pub mod scorer;
 
 use anyhow::Result;
 use parking_lot::RwLock;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::agent::classifier::TaskIntent;
@@ -267,21 +266,13 @@ impl RouterEngine {
             (old_latency.mul_add(0.7, new_latency * 0.3)).round() as u32;
 
         if let Some(other_index) = baseline {
-            let (winner_elo, loser_elo) = if success {
-                update_elo(
-                    models[chosen_index].dynamic_elo,
-                    models[other_index].dynamic_elo,
-                )
+            let baseline_elo = models[other_index].dynamic_elo;
+            let updated_chosen_elo = if success {
+                update_elo(models[chosen_index].dynamic_elo, baseline_elo).0
             } else {
-                let (other, chosen) = update_elo(
-                    models[other_index].dynamic_elo,
-                    models[chosen_index].dynamic_elo,
-                );
-                (chosen, other)
+                update_elo(baseline_elo, models[chosen_index].dynamic_elo).1
             };
-            models[chosen_index].dynamic_elo = winner_elo;
-            models[other_index].dynamic_elo = loser_elo;
-            models[other_index].save_metrics(self.memory.as_ref()).await?;
+            models[chosen_index].dynamic_elo = updated_chosen_elo;
         }
 
         append_success_event(self.memory.as_ref(), &models[chosen_index].config.model_id, success)
@@ -314,6 +305,7 @@ mod tests {
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::io;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -424,6 +416,20 @@ mod tests {
                     elo_rating: 1_000.0,
                 },
             ],
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -690,5 +696,166 @@ mod tests {
         let models = router.models.read();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].config.provider, "anthropic");
+    }
+
+    #[tokio::test]
+    async fn test_router_auto_disable_when_no_reachable_models() {
+        let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
+        let mut config = router_config();
+        config.models = vec![RouterModelConfig {
+            model_id: "gpt-4.1".into(),
+            provider: "openai".into(),
+            cost_per_million_tokens: 1.0,
+            max_context: 128_000,
+            latency_ms: 1_000,
+            categories: vec!["analysis".into()],
+            elo_rating: 1_000.0,
+        }];
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer({
+                let logs = Arc::clone(&logs);
+                move || SharedLogWriter(Arc::clone(&logs))
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let router =
+            RouterEngine::new(config, "anthropic".into(), Vec::new(), Arc::clone(&memory), None)
+                .await
+                .unwrap();
+
+        assert!(!router.config.enabled);
+
+        let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("disabling router"));
+        assert!(output.contains("no reachable models remain"));
+    }
+
+    #[tokio::test]
+    async fn test_select_model_returns_none_for_unreachable() {
+        let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
+        let config = RouterConfig {
+            enabled: true,
+            models: vec![RouterModelConfig {
+                model_id: "gpt-4.1".into(),
+                provider: "openai".into(),
+                cost_per_million_tokens: 0.1,
+                max_context: 128_000,
+                latency_ms: 500,
+                categories: vec!["conversation".into()],
+                elo_rating: 1_500.0,
+            }],
+            ..RouterConfig::default()
+        };
+        let router = RouterEngine {
+            config,
+            default_provider: "anthropic".into(),
+            model_routes: Vec::new(),
+            models: RwLock::new(vec![ModelCapabilityEntry {
+                config: RouterModelConfig {
+                    model_id: "gpt-4.1".into(),
+                    provider: "openai".into(),
+                    cost_per_million_tokens: 0.1,
+                    max_context: 128_000,
+                    latency_ms: 500,
+                    categories: vec!["conversation".into()],
+                    elo_rating: 1_500.0,
+                },
+                dynamic_elo: 1_500.0,
+                success_rate: 1.0,
+                recent_latency_ms: 500,
+            }]),
+            memory,
+            history: None,
+        };
+
+        let result = router.select_model("hello", &TaskIntent::Simple).await;
+
+        assert!(result.chosen_model.is_none());
+        assert!(result.chosen_provider.is_none());
+        assert_eq!(result.score, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_record_outcome_updates_only_chosen_model_elo() {
+        let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
+        let config = RouterConfig {
+            enabled: true,
+            alpha: 0.0,
+            beta: 0.5,
+            gamma: 0.3,
+            delta: 1.0,
+            epsilon: 0.3,
+            knn_enabled: false,
+            knn_min_records: 10,
+            knn_k: 7,
+            automix: crate::config::AutomixConfig {
+                enabled: true,
+                confidence_threshold: 0.7,
+                cheap_model_tiers: vec!["cheap".into()],
+                premium_model_id: "openai/model-premium".into(),
+            },
+            models: vec![
+                RouterModelConfig {
+                    model_id: "model-cheap".into(),
+                    provider: "openai".into(),
+                    cost_per_million_tokens: 0.1,
+                    max_context: 128_000,
+                    latency_ms: 500,
+                    categories: vec!["conversation".into()],
+                    elo_rating: 1_000.0,
+                },
+                RouterModelConfig {
+                    model_id: "model-premium".into(),
+                    provider: "openai".into(),
+                    cost_per_million_tokens: 10.0,
+                    max_context: 128_000,
+                    latency_ms: 2_000,
+                    categories: vec!["conversation".into()],
+                    elo_rating: 1_000.0,
+                },
+            ],
+        };
+        let router =
+            RouterEngine::new(config, "openai".into(), Vec::new(), Arc::clone(&memory), None)
+                .await
+                .unwrap();
+
+        router
+            .record_outcome("hello", "model-cheap", true, 500)
+            .await
+            .unwrap();
+
+        let cheap_elo = memory
+            .get("router/elo/model-cheap")
+            .await
+            .unwrap()
+            .expect("cheap elo persisted");
+        let cheap_snapshot: serde_json::Value = serde_json::from_str(&cheap_elo.content).unwrap();
+        assert!(cheap_snapshot["dynamic_elo"].as_f64().unwrap() > 1_000.0);
+
+        assert!(memory
+            .get("router/elo/model-premium")
+            .await
+            .unwrap()
+            .is_none());
+
+        let router_entries = memory
+            .list(
+                Some(&MemoryCategory::Custom("router".into())),
+                Some(crate::self_system::SELF_SYSTEM_SESSION_ID),
+            )
+            .await
+            .unwrap();
+        assert!(router_entries
+            .iter()
+            .any(|entry| entry.key.starts_with("router/success/model-cheap/")));
+        assert!(router_entries
+            .iter()
+            .all(|entry| !entry.key.starts_with("router/success/model-premium/")));
     }
 }
