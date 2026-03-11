@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Router (High)** — Hardened `record_outcome` persistence path to keep async awaits outside lock scope (lock-free async persistence).
 - **Router (High)** — Reserved `router/` namespace now requires `session_id="self_system"` for memory write/read paths via backend and tool-level guards.
 
+## [0.2.1] - 2026-03-11
+
+### Added
+- **LLM Router Phase 1-5** — Delivered heuristic routing, capability registry, feedback loop updates, KNN semantic routing, and Automix adaptive escalation.
+
+### Fixed
+- **Router audit fixes** — Applied critical/high audit hardening for provider reachability filtering, lock-safe async outcome persistence, and reserved `router/` namespace enforcement.
+
 ## [0.1.0] - 2026-02-13
 
 ### Added
@@ -67,3 +75,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Forbidden system path protection (`/etc`, `/root`, `~/.ssh`)
 
 [0.1.0]: https://github.com/theonlyhennygod/zeroclaw/releases/tag/v0.1.0
+[0.2.1]: https://github.com/theonlyhennygod/zeroclaw/releases/tag/v0.2.1
