@@ -147,7 +147,7 @@ pub use openprx::{HardwareCommands, PeripheralCommands};
 #[derive(Parser, Debug)]
 #[command(name = "openprx")]
 #[command(author = "theonlyhennygod")]
-#[command(version = "0.1.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
     #[arg(long, global = true)]

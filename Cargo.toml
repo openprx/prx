@@ -198,7 +198,7 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = ["hardware", "channel-matrix"]
+default = ["hardware", "channel-matrix", "llm-router", "wasm-plugins"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 peripheral-rpi = ["rppal"]
