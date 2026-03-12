@@ -38,6 +38,7 @@ pub use traits::{
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 const MAX_API_ERROR_CHARS: usize = 200;
@@ -1670,39 +1671,46 @@ pub fn create_resilient_provider_with_options(
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
+    let availability = summarize_provider_availability(primary_name, api_key, reliability);
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
+    let mut unavailable = availability.unavailable.clone();
 
-    let primary_provider = match primary_name {
-        "openai-codex" | "openai_codex" | "codex" => {
-            create_provider_with_options(primary_name, api_key, options)?
-        }
-        _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
-    };
-    providers.push((primary_name.to_string(), primary_provider));
+    for provider_name in &availability.available {
+        let explicit_key = (provider_name == primary_name).then_some(api_key).flatten();
+        let creation_result = if provider_name == primary_name {
+            match primary_name {
+                "openai-codex" | "openai_codex" | "codex" => {
+                    create_provider_with_options(provider_name, explicit_key, options)
+                }
+                _ => create_provider_with_url_and_options(
+                    provider_name,
+                    explicit_key,
+                    api_url,
+                    options,
+                ),
+            }
+        } else {
+            create_provider_with_options(provider_name, None, options)
+        };
 
-    for fallback in &reliability.fallback_providers {
-        if fallback == primary_name || providers.iter().any(|(name, _)| name == fallback) {
-            continue;
-        }
-
-        // Each fallback provider resolves its own credential via provider-
-        // specific env vars (e.g. DEEPSEEK_API_KEY for "deepseek") instead
-        // of inheriting the primary provider's key. Passing `None` lets
-        // `resolve_provider_credential` check the correct env var for the
-        // fallback provider name.
-        //
-        // Keep using `create_provider_with_options` so fallback entries that
-        // require runtime options (for example Codex auth profile overrides)
-        // continue to work.
-        match create_provider_with_options(fallback, None, options) {
-            Ok(provider) => providers.push((fallback.clone(), provider)),
-            Err(_error) => {
+        match creation_result {
+            Ok(provider) => providers.push((provider_name.clone(), provider)),
+            Err(error) => {
+                let reason = format!("failed to initialize: {error}");
+                if provider_name == primary_name {
+                    anyhow::bail!("Primary provider \"{provider_name}\" unavailable: {reason}");
+                }
                 tracing::warn!(
-                    fallback_provider = fallback,
-                    "Ignoring invalid fallback provider during initialization"
+                    provider = provider_name,
+                    "Ignoring unavailable fallback provider"
                 );
+                unavailable.push((provider_name.clone(), reason));
             }
         }
+    }
+
+    if providers.is_empty() {
+        anyhow::bail!("No available providers after credential/initialization checks");
     }
 
     let reliable = ReliableProvider::new(
@@ -1711,7 +1719,8 @@ pub fn create_resilient_provider_with_options(
         reliability.provider_backoff_ms,
     )
     .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(reliability.model_fallbacks.clone());
+    .with_model_fallbacks(reliability.model_fallbacks.clone())
+    .with_unavailable_providers(unavailable);
 
     Ok(Box::new(reliable))
 }
@@ -1826,6 +1835,118 @@ pub struct ProviderInfo {
     pub aliases: &'static [&'static str],
     /// Whether the provider runs locally (no API key required)
     pub local: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderAvailabilitySummary {
+    pub configured: Vec<String>,
+    pub available: Vec<String>,
+    pub unavailable: Vec<(String, String)>,
+    pub degraded: bool,
+}
+
+fn provider_requires_explicit_credential(name: &str) -> bool {
+    if matches!(name, "bedrock" | "aws-bedrock") {
+        return false;
+    }
+
+    let lowered = name.trim().to_ascii_lowercase();
+    let mut local_names: HashSet<String> = HashSet::new();
+    for info in list_providers() {
+        if info.local {
+            local_names.insert(info.name.to_string());
+            for alias in info.aliases {
+                local_names.insert((*alias).to_string());
+            }
+        }
+    }
+
+    !local_names.contains(&lowered)
+}
+
+pub fn provider_matches_model_prefix(provider_name: &str, model: &str) -> bool {
+    let model = model.trim();
+    if model.is_empty() || model.starts_with("hint:") {
+        return true;
+    }
+
+    let Some((prefix, _rest)) = model.split_once('/') else {
+        return true;
+    };
+
+    let prefix = prefix.trim().to_ascii_lowercase();
+    if prefix.is_empty() {
+        return true;
+    }
+
+    let provider_name = provider_name.trim().to_ascii_lowercase();
+    if provider_name == prefix {
+        return true;
+    }
+
+    for info in list_providers() {
+        if info.name.eq_ignore_ascii_case(&provider_name)
+            || info
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(&provider_name))
+        {
+            if info.name.eq_ignore_ascii_case(&prefix)
+                || info
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(&prefix))
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+pub fn summarize_provider_availability(
+    primary_name: &str,
+    api_key: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+) -> ProviderAvailabilitySummary {
+    let mut configured = vec![primary_name.to_string()];
+    for fallback in &reliability.fallback_providers {
+        if !configured.iter().any(|name| name == fallback) {
+            configured.push(fallback.clone());
+        }
+    }
+
+    let mut available = Vec::new();
+    let mut unavailable = Vec::new();
+
+    for provider in &configured {
+        if let Err(error) = create_provider(provider, None) {
+            unavailable.push((provider.clone(), format!("invalid provider: {error}")));
+            continue;
+        }
+
+        let explicit_for_provider = if provider == primary_name {
+            api_key
+        } else {
+            None
+        };
+        if provider_requires_explicit_credential(provider)
+            && resolve_provider_credential(provider, explicit_for_provider).is_none()
+        {
+            unavailable.push((provider.clone(), "missing credential/api key".to_string()));
+            continue;
+        }
+
+        available.push(provider.clone());
+    }
+
+    ProviderAvailabilitySummary {
+        configured,
+        degraded: available.len() < 2,
+        available,
+        unavailable,
+    }
 }
 
 /// Return the list of all known providers for display in `openprx providers list`.
@@ -2892,6 +3013,35 @@ mod tests {
             &reliability,
         );
         assert!(provider.is_err());
+    }
+
+    #[test]
+    fn summarize_provider_availability_marks_degraded_when_only_primary_has_credentials() {
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["anthropic".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let summary = summarize_provider_availability("openai", Some("sk-test"), &reliability);
+        assert!(summary.degraded);
+        assert_eq!(summary.available, vec!["openai"]);
+        assert!(summary
+            .unavailable
+            .iter()
+            .any(|(name, reason)| name == "anthropic" && reason.contains("missing credential")));
+    }
+
+    #[test]
+    fn provider_model_prefix_matching_rejects_cross_provider_mismatch() {
+        assert!(provider_matches_model_prefix("openai", "openai/gpt-4o"));
+        assert!(!provider_matches_model_prefix("anthropic", "openai/gpt-4o"));
     }
 
     /// Fallback providers resolve their own credentials via provider-specific

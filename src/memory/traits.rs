@@ -71,7 +71,9 @@ pub(crate) fn validate_memory_write_target(
 ) -> anyhow::Result<()> {
     const RESERVED_PREFIXES: &[&str] = &["self/", "router/"];
 
-    if RESERVED_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+    if RESERVED_PREFIXES
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
         && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
     {
         anyhow::bail!("refusing to write reserved memory namespace without self_system session");

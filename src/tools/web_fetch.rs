@@ -76,15 +76,19 @@ impl WebFetchTool {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             anyhow::bail!("URL must start with http:// or https://");
         }
-        if self.allowed_domains.is_empty() {
-            anyhow::bail!("web_fetch is enabled but no allowed browser domains are configured");
-        }
-
         let host = extract_host(url)?;
         if is_private_or_local_host(&host) {
             anyhow::bail!("Blocked local/private host: {host}");
         }
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
+
+        // Graceful degradation: if allowlist is not configured, allow public hosts
+        // only (still blocks localhost/private IPs). Encourage explicit config.
+        if self.allowed_domains.is_empty() {
+            tracing::warn!(
+                "web_fetch running without browser.allowed_domains; allowing public host '{}' only. Configure [browser].allowed_domains for stricter policy",
+                host
+            );
+        } else if !host_matches_allowlist(&host, &self.allowed_domains) {
             anyhow::bail!("Host '{host}' is not in browser.allowed_domains");
         }
 
@@ -503,5 +507,19 @@ mod tests {
             .validate_url("https://evil.com/")
             .expect_err("unexpected allowlist bypass");
         assert!(err.to_string().contains("not in browser.allowed_domains"));
+    }
+
+    #[test]
+    fn validate_url_allows_public_host_when_allowlist_empty() {
+        let tool = WebFetchTool::new(vec![], 10000, 15);
+        let ok = tool
+            .validate_url("https://example.com/docs")
+            .expect("public host should be allowed when allowlist is empty");
+        assert_eq!(ok, "https://example.com/docs");
+
+        let err = tool
+            .validate_url("http://localhost:8080")
+            .expect_err("localhost must still be blocked");
+        assert!(err.to_string().contains("Blocked local/private host"));
     }
 }

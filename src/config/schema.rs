@@ -375,9 +375,7 @@ impl AutomixConfig {
             anyhow::bail!("automix.confidence_threshold must be in [0,1]");
         }
         if self.enabled && self.premium_model_id.trim().is_empty() {
-            anyhow::bail!(
-                "automix.premium_model_id must not be empty when automix.enabled=true"
-            );
+            anyhow::bail!("automix.premium_model_id must not be empty when automix.enabled=true");
         }
         Ok(())
     }

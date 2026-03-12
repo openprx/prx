@@ -40,16 +40,7 @@ impl ConfidenceChecker {
         }
 
         let code_task_markers = [
-            "code",
-            "rust",
-            "python",
-            "bug",
-            "debug",
-            "fix",
-            "function",
-            "函数",
-            "代码",
-            "调试",
+            "code", "rust", "python", "bug", "debug", "fix", "function", "函数", "代码", "调试",
             "修复",
         ];
         let is_code_task = code_task_markers

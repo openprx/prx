@@ -17,7 +17,6 @@ use crate::config::{ModelRouteConfig, RouterConfig};
 use crate::memory::embeddings::EmbeddingProvider;
 use crate::memory::Memory;
 
-use self::knn::KnnStore;
 use self::capability::{
     append_success_event, filter_models_by_providers, is_model_reachable, load_recent_successes,
     reachable_provider_names, ModelCapabilityEntry,
@@ -25,6 +24,7 @@ use self::capability::{
 use self::elo::update_elo;
 use self::history::RouterHistory;
 use self::intent::infer_router_intent;
+use self::knn::KnnStore;
 use self::scorer::rank_models;
 pub use self::scorer::RouterResult;
 
@@ -53,8 +53,10 @@ impl RouterEngine {
     ) -> Result<Self> {
         let reachable_providers = reachable_provider_names(&default_provider, &model_routes);
         if config.models.is_empty() {
-            config.models =
-                filter_models_by_providers(self::models::builtin_model_capabilities(), &reachable_providers);
+            config.models = filter_models_by_providers(
+                self::models::builtin_model_capabilities(),
+                &reachable_providers,
+            );
         } else {
             config.models = filter_models_by_providers(config.models.clone(), &reachable_providers);
         }
@@ -142,7 +144,9 @@ impl RouterEngine {
                 chosen_provider: None,
                 score: 0.0,
                 candidates: Vec::new(),
-                intent: infer_router_intent(task_intent, message).category_name().to_string(),
+                intent: infer_router_intent(task_intent, message)
+                    .category_name()
+                    .to_string(),
                 estimated_tokens: estimate_tokens(message),
             };
         }
@@ -268,21 +272,36 @@ impl RouterEngine {
             load_recent_successes(self.memory.as_ref(), &normalize_model_id(model_id)).await;
         let snapshot = {
             let mut models = self.models.write();
-            apply_outcome_update_locked(&mut models, model_id, success, latency_ms, &mut recent_successes)
+            apply_outcome_update_locked(
+                &mut models,
+                model_id,
+                success,
+                latency_ms,
+                &mut recent_successes,
+            )
         };
         let Some(snapshot) = snapshot else {
             tracing::warn!(model = model_id, "Router outcome ignored for unknown model");
             return Ok(());
         };
 
-        if let Err(err) = append_success_event(self.memory.as_ref(), &snapshot.model_id, success).await {
+        if let Err(err) =
+            append_success_event(self.memory.as_ref(), &snapshot.model_id, success).await
+        {
             tracing::warn!("Router success event append failed: {err}");
         }
-        if let Err(err) = snapshot.metrics_entry.save_metrics(self.memory.as_ref()).await {
+        if let Err(err) = snapshot
+            .metrics_entry
+            .save_metrics(self.memory.as_ref())
+            .await
+        {
             tracing::warn!("Router metrics persistence failed: {err}");
         }
         if let Some(history) = &self.history {
-            if let Err(err) = history.record_query(message, &snapshot.model_id, success).await {
+            if let Err(err) = history
+                .record_query(message, &snapshot.model_id, success)
+                .await
+            {
                 tracing::warn!("Router history record failed: {err}");
             }
         }
@@ -356,7 +375,8 @@ fn apply_outcome_update_locked(
 
     let old_latency = models[chosen_index].recent_latency_ms as f32;
     let new_latency = latency_ms.min(u64::from(u32::MAX)) as f32;
-    models[chosen_index].recent_latency_ms = (old_latency.mul_add(0.7, new_latency * 0.3)).round() as u32;
+    models[chosen_index].recent_latency_ms =
+        (old_latency.mul_add(0.7, new_latency * 0.3)).round() as u32;
 
     if let Some(other_index) = baseline {
         let baseline_elo = models[other_index].dynamic_elo;
@@ -518,10 +538,15 @@ mod tests {
     #[tokio::test]
     async fn test_record_outcome_updates_elo() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router =
-            RouterEngine::new(router_config(), "openai".into(), Vec::new(), Arc::clone(&memory), None)
-                .await
-                .unwrap();
+        let router = RouterEngine::new(
+            router_config(),
+            "openai".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+        )
+        .await
+        .unwrap();
 
         router
             .record_outcome("hello analysis", "model-a", true, 1_600)
@@ -533,7 +558,10 @@ mod tests {
             .await
             .unwrap()
             .expect("elo persisted");
-        assert_eq!(elo.session_id.as_deref(), Some(crate::self_system::SELF_SYSTEM_SESSION_ID));
+        assert_eq!(
+            elo.session_id.as_deref(),
+            Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
+        );
         let elo_snapshot: serde_json::Value = serde_json::from_str(&elo.content).unwrap();
         let updated_elo = elo_snapshot["dynamic_elo"].as_f64().unwrap() as f32;
         assert!(updated_elo > 1_000.0);
@@ -614,10 +642,15 @@ mod tests {
     #[tokio::test]
     async fn test_success_rate_window() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router =
-            RouterEngine::new(router_config(), "openai".into(), Vec::new(), Arc::clone(&memory), None)
-                .await
-                .unwrap();
+        let router = RouterEngine::new(
+            router_config(),
+            "openai".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+        )
+        .await
+        .unwrap();
 
         for _ in 0..100 {
             router
@@ -639,10 +672,15 @@ mod tests {
     #[tokio::test]
     async fn test_latency_ema() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let router =
-            RouterEngine::new(router_config(), "openai".into(), Vec::new(), Arc::clone(&memory), None)
-                .await
-                .unwrap();
+        let router = RouterEngine::new(
+            router_config(),
+            "openai".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+        )
+        .await
+        .unwrap();
 
         router
             .record_outcome("hello analysis", "model-a", true, 1_600)
@@ -753,9 +791,8 @@ mod tests {
     async fn test_knn_timeout_fallback() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
         let store = KnnStore::new(Arc::clone(&memory)).await.unwrap();
-        let history =
-            RouterHistory::new(store, Arc::new(SlowEmbeddingProvider), 7, 10)
-                .with_timeout(Duration::from_millis(10));
+        let history = RouterHistory::new(store, Arc::new(SlowEmbeddingProvider), 7, 10)
+            .with_timeout(Duration::from_millis(10));
         let mut config = router_config();
         config.alpha = 1.0;
         config.knn_enabled = true;
@@ -767,17 +804,13 @@ mod tests {
             Some(history),
         );
 
-        let result = router
-            .select_model("same query", &TaskIntent::Simple)
-            .await;
+        let result = router.select_model("same query", &TaskIntent::Simple).await;
 
         assert!(result.chosen_model.is_some());
-        assert!(
-            result
-                .candidates
-                .iter()
-                .all(|candidate| candidate.similarity_score == 0.0)
-        );
+        assert!(result
+            .candidates
+            .iter()
+            .all(|candidate| candidate.similarity_score == 0.0));
     }
 
     #[tokio::test]
@@ -815,10 +848,15 @@ mod tests {
                 },
             ],
         };
-        let router =
-            RouterEngine::new(config, "anthropic".into(), Vec::new(), Arc::clone(&memory), None)
-                .await
-                .unwrap();
+        let router = RouterEngine::new(
+            config,
+            "anthropic".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+        )
+        .await
+        .unwrap();
 
         let models = router.models.read();
         assert_eq!(models.len(), 1);
@@ -850,10 +888,15 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let router =
-            RouterEngine::new(config, "anthropic".into(), Vec::new(), Arc::clone(&memory), None)
-                .await
-                .unwrap();
+        let router = RouterEngine::new(
+            config,
+            "anthropic".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(!router.config.enabled);
 
@@ -942,12 +985,19 @@ mod tests {
                 },
             ],
         };
-        let router =
-            RouterEngine::new(config, "anthropic".into(), Vec::new(), Arc::clone(&memory), None)
-                .await
-                .unwrap();
+        let router = RouterEngine::new(
+            config,
+            "anthropic".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+        )
+        .await
+        .unwrap();
 
-        let result = router.select_model("hello analysis", &TaskIntent::Simple).await;
+        let result = router
+            .select_model("hello analysis", &TaskIntent::Simple)
+            .await;
         assert_eq!(result.chosen_provider.as_deref(), Some("anthropic"));
         assert_eq!(result.chosen_model.as_deref(), Some("claude-sonnet"));
         assert!(result
@@ -996,10 +1046,15 @@ mod tests {
                 },
             ],
         };
-        let router =
-            RouterEngine::new(config, "openai".into(), Vec::new(), Arc::clone(&memory), None)
-                .await
-                .unwrap();
+        let router = RouterEngine::new(
+            config,
+            "openai".into(),
+            Vec::new(),
+            Arc::clone(&memory),
+            None,
+        )
+        .await
+        .unwrap();
 
         router
             .record_outcome("hello", "model-cheap", true, 500)

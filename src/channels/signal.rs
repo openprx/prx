@@ -2254,7 +2254,10 @@ impl Channel for SignalChannel {
             }
         }
 
-        let rest_url = format!("{}/v2/send", self.http_url);
+        let rest_urls = [
+            format!("{}/v2/send", self.http_url),
+            format!("{}/v1/send", self.http_url),
+        ];
         let mut body = match Self::parse_recipient_target(&message.recipient) {
             RecipientTarget::Direct(number) => serde_json::json!({
                 "number": &self.account,
@@ -2283,55 +2286,56 @@ impl Channel for SignalChannel {
             body["quote_author"] = serde_json::json!(author);
         }
 
-        let resp = self
-            .http_client()
-            .post(&rest_url)
-            .timeout(Duration::from_secs(30))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await;
+        let mut rest_sent = false;
+        let mut last_rest_error: Option<String> = None;
+        for rest_url in &rest_urls {
+            let resp = self
+                .http_client()
+                .post(rest_url)
+                .timeout(Duration::from_secs(30))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await;
 
-        match resp {
-            Ok(r) if r.status().is_success() || r.status().as_u16() == 201 => return Ok(()),
-            Ok(r) => {
-                let status = r.status();
-                let body_text = r.text().await.unwrap_or_default();
-                tracing::warn!("Signal REST send failed: {status} - {body_text}");
-                // Fallback to JSON-RPC for text-only messages
-                if base64_attachments.is_empty() {
-                    let params = match Self::parse_recipient_target(&message.recipient) {
-                        RecipientTarget::Direct(number) => serde_json::json!({
-                            "recipient": [number],
-                            "message": text_content,
-                            "account": &self.account,
-                        }),
-                        RecipientTarget::Group(group_id) => serde_json::json!({
-                            "groupId": group_id,
-                            "message": text_content,
-                            "account": &self.account,
-                        }),
-                    };
-                    self.rpc_request("send", params).await?;
+            match resp {
+                Ok(r) if r.status().is_success() || r.status().as_u16() == 201 => {
+                    rest_sent = true;
+                    break;
+                }
+                Ok(r) => {
+                    let status = r.status();
+                    let body_text = r.text().await.unwrap_or_default();
+                    last_rest_error = Some(format!("{}: {} - {}", rest_url, status, body_text));
+                    // For route mismatch (404/405), try next endpoint; otherwise still allow fallback.
+                    if !matches!(status.as_u16(), 404 | 405) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    last_rest_error = Some(format!("{}: {}", rest_url, e));
                 }
             }
-            Err(e) => {
-                tracing::warn!("Signal REST send error: {e}");
-                if base64_attachments.is_empty() {
-                    let params = match Self::parse_recipient_target(&message.recipient) {
-                        RecipientTarget::Direct(number) => serde_json::json!({
-                            "recipient": [number],
-                            "message": text_content,
-                            "account": &self.account,
-                        }),
-                        RecipientTarget::Group(group_id) => serde_json::json!({
-                            "groupId": group_id,
-                            "message": text_content,
-                            "account": &self.account,
-                        }),
-                    };
-                    self.rpc_request("send", params).await?;
-                }
+        }
+
+        if !rest_sent {
+            if let Some(err) = &last_rest_error {
+                tracing::warn!("Signal REST send failed: {err}");
+            }
+            if base64_attachments.is_empty() {
+                let params = match Self::parse_recipient_target(&message.recipient) {
+                    RecipientTarget::Direct(number) => serde_json::json!({
+                        "recipient": [number],
+                        "message": text_content,
+                        "account": &self.account,
+                    }),
+                    RecipientTarget::Group(group_id) => serde_json::json!({
+                        "groupId": group_id,
+                        "message": text_content,
+                        "account": &self.account,
+                    }),
+                };
+                self.rpc_request("send", params).await?;
             }
         }
         Ok(())

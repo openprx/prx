@@ -223,13 +223,9 @@ pub async fn load_success_rate_snapshot(
         format!("router/success_rate/{model_id}"),
         format!("router/stats/{model_id}"),
     ] {
-        if let Some(snapshot) = memory
-            .get(&key)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|entry| serde_json::from_str::<RouterSuccessRateSnapshot>(&entry.content).ok())
-        {
+        if let Some(snapshot) = memory.get(&key).await.ok().flatten().and_then(|entry| {
+            serde_json::from_str::<RouterSuccessRateSnapshot>(&entry.content).ok()
+        }) {
             return Some(snapshot);
         }
     }

@@ -360,17 +360,20 @@ impl WasmToolAdapter {
         instance: &wasmtime::component::Instance,
         store: &mut wasmtime::Store<HostState>,
     ) -> Result<ToolSpec, PluginError> {
-        // Navigate to the exported interface: prx:plugin/tool-exports@0.1.0
-        let iface_idx = instance
-            .get_export(
-                store.as_context_mut(),
-                None,
-                "prx:plugin/tool-exports@0.1.0",
-            )
+        // Navigate to the exported interface with compatibility fallback.
+        let iface_name_candidates = ["prx:plugin/tool-exports@0.1.0", "prx:plugin/tool-exports"];
+        let (_iface_name, iface_idx) = iface_name_candidates
+            .iter()
+            .find_map(|name| {
+                instance
+                    .get_export(store.as_context_mut(), None, name)
+                    .map(|idx| (*name, idx))
+            })
             .ok_or_else(|| {
-                PluginError::Instantiation(
-                    "plugin does not export prx:plugin/tool-exports@0.1.0".to_string(),
-                )
+                PluginError::Instantiation(format!(
+                    "plugin does not export any supported tool interface: {}",
+                    iface_name_candidates.join(", ")
+                ))
             })?;
 
         // Get the get-spec function from within that interface
@@ -494,17 +497,20 @@ impl WasmToolAdapter {
             ref instance,
         } = *inner;
 
-        // Navigate to execute function — reborrow store for each step
-        let iface_idx = instance
-            .get_export(
-                store.as_context_mut(),
-                None,
-                "prx:plugin/tool-exports@0.1.0",
-            )
+        // Navigate to execute function with compatibility fallback.
+        let iface_name_candidates = ["prx:plugin/tool-exports@0.1.0", "prx:plugin/tool-exports"];
+        let (_iface_name, iface_idx) = iface_name_candidates
+            .iter()
+            .find_map(|name| {
+                instance
+                    .get_export(store.as_context_mut(), None, name)
+                    .map(|idx| (*name, idx))
+            })
             .ok_or_else(|| {
-                PluginError::Runtime(
-                    "plugin does not export prx:plugin/tool-exports@0.1.0".to_string(),
-                )
+                PluginError::Runtime(format!(
+                    "plugin does not export any supported tool interface: {}",
+                    iface_name_candidates.join(", ")
+                ))
             })?;
 
         let func_idx = instance
