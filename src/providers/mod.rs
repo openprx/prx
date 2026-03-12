@@ -1864,6 +1864,42 @@ fn provider_requires_explicit_credential(name: &str) -> bool {
     !local_names.contains(&lowered)
 }
 
+fn is_openai_codex_alias(name: &str) -> bool {
+    matches!(name.trim().to_ascii_lowercase().as_str(), "openai-codex" | "openai_codex" | "codex")
+}
+
+fn default_openprx_state_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("OPENPRX_STATE_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    directories::UserDirs::new().map_or_else(
+        || PathBuf::from(".openprx"),
+        |dirs| dirs.home_dir().join(".openprx"),
+    )
+}
+
+fn openai_codex_auth_profile_available_for_state_dir(state_dir: &std::path::Path) -> bool {
+    let auth = crate::auth::AuthService::new_with_codex_import(
+        state_dir,
+        false,
+        Some(crate::auth::codex_auth::default_codex_auth_json_path()),
+        true,
+    );
+
+    auth.get_provider_bearer_token("openai-codex", None)
+        .ok()
+        .flatten()
+        .is_some_and(|token| !token.trim().is_empty())
+}
+
+fn openai_codex_auth_profile_available() -> bool {
+    openai_codex_auth_profile_available_for_state_dir(&default_openprx_state_dir())
+}
+
 pub fn provider_matches_model_prefix(provider_name: &str, model: &str) -> bool {
     let model = model.trim();
     if model.is_empty() || model.starts_with("hint:") {
@@ -1923,6 +1959,18 @@ pub fn summarize_provider_availability(
     for provider in &configured {
         if let Err(error) = create_provider(provider, None) {
             unavailable.push((provider.clone(), format!("invalid provider: {error}")));
+            continue;
+        }
+
+        if is_openai_codex_alias(provider) {
+            if openai_codex_auth_profile_available() {
+                available.push(provider.clone());
+            } else {
+                unavailable.push((
+                    provider.clone(),
+                    "missing OpenAI Codex auth profile/token".to_string(),
+                ));
+            }
             continue;
         }
 
@@ -3036,6 +3084,113 @@ mod tests {
             .unavailable
             .iter()
             .any(|(name, reason)| name == "anthropic" && reason.contains("missing credential")));
+    }
+
+    #[test]
+    fn summarize_provider_availability_marks_openai_codex_available_with_auth_profile() {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "openprx-provider-avail-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let auth = crate::auth::AuthService::new(&state_dir, false);
+        auth.store_openai_tokens(
+            "default",
+            crate::auth::profiles::TokenSet {
+                access_token: "test-access-token".into(),
+                refresh_token: None,
+                id_token: None,
+                expires_at: None,
+                token_type: Some("Bearer".into()),
+                scope: None,
+            },
+            Some("acct_test".into()),
+            true,
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("OPENPRX_STATE_DIR", &state_dir);
+        }
+        let summary = summarize_provider_availability(
+            "openai",
+            Some("sk-test"),
+            &crate::config::ReliabilityConfig {
+                provider_retries: 1,
+                provider_backoff_ms: 100,
+                fallback_providers: vec!["openai-codex".into()],
+                api_keys: Vec::new(),
+                model_fallbacks: std::collections::HashMap::new(),
+                channel_initial_backoff_secs: 2,
+                channel_max_backoff_secs: 60,
+                scheduler_poll_secs: 15,
+                scheduler_retries: 2,
+            },
+        );
+        unsafe {
+            std::env::remove_var("OPENPRX_STATE_DIR");
+        }
+
+        assert!(summary.available.iter().any(|p| p == "openai-codex"));
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn summarize_provider_availability_marks_openai_codex_unavailable_without_auth_profile() {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "openprx-provider-avail-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        unsafe {
+            std::env::set_var("OPENPRX_STATE_DIR", &state_dir);
+        }
+        let summary = summarize_provider_availability(
+            "openai",
+            Some("sk-test"),
+            &crate::config::ReliabilityConfig {
+                provider_retries: 1,
+                provider_backoff_ms: 100,
+                fallback_providers: vec!["openai-codex".into()],
+                api_keys: Vec::new(),
+                model_fallbacks: std::collections::HashMap::new(),
+                channel_initial_backoff_secs: 2,
+                channel_max_backoff_secs: 60,
+                scheduler_poll_secs: 15,
+                scheduler_retries: 2,
+            },
+        );
+        unsafe {
+            std::env::remove_var("OPENPRX_STATE_DIR");
+        }
+
+        assert!(summary
+            .unavailable
+            .iter()
+            .any(|(name, reason)| name == "openai-codex" && reason.contains("auth profile")));
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 
     #[test]
