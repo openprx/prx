@@ -423,7 +423,7 @@ mod tests {
         assert!(result.output.contains("claude-sonnet-4-6"));
         assert!(result.output.contains("anthropic"));
         assert!(result.output.contains("signal"));
-        assert!(result.output.contains("3000"));
+        assert!(result.output.contains("16830"));
     }
 
     #[tokio::test]

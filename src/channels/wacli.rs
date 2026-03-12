@@ -95,7 +95,7 @@ fn parse_response_id(id: &Option<Value>) -> Option<u64> {
 pub struct WacliChannelConfig {
     /// Daemon host (default "127.0.0.1").
     pub host: String,
-    /// Daemon port (default 8686).
+    /// Daemon port (default 16867).
     pub port: u16,
     /// JID allowlist. `["*"]` means all senders are accepted.
     pub allowed_from: Vec<String>,
@@ -105,7 +105,7 @@ impl Default for WacliChannelConfig {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_string(),
-            port: 8686,
+            port: 16867,
             allowed_from: vec!["*".to_string()],
         }
     }
