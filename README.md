@@ -77,6 +77,7 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 | [Router](docs/router.md) | LLM Router config, flow, safety boundaries |
 | [WASM Plugins](docs/plugin-developer-guide.md) | Plugin developer guide (Rust/Python/JS/Go) |
 | [Host Function Reference](docs/host-function-reference.md) | WASM plugin host API reference |
+| [Service Deploy/Restart SOP (QA)](docs/openprx-unified-service-deploy-restart-sop.md) | Unified systemd-only runtime, port conflict cleanup, plugin deploy/verify |
 
 ## Related Projects
 
