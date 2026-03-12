@@ -235,10 +235,35 @@ impl HookManager {
             anyhow::bail!("hook command is empty");
         }
 
+        let payload_json = payload.to_string();
         let mut cmd = Command::new(command);
         cmd.args(&action.args);
         cmd.env("ZERO_HOOK_EVENT", event.as_str());
-        cmd.env("ZERO_HOOK_PAYLOAD", payload.to_string());
+
+        // Avoid execve argv+env size overflow for large payloads.
+        const MAX_ENV_PAYLOAD_BYTES: usize = 8 * 1024;
+        if payload_json.len() <= MAX_ENV_PAYLOAD_BYTES {
+            cmd.env("ZERO_HOOK_PAYLOAD", &payload_json);
+        } else {
+            cmd.env("ZERO_HOOK_PAYLOAD", "");
+            cmd.env("ZERO_HOOK_PAYLOAD_TRUNCATED", "1");
+        }
+
+        // Always provide a temp payload file path as a stable fallback channel.
+        let payload_file_path = std::env::temp_dir().join(format!(
+            "openprx-hook-payload-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        if let Err(e) = std::fs::write(&payload_file_path, payload_json.as_bytes()) {
+            tracing::warn!(
+                "Failed to write hook payload temp file {:?}: {e}",
+                payload_file_path
+            );
+        } else {
+            cmd.env("ZERO_HOOK_PAYLOAD_FILE", &payload_file_path);
+        }
+
         if !action.env.is_empty() {
             cmd.envs(action.env.clone());
         }
@@ -265,7 +290,12 @@ impl HookManager {
 
         if action.stdin_json {
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(payload.to_string().as_bytes()).await?;
+                if let Err(e) = stdin.write_all(payload_json.as_bytes()).await {
+                    // Hook command may not consume stdin; fallback file path is still available.
+                    if e.kind() != std::io::ErrorKind::BrokenPipe {
+                        return Err(e.into());
+                    }
+                }
             }
         }
 
@@ -274,6 +304,8 @@ impl HookManager {
             tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
                 .await
                 .map_err(|_| anyhow::anyhow!("hook timed out after {timeout_ms} ms"))??;
+
+        let _ = std::fs::remove_file(&payload_file_path);
 
         if output.status.success() {
             return Ok(());
@@ -360,5 +392,33 @@ mod tests {
         assert!(state.config.enabled);
         assert_eq!(state.config.timeout_ms, 1200);
         assert!(state.config.hooks.contains_key("tool_call_start"));
+    }
+
+    #[tokio::test]
+    async fn run_action_large_payload_uses_file_and_stdin_without_env_overflow() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+
+        let action = HookAction {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "test -n \"$ZERO_HOOK_PAYLOAD_FILE\" && test -f \"$ZERO_HOOK_PAYLOAD_FILE\""
+                    .to_string(),
+            ],
+            env: std::collections::HashMap::new(),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            stdin_json: true,
+        };
+
+        let payload = json!({ "blob": "x".repeat(3_000_000) });
+        let result = manager
+            .run_action(HookEvent::ToolCallStart, &payload, 5_000, &action)
+            .await;
+        assert!(
+            result.is_ok(),
+            "large payload hook should succeed via file/stdin: {result:?}"
+        );
     }
 }

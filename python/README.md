@@ -151,4 +151,4 @@ Use **Rust ZeroClaw** for production edge deployments. Use **zeroclaw-tools** wh
 
 ## License
 
-MIT License — see [LICENSE](../LICENSE)
+Dual license: [MIT](../LICENSE-MIT) or [Apache-2.0](../LICENSE-APACHE)

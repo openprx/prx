@@ -322,6 +322,45 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         }
     }
 
+    let availability = crate::providers::summarize_provider_availability(
+        config.default_provider.as_deref().unwrap_or("openrouter"),
+        config.api_key.as_deref(),
+        &config.reliability,
+    );
+    if availability.degraded {
+        items.push(DiagItem::warn(
+            cat,
+            format!(
+                "provider resilience degraded: only {} configured+available provider(s) (need >=2). available=[{}]",
+                availability.available.len(),
+                availability.available.join(", ")
+            ),
+        ));
+    } else {
+        items.push(DiagItem::ok(
+            cat,
+            format!(
+                "provider resilience ready: {} configured+available providers [{}]",
+                availability.available.len(),
+                availability.available.join(", ")
+            ),
+        ));
+    }
+    if !availability.unavailable.is_empty() {
+        items.push(DiagItem::warn(
+            cat,
+            format!(
+                "unavailable providers: {}",
+                availability
+                    .unavailable
+                    .iter()
+                    .map(|(name, reason)| format!("{name}: {reason}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        ));
+    }
+
     // Model routes validation
     for route in &config.model_routes {
         if route.hint.is_empty() {
@@ -951,6 +990,24 @@ mod tests {
         });
         assert!(fb_item.is_some());
         assert_eq!(fb_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_provider_resilience_degraded_with_single_available_provider() {
+        let mut config = Config::default();
+        config.default_provider = Some("openai".into());
+        config.api_key = Some("sk-test".into());
+        config.reliability.fallback_providers = vec!["anthropic".into()];
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let degraded = items.iter().find(|item| {
+            item.message
+                .contains("provider resilience degraded: only 1 configured+available")
+        });
+        assert!(degraded.is_some());
+        assert_eq!(degraded.unwrap().severity, Severity::Warn);
     }
 
     #[test]

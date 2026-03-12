@@ -283,6 +283,24 @@ fn should_disable_after_deterministic_failure(job: &CronJob, output: &str) -> bo
     }
 
     let normalized = output.to_ascii_lowercase();
+
+    // Permission/policy failures should not auto-disable monitor-style jobs.
+    // These are often temporary/environmental and should degrade to retry+alert.
+    let permission_markers = [
+        "read-only mode",
+        "rate limit exceeded",
+        "action budget exhausted",
+        "sessions_spawn",
+        "not allowed",
+        "permission denied",
+    ];
+    if permission_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return false;
+    }
+
     let deterministic_markers = [
         "unknown provider",
         "requires a url",
@@ -909,6 +927,16 @@ mod tests {
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[test]
+    fn deterministic_failure_does_not_disable_permission_denied_sessions_spawn() {
+        let mut job = test_job("echo ok");
+        job.job_type = JobType::Agent;
+        assert!(!should_disable_after_deterministic_failure(
+            &job,
+            "agent job failed: Security policy: read-only mode, cannot perform 'sessions_spawn'"
+        ));
     }
 
     #[tokio::test]

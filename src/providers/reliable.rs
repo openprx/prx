@@ -231,6 +231,8 @@ pub struct ReliableProvider {
     key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Providers filtered out at startup with reasons (invalid/missing credential/init failure).
+    unavailable_providers: Vec<(String, String)>,
 }
 
 impl ReliableProvider {
@@ -246,6 +248,7 @@ impl ReliableProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
+            unavailable_providers: Vec::new(),
         }
     }
 
@@ -259,6 +262,48 @@ impl ReliableProvider {
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         self.model_fallbacks = fallbacks;
         self
+    }
+
+    /// Attach provider availability failures captured during startup.
+    pub fn with_unavailable_providers(mut self, unavailable: Vec<(String, String)>) -> Self {
+        self.unavailable_providers = unavailable;
+        self
+    }
+
+    fn provider_model_compatible(&self, provider_name: &str, model: &str) -> bool {
+        super::provider_matches_model_prefix(provider_name, model)
+    }
+
+    fn all_failed_message(
+        &self,
+        failures: &[String],
+        runtime_unavailable: &[(String, String)],
+    ) -> String {
+        let available = self
+            .providers
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut unavailable = self.unavailable_providers.clone();
+        unavailable.extend(runtime_unavailable.iter().cloned());
+        let unavailable_text = if unavailable.is_empty() {
+            "none".to_string()
+        } else {
+            unavailable
+                .into_iter()
+                .map(|(name, reason)| format!("{name}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+
+        format!(
+            "All providers/models failed. Available providers: [{}]. Unavailable providers: {}. Attempts:\n{}",
+            available,
+            unavailable_text,
+            failures.join("\n")
+        )
     }
 
     /// Build the list of models to try: [original, fallback1, fallback2, ...]
@@ -311,6 +356,7 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut runtime_unavailable = Vec::new();
 
         // Outer: model fallback chain. Middle: provider priority. Inner: retries.
         // Each iteration: attempt one (provider, model) call. On success, return
@@ -318,6 +364,14 @@ impl Provider for ReliableProvider {
         // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if !self.provider_model_compatible(provider_name, current_model) {
+                    runtime_unavailable.push((
+                        provider_name.clone(),
+                        format!("model '{current_model}' not compatible with provider"),
+                    ));
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -421,10 +475,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        anyhow::bail!(self.all_failed_message(&failures, &runtime_unavailable))
     }
 
     async fn chat_with_history(
@@ -435,9 +486,18 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut runtime_unavailable = Vec::new();
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if !self.provider_model_compatible(provider_name, current_model) {
+                    runtime_unavailable.push((
+                        provider_name.clone(),
+                        format!("model '{current_model}' not compatible with provider"),
+                    ));
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -531,10 +591,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        anyhow::bail!(self.all_failed_message(&failures, &runtime_unavailable))
     }
 
     async fn chat(
@@ -545,9 +602,18 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut runtime_unavailable = Vec::new();
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if !self.provider_model_compatible(provider_name, current_model) {
+                    runtime_unavailable.push((
+                        provider_name.clone(),
+                        format!("model '{current_model}' not compatible with provider"),
+                    ));
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -641,10 +707,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        anyhow::bail!(self.all_failed_message(&failures, &runtime_unavailable))
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -669,9 +732,18 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut runtime_unavailable = Vec::new();
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if !self.provider_model_compatible(provider_name, current_model) {
+                    runtime_unavailable.push((
+                        provider_name.clone(),
+                        format!("model '{current_model}' not compatible with provider"),
+                    ));
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -765,10 +837,7 @@ impl Provider for ReliableProvider {
             }
         }
 
-        anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        anyhow::bail!(self.all_failed_message(&failures, &runtime_unavailable))
     }
 
     fn supports_streaming(&self) -> bool {
@@ -1603,6 +1672,75 @@ mod tests {
             1,
             "must not retry non-retryable 429 business errors"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_provider_model_mapping_during_fallback() {
+        let calls_openai = Arc::new(AtomicUsize::new(0));
+        let calls_anthropic = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "openai".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::clone(&calls_openai),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "500 openai down",
+                    }),
+                ),
+                (
+                    "anthropic".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::clone(&calls_anthropic),
+                        fail_until_attempt: 0,
+                        response: "should-not-be-used",
+                        error: "",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let err = provider
+            .simple_chat("hello", "openai/gpt-4o", 0.0)
+            .await
+            .expect_err("cross-provider fallback should be blocked");
+        let msg = err.to_string();
+        assert!(msg.contains("not compatible with provider"));
+        assert_eq!(calls_openai.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_anthropic.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn all_failed_error_includes_available_and_unavailable_provider_summary() {
+        let provider = ReliableProvider::new(
+            vec![(
+                "openai".into(),
+                Box::new(MockProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "p1 error",
+                }),
+            )],
+            0,
+            1,
+        )
+        .with_unavailable_providers(vec![(
+            "anthropic".into(),
+            "missing credential/api key".into(),
+        )]);
+
+        let err = provider
+            .simple_chat("hello", "openai/gpt-4o", 0.0)
+            .await
+            .expect_err("all providers should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("Available providers"));
+        assert!(msg.contains("openai"));
+        assert!(msg.contains("anthropic: missing credential/api key"));
     }
 
     // ── Arc<ModelAwareMock> Provider impl for test ──

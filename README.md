@@ -92,4 +92,4 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 
 Forked from [zeroclaw-labs/zeroclaw](https://github.com/zeroclaw-labs/zeroclaw) (MIT / Apache-2.0). "ZeroClaw" is a trademark of ZeroClaw Labs. This project is **OpenPRX**, an independent fork.
 
-Dual-licensed under [MIT](LICENSE) and [Apache-2.0](LICENSE-APACHE).
+Dual-licensed under [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE).

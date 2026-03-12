@@ -116,8 +116,9 @@ const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
 const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
-const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
-const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 8;
+const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 320;
+const CHANNEL_HISTORY_COMPACT_TOTAL_CHARS: usize = 2400;
 const SIGNAL_IMAGE_UNCERTAINTY_FALLBACK: &str = "无法确认，请提供更清晰图片或补充说明";
 const SIGNAL_VISION_PREFLIGHT_CONFIDENCE_THRESHOLD: f64 = 0.60;
 const SIGNAL_VISION_PREFLIGHT_TIMEOUT_SECS: u64 = 45;
@@ -964,6 +965,17 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
             turn.content =
                 truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
         }
+    }
+
+    // Enforce a hard total character budget to avoid repeated context overflow.
+    while compacted
+        .iter()
+        .map(|turn| turn.content.chars().count())
+        .sum::<usize>()
+        > CHANNEL_HISTORY_COMPACT_TOTAL_CHARS
+        && compacted.len() > 1
+    {
+        compacted.remove(0);
     }
 
     if compacted.is_empty() {
@@ -2276,10 +2288,23 @@ async fn process_channel_message(
 
                 if is_context_window_overflow_error(&e) {
                     let compacted = compact_sender_history(ctx.as_ref(), &history_key);
+                    let compacted_chars = ctx
+                        .conversation_histories
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .get(&history_key)
+                        .map(|turns| {
+                            turns
+                                .iter()
+                                .map(|t| t.content.chars().count())
+                                .sum::<usize>()
+                        })
+                        .unwrap_or(0);
                     eprintln!(
-                        "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
+                        "  ⚠️ Context window exceeded after {}ms; sender history compacted={} (chars={})",
                         started_at.elapsed().as_millis(),
-                        compacted
+                        compacted,
+                        compacted_chars
                     );
 
                     if context_overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES {
@@ -4270,13 +4295,21 @@ mod tests {
         let kept = histories
             .get(&sender)
             .expect("sender history should remain");
-        assert_eq!(kept.len(), CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+        assert!(!kept.is_empty());
+        assert!(kept.len() <= CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
         assert!(kept.iter().all(|turn| {
             let len = turn.content.chars().count();
             len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS
                 || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
                     && turn.content.ends_with("..."))
         }));
+        let total_chars: usize = kept.iter().map(|turn| turn.content.chars().count()).sum();
+        assert!(
+            total_chars <= CHANNEL_HISTORY_COMPACT_TOTAL_CHARS,
+            "total chars {} exceeds budget {}",
+            total_chars,
+            CHANNEL_HISTORY_COMPACT_TOTAL_CHARS
+        );
     }
 
     #[test]

@@ -10,6 +10,9 @@ pub(super) struct StatusResponse {
     memory_backend: String,
     channels: Vec<String>,
     gateway_port: u16,
+    provider_degraded: bool,
+    provider_available: Vec<String>,
+    provider_unavailable: Vec<String>,
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
@@ -18,6 +21,12 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         .default_model
         .clone()
         .unwrap_or_else(|| state.model.clone());
+
+    let availability = crate::providers::summarize_provider_availability(
+        config.default_provider.as_deref().unwrap_or("openrouter"),
+        config.api_key.as_deref(),
+        &config.reliability,
+    );
 
     Json(StatusResponse {
         version: std::env::var("OPENPRX_VERSION")
@@ -28,5 +37,12 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
         memory_backend: resolve_memory_backend(&config),
         channels: configured_channel_names(&config),
         gateway_port: state.gateway_port,
+        provider_degraded: availability.degraded,
+        provider_available: availability.available,
+        provider_unavailable: availability
+            .unavailable
+            .into_iter()
+            .map(|(name, reason)| format!("{name}: {reason}"))
+            .collect(),
     })
 }

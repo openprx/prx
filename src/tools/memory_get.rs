@@ -25,12 +25,8 @@ fn requested_session_id(args: &serde_json::Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn validate_reserved_router_access(
-    key: &str,
-    session_id: Option<&str>,
-) -> anyhow::Result<()> {
-    if key.starts_with("router/")
-        && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
+fn validate_reserved_router_access(key: &str, session_id: Option<&str>) -> anyhow::Result<()> {
+    if key.starts_with("router/") && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
     {
         anyhow::bail!("router/ memory requires session_id=\"self_system\"");
     }

@@ -85,17 +85,20 @@ impl WasmHook {
         let mut inner = self.inner.lock().await;
         let WasmHookInner { store, instance } = &mut *inner;
 
-        // Navigate to the exported interface: prx:plugin/hook-exports@0.1.0
-        let iface_idx = instance
-            .get_export(
-                store.as_context_mut(),
-                None,
-                "prx:plugin/hook-exports@0.1.0",
-            )
+        // Navigate to the exported interface with compatibility fallback.
+        let iface_name_candidates = ["prx:plugin/hook-exports@0.1.0", "prx:plugin/hook-exports"];
+        let (_iface_name, iface_idx) = iface_name_candidates
+            .iter()
+            .find_map(|name| {
+                instance
+                    .get_export(store.as_context_mut(), None, name)
+                    .map(|idx| (*name, idx))
+            })
             .ok_or_else(|| {
-                PluginError::Runtime(
-                    "plugin does not export prx:plugin/hook-exports@0.1.0".to_string(),
-                )
+                PluginError::Runtime(format!(
+                    "plugin does not export any supported hook interface: {}",
+                    iface_name_candidates.join(", ")
+                ))
             })?;
 
         let func_idx = instance

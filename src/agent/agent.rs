@@ -9,9 +9,9 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 #[cfg(feature = "llm-router")]
-use crate::router::RouterEngine;
-#[cfg(feature = "llm-router")]
 use crate::router::automix::{is_cheap_model_target, should_escalate, ConfidenceChecker};
+#[cfg(feature = "llm-router")]
+use crate::router::RouterEngine;
 use crate::runtime;
 use crate::security::SecurityPolicy;
 #[cfg(feature = "llm-router")]
@@ -599,10 +599,7 @@ impl Agent {
     }
 
     #[cfg(feature = "llm-router")]
-    async fn append_router_cost_event(
-        &self,
-        event: &RouterCostEvent,
-    ) {
+    async fn append_router_cost_event(&self, event: &RouterCostEvent) {
         let date = Utc::now().format("%Y-%m-%d").to_string();
         let key = format!("router/cost/{date}/{}", Uuid::new_v4());
 
@@ -857,7 +854,8 @@ impl Agent {
                 Err(err) => {
                     #[cfg(feature = "llm-router")]
                     if let Some(router) = &self.router {
-                        cost_event.primary_prompt_tokens += Self::estimate_text_tokens(user_message);
+                        cost_event.primary_prompt_tokens +=
+                            Self::estimate_text_tokens(user_message);
                         let success = false;
                         let latency = turn_start.elapsed().as_millis() as u64;
                         if let Err(record_err) = router
@@ -904,7 +902,8 @@ impl Agent {
                             parsed.0.clone()
                         };
                         cost_event.primary_model = effective_model.clone();
-                        cost_event.primary_prompt_tokens += Self::estimate_text_tokens(user_message);
+                        cost_event.primary_prompt_tokens +=
+                            Self::estimate_text_tokens(user_message);
                         cost_event.primary_completion_tokens +=
                             Self::estimate_text_tokens(&initial_text);
 
@@ -929,7 +928,8 @@ impl Agent {
                                     .chat(
                                         ChatRequest {
                                             messages: &messages,
-                                            tools: if self.tool_dispatcher.should_send_tool_specs() {
+                                            tools: if self.tool_dispatcher.should_send_tool_specs()
+                                            {
                                                 Some(&dynamic_tool_specs)
                                             } else {
                                                 None
@@ -945,8 +945,7 @@ impl Agent {
                                         cost_event.escalation_model = Some(premium_model.clone());
                                         cost_event.escalation_prompt_tokens +=
                                             Self::estimate_text_tokens(user_message);
-                                        let premium_text =
-                                            resp.text.clone().unwrap_or_default();
+                                        let premium_text = resp.text.clone().unwrap_or_default();
                                         cost_event.escalation_completion_tokens +=
                                             Self::estimate_text_tokens(&premium_text);
                                         effective_model = premium_model;
@@ -1015,7 +1014,8 @@ impl Agent {
                     cost_event.total_cost_usd = router
                         .model_cost_per_million_tokens(&cost_event.primary_model)
                         .map(|rate| {
-                            rate * (cost_event.primary_prompt_tokens + cost_event.primary_completion_tokens)
+                            rate * (cost_event.primary_prompt_tokens
+                                + cost_event.primary_completion_tokens)
                                 as f32
                                 / 1_000_000.0
                         })
