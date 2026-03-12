@@ -78,6 +78,7 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 | [WASM Plugins](docs/plugin-developer-guide.md) | Plugin developer guide (Rust/Python/JS/Go) |
 | [Host Function Reference](docs/host-function-reference.md) | WASM plugin host API reference |
 | [Service Deploy/Restart SOP (QA)](docs/openprx-unified-service-deploy-restart-sop.md) | Unified systemd-only runtime, port conflict cleanup, plugin deploy/verify |
+| [Port Allocation (168xx)](docs/port-allocation-168xx.md) | OpenPRX-related unified port plan and QA baseline mapping |
 
 ## Related Projects
 

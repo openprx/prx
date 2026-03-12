@@ -24,5 +24,5 @@ allowed_from = ["uuid:your-uuid"]
 [channels_config.wacli]
 enabled = true
 host = "127.0.0.1"
-port = 8687
+port = 16867
 ```

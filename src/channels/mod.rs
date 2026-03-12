@@ -3635,7 +3635,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         let signal_channel: Arc<dyn Channel + Send + Sync> = if sig.is_native_mode() {
             tracing::info!(
                 "Signal: native mode — will spawn signal-cli daemon on port {}",
-                sig.daemon_http_port.unwrap_or(8686)
+                sig.daemon_http_port.unwrap_or(16866)
             );
             Arc::new(SignalNativeChannel::new(
                 sig.cli_path
@@ -3643,7 +3643,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     .unwrap_or_else(|| "signal-cli".to_string()),
                 sig.account.clone(),
                 sig.data_dir.clone(),
-                sig.daemon_http_port.unwrap_or(8686),
+                sig.daemon_http_port.unwrap_or(16866),
                 sig.startup_timeout_ms,
                 sig.group_id.clone(),
                 sig.allowed_from.clone(),

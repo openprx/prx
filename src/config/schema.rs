@@ -1329,7 +1329,7 @@ impl Default for PeripheralBoardConfig {
 /// Controls the HTTP gateway for webhook and pairing endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayConfig {
-    /// Gateway port (default: 3000)
+    /// Gateway port (default: 16830)
     #[serde(default = "default_gateway_port")]
     pub port: u16,
     /// Gateway host (default: 127.0.0.1)
@@ -1379,7 +1379,7 @@ pub struct GatewayConfig {
 }
 
 fn default_gateway_port() -> u16 {
-    3000
+    16830
 }
 
 fn default_gateway_host() -> String {
@@ -1443,7 +1443,7 @@ pub struct MemoryWebhookConfig {
     /// Enable the standalone webhook receiver.
     #[serde(default)]
     pub enabled: bool,
-    /// Socket address for the receiver (e.g. "0.0.0.0:18799").
+    /// Socket address for the receiver (e.g. "0.0.0.0:16899").
     #[serde(default = "default_memory_webhook_bind")]
     pub bind: String,
     /// Required bearer token for incoming webhook events.
@@ -1452,7 +1452,7 @@ pub struct MemoryWebhookConfig {
 }
 
 fn default_memory_webhook_bind() -> String {
-    "0.0.0.0:18799".to_string()
+    "0.0.0.0:16899".to_string()
 }
 
 impl Default for MemoryWebhookConfig {
@@ -3512,7 +3512,7 @@ impl Default for SignalStormProtectionConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SignalConfig {
-    /// Base URL for the signal-cli HTTP daemon (e.g. "http://127.0.0.1:8686").
+    /// Base URL for the signal-cli HTTP daemon (e.g. "http://127.0.0.1:16866").
     /// In "native" mode this is ignored; the daemon is spawned on `daemon_http_port`.
     #[serde(default = "default_signal_http_url")]
     pub http_url: String,
@@ -3529,7 +3529,7 @@ pub struct SignalConfig {
     /// Default: $HOME/.local/share/signal-cli (signal-cli's standard XDG location).
     #[serde(default)]
     pub data_dir: Option<String>,
-    /// Local HTTP port for the spawned signal-cli daemon. Only used in native mode. Default: 8686.
+    /// Local HTTP port for the spawned signal-cli daemon. Only used in native mode. Default: 16866.
     #[serde(default)]
     pub daemon_http_port: Option<u16>,
     /// Deprecated: ignored. Accepted for backward compatibility with older config files.
@@ -3608,7 +3608,7 @@ impl SignalConfig {
     /// In rest mode, returns `http_url` as-is.
     pub fn effective_http_url(&self) -> String {
         if self.mode.as_deref() == Some("native") {
-            let port = self.daemon_http_port.unwrap_or(8686);
+            let port = self.daemon_http_port.unwrap_or(16866);
             format!("http://127.0.0.1:{port}")
         } else {
             self.http_url.clone()
@@ -3750,7 +3750,7 @@ impl WhatsAppConfig {
 /// [channels_config.wacli]
 /// enabled = true
 /// host = "127.0.0.1"
-/// port = 8686
+/// port = 16867
 /// allowed_from = ["*"]
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3761,7 +3761,7 @@ pub struct WacliConfig {
     /// Host where the wacli daemon listens (default: "127.0.0.1").
     #[serde(default = "default_wacli_host")]
     pub host: String,
-    /// Port for the wacli daemon's JSON-RPC TCP listener (default: 8686).
+    /// Port for the wacli daemon's JSON-RPC TCP listener (default: 16867).
     #[serde(default = "default_wacli_port")]
     pub port: u16,
     /// Sender JID allowlist. Use `["*"]` to accept all senders.
@@ -3785,7 +3785,7 @@ fn default_wacli_host() -> String {
 }
 
 fn default_wacli_port() -> u16 {
-    8686
+    16867
 }
 
 fn default_wacli_allowed_from() -> Vec<String> {
@@ -6144,7 +6144,7 @@ allowed_users = ["@ops:matrix.org"]
     #[test]
     async fn signal_config_serde() {
         let sc = SignalConfig {
-            http_url: "http://127.0.0.1:8686".into(),
+            http_url: "http://127.0.0.1:16866".into(),
             account: "+1234567890".into(),
             group_id: Some("group123".into()),
             allowed_from: vec!["+1111111111".into()],
@@ -6161,7 +6161,7 @@ allowed_users = ["@ops:matrix.org"]
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.http_url, "http://127.0.0.1:8686");
+        assert_eq!(parsed.http_url, "http://127.0.0.1:16866");
         assert_eq!(parsed.account, "+1234567890");
         assert_eq!(parsed.group_id.as_deref(), Some("group123"));
         assert_eq!(parsed.allowed_from.len(), 1);
@@ -6195,7 +6195,7 @@ allowed_users = ["@ops:matrix.org"]
 
     #[test]
     async fn signal_config_defaults() {
-        let json = r#"{"http_url":"http://127.0.0.1:8686","account":"+1234567890"}"#;
+        let json = r#"{"http_url":"http://127.0.0.1:16866","account":"+1234567890"}"#;
         let parsed: SignalConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.group_id.is_none());
         assert!(parsed.allowed_from.is_empty());
@@ -6550,7 +6550,7 @@ channel_id = "C123"
     #[test]
     async fn checklist_gateway_serde_roundtrip() {
         let g = GatewayConfig {
-            port: 3000,
+            port: 16830,
             host: "127.0.0.1".into(),
             require_pairing: true,
             allow_public_bind: false,
@@ -7354,7 +7354,7 @@ default_model = "legacy-model"
     async fn env_override_gateway_port() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        assert_eq!(config.gateway.port, 3000);
+        assert_eq!(config.gateway.port, 16830);
 
         std::env::set_var("ZEROCLAW_GATEWAY_PORT", "8080");
         config.apply_env_overrides();
@@ -7700,7 +7700,7 @@ default_model = "legacy-model"
     #[test]
     async fn gateway_config_default_values() {
         let g = GatewayConfig::default();
-        assert_eq!(g.port, 3000);
+        assert_eq!(g.port, 16830);
         assert_eq!(g.host, "127.0.0.1");
         assert!(g.require_pairing);
         assert!(!g.allow_public_bind);

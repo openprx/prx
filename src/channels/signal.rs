@@ -2505,7 +2505,7 @@ mod tests {
 
     fn make_channel() -> SignalChannel {
         SignalChannel::new(
-            "http://127.0.0.1:8686".to_string(),
+            "http://127.0.0.1:16866".to_string(),
             "+1234567890".to_string(),
             None,
             vec!["+1111111111".to_string()],
@@ -2517,7 +2517,7 @@ mod tests {
 
     fn make_channel_with_group(group_id: &str) -> SignalChannel {
         SignalChannel::new(
-            "http://127.0.0.1:8686".to_string(),
+            "http://127.0.0.1:16866".to_string(),
             "+1234567890".to_string(),
             Some(group_id.to_string()),
             vec!["*".to_string()],
@@ -2532,7 +2532,7 @@ mod tests {
         storm: crate::config::schema::SignalStormProtectionConfig,
     ) -> SignalChannel {
         SignalChannel::new_with_storm_protection(
-            "http://127.0.0.1:8686".to_string(),
+            "http://127.0.0.1:16866".to_string(),
             "+1234567890".to_string(),
             None,
             allowed_from,
@@ -2563,7 +2563,7 @@ mod tests {
     #[test]
     fn creates_with_correct_fields() {
         let ch = make_channel();
-        assert_eq!(ch.http_url, "http://127.0.0.1:8686");
+        assert_eq!(ch.http_url, "http://127.0.0.1:16866");
         assert_eq!(ch.account, "+1234567890");
         assert!(ch.group_id.is_none());
         assert_eq!(ch.allowed_from.len(), 1);
@@ -2574,7 +2574,7 @@ mod tests {
     #[test]
     fn strips_trailing_slash() {
         let ch = SignalChannel::new(
-            "http://127.0.0.1:8686/".to_string(),
+            "http://127.0.0.1:16866/".to_string(),
             "+1234567890".to_string(),
             None,
             vec![],
@@ -2582,7 +2582,7 @@ mod tests {
             false,
             crate::config::MediaConfig::default(),
         );
-        assert_eq!(ch.http_url, "http://127.0.0.1:8686");
+        assert_eq!(ch.http_url, "http://127.0.0.1:16866");
     }
 
     #[test]
@@ -2606,7 +2606,7 @@ mod tests {
     #[test]
     fn empty_allowlist_denies_all() {
         let ch = SignalChannel::new(
-            "http://127.0.0.1:8686".to_string(),
+            "http://127.0.0.1:16866".to_string(),
             "+1234567890".to_string(),
             None,
             vec![],
@@ -2816,7 +2816,7 @@ mod tests {
     fn process_envelope_uuid_sender_dm() {
         let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
         let ch = SignalChannel::new(
-            "http://127.0.0.1:8686".to_string(),
+            "http://127.0.0.1:16866".to_string(),
             "+1234567890".to_string(),
             None,
             vec!["*".to_string()],
@@ -2866,7 +2866,7 @@ mod tests {
     fn process_envelope_uuid_sender_in_group() {
         let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
         let ch = SignalChannel::new(
-            "http://127.0.0.1:8686".to_string(),
+            "http://127.0.0.1:16866".to_string(),
             "+1234567890".to_string(),
             Some("testgroup".to_string()),
             vec!["*".to_string()],

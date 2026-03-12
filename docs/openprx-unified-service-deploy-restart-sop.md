@@ -12,7 +12,7 @@ Scope: QA runtime standardization for `openprx` + `prx-email` plugin chain.
 
 - Service unit: `~/.config/systemd/user/openprx.service`
 - Start mode: `ExecStart=/usr/local/bin/openprx daemon`
-- Gateway target: `127.0.0.1:3000`
+- Gateway target: `127.0.0.1:16830`
 - Plugin path: `~/.openprx/workspace/plugins/prx-email/`
 
 ## Deploy/update prx-email plugin
@@ -41,7 +41,7 @@ MAIN_PID=$(systemctl --user show openprx -p MainPID --value)
 pgrep -af '/usr/local/bin/openprx daemon'
 
 # 3) Port ownership / uniqueness
-ss -ltnp '( sport = :3000 )'
+ss -ltnp '( sport = :16830 )'
 
 # 4) Plugin artifacts + logs
 ls -l ~/.openprx/workspace/plugins/prx-email/
@@ -52,10 +52,10 @@ journalctl --user -u openprx -n 300 --no-pager | rg -i 'prx-email|plugin|registe
 
 ```bash
 # identify conflicting owner first
-ss -ltnp '( sport = :3000 )'
+ss -ltnp '( sport = :16830 )'
 
-# example: container mapped to 3000
-podman ps --format '{{.Names}} {{.Ports}}' | rg '0.0.0.0:3000->'
+# example: container mapped to 16830
+podman ps --format '{{.Names}} {{.Ports}}' | rg '0.0.0.0:16830->'
 podman stop <non-target-container>
 
 # restart service after cleanup
@@ -73,5 +73,5 @@ done
 
 ## Notes
 
-- If `openprx doctor` reports no available providers, gateway startup may fail before binding `:3000`, and plugin registration logs may be absent.
+- If `openprx doctor` reports no available providers, gateway startup may fail before binding `:16830`, and plugin registration logs may be absent.
 - Fix provider credentials first, then rerun verification commands above.
