@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
-use uuid::Uuid;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::{ModelRouteConfig, RouterModelConfig};
 use crate::memory::{Memory, MemoryCategory};
@@ -152,8 +152,11 @@ pub async fn append_success_event(
     model_id: &str,
     success: bool,
 ) -> Result<()> {
+    static SUCCESS_EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let timestamp = Utc::now().timestamp_millis();
-    let key = format!("router/success/{model_id}/{timestamp}-{}", Uuid::new_v4());
+    let seq = SUCCESS_EVENT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let key = format!("router/success/{model_id}/{timestamp:013}-{seq:020}");
     let payload = serde_json::to_string(&RouterSuccessEvent { success })?;
     memory
         .store(
