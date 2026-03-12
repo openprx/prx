@@ -3086,13 +3086,14 @@ mod tests {
             .any(|(name, reason)| name == "anthropic" && reason.contains("missing credential")));
     }
 
+    fn provider_availability_env_lock() -> &'static std::sync::Mutex<()> {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn summarize_provider_availability_marks_openai_codex_available_with_auth_profile() {
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = provider_availability_env_lock().lock().unwrap();
 
         let state_dir = std::env::temp_dir().join(format!(
             "openprx-provider-avail-test-{}-{}",
@@ -3148,11 +3149,7 @@ mod tests {
 
     #[test]
     fn summarize_provider_availability_marks_openai_codex_unavailable_without_auth_profile() {
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = provider_availability_env_lock().lock().unwrap();
 
         let state_dir = std::env::temp_dir().join(format!(
             "openprx-provider-avail-test-{}-{}",

@@ -1537,7 +1537,7 @@ mod tests {
         });
         let router = RouterEngine::new(
             automix_router_config(automix_enabled),
-            "ollama".into(),
+            "openai".into(),
             Vec::new(),
             memory.clone(),
             None,
@@ -1552,6 +1552,7 @@ mod tests {
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("openai/model-mini".into())
             .model_routes(Vec::new())
             .router(router)
             .build()
@@ -1653,7 +1654,7 @@ mod tests {
         assert_eq!(response, "This is the premium answer.");
         assert_eq!(
             models.lock().clone(),
-            vec!["ollama/*".to_string(), "openai/model-premium".to_string()]
+            vec!["openai/model-mini".to_string(), "openai/model-premium".to_string()]
         );
     }
 
@@ -1671,7 +1672,7 @@ mod tests {
         let response = agent.turn("fix this rust code").await.unwrap();
 
         assert!(response.contains("compiles cleanly"));
-        assert_eq!(models.lock().clone(), vec!["ollama/*".to_string()]);
+        assert_eq!(models.lock().clone(), vec!["openai/model-mini".to_string()]);
     }
 
     #[cfg(feature = "llm-router")]
@@ -1688,7 +1689,7 @@ mod tests {
         let response = agent.turn("hello").await.unwrap();
 
         assert!(response.contains("not sure"));
-        assert_eq!(models.lock().clone(), vec!["ollama/*".to_string()]);
+        assert_eq!(models.lock().clone(), vec!["openai/model-mini".to_string()]);
     }
 
     #[cfg(feature = "llm-router")]
@@ -1741,7 +1742,7 @@ mod tests {
         assert_eq!(response, "I'm not sure, maybe this is the answer.");
         assert_eq!(
             models.lock().clone(),
-            vec!["ollama/*".to_string(), "openai/model-premium".to_string()]
+            vec!["openai/model-mini".to_string(), "openai/model-premium".to_string()]
         );
 
         let prefix = format!("router/cost/{}/", chrono::Utc::now().format("%Y-%m-%d"));
@@ -1756,7 +1757,7 @@ mod tests {
             .find(|entry| entry.key.starts_with(&prefix))
             .expect("cost entry");
         let event: RouterCostEvent = serde_json::from_str(&entry.content).unwrap();
-        assert_eq!(event.primary_model, "ollama/*");
+        assert_eq!(event.primary_model, "openai/model-mini");
         assert!(!event.escalated);
         assert!(event.escalation_failed);
     }
