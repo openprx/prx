@@ -3,18 +3,23 @@ use crate::auth::AuthService;
 use crate::providers::traits::{ChatMessage, Provider};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are OpenPRX, a concise and helpful coding assistant.";
+const DEFAULT_CODEX_STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
+const MAX_CODEX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct OpenAiCodexProvider {
     auth: AuthService,
     auth_profile_override: Option<String>,
     client: Client,
+    stream_idle_timeout: Duration,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,6 +102,7 @@ impl OpenAiCodexProvider {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+            stream_idle_timeout: resolve_stream_idle_timeout(),
         }
     }
 }
@@ -118,6 +124,15 @@ fn default_openprx_dir() -> PathBuf {
             }
         },
     )
+}
+
+fn resolve_stream_idle_timeout() -> Duration {
+    let secs = std::env::var("ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|value| value.max(5))
+        .unwrap_or(DEFAULT_CODEX_STREAM_IDLE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
 
 fn first_nonempty(text: Option<&str>) -> Option<String> {
@@ -364,29 +379,122 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
     None
 }
 
-async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<String> {
-    let body = response.text().await?;
+fn contains_done_event(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .any(|line| line == "data: [DONE]" || line == "data:[DONE]")
+}
 
-    if let Some(text) = parse_sse_text(&body)? {
-        return Ok(text);
-    }
+fn normalize_content_type(value: Option<&str>) -> String {
+    first_nonempty(value)
+        .map(|raw| raw.to_ascii_lowercase())
+        .unwrap_or_else(|| "unknown".to_string())
+}
 
-    let body_trimmed = body.trim_start();
-    let looks_like_sse = body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
+fn decode_responses_payload(body: &str, content_type: Option<&str>) -> anyhow::Result<String> {
+    let normalized_content_type = normalize_content_type(content_type);
+    let trimmed = body.trim_start();
+    let looks_like_sse = normalized_content_type.contains("text/event-stream")
+        || trimmed.starts_with("event:")
+        || trimmed.starts_with("data:");
+    let looks_like_json = normalized_content_type.contains("application/json")
+        || trimmed.starts_with('{')
+        || trimmed.starts_with('[');
+
     if looks_like_sse {
-        return Err(anyhow::anyhow!(
-            "No response from OpenAI Codex stream payload: {}",
-            super::sanitize_api_error(&body)
-        ));
+        if let Some(text) = parse_sse_text(body)? {
+            return Ok(text);
+        }
     }
 
-    let parsed: ResponsesResponse = serde_json::from_str(&body).map_err(|err| {
-        anyhow::anyhow!(
-            "OpenAI Codex JSON parse failed: {err}. Payload: {}",
-            super::sanitize_api_error(&body)
-        )
-    })?;
-    extract_responses_text(&parsed).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
+    if looks_like_json {
+        let parsed: ResponsesResponse = serde_json::from_str(body).map_err(|err| {
+            anyhow::anyhow!(
+                "OpenAI Codex provider_response_parse_error kind=malformed_json content_type={} detail={}",
+                normalized_content_type,
+                super::sanitize_api_error(&err.to_string())
+            )
+        })?;
+        if let Some(text) = extract_responses_text(&parsed) {
+            return Ok(text);
+        }
+    }
+
+    // Keep tolerant fallback order for mislabelled Content-Type.
+    if !looks_like_sse {
+        if let Some(text) = parse_sse_text(body)? {
+            return Ok(text);
+        }
+    }
+    if !looks_like_json {
+        if let Ok(parsed) = serde_json::from_str::<ResponsesResponse>(body) {
+            if let Some(text) = extract_responses_text(&parsed) {
+                return Ok(text);
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "OpenAI Codex provider_response_parse_error kind=empty_or_unsupported_payload content_type={} body_len={}",
+        normalized_content_type,
+        body.len()
+    ))
+}
+
+async fn decode_responses_body(response: reqwest::Response, idle_timeout: Duration) -> anyhow::Result<String> {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let normalized_content_type = normalize_content_type(content_type.as_deref());
+    let is_sse = normalized_content_type.contains("text/event-stream");
+
+    let mut stream = response.bytes_stream();
+    let mut body_bytes = Vec::new();
+
+    loop {
+        let next = tokio::time::timeout(idle_timeout, stream.next())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "OpenAI Codex provider_response_timeout kind=stream_idle_timeout timeout_ms={} content_type={}",
+                    idle_timeout.as_millis(),
+                    normalized_content_type
+                )
+            })?;
+
+        match next {
+            Some(Ok(chunk)) => {
+                body_bytes.extend_from_slice(&chunk);
+                if body_bytes.len() > MAX_CODEX_RESPONSE_BYTES {
+                    anyhow::bail!(
+                        "OpenAI Codex provider_response_parse_error kind=payload_too_large content_type={} body_len={}",
+                        normalized_content_type,
+                        body_bytes.len()
+                    );
+                }
+
+                if is_sse {
+                    let current = String::from_utf8_lossy(&body_bytes);
+                    if contains_done_event(&current) {
+                        break;
+                    }
+                }
+            }
+            Some(Err(err)) => {
+                anyhow::bail!(
+                    "OpenAI Codex provider_response_parse_error kind=body_read_failed content_type={} detail={}",
+                    normalized_content_type,
+                    super::sanitize_api_error(&err.to_string())
+                );
+            }
+            None => break,
+        }
+    }
+
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
+    decode_responses_payload(&body, content_type.as_deref())
 }
 
 impl OpenAiCodexProvider {
@@ -444,6 +552,7 @@ impl OpenAiCodexProvider {
             .header("OpenAI-Beta", "responses=experimental")
             .header("originator", "pi")
             .header("accept", "text/event-stream")
+            .header("accept-encoding", "identity")
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
@@ -453,7 +562,7 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        decode_responses_body(response).await
+        decode_responses_body(response, self.stream_idle_timeout).await
     }
 }
 
@@ -666,5 +775,34 @@ data: [DONE]
         assert_eq!(input.len(), 1);
         let json = serde_json::to_value(&input[0]).unwrap();
         assert_eq!(json["role"], "user");
+    }
+
+    #[test]
+    fn decode_payload_malformed_json_returns_structured_error() {
+        let err = decode_responses_payload("{not-json", Some("application/json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider_response_parse_error"));
+        assert!(err.contains("kind=malformed_json"));
+    }
+
+    #[test]
+    fn decode_payload_unexpected_content_type_still_parses_json() {
+        let body = r#"{"output_text":"hello"}"#;
+        let text = decode_responses_payload(body, Some("text/plain")).unwrap();
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn decode_payload_fallback_error_does_not_leak_protocol_labels() {
+        let body = r#"data: {"type":"response.output_text.delta","delta":""}
+data: {"type":"response.completed","response":{"output":[]}}
+data: [DONE]
+"#;
+        let err = decode_responses_payload(body, Some("text/event-stream"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider_response_parse_error"));
+        assert!(!err.contains("response.output_text.delta"));
     }
 }

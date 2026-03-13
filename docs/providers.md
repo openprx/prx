@@ -28,3 +28,8 @@ OpenPRX supports 14 LLM providers with automatic fallback chains, model routing,
 - **Rate limiting**: Per-provider rate limit handling with backoff
 - **HTTP/1.1 mode**: Configurable per-provider for compatibility (e.g. DashScope)
 - **Custom User-Agent**: Per-provider UA header configuration
+
+## OpenAI Codex Notes
+
+- OpenAI Codex response parsing now fails fast with structured errors for malformed/unexpected payloads (`provider_response_parse_error`), instead of waiting on long tail body decode.
+- Stream idle timeout is controlled by `ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS` (default: `45` seconds, minimum: `5` seconds).
