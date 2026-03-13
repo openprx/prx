@@ -62,6 +62,9 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
     {
         return true;
     }
+    if msg_lower.contains("provider_response_parse_error") {
+        return true;
+    }
 
     msg_lower.contains("model")
         && (msg_lower.contains("not found")
