@@ -1462,6 +1462,8 @@ async fn run_sub_agent_task(
                 max_iterations,
                 2,
                 30,
+                false,
+                vec!["sessions_spawn".to_string(), "delegate".to_string(), "cron_run".to_string()],
                 Some(&compaction_config_owned),
                 Some(cancel_token_owned),
                 None, // no streaming sender

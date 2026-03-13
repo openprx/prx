@@ -13,7 +13,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
@@ -1130,6 +1130,38 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+static TOOL_BARRIERS: LazyLock<std::sync::Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn tool_barrier_key(name: &str) -> Option<&'static str> {
+    match name {
+        // Workspace mutations / command execution.
+        "file_write" | "shell" | "git_operations" => Some("workspace_write"),
+        // Shared runtime configuration / scheduler state.
+        "config_reload" | "cron" | "cron_add" | "cron_update" | "cron_remove" | "cron_run"
+        | "schedule" | "proxy_config" => Some("runtime_config"),
+        // Shared long-term memory writes.
+        "memory_store" | "memory_forget" => Some("memory_write"),
+        // Background session lifecycle operations.
+        "sessions_spawn" | "sessions_send" | "delegate" | "subagents" => Some("session_lifecycle"),
+        _ => None,
+    }
+}
+
+async fn acquire_tool_barrier(key: &'static str) -> tokio::sync::OwnedMutexGuard<()> {
+    let barrier = {
+        let mut barriers = TOOL_BARRIERS
+            .lock()
+            .expect("tool barrier registry mutex should not be poisoned");
+        barriers
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+
+    barrier.lock_owned().await
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -1148,6 +1180,8 @@ pub(crate) async fn agent_turn(
     max_tool_iterations: usize,
     read_only_tool_concurrency_window: usize,
     read_only_tool_timeout_secs: u64,
+    priority_scheduling_enabled: bool,
+    low_priority_tool_names: Vec<String>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -1165,6 +1199,8 @@ pub(crate) async fn agent_turn(
         max_tool_iterations,
         read_only_tool_concurrency_window,
         read_only_tool_timeout_secs,
+        priority_scheduling_enabled,
+        low_priority_tool_names,
         None,
         None,
         None,
@@ -1211,6 +1247,12 @@ async fn execute_one_tool(
         );
     }
 
+    let _barrier_guard = if let Some(key) = tool_barrier_key(call_name) {
+        Some(acquire_tool_barrier(key).await)
+    } else {
+        None
+    };
+
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
     });
@@ -1254,10 +1296,12 @@ async fn execute_one_tool(
 /// - only known read-only tools can run concurrently;
 /// - all stateful tools execute strictly serially;
 /// - read-only batches use a bounded concurrency window and timeout guard.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ReadOnlyToolScheduleConfig {
     concurrency_window: usize,
     timeout_secs: u64,
+    priority_enabled: bool,
+    low_priority_tool_names: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1271,6 +1315,20 @@ fn classify_tool_call(name: &str) -> ToolSchedulingClass {
         ToolSchedulingClass::ReadOnly
     } else {
         ToolSchedulingClass::Stateful
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolPriority {
+    High,
+    Low,
+}
+
+fn classify_tool_priority(name: &str, schedule: &ReadOnlyToolScheduleConfig) -> ToolPriority {
+    if schedule.priority_enabled && schedule.low_priority_tool_names.contains(name) {
+        ToolPriority::Low
+    } else {
+        ToolPriority::High
     }
 }
 
@@ -1448,21 +1506,48 @@ async fn execute_tools_with_policy(
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
 ) -> Result<Vec<String>> {
-    let mut results = Vec::with_capacity(tool_calls.len());
-    let mut index = 0;
+    let mut ordered_indices = Vec::with_capacity(tool_calls.len());
+    if schedule.priority_enabled {
+        ordered_indices.extend(
+            tool_calls
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, call)| {
+                    (classify_tool_priority(&call.name, &schedule) == ToolPriority::High)
+                        .then_some(idx)
+                }),
+        );
+        ordered_indices.extend(
+            tool_calls
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, call)| {
+                    (classify_tool_priority(&call.name, &schedule) == ToolPriority::Low)
+                        .then_some(idx)
+                }),
+        );
+    } else {
+        ordered_indices.extend(0..tool_calls.len());
+    }
 
-    while index < tool_calls.len() {
+    let mut results_by_original = vec![String::new(); tool_calls.len()];
+    let mut cursor = 0;
+
+    while cursor < ordered_indices.len() {
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
             return Err(ToolLoopCancelled.into());
         }
 
+        let index = ordered_indices[cursor];
         let call = &tool_calls[index];
         let approval_required = approval.is_some_and(|mgr| mgr.needs_approval(&call.name));
+
         if classify_tool_call(&call.name) == ToolSchedulingClass::ReadOnly && !approval_required {
-            let batch_start = index;
-            let mut batch_end = index + 1;
-            while batch_end < tool_calls.len() {
-                let next_call = &tool_calls[batch_end];
+            let batch_start = cursor;
+            let mut batch_end = cursor + 1;
+            while batch_end < ordered_indices.len() {
+                let next_index = ordered_indices[batch_end];
+                let next_call = &tool_calls[next_index];
                 let next_approval = approval.is_some_and(|mgr| mgr.needs_approval(&next_call.name));
                 if classify_tool_call(&next_call.name) != ToolSchedulingClass::ReadOnly
                     || next_approval
@@ -1472,17 +1557,24 @@ async fn execute_tools_with_policy(
                 batch_end += 1;
             }
 
-            let mut batch_results = execute_read_only_batch(
-                &tool_calls[batch_start..batch_end],
+            let batch_calls: Vec<ParsedToolCall> = ordered_indices[batch_start..batch_end]
+                .iter()
+                .map(|idx| tool_calls[*idx].clone())
+                .collect();
+            let batch_results = execute_read_only_batch(
+                &batch_calls,
                 tools_registry,
                 observer,
-                schedule,
+                schedule.clone(),
                 cancellation_token,
                 scope_ctx,
             )
             .await?;
-            results.append(&mut batch_results);
-            index = batch_end;
+            for (offset, result) in batch_results.into_iter().enumerate() {
+                let original_index = ordered_indices[batch_start + offset];
+                results_by_original[original_index] = result;
+            }
+            cursor = batch_end;
             continue;
         }
 
@@ -1496,11 +1588,11 @@ async fn execute_tools_with_policy(
             scope_ctx,
         )
         .await?;
-        results.push(result);
-        index += 1;
+        results_by_original[index] = result;
+        cursor += 1;
     }
 
-    Ok(results)
+    Ok(results_by_original)
 }
 
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
@@ -1537,6 +1629,8 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     read_only_tool_concurrency_window: usize,
     read_only_tool_timeout_secs: u64,
+    priority_scheduling_enabled: bool,
+    low_priority_tool_names: Vec<String>,
     compaction_config: Option<&crate::config::AgentCompactionConfig>,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
@@ -1555,6 +1649,8 @@ pub(crate) async fn run_tool_call_loop(
     let read_only_schedule = ReadOnlyToolScheduleConfig {
         concurrency_window: read_only_tool_concurrency_window.max(1),
         timeout_secs: read_only_tool_timeout_secs.max(1),
+        priority_enabled: priority_scheduling_enabled,
+        low_priority_tool_names: low_priority_tool_names.into_iter().collect(),
     };
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
@@ -1794,7 +1890,7 @@ pub(crate) async fn run_tool_call_loop(
             observer,
             approval,
             channel_name,
-            read_only_schedule,
+            read_only_schedule.clone(),
             cancellation_token.as_ref(),
             scope_ctx,
         )
@@ -2195,6 +2291,8 @@ pub async fn run(
             config.agent.max_tool_iterations,
             config.agent.read_only_tool_concurrency_window,
             config.agent.read_only_tool_timeout_secs,
+            config.agent.priority_scheduling_enabled,
+            config.agent.low_priority_tools.clone(),
             Some(&config.agent.compaction),
             None,
             None,
@@ -2367,6 +2465,8 @@ pub async fn run(
                 config.agent.max_tool_iterations,
                 config.agent.read_only_tool_concurrency_window,
                 config.agent.read_only_tool_timeout_secs,
+                config.agent.priority_scheduling_enabled,
+                config.agent.low_priority_tools.clone(),
                 Some(&config.agent.compaction),
                 None,
                 None,
@@ -2626,6 +2726,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.agent.max_tool_iterations,
         config.agent.read_only_tool_concurrency_window,
         config.agent.read_only_tool_timeout_secs,
+        config.agent.priority_scheduling_enabled,
+        config.agent.low_priority_tools.clone(),
     )
     .await?;
     increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
@@ -2884,6 +2986,8 @@ mod tests {
             3,
             2,
             30,
+            false,
+            Vec::new(),
             None,
             None,
             None,
@@ -2933,6 +3037,8 @@ mod tests {
             3,
             2,
             30,
+            false,
+            Vec::new(),
             None,
             None,
             None,
@@ -2976,6 +3082,8 @@ mod tests {
             3,
             2,
             30,
+            false,
+            Vec::new(),
             None,
             None,
             None,
@@ -2986,6 +3094,41 @@ mod tests {
 
         assert_eq!(result, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct RecordingTool {
+        name: String,
+        execution_order: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for RecordingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Records execution order"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.execution_order
+                .lock()
+                .expect("execution order lock should be valid")
+                .push(self.name.clone());
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: self.name.clone(),
+                error: None,
+            })
+        }
     }
 
     #[test]
@@ -3067,6 +3210,8 @@ mod tests {
             4,
             2,
             30,
+            false,
+            Vec::new(),
             None,
             None,
             None,
@@ -3162,6 +3307,8 @@ mod tests {
             4,
             2,
             30,
+            false,
+            Vec::new(),
             None,
             None,
             None,
@@ -3180,6 +3327,93 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             1,
             "stateful tools should never overlap in execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tools_with_policy_prioritizes_foreground_tools() {
+        let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(RecordingTool {
+                name: "sessions_spawn".to_string(),
+                execution_order: Arc::clone(&execution_order),
+            }),
+            Box::new(RecordingTool {
+                name: "file_read".to_string(),
+                execution_order: Arc::clone(&execution_order),
+            }),
+        ];
+
+        let calls = vec![
+            ParsedToolCall {
+                name: "sessions_spawn".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        let results = execute_tools_with_policy(
+            &calls,
+            &tools_registry,
+            &NoopObserver,
+            None,
+            "cli",
+            ReadOnlyToolScheduleConfig {
+                concurrency_window: 2,
+                timeout_secs: 30,
+                priority_enabled: true,
+                low_priority_tool_names: ["sessions_spawn".to_string()].into_iter().collect(),
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("priority scheduling should execute successfully");
+
+        assert_eq!(results, vec!["sessions_spawn", "file_read"]);
+        let observed_order = execution_order
+            .lock()
+            .expect("execution order lock should be valid")
+            .clone();
+        assert_eq!(observed_order, vec!["file_read", "sessions_spawn"]);
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_applies_barrier_for_shared_resource_tools() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "file_write",
+            120,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let first = execute_one_tool(
+            "file_write",
+            serde_json::json!({"value":"A"}),
+            &tools_registry,
+            &NoopObserver,
+            None,
+            None,
+        );
+        let second = execute_one_tool(
+            "file_write",
+            serde_json::json!({"value":"B"}),
+            &tools_registry,
+            &NoopObserver,
+            None,
+            None,
+        );
+
+        let (_a, _b) = tokio::join!(first, second);
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "barrier should serialize concurrent file_write calls"
         );
     }
 

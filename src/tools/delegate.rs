@@ -486,6 +486,8 @@ impl DelegateTool {
                 agent_config.max_iterations,
                 2,
                 30,
+                false,
+                vec!["sessions_spawn".to_string(), "delegate".to_string(), "cron_run".to_string()],
                 Some(&self.compaction_config),
                 None,
                 None,

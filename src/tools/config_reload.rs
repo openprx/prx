@@ -2,7 +2,9 @@
 //!
 //! Hot-reloadable fields (take effect immediately):
 //!   - `default_temperature`
-//!   - `agent.*` (max_tool_iterations, max_history_messages, parallel_tools, compact_context)
+//!   - `agent.*` (max_tool_iterations, max_history_messages, parallel_tools,
+//!     compact_context, read_only_tool_concurrency_window,
+//!     read_only_tool_timeout_secs, priority_scheduling_enabled, low_priority_tools)
 //!   - `heartbeat.enabled`, `heartbeat.interval_minutes`
 //!   - `cron.enabled`, `cron.max_run_history`
 //!   - `web_search.enabled`, `web_search.max_results`
@@ -42,7 +44,7 @@ impl Tool for ConfigReloadTool {
 
     fn description(&self) -> &str {
         "Reload configuration from config.toml without restarting the daemon. \
-         Hot-reloads: temperature, agent settings (max iterations, history), \
+         Hot-reloads: temperature, agent settings (max iterations/history, concurrency, priority), \
          heartbeat, cron, and web_search settings. \
          Provider, model, channels, memory, and security require a full restart."
     }
@@ -136,6 +138,33 @@ impl Tool for ConfigReloadTool {
                 changes.push(format!(
                     "agent.compact_context: {} → {}",
                     old.agent.compact_context, fresh.agent.compact_context
+                ));
+            }
+            if old.agent.read_only_tool_concurrency_window
+                != fresh.agent.read_only_tool_concurrency_window
+            {
+                changes.push(format!(
+                    "agent.read_only_tool_concurrency_window: {} → {}",
+                    old.agent.read_only_tool_concurrency_window,
+                    fresh.agent.read_only_tool_concurrency_window
+                ));
+            }
+            if old.agent.read_only_tool_timeout_secs != fresh.agent.read_only_tool_timeout_secs {
+                changes.push(format!(
+                    "agent.read_only_tool_timeout_secs: {} → {}",
+                    old.agent.read_only_tool_timeout_secs, fresh.agent.read_only_tool_timeout_secs
+                ));
+            }
+            if old.agent.priority_scheduling_enabled != fresh.agent.priority_scheduling_enabled {
+                changes.push(format!(
+                    "agent.priority_scheduling_enabled: {} → {}",
+                    old.agent.priority_scheduling_enabled, fresh.agent.priority_scheduling_enabled
+                ));
+            }
+            if old.agent.low_priority_tools != fresh.agent.low_priority_tools {
+                changes.push(format!(
+                    "agent.low_priority_tools: {:?} → {:?}",
+                    old.agent.low_priority_tools, fresh.agent.low_priority_tools
                 ));
             }
 

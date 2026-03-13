@@ -199,6 +199,8 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
             manifest.max_iterations.max(1),
             config.agent.read_only_tool_concurrency_window,
             config.agent.read_only_tool_timeout_secs,
+            config.agent.priority_scheduling_enabled,
+            config.agent.low_priority_tools.clone(),
             manifest.compaction_config.as_ref(),
             None,
             None,
