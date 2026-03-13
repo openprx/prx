@@ -1,6 +1,7 @@
 use crate::config::Config;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
@@ -321,6 +322,39 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+    let route_providers: HashSet<String> = config
+        .model_routes
+        .iter()
+        .map(|route| route.provider.trim().to_string())
+        .filter(|provider| !provider.is_empty())
+        .collect();
+    for (source_model, fallback_chain) in &config.reliability.model_fallbacks {
+        if fallback_chain.is_empty() {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "model_fallbacks entry \"{source_model}\" has an empty fallback chain; it will never take effect"
+                ),
+            ));
+            continue;
+        }
+
+        for fallback_model in fallback_chain {
+            if !model_has_reachable_provider(
+                config.default_provider.as_deref().unwrap_or("openrouter"),
+                &config.reliability.fallback_providers,
+                &route_providers,
+                fallback_model,
+            ) {
+                items.push(DiagItem::warn(
+                    cat,
+                    format!(
+                        "model_fallbacks route mismatch: fallback model \"{fallback_model}\" has no compatible provider in default/fallback/model_routes"
+                    ),
+                ));
+            }
+        }
+    }
 
     let availability = crate::providers::summarize_provider_availability(
         config.default_provider.as_deref().unwrap_or("openrouter"),
@@ -486,6 +520,26 @@ fn provider_validation_error(name: &str) -> Option<String> {
                 .into(),
         ),
     }
+}
+
+fn model_has_reachable_provider(
+    default_provider: &str,
+    fallback_providers: &[String],
+    route_providers: &HashSet<String>,
+    model: &str,
+) -> bool {
+    if crate::providers::provider_matches_model_prefix(default_provider, model) {
+        return true;
+    }
+    if fallback_providers
+        .iter()
+        .any(|provider| crate::providers::provider_matches_model_prefix(provider, model))
+    {
+        return true;
+    }
+    route_providers
+        .iter()
+        .any(|provider| crate::providers::provider_matches_model_prefix(provider, model))
 }
 
 fn embedding_provider_validation_error(name: &str) -> Option<String> {
@@ -1008,6 +1062,25 @@ mod tests {
         });
         assert!(degraded.is_some());
         assert_eq!(degraded.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_model_fallback_route_mismatch() {
+        let mut config = Config::default();
+        config.default_provider = Some("openai".into());
+        config.reliability.model_fallbacks.insert(
+            "openai/gpt-4o".into(),
+            vec!["anthropic/claude-sonnet-4-20250514".into()],
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let mismatch = items
+            .iter()
+            .find(|item| item.message.contains("model_fallbacks route mismatch"));
+        assert!(mismatch.is_some());
+        assert_eq!(mismatch.unwrap().severity, Severity::Warn);
     }
 
     #[test]

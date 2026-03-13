@@ -153,9 +153,8 @@ impl Provider for RouterProvider {
 
     fn supports_native_tools(&self) -> bool {
         self.providers
-            .get(self.default_index)
-            .map(|(_, p)| p.supports_native_tools())
-            .unwrap_or(false)
+            .iter()
+            .any(|(_, provider)| provider.supports_native_tools())
     }
 
     fn supports_vision(&self) -> bool {
@@ -217,6 +216,27 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_model.lock() = model.to_string();
             Ok(self.response.to_string())
+        }
+    }
+
+    struct NativeCapabilityMock {
+        native_tools: bool,
+    }
+
+    #[async_trait]
+    impl Provider for NativeCapabilityMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            self.native_tools
         }
     }
 
@@ -460,5 +480,27 @@ mod tests {
         assert_eq!(mocks[1].call_count(), 1);
         assert_eq!(mocks[1].last_model(), "claude-opus");
         assert_eq!(mocks[0].call_count(), 0);
+    }
+
+    #[test]
+    fn supports_native_tools_is_true_if_any_routed_provider_supports_it() {
+        let router = RouterProvider::new(
+            vec![
+                (
+                    "default".into(),
+                    Box::new(NativeCapabilityMock {
+                        native_tools: false,
+                    }) as Box<dyn Provider>,
+                ),
+                (
+                    "alternate".into(),
+                    Box::new(NativeCapabilityMock { native_tools: true }) as Box<dyn Provider>,
+                ),
+            ],
+            vec![],
+            "model".into(),
+        );
+
+        assert!(router.supports_native_tools());
     }
 }
