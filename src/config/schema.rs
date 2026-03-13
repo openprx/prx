@@ -745,6 +745,13 @@ pub struct AgentConfig {
     /// Defaults to 30s to preserve existing scheduler behavior.
     #[serde(default = "default_read_only_tool_timeout_secs")]
     pub read_only_tool_timeout_secs: u64,
+    /// Enables priority scheduling so foreground tool calls run before background batches.
+    /// Defaults to false to preserve existing scheduler behavior.
+    #[serde(default)]
+    pub priority_scheduling_enabled: bool,
+    /// Tool names treated as low-priority when `priority_scheduling_enabled = true`.
+    #[serde(default = "default_agent_low_priority_tools")]
+    pub low_priority_tools: Vec<String>,
     /// Context compaction controls (`[agent.compaction]`).
     #[serde(default)]
     pub compaction: AgentCompactionConfig,
@@ -910,6 +917,13 @@ fn default_read_only_tool_timeout_secs() -> u64 {
     30
 }
 
+fn default_agent_low_priority_tools() -> Vec<String> {
+    vec!["sessions_spawn", "delegate", "cron_run"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 fn default_agent_compaction_reserve_tokens() -> usize {
     4096
 }
@@ -932,6 +946,8 @@ impl Default for AgentConfig {
             tool_dispatcher: default_agent_tool_dispatcher(),
             read_only_tool_concurrency_window: default_read_only_tool_concurrency_window(),
             read_only_tool_timeout_secs: default_read_only_tool_timeout_secs(),
+            priority_scheduling_enabled: false,
+            low_priority_tools: default_agent_low_priority_tools(),
             compaction: AgentCompactionConfig::default(),
         }
     }
@@ -4844,6 +4860,10 @@ impl Config {
                 }
             }
         }
+        if let Ok(enabled) = env_openprx_or_openprx("PRIORITY_SCHEDULING_ENABLED") {
+            self.agent.priority_scheduling_enabled =
+                enabled == "1" || enabled.eq_ignore_ascii_case("true");
+        }
 
         // Reasoning override: ZEROCLAW_REASONING_ENABLED or REASONING_ENABLED
         if let Ok(flag) = env_openprx_or_openprx("REASONING_ENABLED")
@@ -5587,6 +5607,8 @@ reasoning_enabled = false
         assert_eq!(cfg.tool_dispatcher, "auto");
         assert_eq!(cfg.read_only_tool_concurrency_window, 2);
         assert_eq!(cfg.read_only_tool_timeout_secs, 30);
+        assert!(!cfg.priority_scheduling_enabled);
+        assert_eq!(cfg.low_priority_tools, default_agent_low_priority_tools());
     }
 
     #[test]
@@ -5601,6 +5623,8 @@ parallel_tools = true
 tool_dispatcher = "xml"
 read_only_tool_concurrency_window = 4
 read_only_tool_timeout_secs = 45
+priority_scheduling_enabled = true
+low_priority_tools = ["sessions_spawn", "delegate"]
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
@@ -5610,6 +5634,8 @@ read_only_tool_timeout_secs = 45
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
         assert_eq!(parsed.agent.read_only_tool_concurrency_window, 4);
         assert_eq!(parsed.agent.read_only_tool_timeout_secs, 45);
+        assert!(parsed.agent.priority_scheduling_enabled);
+        assert_eq!(parsed.agent.low_priority_tools, vec!["sessions_spawn", "delegate"]);
     }
 
     #[tokio::test]

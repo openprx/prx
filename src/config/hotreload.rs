@@ -233,6 +233,30 @@ fn log_diff(old: &Config, fresh: &Config) {
             old.agent.max_history_messages, fresh.agent.max_history_messages
         ));
     }
+    if old.agent.read_only_tool_concurrency_window != fresh.agent.read_only_tool_concurrency_window {
+        changes.push(format!(
+            "agent.read_only_tool_concurrency_window: {} → {}",
+            old.agent.read_only_tool_concurrency_window, fresh.agent.read_only_tool_concurrency_window
+        ));
+    }
+    if old.agent.read_only_tool_timeout_secs != fresh.agent.read_only_tool_timeout_secs {
+        changes.push(format!(
+            "agent.read_only_tool_timeout_secs: {} → {}",
+            old.agent.read_only_tool_timeout_secs, fresh.agent.read_only_tool_timeout_secs
+        ));
+    }
+    if old.agent.priority_scheduling_enabled != fresh.agent.priority_scheduling_enabled {
+        changes.push(format!(
+            "agent.priority_scheduling_enabled: {} → {}",
+            old.agent.priority_scheduling_enabled, fresh.agent.priority_scheduling_enabled
+        ));
+    }
+    if old.agent.low_priority_tools != fresh.agent.low_priority_tools {
+        changes.push(format!(
+            "agent.low_priority_tools: {:?} → {:?}",
+            old.agent.low_priority_tools, fresh.agent.low_priority_tools
+        ));
+    }
     if old.heartbeat.enabled != fresh.heartbeat.enabled {
         changes.push(format!(
             "heartbeat.enabled: {} → {}",

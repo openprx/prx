@@ -51,6 +51,10 @@ compact_context = true
 read_only_tool_concurrency_window = 2
 # Per read-only tool timeout in seconds (default: 30)
 read_only_tool_timeout_secs = 30
+# Enable priority scheduling so foreground tools run before background batches.
+priority_scheduling_enabled = false
+# Optional list of low-priority/background tools.
+low_priority_tools = ["sessions_spawn", "delegate", "cron_run"]
 
 [subagent_governance]
 max_concurrent_subagents = 4

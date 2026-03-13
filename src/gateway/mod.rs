@@ -1100,6 +1100,8 @@ async fn run_gateway_chat_with_multimodal(
         max_tool_iterations,
         2,
         30,
+        false,
+        Vec::new(),
         None,
         None, // no cancellation token
         None, // no streaming delta sender
