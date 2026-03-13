@@ -1654,7 +1654,10 @@ mod tests {
         assert_eq!(response, "This is the premium answer.");
         assert_eq!(
             models.lock().clone(),
-            vec!["openai/model-mini".to_string(), "openai/model-premium".to_string()]
+            vec![
+                "openai/model-mini".to_string(),
+                "openai/model-premium".to_string()
+            ]
         );
     }
 
@@ -1742,7 +1745,10 @@ mod tests {
         assert_eq!(response, "I'm not sure, maybe this is the answer.");
         assert_eq!(
             models.lock().clone(),
-            vec!["openai/model-mini".to_string(), "openai/model-premium".to_string()]
+            vec![
+                "openai/model-mini".to_string(),
+                "openai/model-premium".to_string()
+            ]
         );
 
         let prefix = format!("router/cost/{}/", chrono::Utc::now().format("%Y-%m-%d"));

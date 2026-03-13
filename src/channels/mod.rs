@@ -1440,7 +1440,8 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
-    strip_isolated_tool_json_artifacts(response, &known_tool_names)
+    let cleaned_tags = strip_isolated_tool_tag_artifacts(response, &known_tool_names);
+    strip_isolated_tool_json_artifacts(&cleaned_tags, &known_tool_names)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1803,6 +1804,126 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
         };
         cleaned.push(ch);
         cursor = start + ch.len_utf8();
+    }
+
+    let mut result = cleaned.replace("\r\n", "\n");
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+    result.trim().to_string()
+}
+
+fn tool_call_close_tag_for_name(name: &str) -> Option<&'static str> {
+    match name {
+        "tool_call" => Some("</tool_call>"),
+        "toolcall" => Some("</toolcall>"),
+        "tool-call" => Some("</tool-call>"),
+        "tool_use" => Some("</tool_use>"),
+        "invoke" => Some("</invoke>"),
+        _ => None,
+    }
+}
+
+fn parse_tool_call_open_tag(tag: &str) -> Option<&'static str> {
+    if !(tag.starts_with('<') && tag.ends_with('>')) {
+        return None;
+    }
+
+    let mut inner = tag[1..tag.len() - 1].trim_start();
+    if inner.starts_with('/') {
+        return None;
+    }
+    if inner.ends_with('/') {
+        inner = inner[..inner.len().saturating_sub(1)].trim_end();
+    }
+
+    let name = inner
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    tool_call_close_tag_for_name(&name)
+}
+
+fn find_first_tool_call_open_tag(haystack: &str) -> Option<(usize, usize, &'static str)> {
+    let mut search_from = 0usize;
+    while search_from < haystack.len() {
+        let rel_lt = haystack[search_from..].find('<')?;
+        let start = search_from + rel_lt;
+        let rel_gt = haystack[start..].find('>')?;
+        let end_exclusive = start + rel_gt + 1;
+        let tag = &haystack[start..end_exclusive];
+        if let Some(close_tag) = parse_tool_call_open_tag(tag) {
+            return Some((start, end_exclusive, close_tag));
+        }
+        search_from = end_exclusive;
+    }
+    None
+}
+
+fn parse_first_json_value(input: &str) -> Option<serde_json::Value> {
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(value);
+    }
+
+    for (byte_idx, ch) in trimmed.char_indices() {
+        if ch != '{' && ch != '[' {
+            continue;
+        }
+        let slice = &trimmed[byte_idx..];
+        let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+        if let Some(Ok(value)) = stream.next() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn strip_isolated_tool_tag_artifacts(message: &str, known_tool_names: &HashSet<String>) -> String {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut cursor = 0usize;
+
+    while cursor < message.len() {
+        let Some((start_rel, open_end_rel, close_tag)) =
+            find_first_tool_call_open_tag(&message[cursor..])
+        else {
+            cleaned.push_str(&message[cursor..]);
+            break;
+        };
+
+        let start = cursor + start_rel;
+        let open_end = cursor + open_end_rel;
+        cleaned.push_str(&message[cursor..start]);
+
+        let Some(close_idx_rel) = message[open_end..].find(close_tag) else {
+            cleaned.push_str(&message[start..]);
+            break;
+        };
+        let close_start = open_end + close_idx_rel;
+        let close_end = close_start + close_tag.len();
+        let inner = &message[open_end..close_start];
+
+        let should_strip = if is_line_isolated_json_segment(message, start, close_end) {
+            parse_first_json_value(inner)
+                .as_ref()
+                .is_some_and(|value| is_tool_call_payload(value, known_tool_names))
+        } else {
+            false
+        };
+
+        if should_strip {
+            cursor = close_end;
+            continue;
+        }
+
+        cleaned.push_str(&message[start..close_end]);
+        cursor = close_end;
     }
 
     let mut result = cleaned.replace("\r\n", "\n");
@@ -7078,6 +7199,32 @@ This is an example JSON object for profile settings."#;
 
         let result = strip_isolated_tool_json_artifacts(input, &known_tools);
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn strip_isolated_tool_tag_artifacts_removes_tool_call_blocks() {
+        let mut known_tools = HashSet::new();
+        known_tools.insert("shell".to_string());
+
+        let input = r#"Before
+<tool_call mode="json">
+{"name":"shell","arguments":{"command":"date"}}
+</tool_call>
+After"#;
+
+        let result = strip_isolated_tool_tag_artifacts(input, &known_tools);
+        assert_eq!(result, "Before\n\nAfter");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_isolated_tool_tag_artifacts() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let input = r#"<tool_call name="mock_price">
+{"name":"mock_price","arguments":{"symbol":"BTC"}}
+</tool_call>"#;
+
+        let result = sanitize_channel_response(input, &tools);
+        assert!(result.is_empty());
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────

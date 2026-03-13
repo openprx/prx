@@ -659,29 +659,53 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     calls
 }
 
-const TOOL_CALL_OPEN_TAGS: [&str; 5] = [
-    "<tool_call>",
-    "<toolcall>",
-    "<tool-call>",
-    "<tool_use>",
-    "<invoke>",
-];
-
-fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
-    tags.iter()
-        .filter_map(|tag| haystack.find(tag).map(|idx| (idx, *tag)))
-        .min_by_key(|(idx, _)| *idx)
-}
-
-fn matching_tool_call_close_tag(open_tag: &str) -> Option<&'static str> {
-    match open_tag {
-        "<tool_call>" => Some("</tool_call>"),
-        "<toolcall>" => Some("</toolcall>"),
-        "<tool-call>" => Some("</tool-call>"),
-        "<tool_use>" => Some("</tool_use>"),
-        "<invoke>" => Some("</invoke>"),
+fn tool_call_close_tag_for_name(name: &str) -> Option<&'static str> {
+    match name {
+        "tool_call" => Some("</tool_call>"),
+        "toolcall" => Some("</toolcall>"),
+        "tool-call" => Some("</tool-call>"),
+        "tool_use" => Some("</tool_use>"),
+        "invoke" => Some("</invoke>"),
         _ => None,
     }
+}
+
+fn parse_tool_call_open_tag(tag: &str) -> Option<&'static str> {
+    if !(tag.starts_with('<') && tag.ends_with('>')) {
+        return None;
+    }
+
+    let mut inner = tag[1..tag.len() - 1].trim_start();
+    if inner.starts_with('/') {
+        return None;
+    }
+    if inner.ends_with('/') {
+        inner = inner[..inner.len().saturating_sub(1)].trim_end();
+    }
+
+    let name = inner
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    tool_call_close_tag_for_name(&name)
+}
+
+fn find_first_tool_call_open_tag(haystack: &str) -> Option<(usize, usize, &'static str)> {
+    let mut search_from = 0usize;
+    while search_from < haystack.len() {
+        let rel_lt = haystack[search_from..].find('<')?;
+        let start = search_from + rel_lt;
+        let rel_gt = haystack[start..].find('>')?;
+        let end_exclusive = start + rel_gt + 1;
+        let tag = &haystack[start..end_exclusive];
+        if let Some(close_tag) = parse_tool_call_open_tag(tag) {
+            return Some((start, end_exclusive, close_tag));
+        }
+        search_from = end_exclusive;
+    }
+    None
 }
 
 fn extract_first_json_value_with_end(input: &str) -> Option<(serde_json::Value, usize)> {
@@ -944,18 +968,14 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     }
 
     // Fall back to XML-style tool-call tag parsing.
-    while let Some((start, open_tag)) = find_first_tag(remaining, &TOOL_CALL_OPEN_TAGS) {
+    while let Some((start, open_end, close_tag)) = find_first_tool_call_open_tag(remaining) {
         // Everything before the tag is text
         let before = &remaining[..start];
         if !before.trim().is_empty() {
             text_parts.push(before.trim().to_string());
         }
 
-        let Some(close_tag) = matching_tool_call_close_tag(open_tag) else {
-            break;
-        };
-
-        let after_open = &remaining[start + open_tag.len()..];
+        let after_open = &remaining[open_end..];
         if let Some(close_idx) = after_open.find(close_tag) {
             let inner = &after_open[..close_idx];
             let mut parsed_any = false;
@@ -4111,6 +4131,22 @@ Done."#;
         assert_eq!(
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "whoami"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tool_call_tag_with_attributes() {
+        let response = r#"<tool_call name="shell" mode="json">
+{"name": "shell", "arguments": {"command": "date"}}
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "date"
         );
     }
 

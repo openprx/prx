@@ -712,9 +712,8 @@ impl Provider for ReliableProvider {
 
     fn supports_native_tools(&self) -> bool {
         self.providers
-            .first()
-            .map(|(_, p)| p.supports_native_tools())
-            .unwrap_or(false)
+            .iter()
+            .any(|(_, provider)| provider.supports_native_tools())
     }
 
     fn supports_vision(&self) -> bool {
@@ -979,6 +978,27 @@ mod tests {
                 anyhow::bail!("500 model {} unavailable", model);
             }
             Ok(self.response.to_string())
+        }
+    }
+
+    struct NativeCapabilityMock {
+        native_tools: bool,
+    }
+
+    #[async_trait]
+    impl Provider for NativeCapabilityMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            self.native_tools
         }
     }
 
@@ -1741,6 +1761,28 @@ mod tests {
         assert!(msg.contains("Available providers"));
         assert!(msg.contains("openai"));
         assert!(msg.contains("anthropic: missing credential/api key"));
+    }
+
+    #[test]
+    fn supports_native_tools_is_true_if_any_provider_supports_it() {
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(NativeCapabilityMock {
+                        native_tools: false,
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(NativeCapabilityMock { native_tools: true }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(provider.supports_native_tools());
     }
 
     // ── Arc<ModelAwareMock> Provider impl for test ──

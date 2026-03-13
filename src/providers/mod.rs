@@ -1865,7 +1865,10 @@ fn provider_requires_explicit_credential(name: &str) -> bool {
 }
 
 fn is_openai_codex_alias(name: &str) -> bool {
-    matches!(name.trim().to_ascii_lowercase().as_str(), "openai-codex" | "openai_codex" | "codex")
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "openai-codex" | "openai_codex" | "codex"
+    )
 }
 
 fn default_openprx_state_dir() -> PathBuf {
