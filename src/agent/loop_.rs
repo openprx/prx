@@ -1109,7 +1109,7 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ParsedToolCall {
     name: String,
     arguments: serde_json::Value,
@@ -1246,106 +1246,187 @@ async fn execute_one_tool(
     }
 }
 
-fn should_execute_tools_in_parallel(
-    tool_calls: &[ParsedToolCall],
-    approval: Option<&ApprovalManager>,
-) -> bool {
-    if tool_calls.len() <= 1 {
-        return false;
+/// Fixed conservative scheduler policy:
+/// - only known read-only tools can run concurrently;
+/// - all stateful tools execute strictly serially;
+/// - read-only batches use a small concurrency window and timeout guard.
+const READ_ONLY_TOOL_CONCURRENCY_WINDOW: usize = 2;
+const READ_ONLY_TOOL_TIMEOUT_SECS: u64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSchedulingClass {
+    ReadOnly,
+    Stateful,
+}
+
+fn classify_tool_call(name: &str) -> ToolSchedulingClass {
+    if is_read_only_tool_name(name) {
+        ToolSchedulingClass::ReadOnly
+    } else {
+        ToolSchedulingClass::Stateful
+    }
+}
+
+fn is_read_only_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "file_read"
+            | "memory_get"
+            | "memory_recall"
+            | "memory_search"
+            | "web_fetch"
+            | "web_search_tool"
+            | "image_info"
+            | "session_status"
+            | "sessions_list"
+            | "sessions_history"
+            | "cron_list"
+            | "cron_runs"
+            | "agents_list"
+            | "hardware_board_info"
+            | "hardware_memory_map"
+            | "hardware_memory_read"
+    )
+}
+
+fn scope_or_pipeline_denial(
+    call: &ParsedToolCall,
+    scope_ctx: Option<&ScopeContext<'_>>,
+) -> Option<String> {
+    let ctx = scope_ctx?;
+    if !ctx
+        .policy
+        .is_tool_allowed(&call.name, ctx.sender, ctx.channel, ctx.chat_type)
+    {
+        return Some(format!(
+            "Error: Tool '{}' is not permitted for this user/channel context.",
+            call.name
+        ));
     }
 
-    if let Some(mgr) = approval {
-        if tool_calls.iter().any(|call| mgr.needs_approval(&call.name)) {
-            // Approval-gated calls must keep sequential handling so the caller can
-            // enforce CLI prompt/deny policy consistently.
-            return false;
+    if let Some(pipeline) = ctx.policy_pipeline {
+        let eval_ctx = crate::security::EvalContext {
+            channel: ctx.channel.to_string(),
+            chat_type: ctx.chat_type.to_string(),
+            sender: ctx.sender.to_string(),
+        };
+        let decision = pipeline.evaluate(&call.name, &eval_ctx);
+        if !decision.allowed {
+            return Some(format!(
+                "Error: Tool '{}' blocked by policy pipeline: {}",
+                call.name, decision.reason
+            ));
         }
     }
 
-    true
+    None
 }
 
-async fn execute_tools_parallel(
-    tool_calls: &[ParsedToolCall],
+async fn execute_tool_call_serial(
+    call: &ParsedToolCall,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    cancellation_token: Option<&CancellationToken>,
+    scope_ctx: Option<&ScopeContext<'_>>,
+) -> Result<String> {
+    if let Some(denied) = scope_or_pipeline_denial(call, scope_ctx) {
+        return Ok(denied);
+    }
+
+    if let Some(mgr) = approval {
+        if mgr.needs_approval(&call.name) {
+            let request = ApprovalRequest {
+                tool_name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            };
+
+            let decision = if channel_name == "cli" {
+                mgr.prompt_cli(&request)
+            } else {
+                ApprovalResponse::No
+            };
+
+            mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
+
+            if decision == ApprovalResponse::No {
+                return Ok("Denied by user.".to_string());
+            }
+        }
+    }
+
+    execute_one_tool(
+        &call.name,
+        call.arguments.clone(),
+        tools_registry,
+        observer,
+        cancellation_token,
+        scope_ctx,
+    )
+    .await
+}
+
+async fn execute_read_only_batch(
+    calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
 ) -> Result<Vec<String>> {
-    // Build per-call classification: blocked (scope-denied) vs executable.
-    // Blocked calls get a synthetic error result; others run concurrently.
-    enum CallKind<F> {
-        Blocked(String),
-        Run(F),
-    }
+    use futures::stream::{self, StreamExt};
+    use std::time::Duration;
 
-    let classified: Vec<CallKind<_>> = tool_calls
-        .iter()
-        .map(|call| {
-            if let Some(ctx) = scope_ctx {
-                if !ctx
-                    .policy
-                    .is_tool_allowed(&call.name, ctx.sender, ctx.channel, ctx.chat_type)
-                {
-                    return CallKind::Blocked(format!(
-                        "Error: Tool '{}' is not permitted for this user/channel context.",
-                        call.name
-                    ));
-                }
-                // Policy pipeline check (P3-1)
-                if let Some(pipeline) = ctx.policy_pipeline {
-                    let eval_ctx = crate::security::EvalContext {
-                        channel: ctx.channel.to_string(),
-                        chat_type: ctx.chat_type.to_string(),
-                        sender: ctx.sender.to_string(),
-                    };
-                    let decision = pipeline.evaluate(&call.name, &eval_ctx);
-                    if !decision.allowed {
-                        return CallKind::Blocked(format!(
-                            "Error: Tool '{}' blocked by policy pipeline: {}",
-                            call.name, decision.reason
-                        ));
-                    }
-                }
+    let timeout = Duration::from_secs(READ_ONLY_TOOL_TIMEOUT_SECS);
+    let batch_calls: Vec<ParsedToolCall> = calls.to_vec();
+
+    let mut indexed_results: Vec<(usize, String)> = stream::iter(batch_calls.into_iter().enumerate())
+        .map(|(idx, call)| async move {
+            if let Some(denied) = scope_or_pipeline_denial(&call, scope_ctx) {
+                return Ok((idx, denied));
             }
-            CallKind::Run(execute_one_tool(
+
+            let execute_future = execute_one_tool(
                 &call.name,
                 call.arguments.clone(),
                 tools_registry,
                 observer,
                 cancellation_token,
                 scope_ctx,
-            ))
+            );
+
+            let bounded = async {
+                match tokio::time::timeout(timeout, execute_future).await {
+                    Ok(result) => result,
+                    Err(_) => Ok(format!(
+                        "Error: Tool '{}' timed out after {}s.",
+                        call.name, READ_ONLY_TOOL_TIMEOUT_SECS
+                    )),
+                }
+            };
+
+            let result = if let Some(token) = cancellation_token {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    bounded_result = bounded => bounded_result?,
+                }
+            } else {
+                bounded.await?
+            };
+
+            Ok((idx, result))
         })
-        .collect();
-
-    // Collect futures (keeping original indices for result reconstruction).
-    let mut futures_idx: Vec<usize> = Vec::new();
-    let mut futures_list = Vec::new();
-    let mut pre_results: Vec<Option<String>> = (0..classified.len()).map(|_| None).collect();
-
-    for (i, kind) in classified.into_iter().enumerate() {
-        match kind {
-            CallKind::Blocked(msg) => pre_results[i] = Some(msg),
-            CallKind::Run(fut) => {
-                futures_idx.push(i);
-                futures_list.push(fut);
-            }
-        }
-    }
-
-    let completed = futures::future::join_all(futures_list).await;
-    for (idx, result) in futures_idx.into_iter().zip(completed.into_iter()) {
-        pre_results[idx] = Some(result?);
-    }
-
-    Ok(pre_results
+        .buffer_unordered(READ_ONLY_TOOL_CONCURRENCY_WINDOW)
+        .collect::<Vec<Result<(usize, String)>>>()
+        .await
         .into_iter()
-        .map(|r| r.unwrap_or_default())
-        .collect())
+        .collect::<Result<Vec<(usize, String)>>>()?;
+
+    indexed_results.sort_by_key(|(idx, _)| *idx);
+    Ok(indexed_results.into_iter().map(|(_, result)| result).collect())
 }
 
-async fn execute_tools_sequential(
+async fn execute_tools_with_policy(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
@@ -1354,74 +1435,60 @@ async fn execute_tools_sequential(
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
 ) -> Result<Vec<String>> {
-    let mut individual_results: Vec<String> = Vec::with_capacity(tool_calls.len());
+    let mut results = Vec::with_capacity(tool_calls.len());
+    let mut index = 0;
 
-    for call in tool_calls {
-        // Scope-based access control: check before approval and execution.
-        if let Some(ctx) = scope_ctx {
-            if !ctx
-                .policy
-                .is_tool_allowed(&call.name, ctx.sender, ctx.channel, ctx.chat_type)
-            {
-                individual_results.push(format!(
-                    "Error: Tool '{}' is not permitted for this user/channel context.",
-                    call.name
-                ));
-                continue;
-            }
-            // Policy pipeline check (P3-1)
-            if let Some(pipeline) = ctx.policy_pipeline {
-                let eval_ctx = crate::security::EvalContext {
-                    channel: ctx.channel.to_string(),
-                    chat_type: ctx.chat_type.to_string(),
-                    sender: ctx.sender.to_string(),
-                };
-                let decision = pipeline.evaluate(&call.name, &eval_ctx);
-                if !decision.allowed {
-                    individual_results.push(format!(
-                        "Error: Tool '{}' blocked by policy pipeline: {}",
-                        call.name, decision.reason
-                    ));
-                    continue;
-                }
-            }
+    while index < tool_calls.len() {
+        if cancellation_token
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ToolLoopCancelled.into());
         }
 
-        if let Some(mgr) = approval {
-            if mgr.needs_approval(&call.name) {
-                let request = ApprovalRequest {
-                    tool_name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                };
-
-                let decision = if channel_name == "cli" {
-                    mgr.prompt_cli(&request)
-                } else {
-                    ApprovalResponse::No
-                };
-
-                mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
-
-                if decision == ApprovalResponse::No {
-                    individual_results.push("Denied by user.".to_string());
-                    continue;
+        let call = &tool_calls[index];
+        let approval_required = approval.is_some_and(|mgr| mgr.needs_approval(&call.name));
+        if classify_tool_call(&call.name) == ToolSchedulingClass::ReadOnly && !approval_required {
+            let batch_start = index;
+            let mut batch_end = index + 1;
+            while batch_end < tool_calls.len() {
+                let next_call = &tool_calls[batch_end];
+                let next_approval = approval.is_some_and(|mgr| mgr.needs_approval(&next_call.name));
+                if classify_tool_call(&next_call.name) != ToolSchedulingClass::ReadOnly
+                    || next_approval
+                {
+                    break;
                 }
+                batch_end += 1;
             }
+
+            let mut batch_results = execute_read_only_batch(
+                &tool_calls[batch_start..batch_end],
+                tools_registry,
+                observer,
+                cancellation_token,
+                scope_ctx,
+            )
+            .await?;
+            results.append(&mut batch_results);
+            index = batch_end;
+            continue;
         }
 
-        let result = execute_one_tool(
-            &call.name,
-            call.arguments.clone(),
+        let result = execute_tool_call_serial(
+            call,
             tools_registry,
             observer,
+            approval,
+            channel_name,
             cancellation_token,
             scope_ctx,
         )
         .await?;
-        individual_results.push(result);
+        results.push(result);
+        index += 1;
     }
 
-    Ok(individual_results)
+    Ok(results)
 }
 
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
@@ -1687,8 +1754,9 @@ pub(crate) async fn run_tool_call_loop(
         // Execute tool calls and build results. `individual_results` tracks per-call output so
         // native-mode history can emit one role=tool message per tool call with the correct ID.
         //
-        // When multiple tool calls are present and interactive CLI approval is not needed, run
-        // tool executions concurrently for lower wall-clock latency.
+        // Conservative scheduler:
+        // - run read-only tools in small bounded batches;
+        // - keep all stateful tools strictly serial.
         let mut tool_results = String::new();
         for call in &tool_calls {
             hooks
@@ -1702,28 +1770,16 @@ pub(crate) async fn run_tool_call_loop(
                 .await;
         }
 
-        let should_parallel = should_execute_tools_in_parallel(&tool_calls, approval);
-        let individual_results = if should_parallel {
-            execute_tools_parallel(
-                &tool_calls,
-                tools_registry,
-                observer,
-                cancellation_token.as_ref(),
-                scope_ctx,
-            )
-            .await?
-        } else {
-            execute_tools_sequential(
-                &tool_calls,
-                tools_registry,
-                observer,
-                approval,
-                channel_name,
-                cancellation_token.as_ref(),
-                scope_ctx,
-            )
-            .await?
-        };
+        let individual_results = execute_tools_with_policy(
+            &tool_calls,
+            tools_registry,
+            observer,
+            approval,
+            channel_name,
+            cancellation_token.as_ref(),
+            scope_ctx,
+        )
+        .await?;
 
         for (call, result) in tool_calls.iter().zip(individual_results.iter()) {
             let success = !result.starts_with("Error");
@@ -2902,68 +2958,34 @@ mod tests {
     }
 
     #[test]
-    fn should_execute_tools_in_parallel_returns_false_for_single_call() {
-        let calls = vec![ParsedToolCall {
-            name: "file_read".to_string(),
-            arguments: serde_json::json!({"path": "a.txt"}),
-        }];
-
-        assert!(!should_execute_tools_in_parallel(&calls, None));
+    fn classify_tool_call_marks_known_read_only_tools() {
+        assert_eq!(
+            classify_tool_call("file_read"),
+            ToolSchedulingClass::ReadOnly
+        );
+        assert_eq!(
+            classify_tool_call("memory_search"),
+            ToolSchedulingClass::ReadOnly
+        );
     }
 
     #[test]
-    fn should_execute_tools_in_parallel_returns_false_when_approval_is_required() {
-        let calls = vec![
-            ParsedToolCall {
-                name: "shell".to_string(),
-                arguments: serde_json::json!({"command": "pwd"}),
-            },
-            ParsedToolCall {
-                name: "http_request".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com"}),
-            },
-        ];
-        let approval_cfg = crate::config::AutonomyConfig::default();
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
-
-        assert!(!should_execute_tools_in_parallel(
-            &calls,
-            Some(&approval_mgr)
-        ));
-    }
-
-    #[test]
-    fn should_execute_tools_in_parallel_returns_true_when_cli_has_no_interactive_approvals() {
-        let calls = vec![
-            ParsedToolCall {
-                name: "shell".to_string(),
-                arguments: serde_json::json!({"command": "pwd"}),
-            },
-            ParsedToolCall {
-                name: "http_request".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com"}),
-            },
-        ];
-        let approval_cfg = crate::config::AutonomyConfig {
-            level: crate::security::AutonomyLevel::Full,
-            ..crate::config::AutonomyConfig::default()
-        };
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
-
-        assert!(should_execute_tools_in_parallel(
-            &calls,
-            Some(&approval_mgr)
-        ));
+    fn classify_tool_call_marks_mutating_or_unknown_tools_as_stateful() {
+        assert_eq!(classify_tool_call("shell"), ToolSchedulingClass::Stateful);
+        assert_eq!(
+            classify_tool_call("totally_unknown_tool"),
+            ToolSchedulingClass::Stateful
+        );
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_executes_multiple_tools_in_parallel_with_ordered_results() {
+    async fn run_tool_call_loop_executes_read_only_tools_with_bounded_parallelism() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
-{"name":"delay_a","arguments":{"value":"A"}}
+{"name":"file_read","arguments":{"value":"A"}}
 </tool_call>
 <tool_call>
-{"name":"delay_b","arguments":{"value":"B"}}
+{"name":"memory_get","arguments":{"value":"B"}}
 </tool_call>"#,
             "done",
         ]);
@@ -2972,13 +2994,13 @@ mod tests {
         let max_active = Arc::new(AtomicUsize::new(0));
         let tools_registry: Vec<Box<dyn Tool>> = vec![
             Box::new(DelayTool::new(
-                "delay_a",
+                "file_read",
                 200,
                 Arc::clone(&active),
                 Arc::clone(&max_active),
             )),
             Box::new(DelayTool::new(
-                "delay_b",
+                "memory_get",
                 200,
                 Arc::clone(&active),
                 Arc::clone(&max_active),
@@ -3018,7 +3040,7 @@ mod tests {
             None, // no scope context
         )
         .await
-        .expect("parallel execution should complete");
+        .expect("read-only parallel execution should complete");
         let elapsed = started.elapsed();
 
         assert_eq!(result, "done");
@@ -3037,15 +3059,92 @@ mod tests {
             .expect("tool results message should be present");
         let idx_a = tool_results_message
             .content
-            .find("name=\"delay_a\"")
-            .expect("delay_a result should be present");
+            .find("name=\"file_read\"")
+            .expect("file_read result should be present");
         let idx_b = tool_results_message
             .content
-            .find("name=\"delay_b\"")
-            .expect("delay_b result should be present");
+            .find("name=\"memory_get\"")
+            .expect("memory_get result should be present");
         assert!(
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_keeps_stateful_tools_strictly_serial() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delay_stateful_a","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"delay_stateful_b","arguments":{"value":"B"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(DelayTool::new(
+                "delay_stateful_a",
+                200,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_stateful_b",
+                200,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+        ];
+
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let started = std::time::Instant::now();
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            &crate::hooks::HookManager::new(std::env::temp_dir()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            None, // no scope context
+        )
+        .await
+        .expect("stateful serial execution should complete");
+        let elapsed = started.elapsed();
+
+        assert_eq!(result, "done");
+        assert!(
+            elapsed >= Duration::from_millis(360),
+            "stateful tools should execute serially; elapsed={elapsed:?}"
+        );
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "stateful tools should never overlap in execution"
         );
     }
 
