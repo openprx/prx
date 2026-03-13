@@ -10,7 +10,7 @@
 mod api;
 mod ui;
 
-use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::loop_::{run_tool_call_loop, ToolConcurrencyGovernanceConfig};
 use crate::channels::{
     Channel, LinqChannel, NextcloudTalkChannel, SendMessage, SignalChannel, WhatsAppChannel,
 };
@@ -1098,10 +1098,27 @@ async fn run_gateway_chat_with_multimodal(
         "webhook",
         &multimodal_config,
         max_tool_iterations,
-        2,
-        30,
-        false,
-        Vec::new(),
+        config_snapshot.agent.parallel_tools,
+        config_snapshot.agent.read_only_tool_concurrency_window,
+        config_snapshot.agent.read_only_tool_timeout_secs,
+        config_snapshot.agent.priority_scheduling_enabled,
+        config_snapshot.agent.low_priority_tools.clone(),
+        ToolConcurrencyGovernanceConfig {
+            kill_switch_force_serial: config_snapshot.agent.concurrency_kill_switch_force_serial,
+            rollout_stage: config_snapshot.agent.concurrency_rollout_stage.clone(),
+            rollout_sample_percent: config_snapshot.agent.concurrency_rollout_sample_percent,
+            rollout_channels: config_snapshot.agent.concurrency_rollout_channels.clone(),
+            auto_rollback_enabled: config_snapshot.agent.concurrency_auto_rollback_enabled,
+            rollback_timeout_rate_threshold: config_snapshot
+                .agent
+                .concurrency_rollback_timeout_rate_threshold,
+            rollback_cancel_rate_threshold: config_snapshot
+                .agent
+                .concurrency_rollback_cancel_rate_threshold,
+            rollback_error_rate_threshold: config_snapshot
+                .agent
+                .concurrency_rollback_error_rate_threshold,
+        },
         None,
         None, // no cancellation token
         None, // no streaming delta sender

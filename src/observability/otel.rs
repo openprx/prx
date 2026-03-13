@@ -19,6 +19,11 @@ pub struct OtelObserver {
     llm_calls: Counter<u64>,
     llm_duration: Histogram<f64>,
     tool_calls: Counter<u64>,
+    tool_batches: Counter<u64>,
+    tool_timeouts: Counter<u64>,
+    tool_cancellations: Counter<u64>,
+    tool_degrades: Counter<u64>,
+    tool_rollbacks: Counter<u64>,
     tool_duration: Histogram<f64>,
     channel_messages: Counter<u64>,
     heartbeat_ticks: Counter<u64>,
@@ -107,6 +112,26 @@ impl OtelObserver {
             .u64_counter("openprx.tool.calls")
             .with_description("Total tool calls")
             .build();
+        let tool_batches = meter
+            .u64_counter("openprx.tool.batches")
+            .with_description("Total read-only tool batches")
+            .build();
+        let tool_timeouts = meter
+            .u64_counter("openprx.tool.timeouts")
+            .with_description("Total tool timeouts in scheduler batches")
+            .build();
+        let tool_cancellations = meter
+            .u64_counter("openprx.tool.cancellations")
+            .with_description("Total tool cancellations in scheduler batches")
+            .build();
+        let tool_degrades = meter
+            .u64_counter("openprx.tool.degrades")
+            .with_description("Total scheduler degradations")
+            .build();
+        let tool_rollbacks = meter
+            .u64_counter("openprx.tool.rollbacks")
+            .with_description("Total scheduler rollbacks")
+            .build();
 
         let tool_duration = meter
             .f64_histogram("openprx.tool.duration")
@@ -158,6 +183,11 @@ impl OtelObserver {
             llm_calls,
             llm_duration,
             tool_calls,
+            tool_batches,
+            tool_timeouts,
+            tool_cancellations,
+            tool_degrades,
+            tool_rollbacks,
             tool_duration,
             channel_messages,
             heartbeat_ticks,
@@ -303,6 +333,27 @@ impl Observer for OtelObserver {
                 self.tool_duration
                     .record(secs, &[KeyValue::new("tool", tool.clone())]);
             }
+            ObserverEvent::ToolBatch {
+                rollout_stage,
+                timeout_count,
+                cancel_count,
+                degraded,
+                rollback,
+                ..
+            } => {
+                let attrs = [KeyValue::new("rollout_stage", rollout_stage.clone())];
+                self.tool_batches.add(1, &attrs);
+                self.tool_timeouts
+                    .add(u64::try_from(*timeout_count).unwrap_or(u64::MAX), &attrs);
+                self.tool_cancellations
+                    .add(u64::try_from(*cancel_count).unwrap_or(u64::MAX), &attrs);
+                if *degraded {
+                    self.tool_degrades.add(1, &attrs);
+                }
+                if *rollback {
+                    self.tool_rollbacks.add(1, &attrs);
+                }
+            }
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages.add(
                     1,
@@ -438,6 +489,18 @@ mod tests {
             tool: "file_read".into(),
             duration: Duration::from_millis(5),
             success: false,
+        });
+        obs.record_event(&ObserverEvent::ToolBatch {
+            rollout_stage: "stage_a".into(),
+            batch_size: 2,
+            concurrency_window: 2,
+            timeout_count: 1,
+            cancel_count: 0,
+            error_count: 1,
+            degraded: true,
+            rollback: true,
+            rollback_reason: Some("timeout_rate".into()),
+            kill_switch_applied: false,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {

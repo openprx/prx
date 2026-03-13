@@ -38,6 +38,32 @@ impl Observer for LogObserver {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 info!(tool = %tool, duration_ms = ms, success = success, "tool.call");
             }
+            ObserverEvent::ToolBatch {
+                rollout_stage,
+                batch_size,
+                concurrency_window,
+                timeout_count,
+                cancel_count,
+                error_count,
+                degraded,
+                rollback,
+                rollback_reason,
+                kill_switch_applied,
+            } => {
+                info!(
+                    rollout_stage = %rollout_stage,
+                    batch_size = batch_size,
+                    concurrency_window = concurrency_window,
+                    timeout_count = timeout_count,
+                    cancel_count = cancel_count,
+                    error_count = error_count,
+                    degraded = degraded,
+                    rollback = rollback,
+                    rollback_reason = ?rollback_reason,
+                    kill_switch_applied = kill_switch_applied,
+                    "tool.batch"
+                );
+            }
             ObserverEvent::TurnComplete => {
                 info!("turn.complete");
             }

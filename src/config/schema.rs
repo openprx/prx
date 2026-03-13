@@ -752,6 +752,31 @@ pub struct AgentConfig {
     /// Tool names treated as low-priority when `priority_scheduling_enabled = true`.
     #[serde(default = "default_agent_low_priority_tools")]
     pub low_priority_tools: Vec<String>,
+    /// Global kill switch. When enabled, forces tool scheduling to serial mode.
+    #[serde(default)]
+    pub concurrency_kill_switch_force_serial: bool,
+    /// Rollout stage for read-only parallel scheduling.
+    /// Allowed values: `off`, `stage_a`, `stage_b`, `stage_c`, `full`.
+    #[serde(default = "default_concurrency_rollout_stage")]
+    pub concurrency_rollout_stage: String,
+    /// Optional rollout sample percentage (0-100). When zero, stage defaults apply.
+    #[serde(default)]
+    pub concurrency_rollout_sample_percent: u8,
+    /// Optional channel allowlist for concurrency rollout. Empty means all channels.
+    #[serde(default)]
+    pub concurrency_rollout_channels: Vec<String>,
+    /// Enable automatic fallback to serial mode when rollback thresholds are exceeded.
+    #[serde(default = "default_true")]
+    pub concurrency_auto_rollback_enabled: bool,
+    /// Timeout rate threshold (0.0-1.0) for triggering serial fallback.
+    #[serde(default = "default_concurrency_rollback_threshold")]
+    pub concurrency_rollback_timeout_rate_threshold: f64,
+    /// Cancellation rate threshold (0.0-1.0) for triggering serial fallback.
+    #[serde(default = "default_concurrency_rollback_threshold")]
+    pub concurrency_rollback_cancel_rate_threshold: f64,
+    /// Error rate threshold (0.0-1.0) for triggering serial fallback.
+    #[serde(default = "default_concurrency_rollback_threshold")]
+    pub concurrency_rollback_error_rate_threshold: f64,
     /// Context compaction controls (`[agent.compaction]`).
     #[serde(default)]
     pub compaction: AgentCompactionConfig,
@@ -924,6 +949,14 @@ fn default_agent_low_priority_tools() -> Vec<String> {
         .collect()
 }
 
+fn default_concurrency_rollout_stage() -> String {
+    "off".to_string()
+}
+
+fn default_concurrency_rollback_threshold() -> f64 {
+    0.20
+}
+
 fn default_agent_compaction_reserve_tokens() -> usize {
     4096
 }
@@ -948,6 +981,14 @@ impl Default for AgentConfig {
             read_only_tool_timeout_secs: default_read_only_tool_timeout_secs(),
             priority_scheduling_enabled: false,
             low_priority_tools: default_agent_low_priority_tools(),
+            concurrency_kill_switch_force_serial: false,
+            concurrency_rollout_stage: default_concurrency_rollout_stage(),
+            concurrency_rollout_sample_percent: 0,
+            concurrency_rollout_channels: Vec::new(),
+            concurrency_auto_rollback_enabled: true,
+            concurrency_rollback_timeout_rate_threshold: default_concurrency_rollback_threshold(),
+            concurrency_rollback_cancel_rate_threshold: default_concurrency_rollback_threshold(),
+            concurrency_rollback_error_rate_threshold: default_concurrency_rollback_threshold(),
             compaction: AgentCompactionConfig::default(),
         }
     }
@@ -4674,6 +4715,23 @@ impl Config {
         if self.scheduler.max_tasks == 0 {
             anyhow::bail!("scheduler.max_tasks must be greater than 0");
         }
+        if !matches!(
+            self.agent.concurrency_rollout_stage.as_str(),
+            "off" | "stage_a" | "stage_b" | "stage_c" | "full"
+        ) {
+            anyhow::bail!(
+                "agent.concurrency_rollout_stage must be one of: off|stage_a|stage_b|stage_c|full"
+            );
+        }
+        if !(0.0..=1.0).contains(&self.agent.concurrency_rollback_timeout_rate_threshold) {
+            anyhow::bail!("agent.concurrency_rollback_timeout_rate_threshold must be in [0,1]");
+        }
+        if !(0.0..=1.0).contains(&self.agent.concurrency_rollback_cancel_rate_threshold) {
+            anyhow::bail!("agent.concurrency_rollback_cancel_rate_threshold must be in [0,1]");
+        }
+        if !(0.0..=1.0).contains(&self.agent.concurrency_rollback_error_rate_threshold) {
+            anyhow::bail!("agent.concurrency_rollback_error_rate_threshold must be in [0,1]");
+        }
 
         // Model routes
         for (i, route) in self.model_routes.iter().enumerate() {
@@ -4863,6 +4921,60 @@ impl Config {
         if let Ok(enabled) = env_openprx_or_openprx("PRIORITY_SCHEDULING_ENABLED") {
             self.agent.priority_scheduling_enabled =
                 enabled == "1" || enabled.eq_ignore_ascii_case("true");
+        }
+        if let Ok(enabled) = env_openprx_or_openprx("CONCURRENCY_KILL_SWITCH_FORCE_SERIAL") {
+            self.agent.concurrency_kill_switch_force_serial =
+                enabled == "1" || enabled.eq_ignore_ascii_case("true");
+        }
+        if let Ok(stage) = env_openprx_or_openprx("CONCURRENCY_ROLLOUT_STAGE") {
+            let stage = stage.trim().to_ascii_lowercase();
+            if matches!(
+                stage.as_str(),
+                "off" | "stage_a" | "stage_b" | "stage_c" | "full"
+            ) {
+                self.agent.concurrency_rollout_stage = stage;
+            }
+        }
+        if let Ok(percent) = env_openprx_or_openprx("CONCURRENCY_ROLLOUT_SAMPLE_PERCENT") {
+            if let Ok(percent) = percent.parse::<u8>() {
+                self.agent.concurrency_rollout_sample_percent = percent;
+            }
+        }
+        if let Ok(channels) = env_openprx_or_openprx("CONCURRENCY_ROLLOUT_CHANNELS") {
+            let parsed = channels
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            self.agent.concurrency_rollout_channels = parsed;
+        }
+        if let Ok(enabled) = env_openprx_or_openprx("CONCURRENCY_AUTO_ROLLBACK_ENABLED") {
+            self.agent.concurrency_auto_rollback_enabled =
+                enabled == "1" || enabled.eq_ignore_ascii_case("true");
+        }
+        if let Ok(threshold) = env_openprx_or_openprx("CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD")
+        {
+            if let Ok(threshold) = threshold.parse::<f64>() {
+                if (0.0..=1.0).contains(&threshold) {
+                    self.agent.concurrency_rollback_timeout_rate_threshold = threshold;
+                }
+            }
+        }
+        if let Ok(threshold) = env_openprx_or_openprx("CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD")
+        {
+            if let Ok(threshold) = threshold.parse::<f64>() {
+                if (0.0..=1.0).contains(&threshold) {
+                    self.agent.concurrency_rollback_cancel_rate_threshold = threshold;
+                }
+            }
+        }
+        if let Ok(threshold) = env_openprx_or_openprx("CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD") {
+            if let Ok(threshold) = threshold.parse::<f64>() {
+                if (0.0..=1.0).contains(&threshold) {
+                    self.agent.concurrency_rollback_error_rate_threshold = threshold;
+                }
+            }
         }
 
         // Reasoning override: ZEROCLAW_REASONING_ENABLED or REASONING_ENABLED
@@ -5609,6 +5721,14 @@ reasoning_enabled = false
         assert_eq!(cfg.read_only_tool_timeout_secs, 30);
         assert!(!cfg.priority_scheduling_enabled);
         assert_eq!(cfg.low_priority_tools, default_agent_low_priority_tools());
+        assert!(!cfg.concurrency_kill_switch_force_serial);
+        assert_eq!(cfg.concurrency_rollout_stage, "off");
+        assert_eq!(cfg.concurrency_rollout_sample_percent, 0);
+        assert!(cfg.concurrency_rollout_channels.is_empty());
+        assert!(cfg.concurrency_auto_rollback_enabled);
+        assert!((cfg.concurrency_rollback_timeout_rate_threshold - 0.2).abs() < f64::EPSILON);
+        assert!((cfg.concurrency_rollback_cancel_rate_threshold - 0.2).abs() < f64::EPSILON);
+        assert!((cfg.concurrency_rollback_error_rate_threshold - 0.2).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -5625,6 +5745,14 @@ read_only_tool_concurrency_window = 4
 read_only_tool_timeout_secs = 45
 priority_scheduling_enabled = true
 low_priority_tools = ["sessions_spawn", "delegate"]
+concurrency_kill_switch_force_serial = false
+concurrency_rollout_stage = "stage_b"
+concurrency_rollout_sample_percent = 25
+concurrency_rollout_channels = ["telegram", "discord"]
+concurrency_auto_rollback_enabled = true
+concurrency_rollback_timeout_rate_threshold = 0.21
+concurrency_rollback_cancel_rate_threshold = 0.22
+concurrency_rollback_error_rate_threshold = 0.23
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
@@ -5635,7 +5763,27 @@ low_priority_tools = ["sessions_spawn", "delegate"]
         assert_eq!(parsed.agent.read_only_tool_concurrency_window, 4);
         assert_eq!(parsed.agent.read_only_tool_timeout_secs, 45);
         assert!(parsed.agent.priority_scheduling_enabled);
-        assert_eq!(parsed.agent.low_priority_tools, vec!["sessions_spawn", "delegate"]);
+        assert_eq!(
+            parsed.agent.low_priority_tools,
+            vec!["sessions_spawn", "delegate"]
+        );
+        assert!(!parsed.agent.concurrency_kill_switch_force_serial);
+        assert_eq!(parsed.agent.concurrency_rollout_stage, "stage_b");
+        assert_eq!(parsed.agent.concurrency_rollout_sample_percent, 25);
+        assert_eq!(
+            parsed.agent.concurrency_rollout_channels,
+            vec!["telegram", "discord"]
+        );
+        assert!(parsed.agent.concurrency_auto_rollback_enabled);
+        assert!(
+            (parsed.agent.concurrency_rollback_timeout_rate_threshold - 0.21).abs() < f64::EPSILON
+        );
+        assert!(
+            (parsed.agent.concurrency_rollback_cancel_rate_threshold - 0.22).abs() < f64::EPSILON
+        );
+        assert!(
+            (parsed.agent.concurrency_rollback_error_rate_threshold - 0.23).abs() < f64::EPSILON
+        );
     }
 
     #[tokio::test]
@@ -5853,6 +6001,8 @@ model = "override-beta"
         config.memory.backend = "markdown".into();
         config.storage.provider.config.provider = "postgres".into();
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
+        // Keep test deterministic even if process env mutates proxy defaults elsewhere.
+        config.proxy = ProxyConfig::default();
         config.security.resources.max_cpu_time_seconds = 120;
         config.autonomy.max_actions_per_hour = 42;
         config.agents.insert(
@@ -7615,6 +7765,50 @@ default_model = "legacy-model"
         std::env::remove_var("ZEROCLAW_STORAGE_PROVIDER");
         std::env::remove_var("ZEROCLAW_STORAGE_DB_URL");
         std::env::remove_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS");
+    }
+
+    #[test]
+    async fn env_override_agent_concurrency_controls() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        std::env::set_var("ZEROCLAW_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL", "true");
+        std::env::set_var("ZEROCLAW_CONCURRENCY_ROLLOUT_STAGE", "stage_c");
+        std::env::set_var("ZEROCLAW_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT", "40");
+        std::env::set_var("ZEROCLAW_CONCURRENCY_ROLLOUT_CHANNELS", "telegram,discord");
+        std::env::set_var("ZEROCLAW_CONCURRENCY_AUTO_ROLLBACK_ENABLED", "false");
+        std::env::set_var(
+            "ZEROCLAW_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD",
+            "0.31",
+        );
+        std::env::set_var(
+            "ZEROCLAW_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD",
+            "0.32",
+        );
+        std::env::set_var("ZEROCLAW_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD", "0.33");
+
+        config.apply_env_overrides();
+
+        assert!(config.agent.concurrency_kill_switch_force_serial);
+        assert_eq!(config.agent.concurrency_rollout_stage, "stage_c");
+        assert_eq!(config.agent.concurrency_rollout_sample_percent, 40);
+        assert_eq!(
+            config.agent.concurrency_rollout_channels,
+            vec!["telegram", "discord"]
+        );
+        assert!(!config.agent.concurrency_auto_rollback_enabled);
+        assert!((config.agent.concurrency_rollback_timeout_rate_threshold - 0.31).abs() < 1e-9);
+        assert!((config.agent.concurrency_rollback_cancel_rate_threshold - 0.32).abs() < 1e-9);
+        assert!((config.agent.concurrency_rollback_error_rate_threshold - 0.33).abs() < 1e-9);
+
+        std::env::remove_var("ZEROCLAW_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL");
+        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLOUT_STAGE");
+        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT");
+        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLOUT_CHANNELS");
+        std::env::remove_var("ZEROCLAW_CONCURRENCY_AUTO_ROLLBACK_ENABLED");
+        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD");
+        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD");
+        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD");
     }
 
     #[test]

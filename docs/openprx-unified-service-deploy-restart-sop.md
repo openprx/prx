@@ -75,3 +75,7 @@ done
 
 - If `openprx doctor` reports no available providers, gateway startup may fail before binding `:16830`, and plugin registration logs may be absent.
 - Fix provider credentials first, then rerun verification commands above.
+- For concurrency rollout and rollback operations, use:
+  - `docs/concurrency-p2-runbook.md`
+  - `docs/concurrency-p2-slo.md`
+  - `docs/concurrency-p2-pressure-fault.md`

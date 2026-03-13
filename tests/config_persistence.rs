@@ -81,6 +81,14 @@ fn agent_config_default_compact_context_off() {
     );
 }
 
+#[test]
+fn agent_config_default_concurrency_rollout_is_off() {
+    let agent = AgentConfig::default();
+    assert_eq!(agent.concurrency_rollout_stage, "off");
+    assert_eq!(agent.concurrency_rollout_sample_percent, 0);
+    assert!(!agent.concurrency_kill_switch_force_serial);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MemoryConfig defaults
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +147,9 @@ fn config_toml_roundtrip_preserves_agent_config() {
     config.agent.max_tool_iterations = 5;
     config.agent.max_history_messages = 25;
     config.agent.compact_context = true;
+    config.agent.concurrency_rollout_stage = "stage_b".into();
+    config.agent.concurrency_rollout_sample_percent = 20;
+    config.agent.concurrency_auto_rollback_enabled = true;
 
     let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
     let parsed: Config = toml::from_str(&toml_str).expect("TOML should deserialize back");
@@ -146,6 +157,8 @@ fn config_toml_roundtrip_preserves_agent_config() {
     assert_eq!(parsed.agent.max_tool_iterations, 5);
     assert_eq!(parsed.agent.max_history_messages, 25);
     assert!(parsed.agent.compact_context);
+    assert_eq!(parsed.agent.concurrency_rollout_stage, "stage_b");
+    assert_eq!(parsed.agent.concurrency_rollout_sample_percent, 20);
 }
 
 #[test]

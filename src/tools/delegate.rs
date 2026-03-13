@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::agent::loop_::{run_tool_call_loop, ScopeContext};
+use crate::agent::loop_::{run_tool_call_loop, ScopeContext, ToolConcurrencyGovernanceConfig};
 use crate::config::DelegateAgentConfig;
 use crate::hooks::HookManager;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -484,10 +484,19 @@ impl DelegateTool {
                 "delegate",
                 &self.multimodal_config,
                 agent_config.max_iterations,
+                true,
                 2,
                 30,
                 false,
-                vec!["sessions_spawn".to_string(), "delegate".to_string(), "cron_run".to_string()],
+                vec![
+                    "sessions_spawn".to_string(),
+                    "delegate".to_string(),
+                    "cron_run".to_string(),
+                ],
+                ToolConcurrencyGovernanceConfig {
+                    rollout_stage: "full".to_string(),
+                    ..ToolConcurrencyGovernanceConfig::default()
+                },
                 Some(&self.compaction_config),
                 None,
                 None,

@@ -9,7 +9,7 @@
 //! - `steer` action: inject a message into a running sub-agent's context
 
 use super::traits::{Tool, ToolResult};
-use crate::agent::loop_::{run_tool_call_loop, ScopeContext};
+use crate::agent::loop_::{run_tool_call_loop, ScopeContext, ToolConcurrencyGovernanceConfig};
 use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
 use crate::config::{
@@ -1460,10 +1460,19 @@ async fn run_sub_agent_task(
                 "sessions_spawn",
                 &multimodal_config_owned,
                 max_iterations,
+                true,
                 2,
                 30,
                 false,
-                vec!["sessions_spawn".to_string(), "delegate".to_string(), "cron_run".to_string()],
+                vec![
+                    "sessions_spawn".to_string(),
+                    "delegate".to_string(),
+                    "cron_run".to_string(),
+                ],
+                ToolConcurrencyGovernanceConfig {
+                    rollout_stage: "full".to_string(),
+                    ..ToolConcurrencyGovernanceConfig::default()
+                },
                 Some(&compaction_config_owned),
                 Some(cancel_token_owned),
                 None, // no streaming sender

@@ -47,6 +47,8 @@ enabled = true
 compact_context = true
 
 [agent]
+# Master switch for parallel read-only scheduling (default: false).
+parallel_tools = false
 # Max concurrent read-only tools in one batch (default: 2)
 read_only_tool_concurrency_window = 2
 # Per read-only tool timeout in seconds (default: 30)
@@ -55,6 +57,19 @@ read_only_tool_timeout_secs = 30
 priority_scheduling_enabled = false
 # Optional list of low-priority/background tools.
 low_priority_tools = ["sessions_spawn", "delegate", "cron_run"]
+# Rollout stage: off | stage_a | stage_b | stage_c | full
+concurrency_rollout_stage = "off"
+# Optional sample percent (0 means stage default)
+concurrency_rollout_sample_percent = 0
+# Optional channel allowlist for rollout
+concurrency_rollout_channels = ["telegram", "discord"]
+# Emergency kill switch (highest priority) to force serial scheduling
+concurrency_kill_switch_force_serial = false
+# Auto rollback thresholds
+concurrency_auto_rollback_enabled = true
+concurrency_rollback_timeout_rate_threshold = 0.20
+concurrency_rollback_cancel_rate_threshold = 0.20
+concurrency_rollback_error_rate_threshold = 0.20
 
 [subagent_governance]
 max_concurrent_subagents = 4
@@ -74,6 +89,20 @@ claude-opus-4-6 = ["claude-sonnet-4-6"]
 # Provider fallbacks
 fallback_providers = ["xai"]
 ```
+
+## Agent Concurrency Env Overrides
+
+- `ZEROCLAW_READ_ONLY_TOOL_CONCURRENCY_WINDOW`
+- `ZEROCLAW_READ_ONLY_TOOL_TIMEOUT_SECS`
+- `ZEROCLAW_PRIORITY_SCHEDULING_ENABLED`
+- `ZEROCLAW_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL`
+- `ZEROCLAW_CONCURRENCY_ROLLOUT_STAGE`
+- `ZEROCLAW_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT`
+- `ZEROCLAW_CONCURRENCY_ROLLOUT_CHANNELS` (comma-separated)
+- `ZEROCLAW_CONCURRENCY_AUTO_ROLLBACK_ENABLED`
+- `ZEROCLAW_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD`
+- `ZEROCLAW_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD`
+- `ZEROCLAW_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD`
 
 ## Workspace Files
 

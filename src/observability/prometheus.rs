@@ -10,6 +10,11 @@ pub struct PrometheusObserver {
     // Counters
     agent_starts: IntCounterVec,
     tool_calls: IntCounterVec,
+    tool_batches: IntCounterVec,
+    tool_timeouts: IntCounterVec,
+    tool_cancellations: IntCounterVec,
+    tool_degrades: IntCounterVec,
+    tool_rollbacks: IntCounterVec,
     channel_messages: IntCounterVec,
     heartbeat_ticks: prometheus::IntCounter,
     errors: IntCounterVec,
@@ -38,6 +43,37 @@ impl PrometheusObserver {
         let tool_calls = IntCounterVec::new(
             prometheus::Opts::new("openprx_tool_calls_total", "Total tool calls"),
             &["tool", "success"],
+        )
+        .expect("valid metric");
+        let tool_batches = IntCounterVec::new(
+            prometheus::Opts::new("openprx_tool_batches_total", "Total read-only tool batches"),
+            &["rollout_stage"],
+        )
+        .expect("valid metric");
+        let tool_timeouts = IntCounterVec::new(
+            prometheus::Opts::new("openprx_tool_timeouts_total", "Total tool timeouts"),
+            &["rollout_stage"],
+        )
+        .expect("valid metric");
+        let tool_cancellations = IntCounterVec::new(
+            prometheus::Opts::new(
+                "openprx_tool_cancellations_total",
+                "Total tool cancellations",
+            ),
+            &["rollout_stage"],
+        )
+        .expect("valid metric");
+        let tool_degrades = IntCounterVec::new(
+            prometheus::Opts::new(
+                "openprx_tool_degrades_total",
+                "Total scheduler degradations",
+            ),
+            &["rollout_stage"],
+        )
+        .expect("valid metric");
+        let tool_rollbacks = IntCounterVec::new(
+            prometheus::Opts::new("openprx_tool_rollbacks_total", "Total scheduler rollbacks"),
+            &["rollout_stage"],
         )
         .expect("valid metric");
 
@@ -107,6 +143,11 @@ impl PrometheusObserver {
         // Register all metrics
         registry.register(Box::new(agent_starts.clone())).ok();
         registry.register(Box::new(tool_calls.clone())).ok();
+        registry.register(Box::new(tool_batches.clone())).ok();
+        registry.register(Box::new(tool_timeouts.clone())).ok();
+        registry.register(Box::new(tool_cancellations.clone())).ok();
+        registry.register(Box::new(tool_degrades.clone())).ok();
+        registry.register(Box::new(tool_rollbacks.clone())).ok();
         registry.register(Box::new(channel_messages.clone())).ok();
         registry.register(Box::new(heartbeat_ticks.clone())).ok();
         registry.register(Box::new(errors.clone())).ok();
@@ -121,6 +162,11 @@ impl PrometheusObserver {
             registry,
             agent_starts,
             tool_calls,
+            tool_batches,
+            tool_timeouts,
+            tool_cancellations,
+            tool_degrades,
+            tool_rollbacks,
             channel_messages,
             heartbeat_ticks,
             errors,
@@ -182,6 +228,34 @@ impl Observer for PrometheusObserver {
                 self.tool_duration
                     .with_label_values(&[tool.as_str()])
                     .observe(duration.as_secs_f64());
+            }
+            ObserverEvent::ToolBatch {
+                rollout_stage,
+                timeout_count,
+                cancel_count,
+                degraded,
+                rollback,
+                ..
+            } => {
+                self.tool_batches
+                    .with_label_values(&[rollout_stage.as_str()])
+                    .inc();
+                self.tool_timeouts
+                    .with_label_values(&[rollout_stage.as_str()])
+                    .inc_by(u64::try_from(*timeout_count).unwrap_or(u64::MAX));
+                self.tool_cancellations
+                    .with_label_values(&[rollout_stage.as_str()])
+                    .inc_by(u64::try_from(*cancel_count).unwrap_or(u64::MAX));
+                if *degraded {
+                    self.tool_degrades
+                        .with_label_values(&[rollout_stage.as_str()])
+                        .inc();
+                }
+                if *rollback {
+                    self.tool_rollbacks
+                        .with_label_values(&[rollout_stage.as_str()])
+                        .inc();
+                }
             }
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages
@@ -270,6 +344,18 @@ mod tests {
             tool: "file_read".into(),
             duration: Duration::from_millis(5),
             success: false,
+        });
+        obs.record_event(&ObserverEvent::ToolBatch {
+            rollout_stage: "stage_b".into(),
+            batch_size: 2,
+            concurrency_window: 2,
+            timeout_count: 1,
+            cancel_count: 0,
+            error_count: 1,
+            degraded: true,
+            rollback: true,
+            rollback_reason: Some("timeout_rate".into()),
+            kill_switch_applied: false,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
