@@ -63,7 +63,7 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
         return true;
     }
     if msg_lower.contains("provider_response_parse_error") {
-        return true;
+        return is_non_retryable_provider_response_parse_error(&msg_lower);
     }
 
     msg_lower.contains("model")
@@ -72,6 +72,53 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("unsupported")
             || msg_lower.contains("does not exist")
             || msg_lower.contains("invalid"))
+}
+
+fn is_non_retryable_provider_response_parse_error(msg_lower: &str) -> bool {
+    const NON_RETRYABLE_PARSE_ERROR_KINDS: [&str; 3] = [
+        "kind=malformed_json",
+        "kind=empty_or_unsupported_payload",
+        "kind=payload_too_large",
+    ];
+    const RETRYABLE_PARSE_ERROR_KINDS: [&str; 1] = ["kind=body_read_failed"];
+    const TRANSIENT_BODY_READ_HINTS: [&str; 9] = [
+        "connection reset",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "broken pipe",
+        "network unreachable",
+        "temporary failure",
+        "timed out",
+        "timeout",
+    ];
+
+    if NON_RETRYABLE_PARSE_ERROR_KINDS
+        .iter()
+        .any(|kind| msg_lower.contains(kind))
+    {
+        return true;
+    }
+
+    if RETRYABLE_PARSE_ERROR_KINDS
+        .iter()
+        .any(|kind| msg_lower.contains(kind))
+    {
+        return false;
+    }
+
+    // Keep transient network read failures retryable even when kind tagging
+    // differs by provider implementation details.
+    if TRANSIENT_BODY_READ_HINTS
+        .iter()
+        .any(|hint| msg_lower.contains(hint))
+    {
+        return false;
+    }
+
+    // Unknown parse kinds remain non-retryable by default to preserve
+    // fail-fast behavior on deterministic payload/protocol mismatches.
+    true
 }
 
 fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
@@ -1596,6 +1643,61 @@ mod tests {
         assert!(
             !is_non_retryable(&err),
             "502 must NOT be treated as non-retryable"
+        );
+    }
+
+    #[test]
+    fn parse_error_malformed_json_is_non_retryable() {
+        let err = anyhow::anyhow!(
+            "OpenAI Codex provider_response_parse_error kind=malformed_json content_type=application/json detail=EOF while parsing"
+        );
+        assert!(
+            is_non_retryable(&err),
+            "malformed_json parse errors must be non-retryable"
+        );
+    }
+
+    #[test]
+    fn parse_error_empty_or_unsupported_payload_is_non_retryable() {
+        let err = anyhow::anyhow!(
+            "OpenAI Codex provider_response_parse_error kind=empty_or_unsupported_payload content_type=text/plain body_len=0"
+        );
+        assert!(
+            is_non_retryable(&err),
+            "empty_or_unsupported_payload parse errors must be non-retryable"
+        );
+    }
+
+    #[test]
+    fn parse_error_payload_too_large_is_non_retryable() {
+        let err = anyhow::anyhow!(
+            "OpenAI Codex provider_response_parse_error kind=payload_too_large content_type=application/json body_len=16777217"
+        );
+        assert!(
+            is_non_retryable(&err),
+            "payload_too_large parse errors must be non-retryable"
+        );
+    }
+
+    #[test]
+    fn parse_error_body_read_failed_is_retryable() {
+        let err = anyhow::anyhow!(
+            "OpenAI Codex provider_response_parse_error kind=body_read_failed content_type=application/json detail=error reading response body"
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "body_read_failed parse errors must remain retryable"
+        );
+    }
+
+    #[test]
+    fn parse_error_with_transient_network_read_hint_is_retryable() {
+        let err = anyhow::anyhow!(
+            "OpenAI Codex provider_response_parse_error kind=unknown content_type=application/json detail=connection reset by peer while reading response body"
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "transient network read parse errors must remain retryable"
         );
     }
 
