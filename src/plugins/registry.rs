@@ -166,6 +166,11 @@ impl PluginRegistry {
         let plugins = self.plugins.read().await;
         plugins.len()
     }
+
+    /// Returns `true` when no plugins are loaded.
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
 }
 
 #[cfg(test)]

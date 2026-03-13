@@ -96,6 +96,7 @@ pub fn compute_score(
     }
 }
 
+#[allow(clippy::implicit_hasher)]
 pub fn rank_models(
     intent: &RouterIntent,
     estimated_tokens: usize,

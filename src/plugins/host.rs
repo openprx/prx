@@ -78,9 +78,11 @@ impl WebSocketConnection for TungsteniteConnection {
                 Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
                     return Ok(None);
                 }
-                Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_)))
-                | Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_)))
-                | Some(Ok(tokio_tungstenite::tungstenite::Message::Frame(_))) => {}
+                Some(Ok(
+                    tokio_tungstenite::tungstenite::Message::Ping(_)
+                    | tokio_tungstenite::tungstenite::Message::Pong(_)
+                    | tokio_tungstenite::tungstenite::Message::Frame(_),
+                )) => {}
                 Some(Err(e)) => return Err(format!("websocket receive failed: {e}")),
             }
         }

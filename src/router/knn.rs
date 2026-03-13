@@ -60,7 +60,7 @@ pub struct KnnStore {
 }
 
 impl KnnStore {
-    pub async fn new(memory: Arc<dyn Memory>) -> Result<Self> {
+    pub fn new(memory: Arc<dyn Memory>) -> Result<Self> {
         Ok(Self { memory })
     }
 

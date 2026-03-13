@@ -121,6 +121,7 @@ pub fn reachable_provider_names(
     providers
 }
 
+#[allow(clippy::implicit_hasher)]
 pub fn filter_models_by_providers(
     models: Vec<RouterModelConfig>,
     allowed_providers: &HashSet<String>,

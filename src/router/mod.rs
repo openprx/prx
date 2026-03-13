@@ -79,7 +79,7 @@ impl RouterEngine {
         }
         let history = if config.knn_enabled {
             if let Some(embedder) = embedder.filter(|embedder| embedder.dimensions() > 0) {
-                let store = KnnStore::new(Arc::clone(&memory)).await?;
+                let store = KnnStore::new(Arc::clone(&memory))?;
                 Some(RouterHistory::new(
                     store,
                     embedder,
@@ -144,13 +144,13 @@ impl RouterEngine {
                 chosen_provider: None,
                 score: 0.0,
                 candidates: Vec::new(),
-                intent: infer_router_intent(task_intent, message)
+                intent: infer_router_intent(*task_intent, message)
                     .category_name()
                     .to_string(),
                 estimated_tokens: estimate_tokens(message),
             };
         }
-        let intent = infer_router_intent(task_intent, message);
+        let intent = infer_router_intent(*task_intent, message);
         let estimated_tokens = estimate_tokens(message);
         let similarity_scores = if let Some(history) = &self.history {
             history.similarity_scores(message).await
@@ -747,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn test_knn_cold_start() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let store = KnnStore::new(Arc::clone(&memory)).await.unwrap();
+        let store = KnnStore::new(Arc::clone(&memory)).unwrap();
         let history = RouterHistory::new(store, Arc::new(FixedEmbeddingProvider), 7, 10);
 
         for index in 0..9 {
@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn test_majority_vote() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let store = futures::executor::block_on(KnnStore::new(memory)).unwrap();
+        let store = KnnStore::new(memory).unwrap();
         let voted = store.majority_vote(&[
             ("model-a".to_string(), 0.1),
             ("model-a".to_string(), 0.2),
@@ -790,7 +790,7 @@ mod tests {
     #[tokio::test]
     async fn test_knn_timeout_fallback() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
-        let store = KnnStore::new(Arc::clone(&memory)).await.unwrap();
+        let store = KnnStore::new(Arc::clone(&memory)).unwrap();
         let history = RouterHistory::new(store, Arc::new(SlowEmbeddingProvider), 7, 10)
             .with_timeout(Duration::from_millis(10));
         let mut config = router_config();
