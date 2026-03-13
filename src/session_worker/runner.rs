@@ -197,6 +197,8 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
             "session-worker",
             &config.multimodal,
             manifest.max_iterations.max(1),
+            config.agent.read_only_tool_concurrency_window,
+            config.agent.read_only_tool_timeout_secs,
             manifest.compaction_config.as_ref(),
             None,
             None,
