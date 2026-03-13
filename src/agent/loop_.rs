@@ -1146,6 +1146,8 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    read_only_tool_concurrency_window: usize,
+    read_only_tool_timeout_secs: u64,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -1161,6 +1163,8 @@ pub(crate) async fn agent_turn(
         "channel",
         multimodal_config,
         max_tool_iterations,
+        read_only_tool_concurrency_window,
+        read_only_tool_timeout_secs,
         None,
         None,
         None,
@@ -1246,12 +1250,15 @@ async fn execute_one_tool(
     }
 }
 
-/// Fixed conservative scheduler policy:
+/// Conservative scheduler policy:
 /// - only known read-only tools can run concurrently;
 /// - all stateful tools execute strictly serially;
-/// - read-only batches use a small concurrency window and timeout guard.
-const READ_ONLY_TOOL_CONCURRENCY_WINDOW: usize = 2;
-const READ_ONLY_TOOL_TIMEOUT_SECS: u64 = 30;
+/// - read-only batches use a bounded concurrency window and timeout guard.
+#[derive(Debug, Clone, Copy)]
+struct ReadOnlyToolScheduleConfig {
+    concurrency_window: usize,
+    timeout_secs: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolSchedulingClass {
@@ -1371,59 +1378,64 @@ async fn execute_read_only_batch(
     calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
+    schedule: ReadOnlyToolScheduleConfig,
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
 ) -> Result<Vec<String>> {
     use futures::stream::{self, StreamExt};
     use std::time::Duration;
 
-    let timeout = Duration::from_secs(READ_ONLY_TOOL_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(schedule.timeout_secs);
     let batch_calls: Vec<ParsedToolCall> = calls.to_vec();
 
-    let mut indexed_results: Vec<(usize, String)> = stream::iter(batch_calls.into_iter().enumerate())
-        .map(|(idx, call)| async move {
-            if let Some(denied) = scope_or_pipeline_denial(&call, scope_ctx) {
-                return Ok((idx, denied));
-            }
-
-            let execute_future = execute_one_tool(
-                &call.name,
-                call.arguments.clone(),
-                tools_registry,
-                observer,
-                cancellation_token,
-                scope_ctx,
-            );
-
-            let bounded = async {
-                match tokio::time::timeout(timeout, execute_future).await {
-                    Ok(result) => result,
-                    Err(_) => Ok(format!(
-                        "Error: Tool '{}' timed out after {}s.",
-                        call.name, READ_ONLY_TOOL_TIMEOUT_SECS
-                    )),
+    let mut indexed_results: Vec<(usize, String)> =
+        stream::iter(batch_calls.into_iter().enumerate())
+            .map(|(idx, call)| async move {
+                if let Some(denied) = scope_or_pipeline_denial(&call, scope_ctx) {
+                    return Ok((idx, denied));
                 }
-            };
 
-            let result = if let Some(token) = cancellation_token {
-                tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    bounded_result = bounded => bounded_result?,
-                }
-            } else {
-                bounded.await?
-            };
+                let execute_future = execute_one_tool(
+                    &call.name,
+                    call.arguments.clone(),
+                    tools_registry,
+                    observer,
+                    cancellation_token,
+                    scope_ctx,
+                );
 
-            Ok((idx, result))
-        })
-        .buffer_unordered(READ_ONLY_TOOL_CONCURRENCY_WINDOW)
-        .collect::<Vec<Result<(usize, String)>>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<(usize, String)>>>()?;
+                let bounded = async {
+                    match tokio::time::timeout(timeout, execute_future).await {
+                        Ok(result) => result,
+                        Err(_) => Ok(format!(
+                            "Error: Tool '{}' timed out after {}s.",
+                            call.name, schedule.timeout_secs
+                        )),
+                    }
+                };
+
+                let result = if let Some(token) = cancellation_token {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        bounded_result = bounded => bounded_result?,
+                    }
+                } else {
+                    bounded.await?
+                };
+
+                Ok((idx, result))
+            })
+            .buffer_unordered(schedule.concurrency_window)
+            .collect::<Vec<Result<(usize, String)>>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<(usize, String)>>>()?;
 
     indexed_results.sort_by_key(|(idx, _)| *idx);
-    Ok(indexed_results.into_iter().map(|(_, result)| result).collect())
+    Ok(indexed_results
+        .into_iter()
+        .map(|(_, result)| result)
+        .collect())
 }
 
 async fn execute_tools_with_policy(
@@ -1432,6 +1444,7 @@ async fn execute_tools_with_policy(
     observer: &dyn Observer,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    schedule: ReadOnlyToolScheduleConfig,
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
 ) -> Result<Vec<String>> {
@@ -1439,9 +1452,7 @@ async fn execute_tools_with_policy(
     let mut index = 0;
 
     while index < tool_calls.len() {
-        if cancellation_token
-            .is_some_and(CancellationToken::is_cancelled)
-        {
+        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
             return Err(ToolLoopCancelled.into());
         }
 
@@ -1465,6 +1476,7 @@ async fn execute_tools_with_policy(
                 &tool_calls[batch_start..batch_end],
                 tools_registry,
                 observer,
+                schedule,
                 cancellation_token,
                 scope_ctx,
             )
@@ -1523,6 +1535,8 @@ pub(crate) async fn run_tool_call_loop(
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    read_only_tool_concurrency_window: usize,
+    read_only_tool_timeout_secs: u64,
     compaction_config: Option<&crate::config::AgentCompactionConfig>,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
@@ -1538,6 +1552,10 @@ pub(crate) async fn run_tool_call_loop(
         .iter()
         .flat_map(|tool| tool.specs())
         .collect();
+    let read_only_schedule = ReadOnlyToolScheduleConfig {
+        concurrency_window: read_only_tool_concurrency_window.max(1),
+        timeout_secs: read_only_tool_timeout_secs.max(1),
+    };
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
     for _iteration in 0..max_iterations {
@@ -1776,6 +1794,7 @@ pub(crate) async fn run_tool_call_loop(
             observer,
             approval,
             channel_name,
+            read_only_schedule,
             cancellation_token.as_ref(),
             scope_ctx,
         )
@@ -2174,6 +2193,8 @@ pub async fn run(
             "cli",
             &config.multimodal,
             config.agent.max_tool_iterations,
+            config.agent.read_only_tool_concurrency_window,
+            config.agent.read_only_tool_timeout_secs,
             Some(&config.agent.compaction),
             None,
             None,
@@ -2344,6 +2365,8 @@ pub async fn run(
                 "cli",
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                config.agent.read_only_tool_concurrency_window,
+                config.agent.read_only_tool_timeout_secs,
                 Some(&config.agent.compaction),
                 None,
                 None,
@@ -2601,6 +2624,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         true,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        config.agent.read_only_tool_concurrency_window,
+        config.agent.read_only_tool_timeout_secs,
     )
     .await?;
     increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
@@ -2857,6 +2882,8 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            2,
+            30,
             None,
             None,
             None,
@@ -2904,6 +2931,8 @@ mod tests {
             "cli",
             &multimodal,
             3,
+            2,
+            30,
             None,
             None,
             None,
@@ -2945,6 +2974,8 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            2,
+            30,
             None,
             None,
             None,
@@ -3034,6 +3065,8 @@ mod tests {
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
+            2,
+            30,
             None,
             None,
             None,
@@ -3127,6 +3160,8 @@ mod tests {
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
+            2,
+            30,
             None,
             None,
             None,

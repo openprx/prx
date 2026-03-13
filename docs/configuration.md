@@ -46,6 +46,12 @@ active_hours = "08:00-23:00"
 enabled = true
 compact_context = true
 
+[agent]
+# Max concurrent read-only tools in one batch (default: 2)
+read_only_tool_concurrency_window = 2
+# Per read-only tool timeout in seconds (default: 30)
+read_only_tool_timeout_secs = 30
+
 [subagent_governance]
 max_concurrent_subagents = 4
 max_spawn_depth = 2

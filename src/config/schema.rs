@@ -737,6 +737,14 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Max concurrent read-only tool calls in an iteration batch.
+    /// Defaults to 2 to preserve existing scheduler behavior.
+    #[serde(default = "default_read_only_tool_concurrency_window")]
+    pub read_only_tool_concurrency_window: usize,
+    /// Timeout in seconds for each read-only tool call in a parallel batch.
+    /// Defaults to 30s to preserve existing scheduler behavior.
+    #[serde(default = "default_read_only_tool_timeout_secs")]
+    pub read_only_tool_timeout_secs: u64,
     /// Context compaction controls (`[agent.compaction]`).
     #[serde(default)]
     pub compaction: AgentCompactionConfig,
@@ -894,6 +902,14 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_read_only_tool_concurrency_window() -> usize {
+    2
+}
+
+fn default_read_only_tool_timeout_secs() -> u64 {
+    30
+}
+
 fn default_agent_compaction_reserve_tokens() -> usize {
     4096
 }
@@ -914,6 +930,8 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            read_only_tool_concurrency_window: default_read_only_tool_concurrency_window(),
+            read_only_tool_timeout_secs: default_read_only_tool_timeout_secs(),
             compaction: AgentCompactionConfig::default(),
         }
     }
@@ -4811,6 +4829,22 @@ impl Config {
             }
         }
 
+        // Agent read-only tool scheduler tuning.
+        if let Ok(window) = env_openprx_or_openprx("READ_ONLY_TOOL_CONCURRENCY_WINDOW") {
+            if let Ok(window) = window.parse::<usize>() {
+                if window > 0 {
+                    self.agent.read_only_tool_concurrency_window = window;
+                }
+            }
+        }
+        if let Ok(timeout_secs) = env_openprx_or_openprx("READ_ONLY_TOOL_TIMEOUT_SECS") {
+            if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
+                if timeout_secs > 0 {
+                    self.agent.read_only_tool_timeout_secs = timeout_secs;
+                }
+            }
+        }
+
         // Reasoning override: ZEROCLAW_REASONING_ENABLED or REASONING_ENABLED
         if let Ok(flag) = env_openprx_or_openprx("REASONING_ENABLED")
             .or_else(|_| std::env::var("REASONING_ENABLED"))
@@ -5551,6 +5585,8 @@ reasoning_enabled = false
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+        assert_eq!(cfg.read_only_tool_concurrency_window, 2);
+        assert_eq!(cfg.read_only_tool_timeout_secs, 30);
     }
 
     #[test]
@@ -5563,6 +5599,8 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
+read_only_tool_concurrency_window = 4
+read_only_tool_timeout_secs = 45
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
         assert!(parsed.agent.compact_context);
@@ -5570,6 +5608,8 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.agent.max_history_messages, 80);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
+        assert_eq!(parsed.agent.read_only_tool_concurrency_window, 4);
+        assert_eq!(parsed.agent.read_only_tool_timeout_secs, 45);
     }
 
     #[tokio::test]

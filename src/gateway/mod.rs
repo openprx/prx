@@ -1098,6 +1098,8 @@ async fn run_gateway_chat_with_multimodal(
         "webhook",
         &multimodal_config,
         max_tool_iterations,
+        2,
+        30,
         None,
         None, // no cancellation token
         None, // no streaming delta sender

@@ -1460,6 +1460,8 @@ async fn run_sub_agent_task(
                 "sessions_spawn",
                 &multimodal_config_owned,
                 max_iterations,
+                2,
+                30,
                 Some(&compaction_config_owned),
                 Some(cancel_token_owned),
                 None, // no streaming sender
