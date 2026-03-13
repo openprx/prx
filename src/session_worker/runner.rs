@@ -1,4 +1,4 @@
-use crate::agent::loop_::{run_tool_call_loop, ScopeContext};
+use crate::agent::loop_::{run_tool_call_loop, ScopeContext, ToolConcurrencyGovernanceConfig};
 use crate::channels::build_identity_prompt;
 use crate::config::Config;
 use crate::hooks::HookManager;
@@ -197,10 +197,27 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
             "session-worker",
             &config.multimodal,
             manifest.max_iterations.max(1),
+            config.agent.parallel_tools,
             config.agent.read_only_tool_concurrency_window,
             config.agent.read_only_tool_timeout_secs,
             config.agent.priority_scheduling_enabled,
             config.agent.low_priority_tools.clone(),
+            ToolConcurrencyGovernanceConfig {
+                kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
+                rollout_stage: config.agent.concurrency_rollout_stage.clone(),
+                rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
+                rollout_channels: config.agent.concurrency_rollout_channels.clone(),
+                auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
+                rollback_timeout_rate_threshold: config
+                    .agent
+                    .concurrency_rollback_timeout_rate_threshold,
+                rollback_cancel_rate_threshold: config
+                    .agent
+                    .concurrency_rollback_cancel_rate_threshold,
+                rollback_error_rate_threshold: config
+                    .agent
+                    .concurrency_rollback_error_rate_threshold,
+            },
             manifest.compaction_config.as_ref(),
             None,
             None,

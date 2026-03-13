@@ -62,7 +62,9 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, ScopeContext};
+use crate::agent::loop_::{
+    build_tool_instructions, run_tool_call_loop, ScopeContext, ToolConcurrencyGovernanceConfig,
+};
 use crate::config::Config;
 use crate::hooks::HookManager;
 use crate::identity;
@@ -2267,10 +2269,12 @@ async fn process_channel_message(
                     msg.channel.as_str(),
                     &ctx.multimodal,
                     ctx.max_tool_iterations,
+                    true,
                     ctx.read_only_tool_concurrency_window,
                     ctx.read_only_tool_timeout_secs,
                     ctx.priority_scheduling_enabled,
                     ctx.low_priority_tools.clone(),
+                    ToolConcurrencyGovernanceConfig::default(),
                     Some(&ctx.agent_compaction),
                     Some(cancellation_token.clone()),
                     delta_tx.clone(),

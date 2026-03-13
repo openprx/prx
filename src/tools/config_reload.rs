@@ -4,7 +4,8 @@
 //!   - `default_temperature`
 //!   - `agent.*` (max_tool_iterations, max_history_messages, parallel_tools,
 //!     compact_context, read_only_tool_concurrency_window,
-//!     read_only_tool_timeout_secs, priority_scheduling_enabled, low_priority_tools)
+//!     read_only_tool_timeout_secs, priority_scheduling_enabled, low_priority_tools,
+//!     rollout/kill-switch/rollback thresholds)
 //!   - `heartbeat.enabled`, `heartbeat.interval_minutes`
 //!   - `cron.enabled`, `cron.max_run_history`
 //!   - `web_search.enabled`, `web_search.max_results`
@@ -165,6 +166,79 @@ impl Tool for ConfigReloadTool {
                 changes.push(format!(
                     "agent.low_priority_tools: {:?} → {:?}",
                     old.agent.low_priority_tools, fresh.agent.low_priority_tools
+                ));
+            }
+            if old.agent.concurrency_kill_switch_force_serial
+                != fresh.agent.concurrency_kill_switch_force_serial
+            {
+                changes.push(format!(
+                    "agent.concurrency_kill_switch_force_serial: {} → {}",
+                    old.agent.concurrency_kill_switch_force_serial,
+                    fresh.agent.concurrency_kill_switch_force_serial
+                ));
+            }
+            if old.agent.concurrency_rollout_stage != fresh.agent.concurrency_rollout_stage {
+                changes.push(format!(
+                    "agent.concurrency_rollout_stage: {} → {}",
+                    old.agent.concurrency_rollout_stage, fresh.agent.concurrency_rollout_stage
+                ));
+            }
+            if old.agent.concurrency_rollout_sample_percent
+                != fresh.agent.concurrency_rollout_sample_percent
+            {
+                changes.push(format!(
+                    "agent.concurrency_rollout_sample_percent: {} → {}",
+                    old.agent.concurrency_rollout_sample_percent,
+                    fresh.agent.concurrency_rollout_sample_percent
+                ));
+            }
+            if old.agent.concurrency_rollout_channels != fresh.agent.concurrency_rollout_channels {
+                changes.push(format!(
+                    "agent.concurrency_rollout_channels: {:?} → {:?}",
+                    old.agent.concurrency_rollout_channels,
+                    fresh.agent.concurrency_rollout_channels
+                ));
+            }
+            if old.agent.concurrency_auto_rollback_enabled
+                != fresh.agent.concurrency_auto_rollback_enabled
+            {
+                changes.push(format!(
+                    "agent.concurrency_auto_rollback_enabled: {} → {}",
+                    old.agent.concurrency_auto_rollback_enabled,
+                    fresh.agent.concurrency_auto_rollback_enabled
+                ));
+            }
+            if (old.agent.concurrency_rollback_timeout_rate_threshold
+                - fresh.agent.concurrency_rollback_timeout_rate_threshold)
+                .abs()
+                > f64::EPSILON
+            {
+                changes.push(format!(
+                    "agent.concurrency_rollback_timeout_rate_threshold: {:.3} → {:.3}",
+                    old.agent.concurrency_rollback_timeout_rate_threshold,
+                    fresh.agent.concurrency_rollback_timeout_rate_threshold
+                ));
+            }
+            if (old.agent.concurrency_rollback_cancel_rate_threshold
+                - fresh.agent.concurrency_rollback_cancel_rate_threshold)
+                .abs()
+                > f64::EPSILON
+            {
+                changes.push(format!(
+                    "agent.concurrency_rollback_cancel_rate_threshold: {:.3} → {:.3}",
+                    old.agent.concurrency_rollback_cancel_rate_threshold,
+                    fresh.agent.concurrency_rollback_cancel_rate_threshold
+                ));
+            }
+            if (old.agent.concurrency_rollback_error_rate_threshold
+                - fresh.agent.concurrency_rollback_error_rate_threshold)
+                .abs()
+                > f64::EPSILON
+            {
+                changes.push(format!(
+                    "agent.concurrency_rollback_error_rate_threshold: {:.3} → {:.3}",
+                    old.agent.concurrency_rollback_error_rate_threshold,
+                    fresh.agent.concurrency_rollback_error_rate_threshold
                 ));
             }
 

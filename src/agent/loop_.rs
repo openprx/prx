@@ -13,8 +13,9 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{hash_map::DefaultHasher, BTreeSet, HashMap};
 use std::fmt::Write;
+use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -37,6 +38,34 @@ pub(crate) struct ScopeContext<'a> {
     /// When set, tool calls are additionally evaluated against the pipeline
     /// before execution. A denial from the pipeline blocks the tool call.
     pub policy_pipeline: Option<&'a crate::security::PolicyPipeline>,
+}
+
+/// P2 concurrency governance controls used by the tool scheduler.
+#[derive(Debug, Clone)]
+pub struct ToolConcurrencyGovernanceConfig {
+    pub kill_switch_force_serial: bool,
+    pub rollout_stage: String,
+    pub rollout_sample_percent: u8,
+    pub rollout_channels: Vec<String>,
+    pub auto_rollback_enabled: bool,
+    pub rollback_timeout_rate_threshold: f64,
+    pub rollback_cancel_rate_threshold: f64,
+    pub rollback_error_rate_threshold: f64,
+}
+
+impl Default for ToolConcurrencyGovernanceConfig {
+    fn default() -> Self {
+        Self {
+            kill_switch_force_serial: false,
+            rollout_stage: "off".to_string(),
+            rollout_sample_percent: 0,
+            rollout_channels: Vec::new(),
+            auto_rollback_enabled: true,
+            rollback_timeout_rate_threshold: 0.2,
+            rollback_cancel_rate_threshold: 0.2,
+            rollback_error_rate_threshold: 0.2,
+        }
+    }
 }
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
@@ -1130,8 +1159,9 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
-static TOOL_BARRIERS: LazyLock<std::sync::Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static TOOL_BARRIERS: LazyLock<
+    std::sync::Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 fn tool_barrier_key(name: &str) -> Option<&'static str> {
     match name {
@@ -1178,10 +1208,12 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    parallel_tools_enabled: bool,
     read_only_tool_concurrency_window: usize,
     read_only_tool_timeout_secs: u64,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
+    concurrency_governance: ToolConcurrencyGovernanceConfig,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -1197,10 +1229,12 @@ pub(crate) async fn agent_turn(
         "channel",
         multimodal_config,
         max_tool_iterations,
+        parallel_tools_enabled,
         read_only_tool_concurrency_window,
         read_only_tool_timeout_secs,
         priority_scheduling_enabled,
         low_priority_tool_names,
+        concurrency_governance,
         None,
         None,
         None,
@@ -1298,10 +1332,150 @@ async fn execute_one_tool(
 /// - read-only batches use a bounded concurrency window and timeout guard.
 #[derive(Debug, Clone)]
 struct ReadOnlyToolScheduleConfig {
+    parallel_enabled: bool,
     concurrency_window: usize,
     timeout_secs: u64,
     priority_enabled: bool,
     low_priority_tool_names: std::collections::HashSet<String>,
+    rollout_stage: String,
+    kill_switch_applied: bool,
+    auto_rollback_enabled: bool,
+    rollback_timeout_rate_threshold: f64,
+    rollback_cancel_rate_threshold: f64,
+    rollback_error_rate_threshold: f64,
+}
+
+#[derive(Debug, Clone)]
+struct RolloutDecision {
+    enabled: bool,
+    stage: String,
+    kill_switch_applied: bool,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct BatchExecutionOutcome {
+    results: Vec<String>,
+    total_calls: usize,
+    timeout_count: usize,
+    cancel_count: usize,
+    error_count: usize,
+}
+
+fn rollout_stage_default_sample(stage: &str) -> u8 {
+    match stage {
+        "stage_a" => 5,
+        "stage_b" => 25,
+        "stage_c" => 50,
+        "full" => 100,
+        _ => 0,
+    }
+}
+
+fn rollout_effective_sample_percent(stage: &str, configured_percent: u8) -> u8 {
+    let stage_default = rollout_stage_default_sample(stage);
+    if configured_percent == 0 {
+        stage_default
+    } else {
+        configured_percent.min(stage_default.max(1))
+    }
+}
+
+fn rollout_sampling_key(channel_name: &str, scope_ctx: Option<&ScopeContext<'_>>) -> String {
+    if let Some(scope) = scope_ctx {
+        format!(
+            "{}:{}:{}:{}",
+            channel_name, scope.channel, scope.sender, scope.chat_id
+        )
+    } else {
+        channel_name.to_string()
+    }
+}
+
+fn rollout_sample_selected(key: &str, sample_percent: u8) -> bool {
+    if sample_percent >= 100 {
+        return true;
+    }
+    if sample_percent == 0 {
+        return false;
+    }
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() % 100) < u64::from(sample_percent)
+}
+
+fn resolve_rollout_decision(
+    parallel_tools_enabled: bool,
+    governance: &ToolConcurrencyGovernanceConfig,
+    channel_name: &str,
+    scope_ctx: Option<&ScopeContext<'_>>,
+) -> RolloutDecision {
+    if !parallel_tools_enabled {
+        return RolloutDecision {
+            enabled: false,
+            stage: "off".to_string(),
+            kill_switch_applied: false,
+            reason: "parallel_tools_disabled",
+        };
+    }
+    if governance.kill_switch_force_serial {
+        return RolloutDecision {
+            enabled: false,
+            stage: governance.rollout_stage.clone(),
+            kill_switch_applied: true,
+            reason: "kill_switch_force_serial",
+        };
+    }
+
+    let stage = governance.rollout_stage.trim().to_ascii_lowercase();
+    if stage == "off" {
+        return RolloutDecision {
+            enabled: false,
+            stage,
+            kill_switch_applied: false,
+            reason: "rollout_off",
+        };
+    }
+
+    if !governance.rollout_channels.is_empty()
+        && !governance
+            .rollout_channels
+            .iter()
+            .any(|name| name == channel_name)
+    {
+        return RolloutDecision {
+            enabled: false,
+            stage,
+            kill_switch_applied: false,
+            reason: "channel_not_in_rollout_allowlist",
+        };
+    }
+
+    if stage == "full" {
+        return RolloutDecision {
+            enabled: true,
+            stage,
+            kill_switch_applied: false,
+            reason: "full_rollout",
+        };
+    }
+
+    let sample_percent =
+        rollout_effective_sample_percent(&stage, governance.rollout_sample_percent).min(100);
+    let selected = rollout_sample_selected(
+        &rollout_sampling_key(channel_name, scope_ctx),
+        sample_percent,
+    );
+    RolloutDecision {
+        enabled: selected,
+        stage,
+        kill_switch_applied: false,
+        reason: if selected {
+            "sample_selected"
+        } else {
+            "sample_not_selected"
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1439,7 +1613,7 @@ async fn execute_read_only_batch(
     schedule: ReadOnlyToolScheduleConfig,
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
-) -> Result<Vec<String>> {
+) -> Result<BatchExecutionOutcome> {
     use futures::stream::{self, StreamExt};
     use std::time::Duration;
 
@@ -1490,10 +1664,30 @@ async fn execute_read_only_batch(
             .collect::<Result<Vec<(usize, String)>>>()?;
 
     indexed_results.sort_by_key(|(idx, _)| *idx);
-    Ok(indexed_results
+    let results = indexed_results
         .into_iter()
         .map(|(_, result)| result)
-        .collect())
+        .collect::<Vec<String>>();
+    let timeout_count = results
+        .iter()
+        .filter(|value| value.contains("timed out"))
+        .count();
+    let cancel_count = results
+        .iter()
+        .filter(|value| value.contains("cancelled") || value.contains("Cancelled"))
+        .count();
+    let error_count = results
+        .iter()
+        .filter(|value| value.starts_with("Error"))
+        .count();
+
+    Ok(BatchExecutionOutcome {
+        total_calls: results.len(),
+        results,
+        timeout_count,
+        cancel_count,
+        error_count,
+    })
 }
 
 async fn execute_tools_with_policy(
@@ -1508,30 +1702,19 @@ async fn execute_tools_with_policy(
 ) -> Result<Vec<String>> {
     let mut ordered_indices = Vec::with_capacity(tool_calls.len());
     if schedule.priority_enabled {
-        ordered_indices.extend(
-            tool_calls
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, call)| {
-                    (classify_tool_priority(&call.name, &schedule) == ToolPriority::High)
-                        .then_some(idx)
-                }),
-        );
-        ordered_indices.extend(
-            tool_calls
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, call)| {
-                    (classify_tool_priority(&call.name, &schedule) == ToolPriority::Low)
-                        .then_some(idx)
-                }),
-        );
+        ordered_indices.extend(tool_calls.iter().enumerate().filter_map(|(idx, call)| {
+            (classify_tool_priority(&call.name, &schedule) == ToolPriority::High).then_some(idx)
+        }));
+        ordered_indices.extend(tool_calls.iter().enumerate().filter_map(|(idx, call)| {
+            (classify_tool_priority(&call.name, &schedule) == ToolPriority::Low).then_some(idx)
+        }));
     } else {
         ordered_indices.extend(0..tool_calls.len());
     }
 
     let mut results_by_original = vec![String::new(); tool_calls.len()];
     let mut cursor = 0;
+    let mut force_serial_for_remaining_turn = !schedule.parallel_enabled;
 
     while cursor < ordered_indices.len() {
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
@@ -1542,7 +1725,10 @@ async fn execute_tools_with_policy(
         let call = &tool_calls[index];
         let approval_required = approval.is_some_and(|mgr| mgr.needs_approval(&call.name));
 
-        if classify_tool_call(&call.name) == ToolSchedulingClass::ReadOnly && !approval_required {
+        if classify_tool_call(&call.name) == ToolSchedulingClass::ReadOnly
+            && !approval_required
+            && !force_serial_for_remaining_turn
+        {
             let batch_start = cursor;
             let mut batch_end = cursor + 1;
             while batch_end < ordered_indices.len() {
@@ -1561,7 +1747,7 @@ async fn execute_tools_with_policy(
                 .iter()
                 .map(|idx| tool_calls[*idx].clone())
                 .collect();
-            let batch_results = execute_read_only_batch(
+            let batch_outcome = execute_read_only_batch(
                 &batch_calls,
                 tools_registry,
                 observer,
@@ -1570,7 +1756,60 @@ async fn execute_tools_with_policy(
                 scope_ctx,
             )
             .await?;
-            for (offset, result) in batch_results.into_iter().enumerate() {
+
+            let total = batch_outcome.total_calls.max(1);
+            let timeout_rate = batch_outcome.timeout_count as f64 / total as f64;
+            let cancel_rate = batch_outcome.cancel_count as f64 / total as f64;
+            let error_rate = batch_outcome.error_count as f64 / total as f64;
+            let mut rollback_reason: Option<String> = None;
+            let mut rollback_triggered = false;
+            if schedule.auto_rollback_enabled {
+                if timeout_rate > schedule.rollback_timeout_rate_threshold {
+                    rollback_reason = Some("timeout_rate".to_string());
+                    rollback_triggered = true;
+                } else if cancel_rate > schedule.rollback_cancel_rate_threshold {
+                    rollback_reason = Some("cancel_rate".to_string());
+                    rollback_triggered = true;
+                } else if error_rate > schedule.rollback_error_rate_threshold {
+                    rollback_reason = Some("error_rate".to_string());
+                    rollback_triggered = true;
+                }
+            }
+            if rollback_triggered {
+                force_serial_for_remaining_turn = true;
+            }
+
+            observer.record_event(&ObserverEvent::ToolBatch {
+                rollout_stage: schedule.rollout_stage.clone(),
+                batch_size: batch_outcome.total_calls,
+                concurrency_window: schedule.concurrency_window,
+                timeout_count: batch_outcome.timeout_count,
+                cancel_count: batch_outcome.cancel_count,
+                error_count: batch_outcome.error_count,
+                degraded: force_serial_for_remaining_turn,
+                rollback: rollback_triggered,
+                rollback_reason: rollback_reason.clone(),
+                kill_switch_applied: schedule.kill_switch_applied,
+            });
+
+            tracing::info!(
+                rollout_stage = %schedule.rollout_stage,
+                batch_size = batch_outcome.total_calls,
+                concurrency_window = schedule.concurrency_window,
+                timeout_count = batch_outcome.timeout_count,
+                cancel_count = batch_outcome.cancel_count,
+                error_count = batch_outcome.error_count,
+                timeout_rate = timeout_rate,
+                cancel_rate = cancel_rate,
+                error_rate = error_rate,
+                degraded = force_serial_for_remaining_turn,
+                rollback = rollback_triggered,
+                rollback_reason = ?rollback_reason,
+                kill_switch_applied = schedule.kill_switch_applied,
+                "tool batch execution"
+            );
+
+            for (offset, result) in batch_outcome.results.into_iter().enumerate() {
                 let original_index = ordered_indices[batch_start + offset];
                 results_by_original[original_index] = result;
             }
@@ -1627,10 +1866,12 @@ pub(crate) async fn run_tool_call_loop(
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    parallel_tools_enabled: bool,
     read_only_tool_concurrency_window: usize,
     read_only_tool_timeout_secs: u64,
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
+    concurrency_governance: ToolConcurrencyGovernanceConfig,
     compaction_config: Option<&crate::config::AgentCompactionConfig>,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
@@ -1646,11 +1887,38 @@ pub(crate) async fn run_tool_call_loop(
         .iter()
         .flat_map(|tool| tool.specs())
         .collect();
+    let rollout = resolve_rollout_decision(
+        parallel_tools_enabled,
+        &concurrency_governance,
+        channel_name,
+        scope_ctx,
+    );
+    tracing::info!(
+        channel = channel_name,
+        rollout_stage = %rollout.stage,
+        parallel_enabled = rollout.enabled,
+        kill_switch_applied = rollout.kill_switch_applied,
+        reason = rollout.reason,
+        "tool scheduler rollout decision"
+    );
     let read_only_schedule = ReadOnlyToolScheduleConfig {
+        parallel_enabled: rollout.enabled,
         concurrency_window: read_only_tool_concurrency_window.max(1),
         timeout_secs: read_only_tool_timeout_secs.max(1),
         priority_enabled: priority_scheduling_enabled,
         low_priority_tool_names: low_priority_tool_names.into_iter().collect(),
+        rollout_stage: rollout.stage.clone(),
+        kill_switch_applied: rollout.kill_switch_applied,
+        auto_rollback_enabled: concurrency_governance.auto_rollback_enabled,
+        rollback_timeout_rate_threshold: concurrency_governance
+            .rollback_timeout_rate_threshold
+            .clamp(0.0, 1.0),
+        rollback_cancel_rate_threshold: concurrency_governance
+            .rollback_cancel_rate_threshold
+            .clamp(0.0, 1.0),
+        rollback_error_rate_threshold: concurrency_governance
+            .rollback_error_rate_threshold
+            .clamp(0.0, 1.0),
     };
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
@@ -2289,10 +2557,27 @@ pub async fn run(
             "cli",
             &config.multimodal,
             config.agent.max_tool_iterations,
+            config.agent.parallel_tools,
             config.agent.read_only_tool_concurrency_window,
             config.agent.read_only_tool_timeout_secs,
             config.agent.priority_scheduling_enabled,
             config.agent.low_priority_tools.clone(),
+            ToolConcurrencyGovernanceConfig {
+                kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
+                rollout_stage: config.agent.concurrency_rollout_stage.clone(),
+                rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
+                rollout_channels: config.agent.concurrency_rollout_channels.clone(),
+                auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
+                rollback_timeout_rate_threshold: config
+                    .agent
+                    .concurrency_rollback_timeout_rate_threshold,
+                rollback_cancel_rate_threshold: config
+                    .agent
+                    .concurrency_rollback_cancel_rate_threshold,
+                rollback_error_rate_threshold: config
+                    .agent
+                    .concurrency_rollback_error_rate_threshold,
+            },
             Some(&config.agent.compaction),
             None,
             None,
@@ -2463,10 +2748,27 @@ pub async fn run(
                 "cli",
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                config.agent.parallel_tools,
                 config.agent.read_only_tool_concurrency_window,
                 config.agent.read_only_tool_timeout_secs,
                 config.agent.priority_scheduling_enabled,
                 config.agent.low_priority_tools.clone(),
+                ToolConcurrencyGovernanceConfig {
+                    kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
+                    rollout_stage: config.agent.concurrency_rollout_stage.clone(),
+                    rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
+                    rollout_channels: config.agent.concurrency_rollout_channels.clone(),
+                    auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
+                    rollback_timeout_rate_threshold: config
+                        .agent
+                        .concurrency_rollback_timeout_rate_threshold,
+                    rollback_cancel_rate_threshold: config
+                        .agent
+                        .concurrency_rollback_cancel_rate_threshold,
+                    rollback_error_rate_threshold: config
+                        .agent
+                        .concurrency_rollback_error_rate_threshold,
+                },
                 Some(&config.agent.compaction),
                 None,
                 None,
@@ -2724,10 +3026,23 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         true,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        config.agent.parallel_tools,
         config.agent.read_only_tool_concurrency_window,
         config.agent.read_only_tool_timeout_secs,
         config.agent.priority_scheduling_enabled,
         config.agent.low_priority_tools.clone(),
+        ToolConcurrencyGovernanceConfig {
+            kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
+            rollout_stage: config.agent.concurrency_rollout_stage.clone(),
+            rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
+            rollout_channels: config.agent.concurrency_rollout_channels.clone(),
+            auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
+            rollback_timeout_rate_threshold: config
+                .agent
+                .concurrency_rollback_timeout_rate_threshold,
+            rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
+            rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
+        },
     )
     .await?;
     increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
@@ -2984,10 +3299,12 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            false,
             2,
             30,
             false,
             Vec::new(),
+            ToolConcurrencyGovernanceConfig::default(),
             None,
             None,
             None,
@@ -3035,10 +3352,12 @@ mod tests {
             "cli",
             &multimodal,
             3,
+            false,
             2,
             30,
             false,
             Vec::new(),
+            ToolConcurrencyGovernanceConfig::default(),
             None,
             None,
             None,
@@ -3080,10 +3399,12 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            false,
             2,
             30,
             false,
             Vec::new(),
+            ToolConcurrencyGovernanceConfig::default(),
             None,
             None,
             None,
@@ -3099,6 +3420,32 @@ mod tests {
     struct RecordingTool {
         name: String,
         execution_order: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct SchedulerEventObserver {
+        batch_events: std::sync::Mutex<Vec<ObserverEvent>>,
+    }
+
+    impl Observer for SchedulerEventObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            if matches!(event, ObserverEvent::ToolBatch { .. }) {
+                self.batch_events
+                    .lock()
+                    .expect("batch events lock should be valid")
+                    .push(event.clone());
+            }
+        }
+
+        fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "scheduler-events"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     #[async_trait]
@@ -3150,6 +3497,36 @@ mod tests {
             classify_tool_call("totally_unknown_tool"),
             ToolSchedulingClass::Stateful
         );
+    }
+
+    #[test]
+    fn resolve_rollout_decision_prioritizes_kill_switch() {
+        let decision = resolve_rollout_decision(
+            true,
+            &ToolConcurrencyGovernanceConfig {
+                kill_switch_force_serial: true,
+                rollout_stage: "full".to_string(),
+                ..ToolConcurrencyGovernanceConfig::default()
+            },
+            "telegram",
+            None,
+        );
+        assert!(!decision.enabled);
+        assert!(decision.kill_switch_applied);
+        assert_eq!(decision.reason, "kill_switch_force_serial");
+    }
+
+    #[test]
+    fn resolve_rollout_decision_stage_sampling_is_deterministic() {
+        let governance = ToolConcurrencyGovernanceConfig {
+            rollout_stage: "stage_a".to_string(),
+            rollout_sample_percent: 5,
+            ..ToolConcurrencyGovernanceConfig::default()
+        };
+        let first = resolve_rollout_decision(true, &governance, "telegram", None);
+        let second = resolve_rollout_decision(true, &governance, "telegram", None);
+        assert_eq!(first.enabled, second.enabled);
+        assert_eq!(first.stage, "stage_a");
     }
 
     #[tokio::test]
@@ -3208,10 +3585,15 @@ mod tests {
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
+            true,
             2,
             30,
             false,
             Vec::new(),
+            ToolConcurrencyGovernanceConfig {
+                rollout_stage: "full".to_string(),
+                ..ToolConcurrencyGovernanceConfig::default()
+            },
             None,
             None,
             None,
@@ -3305,10 +3687,15 @@ mod tests {
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
+            true,
             2,
             30,
             false,
             Vec::new(),
+            ToolConcurrencyGovernanceConfig {
+                rollout_stage: "full".to_string(),
+                ..ToolConcurrencyGovernanceConfig::default()
+            },
             None,
             None,
             None,
@@ -3362,10 +3749,17 @@ mod tests {
             None,
             "cli",
             ReadOnlyToolScheduleConfig {
+                parallel_enabled: true,
                 concurrency_window: 2,
                 timeout_secs: 30,
                 priority_enabled: true,
                 low_priority_tool_names: ["sessions_spawn".to_string()].into_iter().collect(),
+                rollout_stage: "full".to_string(),
+                kill_switch_applied: false,
+                auto_rollback_enabled: true,
+                rollback_timeout_rate_threshold: 0.2,
+                rollback_cancel_rate_threshold: 0.2,
+                rollback_error_rate_threshold: 0.2,
             },
             None,
             None,
@@ -3379,6 +3773,81 @@ mod tests {
             .expect("execution order lock should be valid")
             .clone();
         assert_eq!(observed_order, vec!["file_read", "sessions_spawn"]);
+    }
+
+    #[tokio::test]
+    async fn execute_tools_with_policy_triggers_rollback_and_forces_remaining_serial() {
+        let observer = SchedulerEventObserver::default();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(DelayTool::new(
+                "file_read",
+                150,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(RecordingTool {
+                name: "shell".to_string(),
+                execution_order: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+        ];
+        let calls = vec![
+            ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({"id": 1}),
+            },
+            ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({"id": 2}),
+            },
+            ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({"id": 3}),
+            },
+        ];
+
+        let _ = execute_tools_with_policy(
+            &calls,
+            &tools_registry,
+            &observer,
+            None,
+            "cli",
+            ReadOnlyToolScheduleConfig {
+                parallel_enabled: true,
+                concurrency_window: 2,
+                timeout_secs: 0,
+                priority_enabled: false,
+                low_priority_tool_names: std::collections::HashSet::new(),
+                rollout_stage: "stage_a".to_string(),
+                kill_switch_applied: false,
+                auto_rollback_enabled: true,
+                rollback_timeout_rate_threshold: 0.10,
+                rollback_cancel_rate_threshold: 1.0,
+                rollback_error_rate_threshold: 1.0,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("scheduler should complete with rollback");
+
+        let events = observer
+            .batch_events
+            .lock()
+            .expect("batch events lock should be valid")
+            .clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "rollback should force subsequent read-only calls into serial lane"
+        );
+        assert!(matches!(
+            events[0],
+            ObserverEvent::ToolBatch { rollback: true, .. }
+        ));
     }
 
     #[tokio::test]

@@ -74,6 +74,9 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 | [Web Console](docs/web-console.md) | Browser-based management (planned) |
 | [Evolution](docs/evolution.md) | Self-improvement pipeline |
 | [Configuration](docs/configuration.md) | Config reference, workspace files, security |
+| [Concurrency P2 Runbook](docs/concurrency-p2-runbook.md) | Enablement, staged rollout, kill switch, rollback drills |
+| [Concurrency P2 SLO](docs/concurrency-p2-slo.md) | SLI/SLO definitions and alert thresholds for concurrency scheduler |
+| [Concurrency P2 Pressure & Fault](docs/concurrency-p2-pressure-fault.md) | Baseline stress script and failure-injection regression matrix |
 | [Router](docs/router.md) | LLM Router config, flow, safety boundaries |
 | [WASM Plugins](docs/plugin-developer-guide.md) | Plugin developer guide (Rust/Python/JS/Go) |
 | [Host Function Reference](docs/host-function-reference.md) | WASM plugin host API reference |

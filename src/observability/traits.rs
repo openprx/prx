@@ -45,6 +45,19 @@ pub enum ObserverEvent {
         duration: Duration,
         success: bool,
     },
+    /// A read-only tool batch has completed.
+    ToolBatch {
+        rollout_stage: String,
+        batch_size: usize,
+        concurrency_window: usize,
+        timeout_count: usize,
+        cancel_count: usize,
+        error_count: usize,
+        degraded: bool,
+        rollback: bool,
+        rollback_reason: Option<String>,
+        kill_switch_applied: bool,
+    },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
     /// A message was sent or received through a channel.

@@ -44,6 +44,19 @@ impl Observer for VerboseObserver {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 eprintln!("< Tool {tool} (success={success}, duration_ms={ms})");
             }
+            ObserverEvent::ToolBatch {
+                rollout_stage,
+                batch_size,
+                timeout_count,
+                cancel_count,
+                error_count,
+                rollback,
+                ..
+            } => {
+                eprintln!(
+                    "< ToolBatch stage={rollout_stage} size={batch_size} timeout={timeout_count} cancel={cancel_count} error={error_count} rollback={rollback}"
+                );
+            }
             ObserverEvent::TurnComplete => {
                 eprintln!("< Complete");
             }
