@@ -201,11 +201,11 @@ impl WasmProvider {
                 wasmtime::component::Val::Record(vec![
                     (
                         "role".to_string(),
-                        wasmtime::component::Val::String(m.role.clone().into()),
+                        wasmtime::component::Val::String(m.role.clone()),
                     ),
                     (
                         "content".to_string(),
-                        wasmtime::component::Val::String(m.content.clone().into()),
+                        wasmtime::component::Val::String(m.content.clone()),
                     ),
                 ])
             })

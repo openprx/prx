@@ -58,7 +58,7 @@ impl ConfidenceChecker {
     }
 
     /// Placeholder for future sampling-based confidence checks.
-    pub async fn check(
+    pub fn check(
         &self,
         question: &str,
         answer: &str,

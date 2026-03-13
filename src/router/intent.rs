@@ -11,7 +11,7 @@ pub enum RouterIntent {
     Unknown,
 }
 
-pub fn infer_router_intent(task_intent: &TaskIntent, message: &str) -> RouterIntent {
+pub fn infer_router_intent(task_intent: TaskIntent, message: &str) -> RouterIntent {
     if matches!(task_intent, TaskIntent::Delegate) {
         return RouterIntent::Tool;
     }
@@ -69,7 +69,7 @@ mod tests {
     #[test]
     fn infer_code_intent_from_keywords() {
         assert_eq!(
-            infer_router_intent(&TaskIntent::Stream, "请 debug 这段 cargo build 错误"),
+            infer_router_intent(TaskIntent::Stream, "请 debug 这段 cargo build 错误"),
             RouterIntent::Code
         );
     }
@@ -78,7 +78,7 @@ mod tests {
     fn infer_long_doc_from_length() {
         let message = "a".repeat(2_100);
         assert_eq!(
-            infer_router_intent(&TaskIntent::Stream, &message),
+            infer_router_intent(TaskIntent::Stream, &message),
             RouterIntent::LongDoc
         );
     }
