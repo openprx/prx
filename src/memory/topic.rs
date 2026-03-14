@@ -127,11 +127,7 @@ pub fn find_topic_by_fingerprint(conn: &Connection, fingerprint: &str) -> Result
 }
 
 pub fn search_topics_fts(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Topic>> {
-    let fts_query = query
-        .split_whitespace()
-        .map(|w| format!("\"{w}\""))
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    let fts_query = build_safe_fts_query(query);
     if fts_query.is_empty() {
         return Ok(Vec::new());
     }
@@ -147,7 +143,13 @@ pub fn search_topics_fts(conn: &Connection, query: &str, limit: usize) -> Result
          LIMIT ?2",
     )?;
 
-    let rows = stmt.query_map(params![fts_query, limit_i64], map_topic)?;
+    let rows = match stmt.query_map(params![fts_query, limit_i64], map_topic) {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!("topic fts query rejected, skipping candidate lookup: {error}");
+            return Ok(Vec::new());
+        }
+    };
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -348,6 +350,23 @@ fn extract_external_ref(content: &str) -> Option<String> {
                 .find(content)
                 .map(|m| m.as_str().trim().to_lowercase())
         })
+}
+
+fn build_safe_fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(sanitize_fts_token)
+        .filter(|token| token.chars().count() >= 3)
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn sanitize_fts_token(token: &str) -> String {
+    token
+        .chars()
+        .filter(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect()
 }
 
 fn generate_topic_title(content: &str) -> String {
@@ -737,5 +756,12 @@ mod tests {
         let rows = query_topic_context(&conn, topic_id, &principal, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "m1");
+    }
+
+    #[test]
+    fn search_topics_fts_rejects_short_or_unsafe_tokens() {
+        let (_tmp, conn) = setup_conn();
+        let result = search_topics_fts(&conn, "qa b :topic", 5).unwrap();
+        assert!(result.is_empty());
     }
 }
