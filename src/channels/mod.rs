@@ -3277,22 +3277,6 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
-    if let Some(ref sg) = config.channels_config.signal {
-        channels.push((
-            "Signal",
-            Arc::new(SignalChannel::new_with_storm_protection(
-                sg.effective_http_url(),
-                sg.account.clone(),
-                sg.group_id.clone(),
-                sg.allowed_from.clone(),
-                sg.ignore_attachments,
-                sg.ignore_stories,
-                config.media.clone(),
-                sg.storm_protection.clone(),
-            )),
-        ));
-    }
-
     if let Some(ref im) = config.channels_config.imessage {
         channels.push((
             "iMessage",
@@ -3323,8 +3307,23 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref sig) = config.channels_config.signal {
-        channels.push((
-            "Signal",
+        let signal_channel: Arc<dyn Channel + Send + Sync> = if sig.is_native_mode() {
+            Arc::new(SignalNativeChannel::new(
+                sig.cli_path
+                    .clone()
+                    .unwrap_or_else(|| "signal-cli".to_string()),
+                sig.account.clone(),
+                sig.data_dir.clone(),
+                sig.daemon_http_port.unwrap_or(16866),
+                sig.startup_timeout_ms,
+                sig.group_id.clone(),
+                sig.allowed_from.clone(),
+                sig.ignore_attachments,
+                sig.ignore_stories,
+                config.media.clone(),
+                sig.storm_protection.clone(),
+            ))
+        } else {
             Arc::new(SignalChannel::new_with_storm_protection(
                 sig.effective_http_url(),
                 sig.account.clone(),
@@ -3334,7 +3333,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 sig.ignore_stories,
                 config.media.clone(),
                 sig.storm_protection.clone(),
-            )),
+            ))
+        };
+        channels.push((
+            "Signal",
+            signal_channel,
         ));
     }
 

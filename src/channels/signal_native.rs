@@ -209,6 +209,21 @@ impl Channel for SignalNativeChannel {
     }
 
     async fn health_check(&self) -> bool {
+        // Fast path: if a daemon is already running (e.g. managed externally
+        // or by an active runtime listener), reuse it.
+        if self.inner.health_check().await {
+            return true;
+        }
+
+        // Doctor path: when native mode is configured but no daemon is running,
+        // spawn a short-lived daemon to validate startup + health semantics.
+        let mut cmd = self.build_command();
+        let Ok(_child) = cmd.spawn() else {
+            return false;
+        };
+        if self.wait_for_ready().await.is_err() {
+            return false;
+        }
         self.inner.health_check().await
     }
 
