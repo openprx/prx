@@ -130,7 +130,7 @@ fn atomic_write_test_hook_cell() -> &'static std::sync::Mutex<Option<Box<dyn Fn(
 fn run_atomic_write_test_hook() {
     if let Some(callback) = atomic_write_test_hook_cell()
         .lock()
-        .expect("atomic_write test hook mutex poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .as_ref()
     {
         callback();
@@ -141,7 +141,7 @@ fn run_atomic_write_test_hook() {
 fn set_atomic_write_test_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
     *atomic_write_test_hook_cell()
         .lock()
-        .expect("atomic_write test hook mutex poisoned") = hook;
+        .unwrap_or_else(|e| e.into_inner()) = hook;
 }
 
 #[cfg(not(test))]
