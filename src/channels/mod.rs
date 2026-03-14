@@ -83,7 +83,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Per-sender conversation history for channel messages.
@@ -176,10 +176,9 @@ struct ChannelRuntimeDefaults {
     reliability: crate::config::ReliabilityConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigFileStamp {
-    modified: SystemTime,
-    len: u64,
+    fingerprint: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -798,45 +797,20 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
 }
 
 async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    let modified = metadata.modified().ok()?;
-    Some(ConfigFileStamp {
-        modified,
-        len: metadata.len(),
+    let path = path.to_path_buf();
+    let fingerprint = tokio::task::spawn_blocking(move || {
+        crate::config::files::compute_config_fingerprint(&path).ok()
     })
+    .await
+    .ok()??;
+    Some(ConfigFileStamp { fingerprint })
 }
 
-fn decrypt_optional_secret_for_runtime_reload(
-    store: &crate::security::SecretStore,
-    value: &mut Option<String>,
-    field_name: &str,
-) -> Result<()> {
-    if let Some(raw) = value.clone() {
-        if crate::security::SecretStore::is_encrypted(&raw) {
-            *value = Some(
-                store
-                    .decrypt(&raw)
-                    .with_context(|| format!("Failed to decrypt {field_name}"))?,
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
-    let contents = tokio::fs::read_to_string(path)
-        .await
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut parsed: Config =
-        toml::from_str(&contents).with_context(|| format!("Failed to parse {}", path.display()))?;
-    parsed.config_path = path.to_path_buf();
-
-    if let Some(openprx_dir) = path.parent() {
-        let store = crate::security::SecretStore::new(openprx_dir, parsed.secrets.encrypt);
-        decrypt_optional_secret_for_runtime_reload(&store, &mut parsed.api_key, "config.api_key")?;
-    }
-
-    parsed.apply_env_overrides();
+fn load_runtime_defaults_from_config_file(
+    path: &Path,
+    workspace_dir: &Path,
+) -> Result<ChannelRuntimeDefaults> {
+    let parsed = Config::load_from_path(path, workspace_dir.to_path_buf())?;
     Ok(runtime_defaults_from_config(&parsed))
 }
 
@@ -854,13 +828,14 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(state) = store.get(&config_path) {
-            if state.last_applied_stamp == Some(stamp) {
+            if state.last_applied_stamp == Some(stamp.clone()) {
                 return Ok(());
             }
         }
     }
 
-    let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
+    let next_defaults =
+        load_runtime_defaults_from_config_file(&config_path, ctx.workspace_dir.as_path())?;
     let next_default_provider = providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
@@ -5765,6 +5740,60 @@ BTC is currently around $65,000 based on latest tool output."#
                 .as_slice(),
             &["hot-reloaded-model".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn config_file_stamp_changes_when_config_fragment_changes() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let config_dir = temp.path().join("config.d");
+        std::fs::create_dir_all(&config_dir).expect("create config.d");
+
+        std::fs::write(&config_path, "default_provider = \"openrouter\"\n")
+            .expect("write config.toml");
+        std::fs::write(
+            config_dir.join("memory.toml"),
+            "[memory]\nbackend = \"sqlite\"\n",
+        )
+        .expect("write fragment");
+
+        let before = config_file_stamp(&config_path)
+            .await
+            .expect("stamp before");
+
+        std::fs::write(
+            config_dir.join("memory.toml"),
+            "[memory]\nbackend = \"markdown\"\n",
+        )
+        .expect("rewrite fragment");
+
+        let after = config_file_stamp(&config_path).await.expect("stamp after");
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn load_runtime_defaults_merges_config_and_fragments() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let config_dir = temp.path().join("config.d");
+        std::fs::create_dir_all(&config_dir).expect("create config.d");
+
+        std::fs::write(
+            &config_path,
+            "default_provider = \"openrouter\"\ndefault_model = \"base-model\"\n",
+        )
+        .expect("write config.toml");
+        std::fs::write(
+            config_dir.join("agents.toml"),
+            "default_model = \"fragment-model\"\ndefault_temperature = 0.42\n",
+        )
+        .expect("write fragment");
+
+        let defaults = load_runtime_defaults_from_config_file(&config_path, temp.path())
+            .expect("load merged defaults");
+        assert_eq!(defaults.default_provider, "openrouter");
+        assert_eq!(defaults.model, "fragment-model");
+        assert!((defaults.temperature - 0.42).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

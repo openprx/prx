@@ -385,6 +385,25 @@ fn contains_done_event(text: &str) -> bool {
         .any(|line| line == "data: [DONE]" || line == "data:[DONE]")
 }
 
+fn contains_terminal_response_event(text: &str) -> bool {
+    text.lines().any(|line| {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            return false;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return false;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            return false;
+        };
+        matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("response.completed" | "response.done" | "response.failed" | "error")
+        )
+    })
+}
+
 fn normalize_content_type(value: Option<&str>) -> String {
     first_nonempty(value)
         .map(|raw| raw.to_ascii_lowercase())
@@ -477,7 +496,7 @@ async fn decode_responses_body(response: reqwest::Response, idle_timeout: Durati
 
                 if is_sse {
                     let current = String::from_utf8_lossy(&body_bytes);
-                    if contains_done_event(&current) {
+                    if contains_done_event(&current) || contains_terminal_response_event(&current) {
                         break;
                     }
                 }
@@ -804,5 +823,14 @@ data: [DONE]
             .to_string();
         assert!(err.contains("provider_response_parse_error"));
         assert!(!err.contains("response.output_text.delta"));
+    }
+
+    #[test]
+    fn detects_terminal_response_event_without_done_marker() {
+        let body = r#"data: {"type":"response.output_text.delta","delta":"partial"}
+data: {"type":"response.completed","response":{"output_text":"final"}}
+"#;
+        assert!(contains_terminal_response_event(body));
+        assert!(!contains_done_event(body));
     }
 }
