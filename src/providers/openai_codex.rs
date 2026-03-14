@@ -11,6 +11,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -296,6 +297,55 @@ fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<serde_json::Value>> {
     })
 }
 
+fn sanitize_codex_tool_name(name: &str) -> String {
+    name.replace('.', "_")
+}
+
+fn sanitize_codex_tools(
+    tools: Option<Vec<serde_json::Value>>,
+) -> (Option<Vec<serde_json::Value>>, HashMap<String, String>) {
+    let mut tool_name_map = HashMap::new();
+    let Some(items) = tools else {
+        return (None, tool_name_map);
+    };
+
+    let sanitized_items = items
+        .into_iter()
+        .map(|mut tool| {
+            let Some(obj) = tool.as_object_mut() else {
+                return tool;
+            };
+            let Some(name) = obj.get("name").and_then(Value::as_str) else {
+                return tool;
+            };
+
+            let sanitized = sanitize_codex_tool_name(name);
+            if sanitized != name {
+                tracing::warn!(
+                    original_tool_name = name,
+                    sanitized_tool_name = sanitized,
+                    "OpenAI Codex tool name sanitized to satisfy API pattern"
+                );
+                if let Some(existing) = tool_name_map.insert(sanitized.clone(), name.to_string()) {
+                    if existing != name {
+                        tracing::warn!(
+                            sanitized_tool_name = sanitized,
+                            existing_original_tool_name = existing,
+                            conflicting_original_tool_name = name,
+                            "OpenAI Codex tool name sanitization collision detected"
+                        );
+                    }
+                }
+                obj.insert("name".to_string(), Value::String(sanitized));
+            }
+
+            tool
+        })
+        .collect();
+
+    (Some(sanitized_items), tool_name_map)
+}
+
 fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<serde_json::Value> {
     if value
         .get("type")
@@ -308,7 +358,10 @@ fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<serde_json
     }
 }
 
-fn extract_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToolCall> {
+fn extract_tool_calls(
+    response: &ResponsesResponse,
+    tool_name_map: &HashMap<String, String>,
+) -> Vec<ProviderToolCall> {
     response
         .output
         .iter()
@@ -322,11 +375,15 @@ fn extract_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToolCall> {
                 if name.is_empty() {
                     return None;
                 }
+                let name = tool_name_map
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| name.to_string());
                 Some(ProviderToolCall {
                     id: call_id
                         .clone()
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    name: name.to_string(),
+                    name,
                     arguments: arguments.clone().unwrap_or_else(|| "{}".to_string()),
                 })
             }
@@ -336,7 +393,8 @@ fn extract_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToolCall> {
 }
 
 fn has_semantic_output(response: &ResponsesResponse) -> bool {
-    extract_responses_text(response).is_some() || !extract_tool_calls(response).is_empty()
+    extract_responses_text(response).is_some()
+        || !extract_tool_calls(response, &HashMap::new()).is_empty()
 }
 
 fn extract_stream_event_text(event: &Value, saw_delta: bool) -> Option<String> {
@@ -809,13 +867,13 @@ impl Provider for OpenAiCodexProvider {
         _temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
         let (instructions, input) = build_responses_input(request.messages);
-        let tools = convert_tools(request.tools);
+        let (tools, tool_name_map) = sanitize_codex_tools(convert_tools(request.tools));
         let parsed = self
             .send_and_decode_full_response(input, instructions, model, tools)
             .await?;
         Ok(ProviderChatResponse {
             text: extract_responses_text(&parsed),
-            tool_calls: extract_tool_calls(&parsed),
+            tool_calls: extract_tool_calls(&parsed, &tool_name_map),
         })
     }
 
@@ -838,12 +896,13 @@ impl Provider for OpenAiCodexProvider {
                     .collect::<Result<Vec<_>, _>>()?,
             )
         };
+        let (native_tools, tool_name_map) = sanitize_codex_tools(native_tools);
         let parsed = self
             .send_and_decode_full_response(input, instructions, model, native_tools)
             .await?;
         Ok(ProviderChatResponse {
             text: extract_responses_text(&parsed),
-            tool_calls: extract_tool_calls(&parsed),
+            tool_calls: extract_tool_calls(&parsed, &tool_name_map),
         })
     }
 }
@@ -1066,11 +1125,47 @@ data: [DONE]
 "#;
 
         let response = parse_sse_text(payload).unwrap().unwrap();
-        let tool_calls = extract_tool_calls(&response);
+        let tool_calls = extract_tool_calls(&response, &HashMap::new());
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call_123");
         assert_eq!(tool_calls[0].name, "list_files");
         assert_eq!(tool_calls[0].arguments, "{\"path\":\".\"}");
+    }
+
+    #[test]
+    fn sanitize_codex_tools_rewrites_dot_name_and_tracks_reverse_mapping() {
+        let tools = Some(vec![serde_json::json!({
+            "type": "function",
+            "name": "email.execute",
+            "description": "email action",
+            "parameters": {"type":"object"}
+        })]);
+
+        let (sanitized, mapping) = sanitize_codex_tools(tools);
+        let sanitized = sanitized.expect("sanitized tools must exist");
+        assert_eq!(sanitized[0]["name"], "email_execute");
+        assert_eq!(
+            mapping.get("email_execute").map(String::as_str),
+            Some("email.execute")
+        );
+    }
+
+    #[test]
+    fn extract_tool_calls_restores_original_name_from_mapping() {
+        let response = ResponsesResponse {
+            output: vec![ResponsesOutputItem::FunctionCall {
+                call_id: Some("call_123".to_string()),
+                name: Some("email_execute".to_string()),
+                arguments: Some("{\"to\":\"x@example.com\"}".to_string()),
+            }],
+            output_text: None,
+        };
+        let mut mapping = HashMap::new();
+        mapping.insert("email_execute".to_string(), "email.execute".to_string());
+
+        let tool_calls = extract_tool_calls(&response, &mapping);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "email.execute");
     }
 
     #[test]
