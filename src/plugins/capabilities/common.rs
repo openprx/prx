@@ -19,27 +19,29 @@ use crate::plugins::host::HostState;
 pub fn register_log_host_functions(
     linker: &mut wasmtime::component::Linker<HostState>,
 ) -> PluginResult<()> {
-    let mut log_inst = linker
-        .instance("prx:host/log@0.1.0")
-        .map_err(|e| PluginError::Instantiation(format!("linker error (log): {e}")))?;
-    log_inst
-        .func_wrap(
-            "log",
-            |store: wasmtime::StoreContextMut<'_, HostState>,
-             (level, message): (String, String)| {
-                let name = store.data().plugin_name.clone();
-                match level.as_str() {
-                    "trace" => tracing::trace!(plugin = %name, "{message}"),
-                    "debug" => tracing::debug!(plugin = %name, "{message}"),
-                    "info" => tracing::info!(plugin = %name, "{message}"),
-                    "warn" => tracing::warn!(plugin = %name, "{message}"),
-                    "error" => tracing::error!(plugin = %name, "{message}"),
-                    _ => tracing::info!(plugin = %name, level = %level, "{message}"),
-                }
-                Ok(())
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link log.log: {e}")))?;
+    for iface in ["prx:host/log@0.1.0", "prx:host/log"] {
+        let mut log_inst = linker.instance(iface).map_err(|e| {
+            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
+        })?;
+        log_inst
+            .func_wrap(
+                "log",
+                |store: wasmtime::StoreContextMut<'_, HostState>,
+                 (level, message): (String, String)| {
+                    let name = store.data().plugin_name.clone();
+                    match level.as_str() {
+                        "trace" => tracing::trace!(plugin = %name, "{message}"),
+                        "debug" => tracing::debug!(plugin = %name, "{message}"),
+                        "info" => tracing::info!(plugin = %name, "{message}"),
+                        "warn" => tracing::warn!(plugin = %name, "{message}"),
+                        "error" => tracing::error!(plugin = %name, "{message}"),
+                        _ => tracing::info!(plugin = %name, level = %level, "{message}"),
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.log: {e}")))?;
+    }
     Ok(())
 }
 
@@ -47,32 +49,34 @@ pub fn register_log_host_functions(
 pub fn register_config_host_functions(
     linker: &mut wasmtime::component::Linker<HostState>,
 ) -> PluginResult<()> {
-    let mut config_inst = linker
-        .instance("prx:host/config@0.1.0")
-        .map_err(|e| PluginError::Instantiation(format!("linker error (config): {e}")))?;
-    config_inst
-        .func_wrap(
-            "get",
-            |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
-                let value = store.data().config.get(&key).cloned();
-                Ok((value,))
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link config.get: {e}")))?;
-    config_inst
-        .func_wrap(
-            "get-all",
-            |store: wasmtime::StoreContextMut<'_, HostState>, (): ()| {
-                let pairs: Vec<(String, String)> = store
-                    .data()
-                    .config
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                Ok((pairs,))
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link config.get-all: {e}")))?;
+    for iface in ["prx:host/config@0.1.0", "prx:host/config"] {
+        let mut config_inst = linker.instance(iface).map_err(|e| {
+            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
+        })?;
+        config_inst
+            .func_wrap(
+                "get",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
+                    let value = store.data().config.get(&key).cloned();
+                    Ok((value,))
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.get: {e}")))?;
+        config_inst
+            .func_wrap(
+                "get-all",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (): ()| {
+                    let pairs: Vec<(String, String)> = store
+                        .data()
+                        .config
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    Ok((pairs,))
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.get-all: {e}")))?;
+    }
     Ok(())
 }
 
@@ -85,85 +89,87 @@ pub fn register_config_host_functions(
 pub fn register_kv_host_functions(
     linker: &mut wasmtime::component::Linker<HostState>,
 ) -> PluginResult<()> {
-    let mut kv_inst = linker
-        .instance("prx:host/kv@0.1.0")
-        .map_err(|e| PluginError::Instantiation(format!("linker error (kv): {e}")))?;
+    for iface in ["prx:host/kv@0.1.0", "prx:host/kv"] {
+        let mut kv_inst = linker.instance(iface).map_err(|e| {
+            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
+        })?;
 
-    kv_inst
-        .func_wrap_async(
-            "get",
-            |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
-                Box::new(async move {
-                    if let Err(e) = store.data().check_permission("kv") {
-                        tracing::warn!("{e}");
-                        return Ok((None::<Vec<u8>>,));
-                    }
-                    let kv = store.data().kv_store.clone();
-                    let guard = kv.read().await;
-                    let value = guard.get(&key).cloned();
-                    Ok((value,))
-                })
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link kv.get: {e}")))?;
+        kv_inst
+            .func_wrap_async(
+                "get",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
+                    Box::new(async move {
+                        if let Err(e) = store.data().check_permission("kv") {
+                            tracing::warn!("{e}");
+                            return Ok((None::<Vec<u8>>,));
+                        }
+                        let kv = store.data().kv_store.clone();
+                        let guard = kv.read().await;
+                        let value = guard.get(&key).cloned();
+                        Ok((value,))
+                    })
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.get: {e}")))?;
 
-    kv_inst
-        .func_wrap_async(
-            "set",
-            |store: wasmtime::StoreContextMut<'_, HostState>, (key, value): (String, Vec<u8>)| {
-                Box::new(async move {
-                    if let Err(e) = store.data().check_permission("kv") {
-                        tracing::warn!("{e}");
-                        return Ok(());
-                    }
-                    let kv = store.data().kv_store.clone();
-                    let mut guard = kv.write().await;
-                    guard.insert(key, value);
-                    Ok(())
-                })
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link kv.set: {e}")))?;
+        kv_inst
+            .func_wrap_async(
+                "set",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (key, value): (String, Vec<u8>)| {
+                    Box::new(async move {
+                        if let Err(e) = store.data().check_permission("kv") {
+                            tracing::warn!("{e}");
+                            return Ok(());
+                        }
+                        let kv = store.data().kv_store.clone();
+                        let mut guard = kv.write().await;
+                        guard.insert(key, value);
+                        Ok(())
+                    })
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.set: {e}")))?;
 
-    kv_inst
-        .func_wrap_async(
-            "delete",
-            |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
-                Box::new(async move {
-                    if let Err(e) = store.data().check_permission("kv") {
-                        tracing::warn!("{e}");
-                        return Ok((false,));
-                    }
-                    let kv = store.data().kv_store.clone();
-                    let mut guard = kv.write().await;
-                    let existed = guard.remove(&key).is_some();
-                    Ok((existed,))
-                })
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link kv.delete: {e}")))?;
+        kv_inst
+            .func_wrap_async(
+                "delete",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
+                    Box::new(async move {
+                        if let Err(e) = store.data().check_permission("kv") {
+                            tracing::warn!("{e}");
+                            return Ok((false,));
+                        }
+                        let kv = store.data().kv_store.clone();
+                        let mut guard = kv.write().await;
+                        let existed = guard.remove(&key).is_some();
+                        Ok((existed,))
+                    })
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.delete: {e}")))?;
 
-    kv_inst
-        .func_wrap_async(
-            "list-keys",
-            |store: wasmtime::StoreContextMut<'_, HostState>, (prefix,): (String,)| {
-                Box::new(async move {
-                    if let Err(e) = store.data().check_permission("kv") {
-                        tracing::warn!("{e}");
-                        return Ok((vec![],));
-                    }
-                    let kv = store.data().kv_store.clone();
-                    let guard = kv.read().await;
-                    let keys: Vec<String> = guard
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix))
-                        .cloned()
-                        .collect();
-                    Ok((keys,))
-                })
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link kv.list-keys: {e}")))?;
+        kv_inst
+            .func_wrap_async(
+                "list-keys",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (prefix,): (String,)| {
+                    Box::new(async move {
+                        if let Err(e) = store.data().check_permission("kv") {
+                            tracing::warn!("{e}");
+                            return Ok((vec![],));
+                        }
+                        let kv = store.data().kv_store.clone();
+                        let guard = kv.read().await;
+                        let keys: Vec<String> = guard
+                            .keys()
+                            .filter(|k| k.starts_with(&prefix))
+                            .cloned()
+                            .collect();
+                        Ok((keys,))
+                    })
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.list-keys: {e}")))?;
+    }
 
     Ok(())
 }
@@ -178,111 +184,113 @@ pub fn register_event_host_functions(
 ) -> PluginResult<()> {
     use crate::plugins::event_bus::MAX_PAYLOAD_BYTES;
 
-    let mut inst = linker
-        .instance("prx:host/events@0.1.0")
-        .map_err(|e| PluginError::Instantiation(format!("linker error (events): {e}")))?;
+    for iface in ["prx:host/events@0.1.0", "prx:host/events"] {
+        let mut inst = linker.instance(iface).map_err(|e| {
+            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
+        })?;
 
-    // ── publish ──
-    inst.func_wrap_async(
-        "publish",
-        |store: wasmtime::StoreContextMut<'_, HostState>,
-         (topic, payload): (String, String)| {
-            Box::new(async move {
-                // Permission check.
-                if let Err(e) = store.data().check_permission("events") {
-                    tracing::warn!("{e}");
-                    return Ok((Err::<(), String>(e),));
-                }
-                // Payload size check.
-                if payload.len() > MAX_PAYLOAD_BYTES {
-                    let err = format!(
-                        "event bus: payload size {} exceeds maximum {} bytes",
-                        payload.len(),
-                        MAX_PAYLOAD_BYTES
-                    );
-                    return Ok((Err(err),));
-                }
-                match &store.data().event_bus {
-                    None => {
-                        // No event bus configured — silently succeed.
-                        tracing::debug!(topic = %topic, "event bus not configured, dropping publish");
-                        Ok((Ok(()),))
+        // ── publish ──
+        inst.func_wrap_async(
+            "publish",
+            |store: wasmtime::StoreContextMut<'_, HostState>,
+             (topic, payload): (String, String)| {
+                Box::new(async move {
+                    // Permission check.
+                    if let Err(e) = store.data().check_permission("events") {
+                        tracing::warn!("{e}");
+                        return Ok((Err::<(), String>(e),));
                     }
-                    Some(bus) => {
-                        let bus = bus.clone();
-                        match bus.publish(&topic, &payload).await {
-                            Ok(()) => Ok((Ok(()),)),
-                            Err(e) => Ok((Err(e),)),
+                    // Payload size check.
+                    if payload.len() > MAX_PAYLOAD_BYTES {
+                        let err = format!(
+                            "event bus: payload size {} exceeds maximum {} bytes",
+                            payload.len(),
+                            MAX_PAYLOAD_BYTES
+                        );
+                        return Ok((Err(err),));
+                    }
+                    match &store.data().event_bus {
+                        None => {
+                            // No event bus configured — silently succeed.
+                            tracing::debug!(topic = %topic, "event bus not configured, dropping publish");
+                            Ok((Ok(()),))
                         }
-                    }
-                }
-            })
-        },
-    )
-    .map_err(|e| PluginError::Instantiation(format!("link events.publish: {e}")))?;
-
-    // ── subscribe ──
-    inst.func_wrap_async(
-        "subscribe",
-        |store: wasmtime::StoreContextMut<'_, HostState>, (pattern,): (String,)| {
-            Box::new(async move {
-                if let Err(e) = store.data().check_permission("events") {
-                    tracing::warn!("{e}");
-                    return Ok((Err::<u64, String>(e),));
-                }
-                match &store.data().event_bus {
-                    None => {
-                        tracing::debug!(pattern = %pattern, "event bus not configured, subscribe no-op");
-                        Ok((Ok(0u64),))
-                    }
-                    Some(bus) => {
-                        let plugin_name = store.data().plugin_name.clone();
-                        let bus = bus.clone();
-                        match bus.subscribe(&plugin_name, &pattern).await {
-                            Ok((id, _rx)) => {
-                                // Note: the receiver is intentionally dropped here for the
-                                // host-function path. Full receiver wiring (dispatching back
-                                // into guest on-event) is deferred to the PDK integration layer.
-                                tracing::debug!(
-                                    plugin = %plugin_name,
-                                    pattern = %pattern,
-                                    subscription_id = id,
-                                    "event bus: subscription registered"
-                                );
-                                Ok((Ok(id),))
+                        Some(bus) => {
+                            let bus = bus.clone();
+                            match bus.publish(&topic, &payload).await {
+                                Ok(()) => Ok((Ok(()),)),
+                                Err(e) => Ok((Err(e),)),
                             }
-                            Err(e) => Ok((Err(e),)),
                         }
                     }
-                }
-            })
-        },
-    )
-    .map_err(|e| PluginError::Instantiation(format!("link events.subscribe: {e}")))?;
+                })
+            },
+        )
+        .map_err(|e| PluginError::Instantiation(format!("link {iface}.publish: {e}")))?;
 
-    // ── unsubscribe ──
-    inst.func_wrap_async(
-        "unsubscribe",
-        |store: wasmtime::StoreContextMut<'_, HostState>, (sub_id,): (u64,)| {
-            Box::new(async move {
-                if let Err(e) = store.data().check_permission("events") {
-                    tracing::warn!("{e}");
-                    return Ok((Err::<(), String>(e),));
-                }
-                match &store.data().event_bus {
-                    None => Ok((Ok(()),)),
-                    Some(bus) => {
-                        let bus = bus.clone();
-                        match bus.unsubscribe(sub_id).await {
-                            Ok(()) => Ok((Ok(()),)),
-                            Err(e) => Ok((Err(e),)),
+        // ── subscribe ──
+        inst.func_wrap_async(
+            "subscribe",
+            |store: wasmtime::StoreContextMut<'_, HostState>, (pattern,): (String,)| {
+                Box::new(async move {
+                    if let Err(e) = store.data().check_permission("events") {
+                        tracing::warn!("{e}");
+                        return Ok((Err::<u64, String>(e),));
+                    }
+                    match &store.data().event_bus {
+                        None => {
+                            tracing::debug!(pattern = %pattern, "event bus not configured, subscribe no-op");
+                            Ok((Ok(0u64),))
+                        }
+                        Some(bus) => {
+                            let plugin_name = store.data().plugin_name.clone();
+                            let bus = bus.clone();
+                            match bus.subscribe(&plugin_name, &pattern).await {
+                                Ok((id, _rx)) => {
+                                    // Note: the receiver is intentionally dropped here for the
+                                    // host-function path. Full receiver wiring (dispatching back
+                                    // into guest on-event) is deferred to the PDK integration layer.
+                                    tracing::debug!(
+                                        plugin = %plugin_name,
+                                        pattern = %pattern,
+                                        subscription_id = id,
+                                        "event bus: subscription registered"
+                                    );
+                                    Ok((Ok(id),))
+                                }
+                                Err(e) => Ok((Err(e),)),
+                            }
                         }
                     }
-                }
-            })
-        },
-    )
-    .map_err(|e| PluginError::Instantiation(format!("link events.unsubscribe: {e}")))?;
+                })
+            },
+        )
+        .map_err(|e| PluginError::Instantiation(format!("link {iface}.subscribe: {e}")))?;
+
+        // ── unsubscribe ──
+        inst.func_wrap_async(
+            "unsubscribe",
+            |store: wasmtime::StoreContextMut<'_, HostState>, (sub_id,): (u64,)| {
+                Box::new(async move {
+                    if let Err(e) = store.data().check_permission("events") {
+                        tracing::warn!("{e}");
+                        return Ok((Err::<(), String>(e),));
+                    }
+                    match &store.data().event_bus {
+                        None => Ok((Ok(()),)),
+                        Some(bus) => {
+                            let bus = bus.clone();
+                            match bus.unsubscribe(sub_id).await {
+                                Ok(()) => Ok((Ok(()),)),
+                                Err(e) => Ok((Err(e),)),
+                            }
+                        }
+                    }
+                })
+            },
+        )
+        .map_err(|e| PluginError::Instantiation(format!("link {iface}.unsubscribe: {e}")))?;
+    }
 
     Ok(())
 }
@@ -294,66 +302,68 @@ pub fn register_event_host_functions(
 pub fn register_http_host_functions(
     linker: &mut wasmtime::component::Linker<HostState>,
 ) -> PluginResult<()> {
-    let mut http_inst = linker
-        .instance("prx:host/http-outbound@0.1.0")
-        .map_err(|e| PluginError::Instantiation(format!("linker error (http): {e}")))?;
+    for iface in ["prx:host/http-outbound@0.1.0", "prx:host/http-outbound"] {
+        let mut http_inst = linker.instance(iface).map_err(|e| {
+            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
+        })?;
 
-    http_inst
-        .func_wrap_async(
-            "request",
-            |store: wasmtime::StoreContextMut<'_, HostState>,
-             (method, url, headers, body): (
-                String,
-                String,
-                Vec<(String, String)>,
-                Option<Vec<u8>>,
-            )| {
-                Box::new(async move {
-                    if let Err(e) = store.data().check_permission("http-outbound") {
-                        return Ok((Err::<(u16, Vec<(String, String)>, Vec<u8>), String>(e),));
-                    }
-                    if !store.data().check_url_allowed(&url) {
-                        return Ok((Err(format!("URL not in allowlist: {url}")),));
-                    }
-
-                    let client = reqwest::Client::new();
-                    let mut req = match method.to_uppercase().as_str() {
-                        "GET" => client.get(&url),
-                        "POST" => client.post(&url),
-                        "PUT" => client.put(&url),
-                        "DELETE" => client.delete(&url),
-                        "PATCH" => client.patch(&url),
-                        "HEAD" => client.head(&url),
-                        _ => return Ok((Err(format!("unsupported method: {method}")),)),
-                    };
-
-                    for (k, v) in &headers {
-                        req = req.header(k.as_str(), v.as_str());
-                    }
-
-                    if let Some(b) = body {
-                        req = req.body(b);
-                    }
-
-                    match req.send().await {
-                        Ok(resp) => {
-                            let status = resp.status().as_u16();
-                            let resp_headers: Vec<(String, String)> = resp
-                                .headers()
-                                .iter()
-                                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-                                .collect();
-                            match resp.bytes().await {
-                                Ok(bytes) => Ok((Ok((status, resp_headers, bytes.to_vec())),)),
-                                Err(e) => Ok((Err(format!("body read error: {e}")),)),
-                            }
+        http_inst
+            .func_wrap_async(
+                "request",
+                |store: wasmtime::StoreContextMut<'_, HostState>,
+                 (method, url, headers, body): (
+                    String,
+                    String,
+                    Vec<(String, String)>,
+                    Option<Vec<u8>>,
+                )| {
+                    Box::new(async move {
+                        if let Err(e) = store.data().check_permission("http-outbound") {
+                            return Ok((Err::<(u16, Vec<(String, String)>, Vec<u8>), String>(e),));
                         }
-                        Err(e) => Ok((Err(format!("request failed: {e}")),)),
-                    }
-                })
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link http.request: {e}")))?;
+                        if !store.data().check_url_allowed(&url) {
+                            return Ok((Err(format!("URL not in allowlist: {url}")),));
+                        }
+
+                        let client = reqwest::Client::new();
+                        let mut req = match method.to_uppercase().as_str() {
+                            "GET" => client.get(&url),
+                            "POST" => client.post(&url),
+                            "PUT" => client.put(&url),
+                            "DELETE" => client.delete(&url),
+                            "PATCH" => client.patch(&url),
+                            "HEAD" => client.head(&url),
+                            _ => return Ok((Err(format!("unsupported method: {method}")),)),
+                        };
+
+                        for (k, v) in &headers {
+                            req = req.header(k.as_str(), v.as_str());
+                        }
+
+                        if let Some(b) = body {
+                            req = req.body(b);
+                        }
+
+                        match req.send().await {
+                            Ok(resp) => {
+                                let status = resp.status().as_u16();
+                                let resp_headers: Vec<(String, String)> = resp
+                                    .headers()
+                                    .iter()
+                                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                                    .collect();
+                                match resp.bytes().await {
+                                    Ok(bytes) => Ok((Ok((status, resp_headers, bytes.to_vec())),)),
+                                    Err(e) => Ok((Err(format!("body read error: {e}")),)),
+                                }
+                            }
+                            Err(e) => Ok((Err(format!("request failed: {e}")),)),
+                        }
+                    })
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.request: {e}")))?;
+    }
 
     Ok(())
 }
@@ -366,104 +376,109 @@ pub fn register_http_host_functions(
 pub fn register_websocket_host_functions(
     linker: &mut wasmtime::component::Linker<HostState>,
 ) -> PluginResult<()> {
-    let mut ws_inst = linker
-        .instance("prx:host/websocket-outbound@0.1.0")
-        .map_err(|e| PluginError::Instantiation(format!("linker error (websocket): {e}")))?;
+    for iface in [
+        "prx:host/websocket-outbound@0.1.0",
+        "prx:host/websocket-outbound",
+    ] {
+        let mut ws_inst = linker.instance(iface).map_err(|e| {
+            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
+        })?;
 
-    ws_inst
-        .func_wrap_async(
-            "connect",
-            |store: wasmtime::StoreContextMut<'_, HostState>, (url,): (String,)| {
-                let permission = store.data().check_permission("websocket-outbound");
-                let is_allowed = store.data().check_url_allowed(&url);
-                let timeout_ms = store.data().timeout_ms;
-                let connector = Arc::clone(&store.data().websocket_connector);
-                let sessions = Arc::clone(&store.data().websocket_sessions);
-                let next_session_id = Arc::clone(&store.data().next_websocket_session_id);
-                Box::new(async move {
-                    if let Err(error) = permission {
-                        return Ok((Err::<u64, String>(error),));
-                    }
-                    if !is_allowed {
-                        return Ok((Err(format!("URL not in allowlist: {url}")),));
-                    }
-                    let result = crate::plugins::host::websocket_connect_with(
-                        connector,
-                        sessions,
-                        next_session_id,
-                        timeout_ms,
-                        url,
-                    )
-                    .await;
-                    Ok((result,))
-                })
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link websocket.connect: {e}")))?;
+        ws_inst
+            .func_wrap_async(
+                "connect",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (url,): (String,)| {
+                    let permission = store.data().check_permission("websocket-outbound");
+                    let is_allowed = store.data().check_url_allowed(&url);
+                    let timeout_ms = store.data().timeout_ms;
+                    let connector = Arc::clone(&store.data().websocket_connector);
+                    let sessions = Arc::clone(&store.data().websocket_sessions);
+                    let next_session_id = Arc::clone(&store.data().next_websocket_session_id);
+                    Box::new(async move {
+                        if let Err(error) = permission {
+                            return Ok((Err::<u64, String>(error),));
+                        }
+                        if !is_allowed {
+                            return Ok((Err(format!("URL not in allowlist: {url}")),));
+                        }
+                        let result = crate::plugins::host::websocket_connect_with(
+                            connector,
+                            sessions,
+                            next_session_id,
+                            timeout_ms,
+                            url,
+                        )
+                        .await;
+                        Ok((result,))
+                    })
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.connect: {e}")))?;
 
-    ws_inst
-        .func_wrap_async(
-            "send",
-            |store: wasmtime::StoreContextMut<'_, HostState>,
-             (session_id, message): (u64, String)| {
-                let permission = store.data().check_permission("websocket-outbound");
-                let timeout_ms = store.data().timeout_ms;
-                let sessions = Arc::clone(&store.data().websocket_sessions);
-                Box::new(async move {
-                    if let Err(error) = permission {
-                        return Ok((Err::<(), String>(error),));
-                    }
-                    let result = crate::plugins::host::websocket_send_with(
-                        sessions, timeout_ms, session_id, message,
-                    )
-                    .await;
-                    Ok((result,))
-                })
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link websocket.send: {e}")))?;
+        ws_inst
+            .func_wrap_async(
+                "send",
+                |store: wasmtime::StoreContextMut<'_, HostState>,
+                 (session_id, message): (u64, String)| {
+                    let permission = store.data().check_permission("websocket-outbound");
+                    let timeout_ms = store.data().timeout_ms;
+                    let sessions = Arc::clone(&store.data().websocket_sessions);
+                    Box::new(async move {
+                        if let Err(error) = permission {
+                            return Ok((Err::<(), String>(error),));
+                        }
+                        let result = crate::plugins::host::websocket_send_with(
+                            sessions, timeout_ms, session_id, message,
+                        )
+                        .await;
+                        Ok((result,))
+                    })
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.send: {e}")))?;
 
-    ws_inst
-        .func_wrap_async(
-            "receive",
-            |store: wasmtime::StoreContextMut<'_, HostState>, (session_id,): (u64,)| {
-                let permission = store.data().check_permission("websocket-outbound");
-                let timeout_ms = store.data().timeout_ms;
-                let sessions = Arc::clone(&store.data().websocket_sessions);
-                Box::new(async move {
-                    if let Err(error) = permission {
-                        return Ok((Err::<String, String>(error),));
-                    }
-                    let result = crate::plugins::host::websocket_receive_with(
-                        sessions, timeout_ms, session_id,
-                    )
-                    .await;
-                    Ok((result,))
-                })
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link websocket.receive: {e}")))?;
+        ws_inst
+            .func_wrap_async(
+                "receive",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (session_id,): (u64,)| {
+                    let permission = store.data().check_permission("websocket-outbound");
+                    let timeout_ms = store.data().timeout_ms;
+                    let sessions = Arc::clone(&store.data().websocket_sessions);
+                    Box::new(async move {
+                        if let Err(error) = permission {
+                            return Ok((Err::<String, String>(error),));
+                        }
+                        let result = crate::plugins::host::websocket_receive_with(
+                            sessions, timeout_ms, session_id,
+                        )
+                        .await;
+                        Ok((result,))
+                    })
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.receive: {e}")))?;
 
-    ws_inst
-        .func_wrap_async(
-            "close",
-            |store: wasmtime::StoreContextMut<'_, HostState>, (session_id,): (u64,)| {
-                let permission = store.data().check_permission("websocket-outbound");
-                let timeout_ms = store.data().timeout_ms;
-                let sessions = Arc::clone(&store.data().websocket_sessions);
-                Box::new(async move {
-                    if let Err(error) = permission {
-                        return Ok((Err::<(), String>(error),));
-                    }
-                    let result = crate::plugins::host::websocket_close_with(
-                        sessions, timeout_ms, session_id,
-                    )
-                    .await;
-                    Ok((result,))
-                })
-            },
-        )
-        .map_err(|e| PluginError::Instantiation(format!("link websocket.close: {e}")))?;
+        ws_inst
+            .func_wrap_async(
+                "close",
+                |store: wasmtime::StoreContextMut<'_, HostState>, (session_id,): (u64,)| {
+                    let permission = store.data().check_permission("websocket-outbound");
+                    let timeout_ms = store.data().timeout_ms;
+                    let sessions = Arc::clone(&store.data().websocket_sessions);
+                    Box::new(async move {
+                        if let Err(error) = permission {
+                            return Ok((Err::<(), String>(error),));
+                        }
+                        let result = crate::plugins::host::websocket_close_with(
+                            sessions, timeout_ms, session_id,
+                        )
+                        .await;
+                        Ok((result,))
+                    })
+                },
+            )
+            .map_err(|e| PluginError::Instantiation(format!("link {iface}.close: {e}")))?;
+    }
 
     Ok(())
 }

@@ -119,232 +119,238 @@ impl WasmToolAdapter {
         super::common::register_log_host_functions(linker)?;
         super::common::register_config_host_functions(linker)?;
 
-        // prx:host/kv@0.1.0
-        // Tool plugins use result<T, string> return types, which differ from the
-        // simpler variants in middleware/hook/cron. We register kv manually here.
-        let mut kv_inst = linker
-            .instance("prx:host/kv@0.1.0")
-            .map_err(|e| PluginError::Instantiation(format!("linker error (kv): {e}")))?;
+        // Tool plugins use result<T, string> return types for kv/http/memory,
+        // so these interfaces are linked manually here.
+        for iface in ["prx:host/kv@0.1.0", "prx:host/kv"] {
+            let mut kv_inst = linker.instance(iface).map_err(|e| {
+                PluginError::Instantiation(format!("linker error ({iface}): {e}"))
+            })?;
 
-        kv_inst
-            .func_wrap_async(
-                "get",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
-                    Box::new(async move {
-                        if let Err(e) = store.data().check_permission("kv") {
-                            tracing::warn!("{e}");
-                            return Ok((None::<Vec<u8>>,));
-                        }
-                        let kv = store.data().kv_store.clone();
-                        let guard = kv.read().await;
-                        let val = guard.get(&key).cloned();
-                        Ok((val,))
-                    })
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link kv.get: {e}")))?;
-
-        kv_inst
-            .func_wrap_async(
-                "set",
-                |store: wasmtime::StoreContextMut<'_, HostState>,
-                 (key, value): (String, Vec<u8>)| {
-                    Box::new(async move {
-                        if let Err(e) = store.data().check_permission("kv") {
-                            return Ok((Err::<(), String>(e),));
-                        }
-                        let kv = store.data().kv_store.clone();
-                        let mut guard = kv.write().await;
-                        guard.insert(key, value);
-                        Ok((Ok::<(), String>(()),))
-                    })
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link kv.set: {e}")))?;
-
-        kv_inst
-            .func_wrap_async(
-                "delete",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
-                    Box::new(async move {
-                        if let Err(e) = store.data().check_permission("kv") {
-                            return Ok((Err::<bool, String>(e),));
-                        }
-                        let kv = store.data().kv_store.clone();
-                        let mut guard = kv.write().await;
-                        let existed = guard.remove(&key).is_some();
-                        Ok((Ok::<bool, String>(existed),))
-                    })
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link kv.delete: {e}")))?;
-
-        kv_inst
-            .func_wrap_async(
-                "list-keys",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (prefix,): (String,)| {
-                    Box::new(async move {
-                        if let Err(e) = store.data().check_permission("kv") {
-                            tracing::warn!("{e}");
-                            return Ok((vec![],));
-                        }
-                        let kv = store.data().kv_store.clone();
-                        let guard = kv.read().await;
-                        let keys: Vec<String> = guard
-                            .keys()
-                            .filter(|k| k.starts_with(&prefix))
-                            .cloned()
-                            .collect();
-                        Ok((keys,))
-                    })
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link kv.list-keys: {e}")))?;
-
-        // prx:host/http-outbound@0.1.0
-        let mut http_inst = linker
-            .instance("prx:host/http-outbound@0.1.0")
-            .map_err(|e| PluginError::Instantiation(format!("linker error (http): {e}")))?;
-
-        http_inst
-            .func_wrap_async(
-                "request",
-                |store: wasmtime::StoreContextMut<'_, HostState>,
-                 (method, url, headers, body): (
-                    String,
-                    String,
-                    Vec<(String, String)>,
-                    Option<Vec<u8>>,
-                )| {
-                    Box::new(async move {
-                        if let Err(e) = store.data().check_permission("http-outbound") {
-                            return Ok((Err::<(u16, Vec<(String, String)>, Vec<u8>), String>(e),));
-                        }
-                        if !store.data().check_url_allowed(&url) {
-                            return Ok((Err(format!("URL not in allowlist: {url}")),));
-                        }
-
-                        let client = reqwest::Client::new();
-                        let mut req = match method.to_uppercase().as_str() {
-                            "GET" => client.get(&url),
-                            "POST" => client.post(&url),
-                            "PUT" => client.put(&url),
-                            "DELETE" => client.delete(&url),
-                            "PATCH" => client.patch(&url),
-                            "HEAD" => client.head(&url),
-                            _ => return Ok((Err(format!("unsupported method: {method}")),)),
-                        };
-
-                        for (k, v) in &headers {
-                            req = req.header(k.as_str(), v.as_str());
-                        }
-
-                        if let Some(b) = body {
-                            req = req.body(b);
-                        }
-
-                        match req.send().await {
-                            Ok(resp) => {
-                                let status = resp.status().as_u16();
-                                let resp_headers: Vec<(String, String)> = resp
-                                    .headers()
-                                    .iter()
-                                    .map(|(k, v)| {
-                                        (k.to_string(), v.to_str().unwrap_or("").to_string())
-                                    })
-                                    .collect();
-                                match resp.bytes().await {
-                                    Ok(bytes) => Ok((Ok((status, resp_headers, bytes.to_vec())),)),
-                                    Err(e) => Ok((Err(format!("body read error: {e}")),)),
-                                }
+            kv_inst
+                .func_wrap_async(
+                    "get",
+                    |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
+                        Box::new(async move {
+                            if let Err(e) = store.data().check_permission("kv") {
+                                tracing::warn!("{e}");
+                                return Ok((None::<Vec<u8>>,));
                             }
-                            Err(e) => Ok((Err(format!("request failed: {e}")),)),
-                        }
-                    })
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link http.request: {e}")))?;
+                            let kv = store.data().kv_store.clone();
+                            let guard = kv.read().await;
+                            let val = guard.get(&key).cloned();
+                            Ok((val,))
+                        })
+                    },
+                )
+                .map_err(|e| PluginError::Instantiation(format!("link {iface}.get: {e}")))?;
+
+            kv_inst
+                .func_wrap_async(
+                    "set",
+                    |store: wasmtime::StoreContextMut<'_, HostState>,
+                     (key, value): (String, Vec<u8>)| {
+                        Box::new(async move {
+                            if let Err(e) = store.data().check_permission("kv") {
+                                return Ok((Err::<(), String>(e),));
+                            }
+                            let kv = store.data().kv_store.clone();
+                            let mut guard = kv.write().await;
+                            guard.insert(key, value);
+                            Ok((Ok::<(), String>(()),))
+                        })
+                    },
+                )
+                .map_err(|e| PluginError::Instantiation(format!("link {iface}.set: {e}")))?;
+
+            kv_inst
+                .func_wrap_async(
+                    "delete",
+                    |store: wasmtime::StoreContextMut<'_, HostState>, (key,): (String,)| {
+                        Box::new(async move {
+                            if let Err(e) = store.data().check_permission("kv") {
+                                return Ok((Err::<bool, String>(e),));
+                            }
+                            let kv = store.data().kv_store.clone();
+                            let mut guard = kv.write().await;
+                            let existed = guard.remove(&key).is_some();
+                            Ok((Ok::<bool, String>(existed),))
+                        })
+                    },
+                )
+                .map_err(|e| PluginError::Instantiation(format!("link {iface}.delete: {e}")))?;
+
+            kv_inst
+                .func_wrap_async(
+                    "list-keys",
+                    |store: wasmtime::StoreContextMut<'_, HostState>, (prefix,): (String,)| {
+                        Box::new(async move {
+                            if let Err(e) = store.data().check_permission("kv") {
+                                tracing::warn!("{e}");
+                                return Ok((vec![],));
+                            }
+                            let kv = store.data().kv_store.clone();
+                            let guard = kv.read().await;
+                            let keys: Vec<String> = guard
+                                .keys()
+                                .filter(|k| k.starts_with(&prefix))
+                                .cloned()
+                                .collect();
+                            Ok((keys,))
+                        })
+                    },
+                )
+                .map_err(|e| PluginError::Instantiation(format!("link {iface}.list-keys: {e}")))?;
+        }
+
+        for iface in ["prx:host/http-outbound@0.1.0", "prx:host/http-outbound"] {
+            let mut http_inst = linker.instance(iface).map_err(|e| {
+                PluginError::Instantiation(format!("linker error ({iface}): {e}"))
+            })?;
+
+            http_inst
+                .func_wrap_async(
+                    "request",
+                    |store: wasmtime::StoreContextMut<'_, HostState>,
+                     (method, url, headers, body): (
+                        String,
+                        String,
+                        Vec<(String, String)>,
+                        Option<Vec<u8>>,
+                    )| {
+                        Box::new(async move {
+                            if let Err(e) = store.data().check_permission("http-outbound") {
+                                return Ok((Err::<(u16, Vec<(String, String)>, Vec<u8>), String>(e),));
+                            }
+                            if !store.data().check_url_allowed(&url) {
+                                return Ok((Err(format!("URL not in allowlist: {url}")),));
+                            }
+
+                            let client = reqwest::Client::new();
+                            let mut req = match method.to_uppercase().as_str() {
+                                "GET" => client.get(&url),
+                                "POST" => client.post(&url),
+                                "PUT" => client.put(&url),
+                                "DELETE" => client.delete(&url),
+                                "PATCH" => client.patch(&url),
+                                "HEAD" => client.head(&url),
+                                _ => return Ok((Err(format!("unsupported method: {method}")),)),
+                            };
+
+                            for (k, v) in &headers {
+                                req = req.header(k.as_str(), v.as_str());
+                            }
+
+                            if let Some(b) = body {
+                                req = req.body(b);
+                            }
+
+                            match req.send().await {
+                                Ok(resp) => {
+                                    let status = resp.status().as_u16();
+                                    let resp_headers: Vec<(String, String)> = resp
+                                        .headers()
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            (k.to_string(), v.to_str().unwrap_or("").to_string())
+                                        })
+                                        .collect();
+                                    match resp.bytes().await {
+                                        Ok(bytes) => Ok((Ok((status, resp_headers, bytes.to_vec())),)),
+                                        Err(e) => Ok((Err(format!("body read error: {e}")),)),
+                                    }
+                                }
+                                Err(e) => Ok((Err(format!("request failed: {e}")),)),
+                            }
+                        })
+                    },
+                )
+                .map_err(|e| PluginError::Instantiation(format!("link {iface}.request: {e}")))?;
+        }
 
         super::common::register_websocket_host_functions(linker)?;
 
-        // prx:host/memory@0.1.0 — connected to real memory backend
-        let mut mem_inst = linker
-            .instance("prx:host/memory@0.1.0")
-            .map_err(|e| PluginError::Instantiation(format!("linker error (memory): {e}")))?;
+        // prx:host/memory — connected to real memory backend
+        for iface in ["prx:host/memory@0.1.0", "prx:host/memory"] {
+            let mut mem_inst = linker.instance(iface).map_err(|e| {
+                PluginError::Instantiation(format!("linker error ({iface}): {e}"))
+            })?;
 
-        mem_inst
-            .func_wrap_async(
-                "store",
-                |store: wasmtime::StoreContextMut<'_, HostState>,
-                 (text, category): (String, String)| {
-                    Box::new(async move {
-                        if let Err(e) = store.data().check_permission("memory") {
-                            return Ok((Err::<String, String>(e),));
-                        }
-                        let mem = match &store.data().memory {
-                            Some(m) => Arc::clone(m),
-                            None => {
-                                return Ok((Err::<String, String>(
-                                    "memory backend not configured".to_string(),
-                                ),));
+            mem_inst
+                .func_wrap_async(
+                    "store",
+                    |store: wasmtime::StoreContextMut<'_, HostState>,
+                     (text, category): (String, String)| {
+                        Box::new(async move {
+                            if let Err(e) = store.data().check_permission("memory") {
+                                return Ok((Err::<String, String>(e),));
                             }
-                        };
-                        let plugin_name = store.data().plugin_name.clone();
-                        let key = format!("plugin:{plugin_name}:{}", uuid::Uuid::new_v4());
-                        let cat = match category.as_str() {
-                            "core" => crate::memory::traits::MemoryCategory::Core,
-                            "daily" => crate::memory::traits::MemoryCategory::Daily,
-                            "conversation" => crate::memory::traits::MemoryCategory::Conversation,
-                            other => {
-                                crate::memory::traits::MemoryCategory::Custom(other.to_string())
+                            let mem = match &store.data().memory {
+                                Some(m) => Arc::clone(m),
+                                None => {
+                                    return Ok((Err::<String, String>(
+                                        "memory backend not configured".to_string(),
+                                    ),));
+                                }
+                            };
+                            let plugin_name = store.data().plugin_name.clone();
+                            let key = format!("plugin:{plugin_name}:{}", uuid::Uuid::new_v4());
+                            let cat = match category.as_str() {
+                                "core" => crate::memory::traits::MemoryCategory::Core,
+                                "daily" => crate::memory::traits::MemoryCategory::Daily,
+                                "conversation" => {
+                                    crate::memory::traits::MemoryCategory::Conversation
+                                }
+                                other => {
+                                    crate::memory::traits::MemoryCategory::Custom(other.to_string())
+                                }
+                            };
+                            match mem.store(&key, &text, cat, None).await {
+                                Ok(()) => Ok((Ok::<String, String>(key),)),
+                                Err(e) => Ok((Err(format!("memory store failed: {e}")),)),
                             }
-                        };
-                        match mem.store(&key, &text, cat, None).await {
-                            Ok(()) => Ok((Ok::<String, String>(key),)),
-                            Err(e) => Ok((Err(format!("memory store failed: {e}")),)),
-                        }
-                    })
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link memory.store: {e}")))?;
+                        })
+                    },
+                )
+                .map_err(|e| PluginError::Instantiation(format!("link {iface}.store: {e}")))?;
 
-        mem_inst
-            .func_wrap_async(
-                "recall",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (query, limit): (String, u32)| {
-                    Box::new(async move {
-                        if let Err(e) = store.data().check_permission("memory") {
-                            return Ok((Err::<Vec<(String, String, String, f64)>, String>(e),));
-                        }
-                        let mem = match &store.data().memory {
-                            Some(m) => Arc::clone(m),
-                            None => {
-                                return Ok((Err::<Vec<(String, String, String, f64)>, String>(
-                                    "memory backend not configured".to_string(),
-                                ),));
+            mem_inst
+                .func_wrap_async(
+                    "recall",
+                    |store: wasmtime::StoreContextMut<'_, HostState>, (query, limit): (String, u32)| {
+                        Box::new(async move {
+                            if let Err(e) = store.data().check_permission("memory") {
+                                return Ok((Err::<Vec<(String, String, String, f64)>, String>(e),));
                             }
-                        };
-                        match mem.recall(&query, limit as usize, None).await {
-                            Ok(entries) => {
-                                let results: Vec<(String, String, String, f64)> = entries
-                                    .into_iter()
-                                    .map(|e| {
-                                        (
-                                            e.id,
-                                            e.content,
-                                            e.category.to_string(),
-                                            e.score.unwrap_or(0.0),
-                                        )
-                                    })
-                                    .collect();
-                                Ok((Ok(results),))
+                            let mem = match &store.data().memory {
+                                Some(m) => Arc::clone(m),
+                                None => {
+                                    return Ok((Err::<Vec<(String, String, String, f64)>, String>(
+                                        "memory backend not configured".to_string(),
+                                    ),));
+                                }
+                            };
+                            match mem.recall(&query, limit as usize, None).await {
+                                Ok(entries) => {
+                                    let results: Vec<(String, String, String, f64)> = entries
+                                        .into_iter()
+                                        .map(|e| {
+                                            (
+                                                e.id,
+                                                e.content,
+                                                e.category.to_string(),
+                                                e.score.unwrap_or(0.0),
+                                            )
+                                        })
+                                        .collect();
+                                    Ok((Ok(results),))
+                                }
+                                Err(e) => Ok((Err(format!("memory recall failed: {e}")),)),
                             }
-                            Err(e) => Ok((Err(format!("memory recall failed: {e}")),)),
-                        }
-                    })
-                },
-            )
-            .map_err(|e| PluginError::Instantiation(format!("link memory.recall: {e}")))?;
+                        })
+                    },
+                )
+                .map_err(|e| PluginError::Instantiation(format!("link {iface}.recall: {e}")))?;
+        }
 
         // prx:host/events@0.1.0
         super::common::register_event_host_functions(linker)?;
