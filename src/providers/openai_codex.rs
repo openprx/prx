@@ -1,7 +1,11 @@
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
-use crate::providers::traits::{ChatMessage, Provider};
+use crate::providers::traits::{
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    Provider, ToolCall as ProviderToolCall,
+};
 use crate::providers::ProviderRuntimeOptions;
+use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -34,6 +38,8 @@ struct ResponsesRequest {
     include: Vec<String>,
     tool_choice: String,
     parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,15 +69,30 @@ struct ResponsesReasoningOptions {
 #[derive(Debug, Deserialize)]
 struct ResponsesResponse {
     #[serde(default)]
-    output: Vec<ResponsesOutput>,
+    output: Vec<ResponsesOutputItem>,
     #[serde(default)]
     output_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ResponsesOutput {
-    #[serde(default)]
-    content: Vec<ResponsesContent>,
+#[serde(tag = "type")]
+enum ResponsesOutputItem {
+    #[serde(rename = "message")]
+    Message {
+        #[serde(default)]
+        content: Vec<ResponsesContent>,
+    },
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        arguments: Option<String>,
+    },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,24 +256,87 @@ fn extract_responses_text(response: &ResponsesResponse) -> Option<String> {
     }
 
     for item in &response.output {
-        for content in &item.content {
-            if content.kind.as_deref() == Some("output_text") {
-                if let Some(text) = first_nonempty(content.text.as_deref()) {
-                    return Some(text);
+        if let ResponsesOutputItem::Message { content } = item {
+            for part in content {
+                if part.kind.as_deref() == Some("output_text") {
+                    if let Some(text) = first_nonempty(part.text.as_deref()) {
+                        return Some(text);
+                    }
                 }
             }
         }
     }
 
     for item in &response.output {
-        for content in &item.content {
-            if let Some(text) = first_nonempty(content.text.as_deref()) {
-                return Some(text);
+        if let ResponsesOutputItem::Message { content } = item {
+            for part in content {
+                if let Some(text) = first_nonempty(part.text.as_deref()) {
+                    return Some(text);
+                }
             }
         }
     }
 
     None
+}
+
+fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<serde_json::Value>> {
+    tools.map(|items| {
+        items
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect()
+    })
+}
+
+fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    if value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "function")
+    {
+        Ok(value)
+    } else {
+        anyhow::bail!("Invalid OpenAI Codex tool specification: expected type='function'")
+    }
+}
+
+fn extract_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToolCall> {
+    response
+        .output
+        .iter()
+        .filter_map(|item| match item {
+            ResponsesOutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                let name = name.as_deref().map(str::trim)?;
+                if name.is_empty() {
+                    return None;
+                }
+                Some(ProviderToolCall {
+                    id: call_id
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    name: name.to_string(),
+                    arguments: arguments.clone().unwrap_or_else(|| "{}".to_string()),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn has_semantic_output(response: &ResponsesResponse) -> bool {
+    extract_responses_text(response).is_some() || !extract_tool_calls(response).is_empty()
 }
 
 fn extract_stream_event_text(event: &Value, saw_delta: bool) -> Option<String> {
@@ -272,15 +356,39 @@ fn extract_stream_event_text(event: &Value, saw_delta: bool) -> Option<String> {
     }
 }
 
-fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
+fn extract_stream_output_item(event: &Value) -> Option<ResponsesOutputItem> {
+    let event_type = event.get("type").and_then(Value::as_str)?;
+    if event_type != "response.output_item.done" {
+        return None;
+    }
+    let item = event.get("item")?.clone();
+    serde_json::from_value::<ResponsesOutputItem>(item).ok()
+}
+
+fn parse_sse_text(body: &str) -> anyhow::Result<Option<ResponsesResponse>> {
     let mut saw_delta = false;
     let mut delta_accumulator = String::new();
     let mut fallback_text = None;
+    let mut output = Vec::new();
+    let mut completed_response = None;
     let mut buffer = body.to_string();
 
     let mut process_event = |event: Value| -> anyhow::Result<()> {
         if let Some(message) = extract_stream_error_message(&event) {
             return Err(anyhow::anyhow!("OpenAI Codex stream error: {message}"));
+        }
+        if let Some(item) = extract_stream_output_item(&event) {
+            output.push(item);
+        }
+        if matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("response.completed" | "response.done")
+        ) {
+            if let Some(response) = event.get("response") {
+                if let Ok(parsed) = serde_json::from_value::<ResponsesResponse>(response.clone()) {
+                    completed_response = Some(parsed);
+                }
+            }
         }
         if let Some(text) = extract_stream_event_text(&event, saw_delta) {
             let event_type = event.get("type").and_then(Value::as_str);
@@ -321,6 +429,11 @@ fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
             }
             if let Ok(event) = serde_json::from_str::<Value>(line) {
                 process_event(event)?;
+            } else {
+                tracing::warn!(
+                    "OpenAI Codex provider_response_parse_warning kind=malformed_sse_data_line line={}",
+                    super::sanitize_api_error(line)
+                );
             }
         }
 
@@ -341,11 +454,36 @@ fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
         process_chunk(&buffer)?;
     }
 
-    if saw_delta {
-        return Ok(nonempty_preserve(Some(&delta_accumulator)));
+    if let Some(mut response) = completed_response {
+        if response.output.is_empty() && !output.is_empty() {
+            response.output = output;
+        }
+        if response.output_text.is_none() {
+            if saw_delta {
+                response.output_text = nonempty_preserve(Some(&delta_accumulator));
+            } else {
+                response.output_text = fallback_text;
+            }
+        }
+        if !has_semantic_output(&response) {
+            return Ok(None);
+        }
+        return Ok(Some(response));
     }
 
-    Ok(fallback_text)
+    let output_text = if saw_delta {
+        nonempty_preserve(Some(&delta_accumulator))
+    } else {
+        fallback_text
+    };
+    if output_text.is_none() && output.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ResponsesResponse {
+        output,
+        output_text,
+    }))
 }
 
 fn extract_stream_error_message(event: &Value) -> Option<String> {
@@ -386,21 +524,34 @@ fn contains_done_event(text: &str) -> bool {
 }
 
 fn contains_terminal_response_event(text: &str) -> bool {
-    text.lines().any(|line| {
-        let Some(data) = line.trim().strip_prefix("data:") else {
-            return false;
-        };
-        let data = data.trim();
+    text.split("\n\n").any(|block| {
+        let data_lines = block
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("data:"))
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        let data = data_lines.join("\n");
         if data.is_empty() || data == "[DONE]" {
             return false;
         }
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
-            return false;
-        };
-        matches!(
-            event.get("type").and_then(Value::as_str),
-            Some("response.completed" | "response.done" | "response.failed" | "error")
-        )
+        if let Ok(event) = serde_json::from_str::<Value>(&data) {
+            return matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("response.completed" | "response.done" | "response.failed" | "error")
+            );
+        }
+        data_lines.into_iter().any(|line| {
+            if line.is_empty() || line == "[DONE]" {
+                return false;
+            }
+            let Ok(event) = serde_json::from_str::<Value>(line) else {
+                return false;
+            };
+            matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("response.completed" | "response.done" | "response.failed" | "error")
+            )
+        })
     })
 }
 
@@ -410,7 +561,10 @@ fn normalize_content_type(value: Option<&str>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn decode_responses_payload(body: &str, content_type: Option<&str>) -> anyhow::Result<String> {
+fn decode_responses_payload(
+    body: &str,
+    content_type: Option<&str>,
+) -> anyhow::Result<ResponsesResponse> {
     let normalized_content_type = normalize_content_type(content_type);
     let trimmed = body.trim_start();
     let looks_like_sse = normalized_content_type.contains("text/event-stream")
@@ -421,8 +575,10 @@ fn decode_responses_payload(body: &str, content_type: Option<&str>) -> anyhow::R
         || trimmed.starts_with('[');
 
     if looks_like_sse {
-        if let Some(text) = parse_sse_text(body)? {
-            return Ok(text);
+        if let Some(response) = parse_sse_text(body)? {
+            if has_semantic_output(&response) {
+                return Ok(response);
+            }
         }
     }
 
@@ -434,21 +590,23 @@ fn decode_responses_payload(body: &str, content_type: Option<&str>) -> anyhow::R
                 super::sanitize_api_error(&err.to_string())
             )
         })?;
-        if let Some(text) = extract_responses_text(&parsed) {
-            return Ok(text);
+        if has_semantic_output(&parsed) {
+            return Ok(parsed);
         }
     }
 
     // Keep tolerant fallback order for mislabelled Content-Type.
     if !looks_like_sse {
-        if let Some(text) = parse_sse_text(body)? {
-            return Ok(text);
+        if let Some(response) = parse_sse_text(body)? {
+            if has_semantic_output(&response) {
+                return Ok(response);
+            }
         }
     }
     if !looks_like_json {
         if let Ok(parsed) = serde_json::from_str::<ResponsesResponse>(body) {
-            if let Some(text) = extract_responses_text(&parsed) {
-                return Ok(text);
+            if has_semantic_output(&parsed) {
+                return Ok(parsed);
             }
         }
     }
@@ -463,14 +621,14 @@ fn decode_responses_payload(body: &str, content_type: Option<&str>) -> anyhow::R
 async fn decode_responses_body(
     response: reqwest::Response,
     idle_timeout: Duration,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ResponsesResponse> {
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string());
     let normalized_content_type = normalize_content_type(content_type.as_deref());
-    let is_sse = normalized_content_type.contains("text/event-stream");
+    let is_sse_by_header = normalized_content_type.contains("text/event-stream");
 
     let mut stream = response.bytes_stream();
     let mut body_bytes = Vec::new();
@@ -497,8 +655,11 @@ async fn decode_responses_body(
                     );
                 }
 
-                if is_sse {
-                    let current = String::from_utf8_lossy(&body_bytes);
+                let current = String::from_utf8_lossy(&body_bytes);
+                let looks_sse_by_body = current.contains("\ndata:")
+                    || current.starts_with("data:")
+                    || current.contains("\nevent:");
+                if is_sse_by_header || looks_sse_by_body {
                     if contains_done_event(&current) || contains_terminal_response_event(&current) {
                         break;
                     }
@@ -520,12 +681,13 @@ async fn decode_responses_body(
 }
 
 impl OpenAiCodexProvider {
-    async fn send_responses_request(
+    async fn send_and_decode_full_response(
         &self,
         input: Vec<ResponsesInput>,
         instructions: String,
         model: &str,
-    ) -> anyhow::Result<String> {
+        tools: Option<Vec<serde_json::Value>>,
+    ) -> anyhow::Result<ResponsesResponse> {
         let access_token = self
             .auth
             .get_valid_openai_access_token(self.auth_profile_override.as_deref())
@@ -564,6 +726,7 @@ impl OpenAiCodexProvider {
             include: vec!["reasoning.encrypted_content".to_string()],
             tool_choice: "auto".to_string(),
             parallel_tool_calls: true,
+            tools,
         };
 
         let response = self
@@ -585,6 +748,19 @@ impl OpenAiCodexProvider {
         }
 
         decode_responses_body(response, self.stream_idle_timeout).await
+    }
+
+    async fn send_responses_request(
+        &self,
+        input: Vec<ResponsesInput>,
+        instructions: String,
+        model: &str,
+    ) -> anyhow::Result<String> {
+        let response = self
+            .send_and_decode_full_response(input, instructions, model, None)
+            .await?;
+        extract_responses_text(&response)
+            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
     }
 }
 
@@ -625,6 +801,51 @@ impl Provider for OpenAiCodexProvider {
         self.send_responses_request(input, instructions, model)
             .await
     }
+
+    async fn chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let (instructions, input) = build_responses_input(request.messages);
+        let tools = convert_tools(request.tools);
+        let parsed = self
+            .send_and_decode_full_response(input, instructions, model, tools)
+            .await?;
+        Ok(ProviderChatResponse {
+            text: extract_responses_text(&parsed),
+            tool_calls: extract_tool_calls(&parsed),
+        })
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let (instructions, input) = build_responses_input(messages);
+        let native_tools: Option<Vec<serde_json::Value>> = if tools.is_empty() {
+            None
+        } else {
+            Some(
+                tools
+                    .iter()
+                    .cloned()
+                    .map(parse_native_tool_spec)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        };
+        let parsed = self
+            .send_and_decode_full_response(input, instructions, model, native_tools)
+            .await?;
+        Ok(ProviderChatResponse {
+            text: extract_responses_text(&parsed),
+            tool_calls: extract_tool_calls(&parsed),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -643,7 +864,7 @@ mod tests {
     #[test]
     fn extracts_nested_output_text() {
         let response = ResponsesResponse {
-            output: vec![ResponsesOutput {
+            output: vec![ResponsesOutputItem::Message {
                 content: vec![ResponsesContent {
                     kind: Some("output_text".into()),
                     text: Some("nested".into()),
@@ -718,10 +939,8 @@ data: {"type":"response.completed","response":{"output_text":"Hello world"}}
 data: [DONE]
 "#;
 
-        assert_eq!(
-            parse_sse_text(payload).unwrap().as_deref(),
-            Some("Hello world")
-        );
+        let response = parse_sse_text(payload).unwrap().unwrap();
+        assert_eq!(response.output_text.as_deref(), Some("Hello world"));
     }
 
     #[test]
@@ -730,7 +949,8 @@ data: [DONE]
 data: [DONE]
 "#;
 
-        assert_eq!(parse_sse_text(payload).unwrap().as_deref(), Some("Done"));
+        let response = parse_sse_text(payload).unwrap().unwrap();
+        assert_eq!(response.output_text.as_deref(), Some("Done"));
     }
 
     #[test]
@@ -811,8 +1031,8 @@ data: [DONE]
     #[test]
     fn decode_payload_unexpected_content_type_still_parses_json() {
         let body = r#"{"output_text":"hello"}"#;
-        let text = decode_responses_payload(body, Some("text/plain")).unwrap();
-        assert_eq!(text, "hello");
+        let response = decode_responses_payload(body, Some("text/plain")).unwrap();
+        assert_eq!(response.output_text.as_deref(), Some("hello"));
     }
 
     #[test]
@@ -835,5 +1055,29 @@ data: {"type":"response.completed","response":{"output_text":"final"}}
 "#;
         assert!(contains_terminal_response_event(body));
         assert!(!contains_done_event(body));
+    }
+
+    #[test]
+    fn parse_sse_text_extracts_function_call_output_item() {
+        let payload = r#"event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_123","name":"list_files","arguments":"{\"path\":\".\"}"}}
+
+data: [DONE]
+"#;
+
+        let response = parse_sse_text(payload).unwrap().unwrap();
+        let tool_calls = extract_tool_calls(&response);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_123");
+        assert_eq!(tool_calls[0].name, "list_files");
+        assert_eq!(tool_calls[0].arguments, "{\"path\":\".\"}");
+    }
+
+    #[test]
+    fn detects_terminal_response_event_for_multiline_data_block() {
+        let body = "event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":\n\
+data: {\"output_text\":\"final\"}}\n\n";
+        assert!(contains_terminal_response_event(body));
     }
 }
