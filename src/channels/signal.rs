@@ -195,6 +195,7 @@ async fn extract_document_text(path: &str, content_type: &str, filename: &str) -
 }
 
 const GROUP_TARGET_PREFIX: &str = "group:";
+const SIGNAL_DM_DEDUPE_WINDOW_SECS: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecipientTarget {
@@ -256,6 +257,14 @@ struct SignalStormGuard {
     breaker_until: HashMap<String, Instant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserEventGuardDecision {
+    Allowed,
+    BreakerOpen,
+    Duplicate,
+    MinReplyInterval,
+}
+
 impl SignalStormGuard {
     fn new(config: crate::config::schema::SignalStormProtectionConfig) -> Self {
         Self {
@@ -305,13 +314,13 @@ impl SignalStormGuard {
         false
     }
 
-    fn is_duplicate(&mut self, fingerprint: &str, now: Instant) -> bool {
-        if self.settings.dedupe_ttl.is_zero() {
+    fn is_duplicate(&mut self, fingerprint: &str, ttl: Duration, now: Instant) -> bool {
+        if ttl.is_zero() {
             return false;
         }
         self.seen_fingerprints
             .get(fingerprint)
-            .is_some_and(|seen_at| now.duration_since(*seen_at) <= self.settings.dedupe_ttl)
+            .is_some_and(|seen_at| now.duration_since(*seen_at) <= ttl)
     }
 
     fn within_min_reply_interval(&self, key: &str, now: Instant) -> bool {
@@ -323,11 +332,17 @@ impl SignalStormGuard {
             .is_some_and(|last_at| now.duration_since(*last_at) < self.settings.min_reply_interval)
     }
 
-    fn record_user_pass(&mut self, key: &str, fingerprint: &str, now: Instant) {
+    fn record_user_pass(
+        &mut self,
+        key: &str,
+        fingerprint: &str,
+        now: Instant,
+        enforce_min_reply_interval: bool,
+    ) {
         if !self.settings.dedupe_ttl.is_zero() {
             self.seen_fingerprints.insert(fingerprint.to_string(), now);
         }
-        if !self.settings.min_reply_interval.is_zero() {
+        if enforce_min_reply_interval && !self.settings.min_reply_interval.is_zero() {
             self.last_reply_by_target.insert(key.to_string(), now);
         }
         self.prune(now);
@@ -1449,23 +1464,33 @@ impl SignalChannel {
         guard.record_non_user_event(key, now)
     }
 
-    fn guard_allow_user_event(&self, key: &str, fingerprint: &str, now: Instant) -> bool {
+    fn guard_allow_user_event(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        now: Instant,
+        is_group_message: bool,
+    ) -> UserEventGuardDecision {
         let mut guard = self
             .storm_guard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if guard.is_breaker_open(key, now) {
-            return false;
+            return UserEventGuardDecision::BreakerOpen;
         }
-        if guard.is_duplicate(fingerprint, now) {
-            return false;
+        let mut dedupe_window = guard.settings.dedupe_ttl;
+        if !is_group_message {
+            dedupe_window = dedupe_window.min(Duration::from_secs(SIGNAL_DM_DEDUPE_WINDOW_SECS));
         }
-        if guard.within_min_reply_interval(key, now) {
-            return false;
+        if guard.is_duplicate(fingerprint, dedupe_window, now) {
+            return UserEventGuardDecision::Duplicate;
         }
-        guard.record_user_pass(key, fingerprint, now);
-        true
+        if is_group_message && guard.within_min_reply_interval(key, now) {
+            return UserEventGuardDecision::MinReplyInterval;
+        }
+        guard.record_user_pass(key, fingerprint, now, is_group_message);
+        UserEventGuardDecision::Allowed
     }
 
     /// Send a JSON-RPC request to signal-cli daemon.
@@ -1583,7 +1608,9 @@ impl SignalChannel {
 
         let now = Instant::now();
         if self.guard_check_breaker(&storm_key, now) {
-            tracing::debug!("Signal storm guard: breaker open for key={storm_key}");
+            tracing::warn!(
+                "Signal storm guard dropped envelope due to open breaker key={storm_key}"
+            );
             return None;
         }
 
@@ -1611,11 +1638,24 @@ impl SignalChannel {
         let normalized_content =
             Self::build_normalized_content_for_fingerprint(text, &event_prefixes, has_attachments);
         let fingerprint = Self::build_dedupe_fingerprint(&sender, &event_type, &normalized_content);
-        if !self.guard_allow_user_event(&storm_key, &fingerprint, now) {
-            tracing::debug!(
-                "Signal storm guard: dropped by dedupe/interval/breaker key={storm_key}"
-            );
-            return None;
+        match self.guard_allow_user_event(&storm_key, &fingerprint, now, is_group_message) {
+            UserEventGuardDecision::Allowed => {}
+            UserEventGuardDecision::BreakerOpen => {
+                tracing::warn!(
+                    "Signal storm guard dropped user event due to open breaker key={storm_key}"
+                );
+                return None;
+            }
+            UserEventGuardDecision::Duplicate => {
+                tracing::warn!("Signal storm guard dropped duplicate user event key={storm_key}");
+                return None;
+            }
+            UserEventGuardDecision::MinReplyInterval => {
+                tracing::warn!(
+                    "Signal storm guard dropped group user event due to min_reply_interval key={storm_key}"
+                );
+                return None;
+            }
         }
 
         let timestamp = data_msg
@@ -2984,13 +3024,109 @@ mod tests {
             },
         );
 
-        let first = make_envelope(Some("+1111111111"), Some("first"));
-        let second_same_target = make_envelope(Some("+1111111111"), Some("second"));
-        let third_other_target = make_envelope(Some("+2222222222"), Some("third"));
+        let first = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: Some("first".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: Some(GroupInfo {
+                    group_id: Some("group-1".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000_000),
+            ..Default::default()
+        };
+        let second_same_target = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: Some("second".to_string()),
+                timestamp: Some(1_700_000_000_001),
+                group_info: Some(GroupInfo {
+                    group_id: Some("group-1".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000_001),
+            ..Default::default()
+        };
+        let third_other_target = Envelope {
+            source: Some("+2222222222".to_string()),
+            source_number: Some("+2222222222".to_string()),
+            data_message: Some(DataMessage {
+                message: Some("third".to_string()),
+                timestamp: Some(1_700_000_000_002),
+                group_info: Some(GroupInfo {
+                    group_id: Some("group-2".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000_002),
+            ..Default::default()
+        };
 
         assert!(ch.process_envelope(&first).is_some());
         assert!(ch.process_envelope(&second_same_target).is_none());
         assert!(ch.process_envelope(&third_other_target).is_some());
+    }
+
+    #[test]
+    fn process_envelope_dm_does_not_enforce_min_reply_interval() {
+        let ch = make_channel_with_storm(
+            vec!["*".to_string()],
+            crate::config::schema::SignalStormProtectionConfig {
+                dedupe_ttl_secs: 0,
+                min_reply_interval_secs: 10,
+                abnormal_threshold: 10,
+                abnormal_window_secs: 60,
+                breaker_duration_secs: 300,
+            },
+        );
+
+        let first = make_envelope(Some("+1111111111"), Some("first"));
+        let second = make_envelope(Some("+1111111111"), Some("second"));
+
+        assert!(ch.process_envelope(&first).is_some());
+        assert!(ch.process_envelope(&second).is_some());
+    }
+
+    #[test]
+    fn guard_allow_user_event_caps_dm_dedupe_window_to_five_seconds() {
+        let ch = make_channel_with_storm(
+            vec!["*".to_string()],
+            crate::config::schema::SignalStormProtectionConfig {
+                dedupe_ttl_secs: 60,
+                min_reply_interval_secs: 0,
+                abnormal_threshold: 10,
+                abnormal_window_secs: 60,
+                breaker_duration_secs: 300,
+            },
+        );
+        let key = "signal:+1111111111";
+        let fingerprint = "fingerprint";
+        let now = Instant::now();
+
+        assert_eq!(
+            ch.guard_allow_user_event(key, fingerprint, now, false),
+            UserEventGuardDecision::Allowed
+        );
+        assert_eq!(
+            ch.guard_allow_user_event(key, fingerprint, now + Duration::from_secs(4), false),
+            UserEventGuardDecision::Duplicate
+        );
+        assert_eq!(
+            ch.guard_allow_user_event(key, fingerprint, now + Duration::from_secs(6), false),
+            UserEventGuardDecision::Allowed
+        );
+        assert_eq!(
+            ch.guard_allow_user_event(key, fingerprint, now + Duration::from_secs(6), true),
+            UserEventGuardDecision::Duplicate
+        );
     }
 
     #[test]

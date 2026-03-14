@@ -3189,7 +3189,7 @@ fn default_heartbeat_prompt() -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DmPolicy {
-    /// Future pairing handshake flow (placeholder, currently deny-by-default).
+    /// Future pairing handshake flow (placeholder; runtime currently falls back to allowlist).
     Pairing,
     /// Accept only senders listed in `allowed_from`.
     #[default]
