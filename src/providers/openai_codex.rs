@@ -460,7 +460,10 @@ fn decode_responses_payload(body: &str, content_type: Option<&str>) -> anyhow::R
     ))
 }
 
-async fn decode_responses_body(response: reqwest::Response, idle_timeout: Duration) -> anyhow::Result<String> {
+async fn decode_responses_body(
+    response: reqwest::Response,
+    idle_timeout: Duration,
+) -> anyhow::Result<String> {
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
