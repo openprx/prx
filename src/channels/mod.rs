@@ -321,6 +321,22 @@ fn allowlist_matches(allowlist: &HashSet<String>, value: &str) -> bool {
     allowlist.contains("*") || allowlist.contains(value)
 }
 
+fn normalize_dm_policy(
+    channel_name: &str,
+    dm_policy: crate::config::DmPolicy,
+) -> crate::config::DmPolicy {
+    match dm_policy {
+        crate::config::DmPolicy::Pairing => {
+            tracing::warn!(
+                channel = channel_name,
+                "dm_policy=pairing is not implemented for inbound channel policy; falling back to dm_policy=allowlist"
+            );
+            crate::config::DmPolicy::Allowlist
+        }
+        other => other,
+    }
+}
+
 fn evaluate_inbound_policy(policy: &InboundPolicyConfig, msg: &traits::ChannelMessage) -> bool {
     match infer_chat_type_from_message(msg) {
         "group" => match policy.group_policy {
@@ -357,8 +373,17 @@ fn evaluate_inbound_policy(policy: &InboundPolicyConfig, msg: &traits::ChannelMe
                 }
             }
             crate::config::DmPolicy::Pairing => {
-                tracing::warn!(channel = %msg.channel, sender = %msg.sender, "Dropping direct message: dm_policy=pairing is not implemented yet");
-                false
+                tracing::warn!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "dm_policy=pairing is not implemented yet; evaluating as dm_policy=allowlist"
+                );
+                if allowlist_matches(&policy.allowed_from, &msg.sender) {
+                    true
+                } else {
+                    tracing::warn!(channel = %msg.channel, sender = %msg.sender, "Dropping direct message: sender not in allowlist");
+                    false
+                }
             }
         },
     }
@@ -4141,7 +4166,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             &group_allow_from,
         );
         InboundPolicyConfig {
-            dm_policy: signal.dm_policy,
+            dm_policy: normalize_dm_policy("signal", signal.dm_policy),
             group_policy: signal.group_policy,
             allowed_from,
             group_allow_from,
@@ -4158,7 +4183,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             &group_allow_from,
         );
         InboundPolicyConfig {
-            dm_policy: whatsapp.dm_policy,
+            dm_policy: normalize_dm_policy("whatsapp", whatsapp.dm_policy),
             group_policy: whatsapp.group_policy,
             allowed_from,
             group_allow_from,
@@ -4492,11 +4517,11 @@ mod tests {
     }
 
     #[test]
-    fn inbound_policy_pairing_rejects_direct_message() {
+    fn inbound_policy_pairing_follows_allowlist_behavior() {
         let policy = InboundPolicyConfig {
             dm_policy: crate::config::DmPolicy::Pairing,
             group_policy: crate::config::GroupPolicy::Allowlist,
-            allowed_from: normalize_allowlist(&["*".to_string()]),
+            allowed_from: normalize_allowlist(&["+10000000000".to_string()]),
             group_allow_from: HashSet::new(),
         };
         let msg = traits::ChannelMessage {
@@ -4509,7 +4534,25 @@ mod tests {
             thread_ts: None,
             mentioned_uuids: vec![],
         };
-        assert!(!evaluate_inbound_policy(&policy, &msg));
+        assert!(evaluate_inbound_policy(&policy, &msg));
+
+        let blocked = traits::ChannelMessage {
+            sender: "+20000000000".to_string(),
+            ..msg
+        };
+        assert!(!evaluate_inbound_policy(&policy, &blocked));
+    }
+
+    #[test]
+    fn normalize_dm_policy_falls_back_pairing_to_allowlist() {
+        assert_eq!(
+            normalize_dm_policy("signal", crate::config::DmPolicy::Pairing),
+            crate::config::DmPolicy::Allowlist
+        );
+        assert_eq!(
+            normalize_dm_policy("signal", crate::config::DmPolicy::Open),
+            crate::config::DmPolicy::Open
+        );
     }
 
     #[test]
@@ -5757,9 +5800,7 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .expect("write fragment");
 
-        let before = config_file_stamp(&config_path)
-            .await
-            .expect("stamp before");
+        let before = config_file_stamp(&config_path).await.expect("stamp before");
 
         std::fs::write(
             config_dir.join("memory.toml"),
