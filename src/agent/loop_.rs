@@ -923,6 +923,180 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
     calls
 }
 
+fn strip_markdown_fence_block(input: &str) -> String {
+    let trimmed = input.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_string();
+    }
+
+    let Some(first_newline) = trimmed.find('\n') else {
+        return trimmed.to_string();
+    };
+    let content = &trimmed[first_newline + 1..];
+    let content = if let Some(end) = content.rfind("```") {
+        &content[..end]
+    } else {
+        content
+    };
+    content.trim().to_string()
+}
+
+fn parse_recipient_tool_calls(recipient: &str, body: &str) -> Vec<ParsedToolCall> {
+    let mut calls = Vec::new();
+    let recipient = recipient.trim();
+    if recipient.is_empty() {
+        return calls;
+    }
+
+    for value in extract_json_values(body) {
+        let parsed_calls = parse_tool_calls_from_json_value(&value);
+        if !parsed_calls.is_empty() {
+            calls.extend(parsed_calls);
+            continue;
+        }
+
+        if value.is_object() {
+            calls.push(ParsedToolCall {
+                name: recipient.to_string(),
+                arguments: value,
+            });
+        }
+    }
+
+    if !calls.is_empty() {
+        return calls;
+    }
+
+    let cleaned_body = strip_markdown_fence_block(body);
+    if cleaned_body.is_empty() {
+        return calls;
+    }
+
+    if recipient == "shell" || recipient == "bash" {
+        calls.push(ParsedToolCall {
+            name: "shell".to_string(),
+            arguments: serde_json::json!({ "command": cleaned_body }),
+        });
+    }
+
+    calls
+}
+
+fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
+    static CODEX_TO_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)^\s*(?:assistant\s+)?to=([a-zA-Z0-9_.-]+)\s+code\s*$"#).unwrap()
+    });
+
+    let mut found_header = false;
+    let mut calls = Vec::new();
+    let mut text_parts = Vec::new();
+    let mut plain_text = String::new();
+    let mut current_recipient: Option<String> = None;
+    let mut current_body = String::new();
+
+    let flush_current = |recipient: &mut Option<String>,
+                         body: &mut String,
+                         out_calls: &mut Vec<ParsedToolCall>| {
+        if let Some(recipient) = recipient.take() {
+            out_calls.extend(parse_recipient_tool_calls(&recipient, body));
+            body.clear();
+        }
+    };
+
+    for line in text.lines() {
+        if let Some(cap) = CODEX_TO_HEADER_RE.captures(line) {
+            found_header = true;
+            flush_current(&mut current_recipient, &mut current_body, &mut calls);
+            current_recipient = cap.get(1).map(|m| m.as_str().to_string());
+            continue;
+        }
+
+        if current_recipient.is_some() {
+            if !current_body.is_empty() {
+                current_body.push('\n');
+            }
+            current_body.push_str(line);
+        } else {
+            if !plain_text.is_empty() {
+                plain_text.push('\n');
+            }
+            plain_text.push_str(line);
+        }
+    }
+    flush_current(&mut current_recipient, &mut current_body, &mut calls);
+
+    if !calls.is_empty() {
+        if !plain_text.trim().is_empty() {
+            text_parts.push(plain_text.trim().to_string());
+        }
+    } else if !found_header && !text.trim().is_empty() {
+        text_parts.push(text.trim().to_string());
+    } else if found_header {
+        text_parts.push(text.trim().to_string());
+    }
+
+    (text_parts.join("\n"), calls)
+}
+
+fn parse_assistant_recipient_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
+    static ASSISTANT_RECIPIENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#).unwrap()
+    });
+    static RECIPIENT_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)\brecipient\s*=\s*["']?([a-zA-Z0-9_.-]+)["']?"#).unwrap()
+    });
+
+    let mut calls = Vec::new();
+    let mut text_parts = Vec::new();
+    let mut last_end = 0usize;
+
+    for cap in ASSISTANT_RECIPIENT_RE.captures_iter(text) {
+        let Some(full_match) = cap.get(0) else {
+            continue;
+        };
+        let before = &text[last_end..full_match.start()];
+        if !before.trim().is_empty() {
+            text_parts.push(before.trim().to_string());
+        }
+
+        let attrs = cap.get(1).map_or("", |m| m.as_str());
+        let body = cap.get(2).map_or("", |m| m.as_str());
+        if let Some(recipient_match) = RECIPIENT_ATTR_RE.captures(attrs) {
+            if let Some(recipient) = recipient_match.get(1).map(|m| m.as_str()) {
+                calls.extend(parse_recipient_tool_calls(recipient, body));
+            }
+        }
+
+        last_end = full_match.end();
+    }
+
+    if !calls.is_empty() {
+        let tail = &text[last_end..];
+        if !tail.trim().is_empty() {
+            text_parts.push(tail.trim().to_string());
+        }
+    } else if !text.trim().is_empty() {
+        text_parts.push(text.trim().to_string());
+    }
+
+    (text_parts.join("\n"), calls)
+}
+
+fn looks_like_unparsed_tool_call_syntax(text: &str) -> bool {
+    static UNPARSED_TOOL_SYNTAX: LazyLock<RegexSet> = LazyLock::new(|| {
+        RegexSet::new([
+            r"(?is)<tool[_-]?call\b",
+            r"(?is)<toolcall\b",
+            r"(?is)<tool_use\b",
+            r"(?is)<invoke\b",
+            r#"(?is)<assistant\b[^>]*\brecipient\s*="#,
+            r"(?is)(?:^|\n)\s*(?:assistant\s+)?to=[a-zA-Z0-9_.-]+\s+code\b",
+        ])
+        .unwrap()
+    });
+    UNPARSED_TOOL_SYNTAX.is_match(text)
+}
+
 // ── Tool-Call Parsing ─────────────────────────────────────────────────────
 // LLM responses may contain tool calls in multiple formats depending on
 // the provider. Parsing follows a priority chain:
@@ -989,7 +1163,10 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             }
 
             if !parsed_any {
-                tracing::warn!("Malformed <tool_call> JSON: expected tool-call object in tag body");
+                tracing::error!(
+                    raw_tool_call_body = inner,
+                    "Malformed <tool_call> JSON: expected tool-call object in tag body"
+                );
             }
 
             remaining = &after_open[close_idx + close_tag.len()..];
@@ -1055,6 +1232,34 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 md_text_parts.push(after.trim().to_string());
             }
             text_parts = md_text_parts;
+            remaining = "";
+        }
+    }
+
+    // OpenAI Codex text protocol: `assistant to=<tool> code ...`
+    if calls.is_empty() {
+        let (parsed_text, parsed_calls) = parse_codex_to_style_tool_calls(response);
+        if !parsed_calls.is_empty() {
+            calls = parsed_calls;
+            if !parsed_text.is_empty() {
+                text_parts = vec![parsed_text];
+            } else {
+                text_parts.clear();
+            }
+            remaining = "";
+        }
+    }
+
+    // Assistant-recipient XML protocol: <assistant recipient="tool">...</assistant>
+    if calls.is_empty() {
+        let (parsed_text, parsed_calls) = parse_assistant_recipient_tool_calls(response);
+        if !parsed_calls.is_empty() {
+            calls = parsed_calls;
+            if !parsed_text.is_empty() {
+                text_parts = vec![parsed_text];
+            } else {
+                text_parts.clear();
+            }
             remaining = "";
         }
     }
@@ -2063,6 +2268,14 @@ pub(crate) async fn run_tool_call_loop(
                             parsed_text = fallback_text;
                         }
                         calls = fallback_calls;
+                        if calls.is_empty() && looks_like_unparsed_tool_call_syntax(&response_text)
+                        {
+                            tracing::error!(
+                                raw_response = response_text.as_str(),
+                                "Failed to parse model tool-call syntax; suppressing raw tool-call text"
+                            );
+                            parsed_text = "tool execution failed".to_string();
+                        }
                     }
 
                     // Preserve native tool call IDs in assistant history so role=tool
@@ -4164,6 +4377,60 @@ Done."#;
             calls[0].arguments.get("command").unwrap().as_str().unwrap(),
             "uptime"
         );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_codex_to_shell_code_format() {
+        let response = r#"assistant to=shell code
+date
+"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "date");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_codex_to_shell_code_with_fence() {
+        let response = r#"to=shell code
+```bash
+pwd
+```
+"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_assistant_recipient_format_with_json_arguments() {
+        let response = r#"<assistant recipient="file_read">
+{"path":"README.md"}
+</assistant>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[0].arguments["path"], "README.md");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_assistant_recipient_format_with_shell_command_body() {
+        let response = r#"<assistant recipient="shell">
+ls -la
+</assistant>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
     }
 
     #[test]
