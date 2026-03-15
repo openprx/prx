@@ -1251,7 +1251,7 @@ impl SignalChannel {
             }
 
             if data_msg.is_expiration_update.unwrap_or(false)
-                || data_msg.expires_in_seconds.is_some()
+                || data_msg.expires_in_seconds.unwrap_or(0) > 0
             {
                 let mut expiration_meta = serde_json::Map::new();
                 expiration_meta.insert(
