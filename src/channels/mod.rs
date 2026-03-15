@@ -2369,6 +2369,7 @@ async fn process_channel_message(
     };
 
     let mut context_overflow_retries = 0usize;
+    let mut timeout_retries = 0usize;
     let final_outcome = loop {
         // Record history length before tool loop so we can extract tool context after.
         let history_len_before_tools = history.len();
@@ -2451,7 +2452,20 @@ async fn process_channel_message(
 
                 break LlmFinalOutcome::Error(e);
             }
-            LlmExecutionResult::Completed(Err(_)) => break LlmFinalOutcome::Timeout,
+            LlmExecutionResult::Completed(Err(_)) => {
+                if timeout_retries < 1 {
+                    timeout_retries += 1;
+                    tracing::warn!(
+                        "LLM timeout after {}ms, retrying (attempt {}/1)",
+                        started_at.elapsed().as_millis(),
+                        timeout_retries
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    history = rebuild_history();
+                    continue;
+                }
+                break LlmFinalOutcome::Timeout;
+            }
         }
     };
 
@@ -2553,12 +2567,12 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                        .finalize_draft(&msg.reply_target, draft_id, "⚠️ Something went wrong. Please try again later.")
                         .await;
                 } else {
                     let _ = channel
                         .send(
-                            &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                            &SendMessage::new("⚠️ Something went wrong. Please try again later.", &msg.reply_target)
                                 .in_thread(msg.thread_ts.clone()),
                         )
                         .await;
@@ -2576,8 +2590,7 @@ async fn process_channel_message(
                 started_at.elapsed().as_millis()
             );
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "⚠️ Request timed out while waiting for the model. Please try again.";
+                let error_text = "⚠️ Request timed out. Please try again shortly.";
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
                         .finalize_draft(&msg.reply_target, draft_id, error_text)
@@ -2594,7 +2607,7 @@ async fn process_channel_message(
         }
         LlmFinalOutcome::ContextOverflowExhausted => {
             if let Some(channel) = target_channel.as_ref() {
-                let error_text = "Session context reset. Please try again.";
+                let error_text = "Session context was too long and has been reset. Please resend your message.";
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
                         .finalize_draft(&msg.reply_target, draft_id, error_text)
@@ -3335,10 +3348,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 sig.storm_protection.clone(),
             ))
         };
-        channels.push((
-            "Signal",
-            signal_channel,
-        ));
+        channels.push(("Signal", signal_channel));
     }
 
     if let Some(ref wa) = config.channels_config.whatsapp {
