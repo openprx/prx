@@ -20,9 +20,9 @@ pub fn register_log_host_functions(
     linker: &mut wasmtime::component::Linker<HostState>,
 ) -> PluginResult<()> {
     for iface in ["prx:host/log@0.1.0", "prx:host/log"] {
-        let mut log_inst = linker.instance(iface).map_err(|e| {
-            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
-        })?;
+        let mut log_inst = linker
+            .instance(iface)
+            .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
         log_inst
             .func_wrap(
                 "log",
@@ -50,9 +50,9 @@ pub fn register_config_host_functions(
     linker: &mut wasmtime::component::Linker<HostState>,
 ) -> PluginResult<()> {
     for iface in ["prx:host/config@0.1.0", "prx:host/config"] {
-        let mut config_inst = linker.instance(iface).map_err(|e| {
-            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
-        })?;
+        let mut config_inst = linker
+            .instance(iface)
+            .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
         config_inst
             .func_wrap(
                 "get",
@@ -90,9 +90,9 @@ pub fn register_kv_host_functions(
     linker: &mut wasmtime::component::Linker<HostState>,
 ) -> PluginResult<()> {
     for iface in ["prx:host/kv@0.1.0", "prx:host/kv"] {
-        let mut kv_inst = linker.instance(iface).map_err(|e| {
-            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
-        })?;
+        let mut kv_inst = linker
+            .instance(iface)
+            .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
 
         kv_inst
             .func_wrap_async(
@@ -115,7 +115,8 @@ pub fn register_kv_host_functions(
         kv_inst
             .func_wrap_async(
                 "set",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (key, value): (String, Vec<u8>)| {
+                |store: wasmtime::StoreContextMut<'_, HostState>,
+                 (key, value): (String, Vec<u8>)| {
                     Box::new(async move {
                         if let Err(e) = store.data().check_permission("kv") {
                             tracing::warn!("{e}");
@@ -185,9 +186,9 @@ pub fn register_event_host_functions(
     use crate::plugins::event_bus::MAX_PAYLOAD_BYTES;
 
     for iface in ["prx:host/events@0.1.0", "prx:host/events"] {
-        let mut inst = linker.instance(iface).map_err(|e| {
-            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
-        })?;
+        let mut inst = linker
+            .instance(iface)
+            .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
 
         // ── publish ──
         inst.func_wrap_async(
@@ -303,9 +304,9 @@ pub fn register_http_host_functions(
     linker: &mut wasmtime::component::Linker<HostState>,
 ) -> PluginResult<()> {
     for iface in ["prx:host/http-outbound@0.1.0", "prx:host/http-outbound"] {
-        let mut http_inst = linker.instance(iface).map_err(|e| {
-            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
-        })?;
+        let mut http_inst = linker
+            .instance(iface)
+            .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
 
         http_inst
             .func_wrap_async(
@@ -350,7 +351,9 @@ pub fn register_http_host_functions(
                                 let resp_headers: Vec<(String, String)> = resp
                                     .headers()
                                     .iter()
-                                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                                    .map(|(k, v)| {
+                                        (k.to_string(), v.to_str().unwrap_or("").to_string())
+                                    })
                                     .collect();
                                 match resp.bytes().await {
                                     Ok(bytes) => Ok((Ok((status, resp_headers, bytes.to_vec())),)),
@@ -380,9 +383,9 @@ pub fn register_websocket_host_functions(
         "prx:host/websocket-outbound@0.1.0",
         "prx:host/websocket-outbound",
     ] {
-        let mut ws_inst = linker.instance(iface).map_err(|e| {
-            PluginError::Instantiation(format!("linker error ({iface}): {e}"))
-        })?;
+        let mut ws_inst = linker
+            .instance(iface)
+            .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
 
         ws_inst
             .func_wrap_async(

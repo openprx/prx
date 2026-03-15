@@ -72,6 +72,10 @@ impl Default for ToolConcurrencyGovernanceConfig {
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+/// Mid-turn history length threshold: trim immediately inside the tool-call loop when history
+/// exceeds this value, rather than waiting for the turn to finish.
+const MID_TURN_COMPACT_THRESHOLD: usize = 80;
+
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
@@ -101,9 +105,8 @@ static SENSITIVE_LOG_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-static SENSITIVE_BEARER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}"#).unwrap()
-});
+static SENSITIVE_BEARER_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}"#).unwrap());
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
@@ -1024,14 +1027,13 @@ fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) 
     let mut current_recipient: Option<String> = None;
     let mut current_body = String::new();
 
-    let flush_current = |recipient: &mut Option<String>,
-                         body: &mut String,
-                         out_calls: &mut Vec<ParsedToolCall>| {
-        if let Some(recipient) = recipient.take() {
-            out_calls.extend(parse_recipient_tool_calls(&recipient, body));
-            body.clear();
-        }
-    };
+    let flush_current =
+        |recipient: &mut Option<String>, body: &mut String, out_calls: &mut Vec<ParsedToolCall>| {
+            if let Some(recipient) = recipient.take() {
+                out_calls.extend(parse_recipient_tool_calls(&recipient, body));
+                body.clear();
+            }
+        };
 
     for line in text.lines() {
         if let Some(cap) = CODEX_TO_HEADER_RE.captures(line) {
@@ -1069,9 +1071,8 @@ fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) 
 }
 
 fn parse_assistant_recipient_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
-    static ASSISTANT_RECIPIENT_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#).unwrap()
-    });
+    static ASSISTANT_RECIPIENT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#).unwrap());
     static RECIPIENT_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)\brecipient\s*=\s*["']?([a-zA-Z0-9_.-]+)["']?"#).unwrap()
     });
@@ -2301,8 +2302,7 @@ pub(crate) async fn run_tool_call_loop(
                         calls = fallback_calls;
                         if calls.is_empty() && looks_like_unparsed_tool_call_syntax(&response_text)
                         {
-                            let sanitized_preview =
-                                sanitize_tool_parse_log_preview(&response_text);
+                            let sanitized_preview = sanitize_tool_parse_log_preview(&response_text);
                             tracing::error!(
                                 raw_response = sanitized_preview.as_str(),
                                 "Failed to parse model tool-call syntax; suppressing raw tool-call text"
@@ -2469,6 +2469,18 @@ pub(crate) async fn run_tool_call_loop(
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
+        }
+
+        // Mid-turn context trim to prevent unbounded growth during tool loops.
+        // Applied after tool results are appended and before the next LLM request.
+        if history.len() > MID_TURN_COMPACT_THRESHOLD {
+            let before = history.len();
+            trim_history(history, DEFAULT_MAX_HISTORY_MESSAGES);
+            tracing::info!(
+                before,
+                after = history.len(),
+                "Mid-turn context trim triggered",
+            );
         }
     }
 
