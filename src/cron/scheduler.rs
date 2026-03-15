@@ -166,10 +166,19 @@ async fn run_agent_job(
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
+    // Cap tool iterations for cron jobs to prevent runaway context growth.
+    const CRON_MAX_TOOL_ITERATIONS: usize = 30;
+    let mut cron_config = config.clone();
+    if cron_config.agent.max_tool_iterations == 0
+        || cron_config.agent.max_tool_iterations > CRON_MAX_TOOL_ITERATIONS
+    {
+        cron_config.agent.max_tool_iterations = CRON_MAX_TOOL_ITERATIONS;
+    }
+
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             crate::agent::run(
-                config.clone(),
+                cron_config,
                 Some(prefixed_prompt),
                 None,
                 model_override,

@@ -122,9 +122,9 @@ impl WasmToolAdapter {
         // Tool plugins use result<T, string> return types for kv/http/memory,
         // so these interfaces are linked manually here.
         for iface in ["prx:host/kv@0.1.0", "prx:host/kv"] {
-            let mut kv_inst = linker.instance(iface).map_err(|e| {
-                PluginError::Instantiation(format!("linker error ({iface}): {e}"))
-            })?;
+            let mut kv_inst = linker
+                .instance(iface)
+                .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
 
             kv_inst
                 .func_wrap_async(
@@ -203,9 +203,9 @@ impl WasmToolAdapter {
         }
 
         for iface in ["prx:host/http-outbound@0.1.0", "prx:host/http-outbound"] {
-            let mut http_inst = linker.instance(iface).map_err(|e| {
-                PluginError::Instantiation(format!("linker error ({iface}): {e}"))
-            })?;
+            let mut http_inst = linker
+                .instance(iface)
+                .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
 
             http_inst
                 .func_wrap_async(
@@ -219,7 +219,9 @@ impl WasmToolAdapter {
                     )| {
                         Box::new(async move {
                             if let Err(e) = store.data().check_permission("http-outbound") {
-                                return Ok((Err::<(u16, Vec<(String, String)>, Vec<u8>), String>(e),));
+                                return Ok((Err::<(u16, Vec<(String, String)>, Vec<u8>), String>(
+                                    e,
+                                ),));
                             }
                             if !store.data().check_url_allowed(&url) {
                                 return Ok((Err(format!("URL not in allowlist: {url}")),));
@@ -255,7 +257,9 @@ impl WasmToolAdapter {
                                         })
                                         .collect();
                                     match resp.bytes().await {
-                                        Ok(bytes) => Ok((Ok((status, resp_headers, bytes.to_vec())),)),
+                                        Ok(bytes) => {
+                                            Ok((Ok((status, resp_headers, bytes.to_vec())),))
+                                        }
                                         Err(e) => Ok((Err(format!("body read error: {e}")),)),
                                     }
                                 }
@@ -271,9 +275,9 @@ impl WasmToolAdapter {
 
         // prx:host/memory — connected to real memory backend
         for iface in ["prx:host/memory@0.1.0", "prx:host/memory"] {
-            let mut mem_inst = linker.instance(iface).map_err(|e| {
-                PluginError::Instantiation(format!("linker error ({iface}): {e}"))
-            })?;
+            let mut mem_inst = linker
+                .instance(iface)
+                .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
 
             mem_inst
                 .func_wrap_async(
@@ -316,7 +320,8 @@ impl WasmToolAdapter {
             mem_inst
                 .func_wrap_async(
                     "recall",
-                    |store: wasmtime::StoreContextMut<'_, HostState>, (query, limit): (String, u32)| {
+                    |store: wasmtime::StoreContextMut<'_, HostState>,
+                     (query, limit): (String, u32)| {
                         Box::new(async move {
                             if let Err(e) = store.data().check_permission("memory") {
                                 return Ok((Err::<Vec<(String, String, String, f64)>, String>(e),));
@@ -324,9 +329,11 @@ impl WasmToolAdapter {
                             let mem = match &store.data().memory {
                                 Some(m) => Arc::clone(m),
                                 None => {
-                                    return Ok((Err::<Vec<(String, String, String, f64)>, String>(
-                                        "memory backend not configured".to_string(),
-                                    ),));
+                                    return Ok((
+                                        Err::<Vec<(String, String, String, f64)>, String>(
+                                            "memory backend not configured".to_string(),
+                                        ),
+                                    ));
                                 }
                             };
                             match mem.recall(&query, limit as usize, None).await {
