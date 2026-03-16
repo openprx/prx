@@ -321,7 +321,36 @@ impl Tool for GatewayTool {
                 #[cfg(unix)]
                 {
                     let pid = std::process::id();
-                    // SAFETY: kill(2) with SIGHUP is safe to call with our own PID
+
+                    // Verify the PID still belongs to us by checking /proc/self/cmdline.
+                    // This guards against PID reuse in the unlikely event the process
+                    // table wraps between id() and kill().
+                    let cmdline_path = format!("/proc/{pid}/cmdline");
+                    match std::fs::read(&cmdline_path) {
+                        Ok(data) => {
+                            let cmdline = String::from_utf8_lossy(&data);
+                            if !cmdline.contains("openprx") && !cmdline.contains("prx") {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(format!(
+                                        "PID {pid} cmdline does not match expected process: {cmdline}"
+                                    )),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            // /proc may not exist (non-Linux), fall through since
+                            // std::process::id() is inherently our own PID.
+                            tracing::warn!(
+                                "Could not read {cmdline_path} for PID validation: {e}"
+                            );
+                        }
+                    }
+
+                    // SAFETY: We send SIGHUP to our own PID (verified above via
+                    // /proc/{pid}/cmdline).  kill(2) is safe for signal delivery
+                    // to the calling process.
                     let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
                     if ret == 0 {
                         Ok(ToolResult {

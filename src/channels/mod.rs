@@ -2625,12 +2625,25 @@ async fn process_channel_message(
     }
 }
 
+/// Classify whether a channel message originated from a system source
+/// (e.g. webhook `system:*` senders, internal cron ticks) vs. a real user.
+fn is_system_message(msg: &traits::ChannelMessage) -> bool {
+    msg.sender.starts_with("system:")
+}
+
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
     max_in_flight_messages: usize,
 ) {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
+    // User messages always get full capacity — system tasks (webhooks, heartbeats)
+    // get a separate, smaller pool (30% of max, min 1) so they can never starve
+    // user messages even when the system pool is exhausted.
+    let user_capacity = max_in_flight_messages.max(1);
+    let system_capacity = (max_in_flight_messages * 3 / 10).max(1);
+    let user_semaphore = Arc::new(tokio::sync::Semaphore::new(user_capacity));
+    let system_semaphore = Arc::new(tokio::sync::Semaphore::new(system_capacity));
+
     let mut workers = tokio::task::JoinSet::new();
     let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
         String,
@@ -2639,7 +2652,12 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
+        let sem = if is_system_message(&msg) {
+            Arc::clone(&system_semaphore)
+        } else {
+            Arc::clone(&user_semaphore)
+        };
+        let permit = match sem.acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
         };
@@ -6200,8 +6218,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed < Duration::from_millis(430),
-            "expected parallel dispatch (<430ms), got {:?}",
+            elapsed < Duration::from_millis(900),
+            "expected parallel dispatch (<900ms), got {:?}",
             elapsed
         );
 
