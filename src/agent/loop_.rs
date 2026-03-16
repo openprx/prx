@@ -100,22 +100,22 @@ static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
         r"(?i)bearer",
         r"(?i)credential",
     ])
-    .unwrap()
+    .expect("compile regex set: sensitive key name patterns")
 });
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).expect("compile regex: sensitive key-value pair pattern")
 });
 
 static SENSITIVE_LOG_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?i)(["']?\b(?:token|api[_-]?key|password|secret|user[_-]?key|credential|key)\b["']?\s*[:=]\s*)(?:"[^"]{8,}"|'[^']{8,}'|[^\s,;}{]{8,})"#,
     )
-    .unwrap()
+    .expect("compile regex: sensitive log key-value pattern")
 });
 
 static SENSITIVE_BEARER_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}"#).expect("compile regex: bearer token pattern"));
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
@@ -1137,7 +1137,7 @@ fn parse_recipient_tool_calls(recipient: &str, body: &str) -> Vec<ParsedToolCall
 
 fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
     static CODEX_TO_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)^\s*(?:assistant\s+)?to=([a-zA-Z0-9_.-]+)\s+code\s*$"#).unwrap()
+        Regex::new(r#"(?i)^\s*(?:assistant\s+)?to=([a-zA-Z0-9_.-]+)\s+code\s*$"#).expect("compile regex: codex to=recipient header")
     });
 
     let mut found_header = false;
@@ -1192,9 +1192,9 @@ fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) 
 
 fn parse_assistant_recipient_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
     static ASSISTANT_RECIPIENT_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#).unwrap());
+        LazyLock::new(|| Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#).expect("compile regex: assistant XML tag pattern"));
     static RECIPIENT_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)\brecipient\s*=\s*["']?([a-zA-Z0-9_.-]+)["']?"#).unwrap()
+        Regex::new(r#"(?i)\brecipient\s*=\s*["']?([a-zA-Z0-9_.-]+)["']?"#).expect("compile regex: recipient attribute pattern")
     });
 
     let mut calls = Vec::new();
@@ -1243,7 +1243,7 @@ fn looks_like_unparsed_tool_call_syntax(text: &str) -> bool {
             r#"(?is)<assistant\b[^>]*\brecipient\s*=\s*["']?[a-zA-Z0-9_.-]+["']?[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\]|```[\s\S]*?```)\s*</assistant>"#,
             r"(?is)(?:^|\n)\s*(?:assistant\s+)?to=[a-zA-Z0-9_.-]+\s+code\s*(?:\r?\n)+\s*(?:```(?:json|tool[_-]?call|toolcall|invoke)?\s*(?:\r?\n)+)?\s*(?:\{|\[)",
         ])
-        .unwrap()
+        .expect("compile regex set: complete tool syntax patterns")
     });
     COMPLETE_TOOL_SYNTAX.is_match(text)
 }
@@ -1358,13 +1358,13 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             Regex::new(
                 r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</tool_use>|</invoke>)",
             )
-            .unwrap()
+            .expect("compile regex: markdown tool_call block pattern")
         });
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
 
         for cap in MD_TOOL_CALL_RE.captures_iter(response) {
-            let full_match = cap.get(0).unwrap();
+            let full_match = cap.get(0).expect("regex capture group 0 always exists");
             let before = &response[last_end..full_match.start()];
             if !before.trim().is_empty() {
                 md_text_parts.push(before.trim().to_string());
@@ -1537,8 +1537,8 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 }
 
 static TOOL_BARRIERS: LazyLock<
-    std::sync::Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>,
-> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    parking_lot::Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 fn tool_barrier_key(name: &str) -> Option<&'static str> {
     match name {
@@ -1557,9 +1557,7 @@ fn tool_barrier_key(name: &str) -> Option<&'static str> {
 
 async fn acquire_tool_barrier(key: &'static str) -> tokio::sync::OwnedMutexGuard<()> {
     let barrier = {
-        let mut barriers = TOOL_BARRIERS
-            .lock()
-            .expect("tool barrier registry mutex should not be poisoned");
+        let mut barriers = TOOL_BARRIERS.lock();
         barriers
             .entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))

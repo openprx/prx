@@ -103,7 +103,8 @@ impl Tool for HardwareMemoryReadTool {
 
         #[cfg(feature = "probe")]
         {
-            match probe_read_memory(chip.unwrap(), _address, _length) {
+            // Safety: chip.is_none() returned early above
+            match probe_read_memory(chip.expect("BUG: chip checked above"), _address, _length) {
                 Ok(output) => {
                     return Ok(ToolResult {
                         success: true,

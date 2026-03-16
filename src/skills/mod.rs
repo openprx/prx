@@ -1117,7 +1117,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                             .arg(&src)
                             .output();
 
-                        if junction_result.is_ok() && junction_result.unwrap().status.success() {
+                        if junction_result.as_ref().is_ok_and(|o| o.status.success()) {
                             println!(
                                 "  {} Skill linked (junction): {}",
                                 console::style("✓").green().bold(),

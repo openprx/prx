@@ -110,7 +110,10 @@ pub fn rank_models(
             let similarity = similarity_scores
                 .and_then(|scores| scores.get(&model.config.model_id))
                 .copied()
-                .unwrap_or(0.0);
+                .unwrap_or_else(|| {
+                    tracing::trace!("No similarity score for model {}, defaulting to 0.0", model.config.model_id);
+                    0.0
+                });
             compute_score(intent, estimated_tokens, model, config, similarity)
         })
         .collect();
@@ -118,7 +121,10 @@ pub fn rank_models(
     candidates.sort_by(|a, b| {
         b.total_score
             .partial_cmp(&a.total_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or_else(|| {
+                tracing::warn!("Router scoring: NaN comparison for models {} vs {}, treating as equal", a.model_id, b.model_id);
+                std::cmp::Ordering::Equal
+            })
     });
 
     let best = candidates

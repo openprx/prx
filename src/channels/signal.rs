@@ -9,7 +9,8 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -1451,16 +1452,14 @@ impl SignalChannel {
     fn guard_check_breaker(&self, key: &str, now: Instant) -> bool {
         let mut guard = self
             .storm_guard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         guard.is_breaker_open(key, now)
     }
 
     fn guard_record_non_user_and_maybe_trip(&self, key: &str, now: Instant) -> bool {
         let mut guard = self
             .storm_guard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         guard.record_non_user_event(key, now)
     }
 
@@ -1473,8 +1472,7 @@ impl SignalChannel {
     ) -> UserEventGuardDecision {
         let mut guard = self
             .storm_guard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
 
         if guard.is_breaker_open(key, now) {
             return UserEventGuardDecision::BreakerOpen;

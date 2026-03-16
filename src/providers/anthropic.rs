@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 /// OAuth state for Claude Code token auto-refresh.
 struct OAuthState {
@@ -215,8 +215,7 @@ impl AnthropicProvider {
     fn ensure_fresh_credential(&self) -> anyhow::Result<String> {
         let mut state = self
             .oauth
-            .lock()
-            .map_err(|_| anyhow::anyhow!("OAuth state lock poisoned"))?;
+            .lock();
 
         // If no refresh_token, this is a plain API key — just return it.
         if state.refresh_token.is_none() {
@@ -283,8 +282,7 @@ impl AnthropicProvider {
     fn try_refresh_after_401(&self) -> anyhow::Result<String> {
         let mut state = self
             .oauth
-            .lock()
-            .map_err(|_| anyhow::anyhow!("OAuth state lock poisoned"))?;
+            .lock();
 
         let refresh_token = state
             .refresh_token
@@ -835,11 +833,7 @@ impl Provider for AnthropicProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        let credential = self
-            .oauth
-            .lock()
-            .ok()
-            .and_then(|state| state.credential.clone());
+        let credential = self.oauth.lock().credential.clone();
         if let Some(credential) = credential {
             let mut request = self
                 .http_client()
@@ -857,7 +851,7 @@ impl Provider for AnthropicProvider {
 #[cfg(test)]
 impl AnthropicProvider {
     fn credential(&self) -> Option<String> {
-        self.oauth.lock().ok().and_then(|s| s.credential.clone())
+        self.oauth.lock().credential.clone()
     }
 }
 

@@ -2,6 +2,10 @@
 
 This file is loaded by Claude Code on every session. These rules are MANDATORY.
 
+## Rust Edition
+
+Use **Rust 2024 edition** (`edition = "2024"` in Cargo.toml) for all new code.
+
 ## Build & Test
 
 ```bash
@@ -11,6 +15,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo build --release --all-features  # QA/production build
 ```
+
+## Seven Iron Rules (Strictly Enforced)
+
+1. **NO panic-capable unwrapping** — `.unwrap()`, `.expect()`, and any shorthand that can panic are BANNED in production code. Use `?`, `unwrap_or`, `if let`, or explicit error returns.
+2. **NO dead code** — No unused variables, parameters, or imports. Code must compile with zero warnings. `#[allow(dead_code)]` is not a fix.
+3. **NO incomplete implementations** — `todo!()`, `unimplemented!()`, placeholder returns, and empty match arms are BANNED. Every code path must be fully implemented.
+4. **Business logic must be verifiable** — All code must pass `cargo check`. No speculative interfaces, no pseudo-implementations, no "will fix later" stubs.
+5. **Validate with `cargo check` and `cargo fix`** — Do NOT use `cargo run` or `cargo build` for validation during development. Check correctness first.
+6. **Explicit API and error handling** — Validate all external inputs at boundaries. Never use panic as a substitute for error branches. Return typed errors.
+7. **Minimize allocations and copies** — Follow ownership and borrowing best practices. Clone only when necessary (async move, cross-thread). Prefer `&str` over `String`, `Cow` over clone, `Arc` over deep copy.
 
 ## Rust Safety Rules (Production-Grade, Non-Negotiable)
 

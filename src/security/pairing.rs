@@ -8,6 +8,9 @@
 // Already-paired tokens are persisted in config so restarts don't require
 // re-pairing.
 
+// Safety: parking_lot::Mutex is correct here — all lock scopes are synchronous
+// (no .await while holding the guard). The async `try_pair` delegates to
+// `spawn_blocking` which runs the blocking `try_pair_blocking` on a thread pool.
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
