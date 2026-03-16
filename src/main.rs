@@ -120,7 +120,6 @@ mod multimodal;
 mod nodes;
 mod observability;
 mod onboard;
-mod peripherals;
 #[cfg(feature = "wasm-plugins")]
 mod plugins;
 mod providers;
@@ -140,8 +139,7 @@ mod webhook;
 
 use config::Config;
 
-// Re-export so binary's hardware/peripherals modules can use crate::HardwareCommands etc.
-pub use openprx::{HardwareCommands, PeripheralCommands};
+pub use openprx::HardwareCommands;
 
 /// `OpenPRX` - 100% Rust. 100% Agnostic. Your AI, your rules.
 #[derive(Parser, Debug)]
@@ -224,8 +222,7 @@ Use --message for single-shot queries without entering interactive mode.
 Examples:
   openprx agent                              # interactive session
   openprx agent -m \"Summarize today's logs\"  # single message
-  openprx agent -p anthropic --model claude-sonnet-4-20250514
-  openprx agent --peripheral nucleo-f401re:/dev/ttyACM0")]
+  openprx agent -p anthropic --model claude-sonnet-4-20250514")]
     Agent {
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
@@ -243,9 +240,6 @@ Examples:
         #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
         temperature: f64,
 
-        /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
-        #[arg(long)]
-        peripheral: Vec<String>,
     },
 
     /// Start the gateway server (webhooks, websockets)
@@ -419,24 +413,6 @@ Examples:
         hardware_command: openprx::HardwareCommands,
     },
 
-    /// Manage hardware peripherals (STM32, RPi GPIO, etc.)
-    #[command(long_about = "\
-Manage hardware peripherals.
-
-Add, list, flash, and configure hardware boards that expose tools \
-to the agent (GPIO, sensors, actuators). Supported boards: \
-nucleo-f401re, rpi-gpio, esp32, arduino-uno.
-
-Examples:
-  openprx peripheral list
-  openprx peripheral add nucleo-f401re /dev/ttyACM0
-  openprx peripheral add rpi-gpio native
-  openprx peripheral flash --port /dev/cu.usbmodem12345
-  openprx peripheral flash-nucleo")]
-    Peripheral {
-        #[command(subcommand)]
-        peripheral_command: openprx::PeripheralCommands,
-    },
 
     /// Manage configuration
     #[command(long_about = "\
@@ -910,8 +886,7 @@ async fn main() -> Result<()> {
             provider,
             model,
             temperature,
-            peripheral,
-        } => agent::run(config, message, provider, model, temperature, peripheral)
+        } => agent::run(config, message, provider, model, temperature)
             .await
             .map(|_| ()),
 
@@ -1008,17 +983,6 @@ async fn main() -> Result<()> {
                 );
             }
             println!();
-            println!("Peripherals:");
-            println!(
-                "  Enabled:   {}",
-                if config.peripherals.enabled {
-                    "yes"
-                } else {
-                    "no"
-                }
-            );
-            println!("  Boards:    {}", config.peripherals.boards.len());
-
             Ok(())
         }
 
@@ -1116,10 +1080,6 @@ async fn main() -> Result<()> {
 
         Commands::Hardware { hardware_command } => {
             hardware::handle_command(hardware_command.clone(), &config)
-        }
-
-        Commands::Peripheral { peripheral_command } => {
-            peripherals::handle_command(peripheral_command.clone(), &config).await
         }
 
         Commands::Config { config_command } => match config_command {

@@ -222,10 +222,6 @@ pub struct Config {
     #[serde(default)]
     pub cost: CostConfig,
 
-    /// Peripheral board configuration for hardware integration (`[peripherals]`).
-    #[serde(default)]
-    pub peripherals: PeripheralsConfig,
-
     /// Remote node proxy configuration (`[nodes]`).
     #[serde(default)]
     pub nodes: NodesConfig,
@@ -1343,59 +1339,6 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
     prices
 }
 
-// ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
-
-/// Peripheral board integration configuration (`[peripherals]` section).
-///
-/// Boards become agent tools when enabled.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
-pub struct PeripheralsConfig {
-    /// Enable peripheral support (boards become agent tools)
-    #[serde(default)]
-    pub enabled: bool,
-    /// Board configurations (nucleo-f401re, rpi-gpio, etc.)
-    #[serde(default)]
-    pub boards: Vec<PeripheralBoardConfig>,
-    /// Path to datasheet docs (relative to workspace) for RAG retrieval.
-    /// Place .md/.txt files named by board (e.g. nucleo-f401re.md, rpi-gpio.md).
-    #[serde(default)]
-    pub datasheet_dir: Option<String>,
-}
-
-/// Configuration for a single peripheral board (e.g. STM32, RPi GPIO).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct PeripheralBoardConfig {
-    /// Board type: "nucleo-f401re", "rpi-gpio", "esp32", etc.
-    pub board: String,
-    /// Transport: "serial", "native", "websocket"
-    #[serde(default = "default_peripheral_transport")]
-    pub transport: String,
-    /// Path for serial: "/dev/ttyACM0", "/dev/ttyUSB0"
-    #[serde(default)]
-    pub path: Option<String>,
-    /// Baud rate for serial (default: 115200)
-    #[serde(default = "default_peripheral_baud")]
-    pub baud: u32,
-}
-
-fn default_peripheral_transport() -> String {
-    "serial".into()
-}
-
-fn default_peripheral_baud() -> u32 {
-    115_200
-}
-
-impl Default for PeripheralBoardConfig {
-    fn default() -> Self {
-        Self {
-            board: String::new(),
-            transport: default_peripheral_transport(),
-            path: None,
-            baud: default_peripheral_baud(),
-        }
-    }
-}
 
 // ── Gateway security ─────────────────────────────────────────────
 
@@ -4253,7 +4196,6 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            peripherals: PeripheralsConfig::default(),
             nodes: NodesConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
@@ -5576,7 +5518,6 @@ default_temperature = 0.7
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            peripherals: PeripheralsConfig::default(),
             nodes: NodesConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
@@ -5850,7 +5791,6 @@ concurrency_rollback_error_rate_threshold = 0.23
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
-            peripherals: PeripheralsConfig::default(),
             nodes: NodesConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
@@ -8009,44 +7949,6 @@ allowed_from = ["*"]
         let hb = HeartbeatConfig::default();
         assert_eq!(hb.active_hours, vec![8, 23]);
         assert_eq!(hb.prompt, "Check HEARTBEAT.md and follow instructions.");
-    }
-
-    // ── Peripherals config ───────────────────────────────────────
-
-    #[test]
-    async fn peripherals_config_default_disabled() {
-        let p = PeripheralsConfig::default();
-        assert!(!p.enabled);
-        assert!(p.boards.is_empty());
-    }
-
-    #[test]
-    async fn peripheral_board_config_defaults() {
-        let b = PeripheralBoardConfig::default();
-        assert!(b.board.is_empty());
-        assert_eq!(b.transport, "serial");
-        assert!(b.path.is_none());
-        assert_eq!(b.baud, 115_200);
-    }
-
-    #[test]
-    async fn peripherals_config_toml_roundtrip() {
-        let p = PeripheralsConfig {
-            enabled: true,
-            boards: vec![PeripheralBoardConfig {
-                board: "nucleo-f401re".into(),
-                transport: "serial".into(),
-                path: Some("/dev/ttyACM0".into()),
-                baud: 115_200,
-            }],
-            datasheet_dir: None,
-        };
-        let toml_str = toml::to_string(&p).unwrap();
-        let parsed: PeripheralsConfig = toml::from_str(&toml_str).unwrap();
-        assert!(parsed.enabled);
-        assert_eq!(parsed.boards.len(), 1);
-        assert_eq!(parsed.boards[0].board, "nucleo-f401re");
-        assert_eq!(parsed.boards[0].path.as_deref(), Some("/dev/ttyACM0"));
     }
 
     #[test]

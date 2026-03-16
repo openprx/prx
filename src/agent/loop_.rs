@@ -690,46 +690,6 @@ fn build_runtime_system_prompt(
     system_prompt
 }
 
-/// Build hardware datasheet context from RAG when peripherals are enabled.
-/// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
-fn build_hardware_context(
-    rag: &crate::rag::HardwareRag,
-    user_msg: &str,
-    boards: &[String],
-    chunk_limit: usize,
-) -> String {
-    if rag.is_empty() || boards.is_empty() {
-        return String::new();
-    }
-
-    let mut context = String::new();
-
-    // Pin aliases: when user says "red led", inject "red_led: 13" for matching boards
-    let pin_ctx = rag.pin_alias_context(user_msg, boards);
-    if !pin_ctx.is_empty() {
-        context.push_str(&pin_ctx);
-    }
-
-    let chunks = rag.retrieve(user_msg, boards, chunk_limit);
-    if chunks.is_empty() && pin_ctx.is_empty() {
-        return String::new();
-    }
-
-    if !chunks.is_empty() {
-        context.push_str("[Hardware documentation]\n");
-    }
-    for chunk in chunks {
-        let board_tag = chunk.board.as_deref().unwrap_or("generic");
-        let _ = writeln!(
-            context,
-            "--- {} ({}) ---\n{}\n",
-            chunk.source, board_tag, chunk.content
-        );
-    }
-    context.push('\n');
-    context
-}
-
 /// Find a tool by name in the registry.
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools
@@ -2734,7 +2694,7 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
 
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
-// provider, hardware RAG, peripherals) and enters either single-shot or
+// provider, hardware RAG) and enters either single-shot or
 // interactive REPL mode. The interactive loop manages history compaction
 // and hard trimming to keep the context window bounded.
 
@@ -2745,7 +2705,6 @@ pub async fn run(
     provider_override: Option<String>,
     model_override: Option<String>,
     temperature: f64,
-    peripheral_overrides: Vec<String>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -2770,15 +2729,7 @@ pub async fn run(
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
-    // ── Peripherals (merge peripheral tools into registry) ─
-    if !peripheral_overrides.is_empty() {
-        tracing::info!(
-            peripherals = ?peripheral_overrides,
-            "Peripheral overrides from CLI (config boards take precedence)"
-        );
-    }
-
-    // ── Tools (including memory tools and peripherals) ────────────
+    // ── Tools ────────────────────────────────────────────────────
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -2802,12 +2753,6 @@ pub async fn run(
         &config,
     );
 
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    if !peripheral_tools.is_empty() {
-        tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
-        tools_registry.extend(peripheral_tools);
-    }
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -2852,26 +2797,6 @@ pub async fn run(
             }),
         )
         .await;
-
-    // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
-    let hardware_rag: Option<crate::rag::HardwareRag> = config
-        .peripherals
-        .datasheet_dir
-        .as_ref()
-        .filter(|d| !d.trim().is_empty())
-        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
-        .and_then(Result::ok)
-        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
-    if let Some(ref rag) = hardware_rag {
-        tracing::info!(chunks = rag.len(), "Hardware RAG loaded");
-    }
-
-    let board_names: Vec<String> = config
-        .peripherals
-        .boards
-        .iter()
-        .map(|b| b.board.clone())
-        .collect();
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -2948,36 +2873,6 @@ pub async fn run(
             "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
         ));
     }
-    if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
-        tool_descs.push((
-            "gpio_read",
-            "Read GPIO pin value (0 or 1) on connected hardware (STM32, Arduino). Use when: checking sensor/button state, LED status.",
-        ));
-        tool_descs.push((
-            "gpio_write",
-            "Set GPIO pin high (1) or low (0) on connected hardware. Use when: turning LED on/off, controlling actuators.",
-        ));
-        tool_descs.push((
-            "arduino_upload",
-            "Upload agent-generated Arduino sketch. Use when: user asks for 'make a heart', 'blink pattern', or custom LED behavior on Arduino. You write the full .ino code; OpenPRX compiles and uploads it. Pin 13 = built-in LED on Uno.",
-        ));
-        tool_descs.push((
-            "hardware_memory_map",
-            "Return flash and RAM address ranges for connected hardware. Use when: user asks for 'upper and lower memory addresses', 'memory map', or 'readable addresses'.",
-        ));
-        tool_descs.push((
-            "hardware_board_info",
-            "Return full board info (chip, architecture, memory map) for connected hardware. Use when: user asks for 'board info', 'what board do I have', 'connected hardware', 'chip info', or 'what hardware'.",
-        ));
-        tool_descs.push((
-            "hardware_memory_read",
-            "Read actual memory/register values from Nucleo via USB. Use when: user asks to 'read register values', 'read memory', 'dump lower memory 0-126', 'give address and value'. Params: address (hex, default 0x20000000), length (bytes, default 128).",
-        ));
-        tool_descs.push((
-            "hardware_capabilities",
-            "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
-        ));
-    }
     let native_tools = provider.supports_native_tools();
     let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
     let mut skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
@@ -3016,15 +2911,10 @@ pub async fn run(
                 .await;
         }
 
-        // Inject memory + hardware RAG context into user message
+        // Inject memory context into user message
         let mem_context =
             build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
-        let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-        let hw_context = hardware_rag
-            .as_ref()
-            .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
-            .unwrap_or_default();
-        let context = format!("{}{}", mem_context.preamble, hw_context);
+        let context = mem_context.preamble.clone();
         let enriched = if context.is_empty() {
             msg.clone()
         } else {
@@ -3195,15 +3085,10 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory + hardware RAG context into user message
+            // Inject memory context into user message
             let mem_context =
                 build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
-            let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-            let hw_context = hardware_rag
-                .as_ref()
-                .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
-                .unwrap_or_default();
-            let context = format!("{}{}", mem_context.preamble, hw_context);
+            let context = mem_context.preamble.clone();
             let enriched = if context.is_empty() {
                 user_input.clone()
             } else {
@@ -3343,7 +3228,7 @@ pub async fn run(
     Ok(final_output)
 }
 
-/// Process a single message through the full agent (with tools, peripherals, memory).
+/// Process a single message through the full agent (with tools and memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let observer: Arc<dyn Observer> =
@@ -3387,9 +3272,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.api_key.as_deref(),
         &config,
     );
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    tools_registry.extend(peripheral_tools);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
@@ -3414,21 +3296,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &provider_runtime_options,
     )?;
 
-    let hardware_rag: Option<crate::rag::HardwareRag> = config
-        .peripherals
-        .datasheet_dir
-        .as_ref()
-        .filter(|d| !d.trim().is_empty())
-        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
-        .and_then(Result::ok)
-        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
-    let board_names: Vec<String> = config
-        .peripherals
-        .boards
-        .iter()
-        .map(|b| b.board.clone())
-        .collect();
-
     let mut skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
@@ -3445,33 +3312,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     }
     if config.composio.enabled {
         tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
-    }
-    if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
-        tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
-        tool_descs.push((
-            "gpio_write",
-            "Set GPIO pin high or low on connected hardware.",
-        ));
-        tool_descs.push((
-            "arduino_upload",
-            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; OpenPRX uploads it.",
-        ));
-        tool_descs.push((
-            "hardware_memory_map",
-            "Return flash and RAM address ranges. Use when user asks for memory addresses or memory map.",
-        ));
-        tool_descs.push((
-            "hardware_board_info",
-            "Return full board info (chip, architecture, memory map). Use when user asks for board info, what board, connected hardware, or chip info.",
-        ));
-        tool_descs.push((
-            "hardware_memory_read",
-            "Read actual memory/register values from Nucleo. Use when user asks to read registers, read memory, dump lower memory 0-126, or give address and value.",
-        ));
-        tool_descs.push((
-            "hardware_capabilities",
-            "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
-        ));
     }
     let native_tools = provider.supports_native_tools();
     let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
@@ -3490,12 +3330,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     );
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
-    let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-    let hw_context = hardware_rag
-        .as_ref()
-        .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
-        .unwrap_or_default();
-    let context = format!("{}{}", mem_context.preamble, hw_context);
+    let context = mem_context.preamble.clone();
     let enriched = if context.is_empty() {
         message.to_string()
     } else {
