@@ -251,6 +251,3 @@ panic = "abort"
 tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
 
-[[bench]]
-name = "agent_benchmarks"
-harness = false
