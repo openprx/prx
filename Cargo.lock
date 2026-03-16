@@ -4412,7 +4412,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rmcp",
- "rppal 0.22.1",
+ "rppal",
  "rusqlite",
  "rust-embed",
  "rustls",
@@ -4452,27 +4452,6 @@ dependencies = [
  "wasmtime-wasi",
  "webpki-roots 1.0.6",
  "which",
-]
-
-[[package]]
-name = "openprx-kit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "directories",
- "reqwest",
- "rppal 0.19.0",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "toml 1.0.1+spec-1.1.0",
- "tracing",
 ]
 
 [[package]]
@@ -5648,15 +5627,6 @@ checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
 dependencies = [
  "rmp",
  "serde",
-]
-
-[[package]]
-name = "rppal"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b37e992f3222e304708025de77c9e395068a347449d0d7164f52d3beccdbd8d"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -6918,17 +6888,6 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "tokio-test"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
-dependencies = [
- "futures-core",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]

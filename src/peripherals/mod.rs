@@ -9,8 +9,6 @@ pub mod traits;
 pub mod serial;
 
 #[cfg(feature = "hardware")]
-pub mod arduino_flash;
-#[cfg(feature = "hardware")]
 pub mod arduino_upload;
 #[cfg(feature = "hardware")]
 pub mod capabilities_tool;
@@ -18,8 +16,6 @@ pub mod capabilities_tool;
 pub mod nucleo_flash;
 #[cfg(feature = "hardware")]
 pub mod uno_q_bridge;
-#[cfg(feature = "hardware")]
-pub mod uno_q_setup;
 
 #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
 pub mod rpi;
@@ -98,28 +94,11 @@ pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> 
             cfg.save().await?;
             println!("Added {} at {}. Restart daemon to apply.", board, path);
         }
-        #[cfg(feature = "hardware")]
-        crate::PeripheralCommands::Flash { port } => {
-            let port_str = arduino_flash::resolve_port(config, port.as_deref())
-                .or_else(|| port.clone())
-                .ok_or_else(|| anyhow::anyhow!(
-                    "No port specified. Use --port /dev/cu.usbmodem* or add arduino-uno to config.toml"
-                ))?;
-            arduino_flash::flash_arduino_firmware(&port_str)?;
-        }
-        #[cfg(not(feature = "hardware"))]
         crate::PeripheralCommands::Flash { .. } => {
-            println!("Arduino flash requires the 'hardware' feature.");
-            println!("Build with: cargo build --features hardware");
+            println!("Arduino flash is no longer supported (firmware removed).");
         }
-        #[cfg(feature = "hardware")]
-        crate::PeripheralCommands::SetupUnoQ { host } => {
-            uno_q_setup::setup_uno_q_bridge(host.as_deref())?;
-        }
-        #[cfg(not(feature = "hardware"))]
         crate::PeripheralCommands::SetupUnoQ { .. } => {
-            println!("Uno Q setup requires the 'hardware' feature.");
-            println!("Build with: cargo build --features hardware");
+            println!("Uno Q bridge setup is no longer supported (firmware removed).");
         }
         #[cfg(feature = "hardware")]
         crate::PeripheralCommands::FlashNucleo => {
