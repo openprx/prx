@@ -1,5 +1,7 @@
 # codex.md — PRX Rust Production Code Standards for Codex
 
+## Rust Edition: 2024
+
 ## Build Commands
 ```bash
 source ~/.cargo/env
@@ -9,12 +11,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release --all-features
 ```
 
+## Seven Iron Rules (Strictly Enforced)
+1. NO panic-capable unwrapping — .unwrap(), .expect(), any panic shorthand BANNED in production code
+2. NO dead code — zero unused variables, parameters, imports. Zero warnings.
+3. NO incomplete implementations — todo!(), unimplemented!(), placeholder returns, empty match arms BANNED
+4. Business logic must be verifiable — must pass cargo check, no speculative interfaces
+5. Validate with cargo check and cargo fix — not cargo run/build
+6. Explicit error handling — validate external inputs at boundaries, never panic instead of error
+7. Minimize allocations — prefer &str over String, Cow over clone, Arc over deep copy, clone only when necessary
+
 ## MANDATORY Rules
 
-### NO .unwrap() in Production Code
-- BANNED: `.unwrap()` outside `#[cfg(test)]`
+### NO .unwrap()/.expect() in Production Code
+- BANNED: `.unwrap()` and `.expect()` outside `#[cfg(test)]`
 - Use instead: `?`, `.context("msg")?`, `.unwrap_or_default()`, `.unwrap_or(val)`, `if let`
-- ONLY exception: `.expect("BUG: reason")` on compile-time constants (LazyLock Regex, etc.)
+- For compile-time constants in LazyLock: use a safe init function that returns Result, not .expect()
 
 ### Error Propagation
 - Prefer `?` operator with anyhow context

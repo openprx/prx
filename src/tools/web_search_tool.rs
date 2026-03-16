@@ -177,7 +177,7 @@ fn decode_ddg_redirect_url(raw_url: &str) -> String {
 }
 
 fn strip_tags(content: &str) -> String {
-    let re = Regex::new(r"<[^>]+>").unwrap();
+    let re = Regex::new(r"<[^>]+>").expect("compile regex: strip HTML tags");
     re.replace_all(content, "").to_string()
 }
 

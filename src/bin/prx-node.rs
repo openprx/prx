@@ -62,7 +62,7 @@ struct NodeConfigFile {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().expect("BUG: static directive")))
         .init();
 
     let cli = Cli::parse();

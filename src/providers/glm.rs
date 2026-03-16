@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct GlmProvider {
@@ -106,7 +106,8 @@ impl GlmProvider {
             .as_millis() as u64;
 
         // Check cache (valid for 3 minutes, token expires at 3.5 min)
-        if let Ok(cache) = self.token_cache.lock() {
+        {
+            let cache = self.token_cache.lock();
             if let Some((ref token, expiry)) = *cache {
                 if now_ms < expiry {
                     return Ok(token.clone());
@@ -137,7 +138,8 @@ impl GlmProvider {
         let token = format!("{signing_input}.{sig_b64}");
 
         // Cache for 3 minutes
-        if let Ok(mut cache) = self.token_cache.lock() {
+        {
+            let mut cache = self.token_cache.lock();
             *cache = Some((token.clone(), now_ms + 180_000));
         }
 

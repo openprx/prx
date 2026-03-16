@@ -82,7 +82,8 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -804,8 +805,7 @@ fn runtime_config_path(ctx: &ChannelRuntimeContext) -> Option<PathBuf> {
 fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefaults {
     if let Some(config_path) = runtime_config_path(ctx) {
         let store = runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         if let Some(state) = store.get(&config_path) {
             return state.defaults.clone();
         }
@@ -850,8 +850,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
 
     {
         let store = runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         if let Some(state) = store.get(&config_path) {
             if state.last_applied_stamp == Some(stamp.clone()) {
                 return Ok(());
@@ -878,7 +877,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     }
 
     {
-        let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = ctx.provider_cache.lock();
         cache.clear();
         cache.insert(
             next_defaults.default_provider.clone(),
@@ -888,8 +887,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
 
     {
         let mut store = runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         store.insert(
             config_path.clone(),
             RuntimeConfigState {
@@ -921,7 +919,6 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
 fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> ChannelRouteSelection {
     ctx.route_overrides
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .get(sender_key)
         .cloned()
         .unwrap_or_else(|| default_route_selection(ctx))
@@ -931,8 +928,7 @@ fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: Chan
     let default_route = default_route_selection(ctx);
     let mut routes = ctx
         .route_overrides
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .lock();
     if next == default_route {
         routes.remove(sender_key);
     } else {
@@ -943,15 +939,13 @@ fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: Chan
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
     ctx.conversation_histories
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .remove(sender_key);
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
     let mut histories = ctx
         .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .lock();
 
     let Some(turns) = histories.get_mut(sender_key) else {
         return false;
@@ -1007,8 +1001,7 @@ async fn append_sender_turn(
     {
         let mut histories = ctx
             .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         let turns = histories.entry(sender_key.to_string()).or_default();
         turns.push(turn);
         while turns.len() > MAX_CHANNEL_HISTORY {
@@ -1118,7 +1111,6 @@ async fn get_or_create_provider(
     if let Some(existing) = ctx
         .provider_cache
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .get(provider_name)
         .cloned()
     {
@@ -1149,7 +1141,7 @@ async fn get_or_create_provider(
         tracing::warn!(provider = provider_name, "Provider warmup failed: {err}");
     }
 
-    let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = ctx.provider_cache.lock();
     let cached = cache
         .entry(provider_name.to_string())
         .or_insert_with(|| Arc::clone(&provider));
@@ -2154,7 +2146,6 @@ async fn process_channel_message(
     let had_prior_history = ctx
         .conversation_histories
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
 
@@ -2244,7 +2235,6 @@ async fn process_channel_message(
         let prior_turns_raw = ctx
             .conversation_histories
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .get(&history_key)
             .cloned()
             .unwrap_or_default();
@@ -2425,7 +2415,7 @@ async fn process_channel_message(
                     let compacted_chars = ctx
                         .conversation_histories
                         .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
+                        
                         .get(&history_key)
                         .map(|turns| {
                             turns
@@ -3560,8 +3550,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let initial_stamp = config_file_stamp(&config.config_path).await;
     {
         let mut store = runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         store.insert(
             config.config_path.clone(),
             RuntimeConfigState {
@@ -4462,8 +4451,7 @@ mod tests {
 
         let histories = ctx
             .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         let kept = histories
             .get(&sender)
             .expect("sender history should remain");
@@ -4928,7 +4916,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[derive(Default)]
     struct HistoryCaptureProvider {
-        calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        calls: parking_lot::Mutex<Vec<Vec<(String, String)>>>,
     }
 
     #[async_trait::async_trait]
@@ -4953,7 +4941,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
                 .collect::<Vec<_>>();
-            let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            let mut calls = self.calls.lock();
             calls.push(snapshot);
             Ok(format!("response-{}", calls.len()))
         }
@@ -4961,7 +4949,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     struct DelayedHistoryCaptureProvider {
         delay: Duration,
-        calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        calls: parking_lot::Mutex<Vec<Vec<(String, String)>>>,
     }
 
     #[async_trait::async_trait]
@@ -4987,7 +4975,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .map(|m| (m.role.clone(), m.content.clone()))
                 .collect::<Vec<_>>();
             let call_index = {
-                let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+                let mut calls = self.calls.lock();
                 calls.push(snapshot);
                 calls.len()
             };
@@ -5001,7 +4989,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[derive(Default)]
     struct ModelCaptureProvider {
         call_count: AtomicUsize,
-        models: std::sync::Mutex<Vec<String>>,
+        models: parking_lot::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -5025,7 +5013,6 @@ BTC is currently around $65,000 based on latest tool output."#
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.models
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
                 .push(model.to_string());
             Ok("ok".to_string())
         }
@@ -5518,7 +5505,6 @@ BTC is currently around $65,000 based on latest tool output."#
         let route = runtime_ctx
             .route_overrides
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .get(route_key)
             .cloned()
             .expect("route should be stored for sender");
@@ -5619,7 +5605,6 @@ BTC is currently around $65,000 based on latest tool output."#
             routed_provider_impl
                 .models
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
                 .as_slice(),
             &["route-model".to_string()]
         );
@@ -5720,8 +5705,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         {
             let mut store = runtime_config_store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock();
             store.insert(
                 config_path.clone(),
                 RuntimeConfigState {
@@ -5800,8 +5784,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         {
             let mut store = runtime_config_store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .lock();
             store.remove(&config_path);
         }
 
@@ -5810,7 +5793,6 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_impl
                 .models
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
                 .as_slice(),
             &["hot-reloaded-model".to_string()]
         );
@@ -6237,7 +6219,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let provider_impl = Arc::new(DelayedHistoryCaptureProvider {
             delay: Duration::from_millis(250),
-            calls: std::sync::Mutex::new(Vec::new()),
+            calls: parking_lot::Mutex::new(Vec::new()),
         });
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -6321,8 +6303,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let calls = provider_impl
             .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         assert_eq!(calls.len(), 2);
         let second_call = &calls[1];
         assert!(second_call
@@ -7007,8 +6988,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let calls = provider_impl
             .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].len(), 2);
         assert_eq!(calls[0][0].0, "system");
@@ -7091,8 +7071,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let calls = provider_impl
             .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
         assert_eq!(calls[0][1].0, "user");
@@ -7102,8 +7081,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let histories = runtime_ctx
             .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         let turns = histories
             .get("test-channel_alice")
             .expect("history should be stored for sender");
@@ -7190,8 +7168,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let calls = provider_impl
             .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 4);
 

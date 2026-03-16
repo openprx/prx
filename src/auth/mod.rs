@@ -14,7 +14,8 @@ use crate::config::Config;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
@@ -364,7 +365,7 @@ fn refresh_lock_for_profile(profile_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
 
     let table = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = table.lock().expect("refresh lock table poisoned");
+    let mut guard = table.lock();
 
     guard
         .entry(profile_id.to_string())
@@ -374,7 +375,7 @@ fn refresh_lock_for_profile(profile_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 
 fn refresh_backoff_remaining(profile_id: &str) -> Option<u64> {
     let map = REFRESH_BACKOFFS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().ok()?;
+    let mut guard = map.lock();
     let now = Instant::now();
     let deadline = guard.get(profile_id).copied()?;
     if deadline <= now {
@@ -386,16 +387,14 @@ fn refresh_backoff_remaining(profile_id: &str) -> Option<u64> {
 
 fn set_refresh_backoff(profile_id: &str, duration: Duration) {
     let map = REFRESH_BACKOFFS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = map.lock() {
-        guard.insert(profile_id.to_string(), Instant::now() + duration);
-    }
+    let mut guard = map.lock();
+    guard.insert(profile_id.to_string(), Instant::now() + duration);
 }
 
 fn clear_refresh_backoff(profile_id: &str) {
     let map = REFRESH_BACKOFFS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = map.lock() {
-        guard.remove(profile_id);
-    }
+    let mut guard = map.lock();
+    guard.remove(profile_id);
 }
 
 fn should_attempt_codex_import(data: &AuthProfilesData, profile_override: Option<&str>) -> bool {

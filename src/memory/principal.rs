@@ -460,22 +460,22 @@ fn is_acl_enforced_for_role(role: &Role) -> bool {
 
 static SENSITIVE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
-        Regex::new(r"\bssh\b").unwrap(),
-        Regex::new(r"\bapi[_-]?key\b").unwrap(),
-        Regex::new(r"密钥|私钥|秘钥").unwrap(),
-        Regex::new(r"\bpassw(or)?d\b").unwrap(),
-        Regex::new(r"\btok(en)?\b").unwrap(),
-        Regex::new(r"\bsecret\b").unwrap(),
-        Regex::new(r"im-ops|服务器地址").unwrap(),
-        Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").unwrap(),
-        Regex::new(r"\bprivate[_\s]?key\b").unwrap(),
+        Regex::new(r"\bssh\b").expect("compile regex: ssh keyword"),
+        Regex::new(r"\bapi[_-]?key\b").expect("compile regex: api key keyword"),
+        Regex::new(r"密钥|私钥|秘钥").expect("compile regex: Chinese key/secret keywords"),
+        Regex::new(r"\bpassw(or)?d\b").expect("compile regex: password keyword"),
+        Regex::new(r"\btok(en)?\b").expect("compile regex: token keyword"),
+        Regex::new(r"\bsecret\b").expect("compile regex: secret keyword"),
+        Regex::new(r"im-ops|服务器地址").expect("compile regex: server address keywords"),
+        Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").expect("compile regex: IPv4 address pattern"),
+        Regex::new(r"\bprivate[_\s]?key\b").expect("compile regex: private key keyword"),
     ]
 });
 
 static EMAIL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b").expect("compile regex: email address pattern"));
 static IPV4_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").unwrap());
+    LazyLock::new(|| Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").expect("compile regex: IPv4 address pattern"));
 
 #[cfg(test)]
 mod tests {

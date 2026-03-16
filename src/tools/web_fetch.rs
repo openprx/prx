@@ -25,21 +25,21 @@ impl WebFetchTool {
         // Remove script/style/head blocks (case-insensitive, multiline).
         // Rust's regex crate does not support backreferences, so use three
         // separate patterns instead of the combined `(?si)<(script|style|head)[^>]*>.*?</\1>`.
-        let re_script = Regex::new(r"(?si)<script[^>]*>.*?</script>").unwrap();
+        let re_script = Regex::new(r"(?si)<script[^>]*>.*?</script>").expect("compile regex: strip script tags");
         let text = re_script.replace_all(html, "");
-        let re_style = Regex::new(r"(?si)<style[^>]*>.*?</style>").unwrap();
+        let re_style = Regex::new(r"(?si)<style[^>]*>.*?</style>").expect("compile regex: strip style tags");
         let text = re_style.replace_all(&text, "");
-        let re_head = Regex::new(r"(?si)<head[^>]*>.*?</head>").unwrap();
+        let re_head = Regex::new(r"(?si)<head[^>]*>.*?</head>").expect("compile regex: strip head tags");
         let text = re_head.replace_all(&text, "");
 
         // Replace block-level elements with newlines so paragraphs separate cleanly
         let re_block =
             Regex::new(r"(?i)<(br\s*/?|p|div|h[1-6]|li|tr|article|section|header|footer)[^>]*>")
-                .unwrap();
+                .expect("compile regex: block-level HTML elements");
         let text = re_block.replace_all(&text, "\n");
 
         // Strip all remaining tags
-        let re_tags = Regex::new(r"<[^>]+>").unwrap();
+        let re_tags = Regex::new(r"<[^>]+>").expect("compile regex: strip remaining HTML tags");
         let text = re_tags.replace_all(&text, "");
 
         // Decode common HTML entities

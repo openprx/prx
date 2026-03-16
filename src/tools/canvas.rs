@@ -2,7 +2,8 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 #[derive(Debug, Default)]
 struct CanvasState {
@@ -114,7 +115,7 @@ impl Tool for CanvasTool {
                     .unwrap_or_default()
                     .to_string();
 
-                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = self.state.lock();
                 state.visible = true;
                 state.content = Some(content.clone());
 
@@ -134,7 +135,7 @@ impl Tool for CanvasTool {
                     return Ok(blocked);
                 }
 
-                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = self.state.lock();
                 state.visible = false;
 
                 Ok(ToolResult {
@@ -167,7 +168,7 @@ impl Tool for CanvasTool {
                     });
                 }
 
-                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = self.state.lock();
                 state.current_url = Some(url.to_string());
                 state.visible = true;
 
@@ -207,7 +208,7 @@ impl Tool for CanvasTool {
                     "value": format!("stub: evaluated {} characters", script.len()),
                 });
 
-                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = self.state.lock();
                 state.last_eval_script = Some(script.to_string());
                 state.last_eval_result = Some(mock_result.clone());
 
@@ -223,7 +224,7 @@ impl Tool for CanvasTool {
                 })
             }
             "snapshot" => {
-                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = self.state.lock();
                 state.snapshot_version += 1;
 
                 Ok(ToolResult {
