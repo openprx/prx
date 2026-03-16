@@ -779,12 +779,10 @@ impl Agent {
                         } else {
                             self.classify_model(user_message)
                         }
+                    } else if let Some(target) = classify_result.model_hint.as_deref() {
+                        self.resolve_model_target(target)
                     } else {
-                        classify_result
-                            .model_hint
-                            .as_deref()
-                            .map(|target| self.resolve_model_target(target))
-                            .unwrap()
+                        self.classify_model(user_message)
                     }
                 } else {
                     classify_result

@@ -39,6 +39,8 @@ pub struct WebhookEvent {
 #[derive(Clone)]
 struct WebhookState {
     token: Arc<str>,
+    /// Optional HMAC signing secret for `X-Webhook-Signature` verification.
+    signing_secret: Option<Arc<str>>,
     db_path: Arc<PathBuf>,
     acl_enabled: bool,
     rate_limiter: Arc<WebhookRateLimiter>,
@@ -126,6 +128,20 @@ impl IdempotencyStore {
 }
 
 pub async fn run(bind: &str, token: &str, workspace_dir: &Path, acl_enabled: bool) -> Result<()> {
+    run_with_signing_secret(bind, token, None, workspace_dir, acl_enabled).await
+}
+
+/// Run the standalone webhook server with optional HMAC signing secret.
+///
+/// When `signing_secret` is `Some`, every request must include a valid
+/// `X-Webhook-Signature` header (HMAC-SHA256 of the request body).
+pub async fn run_with_signing_secret(
+    bind: &str,
+    token: &str,
+    signing_secret: Option<&str>,
+    workspace_dir: &Path,
+    acl_enabled: bool,
+) -> Result<()> {
     let trimmed_token = token.trim();
     if trimmed_token.is_empty() {
         anyhow::bail!("webhook token must not be empty when webhook is enabled");
@@ -143,6 +159,10 @@ pub async fn run(bind: &str, token: &str, workspace_dir: &Path, acl_enabled: boo
 
     let state = WebhookState {
         token: Arc::<str>::from(trimmed_token.to_string()),
+        signing_secret: signing_secret
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| Arc::<str>::from(s.to_string())),
         db_path: Arc::new(db_path),
         acl_enabled,
         rate_limiter: Arc::new(WebhookRateLimiter::new(
@@ -176,7 +196,7 @@ fn router(state: WebhookState) -> Router {
 async fn handle_webhook_event(
     State(state): State<WebhookState>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     if !state.rate_limiter.allow().await {
         return (
@@ -196,6 +216,34 @@ async fn handle_webhook_event(
         )
             .into_response();
     }
+
+    // HMAC signature verification (when signing secret is configured)
+    if let Some(ref signing_secret) = state.signing_secret {
+        let signature = headers
+            .get("X-Webhook-Signature")
+            .and_then(|v| v.to_str().ok());
+        match signature {
+            Some(sig) if verify_webhook_hmac_signature(signing_secret, &body, sig) => {}
+            _ => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({ "error": "Invalid HMAC signature" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("Invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
 
     let event = match parse_webhook_event(payload) {
         Ok(event) => event,
@@ -256,6 +304,26 @@ async fn handle_webhook_event(
                 .into_response()
         }
     }
+}
+
+/// Verify HMAC-SHA256 signature of the request body.
+/// Accepts signatures in the format `sha256=<hex>` or raw hex.
+fn verify_webhook_hmac_signature(secret: &str, body: &[u8], signature_header: &str) -> bool {
+    use hmac::{Hmac, Mac};
+
+    let signature_hex = signature_header
+        .trim()
+        .strip_prefix("sha256=")
+        .unwrap_or(signature_header.trim());
+    let Ok(provided) = hex::decode(signature_hex) else {
+        return false;
+    };
+
+    let Ok(mut mac) = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+    mac.verify_slice(&provided).is_ok()
 }
 
 fn is_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
@@ -634,6 +702,7 @@ mod tests {
         ensure_memory_schema(&db_path).unwrap();
         WebhookState {
             token: Arc::<str>::from(token.to_string()),
+            signing_secret: None,
             db_path: Arc::new(db_path),
             acl_enabled: false,
             rate_limiter: Arc::new(WebhookRateLimiter::new(
@@ -657,6 +726,7 @@ mod tests {
         ensure_memory_schema(&db_path).unwrap();
         WebhookState {
             token: Arc::<str>::from(token.to_string()),
+            signing_secret: None,
             db_path: Arc::new(db_path),
             acl_enabled: false,
             rate_limiter: Arc::new(WebhookRateLimiter::new(

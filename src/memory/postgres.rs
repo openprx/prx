@@ -151,14 +151,23 @@ impl PostgresMemory {
 }
 
 fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
+    // PostgreSQL identifiers: start with letter or underscore, followed by
+    // letters, digits, or underscores.  Maximum length is 63 bytes (NAMEDATALEN-1).
+    // We enforce the regex ^[a-zA-Z_][a-zA-Z0-9_]{0,62}$ to prevent any
+    // possibility of SQL injection through identifier manipulation.
     if value.is_empty() {
         anyhow::bail!("{field_name} must not be empty");
     }
 
+    if value.len() > 63 {
+        anyhow::bail!(
+            "{field_name} exceeds PostgreSQL identifier limit of 63 characters; got {} characters",
+            value.len()
+        );
+    }
+
     let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        anyhow::bail!("{field_name} must not be empty");
-    };
+    let first = chars.next().unwrap(); // safe: checked non-empty above
 
     if !(first.is_ascii_alphabetic() || first == '_') {
         anyhow::bail!("{field_name} must start with an ASCII letter or underscore; got '{value}'");
@@ -376,6 +385,22 @@ mod tests {
         assert!(validate_identifier("", "schema").is_err());
         assert!(validate_identifier("1bad", "schema").is_err());
         assert!(validate_identifier("bad-name", "table").is_err());
+    }
+
+    #[test]
+    fn identifier_length_limit_enforced() {
+        // Exactly 63 chars — valid
+        let max_len = "a".repeat(63);
+        assert!(validate_identifier(&max_len, "table").is_ok());
+
+        // 64 chars — exceeds PostgreSQL NAMEDATALEN-1 limit
+        let too_long = "a".repeat(64);
+        assert!(validate_identifier(&too_long, "table").is_err());
+
+        // SQL injection attempts
+        assert!(validate_identifier("table; DROP TABLE users", "table").is_err());
+        assert!(validate_identifier("table\"--", "table").is_err());
+        assert!(validate_identifier("table\x00name", "table").is_err());
     }
 
     #[test]

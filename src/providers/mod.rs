@@ -3124,6 +3124,8 @@ mod tests {
         )
         .unwrap();
 
+        // SAFETY: Test-only env manipulation; tests using this are serialized
+        // via `provider_availability_env_lock()` to prevent data races.
         unsafe {
             std::env::set_var("OPENPRX_STATE_DIR", &state_dir);
         }
@@ -3142,6 +3144,8 @@ mod tests {
                 scheduler_retries: 2,
             },
         );
+        // SAFETY: Test-only env manipulation; tests using this are serialized
+        // via `provider_availability_env_lock()` to prevent data races.
         unsafe {
             std::env::remove_var("OPENPRX_STATE_DIR");
         }
@@ -3164,6 +3168,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&state_dir).unwrap();
 
+        // SAFETY: Test-only env manipulation; tests using this are serialized
+        // via `provider_availability_env_lock()` to prevent data races.
         unsafe {
             std::env::set_var("OPENPRX_STATE_DIR", &state_dir);
         }
@@ -3182,6 +3188,8 @@ mod tests {
                 scheduler_retries: 2,
             },
         );
+        // SAFETY: Test-only env manipulation; tests using this are serialized
+        // via `provider_availability_env_lock()` to prevent data races.
         unsafe {
             std::env::remove_var("OPENPRX_STATE_DIR");
         }
