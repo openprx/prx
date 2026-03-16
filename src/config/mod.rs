@@ -16,7 +16,7 @@ pub use schema::{
     IdentityBindingConfig, IdentityConfig, LarkConfig, MatrixConfig, McpConfig, McpServerConfig,
     McpTransport, MediaConfig, MemoryConfig, MemoryWebhookConfig, ModelRouteConfig,
     MultimodalConfig, NextcloudTalkConfig, NodeServerConfig, NodesConfig, ObservabilityConfig,
-    PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
+    ProxyConfig, ProxyScope, QueryClassificationConfig,
     ReliabilityConfig, RemoteNodeConfig, ResourceLimitsConfig, RouterConfig, RouterModelConfig,
     RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, ScopeConfig, ScopeRule,
     SecretsConfig, SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig,
