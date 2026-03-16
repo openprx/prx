@@ -81,6 +81,15 @@ const MID_TURN_COMPACT_THRESHOLD: usize = 80;
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 const TOOL_PARSE_LOG_PREVIEW_CHARS: usize = 200;
 
+/// Maximum characters allowed for a single tool result before truncation.
+const MAX_TOOL_RESULT_CHARS: usize = 30_000;
+
+/// Timeout (seconds) for apply_configurable_compaction before falling back to aggressive trim.
+const COMPACTION_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum number of times to retry an LLM call after a context overflow error.
+const MAX_OVERFLOW_RETRIES: usize = 3;
+
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)token",
@@ -224,6 +233,61 @@ fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     history.drain(start..start + to_remove);
 }
 
+/// Aggressive trim fallback: keep only the most recent non-system messages.
+fn apply_aggressive_trim(history: &mut Vec<ChatMessage>, keep_recent: usize) {
+    trim_history(history, keep_recent.max(1));
+}
+
+/// Truncate a tool result string if it exceeds max_chars.
+/// Appends a note describing how many characters were dropped.
+fn truncate_tool_result_if_needed(content: &str, max_chars: usize) -> String {
+    if content.len() <= max_chars {
+        return content.to_string();
+    }
+    // Safe UTF-8 boundary
+    let boundary = content
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= max_chars)
+        .last()
+        .unwrap_or(0);
+    let kept = &content[..boundary];
+    format!(
+        "{}\n\n[truncated: output exceeded context limit ({} chars, kept {})]",
+        kept,
+        content.len(),
+        boundary
+    )
+}
+
+/// Returns true when an LLM error indicates the request exceeded the context window.
+fn is_context_overflow_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("context_length_exceeded")
+        || msg.contains("maximum context length")
+        || msg.contains("token limit")
+        || msg.contains("too many tokens")
+        || msg.contains("context window")
+        || msg.contains("max_tokens")
+        || msg.contains("prompt is too long")
+}
+
+/// Token-aware mid-turn trim: remove the oldest non-system messages one at a time
+/// until the estimated token count drops below max_tokens.
+fn trim_history_token_aware(history: &mut Vec<ChatMessage>, max_tokens: usize) {
+    loop {
+        if estimate_history_tokens(history) <= max_tokens {
+            break;
+        }
+        let has_system = history.first().is_some_and(|m| m.role == "system");
+        let start = if has_system { 1 } else { 0 };
+        if history.len() <= start + 1 {
+            break; // nothing left to remove
+        }
+        history.remove(start);
+    }
+}
+
 fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
     let mut transcript = String::new();
     for msg in messages {
@@ -323,20 +387,66 @@ async fn apply_configurable_compaction(
 
     let summary = match config.mode {
         crate::config::AgentCompactionMode::Safeguard => {
-            let prompt = format!(
-                "Summarize this conversation segment into concise context. Preserve decisions, preferences, commitments, unresolved tasks, and key facts.\n\n{}",
-                build_compaction_transcript(&to_compact)
+            let transcript = build_compaction_transcript(&to_compact);
+            let structured_prompt = format!(
+                "Summarize this conversation into a structured context summary. \
+                 You MUST include ALL of these sections (use ## headers):\n\
+                 ## Decisions\n\
+                 ## Open TODOs\n\
+                 ## Constraints/Rules\n\
+                 ## Pending user asks\n\
+                 ## Exact identifiers\n\
+                 Preserve all UUIDs, hashes, file paths, URLs, port numbers, and \
+                 IP addresses EXACTLY as written. Never paraphrase identifiers.\n\n\
+                 ## Progress\n\
+                 ### Done\n\
+                 ### In Progress\n\
+                 ### Blocked\n\n\
+                 ## Recent turns preserved verbatim\n\
+                 Include the last 2-3 user/assistant exchanges word-for-word.\n\n\
+                 ## Critical Context\n\
+                 Key technical details that would be lost if forgotten.\n\n\
+                 Conversation to summarize:\n{}",
+                transcript
             );
             let raw = provider
                 .chat_with_system(
                     Some("You are a context compaction summarizer."),
-                    &prompt,
+                    &structured_prompt,
                     model,
                     0.2,
                 )
                 .await
                 .unwrap_or_else(|_| "Summary unavailable; compacted conservatively.".to_string());
-            truncate_with_ellipsis(&raw, COMPACTION_MAX_SUMMARY_CHARS)
+            // Validate: require at least 3 of the expected ## headers.
+            let required_headers = ["## Decisions", "## Open TODOs", "## Constraints", "## Pending", "## Exact", "## Progress", "## Critical Context"];
+            let found_count = required_headers.iter().filter(|h| raw.contains(*h)).count();
+            let validated = if found_count < 3 {
+                tracing::warn!(
+                    found_count,
+                    "Compaction summary missing required sections; retrying with explicit prompt"
+                );
+                let retry_prompt = format!(
+                    "The previous summary was missing required sections. \
+                     You MUST produce a summary with these exact ## headers: \
+                     ## Decisions, ## Open TODOs, ## Constraints/Rules, ## Pending user asks, \
+                     ## Exact identifiers, ## Progress, ## Critical Context. \
+                     Do not skip any. Conversation:\n{}",
+                    transcript
+                );
+                provider
+                    .chat_with_system(
+                        Some("You are a context compaction summarizer. Always include all required ## sections."),
+                        &retry_prompt,
+                        model,
+                        0.1,
+                    )
+                    .await
+                    .unwrap_or(raw)
+            } else {
+                raw
+            };
+            truncate_with_ellipsis(&validated, COMPACTION_MAX_SUMMARY_CHARS)
         }
         crate::config::AgentCompactionMode::Aggressive => {
             let mut summary = format!(
@@ -358,6 +468,16 @@ async fn apply_configurable_compaction(
             "[Context compacted at {timestamp}. Summary: {summary}]"
         ))),
     );
+
+    // P1-1: Inject post-compaction context refresh so the model knows critical
+    // rules may have been summarized and should re-read workspace instructions.
+    history.push(ChatMessage::user(
+        "[Post-compaction context refresh]\n\
+         Session was just compacted. Critical rules may have been summarized.\n\
+         Re-read workspace instructions if available."
+            .to_string(),
+    ));
+
     Ok(true)
 }
 
@@ -2179,6 +2299,38 @@ pub(crate) async fn run_tool_call_loop(
     };
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
+    // P1-3: Proactive pre-turn memory flush — compact before starting the loop
+    // if the context is already above 85% of the token budget.
+    if let Some(config) = compaction_config {
+        let token_estimate = estimate_history_tokens(history);
+        let threshold = (config.max_context_tokens as f64 * 0.85) as usize;
+        if token_estimate > threshold {
+            tracing::info!(
+                token_estimate,
+                threshold,
+                "Pre-turn memory flush: context near limit, running pre-emptive compaction"
+            );
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
+                apply_configurable_compaction(history, provider, model, config),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("Pre-turn compaction failed: {e}"),
+                Err(_) => {
+                    tracing::warn!(
+                        "Pre-turn compaction timed out after {}s, applying aggressive trim",
+                        COMPACTION_TIMEOUT_SECS
+                    );
+                    apply_aggressive_trim(history, config.keep_recent_messages);
+                }
+            }
+        }
+    }
+
+    let mut overflow_retries: usize = 0;
+
     for _iteration in 0..max_iterations {
         if cancellation_token
             .as_ref()
@@ -2187,8 +2339,24 @@ pub(crate) async fn run_tool_call_loop(
             return Err(ToolLoopCancelled.into());
         }
 
+        // P0-3: Wrap mid-loop compaction in a safety timeout.
         if let Some(config) = compaction_config {
-            let _ = apply_configurable_compaction(history, provider, model, config).await?;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
+                apply_configurable_compaction(history, provider, model, config),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    tracing::warn!(
+                        "Compaction timed out after {}s, falling back to aggressive trim",
+                        COMPACTION_TIMEOUT_SECS
+                    );
+                    apply_aggressive_trim(history, config.keep_recent_messages);
+                }
+            }
         }
 
         let image_marker_count = multimodal::count_image_markers(history);
@@ -2262,99 +2430,131 @@ pub(crate) async fn run_tool_call_loop(
             chat_future.await
         };
 
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match chat_result {
-                Ok(resp) => {
-                    let duration = llm_started_at.elapsed();
-                    hooks
-                        .emit(
-                            HookEvent::LlmResponse,
-                            serde_json::json!({
-                                "provider": provider_name,
-                                "model": model,
-                                "duration_ms": duration.as_millis(),
-                                "success": true,
-                                "error_message": serde_json::Value::Null,
-                            }),
-                        )
-                        .await;
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration,
-                        success: true,
-                        error_message: None,
-                    });
-
-                    let response_text = resp.text_or_empty().to_string();
-                    // First try native structured tool calls (OpenAI-format).
-                    // Fall back to text-based parsing (XML tags, markdown blocks,
-                    // GLM format) only if the provider returned no native calls —
-                    // this ensures we support both native and prompt-guided models.
-                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                    let mut parsed_text = String::new();
-
-                    if calls.is_empty() {
-                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                        if !fallback_text.is_empty() {
-                            parsed_text = fallback_text;
-                        }
-                        calls = fallback_calls;
-                        if calls.is_empty() && looks_like_unparsed_tool_call_syntax(&response_text)
-                        {
-                            let sanitized_preview = sanitize_tool_parse_log_preview(&response_text);
-                            tracing::error!(
-                                raw_response = sanitized_preview.as_str(),
-                                "Failed to parse model tool-call syntax; suppressing raw tool-call text"
-                            );
-                            parsed_text = "tool execution failed".to_string();
-                        }
-                    }
-
-                    // Preserve native tool call IDs in assistant history so role=tool
-                    // follow-up messages can reference the exact call id.
-                    let assistant_history_content = if resp.tool_calls.is_empty() {
-                        response_text.clone()
-                    } else {
-                        build_native_assistant_history(&response_text, &resp.tool_calls)
-                    };
-
-                    let native_calls = resp.tool_calls;
-                    (
-                        response_text,
-                        parsed_text,
-                        calls,
-                        assistant_history_content,
-                        native_calls,
+        // P0-1: chat_processed is Result so we can detect context overflow below.
+        let chat_processed = match chat_result {
+            Ok(resp) => {
+                let duration = llm_started_at.elapsed();
+                hooks
+                    .emit(
+                        HookEvent::LlmResponse,
+                        serde_json::json!({
+                            "provider": provider_name,
+                            "model": model,
+                            "duration_ms": duration.as_millis(),
+                            "success": true,
+                            "error_message": serde_json::Value::Null,
+                        }),
                     )
+                    .await;
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration,
+                    success: true,
+                    error_message: None,
+                });
+
+                let response_text = resp.text_or_empty().to_string();
+                // First try native structured tool calls (OpenAI-format).
+                // Fall back to text-based parsing (XML tags, markdown blocks,
+                // GLM format) only if the provider returned no native calls —
+                // this ensures we support both native and prompt-guided models.
+                let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                let mut parsed_text = String::new();
+
+                if calls.is_empty() {
+                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                    if !fallback_text.is_empty() {
+                        parsed_text = fallback_text;
+                    }
+                    calls = fallback_calls;
+                    if calls.is_empty() && looks_like_unparsed_tool_call_syntax(&response_text) {
+                        let sanitized_preview = sanitize_tool_parse_log_preview(&response_text);
+                        tracing::error!(
+                            raw_response = sanitized_preview.as_str(),
+                            "Failed to parse model tool-call syntax; suppressing raw tool-call text"
+                        );
+                        parsed_text = "tool execution failed".to_string();
+                    }
                 }
-                Err(e) => {
-                    let duration = llm_started_at.elapsed();
-                    let error_message = crate::providers::sanitize_api_error(&e.to_string());
-                    hooks
-                        .emit(
-                            HookEvent::LlmResponse,
-                            serde_json::json!({
-                                "provider": provider_name,
-                                "model": model,
-                                "duration_ms": duration.as_millis(),
-                                "success": false,
-                                "error_message": error_message,
-                            }),
+
+                // Preserve native tool call IDs in assistant history so role=tool
+                // follow-up messages can reference the exact call id.
+                let assistant_history_content = if resp.tool_calls.is_empty() {
+                    response_text.clone()
+                } else {
+                    build_native_assistant_history(&response_text, &resp.tool_calls)
+                };
+
+                let native_calls = resp.tool_calls;
+                Ok((
+                    response_text,
+                    parsed_text,
+                    calls,
+                    assistant_history_content,
+                    native_calls,
+                ))
+            }
+            Err(e) => {
+                let duration = llm_started_at.elapsed();
+                let error_message = crate::providers::sanitize_api_error(&e.to_string());
+                hooks
+                    .emit(
+                        HookEvent::LlmResponse,
+                        serde_json::json!({
+                            "provider": provider_name,
+                            "model": model,
+                            "duration_ms": duration.as_millis(),
+                            "success": false,
+                            "error_message": error_message,
+                        }),
+                    )
+                    .await;
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration,
+                    success: false,
+                    error_message: Some(error_message.clone()),
+                });
+                hooks
+                    .emit(HookEvent::Error, payload_error("llm", &error_message))
+                    .await;
+                Err(e)
+            }
+        };
+
+        // P0-1: On context overflow, run compaction and retry (up to MAX_OVERFLOW_RETRIES).
+        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
+            match chat_processed {
+                Err(ref e) if is_context_overflow_error(e) && overflow_retries < MAX_OVERFLOW_RETRIES => {
+                    overflow_retries += 1;
+                    tracing::warn!(
+                        attempt = overflow_retries,
+                        max = MAX_OVERFLOW_RETRIES,
+                        "Context overflow detected; running compaction and retrying LLM call"
+                    );
+                    if let Some(config) = compaction_config {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
+                            apply_configurable_compaction(history, provider, model, config),
                         )
-                        .await;
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration,
-                        success: false,
-                        error_message: Some(error_message.clone()),
-                    });
-                    hooks
-                        .emit(HookEvent::Error, payload_error("llm", &error_message))
-                        .await;
-                    return Err(e);
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => tracing::warn!("Overflow retry compaction failed: {e}"),
+                            Err(_) => {
+                                tracing::warn!("Overflow retry compaction timed out, applying aggressive trim");
+                                apply_aggressive_trim(history, config.keep_recent_messages);
+                            }
+                        }
+                    } else {
+                        apply_aggressive_trim(history, COMPACTION_KEEP_RECENT_MESSAGES);
+                    }
+                    continue;
                 }
+                Err(e) => return Err(e),
+                Ok(values) => values,
             };
 
         let display_text = if parsed_text.is_empty() {
@@ -2447,10 +2647,12 @@ pub(crate) async fn run_tool_call_loop(
                     .emit(HookEvent::Error, payload_error("tool", result))
                     .await;
             }
+            // P0-2: Truncate oversized tool results before inserting into history.
+            let truncated_result = truncate_tool_result_if_needed(result, MAX_TOOL_RESULT_CHARS);
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                call.name, result
+                call.name, truncated_result
             );
         }
 
@@ -2463,23 +2665,38 @@ pub(crate) async fn run_tool_call_loop(
             history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
         } else {
             for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
+                // P0-2: Also truncate native tool result content.
+                let truncated_result = truncate_tool_result_if_needed(result, MAX_TOOL_RESULT_CHARS);
                 let tool_msg = serde_json::json!({
                     "tool_call_id": native_call.id,
-                    "content": result,
+                    "content": truncated_result,
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
         }
 
-        // Mid-turn context trim to prevent unbounded growth during tool loops.
-        // Applied after tool results are appended and before the next LLM request.
-        if history.len() > MID_TURN_COMPACT_THRESHOLD {
+        // P1-4: Token-aware mid-turn trim (primary) + count-based safety net (secondary).
+        if let Some(config) = compaction_config {
+            let mid_turn_tokens = estimate_history_tokens(history);
+            let mid_turn_limit =
+                config.max_context_tokens.saturating_sub(config.reserve_tokens);
+            if mid_turn_tokens > mid_turn_limit {
+                tracing::warn!(
+                    mid_turn_tokens,
+                    mid_turn_limit,
+                    "Mid-turn token trim triggered"
+                );
+                trim_history_token_aware(history, mid_turn_limit);
+            }
+        }
+        // Secondary count-based safety net to catch cases with no compaction config.
+        if history.len() > 200 {
             let before = history.len();
             trim_history(history, DEFAULT_MAX_HISTORY_MESSAGES);
             tracing::info!(
                 before,
                 after = history.len(),
-                "Mid-turn context trim triggered",
+                "Mid-turn count-based safety trim triggered",
             );
         }
     }

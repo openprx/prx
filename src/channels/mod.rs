@@ -5994,7 +5994,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 1);
         assert!(sent_messages[0].starts_with("chat-iter-fail:"));
-        assert!(sent_messages[0].contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));
+        assert!(sent_messages[0].contains("⚠️ Something went wrong. Please try again later."));
     }
 
     struct NoopMemory;
