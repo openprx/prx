@@ -107,7 +107,6 @@ mod daemon;
 mod doctor;
 mod evolution_cli;
 mod gateway;
-mod hardware;
 mod health;
 mod heartbeat;
 mod hooks;
@@ -138,8 +137,6 @@ mod util;
 mod webhook;
 
 use config::Config;
-
-pub use openprx::HardwareCommands;
 
 /// `OpenPRX` - 100% Rust. 100% Agnostic. Your AI, your rules.
 #[derive(Parser, Debug)]
@@ -395,24 +392,6 @@ Examples:
         #[command(subcommand)]
         auth_command: AuthCommands,
     },
-
-    /// Discover and introspect USB hardware
-    #[command(long_about = "\
-Discover and introspect USB hardware.
-
-Enumerate connected USB devices, identify known development boards \
-(STM32 Nucleo, Arduino, ESP32), and retrieve chip information via \
-probe-rs / ST-Link.
-
-Examples:
-  openprx hardware discover
-  openprx hardware introspect /dev/ttyACM0
-  openprx hardware info --chip STM32F401RETx")]
-    Hardware {
-        #[command(subcommand)]
-        hardware_command: openprx::HardwareCommands,
-    },
-
 
     /// Manage configuration
     #[command(long_about = "\
@@ -1077,10 +1056,6 @@ async fn main() -> Result<()> {
         }
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
-
-        Commands::Hardware { hardware_command } => {
-            hardware::handle_command(hardware_command.clone(), &config)
-        }
 
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Schema => {

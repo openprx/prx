@@ -12,7 +12,7 @@ pub use schema::{
     AutomixConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, ChannelsConfig,
     ClassificationRule, ComposioConfig, Config, CostConfig, CronConfig, DelegateAgentConfig,
     DiscordConfig, DmPolicy, DockerRuntimeConfig, EmbeddingRouteConfig, GatewayConfig, GroupPolicy,
-    HardwareConfig, HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
+    HeartbeatConfig, HttpRequestConfig, IMessageConfig,
     IdentityBindingConfig, IdentityConfig, LarkConfig, MatrixConfig, McpConfig, McpServerConfig,
     McpTransport, MediaConfig, MemoryConfig, MemoryWebhookConfig, ModelRouteConfig,
     MultimodalConfig, NextcloudTalkConfig, NodeServerConfig, NodesConfig, ObservabilityConfig,

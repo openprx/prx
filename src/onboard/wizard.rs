@@ -6,7 +6,6 @@ use crate::config::{
     HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
     RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
 };
-use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
 };
@@ -113,31 +112,28 @@ pub async fn run_wizard() -> Result<Config> {
     );
     println!();
 
-    print_step(1, 9, "Workspace Setup");
+    print_step(1, 8, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace()?;
 
-    print_step(2, 9, "AI Provider & API Key");
+    print_step(2, 8, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
 
-    print_step(3, 9, "Channels (How You Talk to OpenPRX)");
+    print_step(3, 8, "Channels (How You Talk to OpenPRX)");
     let channels_config = setup_channels()?;
 
-    print_step(4, 9, "Tunnel (Expose to Internet)");
+    print_step(4, 8, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
 
-    print_step(5, 9, "Tool Mode & Security");
+    print_step(5, 8, "Tool Mode & Security");
     let (composio_config, secrets_config) = setup_tool_mode()?;
 
-    print_step(6, 9, "Hardware (Physical World)");
-    let hardware_config = setup_hardware()?;
-
-    print_step(7, 9, "Memory Configuration");
+    print_step(6, 8, "Memory Configuration");
     let memory_config = setup_memory()?;
 
-    print_step(8, 9, "Project Context (Personalize Your Agent)");
+    print_step(7, 8, "Project Context (Personalize Your Agent)");
     let project_ctx = setup_project_context()?;
 
-    print_step(9, 9, "Workspace Files");
+    print_step(8, 8, "Workspace Files");
     scaffold_workspace(&workspace_dir, &project_ctx)?;
 
     // ── Build config ──
@@ -192,7 +188,6 @@ pub async fn run_wizard() -> Result<Config> {
         cost: crate::config::CostConfig::default(),
         nodes: crate::config::NodesConfig::default(),
         agents: std::collections::HashMap::new(),
-        hardware: hardware_config,
         media: crate::config::MediaConfig::default(),
         security: crate::config::SecurityConfig::default(),
     };
@@ -441,7 +436,6 @@ async fn run_quick_setup_with_home(
         cost: crate::config::CostConfig::default(),
         nodes: crate::config::NodesConfig::default(),
         agents: std::collections::HashMap::new(),
-        hardware: crate::config::HardwareConfig::default(),
         media: crate::config::MediaConfig::default(),
         security: crate::config::SecurityConfig::default(),
     };
@@ -2408,195 +2402,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
     Ok((composio_config, secrets_config))
 }
 
-// ── Step 6: Hardware (Physical World) ───────────────────────────
-
-fn setup_hardware() -> Result<HardwareConfig> {
-    print_bullet("OpenPRX can talk to physical hardware (LEDs, sensors, motors).");
-    print_bullet("Scanning for connected devices...");
-    println!();
-
-    // ── Auto-discovery ──
-    let devices = hardware::discover_hardware();
-
-    if devices.is_empty() {
-        println!(
-            "  {} {}",
-            style("ℹ").dim(),
-            style("No hardware devices detected on this system.").dim()
-        );
-        println!(
-            "  {} {}",
-            style("ℹ").dim(),
-            style("You can enable hardware later in config.toml under [hardware].").dim()
-        );
-    } else {
-        println!(
-            "  {} {} device(s) found:",
-            style("✓").green().bold(),
-            devices.len()
-        );
-        for device in &devices {
-            let detail = device
-                .detail
-                .as_deref()
-                .map(|d| format!(" ({d})"))
-                .unwrap_or_default();
-            let path = device
-                .device_path
-                .as_deref()
-                .map(|p| format!(" → {p}"))
-                .unwrap_or_default();
-            println!(
-                "    {} {}{}{} [{}]",
-                style("›").cyan(),
-                style(&device.name).green(),
-                style(&detail).dim(),
-                style(&path).dim(),
-                style(device.transport.to_string()).cyan()
-            );
-        }
-    }
-    println!();
-
-    let options = vec![
-        "🚀 Native — direct GPIO on this Linux board (Raspberry Pi, Orange Pi, etc.)",
-        "🔌 Tethered — control an Arduino/ESP32/Nucleo plugged into USB",
-        "🔬 Debug Probe — flash/read MCUs via SWD/JTAG (probe-rs)",
-        "☁️  Software Only — no hardware access (default)",
-    ];
-
-    let recommended = hardware::recommended_wizard_default(&devices);
-
-    let choice = Select::new()
-        .with_prompt("  How should OpenPRX interact with the physical world?")
-        .items(&options)
-        .default(recommended)
-        .interact()?;
-
-    let mut hw_config = hardware::config_from_wizard_choice(choice, &devices);
-
-    // ── Serial: pick a port if multiple found ──
-    if hw_config.transport_mode() == hardware::HardwareTransport::Serial {
-        let serial_devices: Vec<&hardware::DiscoveredDevice> = devices
-            .iter()
-            .filter(|d| d.transport == hardware::HardwareTransport::Serial)
-            .collect();
-
-        if serial_devices.len() > 1 {
-            let port_labels: Vec<String> = serial_devices
-                .iter()
-                .map(|d| {
-                    format!(
-                        "{} ({})",
-                        d.device_path.as_deref().unwrap_or("unknown"),
-                        d.name
-                    )
-                })
-                .collect();
-
-            let port_idx = Select::new()
-                .with_prompt("  Multiple serial devices found — select one")
-                .items(&port_labels)
-                .default(0)
-                .interact()?;
-
-            hw_config.serial_port = serial_devices[port_idx].device_path.clone();
-        } else if serial_devices.is_empty() {
-            // User chose serial but no device discovered — ask for manual path
-            let manual_port: String = Input::new()
-                .with_prompt("  Serial port path (e.g. /dev/ttyUSB0)")
-                .default("/dev/ttyUSB0".into())
-                .interact_text()?;
-            hw_config.serial_port = Some(manual_port);
-        }
-
-        // Baud rate
-        let baud_options = vec![
-            "115200 (default, recommended)",
-            "9600 (legacy Arduino)",
-            "57600",
-            "230400",
-            "Custom",
-        ];
-        let baud_idx = Select::new()
-            .with_prompt("  Serial baud rate")
-            .items(&baud_options)
-            .default(0)
-            .interact()?;
-
-        hw_config.baud_rate = match baud_idx {
-            1 => 9600,
-            2 => 57600,
-            3 => 230_400,
-            4 => {
-                let custom: String = Input::new()
-                    .with_prompt("  Custom baud rate")
-                    .default("115200".into())
-                    .interact_text()?;
-                custom.parse::<u32>().unwrap_or(115_200)
-            }
-            _ => 115_200,
-        };
-    }
-
-    // ── Probe: ask for target chip ──
-    if hw_config.transport_mode() == hardware::HardwareTransport::Probe
-        && hw_config.probe_target.is_none()
-    {
-        let target: String = Input::new()
-            .with_prompt("  Target MCU chip (e.g. STM32F411CEUx, nRF52840_xxAA)")
-            .default("STM32F411CEUx".into())
-            .interact_text()?;
-        hw_config.probe_target = Some(target);
-    }
-
-    // ── Datasheet RAG ──
-    if hw_config.enabled {
-        let datasheets = Confirm::new()
-            .with_prompt("  Enable datasheet RAG? (index PDF schematics for AI pin lookups)")
-            .default(true)
-            .interact()?;
-        hw_config.workspace_datasheets = datasheets;
-    }
-
-    // ── Summary ──
-    if hw_config.enabled {
-        let transport_label = match hw_config.transport_mode() {
-            hardware::HardwareTransport::Native => "Native GPIO".to_string(),
-            hardware::HardwareTransport::Serial => format!(
-                "Serial → {} @ {} baud",
-                hw_config.serial_port.as_deref().unwrap_or("?"),
-                hw_config.baud_rate
-            ),
-            hardware::HardwareTransport::Probe => format!(
-                "Probe (SWD/JTAG) → {}",
-                hw_config.probe_target.as_deref().unwrap_or("?")
-            ),
-            hardware::HardwareTransport::None => "Software Only".to_string(),
-        };
-
-        println!(
-            "  {} Hardware: {} | datasheets: {}",
-            style("✓").green().bold(),
-            style(&transport_label).green(),
-            if hw_config.workspace_datasheets {
-                style("on").green().to_string()
-            } else {
-                style("off").dim().to_string()
-            }
-        );
-    } else {
-        println!(
-            "  {} Hardware: {}",
-            style("✓").green().bold(),
-            style("disabled (software only)").dim()
-        );
-    }
-
-    Ok(hw_config)
-}
-
-// ── Step 6: Project Context ─────────────────────────────────────
+// ── Step 7: Project Context ─────────────────────────────────────
 
 fn setup_project_context() -> Result<ProjectContext> {
     print_bullet("Let's personalize your agent. You can always update these later.");
@@ -4777,40 +4583,6 @@ fn print_summary(config: &Config) {
             "pairing required (secure)"
         } else {
             "pairing disabled"
-        }
-    );
-
-    // Hardware
-    println!(
-        "    {} Hardware:      {}",
-        style("🔌").cyan(),
-        if config.hardware.enabled {
-            let mode = config.hardware.transport_mode();
-            match mode {
-                hardware::HardwareTransport::Native => {
-                    style("Native GPIO (direct)").green().to_string()
-                }
-                hardware::HardwareTransport::Serial => format!(
-                    "{}",
-                    style(format!(
-                        "Serial → {} @ {} baud",
-                        config.hardware.serial_port.as_deref().unwrap_or("?"),
-                        config.hardware.baud_rate
-                    ))
-                    .green()
-                ),
-                hardware::HardwareTransport::Probe => format!(
-                    "{}",
-                    style(format!(
-                        "Probe → {}",
-                        config.hardware.probe_target.as_deref().unwrap_or("?")
-                    ))
-                    .green()
-                ),
-                hardware::HardwareTransport::None => "disabled (software only)".to_string(),
-            }
-        } else {
-            "disabled (software only)".to_string()
         }
     );
 
