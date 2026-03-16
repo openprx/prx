@@ -1,10 +1,8 @@
 # Web Console
 
-Browser-based management interface for OpenPRX.
+Browser-based management interface for OpenPRX. Located at `console/` in the repository.
 
-> **Status**: Planned — located at `web/` in the repository.
-
-## Planned Features
+## Features
 
 - Real-time conversation monitoring
 - Configuration editor
@@ -17,5 +15,13 @@ Browser-based management interface for OpenPRX.
 
 ## Tech Stack
 
-- Svelte SPA
+- Svelte SPA (Vite)
 - Served by the OpenPRX gateway (embedded static files)
+
+## Build
+
+```bash
+cd console
+bun install
+bun run build
+```

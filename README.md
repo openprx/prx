@@ -6,13 +6,13 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 
 ## Highlights
 
-- **14 LLM providers** — Anthropic, OpenAI, Google, DashScope, xAI, Ollama, and more
+- **9 LLM providers** — Anthropic, OpenAI, Google Gemini, GitHub Copilot, Ollama, AWS Bedrock, GLM, OpenAI Codex, and OpenAI-compatible endpoints
 - **LLM Router** — heuristic routing (capability + Elo + cost + latency), KNN semantic routing (cold-start guard + 100ms timeout fallback), and Automix low-confidence auto-upgrade
 - **19 messaging channels** — Signal, WhatsApp, Telegram, Discord, Slack, Matrix, and more
-- **45+ built-in tools** — shell, browser, MCP, memory, scheduling, remote nodes
-- **Web Console** — browser-based management interface (planned)
+- **43 built-in tools** — shell, browser, MCP, memory, scheduling, remote nodes
+- **Web Console** — browser-based management interface (`console/`)
 - **Remote Nodes** — control macOS/Linux/Pi devices via `prx-node` agent
-- **Self-Evolution** — autonomous prompt/memory/strategy improvement (22 modules)
+- **Self-Evolution** — autonomous prompt/memory/strategy improvement
 - **Subagent Governance** — concurrency limits, depth control, config inheritance
 
 ### LLM Router Flags
@@ -50,7 +50,7 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 ## Architecture
 
 ```
-         Channels (19)          Tools (45+)           Remote Nodes
+         Channels (19)          Tools (43)            Remote Nodes
     Signal · WA · TG · ...    Shell · MCP · ...     macOS · Pi · ...
               │                      │                     │
               ▼                      ▼                     ▼
@@ -59,7 +59,7 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
          │  Agent Loop · Gateway · Cron · Subagents · Memory   │
          └──────────────────────┬──────────────────────────────┘
                                 │
-                    Providers (14 LLMs)
+                     Providers (9 LLMs)
               Anthropic · OpenAI · Google · ...
 ```
 
@@ -67,21 +67,16 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 
 | Topic | Description |
 |-------|-------------|
-| [Providers](docs/providers.md) | 14 LLM providers, fallback chains, token refresh |
+| [Providers](docs/providers.md) | 9 LLM providers, fallback chains, token refresh |
 | [Channels](docs/channels.md) | 19 messaging platforms, DM/group policies |
-| [Tools](docs/tools.md) | 45+ built-in tools, hooks system, webhooks |
+| [Tools](docs/tools.md) | 43 built-in tools, hooks system, webhooks |
 | [Remote Nodes](docs/remote-nodes.md) | `prx-node` agent, device pairing, JSON-RPC |
-| [Web Console](docs/web-console.md) | Browser-based management (planned) |
+| [Web Console](docs/web-console.md) | Browser-based management interface |
 | [Evolution](docs/evolution.md) | Self-improvement pipeline |
 | [Configuration](docs/configuration.md) | Config reference, workspace files, security |
-| [Concurrency P2 Runbook](docs/concurrency-p2-runbook.md) | Enablement, staged rollout, kill switch, rollback drills |
-| [Concurrency P2 SLO](docs/concurrency-p2-slo.md) | SLI/SLO definitions and alert thresholds for concurrency scheduler |
-| [Concurrency P2 Pressure & Fault](docs/concurrency-p2-pressure-fault.md) | Baseline stress script and failure-injection regression matrix |
 | [Router](docs/router.md) | LLM Router config, flow, safety boundaries |
 | [WASM Plugins](docs/plugin-developer-guide.md) | Plugin developer guide (Rust/Python/JS/Go) |
 | [Host Function Reference](docs/host-function-reference.md) | WASM plugin host API reference |
-| [Service Deploy/Restart SOP (QA)](docs/openprx-unified-service-deploy-restart-sop.md) | Unified systemd-only runtime, port conflict cleanup, plugin deploy/verify |
-| [Port Allocation (168xx)](docs/port-allocation-168xx.md) | OpenPRX-related unified port plan and QA baseline mapping |
 
 ## Related Projects
 
