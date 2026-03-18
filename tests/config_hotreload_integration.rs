@@ -17,7 +17,10 @@ fn shared_config_initial_load() {
 
 #[test]
 fn shared_config_swap_visible_to_readers() {
-    let config = Config { default_provider: Some("anthropic".to_string()), ..Config::default() };
+    let config = Config {
+        default_provider: Some("anthropic".to_string()),
+        ..Config::default()
+    };
     let shared = new_shared(config);
 
     assert_eq!(
@@ -26,7 +29,10 @@ fn shared_config_swap_visible_to_readers() {
     );
 
     // Simulate hot-reload: swap in new config
-    let new_config = Config { default_provider: Some("openai".to_string()), ..Config::default() };
+    let new_config = Config {
+        default_provider: Some("openai".to_string()),
+        ..Config::default()
+    };
     shared.store(std::sync::Arc::new(new_config));
 
     assert_eq!(
@@ -42,7 +48,10 @@ fn shared_config_old_snapshot_still_valid() {
     let old_snapshot = shared.load_full();
     let old_temp = old_snapshot.default_temperature;
 
-    let new_config = Config { default_temperature: 1.5, ..Config::default() };
+    let new_config = Config {
+        default_temperature: 1.5,
+        ..Config::default()
+    };
     shared.store(std::sync::Arc::new(new_config));
 
     // Old snapshot still has old value (ArcSwap guarantee)
@@ -69,7 +78,10 @@ async fn concurrent_readers_during_swap() {
 
     // Swap while readers are running
     for i in 0..5 {
-        let cfg = Config { default_provider: Some(format!("provider-{i}")), ..Config::default() };
+        let cfg = Config {
+            default_provider: Some(format!("provider-{i}")),
+            ..Config::default()
+        };
         shared.store(std::sync::Arc::new(cfg));
         tokio::task::yield_now().await;
     }
@@ -89,7 +101,10 @@ fn shared_config_clone_shares_same_cell() {
     let shared = new_shared(Config::default());
     let clone = shared.clone();
 
-    let cfg = Config { default_provider: Some("from-clone".to_string()), ..Config::default() };
+    let cfg = Config {
+        default_provider: Some("from-clone".to_string()),
+        ..Config::default()
+    };
     clone.store(std::sync::Arc::new(cfg));
 
     assert_eq!(
