@@ -17,8 +17,7 @@ fn shared_config_initial_load() {
 
 #[test]
 fn shared_config_swap_visible_to_readers() {
-    let mut config = Config::default();
-    config.default_provider = Some("anthropic".to_string());
+    let config = Config { default_provider: Some("anthropic".to_string()), ..Config::default() };
     let shared = new_shared(config);
 
     assert_eq!(
@@ -27,8 +26,7 @@ fn shared_config_swap_visible_to_readers() {
     );
 
     // Simulate hot-reload: swap in new config
-    let mut new_config = Config::default();
-    new_config.default_provider = Some("openai".to_string());
+    let new_config = Config { default_provider: Some("openai".to_string()), ..Config::default() };
     shared.store(std::sync::Arc::new(new_config));
 
     assert_eq!(
@@ -44,8 +42,7 @@ fn shared_config_old_snapshot_still_valid() {
     let old_snapshot = shared.load_full();
     let old_temp = old_snapshot.default_temperature;
 
-    let mut new_config = Config::default();
-    new_config.default_temperature = 1.5;
+    let new_config = Config { default_temperature: 1.5, ..Config::default() };
     shared.store(std::sync::Arc::new(new_config));
 
     // Old snapshot still has old value (ArcSwap guarantee)
@@ -72,8 +69,7 @@ async fn concurrent_readers_during_swap() {
 
     // Swap while readers are running
     for i in 0..5 {
-        let mut cfg = Config::default();
-        cfg.default_provider = Some(format!("provider-{i}"));
+        let cfg = Config { default_provider: Some(format!("provider-{i}")), ..Config::default() };
         shared.store(std::sync::Arc::new(cfg));
         tokio::task::yield_now().await;
     }
@@ -93,8 +89,7 @@ fn shared_config_clone_shares_same_cell() {
     let shared = new_shared(Config::default());
     let clone = shared.clone();
 
-    let mut cfg = Config::default();
-    cfg.default_provider = Some("from-clone".to_string());
+    let cfg = Config { default_provider: Some("from-clone".to_string()), ..Config::default() };
     clone.store(std::sync::Arc::new(cfg));
 
     assert_eq!(
@@ -117,10 +112,12 @@ fn config_default_roundtrip_via_toml() {
 
 #[test]
 fn config_modified_fields_survive_toml_roundtrip() {
-    let mut config = Config::default();
-    config.default_provider = Some("deepseek".to_string());
-    config.default_model = Some("ds-v3".to_string());
-    config.default_temperature = 0.42;
+    let config = Config {
+        default_provider: Some("deepseek".to_string()),
+        default_model: Some("ds-v3".to_string()),
+        default_temperature: 0.42,
+        ..Config::default()
+    };
 
     let toml_str = toml::to_string_pretty(&config).expect("test: serialize");
     let restored: Config = toml::from_str(&toml_str).expect("test: deserialize");
