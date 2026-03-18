@@ -30,7 +30,7 @@ jobs:
             suffix: linux-arm64
             use_cross: true
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             suffix: macos-amd64
             use_cross: false
           - target: aarch64-apple-darwin
