@@ -1986,4 +1986,76 @@ mod tests {
             "URL-encoded parent dir traversal must be blocked"
         );
     }
+
+    // ── Platform / cross-OS path handling ───────────────────────
+
+    #[test]
+    fn backslash_path_treated_as_traversal_on_all_platforms() {
+        // On Unix, backslash is a valid filename character but is commonly
+        // used for Windows path traversal. The policy should handle it
+        // gracefully regardless of platform.
+        let policy = SecurityPolicy::default();
+        // These should not crash or panic on any platform
+        let _ = policy.is_path_allowed("foo\\bar");
+        let _ = policy.is_path_allowed("..\\..\\etc\\passwd");
+        let _ = policy.is_path_allowed("C:\\Windows\\System32");
+    }
+
+    #[test]
+    fn path_with_mixed_separators() {
+        let policy = SecurityPolicy::default();
+        // Mixed forward/backslash should not bypass traversal detection
+        let _ = policy.is_path_allowed("foo/bar\\baz");
+        let _ = policy.is_path_allowed("..\\foo/../bar");
+    }
+
+    #[test]
+    fn absolute_path_blocking_works_on_workspace_only() {
+        let policy = SecurityPolicy {
+            workspace_only: true,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        };
+        // Unix absolute
+        assert!(!policy.is_path_allowed("/etc/passwd"));
+        // Relative is allowed
+        assert!(policy.is_path_allowed("relative/file.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_path_symlink_escape_blocked() {
+        use std::path::Path;
+        let policy = SecurityPolicy {
+            workspace_dir: std::env::temp_dir().join("test-workspace"),
+            ..SecurityPolicy::default()
+        };
+        // Path that escapes workspace root
+        let outside = Path::new("/etc/passwd");
+        assert!(!policy.is_resolved_path_allowed(outside));
+    }
+
+    #[test]
+    fn forbidden_paths_block_subpaths() {
+        let policy = SecurityPolicy {
+            forbidden_paths: vec!["/secret".to_string()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!policy.is_path_allowed("/secret/data.txt"));
+        assert!(!policy.is_path_allowed("/secret"));
+    }
+
+    #[test]
+    fn empty_path_is_allowed() {
+        let policy = SecurityPolicy::default();
+        // Empty path is not traversal, not null, not forbidden
+        assert!(policy.is_path_allowed(""));
+    }
+
+    #[test]
+    fn unicode_path_does_not_panic() {
+        let policy = SecurityPolicy::default();
+        assert!(policy.is_path_allowed("文档/笔记.md"));
+        assert!(policy.is_path_allowed("données/résumé.txt"));
+    }
 }

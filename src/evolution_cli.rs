@@ -353,7 +353,7 @@ async fn handle_trigger(
                 )
                 .await?
         }
-        _ => unreachable!("manual trigger only supports L1/L2/L3"),
+        other => anyhow::bail!("manual trigger only supports L1/L2/L3, got: {other:?}"),
     };
 
     let payload = TriggerOutput {

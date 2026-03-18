@@ -49,8 +49,9 @@ impl Sandbox for BubblewrapSandbox {
             "/dev",
             "--proc",
             "/proc",
-            "--bind",
-            "/tmp",
+            // Use a private tmpfs instead of sharing the host /tmp,
+            // which would allow symlink escape and cross-process data access.
+            "--tmpfs",
             "/tmp",
             "--unshare-all",
             "--die-with-parent",

@@ -159,6 +159,25 @@ impl SignalNativeChannel {
 #[cfg(test)]
 mod tests {
     use super::SignalNativeChannel;
+    use crate::channels::traits::Channel;
+
+    fn make_native_channel(port: u16, timeout_ms: u64) -> SignalNativeChannel {
+        SignalNativeChannel::new(
+            "/usr/local/bin/signal-cli".into(),
+            "+15551234567".into(),
+            None,
+            port,
+            timeout_ms,
+            None,
+            vec!["*".into()],
+            false,
+            false,
+            crate::config::MediaConfig::default(),
+            crate::config::schema::SignalStormProtectionConfig::default(),
+        )
+    }
+
+    // ── max_startup_attempts ────────────────────────────────────
 
     #[test]
     fn startup_attempts_have_minimum_single_poll() {
@@ -170,6 +189,104 @@ mod tests {
     fn startup_attempts_scale_with_timeout() {
         assert_eq!(SignalNativeChannel::max_startup_attempts(30_000), 60);
         assert_eq!(SignalNativeChannel::max_startup_attempts(30_100), 61);
+    }
+
+    #[test]
+    fn startup_attempts_zero_timeout() {
+        // 0 ms → clamped to 500, 500/500 = 1
+        assert_eq!(SignalNativeChannel::max_startup_attempts(0), 1);
+    }
+
+    #[test]
+    fn startup_attempts_exact_boundary() {
+        assert_eq!(SignalNativeChannel::max_startup_attempts(500), 1);
+        assert_eq!(SignalNativeChannel::max_startup_attempts(501), 2);
+        assert_eq!(SignalNativeChannel::max_startup_attempts(1000), 2);
+        assert_eq!(SignalNativeChannel::max_startup_attempts(1001), 3);
+    }
+
+    // ── Channel metadata ────────────────────────────────────────
+
+    #[test]
+    fn channel_name_is_signal() {
+        let ch = make_native_channel(19876, 5000);
+        assert_eq!(ch.name(), "signal");
+    }
+
+    // ── build_command ───────────────────────────────────────────
+
+    #[test]
+    fn build_command_includes_account_and_port() {
+        let ch = make_native_channel(19876, 5000);
+        let cmd = ch.build_command();
+        let program = cmd.as_std().get_program().to_string_lossy().to_string();
+        assert!(program.contains("signal-cli"));
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.contains(&"+15551234567".to_string()),
+            "should have account"
+        );
+        assert!(
+            args.contains(&"127.0.0.1:19876".to_string()),
+            "should have host:port"
+        );
+        assert!(
+            args.contains(&"daemon".to_string()),
+            "should have daemon subcommand"
+        );
+        assert!(args.contains(&"--no-receive-stdout".to_string()));
+    }
+
+    #[test]
+    fn build_command_with_data_dir() {
+        let ch = SignalNativeChannel::new(
+            "/usr/bin/signal-cli".into(),
+            "+15551234567".into(),
+            Some("/custom/data".into()),
+            19876,
+            5000,
+            None,
+            vec!["*".into()],
+            false,
+            false,
+            crate::config::MediaConfig::default(),
+            crate::config::schema::SignalStormProtectionConfig::default(),
+        );
+        let cmd = ch.build_command();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"--config".to_string()));
+        assert!(args.contains(&"/custom/data".to_string()));
+    }
+
+    #[test]
+    fn build_command_without_data_dir() {
+        let ch = make_native_channel(19876, 5000);
+        let cmd = ch.build_command();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(!args.contains(&"--config".to_string()));
+    }
+
+    // ── Constructor ─────────────────────────────────────────────
+
+    #[test]
+    fn constructor_stores_port_and_account() {
+        let ch = make_native_channel(12345, 8000);
+        assert_eq!(ch.http_port, 12345);
+        assert_eq!(ch.account, "+15551234567");
+        assert_eq!(ch.startup_timeout_ms, 8000);
     }
 }
 

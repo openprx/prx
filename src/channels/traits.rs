@@ -218,7 +218,8 @@ pub struct ChannelCapabilities {
 /// assert_eq!(media, vec![("IMAGE".to_string(), "/tmp/cat.png".to_string())]);
 /// ```
 pub fn extract_outgoing_media(text: &str) -> (String, Vec<(String, String)>) {
-    let re = regex::Regex::new(r"\[(IMAGE|DOCUMENT|AUDIO|VOICE|VIDEO):([^\]]+)\]").expect("compile regex: outgoing media tag pattern");
+    let re = regex::Regex::new(r"\[(IMAGE|DOCUMENT|AUDIO|VOICE|VIDEO):([^\]]+)\]")
+        .expect("compile regex: outgoing media tag pattern");
     let mut media = Vec::new();
     let clean = re
         .replace_all(text, |caps: &regex::Captures| {

@@ -25,11 +25,14 @@ impl WebFetchTool {
         // Remove script/style/head blocks (case-insensitive, multiline).
         // Rust's regex crate does not support backreferences, so use three
         // separate patterns instead of the combined `(?si)<(script|style|head)[^>]*>.*?</\1>`.
-        let re_script = Regex::new(r"(?si)<script[^>]*>.*?</script>").expect("compile regex: strip script tags");
+        let re_script = Regex::new(r"(?si)<script[^>]*>.*?</script>")
+            .expect("compile regex: strip script tags");
         let text = re_script.replace_all(html, "");
-        let re_style = Regex::new(r"(?si)<style[^>]*>.*?</style>").expect("compile regex: strip style tags");
+        let re_style =
+            Regex::new(r"(?si)<style[^>]*>.*?</style>").expect("compile regex: strip style tags");
         let text = re_style.replace_all(&text, "");
-        let re_head = Regex::new(r"(?si)<head[^>]*>.*?</head>").expect("compile regex: strip head tags");
+        let re_head =
+            Regex::new(r"(?si)<head[^>]*>.*?</head>").expect("compile regex: strip head tags");
         let text = re_head.replace_all(&text, "");
 
         // Replace block-level elements with newlines so paragraphs separate cleanly

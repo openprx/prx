@@ -244,21 +244,81 @@ impl RemoteNodeClient {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use parking_lot::Mutex as ParkingMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct MockTransport {
-        failures: Arc<AtomicUsize>,
+    // ── Mock transports ─────────────────────────────────────────
+
+    /// Always fails for the first N calls, then succeeds with a pong.
+    struct FailThenSucceedTransport {
+        call_count: Arc<AtomicUsize>,
+        fail_until: usize,
     }
 
     #[async_trait]
-    impl NodeTransport for MockTransport {
+    impl NodeTransport for FailThenSucceedTransport {
         async fn call(&self, _request: &TransportRequest) -> Result<serde_json::Value> {
-            let current = self.failures.fetch_add(1, Ordering::SeqCst);
-            if current < 3 {
+            let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_until {
                 Err(anyhow!("simulated failure"))
             } else {
                 Ok(serde_json::json!({"message": "pong", "timestamp": chrono::Utc::now()}))
             }
+        }
+    }
+
+    /// Always succeeds, echoing back the method and params.
+    struct EchoTransport {
+        calls: Arc<ParkingMutex<Vec<String>>>,
+    }
+
+    impl EchoTransport {
+        fn new() -> (Arc<Self>, Arc<ParkingMutex<Vec<String>>>) {
+            let calls = Arc::new(ParkingMutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    calls: calls.clone(),
+                }),
+                calls,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl NodeTransport for EchoTransport {
+        async fn call(&self, request: &TransportRequest) -> Result<serde_json::Value> {
+            self.calls.lock().push(request.method.clone());
+            // Return a generic success response matching common result types
+            Ok(serde_json::json!({
+                "message": "pong",
+                "timestamp": chrono::Utc::now(),
+                "task_id": "t1",
+                "exit_code": 0,
+                "stdout": "ok",
+                "stderr": "",
+                "duration_ms": 10,
+                "timed_out": false,
+                "cancelled": false,
+                "path": "/tmp/f",
+                "content": "data",
+                "bytes_read": 4,
+                "bytes_written": 4,
+                "offset": 0,
+                "eof": true,
+                "created_dirs": false,
+                "cpu_cores": 4,
+                "tasks": []
+            }))
+        }
+    }
+
+    /// Always fails.
+    struct AlwaysFailTransport;
+
+    #[async_trait]
+    impl NodeTransport for AlwaysFailTransport {
+        async fn call(&self, _request: &TransportRequest) -> Result<serde_json::Value> {
+            Err(anyhow!("network error"))
         }
     }
 
@@ -274,21 +334,183 @@ mod tests {
         }
     }
 
+    // ── node_id ─────────────────────────────────────────────────
+
+    #[test]
+    fn node_id_matches_config() {
+        let (transport, _) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        assert_eq!(client.node_id(), "n1");
+    }
+
+    // ── is_healthy ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn healthy_initially() {
+        let (transport, _) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        assert!(client.is_healthy().await);
+    }
+
+    // ── circuit breaker ─────────────────────────────────────────
+
     #[tokio::test]
     async fn circuit_breaker_blocks_after_threshold() {
-        let transport = Arc::new(MockTransport {
-            failures: Arc::new(AtomicUsize::new(0)),
+        let transport = Arc::new(FailThenSucceedTransport {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            fail_until: 100, // always fail
         });
         let client = RemoteNodeClient::new(mock_node(), transport);
 
-        assert!(client.ping().await.is_err());
-        assert!(client.ping().await.is_err());
-        assert!(client.ping().await.is_err());
+        // 3 failures → circuit opens
+        for _ in 0..FAILURE_THRESHOLD {
+            let _ = client.ping().await;
+        }
         let blocked = client.ping().await;
         assert!(blocked.is_err());
         assert!(blocked
             .unwrap_err()
             .to_string()
             .contains("temporarily unhealthy"));
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_resets_on_success() {
+        let transport = Arc::new(FailThenSucceedTransport {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            fail_until: 1, // fail once, then succeed
+        });
+        let client = RemoteNodeClient::new(mock_node(), transport);
+
+        // First call fails, records 1 failure
+        assert!(client.ping().await.is_err());
+        // Second call succeeds, resets counter
+        assert!(client.ping().await.is_ok());
+        // Should still be healthy
+        assert!(client.is_healthy().await);
+    }
+
+    // ── ping ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ping_success_returns_duration() {
+        let (transport, _) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        let duration = client.ping().await.unwrap();
+        assert!(duration.as_millis() < 1000);
+    }
+
+    #[tokio::test]
+    async fn ping_failure_propagates() {
+        let client = RemoteNodeClient::new(mock_node(), Arc::new(AlwaysFailTransport));
+        assert!(client.ping().await.is_err());
+    }
+
+    // ── exec_shell ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn exec_shell_empty_command_fails() {
+        let (transport, _) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        let err = client.exec_shell("", None, None).await.unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[tokio::test]
+    async fn exec_shell_whitespace_command_fails() {
+        let (transport, _) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        assert!(client.exec_shell("   ", None, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exec_shell_calls_correct_method() {
+        let (transport, calls) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        let _ = client.exec_shell("ls", None, None).await;
+        assert!(calls.lock().contains(&"node.exec_shell".to_string()));
+    }
+
+    // ── cancel ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cancel_empty_task_id_fails() {
+        let (transport, _) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        let err = client.cancel("").await.unwrap_err();
+        assert!(err.to_string().contains("task_id cannot be empty"));
+    }
+
+    // ── task_status ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn task_status_empty_id_fails() {
+        let (transport, _) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        assert!(client.task_status("").await.is_err());
+    }
+
+    // ── read_file / write_file ──────────────────────────────────
+
+    #[tokio::test]
+    async fn read_file_calls_correct_method() {
+        let (transport, calls) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        let _ = client.read_file("/etc/hosts", None, None).await;
+        assert!(calls.lock().contains(&"node.read_file".to_string()));
+    }
+
+    #[tokio::test]
+    async fn write_file_calls_correct_method() {
+        let (transport, calls) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        let _ = client.write_file("/tmp/f", "data", false).await;
+        assert!(calls.lock().contains(&"node.write_file".to_string()));
+    }
+
+    // ── metrics / task_list ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn metrics_calls_correct_method() {
+        let (transport, calls) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        let _ = client.metrics().await;
+        assert!(calls.lock().contains(&"node.metrics".to_string()));
+    }
+
+    #[tokio::test]
+    async fn task_list_calls_correct_method() {
+        let (transport, calls) = EchoTransport::new();
+        let client = RemoteNodeClient::new(mock_node(), transport);
+        let _ = client.task_list().await;
+        assert!(calls.lock().contains(&"node.task_list".to_string()));
+    }
+
+    // ── CircuitBreakerState unit tests ──────────────────────────
+
+    #[test]
+    fn circuit_breaker_new_allows_requests() {
+        let cb = CircuitBreakerState::new();
+        assert!(cb.allow_request().is_ok());
+    }
+
+    #[test]
+    fn circuit_breaker_success_resets_counter() {
+        let mut cb = CircuitBreakerState::new();
+        cb.record_failure();
+        cb.record_failure();
+        cb.record_success();
+        assert_eq!(cb.consecutive_failures, 0);
+        assert!(cb.unhealthy_until.is_none());
+    }
+
+    #[test]
+    fn circuit_breaker_opens_at_threshold() {
+        let mut cb = CircuitBreakerState::new();
+        for _ in 0..FAILURE_THRESHOLD {
+            cb.record_failure();
+        }
+        // After threshold, unhealthy_until is set
+        assert!(cb.allow_request().is_err());
     }
 }

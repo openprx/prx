@@ -249,3 +249,187 @@ async fn load_latency_snapshot(
         .flatten()
         .and_then(|entry| serde_json::from_str::<RouterLatencySnapshot>(&entry.content).ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RouterModelConfig;
+    use crate::memory::none::NoneMemory;
+
+    fn model(id: &str, provider: &str, elo: f32, latency: u32) -> RouterModelConfig {
+        RouterModelConfig {
+            model_id: id.to_string(),
+            provider: provider.to_string(),
+            elo_rating: elo,
+            latency_ms: latency,
+            cost_per_million_tokens: 0.0,
+            max_context: 4096,
+            categories: vec![],
+        }
+    }
+
+    fn route(provider: &str, model_name: &str) -> ModelRouteConfig {
+        ModelRouteConfig {
+            hint: "default".to_string(),
+            provider: provider.to_string(),
+            model: model_name.to_string(),
+            api_key: None,
+        }
+    }
+
+    // ── reachable_provider_names ─────────────────────────────────
+
+    #[test]
+    fn reachable_includes_default_provider() {
+        let names = reachable_provider_names("openai", &[]);
+        assert!(names.contains("openai"));
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn reachable_includes_route_providers() {
+        let routes = vec![route("anthropic", "claude-3"), route("deepseek", "ds-v3")];
+        let names = reachable_provider_names("openai", &routes);
+        assert!(names.contains("openai"));
+        assert!(names.contains("anthropic"));
+        assert!(names.contains("deepseek"));
+        assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn reachable_deduplicates_same_provider() {
+        let routes = vec![route("openai", "gpt-4"), route("openai", "gpt-3.5")];
+        let names = reachable_provider_names("openai", &routes);
+        assert_eq!(names.len(), 1);
+    }
+
+    // ── filter_models_by_providers ──────────────────────────────
+
+    #[test]
+    fn filter_keeps_matching_providers() {
+        let models = vec![
+            model("gpt-4", "openai", 1200.0, 500),
+            model("claude-3", "anthropic", 1100.0, 300),
+            model("ds-v3", "deepseek", 1000.0, 200),
+        ];
+        let allowed: HashSet<String> = ["openai", "deepseek"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let filtered = filter_models_by_providers(models, &allowed);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|m| m.provider != "anthropic"));
+    }
+
+    #[test]
+    fn filter_empty_allowed_returns_nothing() {
+        let models = vec![model("gpt-4", "openai", 1200.0, 500)];
+        let allowed = HashSet::new();
+        let filtered = filter_models_by_providers(models, &allowed);
+        assert!(filtered.is_empty());
+    }
+
+    // ── route_matches_model ─────────────────────────────────────
+
+    #[test]
+    fn route_matches_exact() {
+        let r = route("openai", "gpt-4");
+        assert!(route_matches_model(&r, "openai", "gpt-4"));
+    }
+
+    #[test]
+    fn route_no_match_wrong_provider() {
+        let r = route("openai", "gpt-4");
+        assert!(!route_matches_model(&r, "anthropic", "gpt-4"));
+    }
+
+    #[test]
+    fn route_no_match_wrong_model() {
+        let r = route("openai", "gpt-4");
+        assert!(!route_matches_model(&r, "openai", "gpt-3.5"));
+    }
+
+    // ── is_model_reachable ──────────────────────────────────────
+
+    #[test]
+    fn reachable_via_default_provider() {
+        assert!(is_model_reachable("openai", &[], "openai", "gpt-4"));
+    }
+
+    #[test]
+    fn reachable_via_route() {
+        let routes = vec![route("anthropic", "claude-3")];
+        assert!(is_model_reachable(
+            "openai",
+            &routes,
+            "anthropic",
+            "claude-3"
+        ));
+    }
+
+    #[test]
+    fn unreachable_unknown_provider() {
+        assert!(!is_model_reachable("openai", &[], "anthropic", "claude-3"));
+    }
+
+    // ── load_all with empty memory (NoneMemory) ─────────────────
+
+    #[tokio::test]
+    async fn load_all_uses_config_defaults_when_memory_empty() {
+        let models = vec![
+            model("gpt-4", "openai", 1500.0, 400),
+            model("claude-3", "anthropic", 1200.0, 300),
+        ];
+        let memory = NoneMemory;
+        let entries = ModelCapabilityEntry::load_all(&models, &memory).await;
+
+        assert_eq!(entries.len(), 2);
+        assert!((entries[0].dynamic_elo - 1500.0).abs() < f32::EPSILON);
+        assert_eq!(entries[0].recent_latency_ms, 400);
+        assert!((entries[0].success_rate - 1.0).abs() < f32::EPSILON); // default
+        assert!((entries[1].dynamic_elo - 1200.0).abs() < f32::EPSILON);
+    }
+
+    // ── default_success_rate ────────────────────────────────────
+
+    #[test]
+    fn default_success_rate_is_one() {
+        assert!((default_success_rate() - 1.0).abs() < f32::EPSILON);
+    }
+
+    // ── RouterSuccessRateSnapshot defaults ───────────────────────
+
+    #[test]
+    fn success_rate_snapshot_default_values() {
+        let snapshot = RouterSuccessRateSnapshot::default();
+        assert!(snapshot.recent_successes.is_empty());
+        // #[derive(Default)] yields f32 default (0.0);
+        // serde(default = "default_success_rate") only applies during deserialization.
+        assert!((snapshot.success_rate - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn success_rate_snapshot_serde_default() {
+        // When deserialized from empty JSON, serde applies default_success_rate() = 1.0
+        let snapshot: RouterSuccessRateSnapshot =
+            serde_json::from_str("{}").expect("test: parse empty JSON");
+        assert!((snapshot.success_rate - 1.0).abs() < f32::EPSILON);
+    }
+
+    // ── append_success_event + load_recent_successes with NoneMemory ─
+
+    #[tokio::test]
+    async fn append_success_event_with_none_memory_does_not_panic() {
+        // NoneMemory silently discards stores — we just verify no panic
+        let memory = NoneMemory;
+        let result = append_success_event(&memory, "test-model", true).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn load_recent_successes_empty_memory_returns_empty() {
+        let memory = NoneMemory;
+        let successes = load_recent_successes(&memory, "test-model").await;
+        assert!(successes.is_empty());
+    }
+}

@@ -159,9 +159,13 @@ impl SlidingWindowRateLimiter {
             *last_sweep = now;
 
             if requests.len() >= self.max_keys {
+                // Evict the key with the fewest recent requests.  FIFO (oldest)
+                // eviction lets an attacker cycle through IPs and reset legitimate
+                // users' rate-limit counters.  Evicting the least-active key is
+                // harder to weaponize.
                 let evict_key = requests
                     .iter()
-                    .min_by_key(|(_, timestamps)| timestamps.last().copied().unwrap_or(cutoff))
+                    .min_by_key(|(_, timestamps)| timestamps.len())
                     .map(|(k, _)| k.clone());
                 if let Some(evict_key) = evict_key {
                     requests.remove(&evict_key);
@@ -283,18 +287,27 @@ fn parse_client_ip(value: &str) -> Option<IpAddr> {
 }
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    // Prefer X-Real-IP (single trusted proxy) over X-Forwarded-For
+    if let Some(real_ip) = headers
+        .get("X-Real-IP")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_client_ip)
+    {
+        return Some(real_ip);
+    }
+
+    // RFC 7239: use the LAST (rightmost) IP in X-Forwarded-For, which is the
+    // one added by the closest trusted proxy.  Using the first IP is spoofable
+    // by the client and can bypass rate limiting.
     if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
-        for candidate in xff.split(',') {
+        for candidate in xff.rsplit(',') {
             if let Some(ip) = parse_client_ip(candidate) {
                 return Some(ip);
             }
         }
     }
 
-    headers
-        .get("X-Real-IP")
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_client_ip)
+    None
 }
 
 pub(super) fn client_key_from_request(
@@ -2016,16 +2029,25 @@ mod tests {
     }
 
     #[test]
-    fn rate_limiter_bounded_cardinality_evicts_oldest_key() {
+    fn rate_limiter_bounded_cardinality_evicts_least_active_key() {
         let limiter = SlidingWindowRateLimiter::new(5, Duration::from_secs(60), 2);
+        // ip-1 gets 2 requests, ip-2 gets 1 — ip-2 is least active
+        assert!(limiter.allow("ip-1"));
         assert!(limiter.allow("ip-1"));
         assert!(limiter.allow("ip-2"));
+        // ip-3 triggers eviction — ip-2 (1 request) is evicted over ip-1 (2 requests)
         assert!(limiter.allow("ip-3"));
 
         let guard = limiter.requests.lock();
         assert_eq!(guard.0.len(), 2);
-        assert!(guard.0.contains_key("ip-2"));
-        assert!(guard.0.contains_key("ip-3"));
+        assert!(
+            guard.0.contains_key("ip-1"),
+            "ip-1 (most active) must survive"
+        );
+        assert!(
+            guard.0.contains_key("ip-3"),
+            "ip-3 (just inserted) must be present"
+        );
     }
 
     #[test]
@@ -2067,7 +2089,9 @@ mod tests {
         );
 
         let key = client_key_from_request(Some(peer), &headers, true);
-        assert_eq!(key, "198.51.100.10");
+        // RFC 7239: use the LAST (rightmost) IP — it's the one added by the
+        // closest trusted proxy and cannot be spoofed by the client.
+        assert_eq!(key, "203.0.113.11");
     }
 
     #[test]

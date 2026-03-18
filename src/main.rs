@@ -97,9 +97,6 @@ mod agent;
 mod approval;
 mod auth;
 mod channels;
-mod rag {
-    pub use openprx::rag::*;
-}
 mod config;
 mod cost;
 mod cron;
@@ -236,7 +233,6 @@ Examples:
         /// Temperature (0.0 - 2.0)
         #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
         temperature: f64,
-
     },
 
     /// Start the gateway server (webhooks, websockets)
@@ -794,7 +790,9 @@ async fn main() -> Result<()> {
         )
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        eprintln!("failed to set default tracing subscriber: {e}");
+    }
 
     // Onboard runs quick setup by default, or the interactive wizard with --interactive.
     // The onboard wizard uses reqwest::blocking internally, which creates its own
@@ -1060,10 +1058,7 @@ async fn main() -> Result<()> {
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Schema => {
                 let schema = schemars::schema_for!(config::Config);
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
-                );
+                println!("{}", serde_json::to_string_pretty(&schema)?);
                 Ok(())
             }
             ConfigCommands::Split { dry_run } => {

@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 use uuid::Uuid;
 
 const DINGTALK_BOT_CALLBACK_TOPIC: &str = "/v1.0/im/bot/messages/get";
@@ -153,7 +153,11 @@ impl Channel for DingTalkChannel {
         let ws_url = format!("{}?ticket={}", gw.endpoint, gw.ticket);
 
         tracing::info!("DingTalk: connecting to stream WebSocket...");
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(2 * 1024 * 1024);
+        ws_config.max_frame_size = Some(1024 * 1024);
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_config), false).await?;
         let (mut write, mut read) = ws_stream.split();
 
         tracing::info!("DingTalk: connected and listening for messages...");

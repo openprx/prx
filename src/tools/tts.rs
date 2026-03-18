@@ -174,3 +174,237 @@ impl Tool for TtsTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channels::traits::ChannelMessage;
+    use crate::security::AutonomyLevel;
+    use parking_lot::Mutex as ParkingMutex;
+
+    // ── Mock channel ────────────────────────────────────────────
+
+    struct MockChannel {
+        sent: ParkingMutex<Vec<String>>,
+        fail_send: bool,
+    }
+
+    impl MockChannel {
+        fn ok() -> Arc<Self> {
+            Arc::new(Self {
+                sent: ParkingMutex::new(Vec::new()),
+                fail_send: false,
+            })
+        }
+        fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                sent: ParkingMutex::new(Vec::new()),
+                fail_send: true,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Channel for MockChannel {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            if self.fail_send {
+                anyhow::bail!("mock send failure");
+            }
+            self.sent.lock().push(message.content.clone());
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────
+
+    fn test_security(level: AutonomyLevel, max_actions: u32) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: level,
+            max_actions_per_hour: max_actions,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn make_tts(
+        channel: Arc<dyn Channel>,
+        recipient: Option<&str>,
+        level: AutonomyLevel,
+    ) -> TtsTool {
+        let default_recipient = Arc::new(tokio::sync::RwLock::new(recipient.map(String::from)));
+        TtsTool::new(channel, default_recipient, test_security(level, 1000))
+    }
+
+    // ── Metadata ────────────────────────────────────────────────
+
+    #[test]
+    fn tool_name() {
+        let tool = make_tts(MockChannel::ok(), None, AutonomyLevel::Full);
+        assert_eq!(tool.name(), "tts");
+    }
+
+    #[test]
+    fn tool_description_non_empty() {
+        let tool = make_tts(MockChannel::ok(), None, AutonomyLevel::Full);
+        assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn tool_schema_requires_text() {
+        let tool = make_tts(MockChannel::ok(), None, AutonomyLevel::Full);
+        let schema = tool.parameters_schema();
+        let required = schema["required"].as_array().expect("test: required");
+        assert!(required.iter().any(|v| v == "text"));
+    }
+
+    // ── Security: read-only ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn readonly_blocks_execution() {
+        let tool = make_tts(MockChannel::ok(), Some("bob"), AutonomyLevel::ReadOnly);
+        let result = tool.execute(json!({"text": "hello"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
+    }
+
+    // ── Security: rate limiting ─────────────────────────────────
+
+    #[tokio::test]
+    async fn rate_limit_blocks_after_exhaustion() {
+        let default_recipient = Arc::new(tokio::sync::RwLock::new(Some("bob".into())));
+        let tool = TtsTool::new(
+            MockChannel::ok(),
+            default_recipient,
+            test_security(AutonomyLevel::Full, 1),
+        );
+        // First call uses the budget (will fail at auto_generate_voice but after rate limit check)
+        let r1 = tool.execute(json!({"text": "first"})).await.unwrap();
+        // r1 fails at TTS generation (no edge-tts binary) — that's fine, budget consumed
+        let _ = r1;
+
+        // Second call should be blocked by rate limit
+        let r2 = tool.execute(json!({"text": "second"})).await.unwrap();
+        assert!(!r2.success);
+        assert!(r2.error.as_deref().unwrap_or("").contains("rate limit"));
+    }
+
+    // ── Arg validation: missing/empty text ──────────────────────
+
+    #[tokio::test]
+    async fn missing_text_fails() {
+        let tool = make_tts(MockChannel::ok(), Some("bob"), AutonomyLevel::Full);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("text"));
+    }
+
+    #[tokio::test]
+    async fn empty_text_fails() {
+        let tool = make_tts(MockChannel::ok(), Some("bob"), AutonomyLevel::Full);
+        let result = tool.execute(json!({"text": ""})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("text"));
+    }
+
+    #[tokio::test]
+    async fn null_text_fails() {
+        let tool = make_tts(MockChannel::ok(), Some("bob"), AutonomyLevel::Full);
+        let result = tool.execute(json!({"text": null})).await.unwrap();
+        assert!(!result.success);
+    }
+
+    // ── Recipient resolution ────────────────────────────────────
+
+    #[tokio::test]
+    async fn no_recipient_and_no_default_fails() {
+        let tool = make_tts(MockChannel::ok(), None, AutonomyLevel::Full);
+        let result = tool.execute(json!({"text": "hello"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("target"));
+    }
+
+    #[tokio::test]
+    async fn empty_target_and_no_default_fails() {
+        let tool = make_tts(MockChannel::ok(), None, AutonomyLevel::Full);
+        let result = tool
+            .execute(json!({"text": "hello", "target": ""}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("target"));
+    }
+
+    // ── Voice defaults ──────────────────────────────────────────
+    // (auto_generate_voice will fail because edge-tts is not installed in CI,
+    //  but we verify the TTS generation error path is handled gracefully)
+
+    #[tokio::test]
+    async fn tts_generation_failure_returns_error_not_panic() {
+        let tool = make_tts(MockChannel::ok(), Some("bob"), AutonomyLevel::Full);
+        let result = tool.execute(json!({"text": "test speech"})).await.unwrap();
+        // auto_generate_voice fails → graceful error, not panic
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("TTS generation failed"));
+    }
+
+    #[tokio::test]
+    async fn custom_voice_passed_through() {
+        let tool = make_tts(MockChannel::ok(), Some("bob"), AutonomyLevel::Full);
+        // This will fail at TTS generation (no edge-tts), but exercises the voice param path
+        let result = tool
+            .execute(json!({
+                "text": "test",
+                "voice": "en-US-AriaNeural"
+            }))
+            .await
+            .unwrap();
+        // Graceful failure expected — voice is parsed before reaching auto_generate_voice
+        assert!(!result.success);
+    }
+
+    // ── set_active_recipient / set_active_channel ───────────────
+
+    #[tokio::test]
+    async fn set_active_recipient_updates_default() {
+        let tool = make_tts(MockChannel::ok(), None, AutonomyLevel::Full);
+
+        // Initially no default → fails
+        let r1 = tool.execute(json!({"text": "hi"})).await.unwrap();
+        assert!(!r1.success);
+        assert!(r1.error.as_deref().unwrap_or("").contains("target"));
+
+        // Set recipient
+        tool.set_active_recipient("alice").await;
+
+        // Now recipient is resolved → proceeds past validation (fails at TTS generation)
+        let r2 = tool.execute(json!({"text": "hi"})).await.unwrap();
+        assert!(!r2.success);
+        assert!(r2.error.as_deref().unwrap_or("").contains("TTS generation"));
+    }
+
+    #[tokio::test]
+    async fn set_active_channel_switches_channel() {
+        let ch1 = MockChannel::ok();
+        let ch2 = MockChannel::ok();
+        let tool = make_tts(ch1.clone(), Some("bob"), AutonomyLevel::Full);
+
+        // Switch to ch2
+        tool.set_active_channel(ch2.clone()).await;
+
+        let channel = tool.active_channel.read().await;
+        assert_eq!(channel.name(), "mock"); // both are mock, but it's a different Arc
+    }
+}

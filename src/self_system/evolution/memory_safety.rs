@@ -2,7 +2,7 @@ use crate::self_system::evolution::Actor;
 use anyhow::Result;
 use async_trait::async_trait;
 use regex::Regex;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 /// High-level safety issue category.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,44 +157,34 @@ impl MemorySafetyFilter {
 }
 
 fn pii_phone_regex() -> &'static Regex {
-    static PHONE: OnceLock<Regex> = OnceLock::new();
-    PHONE.get_or_init(|| {
+    static PHONE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?x)\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?)?\d{3,4}[-.\s]?\d{4}\b")
-            .unwrap_or_else(|e| {
-                tracing::error!(error = %e, "phone regex compile failed");
-                panic!("phone regex: {e}")
-            })
-    })
+            .expect("BUG: invalid hardcoded phone regex")
+    });
+    &PHONE
 }
 
 fn pii_email_regex() -> &'static Regex {
-    static EMAIL: OnceLock<Regex> = OnceLock::new();
-    EMAIL.get_or_init(|| {
-        Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").unwrap_or_else(|e| {
-            tracing::error!(error = %e, "email regex compile failed");
-            panic!("email regex: {e}")
-        })
-    })
+    static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+            .expect("BUG: invalid hardcoded email regex")
+    });
+    &EMAIL
 }
 
 fn pii_id_regex() -> &'static Regex {
-    static ID: OnceLock<Regex> = OnceLock::new();
-    ID.get_or_init(|| {
-        Regex::new(r"\b\d{17}[\dXx]\b|\b\d{15}\b|\b\d{3}-\d{2}-\d{4}\b").unwrap_or_else(|e| {
-            tracing::error!(error = %e, "id regex compile failed");
-            panic!("id regex: {e}")
-        })
-    })
+    static ID: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\b\d{17}[\dXx]\b|\b\d{15}\b|\b\d{3}-\d{2}-\d{4}\b")
+            .expect("BUG: invalid hardcoded ID regex")
+    });
+    &ID
 }
 
 fn credit_card_candidate_regex() -> &'static Regex {
-    static CARD: OnceLock<Regex> = OnceLock::new();
-    CARD.get_or_init(|| {
-        Regex::new(r"\b(?:\d[ -]?){13,19}\b").unwrap_or_else(|e| {
-            tracing::error!(error = %e, "card regex compile failed");
-            panic!("card regex: {e}")
-        })
-    })
+    static CARD: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\b(?:\d[ -]?){13,19}\b").expect("BUG: invalid hardcoded credit card regex")
+    });
+    &CARD
 }
 
 fn contains_credit_card_number(content: &str) -> bool {

@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 use uuid::Uuid;
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
@@ -248,7 +248,11 @@ impl Channel for DiscordChannel {
         let ws_url = format!("{gw_url}/?v=10&encoding=json");
         tracing::info!("Discord: connecting to gateway...");
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(2 * 1024 * 1024); // 2 MB — chat messages are small
+        ws_config.max_frame_size = Some(1024 * 1024); // 1 MB per frame
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_config), false).await?;
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)
@@ -443,13 +447,28 @@ impl Channel for DiscordChannel {
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
         self.stop_typing(recipient).await?;
 
+        // Cap concurrent typing indicators to prevent resource leaks
+        const MAX_TYPING_INDICATORS: usize = 20;
+        {
+            let guard = self.typing_handles.lock();
+            if guard.len() >= MAX_TYPING_INDICATORS {
+                tracing::warn!("Discord: too many concurrent typing indicators, skipping");
+                return Ok(());
+            }
+        }
+
         let client = self.http_client();
         let token = self.bot_token.clone();
         let channel_id = recipient.to_string();
 
         let handle = tokio::spawn(async move {
             let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
+            // Auto-expire after 60 seconds (safety net if stop_typing is never called)
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
                 let _ = client
                     .post(&url)
                     .header("Authorization", format!("Bot {token}"))

@@ -147,7 +147,7 @@ fn start_linux(init_system: InitSystem) -> Result<()> {
         InitSystem::Openrc => {
             run_checked(Command::new("rc-service").args(["openprx", "start"]))?;
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
     println!("✅ Service started");
     Ok(())
@@ -189,7 +189,7 @@ fn stop_linux(init_system: InitSystem) -> Result<()> {
         InitSystem::Openrc => {
             let _ = run_checked(Command::new("rc-service").args(["openprx", "stop"]));
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
     println!("✅ Service stopped");
     Ok(())
@@ -227,7 +227,7 @@ fn restart_linux(init_system: InitSystem) -> Result<()> {
         InitSystem::Openrc => {
             run_checked(Command::new("rc-service").args(["openprx", "restart"]))?;
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
     println!("✅ Service restarted");
     Ok(())
@@ -300,7 +300,7 @@ fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             println!("Service state: {}", out.trim());
             println!("Unit: /etc/init.d/openprx");
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
     Ok(())
 }
@@ -369,7 +369,7 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             }
             println!("✅ Service uninstalled (/etc/init.d/openprx)");
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
     Ok(())
 }
@@ -430,7 +430,7 @@ fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => install_linux_systemd(config),
         InitSystem::Openrc => install_linux_openrc(config),
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
 }
 
@@ -457,6 +457,8 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
 /// Check if the current process is running as root (Unix only)
 #[cfg(unix)]
 fn is_root() -> bool {
+    // SAFETY: `getuid()` is a read-only syscall that returns the real user ID
+    // of the calling process. It has no side effects and no preconditions.
     unsafe { libc::getuid() == 0 }
 }
 

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::Message as WsMsg;
+use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message as WsMsg};
 use uuid::Uuid;
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
@@ -89,8 +89,8 @@ struct LarkEvent {
 #[derive(Debug, serde::Deserialize)]
 struct LarkEventHeader {
     event_type: String,
-    #[allow(dead_code)]
-    event_id: String,
+    #[serde(rename = "event_id")]
+    _event_id: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -325,7 +325,11 @@ impl LarkChannel {
             .unwrap_or(0);
         tracing::info!("Lark: connecting to {wss_url}");
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&wss_url).await?;
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(2 * 1024 * 1024);
+        ws_config.max_frame_size = Some(1024 * 1024);
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async_with_config(&wss_url, Some(ws_config), false).await?;
         let (mut write, mut read) = ws_stream.split();
         tracing::info!("Lark: WS connected (service_id={service_id})");
 
@@ -446,8 +450,12 @@ impl LarkChannel {
                     }
 
                     // Fragment reassembly
+                    const MAX_FRAGMENTS: usize = 128;
                     let sum = if sum == 0 { 1 } else { sum };
-                    let payload: Vec<u8> = if sum == 1 || msg_id.is_empty() || seq_num >= sum {
+                    let payload: Vec<u8> = if sum == 1 || msg_id.is_empty() || seq_num >= sum || sum > MAX_FRAGMENTS {
+                        if sum > MAX_FRAGMENTS {
+                            tracing::warn!(sum, "Lark: rejecting message with too many fragments");
+                        }
                         frame.payload.clone().unwrap_or_default()
                     } else {
                         let entry = frag_cache.entry(msg_id.clone())

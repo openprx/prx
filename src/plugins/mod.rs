@@ -759,3 +759,235 @@ pub async fn init_plugin_manager(workspace_dir: &Path) -> Option<Arc<PluginManag
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    // ── PluginMetrics ───────────────────────────────────────────
+
+    #[test]
+    fn metrics_default_all_zero() {
+        let m = PluginMetrics::default();
+        assert_eq!(m.compilations.load(Ordering::Relaxed), 0);
+        assert_eq!(m.cache_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(m.cache_misses.load(Ordering::Relaxed), 0);
+        assert_eq!(m.total_compile_ms.load(Ordering::Relaxed), 0);
+        assert_eq!(m.total_instantiations.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn metrics_record_compilation() {
+        let m = PluginMetrics::default();
+        m.record_compilation(42);
+        assert_eq!(m.compilations.load(Ordering::Relaxed), 1);
+        assert_eq!(m.total_compile_ms.load(Ordering::Relaxed), 42);
+        m.record_compilation(8);
+        assert_eq!(m.compilations.load(Ordering::Relaxed), 2);
+        assert_eq!(m.total_compile_ms.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn metrics_record_cache_hit_miss() {
+        let m = PluginMetrics::default();
+        m.record_cache_hit();
+        m.record_cache_hit();
+        m.record_cache_miss();
+        assert_eq!(m.cache_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(m.cache_misses.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn metrics_record_instantiation() {
+        let m = PluginMetrics::default();
+        m.record_instantiation();
+        m.record_instantiation();
+        m.record_instantiation();
+        assert_eq!(m.total_instantiations.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn metrics_snapshot_captures_current_state() {
+        let m = PluginMetrics::default();
+        m.record_compilation(100);
+        m.record_cache_hit();
+        m.record_cache_miss();
+        m.record_instantiation();
+
+        let snap = m.snapshot();
+        assert_eq!(snap.compilations, 1);
+        assert_eq!(snap.cache_hits, 1);
+        assert_eq!(snap.cache_misses, 1);
+        assert_eq!(snap.total_compile_ms, 100);
+        assert_eq!(snap.total_instantiations, 1);
+    }
+
+    #[test]
+    fn metrics_snapshot_serializes_to_json() {
+        let m = PluginMetrics::default();
+        m.record_compilation(55);
+        let snap = m.snapshot();
+        let json = serde_json::to_value(&snap).expect("test: serialize snapshot");
+        assert_eq!(json["compilations"], 1);
+        assert_eq!(json["total_compile_ms"], 55);
+    }
+
+    // ── PluginManager construction ──────────────────────────────
+
+    #[test]
+    fn manager_new_creates_engine() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = PluginManager::new(tmp.path().to_path_buf());
+        assert!(manager.is_ok());
+    }
+
+    #[test]
+    fn manager_plugins_dir_matches() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let path = tmp.path().to_path_buf();
+        let manager = PluginManager::new(path.clone()).expect("test: new");
+        assert_eq!(manager.plugins_dir(), path);
+    }
+
+    #[test]
+    fn manager_initial_metrics_are_zero() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let snap = manager.metrics_snapshot();
+        assert_eq!(snap.compilations, 0);
+        assert_eq!(snap.cache_hits, 0);
+        assert_eq!(snap.total_instantiations, 0);
+    }
+
+    // ── PluginManager async operations ──────────────────────────
+
+    #[tokio::test]
+    async fn load_all_empty_dir_returns_zero() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let count = manager.load_all().await.expect("test: load_all");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn load_all_missing_dir_returns_zero() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let nonexistent = tmp.path().join("does_not_exist");
+        let manager = PluginManager::new(nonexistent).expect("test: new");
+        let count = manager.load_all().await.expect("test: load_all");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn load_all_skips_files_not_dirs() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        // Create a plain file (not a plugin dir)
+        std::fs::write(tmp.path().join("not_a_plugin.txt"), "hello").expect("test: write");
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let count = manager.load_all().await.expect("test: load_all");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn load_all_skips_dirs_without_manifest() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        std::fs::create_dir(tmp.path().join("my_plugin")).expect("test: mkdir");
+        // No plugin.toml → skipped
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let count = manager.load_all().await.expect("test: load_all");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn list_plugins_initially_empty() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let plugins = manager.list_plugins().await;
+        assert!(plugins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_plugin_nonexistent_returns_none() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        assert!(manager.get_plugin("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unload_nonexistent_returns_error() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let result = manager.unload_plugin("nonexistent").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn reload_nonexistent_returns_error() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let result = manager.reload_plugin("nonexistent").await;
+        assert!(result.is_err());
+    }
+
+    // ── init_plugin_manager ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn init_plugin_manager_creates_plugins_dir() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let workspace = tmp.path();
+        let plugins_dir = workspace.join("plugins");
+        assert!(!plugins_dir.exists());
+
+        let manager = init_plugin_manager(workspace).await;
+        assert!(manager.is_some());
+        assert!(plugins_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn init_plugin_manager_empty_workspace_succeeds() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = init_plugin_manager(tmp.path()).await;
+        assert!(manager.is_some());
+        let plugins = manager
+            .as_ref()
+            .expect("test: manager")
+            .list_plugins()
+            .await;
+        assert!(plugins.is_empty());
+    }
+
+    // ── create_tool_adapters on empty registry ──────────────────
+
+    #[tokio::test]
+    async fn create_tool_adapters_empty_returns_empty() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let tools = manager.create_tool_adapters().await;
+        assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_middleware_chain_empty_returns_empty_chain() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let chain = manager.create_middleware_chain(None).await;
+        assert!(chain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_provider_adapters_empty() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let providers = manager.create_provider_adapters(None).await;
+        assert!(providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_storage_adapters_empty() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
+        let storages = manager.create_storage_adapters(None).await;
+        assert!(storages.is_empty());
+    }
+}

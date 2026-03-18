@@ -265,7 +265,26 @@ impl HookManager {
         }
 
         if !action.env.is_empty() {
-            cmd.envs(action.env.clone());
+            // Block env vars that could hijack the process (e.g., LD_PRELOAD, PATH).
+            const BLOCKED_VARS: &[&str] = &[
+                "LD_PRELOAD",
+                "LD_LIBRARY_PATH",
+                "DYLD_INSERT_LIBRARIES",
+                "DYLD_LIBRARY_PATH",
+                "PATH",
+                "HOME",
+            ];
+            for (key, value) in &action.env {
+                if value.contains('\0') || key.contains('\0') {
+                    tracing::warn!(env_var = %key, "hook env var contains null byte, skipping");
+                    continue;
+                }
+                if BLOCKED_VARS.iter().any(|b| key.eq_ignore_ascii_case(b)) {
+                    tracing::warn!(env_var = %key, "hook attempted to set blocked env var, skipping");
+                    continue;
+                }
+                cmd.env(key, value);
+            }
         }
 
         if let Some(cwd) = &action.cwd {
@@ -392,6 +411,224 @@ mod tests {
         assert!(state.config.enabled);
         assert_eq!(state.config.timeout_ms, 1200);
         assert!(state.config.hooks.contains_key("tool_call_start"));
+    }
+
+    // ── HookEvent::as_str ─────────────────────────────────────
+
+    #[test]
+    fn hook_event_all_variants_have_names() {
+        let events = [
+            HookEvent::AgentStart,
+            HookEvent::AgentEnd,
+            HookEvent::LlmRequest,
+            HookEvent::LlmResponse,
+            HookEvent::ToolCallStart,
+            HookEvent::ToolCall,
+            HookEvent::TurnComplete,
+            HookEvent::Error,
+        ];
+        for e in &events {
+            assert!(!e.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn hook_event_as_str_values() {
+        assert_eq!(HookEvent::AgentStart.as_str(), "agent_start");
+        assert_eq!(HookEvent::ToolCall.as_str(), "tool_call");
+        assert_eq!(HookEvent::Error.as_str(), "error");
+    }
+
+    // ── normalize_event_name ────────────────────────────────────
+
+    #[test]
+    fn normalize_event_name_identity() {
+        assert_eq!(normalize_event_name("agent_start"), "agent_start");
+    }
+
+    #[test]
+    fn normalize_event_name_trims() {
+        assert_eq!(normalize_event_name("  tool_call  "), "tool_call");
+    }
+
+    #[test]
+    fn normalize_event_name_uppercased() {
+        assert_eq!(normalize_event_name("AGENT_END"), "agent_end");
+    }
+
+    // ── truncate_for_log ────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate_for_log("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string_adds_ellipsis() {
+        let long = "a".repeat(500);
+        let out = truncate_for_log(&long, 10);
+        assert_eq!(out.len(), 13); // 10 chars + "..."
+        assert!(out.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate_for_log("", 10), "");
+    }
+
+    #[test]
+    fn truncate_unicode_safe() {
+        let s = "你好世界！测试数据会被截断吗";
+        let out = truncate_for_log(s, 4);
+        // Should take exactly 4 chars + "..."
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), 7); // 4 + 3 dots
+    }
+
+    // ── payload_error ───────────────────────────────────────────
+
+    #[test]
+    fn payload_error_format() {
+        let p = payload_error("gateway", "connection refused");
+        assert_eq!(p["component"], "gateway");
+        assert_eq!(p["message"], "connection refused");
+    }
+
+    // ── HookManager::new ────────────────────────────────────────
+
+    #[test]
+    fn hook_manager_new_sets_path() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        assert_eq!(manager.hooks_json_path, temp.path().join(HOOKS_JSON_FILE));
+    }
+
+    // ── refresh_if_changed edge cases ───────────────────────────
+
+    #[test]
+    fn refresh_missing_file_resets_to_default() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        // No hooks.json → should succeed with default config
+        manager.refresh_if_changed().unwrap();
+        let state = manager.state.read();
+        assert!(state.config.enabled);
+        assert_eq!(state.config.timeout_ms, DEFAULT_TIMEOUT_MS);
+        assert!(state.config.hooks.is_empty());
+    }
+
+    #[test]
+    fn refresh_invalid_json_fails() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join(HOOKS_JSON_FILE), "not json!!!").unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        assert!(manager.refresh_if_changed().is_err());
+    }
+
+    #[test]
+    fn refresh_disabled_flag() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join(HOOKS_JSON_FILE),
+            r#"{"enabled": false, "hooks": {}}"#,
+        )
+        .unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        manager.refresh_if_changed().unwrap();
+        let state = manager.state.read();
+        assert!(!state.config.enabled);
+    }
+
+    // ── run_action edge cases ───────────────────────────────────
+
+    #[tokio::test]
+    async fn run_action_empty_command_fails() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        let action = HookAction {
+            command: "".into(),
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+            timeout_ms: Some(1000),
+            stdin_json: false,
+        };
+        let result = manager
+            .run_action(HookEvent::ToolCall, &json!({}), 1000, &action)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn run_action_success() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        let action = HookAction {
+            command: "true".into(),
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+            timeout_ms: Some(2000),
+            stdin_json: false,
+        };
+        let result = manager
+            .run_action(HookEvent::AgentStart, &json!({"msg": "hi"}), 2000, &action)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_action_failure_exit_code() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        let action = HookAction {
+            command: "false".into(),
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+            timeout_ms: Some(2000),
+            stdin_json: false,
+        };
+        let result = manager
+            .run_action(HookEvent::Error, &json!({}), 2000, &action)
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exited with status"));
+    }
+
+    #[tokio::test]
+    async fn run_action_timeout() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        let action = HookAction {
+            command: "sleep".into(),
+            args: vec!["10".into()],
+            env: HashMap::new(),
+            cwd: None,
+            timeout_ms: Some(100),
+            stdin_json: false,
+        };
+        let result = manager
+            .run_action(HookEvent::ToolCall, &json!({}), 100, &action)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    // ── emit with no hooks ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn emit_no_hooks_does_not_panic() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        manager
+            .emit(HookEvent::AgentStart, json!({"test": true}))
+            .await;
+        // Should not panic even with no hooks.json
     }
 
     #[tokio::test]

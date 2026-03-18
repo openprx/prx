@@ -12,9 +12,9 @@ use crate::auth::profiles::{
 };
 use crate::config::Config;
 use anyhow::Result;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 

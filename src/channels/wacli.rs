@@ -55,7 +55,6 @@ struct RpcRequestNoParams<'a> {
 
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
-    #[allow(dead_code)]
     id: Option<Value>,
     result: Option<Value>,
     error: Option<RpcError>,
@@ -581,5 +580,334 @@ impl Channel for WacliChannel {
             thread: false,
             react: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Config defaults ─────────────────────────────────────────
+
+    #[test]
+    fn default_config_host_and_port() {
+        let cfg = WacliChannelConfig::default();
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 16867);
+        assert_eq!(cfg.allowed_from, vec!["*"]);
+    }
+
+    // ── Channel metadata ────────────────────────────────────────
+
+    #[test]
+    fn channel_name() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        assert_eq!(ch.name(), "wacli");
+    }
+
+    #[test]
+    fn capabilities_no_edit_delete_thread_react() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        let caps = ch.capabilities();
+        assert!(!caps.edit);
+        assert!(!caps.delete);
+        assert!(!caps.thread);
+        assert!(!caps.react);
+    }
+
+    // ── addr formatting ─────────────────────────────────────────
+
+    #[test]
+    fn addr_default() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        assert_eq!(ch.addr(), "127.0.0.1:16867");
+    }
+
+    #[test]
+    fn addr_custom() {
+        let ch = WacliChannel::with_params("10.0.0.1".into(), 9000, vec!["*".into()]);
+        assert_eq!(ch.addr(), "10.0.0.1:9000");
+    }
+
+    // ── is_allowed ──────────────────────────────────────────────
+
+    #[test]
+    fn wildcard_allows_any_sender() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        assert!(ch.is_allowed("12345@s.whatsapp.net"));
+        assert!(ch.is_allowed("anyone"));
+    }
+
+    #[test]
+    fn specific_allowlist_filters() {
+        let ch = WacliChannel::with_params(
+            "127.0.0.1".into(),
+            16867,
+            vec!["alice@s.whatsapp.net".into()],
+        );
+        assert!(ch.is_allowed("alice@s.whatsapp.net"));
+        assert!(!ch.is_allowed("bob@s.whatsapp.net"));
+    }
+
+    #[test]
+    fn empty_allowlist_blocks_all() {
+        let ch = WacliChannel::with_params("127.0.0.1".into(), 16867, vec![]);
+        assert!(!ch.is_allowed("anyone"));
+    }
+
+    // ── parse_response_id ───────────────────────────────────────
+
+    #[test]
+    fn parse_id_from_number() {
+        let id = Some(serde_json::json!(42));
+        assert_eq!(parse_response_id(&id), Some(42));
+    }
+
+    #[test]
+    fn parse_id_from_string() {
+        let id = Some(serde_json::json!("99"));
+        assert_eq!(parse_response_id(&id), Some(99));
+    }
+
+    #[test]
+    fn parse_id_from_null() {
+        let id: Option<Value> = None;
+        assert_eq!(parse_response_id(&id), None);
+    }
+
+    #[test]
+    fn parse_id_from_non_numeric_string() {
+        let id = Some(serde_json::json!("not-a-number"));
+        assert_eq!(parse_response_id(&id), None);
+    }
+
+    // ── next_id monotonic ───────────────────────────────────────
+
+    #[test]
+    fn next_id_increments() {
+        let a = next_id();
+        let b = next_id();
+        assert!(b > a);
+    }
+
+    // ── handle_event ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_event_message_received_produces_channel_message() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let notif = RpcNotification {
+            method: "event".into(),
+            params: Some(serde_json::json!({
+                "type": "message.received",
+                "payload": {
+                    "id": "msg-001",
+                    "senderJid": "12345@s.whatsapp.net",
+                    "chatJid": "12345@s.whatsapp.net",
+                    "text": "hello",
+                    "fromMe": false,
+                    "pushName": "Alice",
+                    "timestamp": "2026-03-17T10:00:00Z"
+                }
+            })),
+        };
+
+        ch.handle_event(notif, &tx).await;
+        let msg = rx.try_recv().expect("test: should receive message");
+        assert_eq!(msg.id, "msg-001");
+        assert_eq!(msg.sender, "12345@s.whatsapp.net");
+        assert_eq!(msg.channel, "wacli");
+        assert!(msg.content.contains("hello"));
+        assert!(msg.content.contains("Alice"));
+    }
+
+    #[tokio::test]
+    async fn handle_event_skips_from_me() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let notif = RpcNotification {
+            method: "event".into(),
+            params: Some(serde_json::json!({
+                "type": "message.received",
+                "payload": {
+                    "senderJid": "me@s.whatsapp.net",
+                    "chatJid": "me@s.whatsapp.net",
+                    "text": "own message",
+                    "fromMe": true
+                }
+            })),
+        };
+
+        ch.handle_event(notif, &tx).await;
+        assert!(rx.try_recv().is_err(), "fromMe messages should be skipped");
+    }
+
+    #[tokio::test]
+    async fn handle_event_skips_non_message_type() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let notif = RpcNotification {
+            method: "event".into(),
+            params: Some(serde_json::json!({
+                "type": "presence.update",
+                "payload": {}
+            })),
+        };
+
+        ch.handle_event(notif, &tx).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_event_skips_empty_text_no_media() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let notif = RpcNotification {
+            method: "event".into(),
+            params: Some(serde_json::json!({
+                "type": "message.received",
+                "payload": {
+                    "senderJid": "12345@s.whatsapp.net",
+                    "chatJid": "12345@s.whatsapp.net",
+                    "text": "",
+                    "fromMe": false
+                }
+            })),
+        };
+
+        ch.handle_event(notif, &tx).await;
+        assert!(rx.try_recv().is_err(), "empty messages should be skipped");
+    }
+
+    #[tokio::test]
+    async fn handle_event_blocked_by_allowlist() {
+        let ch = WacliChannel::with_params(
+            "127.0.0.1".into(),
+            16867,
+            vec!["allowed@s.whatsapp.net".into()],
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let notif = RpcNotification {
+            method: "event".into(),
+            params: Some(serde_json::json!({
+                "type": "message.received",
+                "payload": {
+                    "senderJid": "blocked@s.whatsapp.net",
+                    "chatJid": "blocked@s.whatsapp.net",
+                    "text": "should be blocked",
+                    "fromMe": false
+                }
+            })),
+        };
+
+        ch.handle_event(notif, &tx).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "non-allowlisted sender should be blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_group_message_has_prefix() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let notif = RpcNotification {
+            method: "event".into(),
+            params: Some(serde_json::json!({
+                "type": "message.received",
+                "payload": {
+                    "id": "g1",
+                    "senderJid": "alice@s.whatsapp.net",
+                    "chatJid": "group123@g.us",
+                    "text": "hi group",
+                    "fromMe": false,
+                    "pushName": "Alice",
+                    "groupName": "Dev Team"
+                }
+            })),
+        };
+
+        ch.handle_event(notif, &tx).await;
+        let msg = rx.try_recv().expect("test: group message");
+        assert!(msg.content.contains("[WhatsApp Group: Dev Team]"));
+        assert!(msg.content.contains("Alice"));
+        assert_eq!(msg.reply_target, "group123@g.us");
+    }
+
+    #[tokio::test]
+    async fn handle_event_media_message() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let notif = RpcNotification {
+            method: "event".into(),
+            params: Some(serde_json::json!({
+                "type": "message.received",
+                "payload": {
+                    "id": "m1",
+                    "senderJid": "bob@s.whatsapp.net",
+                    "chatJid": "bob@s.whatsapp.net",
+                    "text": "",
+                    "fromMe": false,
+                    "pushName": "Bob",
+                    "media": {
+                        "type": "image",
+                        "mimeType": "image/jpeg",
+                        "caption": "photo"
+                    }
+                }
+            })),
+        };
+
+        ch.handle_event(notif, &tx).await;
+        let msg = rx.try_recv().expect("test: media message");
+        assert!(msg.content.contains("[image: image/jpeg"));
+        assert!(msg.content.contains("photo"));
+    }
+
+    #[tokio::test]
+    async fn handle_event_mentioned_jids_parsed() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let notif = RpcNotification {
+            method: "event".into(),
+            params: Some(serde_json::json!({
+                "type": "message.received",
+                "payload": {
+                    "id": "m2",
+                    "senderJid": "alice@s.whatsapp.net",
+                    "chatJid": "group@g.us",
+                    "text": "@bot hello",
+                    "fromMe": false,
+                    "pushName": "Alice",
+                    "mentionedJids": ["bot@s.whatsapp.net"]
+                }
+            })),
+        };
+
+        ch.handle_event(notif, &tx).await;
+        let msg = rx.try_recv().expect("test: mentioned message");
+        assert_eq!(msg.mentioned_uuids, vec!["bot@s.whatsapp.net"]);
+    }
+
+    #[tokio::test]
+    async fn handle_event_no_params_does_nothing() {
+        let ch = WacliChannel::new(WacliChannelConfig::default());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let notif = RpcNotification {
+            method: "event".into(),
+            params: None,
+        };
+
+        ch.handle_event(notif, &tx).await;
+        assert!(rx.try_recv().is_err());
     }
 }

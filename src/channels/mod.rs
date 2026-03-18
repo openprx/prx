@@ -76,13 +76,13 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -804,8 +804,7 @@ fn runtime_config_path(ctx: &ChannelRuntimeContext) -> Option<PathBuf> {
 
 fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefaults {
     if let Some(config_path) = runtime_config_path(ctx) {
-        let store = runtime_config_store()
-            .lock();
+        let store = runtime_config_store().lock();
         if let Some(state) = store.get(&config_path) {
             return state.defaults.clone();
         }
@@ -849,8 +848,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     };
 
     {
-        let store = runtime_config_store()
-            .lock();
+        let store = runtime_config_store().lock();
         if let Some(state) = store.get(&config_path) {
             if state.last_applied_stamp == Some(stamp.clone()) {
                 return Ok(());
@@ -886,8 +884,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     }
 
     {
-        let mut store = runtime_config_store()
-            .lock();
+        let mut store = runtime_config_store().lock();
         store.insert(
             config_path.clone(),
             RuntimeConfigState {
@@ -926,9 +923,7 @@ fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> Channel
 
 fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
     let default_route = default_route_selection(ctx);
-    let mut routes = ctx
-        .route_overrides
-        .lock();
+    let mut routes = ctx.route_overrides.lock();
     if next == default_route {
         routes.remove(sender_key);
     } else {
@@ -937,15 +932,11 @@ fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: Chan
 }
 
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
-    ctx.conversation_histories
-        .lock()
-        .remove(sender_key);
+    ctx.conversation_histories.lock().remove(sender_key);
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
-    let mut histories = ctx
-        .conversation_histories
-        .lock();
+    let mut histories = ctx.conversation_histories.lock();
 
     let Some(turns) = histories.get_mut(sender_key) else {
         return false;
@@ -999,9 +990,7 @@ async fn append_sender_turn(
     let role = turn.role.clone();
     let content = turn.content.clone();
     {
-        let mut histories = ctx
-            .conversation_histories
-            .lock();
+        let mut histories = ctx.conversation_histories.lock();
         let turns = histories.entry(sender_key.to_string()).or_default();
         turns.push(turn);
         while turns.len() > MAX_CHANNEL_HISTORY {
@@ -1108,12 +1097,7 @@ async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
 ) -> anyhow::Result<Arc<dyn Provider>> {
-    if let Some(existing) = ctx
-        .provider_cache
-        .lock()
-        .get(provider_name)
-        .cloned()
-    {
+    if let Some(existing) = ctx.provider_cache.lock().get(provider_name).cloned() {
         return Ok(existing);
     }
 
@@ -2415,7 +2399,6 @@ async fn process_channel_message(
                     let compacted_chars = ctx
                         .conversation_histories
                         .lock()
-                        
                         .get(&history_key)
                         .map(|turns| {
                             turns
@@ -2557,13 +2540,20 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, "⚠️ Something went wrong. Please try again later.")
+                        .finalize_draft(
+                            &msg.reply_target,
+                            draft_id,
+                            "⚠️ Something went wrong. Please try again later.",
+                        )
                         .await;
                 } else {
                     let _ = channel
                         .send(
-                            &SendMessage::new("⚠️ Something went wrong. Please try again later.", &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
+                            &SendMessage::new(
+                                "⚠️ Something went wrong. Please try again later.",
+                                &msg.reply_target,
+                            )
+                            .in_thread(msg.thread_ts.clone()),
                         )
                         .await;
                 }
@@ -2597,7 +2587,8 @@ async fn process_channel_message(
         }
         LlmFinalOutcome::ContextOverflowExhausted => {
             if let Some(channel) = target_channel.as_ref() {
-                let error_text = "Session context was too long and has been reset. Please resend your message.";
+                let error_text =
+                    "Session context was too long and has been reset. Please resend your message.";
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
                         .finalize_draft(&msg.reply_target, draft_id, error_text)
@@ -3549,8 +3540,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let initial_stamp = config_file_stamp(&config.config_path).await;
     {
-        let mut store = runtime_config_store()
-            .lock();
+        let mut store = runtime_config_store().lock();
         store.insert(
             config.config_path.clone(),
             RuntimeConfigState {
@@ -4449,9 +4439,7 @@ mod tests {
 
         assert!(compact_sender_history(&ctx, &sender));
 
-        let histories = ctx
-            .conversation_histories
-            .lock();
+        let histories = ctx.conversation_histories.lock();
         let kept = histories
             .get(&sender)
             .expect("sender history should remain");
@@ -5011,9 +4999,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _temperature: f64,
         ) -> anyhow::Result<String> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
-            self.models
-                .lock()
-                .push(model.to_string());
+            self.models.lock().push(model.to_string());
             Ok("ok".to_string())
         }
     }
@@ -5602,10 +5588,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
         assert_eq!(routed_provider_impl.call_count.load(Ordering::SeqCst), 1);
         assert_eq!(
-            routed_provider_impl
-                .models
-                .lock()
-                .as_slice(),
+            routed_provider_impl.models.lock().as_slice(),
             &["route-model".to_string()]
         );
     }
@@ -5704,8 +5687,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let config_path = temp.path().join("config.toml");
 
         {
-            let mut store = runtime_config_store()
-                .lock();
+            let mut store = runtime_config_store().lock();
             store.insert(
                 config_path.clone(),
                 RuntimeConfigState {
@@ -5783,17 +5765,13 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         {
-            let mut store = runtime_config_store()
-                .lock();
+            let mut store = runtime_config_store().lock();
             store.remove(&config_path);
         }
 
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 1);
         assert_eq!(
-            provider_impl
-                .models
-                .lock()
-                .as_slice(),
+            provider_impl.models.lock().as_slice(),
             &["hot-reloaded-model".to_string()]
         );
     }
@@ -6301,9 +6279,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(sent_messages[0].contains("response-2"));
         drop(sent_messages);
 
-        let calls = provider_impl
-            .calls
-            .lock();
+        let calls = provider_impl.calls.lock();
         assert_eq!(calls.len(), 2);
         let second_call = &calls[1];
         assert!(second_call
@@ -6986,9 +6962,7 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        let calls = provider_impl
-            .calls
-            .lock();
+        let calls = provider_impl.calls.lock();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].len(), 2);
         assert_eq!(calls[0][0].0, "system");
@@ -7069,9 +7043,7 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        let calls = provider_impl
-            .calls
-            .lock();
+        let calls = provider_impl.calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
         assert_eq!(calls[0][1].0, "user");
@@ -7079,9 +7051,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(calls[0][1].1.contains("Age is 45"));
         assert!(calls[0][1].1.contains("hello"));
 
-        let histories = runtime_ctx
-            .conversation_histories
-            .lock();
+        let histories = runtime_ctx.conversation_histories.lock();
         let turns = histories
             .get("test-channel_alice")
             .expect("history should be stored for sender");
@@ -7166,9 +7136,7 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        let calls = provider_impl
-            .calls
-            .lock();
+        let calls = provider_impl.calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 4);
 

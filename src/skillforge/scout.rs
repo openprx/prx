@@ -73,7 +73,7 @@ pub struct GitHubScout {
 }
 
 impl GitHubScout {
-    pub fn new(token: Option<String>) -> Self {
+    pub fn new(token: Option<String>) -> anyhow::Result<Self> {
         use std::time::Duration;
 
         let mut headers = reqwest::header::HeaderMap::new();
@@ -95,12 +95,12 @@ impl GitHubScout {
             .default_headers(headers)
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("failed to build reqwest client");
+            .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {e}"))?;
 
-        Self {
+        Ok(Self {
             client,
             queries: vec!["openprx skill".into(), "ai agent skill".into()],
-        }
+        })
     }
 
     /// Override the default search queries.

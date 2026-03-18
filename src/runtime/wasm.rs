@@ -155,9 +155,23 @@ impl WasmRuntime {
             );
         }
 
+        // Canonicalize to resolve symlinks and verify the module is inside tools_dir.
+        let canonical_module = module_path
+            .canonicalize()
+            .with_context(|| format!("Failed to resolve WASM module path: {}", module_path.display()))?;
+        let canonical_tools = tools_path
+            .canonicalize()
+            .with_context(|| format!("Failed to resolve tools dir: {}", tools_path.display()))?;
+        if !canonical_module.starts_with(&canonical_tools) {
+            bail!(
+                "WASM module '{}' resolved outside tools directory (symlink escape blocked)",
+                module_name
+            );
+        }
+
         // Read module bytes
-        let wasm_bytes = std::fs::read(&module_path)
-            .with_context(|| format!("Failed to read WASM module: {}", module_path.display()))?;
+        let wasm_bytes = std::fs::read(&canonical_module)
+            .with_context(|| format!("Failed to read WASM module: {}", canonical_module.display()))?;
 
         // Validate module size (sanity check)
         if wasm_bytes.len() > 50 * 1024 * 1024 {

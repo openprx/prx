@@ -472,10 +472,13 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     ]
 });
 
-static EMAIL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b").expect("compile regex: email address pattern"));
-static IPV4_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").expect("compile regex: IPv4 address pattern"));
+static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+        .expect("compile regex: email address pattern")
+});
+static IPV4_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").expect("compile regex: IPv4 address pattern")
+});
 
 #[cfg(test)]
 mod tests {

@@ -5,7 +5,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 use uuid::Uuid;
 
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
@@ -233,7 +233,11 @@ impl Channel for QQChannel {
         let gw_url = self.get_gateway_url(&token).await?;
 
         tracing::info!("QQ: connecting to gateway WebSocket...");
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&gw_url).await?;
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(2 * 1024 * 1024);
+        ws_config.max_frame_size = Some(1024 * 1024);
+        let (ws_stream, _) =
+            tokio_tungstenite::connect_async_with_config(&gw_url, Some(ws_config), false).await?;
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)

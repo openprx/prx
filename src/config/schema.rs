@@ -1265,7 +1265,6 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
     prices
 }
 
-
 // ── Gateway security ─────────────────────────────────────────────
 
 /// Gateway server configuration (`[gateway]` section).

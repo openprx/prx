@@ -4,10 +4,12 @@ use crate::config::AuditConfig;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use uuid::Uuid;
 
 /// Audit event types
@@ -196,11 +198,15 @@ impl AuditLogger {
     }
 
     /// Log a command execution event.
+    ///
+    /// The command string is redacted to remove common secret patterns
+    /// (tokens, passwords, API keys) before writing to the audit log.
     pub fn log_command_event(&self, entry: CommandExecutionLog<'_>) -> Result<()> {
+        let redacted_command = redact_secrets(entry.command);
         let event = AuditEvent::new(AuditEventType::CommandExecution)
             .with_actor(entry.channel.to_string(), None, None)
             .with_action(
-                entry.command.to_string(),
+                redacted_command,
                 entry.risk_level.to_string(),
                 entry.approved,
                 entry.allowed,
@@ -256,6 +262,30 @@ impl AuditLogger {
         std::fs::rename(&self.log_path, &rotated)?;
         Ok(())
     }
+}
+
+/// Redact common secret patterns from a command string before audit logging.
+///
+/// Replaces values that look like API keys, tokens, passwords, and credential
+/// URLs with `[REDACTED]` to prevent accidental secret exposure in logs.
+fn redact_secrets(command: &str) -> String {
+    static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+        vec![
+            // key=value and key:value patterns for known secret names
+            Regex::new(r"(?i)((?:token|key|secret|password|passwd|api[_-]?key|auth)\s*[=:]\s*)\S+")
+                .expect("BUG: invalid hardcoded secret-value regex"),
+            // Bearer tokens in headers / arguments
+            Regex::new(r"(?i)(Bearer\s+)\S+").expect("BUG: invalid hardcoded bearer regex"),
+            // URLs with embedded credentials  (user:pass@host)
+            Regex::new(r"(https?://)[^\s@]+@").expect("BUG: invalid hardcoded cred-url regex"),
+        ]
+    });
+
+    let mut result = command.to_string();
+    for re in SECRET_PATTERNS.iter() {
+        result = re.replace_all(&result, "${1}[REDACTED]").to_string();
+    }
+    result
 }
 
 #[cfg(test)]
