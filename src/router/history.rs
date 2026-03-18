@@ -69,6 +69,11 @@ impl RouterHistory {
             .unwrap_or(0.0)
     }
 
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> &KnnStore {
+        &self.store
+    }
+
     pub async fn similarity_scores(&self, message: &str) -> HashMap<String, f32> {
         let record_count = match self.store.count().await {
             Ok(count) => count,
@@ -109,5 +114,83 @@ impl RouterHistory {
         }
 
         scores
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::embeddings::EmbeddingProvider;
+    use crate::memory::none::NoneMemory;
+    use async_trait::async_trait;
+
+    /// Mock embedder that returns a fixed unit vector for any input.
+    struct FixedEmbedder;
+
+    #[async_trait]
+    impl EmbeddingProvider for FixedEmbedder {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+        fn dimensions(&self) -> usize {
+            3
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+        }
+    }
+
+    fn make_history() -> RouterHistory {
+        let memory = Arc::new(NoneMemory);
+        let store = KnnStore::new(memory).unwrap();
+        RouterHistory::new(
+            store,
+            Arc::new(FixedEmbedder),
+            DEFAULT_KNN_K,
+            MIN_RECORDS_FOR_KNN,
+        )
+    }
+
+    #[test]
+    fn new_clamps_k_to_at_least_one() {
+        let memory = Arc::new(NoneMemory);
+        let store = KnnStore::new(memory).unwrap();
+        let history = RouterHistory::new(store, Arc::new(FixedEmbedder), 0, 0);
+        assert_eq!(history.knn_k, 1);
+    }
+
+    #[test]
+    fn new_clamps_min_records() {
+        let memory = Arc::new(NoneMemory);
+        let store = KnnStore::new(memory).unwrap();
+        let history = RouterHistory::new(store, Arc::new(FixedEmbedder), 5, 0);
+        assert!(history.knn_min_records >= MIN_RECORDS_FOR_KNN);
+    }
+
+    #[tokio::test]
+    async fn record_query_does_not_panic() {
+        let history = make_history();
+        let result = history.record_query("test message", "gpt-4", true).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn similarity_score_empty_store_returns_zero() {
+        let history = make_history();
+        let score = history.similarity_score("hello", "gpt-4").await;
+        assert!((score - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn similarity_scores_empty_store_returns_empty_map() {
+        let history = make_history();
+        let scores = history.similarity_scores("hello").await;
+        assert!(scores.is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_timeout_is_applied() {
+        let history = make_history().with_timeout(Duration::from_secs(5));
+        assert_eq!(history.query_timeout, Duration::from_secs(5));
     }
 }

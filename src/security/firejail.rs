@@ -49,15 +49,16 @@ impl Sandbox for FirejailSandbox {
         // Build firejail wrapper with security flags
         let mut firejail_cmd = Command::new("firejail");
         firejail_cmd.args([
-            "--private=home", // New home directory
-            "--private-dev",  // Minimal /dev
-            "--nosound",      // No audio
-            "--no3d",         // No 3D acceleration
-            "--novideo",      // No video devices
-            "--nowheel",      // No input devices
-            "--notv",         // No TV devices
-            "--noprofile",    // Skip profile loading
-            "--quiet",        // Suppress warnings
+            "--private",     // Isolate home directory (blocks host home access)
+            "--private-dev", // Minimal /dev
+            "--private-tmp", // Isolated /tmp
+            "--nosound",     // No audio
+            "--no3d",        // No 3D acceleration
+            "--novideo",     // No video devices
+            "--nowheel",     // No input devices
+            "--notv",        // No TV devices
+            "--noprofile",   // Skip profile loading
+            "--quiet",       // Suppress warnings
         ]);
 
         // Add the original command
@@ -147,8 +148,9 @@ mod tests {
             .collect();
 
         let expected_flags = [
-            "--private=home",
+            "--private",
             "--private-dev",
+            "--private-tmp",
             "--nosound",
             "--no3d",
             "--novideo",

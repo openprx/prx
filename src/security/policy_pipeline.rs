@@ -204,8 +204,20 @@ impl PolicyPipeline {
 /// "allow" and "supervised" both permit execution (supervised signals that extra care
 /// is advised, but the tool is not blocked at the pipeline level).
 /// "deny" blocks the tool.
+/// Unrecognized values are treated as "deny" and logged, to prevent typos from
+/// silently allowing dangerous tools.
 fn policy_str_to_bool(policy: &str) -> bool {
-    !matches!(policy.trim().to_ascii_lowercase().as_str(), "deny")
+    match policy.trim().to_ascii_lowercase().as_str() {
+        "allow" | "supervised" | "yes" | "true" => true,
+        "deny" | "no" | "false" => false,
+        other => {
+            tracing::warn!(
+                policy = other,
+                "unrecognized policy value (treated as deny); expected allow/deny/supervised"
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]

@@ -769,6 +769,8 @@ mod tests {
     use super::*;
     use crate::config::McpServerConfig;
 
+    // ── tool_allowed rules ────────────────────────────────────
+
     #[test]
     fn tool_allow_deny_rules() {
         let mut cfg = McpServerConfig {
@@ -782,6 +784,27 @@ mod tests {
         cfg.deny_tools = vec!["blocked".into()];
         assert!(!McpTool::tool_allowed(&cfg, "blocked"));
     }
+
+    #[test]
+    fn tool_allowed_empty_lists_allows_all() {
+        let cfg = McpServerConfig::default();
+        assert!(McpTool::tool_allowed(&cfg, "anything"));
+    }
+
+    #[test]
+    fn tool_allowed_deny_takes_priority() {
+        let cfg = McpServerConfig {
+            allow_tools: vec!["tool1".into()],
+            deny_tools: vec!["tool1".into()],
+            ..McpServerConfig::default()
+        };
+        assert!(
+            !McpTool::tool_allowed(&cfg, "tool1"),
+            "deny should override allow"
+        );
+    }
+
+    // ── convert_json_server ─────────────────────────────────────
 
     #[test]
     fn convert_json_server_defaults_transport_from_url() {
@@ -805,6 +828,48 @@ mod tests {
     }
 
     #[test]
+    fn convert_json_server_defaults_to_stdio_when_command_present() {
+        let server = McpJsonServer {
+            enabled: Some(true),
+            transport: None,
+            command: Some("my-tool".into()),
+            args: vec!["--serve".into()],
+            url: None,
+            env: HashMap::new(),
+            startup_timeout_ms: None,
+            request_timeout_ms: None,
+            tool_name_prefix: None,
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
+        };
+        let out = McpTool::convert_json_server(server);
+        assert_eq!(out.transport, McpTransport::Stdio);
+        assert_eq!(out.command.as_deref(), Some("my-tool"));
+        assert_eq!(out.args, vec!["--serve"]);
+    }
+
+    #[test]
+    fn convert_json_server_disabled_flag() {
+        let server = McpJsonServer {
+            enabled: Some(false),
+            transport: None,
+            command: Some("x".into()),
+            args: Vec::new(),
+            url: None,
+            env: HashMap::new(),
+            startup_timeout_ms: None,
+            request_timeout_ms: None,
+            tool_name_prefix: None,
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
+        };
+        let out = McpTool::convert_json_server(server);
+        assert!(!out.enabled);
+    }
+
+    // ── parse_alias_name ────────────────────────────────────────
+
+    #[test]
     fn parse_alias_name_resolves_server_and_tool() {
         let mut cfg = McpConfig::default();
         cfg.enabled = true;
@@ -818,5 +883,189 @@ mod tests {
 
         let parsed = McpTool::parse_alias_name(&cfg, "mcp__qmd__search");
         assert_eq!(parsed, Some(("qmd".into(), "search".into())));
+    }
+
+    #[test]
+    fn parse_alias_name_no_match() {
+        let cfg = McpConfig::default();
+        assert!(McpTool::parse_alias_name(&cfg, "unrelated_name").is_none());
+    }
+
+    #[test]
+    fn parse_alias_name_default_prefix() {
+        let mut cfg = McpConfig::default();
+        cfg.enabled = true;
+        cfg.servers.insert(
+            "myserver".into(),
+            McpServerConfig {
+                tool_name_prefix: "mcp".into(),
+                ..McpServerConfig::default()
+            },
+        );
+        let parsed = McpTool::parse_alias_name(&cfg, "mcp__myserver__run_query");
+        assert_eq!(parsed, Some(("myserver".into(), "run_query".into())));
+    }
+
+    // ── alias_name ──────────────────────────────────────────────
+
+    #[test]
+    fn alias_name_format() {
+        assert_eq!(
+            McpTool::alias_name("mcp", "server1", "search"),
+            "mcp__server1__search"
+        );
+    }
+
+    // ── extract_call_success_and_output ──────────────────────────
+
+    #[test]
+    fn extract_call_success_text_content() {
+        let value = json!({
+            "content": [{"type": "text", "text": "hello world"}]
+        });
+        let (success, output) = McpTool::extract_call_success_and_output(&value);
+        assert!(success);
+        assert_eq!(output, "hello world");
+    }
+
+    #[test]
+    fn extract_call_error_flag() {
+        let value = json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "error msg"}]
+        });
+        let (success, output) = McpTool::extract_call_success_and_output(&value);
+        assert!(!success);
+        assert_eq!(output, "error msg");
+    }
+
+    #[test]
+    fn extract_call_is_error_snake_case() {
+        let value = json!({
+            "is_error": true,
+            "content": []
+        });
+        let (success, _) = McpTool::extract_call_success_and_output(&value);
+        assert!(!success);
+    }
+
+    #[test]
+    fn extract_call_empty_content_falls_back_to_json() {
+        let value = json!({"data": 42});
+        let (success, output) = McpTool::extract_call_success_and_output(&value);
+        assert!(success);
+        assert!(output.contains("42"));
+    }
+
+    #[test]
+    fn extract_call_multiple_text_items_joined() {
+        let value = json!({
+            "content": [
+                {"type": "text", "text": "line1"},
+                {"type": "text", "text": "line2"}
+            ]
+        });
+        let (_, output) = McpTool::extract_call_success_and_output(&value);
+        assert!(output.contains("line1"));
+        assert!(output.contains("line2"));
+    }
+
+    // ── McpTool metadata ────────────────────────────────────────
+
+    #[test]
+    fn mcp_tool_name() {
+        let tool = McpTool::new(
+            Arc::new(SecurityPolicy::default()),
+            McpConfig::default(),
+            std::env::temp_dir(),
+        );
+        assert_eq!(tool.name(), MCP_ROOT_NAME);
+    }
+
+    #[test]
+    fn mcp_tool_description_non_empty() {
+        let tool = McpTool::new(
+            Arc::new(SecurityPolicy::default()),
+            McpConfig::default(),
+            std::env::temp_dir(),
+        );
+        assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn mcp_tool_schema_requires_server_and_tool() {
+        let tool = McpTool::new(
+            Arc::new(SecurityPolicy::default()),
+            McpConfig::default(),
+            std::env::temp_dir(),
+        );
+        let schema = tool.parameters_schema();
+        let required = schema["required"].as_array().expect("test: required");
+        assert!(required.iter().any(|v| v == "server"));
+        assert!(required.iter().any(|v| v == "tool"));
+    }
+
+    // ── list_discovered_tools ───────────────────────────────────
+
+    #[test]
+    fn list_discovered_tools_empty_initially() {
+        let tool = McpTool::new(
+            Arc::new(SecurityPolicy::default()),
+            McpConfig::default(),
+            std::env::temp_dir(),
+        );
+        let tools = tool.list_discovered_tools();
+        assert!(tools.is_empty());
+    }
+
+    // ── Security: read-only ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn readonly_blocks_execute() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::ReadOnly,
+            max_actions_per_hour: 1000,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = McpTool::new(security, McpConfig::default(), std::env::temp_dir());
+        let result = tool
+            .execute(json!({"server": "s", "tool": "t"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
+    }
+
+    // ── MCP disabled ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mcp_disabled_returns_error() {
+        let mut cfg = McpConfig::default();
+        cfg.enabled = false;
+        let tool = McpTool::new(
+            Arc::new(SecurityPolicy::default()),
+            cfg,
+            std::env::temp_dir(),
+        );
+        let result = tool
+            .execute(json!({"server": "s", "tool": "t"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("disabled")
+                || result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains("not found")
+        );
     }
 }

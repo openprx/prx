@@ -310,13 +310,276 @@ impl Tool for NodesTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_shared, Config};
+    use crate::config::{new_shared, Config, RemoteNodeConfig};
+    use crate::security::AutonomyLevel;
 
     fn make_tool() -> NodesTool {
         let config = new_shared(Config::default());
         let security = Arc::new(SecurityPolicy::default());
         NodesTool::new(config, security)
     }
+
+    fn make_tool_with_nodes(nodes: Vec<RemoteNodeConfig>, level: AutonomyLevel) -> NodesTool {
+        let mut config = Config::default();
+        config.nodes.nodes = nodes;
+        let security = Arc::new(SecurityPolicy {
+            autonomy: level,
+            max_actions_per_hour: 1000,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        NodesTool::new(new_shared(config), security)
+    }
+
+    fn test_node(id: &str) -> RemoteNodeConfig {
+        RemoteNodeConfig {
+            id: id.to_string(),
+            endpoint: format!("http://127.0.0.1:8787"),
+            bearer_token: "test-token".to_string(),
+            hmac_secret: None,
+            enabled: true,
+            timeout_ms: None,
+            retry_max: None,
+        }
+    }
+
+    // ── Metadata ────────────────────────────────────────────────
+
+    #[test]
+    fn tool_name() {
+        assert_eq!(make_tool().name(), "nodes");
+    }
+
+    #[test]
+    fn tool_description_non_empty() {
+        assert!(!make_tool().description().is_empty());
+    }
+
+    #[test]
+    fn tool_schema_requires_action() {
+        let schema = make_tool().parameters_schema();
+        let required = schema["required"].as_array().expect("test: required");
+        assert!(required.iter().any(|v| v == "action"));
+    }
+
+    #[test]
+    fn tool_schema_has_six_actions() {
+        let schema = make_tool().parameters_schema();
+        let actions = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("test: action enum");
+        assert_eq!(actions.len(), 6);
+    }
+
+    // ── require_string_arg ──────────────────────────────────────
+
+    #[test]
+    fn require_string_arg_valid() {
+        let args = json!({"key": "value"});
+        assert_eq!(
+            NodesTool::require_string_arg(&args, "key").unwrap(),
+            "value"
+        );
+    }
+
+    #[test]
+    fn require_string_arg_missing() {
+        let args = json!({});
+        assert!(NodesTool::require_string_arg(&args, "key").is_err());
+    }
+
+    #[test]
+    fn require_string_arg_empty() {
+        let args = json!({"key": ""});
+        assert!(NodesTool::require_string_arg(&args, "key").is_err());
+    }
+
+    #[test]
+    fn require_string_arg_whitespace_only() {
+        let args = json!({"key": "   "});
+        assert!(NodesTool::require_string_arg(&args, "key").is_err());
+    }
+
+    #[test]
+    fn require_string_arg_non_string() {
+        let args = json!({"key": 42});
+        assert!(NodesTool::require_string_arg(&args, "key").is_err());
+    }
+
+    // ── optional_u64_arg ────────────────────────────────────────
+
+    #[test]
+    fn optional_u64_missing_is_none() {
+        let args = json!({});
+        assert_eq!(NodesTool::optional_u64_arg(&args, "x").unwrap(), None);
+    }
+
+    #[test]
+    fn optional_u64_valid() {
+        let args = json!({"x": 42});
+        assert_eq!(NodesTool::optional_u64_arg(&args, "x").unwrap(), Some(42));
+    }
+
+    #[test]
+    fn optional_u64_string_is_error() {
+        let args = json!({"x": "bad"});
+        assert!(NodesTool::optional_u64_arg(&args, "x").is_err());
+    }
+
+    // ── optional_bool_arg ───────────────────────────────────────
+
+    #[test]
+    fn optional_bool_missing_is_none() {
+        let args = json!({});
+        assert_eq!(NodesTool::optional_bool_arg(&args, "x").unwrap(), None);
+    }
+
+    #[test]
+    fn optional_bool_valid() {
+        let args = json!({"x": true});
+        assert_eq!(
+            NodesTool::optional_bool_arg(&args, "x").unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn optional_bool_string_is_error() {
+        let args = json!({"x": "yes"});
+        assert!(NodesTool::optional_bool_arg(&args, "x").is_err());
+    }
+
+    // ── resolve_node ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_node_found() {
+        let nodes = vec![test_node("n1"), test_node("n2")];
+        assert!(NodesTool::resolve_node(&nodes, "n1").is_some());
+        assert_eq!(NodesTool::resolve_node(&nodes, "n1").unwrap().id, "n1");
+    }
+
+    #[test]
+    fn resolve_node_not_found() {
+        let nodes = vec![test_node("n1")];
+        assert!(NodesTool::resolve_node(&nodes, "n99").is_none());
+    }
+
+    #[test]
+    fn resolve_node_empty_list() {
+        let nodes: Vec<RemoteNodeConfig> = vec![];
+        assert!(NodesTool::resolve_node(&nodes, "n1").is_none());
+    }
+
+    // ── list action ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_empty_nodes() {
+        let tool = make_tool_with_nodes(vec![], AutonomyLevel::Full);
+        let result = tool.execute(json!({"action": "list"})).await.unwrap();
+        assert!(result.success);
+        let out: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["count"], 0);
+        assert_eq!(out["nodes"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_with_nodes() {
+        let tool =
+            make_tool_with_nodes(vec![test_node("n1"), test_node("n2")], AutonomyLevel::Full);
+        let result = tool.execute(json!({"action": "list"})).await.unwrap();
+        assert!(result.success);
+        let out: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn list_filters_disabled_nodes() {
+        let mut disabled = test_node("disabled");
+        disabled.enabled = false;
+        let tool = make_tool_with_nodes(vec![test_node("active"), disabled], AutonomyLevel::Full);
+        let result = tool.execute(json!({"action": "list"})).await.unwrap();
+        let out: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["nodes"][0]["id"], "active");
+    }
+
+    // ── Security: read-only blocks mutations ────────────────────
+
+    #[tokio::test]
+    async fn readonly_blocks_exec() {
+        let tool = make_tool_with_nodes(vec![test_node("n1")], AutonomyLevel::ReadOnly);
+        let result = tool
+            .execute(json!({"action": "exec", "node": "n1", "command": "ls"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_write() {
+        let tool = make_tool_with_nodes(vec![test_node("n1")], AutonomyLevel::ReadOnly);
+        let result = tool
+            .execute(json!({"action": "write", "node": "n1", "path": "/f", "content": "x"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_cancel() {
+        let tool = make_tool_with_nodes(vec![test_node("n1")], AutonomyLevel::ReadOnly);
+        let result = tool
+            .execute(json!({"action": "cancel", "node": "n1", "task_id": "t1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+    }
+
+    // ── Unknown action ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unknown_action_fails() {
+        let tool = make_tool();
+        let err = tool
+            .execute(json!({"action": "destroy"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Unknown action"));
+    }
+
+    // ── Missing action ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn missing_action_fails() {
+        let tool = make_tool();
+        let err = tool.execute(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("action"));
+    }
+
+    // ── Node not found ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn status_unknown_node_fails() {
+        let tool = make_tool_with_nodes(vec![], AutonomyLevel::Full);
+        let err = tool
+            .execute(json!({"action": "status", "node": "x"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn read_unknown_node_fails() {
+        let tool = make_tool_with_nodes(vec![], AutonomyLevel::Full);
+        let err = tool
+            .execute(json!({"action": "read", "node": "x", "path": "/f"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    // ── Existing param type tests (kept) ────────────────────────
 
     #[tokio::test]
     async fn exec_rejects_non_string_command_param() {
@@ -349,5 +612,21 @@ mod tests {
         assert!(error
             .to_string()
             .contains("'offset' must be an unsigned integer"));
+    }
+
+    #[tokio::test]
+    async fn write_rejects_non_bool_create_dirs() {
+        let tool = make_tool_with_nodes(vec![test_node("n1")], AutonomyLevel::Full);
+        let err = tool
+            .execute(json!({
+                "action": "write",
+                "node": "n1",
+                "path": "/f",
+                "content": "x",
+                "create_dirs": "yes"
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must be a boolean"));
     }
 }

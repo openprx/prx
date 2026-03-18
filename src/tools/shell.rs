@@ -151,6 +151,16 @@ impl Tool for ShellTool {
                 cmd.env(var, val);
             }
         }
+        // Override PATH with a safe default to prevent execution of binaries from
+        // untrusted directories.  The inherited PATH may include user-writable dirs.
+        if cfg!(target_os = "windows") {
+            cmd.env(
+                "PATH",
+                r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem",
+            );
+        } else {
+            cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+        }
 
         let result =
             tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
@@ -529,5 +539,56 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("ACL-protected memory path"));
+    }
+
+    // ── PATH override verification ──────────────────────────────
+
+    #[tokio::test]
+    async fn shell_overrides_path_with_safe_default() {
+        // Execute 'echo $PATH' and verify it uses the hardcoded safe PATH
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime(), false);
+        let result = tool
+            .execute(json!({"command": "echo $PATH"}))
+            .await
+            .expect("test: should execute");
+        assert!(result.success, "echo PATH should succeed");
+        let path_output = result.output.trim();
+        // The safe PATH should contain /usr/bin and /bin
+        assert!(
+            path_output.contains("/usr/bin") && path_output.contains("/bin"),
+            "PATH should use safe defaults, got: {path_output}"
+        );
+        // Should NOT contain user-specific paths like .cargo/bin or node_modules
+        assert!(
+            !path_output.contains(".cargo"),
+            "safe PATH should not contain .cargo"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_env_does_not_leak_api_keys() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime(), false);
+        // Try to read an env var that should NOT be passed through
+        let result = tool
+            .execute(json!({"command": "echo ${OPENPRX_API_KEY:-unset}"}))
+            .await
+            .expect("test: should execute");
+        assert!(result.success);
+        assert_eq!(
+            result.output.trim(),
+            "unset",
+            "API keys should not be in child env"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_fast_command_succeeds() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime(), false);
+        let result = tool
+            .execute(json!({"command": "echo done"}))
+            .await
+            .expect("test: should execute");
+        assert!(result.success);
+        assert_eq!(result.output.trim(), "done");
     }
 }

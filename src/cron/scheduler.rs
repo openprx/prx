@@ -353,7 +353,18 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+async fn deliver_if_configured(config: &Config, job: &CronJob, raw_output: &str) -> Result<()> {
+    // Cap delivery output to prevent OOM on large command stdout.
+    const MAX_DELIVERY_BYTES: usize = 4096;
+    let output: &str = if raw_output.len() > MAX_DELIVERY_BYTES {
+        let mut end = MAX_DELIVERY_BYTES;
+        while end > 0 && !raw_output.is_char_boundary(end) {
+            end -= 1;
+        }
+        &raw_output[..end]
+    } else {
+        raw_output
+    };
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());

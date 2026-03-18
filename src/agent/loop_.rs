@@ -114,8 +114,10 @@ static SENSITIVE_LOG_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     .expect("compile regex: sensitive log key-value pattern")
 });
 
-static SENSITIVE_BEARER_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}"#).expect("compile regex: bearer token pattern"));
+static SENSITIVE_BEARER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}"#)
+        .expect("compile regex: bearer token pattern")
+});
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
@@ -419,7 +421,15 @@ async fn apply_configurable_compaction(
                 .await
                 .unwrap_or_else(|_| "Summary unavailable; compacted conservatively.".to_string());
             // Validate: require at least 3 of the expected ## headers.
-            let required_headers = ["## Decisions", "## Open TODOs", "## Constraints", "## Pending", "## Exact", "## Progress", "## Critical Context"];
+            let required_headers = [
+                "## Decisions",
+                "## Open TODOs",
+                "## Constraints",
+                "## Pending",
+                "## Exact",
+                "## Progress",
+                "## Critical Context",
+            ];
             let found_count = required_headers.iter().filter(|h| raw.contains(*h)).count();
             let validated = if found_count < 3 {
                 tracing::warn!(
@@ -1097,10 +1107,10 @@ fn parse_recipient_tool_calls(recipient: &str, body: &str) -> Vec<ParsedToolCall
 
 fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
     static CODEX_TO_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)^\s*(?:assistant\s+)?to=([a-zA-Z0-9_.-]+)\s+code\s*$"#).expect("compile regex: codex to=recipient header")
+        Regex::new(r#"(?i)^\s*(?:assistant\s+)?to=([a-zA-Z0-9_.-]+)\s+code\s*$"#)
+            .expect("compile regex: codex to=recipient header")
     });
 
-    let mut found_header = false;
     let mut calls = Vec::new();
     let mut text_parts = Vec::new();
     let mut plain_text = String::new();
@@ -1117,7 +1127,6 @@ fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) 
 
     for line in text.lines() {
         if let Some(cap) = CODEX_TO_HEADER_RE.captures(line) {
-            found_header = true;
             flush_current(&mut current_recipient, &mut current_body, &mut calls);
             current_recipient = cap.get(1).map(|m| m.as_str().to_string());
             continue;
@@ -1141,9 +1150,7 @@ fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) 
         if !plain_text.trim().is_empty() {
             text_parts.push(plain_text.trim().to_string());
         }
-    } else if !found_header && !text.trim().is_empty() {
-        text_parts.push(text.trim().to_string());
-    } else if found_header {
+    } else if !text.trim().is_empty() {
         text_parts.push(text.trim().to_string());
     }
 
@@ -1151,10 +1158,13 @@ fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) 
 }
 
 fn parse_assistant_recipient_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
-    static ASSISTANT_RECIPIENT_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#).expect("compile regex: assistant XML tag pattern"));
+    static ASSISTANT_RECIPIENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#)
+            .expect("compile regex: assistant XML tag pattern")
+    });
     static RECIPIENT_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)\brecipient\s*=\s*["']?([a-zA-Z0-9_.-]+)["']?"#).expect("compile regex: recipient attribute pattern")
+        Regex::new(r#"(?i)\brecipient\s*=\s*["']?([a-zA-Z0-9_.-]+)["']?"#)
+            .expect("compile regex: recipient attribute pattern")
     });
 
     let mut calls = Vec::new();
@@ -2485,7 +2495,9 @@ pub(crate) async fn run_tool_call_loop(
         // P0-1: On context overflow, run compaction and retry (up to MAX_OVERFLOW_RETRIES).
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
             match chat_processed {
-                Err(ref e) if is_context_overflow_error(e) && overflow_retries < MAX_OVERFLOW_RETRIES => {
+                Err(ref e)
+                    if is_context_overflow_error(e) && overflow_retries < MAX_OVERFLOW_RETRIES =>
+                {
                     overflow_retries += 1;
                     tracing::warn!(
                         attempt = overflow_retries,
@@ -2502,7 +2514,9 @@ pub(crate) async fn run_tool_call_loop(
                             Ok(Ok(_)) => {}
                             Ok(Err(e)) => tracing::warn!("Overflow retry compaction failed: {e}"),
                             Err(_) => {
-                                tracing::warn!("Overflow retry compaction timed out, applying aggressive trim");
+                                tracing::warn!(
+                                    "Overflow retry compaction timed out, applying aggressive trim"
+                                );
                                 apply_aggressive_trim(history, config.keep_recent_messages);
                             }
                         }
@@ -2624,7 +2638,8 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
                 // P0-2: Also truncate native tool result content.
-                let truncated_result = truncate_tool_result_if_needed(result, MAX_TOOL_RESULT_CHARS);
+                let truncated_result =
+                    truncate_tool_result_if_needed(result, MAX_TOOL_RESULT_CHARS);
                 let tool_msg = serde_json::json!({
                     "tool_call_id": native_call.id,
                     "content": truncated_result,
@@ -2636,8 +2651,9 @@ pub(crate) async fn run_tool_call_loop(
         // P1-4: Token-aware mid-turn trim (primary) + count-based safety net (secondary).
         if let Some(config) = compaction_config {
             let mid_turn_tokens = estimate_history_tokens(history);
-            let mid_turn_limit =
-                config.max_context_tokens.saturating_sub(config.reserve_tokens);
+            let mid_turn_limit = config
+                .max_context_tokens
+                .saturating_sub(config.reserve_tokens);
             if mid_turn_tokens > mid_turn_limit {
                 tracing::warn!(
                     mid_turn_tokens,
@@ -2738,7 +2754,7 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -2752,7 +2768,6 @@ pub async fn run(
         config.api_key.as_deref(),
         &config,
     );
-
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -3258,7 +3273,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,

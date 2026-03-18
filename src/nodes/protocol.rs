@@ -191,10 +191,140 @@ pub struct MetricsResult {
 mod tests {
     use super::*;
 
+    // ── JsonRpcRequest ──────────────────────────────────────────
+
     #[test]
-    fn jsonrpc_success_contains_result() {
+    fn request_new_sets_version() {
+        let req = JsonRpcRequest::new("1".into(), "ping", serde_json::json!({}));
+        assert_eq!(req.jsonrpc, "2.0");
+        assert_eq!(req.method, "ping");
+        assert_eq!(req.id, "1");
+    }
+
+    #[test]
+    fn request_serializes_to_json() {
+        let req = JsonRpcRequest::new("42".into(), "exec", serde_json::json!({"cmd": "ls"}));
+        let json = serde_json::to_value(&req).expect("test: serialize");
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["method"], "exec");
+        assert_eq!(json["params"]["cmd"], "ls");
+    }
+
+    #[test]
+    fn request_roundtrip() {
+        let req = JsonRpcRequest::new(
+            "5".into(),
+            "read",
+            serde_json::json!({"path": "/etc/hosts"}),
+        );
+        let json_str = serde_json::to_string(&req).expect("test: ser");
+        let restored: JsonRpcRequest = serde_json::from_str(&json_str).expect("test: deser");
+        assert_eq!(restored.id, "5");
+        assert_eq!(restored.method, "read");
+    }
+
+    // ── JsonRpcResponse ─────────────────────────────────────────
+
+    #[test]
+    fn response_success_contains_result() {
         let response = JsonRpcResponse::success("id1".into(), serde_json::json!({"ok": true}));
         assert!(response.error.is_none());
-        assert_eq!(response.result.unwrap()["ok"], true);
+        assert_eq!(response.result.expect("test: result")["ok"], true);
+    }
+
+    #[test]
+    fn response_failure_contains_error() {
+        let response = JsonRpcResponse::failure("id2".into(), -32600, "invalid request");
+        assert!(response.result.is_none());
+        let err = response.error.expect("test: error");
+        assert_eq!(err.code, -32600);
+        assert_eq!(err.message, "invalid request");
+    }
+
+    #[test]
+    fn response_success_omits_error_in_json() {
+        let response = JsonRpcResponse::success("1".into(), serde_json::json!(null));
+        let json = serde_json::to_value(&response).expect("test: ser");
+        assert!(json.get("error").is_none());
+    }
+
+    #[test]
+    fn response_failure_omits_result_in_json() {
+        let response = JsonRpcResponse::failure("1".into(), -1, "err");
+        let json = serde_json::to_value(&response).expect("test: ser");
+        assert!(json.get("result").is_none());
+    }
+
+    // ── Params/Result roundtrips ────────────────────────────────
+
+    #[test]
+    fn exec_shell_params_roundtrip() {
+        let params = ExecShellParams {
+            cmd: "ls -la".into(),
+            timeout_ms: Some(5000),
+            cwd: Some("/tmp".into()),
+            env: None,
+            async_exec: None,
+            callback_url: None,
+        };
+        let json = serde_json::to_string(&params).expect("test: ser");
+        let restored: ExecShellParams = serde_json::from_str(&json).expect("test: deser");
+        assert_eq!(restored.cmd, "ls -la");
+        assert_eq!(restored.timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn exec_shell_result_roundtrip() {
+        let result = ExecShellResult {
+            task_id: "t1".into(),
+            exit_code: Some(0),
+            stdout: "hello".into(),
+            stderr: String::new(),
+            duration_ms: 42,
+            timed_out: false,
+            cancelled: false,
+        };
+        let json = serde_json::to_string(&result).expect("test: ser");
+        let restored: ExecShellResult = serde_json::from_str(&json).expect("test: deser");
+        assert_eq!(restored.task_id, "t1");
+        assert!(!restored.timed_out);
+    }
+
+    #[test]
+    fn read_file_result_roundtrip() {
+        let result = ReadFileResult {
+            path: "/etc/hosts".into(),
+            content: "127.0.0.1 localhost".into(),
+            bytes_read: 19,
+            offset: 0,
+            eof: true,
+        };
+        let json = serde_json::to_string(&result).expect("test: ser");
+        let restored: ReadFileResult = serde_json::from_str(&json).expect("test: deser");
+        assert!(restored.eof);
+        assert_eq!(restored.bytes_read, 19);
+    }
+
+    #[test]
+    fn write_file_result_roundtrip() {
+        let result = WriteFileResult {
+            path: "/tmp/test.txt".into(),
+            bytes_written: 5,
+            created_dirs: true,
+        };
+        let json = serde_json::to_string(&result).expect("test: ser");
+        let restored: WriteFileResult = serde_json::from_str(&json).expect("test: deser");
+        assert!(restored.created_dirs);
+    }
+
+    #[test]
+    fn ping_result_roundtrip() {
+        let result = PingResult {
+            message: "pong".into(),
+            timestamp: Utc::now(),
+        };
+        let json = serde_json::to_string(&result).expect("test: ser");
+        let restored: PingResult = serde_json::from_str(&json).expect("test: deser");
+        assert_eq!(restored.message, "pong");
     }
 }

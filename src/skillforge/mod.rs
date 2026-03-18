@@ -140,7 +140,13 @@ impl SkillForge {
             let source: ScoutSource = src.parse().unwrap_or(ScoutSource::GitHub);
             match source {
                 ScoutSource::GitHub => {
-                    let scout = GitHubScout::new(self.config.github_token.clone());
+                    let scout = match GitHubScout::new(self.config.github_token.clone()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("failed to create GitHub scout: {e}");
+                            continue;
+                        }
+                    };
                     match scout.discover().await {
                         Ok(mut found) => {
                             info!(count = found.len(), "GitHub scout returned candidates");

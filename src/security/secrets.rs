@@ -190,14 +190,16 @@ impl SecretStore {
             }
             #[cfg(windows)]
             {
-                // On Windows, use icacls to restrict permissions to current user only
+                // On Windows, use icacls to restrict permissions to current user only.
+                // If permissions cannot be set, delete the key file and fail hard —
+                // a world-readable secret key is worse than no key.
                 let username = std::env::var("USERNAME").unwrap_or_default();
                 let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
-                    tracing::warn!(
-                        "USERNAME environment variable is empty; \
-                         cannot restrict key file permissions via icacls"
+                    let _ = std::fs::remove_file(&self.key_path);
+                    anyhow::bail!(
+                        "Cannot restrict secret key file permissions: USERNAME environment \
+                         variable is empty.  Set USERNAME and try again."
                     );
-                    return Ok(key);
                 };
 
                 match std::process::Command::new("icacls")
@@ -207,13 +209,19 @@ impl SecretStore {
                     .output()
                 {
                     Ok(o) if !o.status.success() => {
-                        tracing::warn!(
-                            "Failed to set key file permissions via icacls (exit code {:?})",
+                        let _ = std::fs::remove_file(&self.key_path);
+                        anyhow::bail!(
+                            "Failed to restrict secret key file permissions via icacls \
+                             (exit code {:?}).  Key file removed for safety.",
                             o.status.code()
                         );
                     }
                     Err(e) => {
-                        tracing::warn!("Could not set key file permissions: {e}");
+                        let _ = std::fs::remove_file(&self.key_path);
+                        anyhow::bail!(
+                            "Could not run icacls to set key file permissions: {e}.  \
+                             Key file removed for safety."
+                        );
                     }
                     _ => {
                         tracing::debug!("Key file permissions restricted via icacls");

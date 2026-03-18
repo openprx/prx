@@ -5,11 +5,11 @@ use crate::channels::traits::{
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::StreamExt;
+use parking_lot::Mutex;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -567,7 +567,7 @@ impl SignalChannel {
     fn http_client(&self) -> Client {
         let builder = Client::builder().connect_timeout(Duration::from_secs(10));
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "channel.signal");
-        builder.build().expect("Signal HTTP client should build")
+        builder.build().unwrap_or_else(|_| Client::new())
     }
 
     /// Effective sender: prefer `sourceNumber` (E.164), fall back to `source`.
@@ -1450,16 +1450,12 @@ impl SignalChannel {
     }
 
     fn guard_check_breaker(&self, key: &str, now: Instant) -> bool {
-        let mut guard = self
-            .storm_guard
-            .lock();
+        let mut guard = self.storm_guard.lock();
         guard.is_breaker_open(key, now)
     }
 
     fn guard_record_non_user_and_maybe_trip(&self, key: &str, now: Instant) -> bool {
-        let mut guard = self
-            .storm_guard
-            .lock();
+        let mut guard = self.storm_guard.lock();
         guard.record_non_user_event(key, now)
     }
 
@@ -1470,9 +1466,7 @@ impl SignalChannel {
         now: Instant,
         is_group_message: bool,
     ) -> UserEventGuardDecision {
-        let mut guard = self
-            .storm_guard
-            .lock();
+        let mut guard = self.storm_guard.lock();
 
         if guard.is_breaker_open(key, now) {
             return UserEventGuardDecision::BreakerOpen;

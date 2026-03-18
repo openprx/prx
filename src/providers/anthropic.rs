@@ -6,9 +6,9 @@ use crate::providers::traits::{
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use parking_lot::Mutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use parking_lot::Mutex;
 
 /// OAuth state for Claude Code token auto-refresh.
 struct OAuthState {
@@ -213,9 +213,7 @@ impl AnthropicProvider {
     /// Returns a fresh credential, refreshing the OAuth token if needed.
     /// For plain API keys (no refresh_token), returns the credential as-is.
     fn ensure_fresh_credential(&self) -> anyhow::Result<String> {
-        let mut state = self
-            .oauth
-            .lock();
+        let mut state = self.oauth.lock();
 
         // If no refresh_token, this is a plain API key — just return it.
         if state.refresh_token.is_none() {
@@ -280,9 +278,7 @@ impl AnthropicProvider {
     /// Try to refresh the token after a 401 response. Returns Ok(new_credential) if
     /// refresh succeeded, Err if no refresh possible (plain API key or no refresh_token).
     fn try_refresh_after_401(&self) -> anyhow::Result<String> {
-        let mut state = self
-            .oauth
-            .lock();
+        let mut state = self.oauth.lock();
 
         let refresh_token = state
             .refresh_token

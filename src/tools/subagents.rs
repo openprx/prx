@@ -339,4 +339,234 @@ mod tests {
         assert!(result.success);
         assert_eq!(rx.try_recv().unwrap(), "pivot");
     }
+
+    // ── Metadata ────────────────────────────────────────────────
+
+    #[test]
+    fn description_non_empty() {
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
+        assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn schema_has_action_enum() {
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
+        let schema = tool.parameters_schema();
+        let actions = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("test: action enum");
+        assert_eq!(actions.len(), 3);
+    }
+
+    // ── list with runs ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_with_runs_shows_count() {
+        let runs = vec![
+            make_run("r1", SubAgentStatus::Running),
+            make_run("r2", SubAgentStatus::Completed("done".into())),
+        ];
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
+        let result = tool.execute(json!({"action": "list"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("2 shown"));
+    }
+
+    #[tokio::test]
+    async fn list_filter_running() {
+        let runs = vec![
+            make_run("r1", SubAgentStatus::Running),
+            make_run("r2", SubAgentStatus::Completed("done".into())),
+            make_run("r3", SubAgentStatus::Failed("err".into())),
+        ];
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
+        let result = tool
+            .execute(json!({"action": "list", "status": "running"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("1 shown"));
+        assert!(result.output.contains("r1"));
+    }
+
+    #[tokio::test]
+    async fn list_filter_completed() {
+        let runs = vec![
+            make_run("r1", SubAgentStatus::Running),
+            make_run("r2", SubAgentStatus::Completed("done".into())),
+        ];
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
+        let result = tool
+            .execute(json!({"action": "list", "status": "completed"}))
+            .await
+            .unwrap();
+        assert!(result.output.contains("r2"));
+        assert!(!result.output.contains("r1"));
+    }
+
+    #[tokio::test]
+    async fn list_respects_limit() {
+        let runs = vec![
+            make_run("r1", SubAgentStatus::Running),
+            make_run("r2", SubAgentStatus::Running),
+            make_run("r3", SubAgentStatus::Running),
+        ];
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
+        let result = tool
+            .execute(json!({"action": "list", "limit": 2}))
+            .await
+            .unwrap();
+        assert!(result.output.contains("2 shown"));
+    }
+
+    // ── default action (no action param) → list ─────────────────
+
+    #[tokio::test]
+    async fn default_action_is_list() {
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("No subagents"));
+    }
+
+    // ── kill edge cases ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn kill_nonexistent_fails() {
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
+        let result = tool
+            .execute(json!({"action": "kill", "run_id": "ghost"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("ghost"));
+    }
+
+    #[tokio::test]
+    async fn kill_completed_fails() {
+        let runs = vec![make_run("r1", SubAgentStatus::Completed("ok".into()))];
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
+        let result = tool
+            .execute(json!({"action": "kill", "run_id": "r1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("completed"));
+    }
+
+    #[tokio::test]
+    async fn kill_failed_fails() {
+        let runs = vec![make_run("r1", SubAgentStatus::Failed("err".into()))];
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
+        let result = tool
+            .execute(json!({"action": "kill", "run_id": "r1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("failed"));
+    }
+
+    #[tokio::test]
+    async fn kill_missing_run_id_errors() {
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
+        let err = tool.execute(json!({"action": "kill"})).await.unwrap_err();
+        assert!(err.to_string().contains("run_id"));
+    }
+
+    // ── steer edge cases ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn steer_nonexistent_fails() {
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
+        let result = tool
+            .execute(json!({"action": "steer", "run_id": "x", "message": "hi"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn steer_completed_fails() {
+        let runs = vec![make_run("r1", SubAgentStatus::Completed("ok".into()))];
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
+        let result = tool
+            .execute(json!({"action": "steer", "run_id": "r1", "message": "hi"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("completed"));
+    }
+
+    #[tokio::test]
+    async fn steer_running_no_tx_fails() {
+        // steer_tx is None
+        let runs = vec![make_run("r1", SubAgentStatus::Running)];
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
+        let result = tool
+            .execute(json!({"action": "steer", "run_id": "r1", "message": "hi"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("cannot be steered"));
+    }
+
+    #[tokio::test]
+    async fn steer_missing_message_errors() {
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
+        let err = tool
+            .execute(json!({"action": "steer", "run_id": "r1"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("message"));
+    }
+
+    #[tokio::test]
+    async fn steer_missing_run_id_errors() {
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
+        let err = tool
+            .execute(json!({"action": "steer", "message": "hi"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("run_id"));
+    }
+
+    // ── unknown action ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unknown_action_fails() {
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
+        let result = tool.execute(json!({"action": "nuke"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Unsupported"));
+    }
+
+    // ── Output formatting ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn completed_run_shows_preview_with_ellipsis() {
+        let long_msg = "a".repeat(100);
+        let runs = vec![make_run("r1", SubAgentStatus::Completed(long_msg))];
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
+        let result = tool.execute(json!({"action": "list"})).await.unwrap();
+        assert!(
+            result.output.contains("…"),
+            "long messages should be truncated with ellipsis"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_run_shows_error_reason() {
+        let runs = vec![make_run("r1", SubAgentStatus::Failed("oom".into()))];
+        let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
+        let result = tool.execute(json!({"action": "list"})).await.unwrap();
+        assert!(result.output.contains("failed: oom"));
+    }
 }

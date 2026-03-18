@@ -174,3 +174,142 @@ pub(crate) fn weighted_model_score(neighbors: &[(String, f32)], model_id: &str) 
 
     (model_weight / total_weight).clamp(0.0, 1.0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::none::NoneMemory;
+
+    // ── weighted_model_score ────────────────────────────────────
+
+    #[test]
+    fn weighted_score_single_model() {
+        let neighbors = vec![("gpt-4".to_string(), 0.1)];
+        let score = weighted_model_score(&neighbors, "gpt-4");
+        assert!((score - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn weighted_score_absent_model() {
+        let neighbors = vec![("gpt-4".to_string(), 0.1)];
+        let score = weighted_model_score(&neighbors, "claude-3");
+        assert!((score - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn weighted_score_two_models_equal_distance() {
+        let neighbors = vec![("gpt-4".to_string(), 0.5), ("claude-3".to_string(), 0.5)];
+        let gpt_score = weighted_model_score(&neighbors, "gpt-4");
+        let claude_score = weighted_model_score(&neighbors, "claude-3");
+        assert!((gpt_score - 0.5).abs() < 0.01);
+        assert!((claude_score - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn weighted_score_closer_model_wins() {
+        let neighbors = vec![
+            ("gpt-4".to_string(), 0.1),    // close → high weight
+            ("claude-3".to_string(), 1.0), // far → low weight
+        ];
+        let gpt_score = weighted_model_score(&neighbors, "gpt-4");
+        assert!(
+            gpt_score > 0.5,
+            "closer model should have higher score: {gpt_score}"
+        );
+    }
+
+    #[test]
+    fn weighted_score_empty_neighbors() {
+        let score = weighted_model_score(&[], "gpt-4");
+        assert!((score - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn weighted_score_zero_distance_uses_epsilon() {
+        let neighbors = vec![("gpt-4".to_string(), 0.0)];
+        let score = weighted_model_score(&neighbors, "gpt-4");
+        // distance clamped to MIN_DISTANCE_EPSILON → still valid
+        assert!((score - 1.0).abs() < 0.01);
+    }
+
+    // ── KnnStore::majority_vote ─────────────────────────────────
+
+    #[test]
+    fn majority_vote_single_winner() {
+        let store = KnnStore::new(Arc::new(NoneMemory)).unwrap();
+        let neighbors = vec![
+            ("gpt-4".to_string(), 0.1),
+            ("gpt-4".to_string(), 0.2),
+            ("claude-3".to_string(), 0.5),
+        ];
+        let (winner, confidence) = store.majority_vote(&neighbors).unwrap();
+        assert_eq!(winner, "gpt-4");
+        assert!(confidence > 0.5);
+    }
+
+    #[test]
+    fn majority_vote_empty() {
+        let store = KnnStore::new(Arc::new(NoneMemory)).unwrap();
+        assert!(store.majority_vote(&[]).is_none());
+    }
+
+    #[test]
+    fn majority_vote_tie_resolved_by_distance() {
+        let store = KnnStore::new(Arc::new(NoneMemory)).unwrap();
+        let neighbors = vec![
+            ("gpt-4".to_string(), 0.1),    // 1/0.1 = 10
+            ("claude-3".to_string(), 0.5), // 1/0.5 = 2
+        ];
+        let (winner, _) = store.majority_vote(&neighbors).unwrap();
+        assert_eq!(winner, "gpt-4", "closer model wins the tie");
+    }
+
+    // ── KnnStore with NoneMemory ────────────────────────────────
+
+    #[tokio::test]
+    async fn store_count_empty() {
+        let store = KnnStore::new(Arc::new(NoneMemory)).unwrap();
+        assert_eq!(store.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn store_search_empty_returns_empty() {
+        let store = KnnStore::new(Arc::new(NoneMemory)).unwrap();
+        let results = store.search(&[1.0, 0.0, 0.0], 5).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_insert_does_not_panic() {
+        let store = KnnStore::new(Arc::new(NoneMemory)).unwrap();
+        let result = store
+            .insert(QueryRecord {
+                query_id: "q1".to_string(),
+                embedding: vec![1.0, 0.0],
+                chosen_model_id: "gpt-4".to_string(),
+                success: true,
+                timestamp: 1000,
+            })
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // ── StoredQueryRecord roundtrip ─────────────────────────────
+
+    #[test]
+    fn stored_record_roundtrip() {
+        let original = QueryRecord {
+            query_id: "q42".to_string(),
+            embedding: vec![0.1, 0.2, 0.3],
+            chosen_model_id: "claude-3".to_string(),
+            success: true,
+            timestamp: 12345,
+        };
+        let stored = StoredQueryRecord::from_record(original.clone());
+        let restored = stored.into_record().expect("test: roundtrip");
+        assert_eq!(restored.query_id, "q42");
+        assert_eq!(restored.chosen_model_id, "claude-3");
+        assert_eq!(restored.embedding.len(), 3);
+        assert!((restored.embedding[0] - 0.1).abs() < 0.001);
+    }
+}

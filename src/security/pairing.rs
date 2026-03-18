@@ -159,19 +159,32 @@ impl PairingGuard {
         // TODO: make this function the main one without spawning a task
         let handle = tokio::task::spawn_blocking(move || this.try_pair_blocking(&code, &client_id));
 
-        handle
-            .await
-            .expect("failed to spawn blocking task this should not happen")
+        match handle.await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("blocking pairing task panicked: {e}");
+                Err(0)
+            }
+        }
     }
 
     /// Check if a bearer token is valid (compares against stored hashes).
+    ///
+    /// Uses constant-time comparison across all stored hashes to prevent
+    /// timing attacks that could leak information about valid token prefixes.
     pub fn is_authenticated(&self, token: &str) -> bool {
         if !self.require_pairing {
             return true;
         }
         let hashed = hash_token(token);
         let tokens = self.paired_tokens.lock();
-        tokens.contains(&hashed)
+        let mut found = false;
+        for stored in tokens.iter() {
+            // constant_time_eq does NOT short-circuit — always iterates all bytes.
+            // We bitwise-OR into `found` to avoid short-circuiting across hashes.
+            found |= constant_time_eq(&hashed, stored);
+        }
+        found
     }
 
     /// Returns true if the gateway is already paired (has at least one token).

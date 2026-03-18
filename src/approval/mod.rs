@@ -116,10 +116,19 @@ impl ApprovalManager {
         decision: ApprovalResponse,
         channel: &str,
     ) {
-        // If "Always", add to session allowlist.
+        // If "Always", add to session allowlist (capped to prevent unbounded growth).
         if decision == ApprovalResponse::Always {
+            const MAX_ALLOWLIST_SIZE: usize = 100;
             let mut allowlist = self.session_allowlist.lock();
-            allowlist.insert(tool_name.to_string());
+            if allowlist.len() < MAX_ALLOWLIST_SIZE {
+                allowlist.insert(tool_name.to_string());
+            } else {
+                tracing::warn!(
+                    tool = tool_name,
+                    "session approval allowlist is full ({MAX_ALLOWLIST_SIZE}); \
+                     tool will require per-use approval"
+                );
+            }
         }
 
         // Append to audit log.

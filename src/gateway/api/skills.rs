@@ -105,7 +105,15 @@ pub async fn discover_skills(
             let _config = state.config.lock().clone();
             // Try to get github token from env or config
             let token = std::env::var("GITHUB_TOKEN").ok();
-            let mut scout = GitHubScout::new(token);
+            let mut scout = match GitHubScout::new(token) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    ))
+                }
+            };
             if let Some(ref q) = params.query {
                 scout.set_queries(vec![q.clone()]);
             }

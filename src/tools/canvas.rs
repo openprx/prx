@@ -1,8 +1,8 @@
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
-use serde_json::{json, Value};
 use parking_lot::Mutex;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 #[derive(Debug, Default)]
@@ -250,5 +250,344 @@ impl Tool for CanvasTool {
                 )),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::security::AutonomyLevel;
+
+    fn test_security(level: AutonomyLevel, max_actions: u32) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: level,
+            max_actions_per_hour: max_actions,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn canvas(level: AutonomyLevel) -> CanvasTool {
+        CanvasTool::new(test_security(level, 1000))
+    }
+
+    // ── Metadata ────────────────────────────────────────────────
+
+    #[test]
+    fn tool_name() {
+        assert_eq!(canvas(AutonomyLevel::Full).name(), "canvas");
+    }
+
+    #[test]
+    fn tool_description_is_non_empty() {
+        assert!(!canvas(AutonomyLevel::Full).description().is_empty());
+    }
+
+    #[test]
+    fn tool_schema_requires_action() {
+        let schema = canvas(AutonomyLevel::Full).parameters_schema();
+        let required = schema["required"].as_array().expect("test: required array");
+        assert!(required.iter().any(|v| v == "action"));
+    }
+
+    // ── parse_action validation ─────────────────────────────────
+
+    #[test]
+    fn parse_action_missing() {
+        let args = json!({});
+        let err = CanvasTool::parse_action(&args).unwrap_err();
+        assert!(!err.success);
+        assert!(err.error.as_deref().unwrap_or("").contains("action"));
+    }
+
+    #[test]
+    fn parse_action_empty_string() {
+        let args = json!({"action": ""});
+        let err = CanvasTool::parse_action(&args).unwrap_err();
+        assert!(err.error.as_deref().unwrap_or("").contains("action"));
+    }
+
+    #[test]
+    fn parse_action_whitespace_only() {
+        let args = json!({"action": "   "});
+        let err = CanvasTool::parse_action(&args).unwrap_err();
+        assert!(err.error.is_some());
+    }
+
+    #[test]
+    fn parse_action_valid() {
+        let args = json!({"action": "present"});
+        assert_eq!(CanvasTool::parse_action(&args).unwrap(), "present");
+    }
+
+    #[test]
+    fn parse_action_trims_whitespace() {
+        let args = json!({"action": "  hide  "});
+        assert_eq!(CanvasTool::parse_action(&args).unwrap(), "hide");
+    }
+
+    // ── Security: read-only blocks mutations ────────────────────
+
+    #[tokio::test]
+    async fn readonly_blocks_present() {
+        let tool = canvas(AutonomyLevel::ReadOnly);
+        let result = tool
+            .execute(json!({"action": "present", "content": "hi"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_hide() {
+        let tool = canvas(AutonomyLevel::ReadOnly);
+        let result = tool.execute(json!({"action": "hide"})).await.unwrap();
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_navigate() {
+        let tool = canvas(AutonomyLevel::ReadOnly);
+        let result = tool
+            .execute(json!({"action": "navigate", "url": "https://x.com"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_eval() {
+        let tool = canvas(AutonomyLevel::ReadOnly);
+        let result = tool
+            .execute(json!({"action": "eval", "script": "1+1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn readonly_allows_snapshot() {
+        let tool = canvas(AutonomyLevel::ReadOnly);
+        let result = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        assert!(result.success);
+    }
+
+    // ── Security: rate limiting ─────────────────────────────────
+
+    #[tokio::test]
+    async fn rate_limit_blocks_after_exhaustion() {
+        let tool = CanvasTool::new(test_security(AutonomyLevel::Full, 1));
+        // First call consumes the budget
+        let r1 = tool
+            .execute(json!({"action": "present", "content": "a"}))
+            .await
+            .unwrap();
+        assert!(r1.success);
+        // Second call blocked by rate limit
+        let r2 = tool
+            .execute(json!({"action": "present", "content": "b"}))
+            .await
+            .unwrap();
+        assert!(!r2.success);
+        assert!(r2.error.as_deref().unwrap_or("").contains("rate limit"));
+    }
+
+    // ── Action: present ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn present_sets_visible_and_content() {
+        let tool = canvas(AutonomyLevel::Full);
+        let result = tool
+            .execute(json!({"action": "present", "content": "Hello World"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let out: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["action"], "present");
+        assert_eq!(out["visible"], true);
+        assert_eq!(out["content"], "Hello World");
+    }
+
+    #[tokio::test]
+    async fn present_without_content_uses_empty_default() {
+        let tool = canvas(AutonomyLevel::Full);
+        let result = tool.execute(json!({"action": "present"})).await.unwrap();
+        assert!(result.success);
+        let out: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["content"], "");
+    }
+
+    // ── Action: hide ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hide_clears_visible() {
+        let tool = canvas(AutonomyLevel::Full);
+        let _ = tool
+            .execute(json!({"action": "present", "content": "x"}))
+            .await;
+        let result = tool.execute(json!({"action": "hide"})).await.unwrap();
+        assert!(result.success);
+        let out: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["visible"], false);
+    }
+
+    // ── Action: navigate ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn navigate_sets_url_and_visible() {
+        let tool = canvas(AutonomyLevel::Full);
+        let result = tool
+            .execute(json!({"action": "navigate", "url": "https://example.com"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let out: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["current_url"], "https://example.com");
+        assert_eq!(out["visible"], true);
+    }
+
+    #[tokio::test]
+    async fn navigate_missing_url_fails() {
+        let tool = canvas(AutonomyLevel::Full);
+        let result = tool.execute(json!({"action": "navigate"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("url"));
+    }
+
+    #[tokio::test]
+    async fn navigate_empty_url_fails() {
+        let tool = canvas(AutonomyLevel::Full);
+        let result = tool
+            .execute(json!({"action": "navigate", "url": ""}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("url"));
+    }
+
+    #[tokio::test]
+    async fn navigate_whitespace_url_fails() {
+        let tool = canvas(AutonomyLevel::Full);
+        let result = tool
+            .execute(json!({"action": "navigate", "url": "   "}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+    }
+
+    // ── Action: eval ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn eval_returns_stub_result() {
+        let tool = canvas(AutonomyLevel::Full);
+        let result = tool
+            .execute(json!({"action": "eval", "script": "document.title"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let out: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["action"], "eval");
+        assert!(out["result"]["value"]
+            .as_str()
+            .unwrap_or("")
+            .contains("14 characters"));
+    }
+
+    #[tokio::test]
+    async fn eval_missing_script_fails() {
+        let tool = canvas(AutonomyLevel::Full);
+        let result = tool.execute(json!({"action": "eval"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("script"));
+    }
+
+    #[tokio::test]
+    async fn eval_empty_script_fails() {
+        let tool = canvas(AutonomyLevel::Full);
+        let result = tool
+            .execute(json!({"action": "eval", "script": ""}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+    }
+
+    // ── Action: snapshot ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn snapshot_returns_full_state() {
+        let tool = canvas(AutonomyLevel::Full);
+        let _ = tool
+            .execute(json!({"action": "present", "content": "snap-test"}))
+            .await;
+        let _ = tool
+            .execute(json!({"action": "navigate", "url": "https://x.com"}))
+            .await;
+
+        let result = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        assert!(result.success);
+        let out: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["action"], "snapshot");
+        assert_eq!(out["visible"], true);
+        assert_eq!(out["content"], "snap-test");
+        assert_eq!(out["current_url"], "https://x.com");
+        assert!(out["snapshot_id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("canvas-snapshot-"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_version_increments() {
+        let tool = canvas(AutonomyLevel::Full);
+        let r1 = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        let r2 = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        let o1: Value = serde_json::from_str(&r1.output).unwrap();
+        let o2: Value = serde_json::from_str(&r2.output).unwrap();
+        assert_eq!(o1["snapshot_id"], "canvas-snapshot-1");
+        assert_eq!(o2["snapshot_id"], "canvas-snapshot-2");
+    }
+
+    // ── Unknown action ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unknown_action_fails() {
+        let tool = canvas(AutonomyLevel::Full);
+        let result = tool.execute(json!({"action": "destroy"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Unsupported"));
+    }
+
+    // ── State continuity across actions ─────────────────────────
+
+    #[tokio::test]
+    async fn present_then_hide_then_snapshot_tracks_state() {
+        let tool = canvas(AutonomyLevel::Full);
+        let _ = tool
+            .execute(json!({"action": "present", "content": "hello"}))
+            .await;
+        let _ = tool.execute(json!({"action": "hide"})).await;
+
+        let result = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        let out: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["visible"], false);
+        assert_eq!(out["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn eval_then_snapshot_captures_eval_result() {
+        let tool = canvas(AutonomyLevel::Full);
+        let _ = tool
+            .execute(json!({"action": "eval", "script": "test()"}))
+            .await;
+
+        let result = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        let out: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["last_eval_script"], "test()");
+        assert!(out["last_eval_result"].is_object());
     }
 }

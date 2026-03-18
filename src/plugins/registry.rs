@@ -50,9 +50,17 @@ impl LoadedPlugin {
         source_dir: std::path::PathBuf,
         component: Option<wasmtime::component::Component>,
     ) -> Self {
-        // Auto-grant all required permissions in P2
-        // (full approval flow deferred to P3).
+        // TODO(P3): implement interactive approval flow for plugin permissions.
+        // Currently all required permissions are auto-granted, which means a
+        // malicious plugin manifest can claim any permission without user consent.
         let granted = manifest.permissions.required.clone();
+        if !granted.is_empty() {
+            tracing::warn!(
+                plugin = %manifest.plugin.name,
+                permissions = ?granted,
+                "auto-granting all required plugin permissions (approval flow not yet implemented)"
+            );
+        }
         Self {
             manifest,
             status: PluginStatus::Active,

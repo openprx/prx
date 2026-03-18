@@ -422,7 +422,13 @@ impl Agent {
                 config.router.clone(),
                 provider_name.to_string(),
                 config.model_routes.clone(),
-                builder.memory.as_ref().expect("memory set").clone(),
+                builder
+                    .memory
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("memory backend must be set before enabling router")
+                    })?
+                    .clone(),
                 Some(router_embedder),
             ))?;
             builder = builder.router(router);
@@ -808,7 +814,7 @@ impl Agent {
             // The previous hard-cap of 3 silently ignored higher configured values.
             super::classifier::TaskIntent::Simple => self.config.max_tool_iterations.clamp(1, 5),
             super::classifier::TaskIntent::Stream => self.config.max_tool_iterations.max(1),
-            super::classifier::TaskIntent::Delegate => unreachable!(),
+            super::classifier::TaskIntent::Delegate => self.config.max_tool_iterations.max(1),
         };
 
         for _ in 0..max_tool_iterations {

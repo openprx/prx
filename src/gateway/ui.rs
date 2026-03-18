@@ -30,12 +30,7 @@ pub async fn index_handler() -> Response {
 }
 
 pub async fn asset_handler(Path(path): Path<String>) -> Response {
-    if path.is_empty()
-        || path.contains('\\')
-        || path
-            .split('/')
-            .any(|segment| segment == ".." || segment.is_empty())
-    {
+    if !is_safe_asset_path(&path) {
         return not_found();
     }
 
@@ -44,12 +39,7 @@ pub async fn asset_handler(Path(path): Path<String>) -> Response {
 }
 
 pub async fn app_asset_handler(Path(path): Path<String>) -> Response {
-    if path.is_empty()
-        || path.contains('\\')
-        || path
-            .split('/')
-            .any(|segment| segment == ".." || segment.is_empty())
-    {
+    if !is_safe_asset_path(&path) {
         return not_found();
     }
 
@@ -92,6 +82,16 @@ fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "Not Found").into_response()
 }
 
+/// Check if a path is safe for embedded asset serving.
+/// Returns `false` for paths containing traversal, backslash, or empty segments.
+fn is_safe_asset_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && !path
+            .split('/')
+            .any(|segment| segment == ".." || segment.is_empty())
+}
+
 fn content_type(path: &str) -> &'static str {
     if path.ends_with(".html") {
         "text/html; charset=utf-8"
@@ -123,5 +123,103 @@ fn content_type(path: &str) -> &'static str {
         "application/json"
     } else {
         "application/octet-stream"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── is_safe_asset_path ──────────────────────────────────────
+
+    #[test]
+    fn safe_path_normal() {
+        assert!(is_safe_asset_path("style.css"));
+        assert!(is_safe_asset_path("js/app.mjs"));
+        assert!(is_safe_asset_path("img/logo.png"));
+    }
+
+    #[test]
+    fn safe_path_rejects_empty() {
+        assert!(!is_safe_asset_path(""));
+    }
+
+    #[test]
+    fn safe_path_rejects_dotdot() {
+        assert!(!is_safe_asset_path(".."));
+        assert!(!is_safe_asset_path("../etc/passwd"));
+        assert!(!is_safe_asset_path("js/../../../etc/shadow"));
+        assert!(!is_safe_asset_path("foo/bar/../../baz"));
+    }
+
+    #[test]
+    fn safe_path_rejects_backslash() {
+        assert!(!is_safe_asset_path("js\\app.js"));
+        assert!(!is_safe_asset_path("..\\..\\etc\\passwd"));
+    }
+
+    #[test]
+    fn safe_path_rejects_empty_segment() {
+        assert!(!is_safe_asset_path("js//app.js"));
+        assert!(!is_safe_asset_path("/leading"));
+    }
+
+    #[test]
+    fn safe_path_allows_dots_in_filenames() {
+        assert!(is_safe_asset_path("app.min.js"));
+        assert!(is_safe_asset_path("data.v2.json"));
+        assert!(is_safe_asset_path(".hidden")); // single-dot is fine (not "..")
+    }
+
+    // ── content_type ────────────────────────────────────────────
+
+    #[test]
+    fn content_type_html() {
+        assert_eq!(content_type("index.html"), "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn content_type_js() {
+        assert_eq!(content_type("app.js"), "text/javascript; charset=utf-8");
+        assert_eq!(content_type("chunk.mjs"), "text/javascript; charset=utf-8");
+    }
+
+    #[test]
+    fn content_type_css() {
+        assert_eq!(content_type("style.css"), "text/css; charset=utf-8");
+    }
+
+    #[test]
+    fn content_type_json() {
+        assert_eq!(content_type("data.json"), "application/json");
+    }
+
+    #[test]
+    fn content_type_images() {
+        assert_eq!(content_type("logo.svg"), "image/svg+xml");
+        assert_eq!(content_type("photo.png"), "image/png");
+        assert_eq!(content_type("photo.jpg"), "image/jpeg");
+        assert_eq!(content_type("photo.jpeg"), "image/jpeg");
+        assert_eq!(content_type("anim.gif"), "image/gif");
+        assert_eq!(content_type("img.webp"), "image/webp");
+        assert_eq!(content_type("favicon.ico"), "image/x-icon");
+    }
+
+    #[test]
+    fn content_type_fonts() {
+        assert_eq!(content_type("font.woff2"), "font/woff2");
+        assert_eq!(content_type("font.woff"), "font/woff");
+        assert_eq!(content_type("font.ttf"), "font/ttf");
+    }
+
+    #[test]
+    fn content_type_sourcemap() {
+        assert_eq!(content_type("app.js.map"), "application/json");
+    }
+
+    #[test]
+    fn content_type_unknown_fallback() {
+        assert_eq!(content_type("binary.dat"), "application/octet-stream");
+        assert_eq!(content_type("noext"), "application/octet-stream");
     }
 }

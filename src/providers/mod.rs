@@ -1429,12 +1429,10 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if moonshot_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Moonshot",
-            moonshot_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::Bearer,
-        ))),
+        name if moonshot_base_url(name).is_some() => {
+            let url = moonshot_base_url(name).ok_or_else(|| anyhow::anyhow!("moonshot URL resolved to None"))?;
+            Ok(Box::new(OpenAiCompatibleProvider::new("Moonshot", url, key, AuthStyle::Bearer)))
+        }
         "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
             OpenAiCompatibleProvider::new_with_user_agent(
                 "Kimi Code",
@@ -1450,28 +1448,18 @@ fn create_provider_with_url_and_options(
         "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer,
         ))),
-        name if zai_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Z.AI",
-            zai_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::Bearer,
-        ))),
-        name if glm_base_url(name).is_some() => {
-            Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
-                "GLM",
-                glm_base_url(name).expect("checked in guard"),
-                key,
-                AuthStyle::Bearer,
-            )))
+        name if zai_base_url(name).is_some() => {
+            let url = zai_base_url(name).ok_or_else(|| anyhow::anyhow!("Z.AI URL resolved to None"))?;
+            Ok(Box::new(OpenAiCompatibleProvider::new("Z.AI", url, key, AuthStyle::Bearer)))
         }
-        name if minimax_base_url(name).is_some() => Ok(Box::new(
-            OpenAiCompatibleProvider::new_merge_system_into_user(
-                "MiniMax",
-                minimax_base_url(name).expect("checked in guard"),
-                key,
-                AuthStyle::Bearer,
-            )
-        )),
+        name if glm_base_url(name).is_some() => {
+            let url = glm_base_url(name).ok_or_else(|| anyhow::anyhow!("GLM URL resolved to None"))?;
+            Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback("GLM", url, key, AuthStyle::Bearer)))
+        }
+        name if minimax_base_url(name).is_some() => {
+            let url = minimax_base_url(name).ok_or_else(|| anyhow::anyhow!("MiniMax URL resolved to None"))?;
+            Ok(Box::new(OpenAiCompatibleProvider::new_merge_system_into_user("MiniMax", url, key, AuthStyle::Bearer)))
+        }
         "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
         name if is_qwen_oauth_alias(name) => {
             let base_url = api_url
@@ -1492,18 +1480,14 @@ fn create_provider_with_url_and_options(
         name if is_qianfan_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
         ))),
-        name if qwen_coding_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Qwen Coding Plan Pro",
-            qwen_coding_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::Bearer,
-        ))),
-        name if qwen_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Qwen",
-            qwen_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::Bearer,
-        ))),
+        name if qwen_coding_base_url(name).is_some() => {
+            let url = qwen_coding_base_url(name).ok_or_else(|| anyhow::anyhow!("Qwen Coding URL resolved to None"))?;
+            Ok(Box::new(OpenAiCompatibleProvider::new("Qwen Coding Plan Pro", url, key, AuthStyle::Bearer)))
+        }
+        name if qwen_base_url(name).is_some() => {
+            let url = qwen_base_url(name).ok_or_else(|| anyhow::anyhow!("Qwen URL resolved to None"))?;
+            Ok(Box::new(OpenAiCompatibleProvider::new("Qwen", url, key, AuthStyle::Bearer)))
+        }
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(

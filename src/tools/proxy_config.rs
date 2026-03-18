@@ -417,7 +417,7 @@ impl Tool for ProxyConfigTool {
                     "disable" => self.handle_disable(&args).await,
                     "apply_env" => self.handle_apply_env(),
                     "clear_env" => self.handle_clear_env(),
-                    _ => unreachable!("handled above"),
+                    other => anyhow::bail!("Unknown proxy sub-action '{other}'"),
                 }
             }
             _ => anyhow::bail!(
