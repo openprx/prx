@@ -334,7 +334,7 @@ mod tests {
     fn test_node(id: &str) -> RemoteNodeConfig {
         RemoteNodeConfig {
             id: id.to_string(),
-            endpoint: format!("http://127.0.0.1:8787"),
+            endpoint: "http://127.0.0.1:8787".to_string(),
             bearer_token: "test-token".to_string(),
             hmac_secret: None,
             enabled: true,
