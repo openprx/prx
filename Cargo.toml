@@ -125,7 +125,7 @@ crossterm = { version = "0.28", default-features = false, features = ["events", 
 reedline = "0.38"
 
 # TUI advanced features (Phase 3) — gated behind terminal-tui feature
-ratatui = { version = "0.29", optional = true, default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
 syntect = { version = "5.2", optional = true, default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "html", "plist-load", "dump-load", "dump-create", "regex-fancy"] }
 unicode-width = { version = "0.2", optional = true }
 
