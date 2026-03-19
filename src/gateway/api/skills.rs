@@ -175,6 +175,21 @@ pub struct InstalledSkillInfo {
     location: String,
 }
 
+/// Validate that a skill install URL targets an allowed host (strict host match).
+fn is_allowed_skill_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    // Reject userinfo in authority (e.g. "user@host")
+    if authority.contains('@') {
+        return false;
+    }
+    // Strip port to isolate the hostname
+    let host = authority.split(':').next().unwrap_or("");
+    matches!(host, "github.com" | "huggingface.co")
+}
+
 pub async fn install_skill(
     State(state): State<AppState>,
     Json(req): Json<InstallRequest>,
@@ -187,13 +202,12 @@ pub async fn install_skill(
         ));
     }
 
-    // Validate URL
-    if !req.url.starts_with("https://github.com/")
-        && !req.url.starts_with("https://huggingface.co/")
-    {
+    // Validate URL — parse host strictly to prevent prefix-based bypass
+    // (e.g. "https://github.com.evil.example/...")
+    if !is_allowed_skill_url(&req.url) {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Only GitHub and HuggingFace URLs are supported"})),
+            Json(serde_json::json!({"error": "Only GitHub and HuggingFace HTTPS URLs are supported"})),
         ));
     }
 
@@ -205,7 +219,7 @@ pub async fn install_skill(
         warn!(error = %e, "Failed to create skills directory");
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to create skills directory: {e}")})),
+            Json(serde_json::json!({"error": "Failed to create skills directory"})),
         ));
     }
 
@@ -264,7 +278,7 @@ pub async fn install_skill(
             warn!(error = %e, "Failed to run git");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to run git: {e}")})),
+                Json(serde_json::json!({"error": "Failed to run git clone"})),
             ))
         }
     }
@@ -326,7 +340,7 @@ pub async fn uninstall_skill(
             warn!(name = name.as_str(), error = %e, "Failed to remove skill directory");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to remove skill: {e}")})),
+                Json(serde_json::json!({"error": "Failed to remove skill"})),
             ))
         }
     }

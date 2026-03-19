@@ -383,12 +383,19 @@ impl McpTool {
                 anyhow::anyhow!("MCP server '{server_name}' uses stdio but command is missing")
             })?;
 
-        tracing::debug!(
-            server = server_name,
-            tool = tool_name,
-            args = ?arguments,
-            "MCP call_stdio: invoking tool"
-        );
+        {
+            let redacted_args = arguments.as_ref().map(|a| {
+                crate::agent::loop_::redact_sensitive_json_keys(&serde_json::Value::Object(
+                    a.clone(),
+                ))
+            });
+            tracing::debug!(
+                server = server_name,
+                tool = tool_name,
+                args = ?redacted_args,
+                "MCP call_stdio: invoking tool"
+            );
+        }
 
         let mut cmd = Command::new(command);
         cmd.args(&server.args);

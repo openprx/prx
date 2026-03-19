@@ -12,6 +12,7 @@ use axum::{
 use tokio::sync::broadcast;
 
 const MAX_MESSAGES_PER_SECOND: usize = 100;
+const MAX_WS_CONNECTIONS: usize = 64;
 
 pub async fn ws_handler(
     State(state): State<AppState>,
@@ -23,6 +24,15 @@ pub async fn ws_handler(
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Unauthorized"})),
+        )
+            .into_response();
+    }
+
+    // Connection-level limit: prevent resource exhaustion from too many open streams
+    if state.logs_broadcast_tx.receiver_count() >= MAX_WS_CONNECTIONS {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Too many log stream connections"})),
         )
             .into_response();
     }

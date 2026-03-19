@@ -1624,7 +1624,7 @@ fn create_provider_with_url_and_options(
         }
 
         _ => anyhow::bail!(
-            "Unknown provider: {name}. Check README for supported providers or run `openprx onboard --interactive` to reconfigure.\n\
+            "Unknown provider: {name}. Check README for supported providers or run `prx onboard --interactive` to reconfigure.\n\
              Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
              Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
         ),
@@ -1984,7 +1984,7 @@ pub fn summarize_provider_availability(
     }
 }
 
-/// Return the list of all known providers for display in `openprx providers list`.
+/// Return the list of all known providers for display in `prx providers list`.
 ///
 /// This is intentionally separate from the factory match in `create_provider`
 /// (display concern vs. construction concern).
@@ -2237,9 +2237,12 @@ mod tests {
     impl EnvGuard {
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let original = std::env::var(key).ok();
-            match value {
-                Some(next) => std::env::set_var(key, next),
-                None => std::env::remove_var(key),
+            // SAFETY: test-only, single-threaded test runner
+            unsafe {
+                match value {
+                    Some(next) => std::env::set_var(key, next),
+                    None => std::env::remove_var(key),
+                }
             }
 
             Self { key, original }
@@ -2248,10 +2251,13 @@ mod tests {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            if let Some(original) = self.original.as_deref() {
-                std::env::set_var(self.key, original);
-            } else {
-                std::env::remove_var(self.key);
+            // SAFETY: test-only, single-threaded test runner
+            unsafe {
+                if let Some(original) = self.original.as_deref() {
+                    std::env::set_var(self.key, original);
+                } else {
+                    std::env::remove_var(self.key);
+                }
             }
         }
     }

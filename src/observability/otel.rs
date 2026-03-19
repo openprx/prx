@@ -41,7 +41,7 @@ impl OtelObserver {
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
     pub fn new(endpoint: Option<&str>, service_name: Option<&str>) -> Result<Self, String> {
         let endpoint = endpoint.unwrap_or("http://localhost:4318");
-        let service_name = service_name.unwrap_or("openprx");
+        let service_name = service_name.unwrap_or("prx");
 
         // ── Trace exporter ──────────────────────────────────────
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -84,94 +84,94 @@ impl OtelObserver {
         global::set_meter_provider(meter_provider);
 
         // ── Create metric instruments ────────────────────────────
-        let meter = global::meter("openprx");
+        let meter = global::meter("prx");
 
         let agent_starts = meter
-            .u64_counter("openprx.agent.starts")
+            .u64_counter("prx.agent.starts")
             .with_description("Total agent invocations")
             .build();
 
         let agent_duration = meter
-            .f64_histogram("openprx.agent.duration")
+            .f64_histogram("prx.agent.duration")
             .with_description("Agent invocation duration in seconds")
             .with_unit("s")
             .build();
 
         let llm_calls = meter
-            .u64_counter("openprx.llm.calls")
+            .u64_counter("prx.llm.calls")
             .with_description("Total LLM provider calls")
             .build();
 
         let llm_duration = meter
-            .f64_histogram("openprx.llm.duration")
+            .f64_histogram("prx.llm.duration")
             .with_description("LLM provider call duration in seconds")
             .with_unit("s")
             .build();
 
         let tool_calls = meter
-            .u64_counter("openprx.tool.calls")
+            .u64_counter("prx.tool.calls")
             .with_description("Total tool calls")
             .build();
         let tool_batches = meter
-            .u64_counter("openprx.tool.batches")
+            .u64_counter("prx.tool.batches")
             .with_description("Total read-only tool batches")
             .build();
         let tool_timeouts = meter
-            .u64_counter("openprx.tool.timeouts")
+            .u64_counter("prx.tool.timeouts")
             .with_description("Total tool timeouts in scheduler batches")
             .build();
         let tool_cancellations = meter
-            .u64_counter("openprx.tool.cancellations")
+            .u64_counter("prx.tool.cancellations")
             .with_description("Total tool cancellations in scheduler batches")
             .build();
         let tool_degrades = meter
-            .u64_counter("openprx.tool.degrades")
+            .u64_counter("prx.tool.degrades")
             .with_description("Total scheduler degradations")
             .build();
         let tool_rollbacks = meter
-            .u64_counter("openprx.tool.rollbacks")
+            .u64_counter("prx.tool.rollbacks")
             .with_description("Total scheduler rollbacks")
             .build();
 
         let tool_duration = meter
-            .f64_histogram("openprx.tool.duration")
+            .f64_histogram("prx.tool.duration")
             .with_description("Tool execution duration in seconds")
             .with_unit("s")
             .build();
 
         let channel_messages = meter
-            .u64_counter("openprx.channel.messages")
+            .u64_counter("prx.channel.messages")
             .with_description("Total channel messages")
             .build();
 
         let heartbeat_ticks = meter
-            .u64_counter("openprx.heartbeat.ticks")
+            .u64_counter("prx.heartbeat.ticks")
             .with_description("Total heartbeat ticks")
             .build();
 
         let errors = meter
-            .u64_counter("openprx.errors")
+            .u64_counter("prx.errors")
             .with_description("Total errors by component")
             .build();
 
         let request_latency = meter
-            .f64_histogram("openprx.request.latency")
+            .f64_histogram("prx.request.latency")
             .with_description("Request latency in seconds")
             .with_unit("s")
             .build();
 
         let tokens_used = meter
-            .u64_counter("openprx.tokens.used")
+            .u64_counter("prx.tokens.used")
             .with_description("Total tokens consumed (monotonic)")
             .build();
 
         let active_sessions = meter
-            .u64_gauge("openprx.sessions.active")
+            .u64_gauge("prx.sessions.active")
             .with_description("Current number of active sessions")
             .build();
 
         let queue_depth = meter
-            .u64_gauge("openprx.queue.depth")
+            .u64_gauge("prx.queue.depth")
             .with_description("Current message queue depth")
             .build();
 
@@ -202,7 +202,7 @@ impl OtelObserver {
 
 impl Observer for OtelObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        let tracer = global::tracer("openprx");
+        let tracer = global::tracer("prx");
 
         match event {
             ObserverEvent::AgentStart { provider, model } => {

@@ -61,7 +61,7 @@ const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
     let ChannelsConfig {
         cli: _,     // `cli` is always available and does not require channel server startup
-        webhook: _, // webhook traffic is handled by gateway, not `openprx channel start`
+        webhook: _, // webhook traffic is handled by gateway, not `prx channel start`
         telegram,
         discord,
         slack,
@@ -167,6 +167,7 @@ pub async fn run_wizard() -> Result<Config> {
         router: crate::config::RouterConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
+        xin: crate::xin::XinConfig::default(),
         channels_config,
         memory: memory_config, // User-selected memory backend
         identity_bindings: Vec::new(),
@@ -231,7 +232,9 @@ pub async fn run_wizard() -> Result<Config> {
             );
             println!();
             // Signal to main.rs to call start_channels after wizard returns
-            std::env::set_var("OPENPRX_AUTOSTART_CHANNELS", "1");
+            // SAFETY: Wizard runs on a single interactive thread; no concurrent
+            // env readers exist at this point.
+            unsafe { std::env::set_var("OPENPRX_AUTOSTART_CHANNELS", "1") };
         }
     }
 
@@ -283,7 +286,9 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
             );
             println!();
             // Signal to main.rs to call start_channels after wizard returns
-            std::env::set_var("OPENPRX_AUTOSTART_CHANNELS", "1");
+            // SAFETY: Wizard runs on a single interactive thread; no concurrent
+            // env readers exist at this point.
+            unsafe { std::env::set_var("OPENPRX_AUTOSTART_CHANNELS", "1") };
         }
     }
 
@@ -293,8 +298,8 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
-/// Use `openprx onboard` or `openprx onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
-/// Use `openprx onboard --interactive` for the full wizard.
+/// Use `prx onboard` or `prx onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
+/// Use `prx onboard --interactive` for the full wizard.
 fn backend_key_from_choice(choice: usize) -> &'static str {
     selectable_memory_backends()
         .get(choice)
@@ -415,6 +420,7 @@ async fn run_quick_setup_with_home(
         router: crate::config::RouterConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
+        xin: crate::xin::XinConfig::default(),
         channels_config: ChannelsConfig::default(),
         memory: memory_config,
         identity_bindings: Vec::new(),
@@ -524,12 +530,12 @@ async fn run_quick_setup_with_home(
     if credential_override.is_none() {
         println!("    1. Set your API key:  export OPENROUTER_API_KEY=\"sk-...\"");
         println!("    2. Or edit:           ~/.openprx/config.toml");
-        println!("    3. Chat:              openprx agent -m \"Hello!\"");
-        println!("    4. Gateway:           openprx gateway");
+        println!("    3. Chat:              prx agent -m \"Hello!\"");
+        println!("    4. Gateway:           prx gateway");
     } else {
-        println!("    1. Chat:     openprx agent -m \"Hello!\"");
-        println!("    2. Gateway:  openprx gateway");
-        println!("    3. Status:   openprx status");
+        println!("    1. Chat:     prx agent -m \"Hello!\"");
+        println!("    2. Gateway:  prx gateway");
+        println!("    3. Status:   prx status");
     }
     println!();
 
@@ -1521,7 +1527,7 @@ pub fn run_models_refresh(
             print_model_preview(&cached.models);
             println!();
             println!(
-                "Tip: run `openprx models refresh --force --provider {}` to fetch latest now.",
+                "Tip: run `prx models refresh --force --provider {}` to fetch latest now.",
                 provider_name
             );
             return Ok(());
@@ -4601,7 +4607,7 @@ fn print_summary(config: &Config) {
             );
             println!(
                 "       {}",
-                style("openprx auth login --provider openai-codex --device-code").yellow()
+                style("prx auth login --provider openai-codex --device-code").yellow()
             );
         } else if provider == "anthropic" {
             println!(
@@ -4615,7 +4621,7 @@ fn print_summary(config: &Config) {
             println!(
                 "       {}",
                 style(
-                    "or: openprx auth paste-token --provider anthropic --auth-kind authorization"
+                    "or: prx auth paste-token --provider anthropic --auth-kind authorization"
                 )
                 .yellow()
             );
@@ -4641,7 +4647,7 @@ fn print_summary(config: &Config) {
             style(format!("{step}.")).cyan().bold(),
             style("Launch your channels").white().bold()
         );
-        println!("       {}", style("openprx channel start").yellow());
+        println!("       {}", style("prx channel start").yellow());
         println!();
         step += 1;
     }
@@ -4652,7 +4658,7 @@ fn print_summary(config: &Config) {
     );
     println!(
         "       {}",
-        style("openprx agent -m \"Hello, OpenPRX!\"").yellow()
+        style("prx agent -m \"Hello, OpenPRX!\"").yellow()
     );
     println!();
     step += 1;
@@ -4661,7 +4667,7 @@ fn print_summary(config: &Config) {
         "    {} Start interactive CLI mode:",
         style(format!("{step}.")).cyan().bold()
     );
-    println!("       {}", style("openprx agent").yellow());
+    println!("       {}", style("prx agent").yellow());
     println!();
     step += 1;
 
@@ -4669,7 +4675,7 @@ fn print_summary(config: &Config) {
         "    {} Check full status:",
         style(format!("{step}.")).cyan().bold()
     );
-    println!("       {}", style("openprx status").yellow());
+    println!("       {}", style("prx status").yellow());
     println!();
     println!(
         "    {} Legacy alias (optional):",

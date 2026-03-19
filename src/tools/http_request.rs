@@ -247,12 +247,12 @@ impl Tool for HttpRequestTool {
                 // Get response headers (redact sensitive ones)
                 let response_headers = response.headers().iter();
                 let headers_text = response_headers
-                    .map(|(k, _)| {
+                    .map(|(k, v)| {
                         let is_sensitive = k.as_str().to_lowercase().contains("set-cookie");
                         if is_sensitive {
                             format!("{}: ***REDACTED***", k.as_str())
                         } else {
-                            format!("{}: {:?}", k.as_str(), k.as_str())
+                            format!("{}: {:?}", k.as_str(), v.to_str().unwrap_or("<non-utf8>"))
                         }
                     })
                     .collect::<Vec<_>>()
@@ -400,6 +400,31 @@ fn is_private_or_local_host(host: &str) -> bool {
             std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
             std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
         };
+    }
+
+    // DNS rebinding defense: resolve the hostname and check if any resolved
+    // IP is private/local. This catches hostnames that pass string checks
+    // but resolve to internal addresses (e.g. attacker-controlled DNS that
+    // alternates between public and private IPs).
+    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host, 80)) {
+        for addr in addrs {
+            let ip = addr.ip();
+            if ip.is_loopback() || ip.is_unspecified() {
+                return true;
+            }
+            match ip {
+                std::net::IpAddr::V4(v4) => {
+                    if is_non_global_v4(v4) {
+                        return true;
+                    }
+                }
+                std::net::IpAddr::V6(v6) => {
+                    if is_non_global_v6(v6) {
+                        return true;
+                    }
+                }
+            }
+        }
     }
 
     false
@@ -760,34 +785,34 @@ mod tests {
     // so regressions are caught if the parsing strategy ever changes.
 
     #[test]
-    fn ssrf_octal_loopback_not_parsed_as_ip() {
-        // 0177.0.0.1 is octal for 127.0.0.1 in some languages, but
-        // Rust's IpAddr rejects it — it falls through as a hostname.
-        assert!(!is_private_or_local_host("0177.0.0.1"));
+    fn ssrf_octal_loopback_caught_by_dns_resolution() {
+        // 0177.0.0.1 is octal for 127.0.0.1; glibc's getaddrinfo resolves
+        // this to loopback, so the DNS rebinding defense catches it.
+        assert!(is_private_or_local_host("0177.0.0.1"));
     }
 
     #[test]
-    fn ssrf_hex_loopback_not_parsed_as_ip() {
-        // 0x7f000001 is hex for 127.0.0.1 in some languages.
-        assert!(!is_private_or_local_host("0x7f000001"));
+    fn ssrf_hex_loopback_caught_by_dns_resolution() {
+        // 0x7f000001 is hex for 127.0.0.1; caught by DNS resolution.
+        assert!(is_private_or_local_host("0x7f000001"));
     }
 
     #[test]
-    fn ssrf_decimal_loopback_not_parsed_as_ip() {
-        // 2130706433 is decimal for 127.0.0.1 in some languages.
-        assert!(!is_private_or_local_host("2130706433"));
+    fn ssrf_decimal_loopback_caught_by_dns_resolution() {
+        // 2130706433 is decimal for 127.0.0.1; caught by DNS resolution.
+        assert!(is_private_or_local_host("2130706433"));
     }
 
     #[test]
-    fn ssrf_zero_padded_loopback_not_parsed_as_ip() {
-        // 127.000.000.001 uses zero-padded octets.
-        assert!(!is_private_or_local_host("127.000.000.001"));
+    fn ssrf_zero_padded_loopback_caught_by_dns_resolution() {
+        // 127.000.000.001 uses zero-padded octets; caught by DNS resolution.
+        assert!(is_private_or_local_host("127.000.000.001"));
     }
 
     #[test]
     fn ssrf_alternate_notations_rejected_by_validate_url() {
-        // Even if is_private_or_local_host doesn't flag these, they
-        // fail the allowlist because they're treated as hostnames.
+        // These alternate notations are now caught by the DNS rebinding defense
+        // (SSRF block) OR by the allowlist, depending on system resolver behavior.
         let tool = test_tool(vec!["example.com"]);
         for notation in [
             "http://0177.0.0.1",
@@ -797,8 +822,8 @@ mod tests {
         ] {
             let err = tool.validate_url(notation).unwrap_err().to_string();
             assert!(
-                err.contains("allowed_domains"),
-                "Expected allowlist rejection for {notation}, got: {err}"
+                err.contains("allowed_domains") || err.contains("Blocked local/private host"),
+                "Expected SSRF or allowlist rejection for {notation}, got: {err}"
             );
         }
     }

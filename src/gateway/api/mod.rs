@@ -168,7 +168,7 @@ pub(super) fn extract_resource_auth_token(headers: &HeaderMap) -> String {
 }
 
 async fn auth_middleware(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let provided_token = extract_bearer_auth_token(request.headers()).unwrap_or_default();
+    let provided_token = extract_resource_auth_token(request.headers());
 
     if state.pairing.require_pairing() && !state.pairing.is_authenticated(&provided_token) {
         return (

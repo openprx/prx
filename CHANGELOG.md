@@ -1,45 +1,57 @@
 # Changelog
 
-All notable changes to ZeroClaw will be documented in this file.
+All notable changes to OpenPRX will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Security
-- **Legacy XOR cipher migration**: The `enc:` prefix (XOR cipher) is now deprecated. 
-  Secrets using this format will be automatically migrated to `enc2:` (ChaCha20-Poly1305 AEAD)
-  when decrypted via `decrypt_and_migrate()`. A `tracing::warn!` is emitted when legacy
-  values are encountered. The XOR cipher will be removed in a future release.
+## [0.3.0] - 2026-03-19
 
 ### Added
-- `SecretStore::decrypt_and_migrate()` — Decrypts secrets and returns a migrated `enc2:` 
-  value if the input used the legacy `enc:` format
-- `SecretStore::needs_migration()` — Check if a value uses the legacy `enc:` format
-- `SecretStore::is_secure_encrypted()` — Check if a value uses the secure `enc2:` format
-- **Telegram mention_only mode** — New config option `mention_only` for Telegram channel.
-  When enabled, bot only responds to messages that @-mention the bot in group chats.
-  Direct messages always work regardless of this setting. Default: `false`.
-- **LLM Router Phase 1** — Heuristic routing (`capability + Elo + cost + latency`) with weighted scoring (`router.alpha/beta/gamma/delta/epsilon`).
-- **LLM Router Phase 2** — Router model capability registry and seeded model metadata for score calculation.
-- **LLM Router Phase 3** — Outcome feedback loop (`record_outcome`) with Elo/success-rate updates and structured decision logging.
-- **LLM Router Phase 4** — KNN semantic routing with cold-start protection (`router.knn_min_records`) and timeout-safe fallback.
-- **LLM Router Phase 5** — Automix adaptive strategy (`router.automix.*`) for low-confidence escalation from cheap tiers to premium model.
+- **Xin (心) autonomous task engine** — Configuration-driven heartbeat scheduler for system-level autonomous work.
+  - 5 built-in system tasks: health check, stale cleanup, memory evolution, fitness report, memory hygiene
+  - 3 execution modes: Internal (Rust fn), AgentSession (LLM), Shell (command)
+  - SQLite-backed task persistence with execution history (`xin/tasks.db`)
+  - LLM tool (`xin`) with 7 actions: list, add, get, remove, status, pause, resume
+  - Configurable: interval, max_concurrent, max_tasks, stale_timeout, builtin_tasks
+  - Evolution/fitness integration mode — xin can take over standalone schedulers
+  - Supervisor with exponential backoff restart and health monitoring
+- **Chat module** — Extracted conversational session management with named constants
+- **Terminal channel** — Dedicated terminal-based messaging channel
+- `SecretStore::decrypt_and_migrate()` — Auto-migrate legacy `enc:` to `enc2:` (ChaCha20-Poly1305 AEAD)
+- `SecretStore::needs_migration()` / `is_secure_encrypted()` — Secret format detection
+- **Telegram mention_only mode** — Bot only responds to @-mentions in group chats
 
-### Deprecated
-- `enc:` prefix for encrypted secrets — Use `enc2:` (ChaCha20-Poly1305) instead.
-  Legacy values are still decrypted for backward compatibility but should be migrated.
+### Security
+- **26-finding comprehensive audit** — Full regression audit of 170K+ LOC, all findings fixed:
+  - (C-1) SQLite foreign keys enabled in memory backend
+  - (C-2) Cron atomic job claiming prevents double-execution
+  - (C-3) SSRF DNS rebinding defense with resolved IP validation
+  - (H-1..H-8) Memory LRU eviction, content hash expansion (128-bit), tool argument schema validation, MCP debug log redaction, rate limiting for web_fetch/http_request
+  - (M-1..M-11) Optimistic concurrency for xin/cron stores, magic number constants, flaky test serialization
+  - (L-1..L-4) Code quality improvements
+- **Web console hardening** — 9 additional fixes:
+  - (C-1) Rate limiter time arithmetic safety
+  - (C-2) Config dual-store atomic update (Mutex + ArcSwap)
+  - (C-3) Upload path traversal defense — reject absolute paths and `..` components
+  - (H-1) Auth middleware now supports cookie authentication with CSRF protection
+  - (H-2) Skill install URL validation — strict host parsing prevents prefix bypass
+  - (H-3) WebSocket log stream connection limit (max 64 concurrent)
+  - (M-1) Extended sensitive key detection patterns
+  - (M-3) Pagination clamp allows small page sizes
+  - (L-1) API error responses no longer leak internal Rust error details
+- **Legacy XOR cipher migration**: `enc:` prefix deprecated, auto-migrated to `enc2:`
 
 ### Fixed
-- **Onboarding channel menu dispatch** now uses an enum-backed selector instead of hard-coded
-  numeric match arms, preventing duplicated pattern arms and related `unreachable pattern`
-  compiler warnings in `src/onboard/wizard.rs`.
-- **OpenAI native tool spec parsing** now uses owned serializable/deserializable structs,
-  fixing a compile-time type mismatch when validating tool schemas before API calls.
-- **Router (Critical/High)** — Enforced provider reachability filtering so router candidates are constrained to reachable provider/model routes.
-- **Router (High)** — Hardened `record_outcome` persistence path to keep async awaits outside lock scope (lock-free async persistence).
-- **Router (High)** — Reserved `router/` namespace now requires `session_id="self_system"` for memory write/read paths via backend and tool-level guards.
+- **Flaky proxy cache test** — Added `Mutex` serialization to prevent global cache race condition
+- **Onboarding channel menu** — Enum-backed selector instead of hard-coded numeric match arms
+- **OpenAI native tool spec** — Owned serializable structs for tool schema validation
+- **Router audit fixes** — Provider reachability filtering, lock-safe async persistence, reserved `router/` namespace
+
+### Deprecated
+- `enc:` prefix for encrypted secrets — Use `enc2:` (ChaCha20-Poly1305) instead
 
 ## [0.2.1] - 2026-03-11
 
@@ -74,5 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace escape prevention
 - Forbidden system path protection (`/etc`, `/root`, `~/.ssh`)
 
-[0.1.0]: https://github.com/theonlyhennygod/zeroclaw/releases/tag/v0.1.0
-[0.2.1]: https://github.com/theonlyhennygod/zeroclaw/releases/tag/v0.2.1
+[Unreleased]: https://github.com/openprx/prx/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/openprx/prx/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/openprx/prx/compare/v0.1.0...v0.2.1
+[0.1.0]: https://github.com/openprx/prx/releases/tag/v0.1.0

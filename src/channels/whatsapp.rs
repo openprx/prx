@@ -100,7 +100,7 @@ impl WhatsAppChannel {
                         tracing::warn!(
                             "WhatsApp: ignoring message from unauthorized number: {normalized_from}. \
                             Add to channels.whatsapp.allowed_numbers in config.toml, \
-                            or run `openprx onboard --channels-only` to configure interactively."
+                            or run `prx onboard --channels-only` to configure interactively."
                         );
                         continue;
                     }

@@ -60,6 +60,7 @@ pub mod traits;
 pub mod tts;
 pub mod web_fetch;
 pub mod web_search_tool;
+pub mod xin;
 
 pub use agents_list::AgentsListTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
@@ -109,6 +110,7 @@ pub use traits::{ToolResult, ToolSpec};
 pub use tts::TtsTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
+pub use xin::XinTool;
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
@@ -282,6 +284,7 @@ pub fn all_tools_with_runtime_ext(
         Arc::new(CronUpdateTool::new(shared_config.clone(), security.clone())),
         Arc::new(CronRunTool::new(shared_config.clone(), security.clone())),
         Arc::new(CronRunsTool::new(shared_config.clone())),
+        Arc::new(XinTool::new(shared_config.clone(), security.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemorySearchTool::new(
@@ -412,6 +415,7 @@ pub fn all_tools_with_runtime_ext(
             );
         } else {
             tool_arcs.push(Arc::new(WebFetchTool::new(
+                security.clone(),
                 browser_config.allowed_domains.clone(),
                 root_config.web_search.fetch_max_chars,
                 root_config.web_search.timeout_secs,

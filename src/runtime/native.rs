@@ -58,6 +58,7 @@ impl RuntimeAdapter for NativeRuntime {
             .unwrap_or_else(|_| workspace_dir.to_path_buf());
         let mut process = tokio::process::Command::new("sh");
         process.arg("-c").arg(command).current_dir(canonical_cwd);
+        process.kill_on_drop(true);
         Ok(process)
     }
 }

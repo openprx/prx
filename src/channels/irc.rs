@@ -916,7 +916,7 @@ mod tests {
             server: "irc.example.com".into(),
             port: 6697,
             nickname: "zcbot".into(),
-            username: Some("openprx".into()),
+            username: Some("prx".into()),
             channels: vec!["#test".into()],
             allowed_users: vec!["alice".into()],
             server_password: Some("serverpass".into()),
@@ -927,7 +927,7 @@ mod tests {
         assert_eq!(ch.server, "irc.example.com");
         assert_eq!(ch.port, 6697);
         assert_eq!(ch.nickname, "zcbot");
-        assert_eq!(ch.username, "openprx");
+        assert_eq!(ch.username, "prx");
         assert_eq!(ch.channels, vec!["#test"]);
         assert_eq!(ch.allowed_users, vec!["alice"]);
         assert_eq!(ch.server_password.as_deref(), Some("serverpass"));
@@ -946,7 +946,7 @@ mod tests {
             server: "irc.example.com".into(),
             port: 6697,
             nickname: "zcbot".into(),
-            username: Some("openprx".into()),
+            username: Some("prx".into()),
             channels: vec!["#test".into(), "#dev".into()],
             allowed_users: vec!["alice".into()],
             mention_only: false,
@@ -961,7 +961,7 @@ mod tests {
         assert_eq!(parsed.server, "irc.example.com");
         assert_eq!(parsed.port, 6697);
         assert_eq!(parsed.nickname, "zcbot");
-        assert_eq!(parsed.username.as_deref(), Some("openprx"));
+        assert_eq!(parsed.username.as_deref(), Some("prx"));
         assert_eq!(parsed.channels, vec!["#test", "#dev"]);
         assert_eq!(parsed.allowed_users, vec!["alice"]);
         assert!(parsed.server_password.is_none());

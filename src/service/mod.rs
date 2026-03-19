@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
-const SERVICE_LABEL: &str = "com.openprx.daemon";
-const WINDOWS_TASK_NAME: &str = "OpenPRX Daemon";
+const SERVICE_LABEL: &str = "com.prx.daemon";
+const WINDOWS_TASK_NAME: &str = "PRX Daemon";
 
 /// Supported init systems for service management
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -142,10 +142,10 @@ fn start_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "start", "openprx.service"]))?;
+            run_checked(Command::new("systemctl").args(["--user", "start", "prx.service"]))?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["openprx", "start"]))?;
+            run_checked(Command::new("rc-service").args(["prx", "start"]))?;
         }
         InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
@@ -184,10 +184,10 @@ fn stop_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             let _ =
-                run_checked(Command::new("systemctl").args(["--user", "stop", "openprx.service"]));
+                run_checked(Command::new("systemctl").args(["--user", "stop", "prx.service"]));
         }
         InitSystem::Openrc => {
-            let _ = run_checked(Command::new("rc-service").args(["openprx", "stop"]));
+            let _ = run_checked(Command::new("rc-service").args(["prx", "stop"]));
         }
         InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
@@ -222,10 +222,10 @@ fn restart_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "restart", "openprx.service"]))?;
+            run_checked(Command::new("systemctl").args(["--user", "restart", "prx.service"]))?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["openprx", "restart"]))?;
+            run_checked(Command::new("rc-service").args(["prx", "restart"]))?;
         }
         InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
@@ -288,17 +288,17 @@ fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             let out = run_capture(Command::new("systemctl").args([
                 "--user",
                 "is-active",
-                "openprx.service",
+                "prx.service",
             ]))
             .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
             println!("Unit: {}", linux_service_file(config)?.display());
         }
         InitSystem::Openrc => {
-            let out = run_capture(Command::new("rc-service").args(["openprx", "status"]))
+            let out = run_capture(Command::new("rc-service").args(["prx", "status"]))
                 .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
-            println!("Unit: /etc/init.d/openprx");
+            println!("Unit: /etc/init.d/prx");
         }
         InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
@@ -332,7 +332,7 @@ fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
             .parent()
             .map_or_else(|| PathBuf::from("."), PathBuf::from)
             .join("logs")
-            .join("openprx-daemon.cmd");
+            .join("prx-daemon.cmd");
         if wrapper.exists() {
             fs::remove_file(&wrapper).ok();
         }
@@ -355,19 +355,19 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             println!("✅ Service uninstalled ({})", file.display());
         }
         InitSystem::Openrc => {
-            let init_script = Path::new("/etc/init.d/openprx");
+            let init_script = Path::new("/etc/init.d/prx");
             if init_script.exists() {
                 if let Err(err) =
-                    run_checked(Command::new("rc-update").args(["del", "openprx", "default"]))
+                    run_checked(Command::new("rc-update").args(["del", "prx", "default"]))
                 {
                     eprintln!(
-                        "⚠️  Warning: Could not remove openprx from OpenRC default runlevel: {err}"
+                        "⚠️  Warning: Could not remove prx from OpenRC default runlevel: {err}"
                     );
                 }
                 fs::remove_file(init_script)
                     .with_context(|| format!("Failed to remove {}", init_script.display()))?;
             }
-            println!("✅ Service uninstalled (/etc/init.d/openprx)");
+            println!("✅ Service uninstalled (/etc/init.d/prx)");
         }
         InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
@@ -422,7 +422,7 @@ fn install_macos(config: &Config) -> Result<()> {
 
     fs::write(&file, plist)?;
     println!("✅ Installed launchd service: {}", file.display());
-    println!("   Start with: openprx service start");
+    println!("   Start with: prx service start");
     Ok(())
 }
 
@@ -442,15 +442,15 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     let unit = format!(
-        "[Unit]\nDescription=OpenPRX daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=PRX daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
         exe.display()
     );
 
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
-    let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "openprx.service"]));
+    let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "prx.service"]));
     println!("✅ Installed systemd user service: {}", file.display());
-    println!("   Start with: openprx service start");
+    println!("   Start with: prx service start");
     Ok(())
 }
 
@@ -471,16 +471,16 @@ fn is_root() -> bool {
 /// Returns Ok if user doesn't exist (OpenRC will handle creation or fail gracefully).
 /// Returns error if user exists but has unexpected properties.
 fn check_openprx_user() -> Result<()> {
-    let output = Command::new("getent").args(["passwd", "openprx"]).output();
+    let output = Command::new("getent").args(["passwd", "prx"]).output();
     let is_alpine = Path::new("/etc/alpine-release").exists();
 
     let (del_cmd, add_cmd) = if is_alpine {
         (
-            "deluser openprx && delgroup openprx",
-            "addgroup -S openprx && adduser -S -s /sbin/nologin -H -D -G openprx openprx",
+            "deluser prx && delgroup prx",
+            "addgroup -S prx && adduser -S -s /sbin/nologin -H -D -G prx prx",
         )
     } else {
-        ("userdel openprx", "useradd -r -s /sbin/nologin openprx")
+        ("userdel prx", "useradd -r -s /sbin/nologin prx")
     };
 
     match output {
@@ -495,7 +495,7 @@ fn check_openprx_user() -> Result<()> {
 
                 if uid.parse::<u32>().unwrap_or(999) >= 1000 {
                     bail!(
-                        "User 'openprx' exists but has unexpected UID {} (expected system UID < 1000).\n\
+                        "User 'prx' exists but has unexpected UID {} (expected system UID < 1000).\n\
                          Recreate with: sudo {} && sudo {}",
                         uid, del_cmd, add_cmd
                     );
@@ -503,7 +503,7 @@ fn check_openprx_user() -> Result<()> {
 
                 if !shell.contains("nologin") && !shell.contains("false") {
                     bail!(
-                        "User 'openprx' exists but has unexpected shell '{}'.\n\
+                        "User 'prx' exists but has unexpected shell '{}'.\n\
                          Expected nologin/false for security. Fix with: sudo {} && sudo {}",
                         shell,
                         del_cmd,
@@ -511,9 +511,9 @@ fn check_openprx_user() -> Result<()> {
                     );
                 }
 
-                if home != "/var/lib/openprx" && home != "/nonexistent" {
+                if home != "/var/lib/prx" && home != "/nonexistent" {
                     eprintln!(
-                        "⚠️  Warning: openprx user has home directory '{}' (expected /var/lib/openprx or /nonexistent)",
+                        "⚠️  Warning: prx user has home directory '{}' (expected /var/lib/prx or /nonexistent)",
                         home
                     );
                 }
@@ -527,7 +527,7 @@ fn check_openprx_user() -> Result<()> {
 }
 
 fn ensure_openprx_user() -> Result<()> {
-    let output = Command::new("getent").args(["passwd", "openprx"]).output();
+    let output = Command::new("getent").args(["passwd", "prx"]).output();
     if let Ok(output) = output {
         if output.status.success() {
             return check_openprx_user();
@@ -537,20 +537,20 @@ fn ensure_openprx_user() -> Result<()> {
     let is_alpine = Path::new("/etc/alpine-release").exists();
 
     if is_alpine {
-        let group_output = Command::new("getent").args(["group", "openprx"]).output();
+        let group_output = Command::new("getent").args(["group", "prx"]).output();
         let group_exists = group_output.map(|o| o.status.success()).unwrap_or(false);
 
         if !group_exists {
             let output = Command::new("addgroup")
-                .args(["-S", "openprx"])
+                .args(["-S", "prx"])
                 .output()
-                .context("Failed to create openprx group")?;
+                .context("Failed to create prx group")?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!("Failed to create openprx group: {}", stderr.trim());
+                bail!("Failed to create prx group: {}", stderr.trim());
             }
-            println!("✅ Created system group: openprx");
+            println!("✅ Created system group: prx");
         }
 
         let output = Command::new("adduser")
@@ -561,44 +561,44 @@ fn ensure_openprx_user() -> Result<()> {
                 "-H",
                 "-D",
                 "-G",
-                "openprx",
-                "openprx",
+                "prx",
+                "prx",
             ])
             .output()
-            .context("Failed to create openprx user")?;
+            .context("Failed to create prx user")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to create openprx user: {}", stderr.trim());
+            bail!("Failed to create prx user: {}", stderr.trim());
         }
     } else {
         let output = Command::new("useradd")
-            .args(["-r", "-s", "/sbin/nologin", "openprx"])
+            .args(["-r", "-s", "/sbin/nologin", "prx"])
             .output()
-            .context("Failed to create openprx user")?;
+            .context("Failed to create prx user")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to create openprx user: {}", stderr.trim());
+            bail!("Failed to create prx user: {}", stderr.trim());
         }
     }
 
-    println!("✅ Created system user: openprx");
+    println!("✅ Created system user: prx");
     Ok(())
 }
 
-/// Change ownership of a path to openprx:openprx
+/// Change ownership of a path to prx:prx
 #[cfg(unix)]
 fn chown_to_openprx(path: &Path) -> Result<()> {
     let output = Command::new("chown")
-        .args(["openprx:openprx", &path.to_string_lossy()])
+        .args(["prx:prx", &path.to_string_lossy()])
         .output()
         .context("Failed to run chown")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "Failed to change ownership of {} to openprx:openprx: {}",
+            "Failed to change ownership of {} to prx:prx: {}",
             path.display(),
             stderr.trim(),
         );
@@ -614,14 +614,14 @@ fn chown_to_openprx(_path: &Path) -> Result<()> {
 #[cfg(unix)]
 fn chown_recursive_to_openprx(path: &Path) -> Result<()> {
     let output = Command::new("chown")
-        .args(["-R", "openprx:openprx", &path.to_string_lossy()])
+        .args(["-R", "prx:prx", &path.to_string_lossy()])
         .output()
         .context("Failed to run recursive chown")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "Failed to recursively change ownership of {} to openprx:openprx: {}",
+            "Failed to recursively change ownership of {} to prx:prx: {}",
             path.display(),
             stderr.trim(),
         );
@@ -745,7 +745,7 @@ fn build_openrc_writability_probe_command(path: &Path, has_runuser: bool) -> (St
             "runuser".to_string(),
             vec![
                 "-u".to_string(),
-                "openprx".to_string(),
+                "prx".to_string(),
                 "--".to_string(),
                 "sh".to_string(),
                 "-c".to_string(),
@@ -760,7 +760,7 @@ fn build_openrc_writability_probe_command(path: &Path, has_runuser: bool) -> (St
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 probe,
-                "openprx".to_string(),
+                "prx".to_string(),
             ],
         )
     }
@@ -788,8 +788,8 @@ fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
             stderr.trim()
         };
         bail!(
-            "OpenRC runtime user 'openprx' cannot write {} ({details}). \
-             Re-run `sudo openprx service install` and ensure ownership is openprx:openprx.",
+            "OpenRC runtime user 'prx' cannot write {} ({details}). \
+             Re-run `sudo prx service install` and ensure ownership is prx:prx.",
             path.display(),
         );
     }
@@ -825,7 +825,7 @@ fn warn_if_binary_in_home(exe_path: &Path) {
         eprintln!(
             "⚠️  Warning: Binary path '{}' appears to be in a user home directory.\n\
              For system-wide OpenRC service, consider installing to /usr/local/bin:\n\
-             sudo cp '{}' /usr/local/bin/openprx",
+             sudo cp '{}' /usr/local/bin/prx",
             exe_path.display(),
             exe_path.display()
         );
@@ -837,17 +837,17 @@ fn generate_openrc_script(exe_path: &Path, config_dir: &Path) -> String {
     format!(
         r#"#!/sbin/openrc-run
 
-name="openprx"
-description="OpenPRX daemon"
+name="prx"
+description="PRX daemon"
 
 command="{}"
 command_args="--config-dir {} daemon"
 command_background="yes"
-command_user="openprx:openprx"
+command_user="prx:prx"
 pidfile="/run/${{RC_SVCNAME}}.pid"
 umask 027
-output_log="/var/log/openprx/access.log"
-error_log="/var/log/openprx/error.log"
+output_log="/var/log/prx/access.log"
+error_log="/var/log/prx/error.log"
 
 depend() {{
     need net
@@ -860,7 +860,7 @@ depend() {{
 }
 
 fn resolve_openrc_executable() -> Result<PathBuf> {
-    let preferred = Path::new("/usr/local/bin/openprx");
+    let preferred = Path::new("/usr/local/bin/prx");
     if preferred.exists() {
         return Ok(preferred.to_path_buf());
     }
@@ -873,7 +873,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     if !is_root() {
         bail!(
             "OpenRC service installation requires root privileges.\n\
-             Please run with sudo: sudo openprx service install"
+             Please run with sudo: sudo prx service install"
         );
     }
 
@@ -882,9 +882,9 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     let exe = resolve_openrc_executable()?;
     warn_if_binary_in_home(&exe);
 
-    let config_dir = Path::new("/etc/openprx");
+    let config_dir = Path::new("/etc/prx");
     let workspace_dir = config_dir.join("workspace");
-    let log_dir = Path::new("/var/log/openprx");
+    let log_dir = Path::new("/var/log/prx");
 
     if !config_dir.exists() {
         fs::create_dir_all(config_dir)
@@ -913,7 +913,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         }
         chown_to_openprx(&workspace_dir)?;
         println!(
-            "✅ Created directory: {} (owned by openprx:openprx)",
+            "✅ Created directory: {} (owned by prx:prx)",
             workspace_dir.display()
         );
     }
@@ -964,13 +964,13 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
     if created_log_dir {
         println!(
-            "✅ Created directory: {} (owned by openprx:openprx)",
+            "✅ Created directory: {} (owned by prx:prx)",
             log_dir.display()
         );
     }
 
     let init_script = generate_openrc_script(&exe, config_dir);
-    let init_path = Path::new("/etc/init.d/openprx");
+    let init_path = Path::new("/etc/init.d/prx");
     fs::write(init_path, init_script)
         .with_context(|| format!("Failed to write {}", init_path.display()))?;
 
@@ -981,10 +981,10 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
             .with_context(|| format!("Failed to set permissions on {}", init_path.display()))?;
     }
 
-    run_checked(Command::new("rc-update").args(["add", "openprx", "default"]))?;
-    println!("✅ Installed OpenRC service: /etc/init.d/openprx");
-    println!("   Config path: /etc/openprx/config.toml");
-    println!("   Start with: sudo openprx service start");
+    run_checked(Command::new("rc-update").args(["add", "prx", "default"]))?;
+    println!("✅ Installed OpenRC service: /etc/init.d/prx");
+    println!("   Config path: /etc/prx/config.toml");
+    println!("   Start with: sudo prx service start");
     let _ = config;
     Ok(())
 }
@@ -999,7 +999,7 @@ fn install_windows(config: &Config) -> Result<()> {
     fs::create_dir_all(&logs_dir)?;
 
     // Create a wrapper script that redirects output to log files
-    let wrapper = logs_dir.join("openprx-daemon.cmd");
+    let wrapper = logs_dir.join("prx-daemon.cmd");
     let stdout_log = logs_dir.join("daemon.stdout.log");
     let stderr_log = logs_dir.join("daemon.stderr.log");
 
@@ -1034,7 +1034,7 @@ fn install_windows(config: &Config) -> Result<()> {
     println!("✅ Installed Windows scheduled task: {}", task_name);
     println!("   Wrapper: {}", wrapper.display());
     println!("   Logs: {}", logs_dir.display());
-    println!("   Start with: openprx service start");
+    println!("   Start with: prx service start");
     Ok(())
 }
 
@@ -1057,7 +1057,7 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
         .join(".config")
         .join("systemd")
         .join("user")
-        .join("openprx.service"))
+        .join("prx.service"))
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
@@ -1125,12 +1125,12 @@ mod tests {
     fn linux_service_file_has_expected_suffix() {
         let file = linux_service_file(&Config::default()).unwrap();
         let path = file.to_string_lossy();
-        assert!(path.ends_with(".config/systemd/user/openprx.service"));
+        assert!(path.ends_with(".config/systemd/user/prx.service"));
     }
 
     #[test]
     fn windows_task_name_is_constant() {
-        assert_eq!(windows_task_name(), "OpenPRX Daemon");
+        assert_eq!(windows_task_name(), "PRX Daemon");
     }
 
     #[cfg(target_os = "windows")]
@@ -1189,22 +1189,22 @@ mod tests {
     fn generate_openrc_script_contains_required_directives() {
         use std::path::PathBuf;
 
-        let exe_path = PathBuf::from("/usr/local/bin/openprx");
-        let script = generate_openrc_script(&exe_path, Path::new("/etc/openprx"));
+        let exe_path = PathBuf::from("/usr/local/bin/prx");
+        let script = generate_openrc_script(&exe_path, Path::new("/etc/prx"));
 
         assert!(script.starts_with("#!/sbin/openrc-run"));
-        assert!(script.contains("name=\"openprx\""));
-        assert!(script.contains("description=\"OpenPRX daemon\""));
-        assert!(script.contains("command=\"/usr/local/bin/openprx\""));
-        assert!(script.contains("command_args=\"--config-dir /etc/openprx daemon\""));
+        assert!(script.contains("name=\"prx\""));
+        assert!(script.contains("description=\"PRX daemon\""));
+        assert!(script.contains("command=\"/usr/local/bin/prx\""));
+        assert!(script.contains("command_args=\"--config-dir /etc/prx daemon\""));
         assert!(!script.contains("env ZEROCLAW_CONFIG_DIR"));
         assert!(!script.contains("env ZEROCLAW_WORKSPACE"));
         assert!(script.contains("command_background=\"yes\""));
-        assert!(script.contains("command_user=\"openprx:openprx\""));
+        assert!(script.contains("command_user=\"prx:prx\""));
         assert!(script.contains("pidfile=\"/run/${RC_SVCNAME}.pid\""));
         assert!(script.contains("umask 027"));
-        assert!(script.contains("output_log=\"/var/log/openprx/access.log\""));
-        assert!(script.contains("error_log=\"/var/log/openprx/error.log\""));
+        assert!(script.contains("output_log=\"/var/log/prx/access.log\""));
+        assert!(script.contains("error_log=\"/var/log/prx/error.log\""));
         assert!(script.contains("depend()"));
         assert!(script.contains("need net"));
         assert!(script.contains("after firewall"));
@@ -1214,14 +1214,14 @@ mod tests {
     fn warn_if_binary_in_home_detects_home_path() {
         use std::path::PathBuf;
 
-        let home_path = PathBuf::from("/home/user/.cargo/bin/openprx");
+        let home_path = PathBuf::from("/home/user/.cargo/bin/prx");
         assert!(home_path.to_string_lossy().contains("/home/"));
         assert!(home_path.to_string_lossy().contains(".cargo/bin"));
 
-        let cargo_path = PathBuf::from("/home/user/.cargo/bin/openprx");
+        let cargo_path = PathBuf::from("/home/user/.cargo/bin/prx");
         assert!(cargo_path.to_string_lossy().contains(".cargo/bin"));
 
-        let system_path = PathBuf::from("/usr/local/bin/openprx");
+        let system_path = PathBuf::from("/usr/local/bin/prx");
         assert!(!system_path.to_string_lossy().contains("/home/"));
         assert!(!system_path.to_string_lossy().contains(".cargo/bin"));
     }
@@ -1239,17 +1239,17 @@ mod tests {
     #[test]
     fn openrc_writability_probe_prefers_runuser_when_available() {
         let (program, args) =
-            build_openrc_writability_probe_command(Path::new("/etc/openprx"), true);
+            build_openrc_writability_probe_command(Path::new("/etc/prx"), true);
         assert_eq!(program, "runuser");
         assert_eq!(
             args,
             vec![
                 "-u".to_string(),
-                "openprx".to_string(),
+                "prx".to_string(),
                 "--".to_string(),
                 "sh".to_string(),
                 "-c".to_string(),
-                "test -w '/etc/openprx'".to_string()
+                "test -w '/etc/prx'".to_string()
             ]
         );
     }
@@ -1258,7 +1258,7 @@ mod tests {
     #[test]
     fn openrc_writability_probe_falls_back_to_su() {
         let (program, args) =
-            build_openrc_writability_probe_command(Path::new("/etc/openprx/workspace"), false);
+            build_openrc_writability_probe_command(Path::new("/etc/prx/workspace"), false);
         assert_eq!(program, "su");
         assert_eq!(
             args,
@@ -1266,8 +1266,8 @@ mod tests {
                 "-s".to_string(),
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "test -w '/etc/openprx/workspace'".to_string(),
-                "openprx".to_string()
+                "test -w '/etc/prx/workspace'".to_string(),
+                "prx".to_string()
             ]
         );
     }

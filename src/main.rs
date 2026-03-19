@@ -97,6 +97,7 @@ mod agent;
 mod approval;
 mod auth;
 mod channels;
+mod chat;
 mod config;
 mod cost;
 mod cron;
@@ -132,12 +133,13 @@ mod tools;
 mod tunnel;
 mod util;
 mod webhook;
+mod xin;
 
 use config::Config;
 
 /// `OpenPRX` - 100% Rust. 100% Agnostic. Your AI, your rules.
 #[derive(Parser, Debug)]
-#[command(name = "openprx")]
+#[command(name = "prx")]
 #[command(author = "theonlyhennygod")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
@@ -214,9 +216,9 @@ Launches an interactive chat session with the configured AI provider. \
 Use --message for single-shot queries without entering interactive mode.
 
 Examples:
-  openprx agent                              # interactive session
-  openprx agent -m \"Summarize today's logs\"  # single message
-  openprx agent -p anthropic --model claude-sonnet-4-20250514")]
+  prx agent                              # interactive session
+  prx agent -m \"Summarize today's logs\"  # single message
+  prx agent -p anthropic --model claude-sonnet-4-20250514")]
     Agent {
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
@@ -235,6 +237,48 @@ Examples:
         temperature: f64,
     },
 
+    /// Start an interactive chat session with streaming output
+    #[command(long_about = "\
+Start an interactive chat session with rich terminal experience.
+
+Features streaming responses, tool execution display, and session history.
+Uses the full Agent pipeline: memory recall, LLM routing, built-in tools,
+and all configured providers.
+
+Examples:
+  prx chat                              # interactive session
+  prx chat -p ollama -m llama3.3        # use local model
+  prx chat -p anthropic                 # use Anthropic
+  prx chat --plain                      # no ANSI colors
+  prx chat --session last               # resume last session
+  prx chat --session abc123             # resume specific session
+  prx chat --list-sessions              # list saved sessions")]
+    Chat {
+        /// Provider to use (openrouter, anthropic, openai, ollama, etc.)
+        #[arg(short, long)]
+        provider: Option<String>,
+
+        /// Model to use
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Temperature (0.0 - 2.0)
+        #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
+        temperature: f64,
+
+        /// Plain text output (no ANSI escapes, for piping)
+        #[arg(long)]
+        plain: bool,
+
+        /// Resume a session by ID, or "last" for the most recent
+        #[arg(short, long)]
+        session: Option<String>,
+
+        /// List all saved sessions and exit
+        #[arg(long)]
+        list_sessions: bool,
+    },
+
     /// Start the gateway server (webhooks, websockets)
     #[command(long_about = "\
 Start the gateway server (webhooks, websockets).
@@ -244,10 +288,10 @@ and WebSocket connections. Bind address defaults to the values in \
 your config file (gateway.host / gateway.port).
 
 Examples:
-  openprx gateway                  # use config defaults
-  openprx gateway -p 8080          # listen on port 8080
-  openprx gateway --host 0.0.0.0   # bind to all interfaces
-  openprx gateway -p 0             # random available port")]
+  prx gateway                  # use config defaults
+  prx gateway -p 8080          # listen on port 8080
+  prx gateway --host 0.0.0.0   # bind to all interfaces
+  prx gateway -p 0             # random available port")]
     Gateway {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -267,13 +311,13 @@ channels (Telegram, Discord, Slack, etc.), heartbeat monitor, and \
 the cron scheduler. This is the recommended way to run OpenPRX in \
 production or as an always-on assistant.
 
-Use 'openprx service install' to register the daemon as an OS \
+Use 'prx service install' to register the daemon as an OS \
 service (systemd/launchd) for auto-start on boot.
 
 Examples:
-  openprx daemon                   # use config defaults
-  openprx daemon -p 9090           # gateway on port 9090
-  openprx daemon --host 127.0.0.1  # localhost only")]
+  prx daemon                   # use config defaults
+  prx daemon -p 9090           # gateway on port 9090
+  prx daemon --host 127.0.0.1  # localhost only")]
     Daemon {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -324,14 +368,14 @@ Cron expressions use the standard 5-field format: \
 override with --tz and an IANA timezone name.
 
 Examples:
-  openprx cron list
-  openprx cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  openprx cron add '*/30 * * * *' 'Check system health'
-  openprx cron add-at 2025-01-15T14:00:00Z 'Send reminder'
-  openprx cron add-every 60000 'Ping heartbeat'
-  openprx cron once 30m 'Run backup in 30 minutes'
-  openprx cron pause <task-id>
-  openprx cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
+  prx cron list
+  prx cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
+  prx cron add '*/30 * * * *' 'Check system health'
+  prx cron add-at 2025-01-15T14:00:00Z 'Send reminder'
+  prx cron add-every 60000 'Ping heartbeat'
+  prx cron once 30m 'Run backup in 30 minutes'
+  prx cron pause <task-id>
+  prx cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
     Cron {
         #[command(subcommand)]
         cron_command: CronCommands,
@@ -355,11 +399,11 @@ to messaging platforms. Supported channel types: telegram, discord, \
 slack, whatsapp, matrix, imessage, email.
 
 Examples:
-  openprx channel list
-  openprx channel doctor
-  openprx channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
-  openprx channel remove my-bot
-  openprx channel bind-telegram openprx_user")]
+  prx channel list
+  prx channel doctor
+  prx channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
+  prx channel remove my-bot
+  prx channel bind-telegram prx_user")]
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
@@ -398,8 +442,8 @@ the full JSON Schema for the config file, which documents every \
 available key, type, and default value.
 
 Examples:
-  openprx config schema              # print JSON Schema to stdout
-  openprx config schema > schema.json")]
+  prx config schema              # print JSON Schema to stdout
+  prx config schema > schema.json")]
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
@@ -426,14 +470,14 @@ Examples:
 
     /// Generate shell completion script to stdout
     #[command(long_about = "\
-Generate shell completion scripts for `openprx`.
+Generate shell completion scripts for `prx`.
 
 The script is printed to stdout so it can be sourced directly:
 
 Examples:
-  source <(openprx completions bash)
-  openprx completions zsh > ~/.zfunc/_openprx
-  openprx completions fish > ~/.config/fish/completions/openprx.fish")]
+  source <(prx completions bash)
+  prx completions zsh > ~/.zfunc/_prx
+  prx completions fish > ~/.config/fish/completions/prx.fish")]
     Completions {
         /// Target shell
         #[arg(value_enum)]
@@ -753,7 +797,9 @@ async fn main() -> Result<()> {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
         }
-        std::env::set_var("OPENPRX_CONFIG_DIR", config_dir);
+        // SAFETY: Called during single-threaded CLI argument parsing before any
+        // async runtime or worker threads are spawned.
+        unsafe { std::env::set_var("OPENPRX_CONFIG_DIR", config_dir) };
     }
 
     // session-worker must stay stdout-clean for IPC JSON.
@@ -866,6 +912,17 @@ async fn main() -> Result<()> {
         } => agent::run(config, message, provider, model, temperature)
             .await
             .map(|_| ()),
+
+        Commands::Chat {
+            provider,
+            model,
+            temperature,
+            plain,
+            session,
+            list_sessions,
+        } => {
+            chat::run(config, provider, model, temperature, plain, session, list_sessions).await
+        }
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);
@@ -1326,7 +1383,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 Err(e) => {
                     println!("Callback capture failed: {e}");
                     println!(
-                            "Run `openprx auth paste-redirect --provider openai-codex --profile {profile}`"
+                            "Run `prx auth paste-redirect --provider openai-codex --profile {profile}`"
                         );
                     return Ok(());
                 }
@@ -1356,7 +1413,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             let pending = load_pending_openai_login(config)?.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "No pending OpenAI login found. Run `openprx auth login --provider openai-codex` first."
+                    "No pending OpenAI login found. Run `prx auth login --provider openai-codex` first."
                 )
             })?;
 
@@ -1461,7 +1518,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 }
                 None => {
                     bail!(
-                        "No OpenAI Codex auth profile found. Run `openprx auth login --provider openai-codex`."
+                        "No OpenAI Codex auth profile found. Run `prx auth login --provider openai-codex`."
                     )
                 }
             }
@@ -1569,7 +1626,7 @@ mod tests {
     #[test]
     fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
         let cli = Cli::try_parse_from([
-            "openprx",
+            "prx",
             "onboard",
             "--provider",
             "openrouter",
@@ -1602,7 +1659,7 @@ mod tests {
     #[test]
     fn completions_cli_parses_supported_shells() {
         for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
-            let cli = Cli::try_parse_from(["openprx", "completions", shell])
+            let cli = Cli::try_parse_from(["prx", "completions", shell])
                 .expect("completions invocation should parse");
             match cli.command {
                 Commands::Completions { .. } => {}
@@ -1618,7 +1675,7 @@ mod tests {
             .expect("completion generation should succeed");
         let script = String::from_utf8(output).expect("completion output should be valid utf-8");
         assert!(
-            script.contains("openprx"),
+            script.contains("prx"),
             "completion script should reference binary name"
         );
     }

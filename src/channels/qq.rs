@@ -262,8 +262,8 @@ impl Channel for QQChannel {
                 "intents": intents,
                 "properties": {
                     "os": "linux",
-                    "browser": "openprx",
-                    "device": "openprx",
+                    "browser": "prx",
+                    "device": "prx",
                 }
             }
         });

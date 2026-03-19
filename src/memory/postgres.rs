@@ -74,13 +74,15 @@ impl PostgresMemory {
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
 
-        let init_result = init_handle
+        init_handle
             .join()
-            .map_err(|_| anyhow::anyhow!("PostgreSQL initializer thread panicked"))?;
-
-        init_result
+            .map_err(|_| anyhow::anyhow!("PostgreSQL initializer thread panicked"))?
     }
 
+    // SAFETY: `schema_ident` and `qualified_table` are validated+quoted at
+    // construction time via `validate_identifier()` + `quote_identifier()`,
+    // which enforce `^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`. SQL injection is not
+    // possible through these interpolated identifiers.
     fn init_schema(client: &mut Client, schema_ident: &str, qualified_table: &str) -> Result<()> {
         client.batch_execute(&format!(
             "

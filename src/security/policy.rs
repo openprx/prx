@@ -636,12 +636,10 @@ impl SecurityPolicy {
         }
 
         // At least one command must be present
-        let has_cmd = segments.iter().any(|s| {
+        segments.iter().any(|s| {
             let s = skip_env_assignments(s.trim());
             s.split_whitespace().next().is_some_and(|w| !w.is_empty())
-        });
-
-        has_cmd
+        })
     }
 
     /// Check for dangerous arguments that allow sub-command execution.

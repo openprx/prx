@@ -31,6 +31,7 @@ pub mod signal;
 pub mod signal_native;
 pub mod slack;
 pub mod telegram;
+pub mod terminal;
 pub mod traits;
 pub mod wacli;
 pub mod whatsapp;
@@ -56,6 +57,7 @@ pub use signal::SignalChannel;
 pub use signal_native::SignalNativeChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
+pub use terminal::TerminalChannel;
 pub use traits::{Channel, SendMessage};
 pub use wacli::WacliChannel;
 pub use whatsapp::WhatsAppChannel;
@@ -193,10 +195,10 @@ fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "openprx.service"];
-const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "openprx.service"];
-const OPENRC_STATUS_ARGS: [&str; 2] = ["openprx", "status"];
-const OPENRC_RESTART_ARGS: [&str; 2] = ["openprx", "restart"];
+const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "prx.service"];
+const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "prx.service"];
+const OPENRC_STATUS_ARGS: [&str; 2] = ["prx", "status"];
+const OPENRC_RESTART_ARGS: [&str; 2] = ["prx", "restart"];
 
 #[derive(Clone)]
 struct ChannelRuntimeContext {
@@ -238,6 +240,21 @@ struct ChannelRuntimeContext {
     bot_names: Vec<String>,
     bot_uuids: Vec<String>,
     mention_only_by_channel: HashMap<String, bool>,
+    /// Skill RAG context (present when skill_rag.enabled) for per-message skill selection.
+    skill_rag_ctx: Option<SkillRagContext>,
+}
+
+/// Holds the data needed for per-message skill RAG selection and system prompt rebuild.
+#[derive(Clone)]
+struct SkillRagContext {
+    skills: Arc<Vec<crate::skills::Skill>>,
+    embedder: Arc<dyn crate::memory::embeddings::EmbeddingProvider>,
+    top_k: usize,
+    /// Owned tool descriptions for prompt rebuild.
+    tool_descs_owned: Arc<Vec<(String, String)>>,
+    identity_config: Option<crate::config::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -407,7 +424,7 @@ fn should_process_inbound_message(
 }
 
 fn collect_bot_names(config: &Config) -> Vec<String> {
-    let mut names: Vec<String> = vec!["openprx".to_string()];
+    let mut names: Vec<String> = vec!["prx".to_string()];
 
     if let Ok(Some(aieos_identity)) =
         identity::load_aieos_identity(&config.identity, &config.workspace_dir)
@@ -1054,7 +1071,7 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
 }
 
-fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
+pub(crate) fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
         "exceeds the context window",
@@ -1145,7 +1162,7 @@ fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &P
     if cached_models.is_empty() {
         let _ = writeln!(
             response,
-            "\nNo cached model list found for `{}`. Ask the operator to run `openprx models refresh --provider {}`.",
+            "\nNo cached model list found for `{}`. Ask the operator to run `prx models refresh --provider {}`.",
             current.provider, current.provider
         );
     } else {
@@ -1321,7 +1338,7 @@ async fn build_memory_context(
 /// during `run_tool_call_loop`. Scans assistant messages for `<tool_call>` tags
 /// or native tool-call JSON to collect tool names used.
 /// Returns an empty string when no tools were invoked.
-fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> String {
+pub(crate) fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> String {
     fn push_unique_tool_name(tool_names: &mut Vec<String>, name: &str) {
         let candidate = name.trim();
         if candidate.is_empty() {
@@ -1411,7 +1428,7 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
-fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
@@ -2007,7 +2024,7 @@ fn spawn_scoped_typing_task(
 ) -> tokio::task::JoinHandle<()> {
     let stop_signal = cancellation_token;
     let refresh_interval = Duration::from_secs(CHANNEL_TYPING_REFRESH_INTERVAL_SECS);
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut interval = tokio::time::interval(refresh_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -2025,9 +2042,7 @@ fn spawn_scoped_typing_task(
         if let Err(e) = channel.stop_typing(&recipient).await {
             tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
         }
-    });
-
-    handle
+    })
 }
 
 async fn process_channel_message(
@@ -2214,7 +2229,38 @@ async fn process_channel_message(
         build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await
     };
 
-    let system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
+    // When Skill RAG is enabled, select relevant skills per-message and rebuild
+    // the system prompt (same as chat/mod.rs per-turn skill selection).
+    let base_system_prompt = if let Some(ref rag_ctx) = ctx.skill_rag_ctx {
+        let selected = crate::skills::select_skills_by_relevance(
+            &msg.content,
+            &rag_ctx.skills,
+            rag_ctx.top_k,
+            rag_ctx.embedder.as_ref(),
+        )
+        .await;
+        let tool_descs_ref: Vec<(&str, &str)> = rag_ctx
+            .tool_descs_owned
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let mut prompt = build_system_prompt_with_mode(
+            &ctx.workspace_dir,
+            &ctx.model,
+            &tool_descs_ref,
+            &selected,
+            rag_ctx.identity_config.as_ref(),
+            rag_ctx.bootstrap_max_chars,
+            rag_ctx.native_tools,
+        );
+        if !rag_ctx.native_tools {
+            prompt.push_str(&build_tool_instructions(&ctx.tools_registry));
+        }
+        prompt
+    } else {
+        ctx.system_prompt.to_string()
+    };
+    let system_prompt = build_channel_system_prompt(&base_system_prompt, &msg.channel);
     let rebuild_history = || {
         let prior_turns_raw = ctx
             .conversation_histories
@@ -2310,6 +2356,39 @@ async fn process_channel_message(
         _ => None,
     };
 
+    // ── Tool event forwarding (structured logging for channel messages) ──
+    let (tool_event_tx, mut tool_event_rx) =
+        tokio::sync::mpsc::channel::<crate::agent::loop_::ToolCallNotification>(32);
+    let tool_event_channel_name = msg.channel.clone();
+    let tool_event_sender_name = msg.sender.clone();
+    let tool_event_forwarder = tokio::spawn(async move {
+        while let Some(notif) = tool_event_rx.recv().await {
+            match notif {
+                crate::agent::loop_::ToolCallNotification::Started {
+                    name,
+                    args_summary,
+                } => {
+                    tracing::info!(
+                        channel = %tool_event_channel_name,
+                        sender = %tool_event_sender_name,
+                        tool = %name,
+                        args = %args_summary,
+                        "Tool call started"
+                    );
+                }
+                crate::agent::loop_::ToolCallNotification::Finished { name, success } => {
+                    tracing::info!(
+                        channel = %tool_event_channel_name,
+                        sender = %tool_event_sender_name,
+                        tool = %name,
+                        success,
+                        "Tool call finished"
+                    );
+                }
+            }
+        }
+    });
+
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
@@ -2375,6 +2454,7 @@ async fn process_channel_message(
                     Some(cancellation_token.clone()),
                     delta_tx.clone(),
                     Some(&scope_ctx),
+                    Some(tool_event_tx.clone()),
                 ),
             ) => LlmExecutionResult::Completed(result),
         };
@@ -2443,9 +2523,11 @@ async fn process_channel_message(
     };
 
     drop(delta_tx);
+    drop(tool_event_tx);
     if let Some(handle) = draft_updater {
         let _ = handle.await;
     }
+    let _ = tool_event_forwarder.await;
 
     if let Some(token) = typing_cancellation.as_ref() {
         token.cancel();
@@ -3028,7 +3110,7 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     let mut updated = config.clone();
     let Some(telegram) = updated.channels_config.telegram.as_mut() else {
         anyhow::bail!(
-            "Telegram channel is not configured. Run `openprx onboard --channels-only` first"
+            "Telegram channel is not configured. Run `prx onboard --channels-only` first"
         );
     };
 
@@ -3058,13 +3140,13 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
         }
         Ok(false) => {
             println!(
-                "ℹ️ No managed daemon service detected. If `openprx daemon`/`channel start` is already running, restart it to load the updated allowlist."
+                "ℹ️ No managed daemon service detected. If `prx daemon`/`channel start` is already running, restart it to load the updated allowlist."
             );
         }
         Err(e) => {
             eprintln!(
                 "⚠️ Allowlist saved, but failed to reload daemon service automatically: {e}\n\
-                 Restart service manually with `openprx service stop && openprx service start`."
+                 Restart service manually with `prx service stop && prx service start`."
             );
         }
     }
@@ -3079,7 +3161,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
         let plist = home
             .join("Library")
             .join("LaunchAgents")
-            .join("com.openprx.daemon.plist");
+            .join("com.prx.daemon.plist");
         if !plist.exists() {
             return Ok(false);
         }
@@ -3089,15 +3171,15 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
             .output()
             .context("Failed to query launchctl list")?;
         let listed = String::from_utf8_lossy(&list_output.stdout);
-        if !listed.contains("com.openprx.daemon") {
+        if !listed.contains("com.prx.daemon") {
             return Ok(false);
         }
 
         let _ = Command::new("launchctl")
-            .args(["stop", "com.openprx.daemon"])
+            .args(["stop", "com.prx.daemon"])
             .output();
         let start_output = Command::new("launchctl")
-            .args(["start", "com.openprx.daemon"])
+            .args(["start", "com.prx.daemon"])
             .output()
             .context("Failed to start launchd daemon service")?;
         if !start_output.status.success() {
@@ -3110,7 +3192,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
 
     if cfg!(target_os = "linux") {
         // OpenRC (system-wide) takes precedence over systemd (user-level)
-        let openrc_init_script = PathBuf::from("/etc/init.d/openprx");
+        let openrc_init_script = PathBuf::from("/etc/init.d/prx");
         if openrc_init_script.exists() {
             if let Ok(status_output) = Command::new("rc-service").args(OPENRC_STATUS_ARGS).output()
             {
@@ -3137,7 +3219,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
             .join(".config")
             .join("systemd")
             .join("user")
-            .join("openprx.service");
+            .join("prx.service");
         if !unit_path.exists() {
             return Ok(false);
         }
@@ -3208,9 +3290,9 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
                     "  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`)."
                 );
             }
-            println!("\nTo start channels: openprx channel start");
-            println!("To check health:    openprx channel doctor");
-            println!("To configure:      openprx onboard");
+            println!("\nTo start channels: prx channel start");
+            println!("To check health:    prx channel doctor");
+            println!("To configure:      prx onboard");
             Ok(())
         }
         crate::ChannelCommands::Add {
@@ -3218,7 +3300,7 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             config: _,
         } => {
             anyhow::bail!(
-                "Channel type '{channel_type}' — use `openprx onboard` to configure channels"
+                "Channel type '{channel_type}' — use `prx onboard` to configure channels"
             );
         }
         crate::ChannelCommands::Remove { name } => {
@@ -3472,7 +3554,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
-        println!("No real-time channels configured. Run `openprx onboard` first.");
+        println!("No real-time channels configured. Run `prx onboard` first.");
         return Ok(());
     }
 
@@ -3504,7 +3586,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if config.channels_config.webhook.is_some() {
-        println!("  ℹ️  Webhook   check via `openprx gateway` then GET /health");
+        println!("  ℹ️  Webhook   check via `prx gateway` then GET /health");
     }
 
     println!();
@@ -3595,7 +3677,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config,
     );
 
-    let skills = crate::skills::load_skills_with_config(&workspace, &config);
+    let skill_embedder =
+        crate::memory::create_embedder_from_config(&config, config.api_key.as_deref());
+    let mut skills = crate::skills::load_skills_with_config(&workspace, &config);
+    if config.skill_rag.enabled {
+        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
+    }
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -3707,6 +3794,25 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 .join(", ")
         );
     }
+
+    // Build Skill RAG context for per-message skill selection (when enabled)
+    let skill_rag_ctx = if config.skill_rag.enabled {
+        let tool_descs_owned: Vec<(String, String)> = tool_descs
+            .iter()
+            .map(|(a, b)| ((*a).to_string(), (*b).to_string()))
+            .collect();
+        Some(SkillRagContext {
+            skills: Arc::new(skills),
+            embedder: skill_embedder,
+            top_k: config.skill_rag.top_k,
+            tool_descs_owned: Arc::new(tool_descs_owned),
+            identity_config: Some(config.identity.clone()),
+            bootstrap_max_chars,
+            native_tools,
+        })
+    } else {
+        None
+    };
 
     // Collect active channels
     let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
@@ -3925,7 +4031,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
-        println!("No channels configured. Run `openprx onboard` to set up channels.");
+        println!("No channels configured. Run `prx onboard` to set up channels.");
         return Ok(());
     }
 
@@ -4245,6 +4351,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         bot_names,
         bot_uuids,
         mention_only_by_channel,
+        skill_rag_ctx,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -4432,9 +4539,10 @@ mod tests {
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            skill_rag_ctx: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -5080,7 +5188,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -5089,6 +5197,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -5153,7 +5262,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -5162,6 +5271,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -5226,7 +5336,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -5235,6 +5345,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -5302,7 +5413,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -5311,6 +5422,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -5376,7 +5488,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -5385,6 +5497,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -5456,7 +5569,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -5465,6 +5578,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -5558,7 +5672,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -5567,6 +5681,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -5639,7 +5754,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -5648,6 +5763,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -5737,7 +5853,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -5746,6 +5862,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -5868,7 +5985,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -5877,6 +5994,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -5942,7 +6060,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -5951,6 +6069,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -6135,7 +6254,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -6144,6 +6263,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -6230,7 +6350,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: true,
@@ -6239,6 +6359,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6334,7 +6455,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: true,
@@ -6343,6 +6464,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -6423,7 +6545,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -6432,6 +6554,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -6919,7 +7042,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -6928,6 +7051,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -7016,7 +7140,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -7025,6 +7149,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -7109,7 +7234,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             signal_inbound_policy: None,
             whatsapp_inbound_policy: None,
-            bot_names: vec!["openprx".to_string()],
+            bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
@@ -7118,6 +7243,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
                 crate::config::ToolPolicyConfig::default(),
             )),
+            skill_rag_ctx: None,
         });
 
         process_channel_message(
@@ -7570,17 +7696,17 @@ After"#;
     fn maybe_restart_daemon_systemd_args_regression() {
         assert_eq!(
             SYSTEMD_STATUS_ARGS,
-            ["--user", "is-active", "openprx.service"]
+            ["--user", "is-active", "prx.service"]
         );
         assert_eq!(
             SYSTEMD_RESTART_ARGS,
-            ["--user", "restart", "openprx.service"]
+            ["--user", "restart", "prx.service"]
         );
     }
 
     #[test]
     fn maybe_restart_daemon_openrc_args_regression() {
-        assert_eq!(OPENRC_STATUS_ARGS, ["openprx", "status"]);
-        assert_eq!(OPENRC_RESTART_ARGS, ["openprx", "restart"]);
+        assert_eq!(OPENRC_STATUS_ARGS, ["prx", "status"]);
+        assert_eq!(OPENRC_RESTART_ARGS, ["prx", "restart"]);
     }
 }

@@ -151,6 +151,22 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Atomically claim a cron job for execution. Returns true if claimed.
+///
+/// Uses an UPDATE with a WHERE guard so that only one instance can transition
+/// the job from a non-running state to `running`. This prevents duplicate
+/// execution when multiple scheduler instances poll the same database.
+pub fn claim_job(config: &Config, job_id: &str) -> Result<bool> {
+    with_connection(config, |conn| {
+        let changed = conn.execute(
+            "UPDATE cron_jobs SET last_status = 'running'
+             WHERE id = ?1 AND enabled = 1 AND (last_status IS NULL OR last_status != 'running')",
+            params![job_id],
+        )?;
+        Ok(changed > 0)
+    })
+}
+
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let lim = i64::try_from(config.scheduler.max_tasks.max(1))
         .context("Scheduler max_tasks overflows i64")?;
@@ -214,7 +230,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     }
 
     with_connection(config, |conn| {
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                  session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
@@ -237,6 +253,9 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             ],
         )
         .context("Failed to update cron job")?;
+        if changed == 0 {
+            anyhow::bail!("cron job '{}' was deleted or modified concurrently", job.id);
+        }
         Ok(())
     })?;
 
@@ -511,6 +530,9 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
 
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
+
+    // Avoid SQLITE_BUSY under concurrent scheduler + CLI access
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
