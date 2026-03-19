@@ -102,7 +102,7 @@ impl WasmMiddleware {
 
         // Navigate to the exported interface: prx:plugin/middleware-exports@0.1.0
         let iface_idx = instance
-            .get_export(
+            .get_export_index(
                 store.as_context_mut(),
                 None,
                 "prx:plugin/middleware-exports@0.1.0",
@@ -114,7 +114,7 @@ impl WasmMiddleware {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "process")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "process")
             .ok_or_else(|| {
                 PluginError::Runtime("process not found in middleware-exports".to_string())
             })?;
@@ -143,26 +143,23 @@ impl WasmMiddleware {
                 "middleware '{}' process error: {e}",
                 self.plugin_name
             ))),
-            Ok(Ok(())) => {
-                func.post_return_async(&mut *store).await.ok();
-                // Parse the result variant
-                match &results[0] {
-                    wasmtime::component::Val::Result(r) => match r.as_ref() {
-                        Ok(Some(b)) => match b.as_ref() {
-                            wasmtime::component::Val::String(s) => Ok(s.to_string()),
-                            _ => Ok(data_json.to_string()),
-                        },
-                        Err(Some(b)) => match b.as_ref() {
-                            wasmtime::component::Val::String(e) => Err(PluginError::Runtime(
-                                format!("middleware '{}' returned error: {e}", self.plugin_name),
-                            )),
-                            _ => Ok(data_json.to_string()),
-                        },
+            Ok(Ok(())) => match &results[0] {
+                wasmtime::component::Val::Result(r) => match r.as_ref() {
+                    Ok(Some(b)) => match b.as_ref() {
+                        wasmtime::component::Val::String(s) => Ok(s.to_string()),
+                        _ => Ok(data_json.to_string()),
+                    },
+                    Err(Some(b)) => match b.as_ref() {
+                        wasmtime::component::Val::String(e) => Err(PluginError::Runtime(format!(
+                            "middleware '{}' returned error: {e}",
+                            self.plugin_name
+                        ))),
                         _ => Ok(data_json.to_string()),
                     },
                     _ => Ok(data_json.to_string()),
-                }
-            }
+                },
+                _ => Ok(data_json.to_string()),
+            },
         }
     }
 

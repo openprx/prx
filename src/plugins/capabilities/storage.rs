@@ -115,7 +115,7 @@ impl WasmStorage {
         store: &mut wasmtime::Store<HostState>,
     ) -> PluginResult<String> {
         let iface_idx = instance
-            .get_export(
+            .get_export_index(
                 store.as_context_mut(),
                 None,
                 "prx:plugin/storage-exports@0.1.0",
@@ -127,7 +127,7 @@ impl WasmStorage {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "name")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "name")
             .ok_or_else(|| {
                 PluginError::Instantiation("name not found in storage-exports".to_string())
             })?;
@@ -141,11 +141,6 @@ impl WasmStorage {
             .call_async(store.as_context_mut(), &[], &mut results)
             .await
             .map_err(|e| PluginError::Runtime(format!("name() call failed: {e}")))?;
-
-        name_fn
-            .post_return_async(store.as_context_mut())
-            .await
-            .map_err(|e| PluginError::Runtime(format!("name() post_return failed: {e}")))?;
 
         match &results[0] {
             wasmtime::component::Val::String(s) => Ok(s.to_string()),
@@ -170,7 +165,7 @@ impl WasmStorage {
         } = *inner;
 
         let iface_idx = instance
-            .get_export(
+            .get_export_index(
                 store.as_context_mut(),
                 None,
                 "prx:plugin/storage-exports@0.1.0",
@@ -182,7 +177,7 @@ impl WasmStorage {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "store-memory")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "store-memory")
             .ok_or_else(|| {
                 PluginError::Runtime("store-memory not found in storage-exports".to_string())
             })?;
@@ -210,11 +205,6 @@ impl WasmStorage {
             .call_async(store.as_context_mut(), &params, &mut results)
             .await
             .map_err(|e| PluginError::Runtime(format!("store-memory() call failed: {e}")))?;
-
-        store_fn
-            .post_return_async(store.as_context_mut())
-            .await
-            .map_err(|e| PluginError::Runtime(format!("store-memory() post_return failed: {e}")))?;
 
         // Parse result<_, string>
         match &results[0] {
@@ -255,7 +245,7 @@ impl WasmStorage {
         } = *inner;
 
         let iface_idx = instance
-            .get_export(
+            .get_export_index(
                 store.as_context_mut(),
                 None,
                 "prx:plugin/storage-exports@0.1.0",
@@ -267,7 +257,7 @@ impl WasmStorage {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "recall-memory")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "recall-memory")
             .ok_or_else(|| {
                 PluginError::Runtime("recall-memory not found in storage-exports".to_string())
             })?;
@@ -294,13 +284,6 @@ impl WasmStorage {
             .call_async(store.as_context_mut(), &params, &mut results)
             .await
             .map_err(|e| PluginError::Runtime(format!("recall-memory() call failed: {e}")))?;
-
-        recall_fn
-            .post_return_async(store.as_context_mut())
-            .await
-            .map_err(|e| {
-                PluginError::Runtime(format!("recall-memory() post_return failed: {e}"))
-            })?;
 
         // Parse result<list<memory-entry>, string>
         match &results[0] {
@@ -337,7 +320,7 @@ impl WasmStorage {
         } = *inner;
 
         let iface_idx = instance
-            .get_export(
+            .get_export_index(
                 store.as_context_mut(),
                 None,
                 "prx:plugin/storage-exports@0.1.0",
@@ -349,7 +332,7 @@ impl WasmStorage {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "forget-memory")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "forget-memory")
             .ok_or_else(|| {
                 PluginError::Runtime("forget-memory not found in storage-exports".to_string())
             })?;
@@ -365,13 +348,6 @@ impl WasmStorage {
             .call_async(store.as_context_mut(), &params, &mut results)
             .await
             .map_err(|e| PluginError::Runtime(format!("forget-memory() call failed: {e}")))?;
-
-        forget_fn
-            .post_return_async(store.as_context_mut())
-            .await
-            .map_err(|e| {
-                PluginError::Runtime(format!("forget-memory() post_return failed: {e}"))
-            })?;
 
         // Parse result<bool, string>
         match &results[0] {
@@ -411,7 +387,7 @@ impl WasmStorage {
         } = *inner;
 
         let iface_idx = instance
-            .get_export(
+            .get_export_index(
                 store.as_context_mut(),
                 None,
                 "prx:plugin/storage-exports@0.1.0",
@@ -423,7 +399,7 @@ impl WasmStorage {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "count-memories")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "count-memories")
             .ok_or_else(|| {
                 PluginError::Runtime("count-memories not found in storage-exports".to_string())
             })?;
@@ -438,13 +414,6 @@ impl WasmStorage {
             .call_async(store.as_context_mut(), &[], &mut results)
             .await
             .map_err(|e| PluginError::Runtime(format!("count-memories() call failed: {e}")))?;
-
-        count_fn
-            .post_return_async(store.as_context_mut())
-            .await
-            .map_err(|e| {
-                PluginError::Runtime(format!("count-memories() post_return failed: {e}"))
-            })?;
 
         // Parse result<u32, string>
         match &results[0] {
@@ -484,7 +453,7 @@ impl WasmStorage {
         } = *inner;
 
         let iface_idx = instance
-            .get_export(
+            .get_export_index(
                 store.as_context_mut(),
                 None,
                 "prx:plugin/storage-exports@0.1.0",
@@ -496,7 +465,7 @@ impl WasmStorage {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "health-check")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "health-check")
             .ok_or_else(|| {
                 PluginError::Runtime("health-check not found in storage-exports".to_string())
             })?;
@@ -511,11 +480,6 @@ impl WasmStorage {
             .call_async(store.as_context_mut(), &[], &mut results)
             .await
             .map_err(|e| PluginError::Runtime(format!("health-check() call failed: {e}")))?;
-
-        health_fn
-            .post_return_async(store.as_context_mut())
-            .await
-            .map_err(|e| PluginError::Runtime(format!("health-check() post_return failed: {e}")))?;
 
         match &results[0] {
             wasmtime::component::Val::Bool(b) => Ok(*b),

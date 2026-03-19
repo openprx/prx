@@ -79,7 +79,7 @@ impl WasmCronJob {
 
         // Navigate to the exported interface: prx:plugin/cron-exports@0.1.0
         let iface_idx = instance
-            .get_export(
+            .get_export_index(
                 store.as_context_mut(),
                 None,
                 "prx:plugin/cron-exports@0.1.0",
@@ -91,7 +91,7 @@ impl WasmCronJob {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "run")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "run")
             .ok_or_else(|| PluginError::Runtime("run not found in cron-exports".to_string()))?;
 
         let func = instance
@@ -113,25 +113,23 @@ impl WasmCronJob {
                 "cron '{}' run error: {e}",
                 self.plugin_name
             ))),
-            Ok(Ok(())) => {
-                func.post_return_async(&mut *store).await.ok();
-                match &results[0] {
-                    wasmtime::component::Val::Result(r) => match r.as_ref() {
-                        Ok(Some(b)) => match b.as_ref() {
-                            wasmtime::component::Val::String(s) => Ok(s.to_string()),
-                            _ => Ok(String::new()),
-                        },
-                        Err(Some(b)) => match b.as_ref() {
-                            wasmtime::component::Val::String(e) => Err(PluginError::Runtime(
-                                format!("cron '{}' returned error: {e}", self.plugin_name),
-                            )),
-                            _ => Ok(String::new()),
-                        },
+            Ok(Ok(())) => match &results[0] {
+                wasmtime::component::Val::Result(r) => match r.as_ref() {
+                    Ok(Some(b)) => match b.as_ref() {
+                        wasmtime::component::Val::String(s) => Ok(s.to_string()),
+                        _ => Ok(String::new()),
+                    },
+                    Err(Some(b)) => match b.as_ref() {
+                        wasmtime::component::Val::String(e) => Err(PluginError::Runtime(format!(
+                            "cron '{}' returned error: {e}",
+                            self.plugin_name
+                        ))),
                         _ => Ok(String::new()),
                     },
                     _ => Ok(String::new()),
-                }
-            }
+                },
+                _ => Ok(String::new()),
+            },
         }
     }
 

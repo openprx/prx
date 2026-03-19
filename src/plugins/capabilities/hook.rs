@@ -87,13 +87,9 @@ impl WasmHook {
 
         // Navigate to the exported interface with compatibility fallback.
         let iface_name_candidates = ["prx:plugin/hook-exports@0.1.0", "prx:plugin/hook-exports"];
-        let (_iface_name, iface_idx) = iface_name_candidates
+        let iface_idx = iface_name_candidates
             .iter()
-            .find_map(|name| {
-                instance
-                    .get_export(store.as_context_mut(), None, name)
-                    .map(|idx| (*name, idx))
-            })
+            .find_map(|name| instance.get_export_index(store.as_context_mut(), None, name))
             .ok_or_else(|| {
                 PluginError::Runtime(format!(
                     "plugin does not export any supported hook interface: {}",
@@ -102,7 +98,7 @@ impl WasmHook {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "on-event")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "on-event")
             .ok_or_else(|| {
                 PluginError::Runtime("on-event not found in hook-exports".to_string())
             })?;
@@ -129,22 +125,19 @@ impl WasmHook {
                 "hook '{}' on-event error: {e}",
                 self.plugin_name
             ))),
-            Ok(Ok(())) => {
-                func.post_return_async(&mut *store).await.ok();
-                // Check for error result
-                match &results[0] {
-                    wasmtime::component::Val::Result(r) => match r.as_ref() {
-                        Err(Some(b)) => match b.as_ref() {
-                            wasmtime::component::Val::String(e) => Err(PluginError::Runtime(
-                                format!("hook '{}' returned error: {e}", self.plugin_name),
-                            )),
-                            _ => Ok(()),
-                        },
+            Ok(Ok(())) => match &results[0] {
+                wasmtime::component::Val::Result(r) => match r.as_ref() {
+                    Err(Some(b)) => match b.as_ref() {
+                        wasmtime::component::Val::String(e) => Err(PluginError::Runtime(format!(
+                            "hook '{}' returned error: {e}",
+                            self.plugin_name
+                        ))),
                         _ => Ok(()),
                     },
                     _ => Ok(()),
-                }
-            }
+                },
+                _ => Ok(()),
+            },
         }
     }
 
