@@ -118,7 +118,7 @@ impl WasmProvider {
         store: &mut wasmtime::Store<HostState>,
     ) -> PluginResult<String> {
         let iface_idx = instance
-            .get_export(
+            .get_export_index(
                 store.as_context_mut(),
                 None,
                 "prx:plugin/provider-exports@0.1.0",
@@ -130,7 +130,7 @@ impl WasmProvider {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "name")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "name")
             .ok_or_else(|| {
                 PluginError::Instantiation("name not found in provider-exports".to_string())
             })?;
@@ -144,11 +144,6 @@ impl WasmProvider {
             .call_async(store.as_context_mut(), &[], &mut results)
             .await
             .map_err(|e| PluginError::Runtime(format!("name() call failed: {e}")))?;
-
-        name_fn
-            .post_return_async(store.as_context_mut())
-            .await
-            .map_err(|e| PluginError::Runtime(format!("name() post_return failed: {e}")))?;
 
         match &results[0] {
             wasmtime::component::Val::String(s) => Ok(s.to_string()),
@@ -173,7 +168,7 @@ impl WasmProvider {
 
         // Navigate to prx:plugin/provider-exports@0.1.0 → chat
         let iface_idx = instance
-            .get_export(
+            .get_export_index(
                 store.as_context_mut(),
                 None,
                 "prx:plugin/provider-exports@0.1.0",
@@ -185,7 +180,7 @@ impl WasmProvider {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "chat")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "chat")
             .ok_or_else(|| {
                 PluginError::Runtime("chat not found in provider-exports".to_string())
             })?;
@@ -222,11 +217,6 @@ impl WasmProvider {
             .call_async(store.as_context_mut(), &params, &mut results)
             .await
             .map_err(|e| PluginError::Runtime(format!("chat() call failed: {e}")))?;
-
-        chat_fn
-            .post_return_async(store.as_context_mut())
-            .await
-            .map_err(|e| PluginError::Runtime(format!("chat() post_return failed: {e}")))?;
 
         // Parse result<chat-response, string>
         match &results[0] {

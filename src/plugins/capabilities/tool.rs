@@ -111,7 +111,7 @@ impl WasmToolAdapter {
     ) -> Result<(), PluginError> {
         // Add WASI interfaces to the linker so WASM components that import
         // wasi:* (e.g. wasi:cli/environment) resolve correctly.
-        wasmtime_wasi::add_to_linker_async(linker)
+        wasmtime_wasi::p2::add_to_linker_async(linker)
             .map_err(|e| PluginError::Instantiation(format!("WASI link: {e}")))?;
 
         // log and config are identical across all capability types — use the
@@ -375,13 +375,9 @@ impl WasmToolAdapter {
     ) -> Result<ToolSpec, PluginError> {
         // Navigate to the exported interface with compatibility fallback.
         let iface_name_candidates = ["prx:plugin/tool-exports@0.1.0", "prx:plugin/tool-exports"];
-        let (_iface_name, iface_idx) = iface_name_candidates
+        let iface_idx = iface_name_candidates
             .iter()
-            .find_map(|name| {
-                instance
-                    .get_export(store.as_context_mut(), None, name)
-                    .map(|idx| (*name, idx))
-            })
+            .find_map(|name| instance.get_export_index(store.as_context_mut(), None, name))
             .ok_or_else(|| {
                 PluginError::Instantiation(format!(
                     "plugin does not export any supported tool interface: {}",
@@ -391,7 +387,7 @@ impl WasmToolAdapter {
 
         // Get the get-spec function from within that interface
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "get-spec")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "get-spec")
             .ok_or_else(|| {
                 PluginError::Instantiation("get-spec not found in tool-exports".to_string())
             })?;
@@ -445,12 +441,6 @@ impl WasmToolAdapter {
                 ));
             }
         };
-
-        // Post-return cleanup
-        get_spec_fn
-            .post_return_async(store.as_context_mut())
-            .await
-            .map_err(|e| PluginError::Runtime(format!("get-spec post_return failed: {e}")))?;
 
         let parameters: serde_json::Value = serde_json::from_str(&params_schema)
             .unwrap_or_else(|_| serde_json::json!({"type": "object", "properties": {}}));
@@ -512,13 +502,9 @@ impl WasmToolAdapter {
 
         // Navigate to execute function with compatibility fallback.
         let iface_name_candidates = ["prx:plugin/tool-exports@0.1.0", "prx:plugin/tool-exports"];
-        let (_iface_name, iface_idx) = iface_name_candidates
+        let iface_idx = iface_name_candidates
             .iter()
-            .find_map(|name| {
-                instance
-                    .get_export(store.as_context_mut(), None, name)
-                    .map(|idx| (*name, idx))
-            })
+            .find_map(|name| instance.get_export_index(store.as_context_mut(), None, name))
             .ok_or_else(|| {
                 PluginError::Runtime(format!(
                     "plugin does not export any supported tool interface: {}",
@@ -527,7 +513,7 @@ impl WasmToolAdapter {
             })?;
 
         let func_idx = instance
-            .get_export(store.as_context_mut(), Some(&iface_idx), "execute")
+            .get_export_index(store.as_context_mut(), Some(&iface_idx), "execute")
             .ok_or_else(|| PluginError::Runtime("execute not found in tool-exports".to_string()))?;
 
         let execute_fn = instance
@@ -580,12 +566,6 @@ impl WasmToolAdapter {
                 ));
             }
         };
-
-        // Post-return cleanup
-        execute_fn
-            .post_return_async(store.as_context_mut())
-            .await
-            .map_err(|e| PluginError::Runtime(format!("execute post_return failed: {e}")))?;
 
         Ok(ToolResult {
             success,

@@ -354,16 +354,12 @@ pub(crate) async fn websocket_close_with(
 // ── WASI trait implementations ──
 
 #[cfg(feature = "wasm-plugins")]
-impl wasmtime_wasi::IoView for HostState {
-    fn table(&mut self) -> &mut wasmtime::component::ResourceTable {
-        &mut self.wasi_table
-    }
-}
-
-#[cfg(feature = "wasm-plugins")]
 impl wasmtime_wasi::WasiView for HostState {
-    fn ctx(&mut self) -> &mut wasmtime_wasi::WasiCtx {
-        &mut self.wasi_ctx
+    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+        wasmtime_wasi::WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.wasi_table,
+        }
     }
 }
 
