@@ -143,6 +143,10 @@ pub struct Config {
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
 
+    /// Xin (心) autonomous task engine configuration (`[xin]`).
+    #[serde(default)]
+    pub xin: crate::xin::XinConfig,
+
     /// Cron job configuration (`[cron]`).
     #[serde(default)]
     pub cron: CronConfig,
@@ -2087,17 +2091,28 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
-        std::env::set_var(key, &value);
-        std::env::set_var(lowercase_key, value);
+        // SAFETY: Called during single-threaded config initialization (apply_env_overrides)
+        // before any concurrent HTTP clients read these variables.
+        unsafe {
+            std::env::set_var(key, &value);
+            std::env::set_var(lowercase_key, value);
+        }
     } else {
-        std::env::remove_var(key);
-        std::env::remove_var(lowercase_key);
+        // SAFETY: Same single-threaded initialization context as set branch above.
+        unsafe {
+            std::env::remove_var(key);
+            std::env::remove_var(lowercase_key);
+        }
     }
 }
 
 fn clear_proxy_env_pair(key: &str) {
-    std::env::remove_var(key);
-    std::env::remove_var(key.to_ascii_lowercase());
+    // SAFETY: Called during single-threaded config initialization to clear stale
+    // proxy env vars before any concurrent HTTP clients are created.
+    unsafe {
+        std::env::remove_var(key);
+        std::env::remove_var(key.to_ascii_lowercase());
+    }
 }
 
 fn runtime_proxy_state() -> &'static RwLock<ProxyConfig> {
@@ -2225,7 +2240,7 @@ pub fn build_runtime_proxy_client_with_timeouts(
 fn parse_proxy_scope(raw: &str) -> Option<ProxyScope> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "environment" | "env" => Some(ProxyScope::Environment),
-        "openprx" | "internal" | "core" => Some(ProxyScope::Zeroclaw),
+        "prx" | "internal" | "core" => Some(ProxyScope::Zeroclaw),
         "services" | "service" => Some(ProxyScope::Services),
         _ => None,
     }
@@ -2486,7 +2501,7 @@ pub struct ObservabilityConfig {
     #[serde(default)]
     pub otel_endpoint: Option<String>,
 
-    /// Service name reported to the OTel collector. Defaults to "openprx".
+    /// Service name reported to the OTel collector. Defaults to "prx".
     #[serde(default)]
     pub otel_service_name: Option<String>,
 }
@@ -4101,6 +4116,7 @@ impl Default for Config {
             task_routing: TaskRoutingConfig::default(),
             router: RouterConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            xin: crate::xin::XinConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
@@ -4413,7 +4429,7 @@ fn encrypt_optional_secret(
 fn config_dir_creation_error(path: &Path) -> String {
     format!(
         "Failed to create config directory: {}. If running as an OpenRC service, \
-         ensure this path is writable by user 'openprx'.",
+         ensure this path is writable by user 'prx'.",
         path.display()
     )
 }
@@ -4977,7 +4993,7 @@ impl Config {
             } else {
                 tracing::warn!(
                     scope = %scope_raw,
-                    "Ignoring invalid ZEROCLAW_PROXY_SCOPE (valid: environment|openprx|services)"
+                    "Ignoring invalid ZEROCLAW_PROXY_SCOPE (valid: environment|prx|services)"
                 );
             }
         }
@@ -5176,6 +5192,18 @@ mod tests {
     use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
 
+    /// Helper to set env vars in tests (unsafe in edition 2024).
+    fn test_set_env(key: impl AsRef<std::ffi::OsStr>, value: impl AsRef<std::ffi::OsStr>) {
+        // SAFETY: tests run single-threaded via serial test mutex or unique env keys.
+        unsafe { std::env::set_var(key, value) }
+    }
+
+    /// Helper to remove env vars in tests (unsafe in edition 2024).
+    fn test_remove_env(key: impl AsRef<std::ffi::OsStr>) {
+        // SAFETY: tests run single-threaded via serial test mutex or unique env keys.
+        unsafe { std::env::remove_var(key) }
+    }
+
     // ── Defaults ─────────────────────────────────────────────
 
     #[test]
@@ -5192,10 +5220,10 @@ mod tests {
 
     #[test]
     async fn config_dir_creation_error_mentions_openrc_and_path() {
-        let msg = config_dir_creation_error(Path::new("/etc/openprx"));
-        assert!(msg.contains("/etc/openprx"));
+        let msg = config_dir_creation_error(Path::new("/etc/prx"));
+        assert!(msg.contains("/etc/prx"));
         assert!(msg.contains("OpenRC"));
-        assert!(msg.contains("openprx"));
+        assert!(msg.contains("prx"));
     }
 
     #[test]
@@ -5395,6 +5423,7 @@ default_temperature = 0.7
                 ..HeartbeatConfig::default()
             },
             cron: CronConfig::default(),
+            xin: crate::xin::XinConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
                 telegram: Some(TelegramConfig {
@@ -5693,6 +5722,7 @@ concurrency_rollback_error_rate_threshold = 0.23
             task_routing: TaskRoutingConfig::default(),
             router: RouterConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            xin: crate::xin::XinConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
@@ -6920,7 +6950,7 @@ default_temperature = 0.7
             "all_proxy",
             "no_proxy",
         ] {
-            std::env::remove_var(key);
+            test_remove_env(key);
         }
     }
 
@@ -6930,11 +6960,11 @@ default_temperature = 0.7
         let mut config = Config::default();
         assert!(config.api_key.is_none());
 
-        std::env::set_var("ZEROCLAW_API_KEY", "sk-test-env-key");
+        test_set_env("ZEROCLAW_API_KEY", "sk-test-env-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("sk-test-env-key"));
 
-        std::env::remove_var("ZEROCLAW_API_KEY");
+        test_remove_env("ZEROCLAW_API_KEY");
     }
 
     #[test]
@@ -6942,12 +6972,12 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_API_KEY");
-        std::env::set_var("API_KEY", "sk-fallback-key");
+        test_remove_env("ZEROCLAW_API_KEY");
+        test_set_env("API_KEY", "sk-fallback-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("sk-fallback-key"));
 
-        std::env::remove_var("API_KEY");
+        test_remove_env("API_KEY");
     }
 
     #[test]
@@ -6955,11 +6985,11 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_PROVIDER", "anthropic");
+        test_set_env("ZEROCLAW_PROVIDER", "anthropic");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
+        test_remove_env("ZEROCLAW_PROVIDER");
     }
 
     #[test]
@@ -6969,8 +6999,8 @@ default_temperature = 0.7
         assert!(!config.skills.open_skills_enabled);
         assert!(config.skills.open_skills_dir.is_none());
 
-        std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
-        std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
+        test_set_env("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
+        test_set_env("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
@@ -6979,8 +7009,8 @@ default_temperature = 0.7
             Some("/tmp/open-skills")
         );
 
-        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
-        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR");
+        test_remove_env("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        test_remove_env("ZEROCLAW_OPEN_SKILLS_DIR");
     }
 
     #[test]
@@ -6989,11 +7019,11 @@ default_temperature = 0.7
         let mut config = Config::default();
         config.skills.open_skills_enabled = true;
 
-        std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
+        test_set_env("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
-        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        test_remove_env("ZEROCLAW_OPEN_SKILLS_ENABLED");
     }
 
     #[test]
@@ -7001,12 +7031,12 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
-        std::env::set_var("PROVIDER", "openai");
+        test_remove_env("ZEROCLAW_PROVIDER");
+        test_set_env("PROVIDER", "openai");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
 
-        std::env::remove_var("PROVIDER");
+        test_remove_env("PROVIDER");
     }
 
     #[test]
@@ -7017,15 +7047,15 @@ default_temperature = 0.7
             ..Config::default()
         };
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
-        std::env::set_var("PROVIDER", "openrouter");
+        test_remove_env("ZEROCLAW_PROVIDER");
+        test_set_env("PROVIDER", "openrouter");
         config.apply_env_overrides();
         assert_eq!(
             config.default_provider.as_deref(),
             Some("custom:https://proxy.example.com/v1")
         );
 
-        std::env::remove_var("PROVIDER");
+        test_remove_env("PROVIDER");
     }
 
     #[test]
@@ -7036,13 +7066,13 @@ default_temperature = 0.7
             ..Config::default()
         };
 
-        std::env::set_var("ZEROCLAW_PROVIDER", "openrouter");
-        std::env::set_var("PROVIDER", "anthropic");
+        test_set_env("ZEROCLAW_PROVIDER", "openrouter");
+        test_set_env("PROVIDER", "anthropic");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
-        std::env::remove_var("PROVIDER");
+        test_remove_env("ZEROCLAW_PROVIDER");
+        test_remove_env("PROVIDER");
     }
 
     #[test]
@@ -7053,11 +7083,11 @@ default_temperature = 0.7
             ..Config::default()
         };
 
-        std::env::set_var("GLM_API_KEY", "glm-regional-key");
+        test_set_env("GLM_API_KEY", "glm-regional-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("glm-regional-key"));
 
-        std::env::remove_var("GLM_API_KEY");
+        test_remove_env("GLM_API_KEY");
     }
 
     #[test]
@@ -7068,11 +7098,11 @@ default_temperature = 0.7
             ..Config::default()
         };
 
-        std::env::set_var("ZAI_API_KEY", "zai-regional-key");
+        test_set_env("ZAI_API_KEY", "zai-regional-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("zai-regional-key"));
 
-        std::env::remove_var("ZAI_API_KEY");
+        test_remove_env("ZAI_API_KEY");
     }
 
     #[test]
@@ -7080,11 +7110,11 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_MODEL", "gpt-4o");
+        test_set_env("ZEROCLAW_MODEL", "gpt-4o");
         config.apply_env_overrides();
         assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
 
-        std::env::remove_var("ZEROCLAW_MODEL");
+        test_remove_env("ZEROCLAW_MODEL");
     }
 
     #[test]
@@ -7092,15 +7122,15 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_MODEL");
-        std::env::set_var("MODEL", "anthropic/claude-3.5-sonnet");
+        test_remove_env("ZEROCLAW_MODEL");
+        test_set_env("MODEL", "anthropic/claude-3.5-sonnet");
         config.apply_env_overrides();
         assert_eq!(
             config.default_model.as_deref(),
             Some("anthropic/claude-3.5-sonnet")
         );
 
-        std::env::remove_var("MODEL");
+        test_remove_env("MODEL");
     }
 
     #[test]
@@ -7108,11 +7138,11 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace");
+        test_set_env("ZEROCLAW_WORKSPACE", "/custom/workspace");
         config.apply_env_overrides();
         assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        test_remove_env("ZEROCLAW_WORKSPACE");
     }
 
     #[test]
@@ -7122,7 +7152,7 @@ default_temperature = 0.7
         let default_workspace_dir = default_config_dir.join("workspace");
         let workspace_dir = default_config_dir.join("profile-a");
 
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        test_set_env("ZEROCLAW_WORKSPACE", &workspace_dir);
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -7132,7 +7162,7 @@ default_temperature = 0.7
         assert_eq!(config_dir, workspace_dir);
         assert_eq!(resolved_workspace_dir, workspace_dir.join("workspace"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        test_remove_env("ZEROCLAW_WORKSPACE");
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -7153,8 +7183,8 @@ default_temperature = 0.7
             .await
             .unwrap();
 
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", &explicit_config_dir);
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        test_set_env("ZEROCLAW_CONFIG_DIR", &explicit_config_dir);
+        test_remove_env("ZEROCLAW_WORKSPACE");
 
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
@@ -7168,7 +7198,7 @@ default_temperature = 0.7
             explicit_config_dir.join("workspace")
         );
 
-        std::env::remove_var("ZEROCLAW_CONFIG_DIR");
+        test_remove_env("ZEROCLAW_CONFIG_DIR");
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -7180,7 +7210,7 @@ default_temperature = 0.7
         let marker_config_dir = default_config_dir.join("profiles").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        test_remove_env("ZEROCLAW_WORKSPACE");
         fs::create_dir_all(&default_config_dir).await.unwrap();
         let state = ActiveWorkspaceState {
             config_dir: marker_config_dir.to_string_lossy().into_owned(),
@@ -7207,7 +7237,7 @@ default_temperature = 0.7
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let default_workspace_dir = default_config_dir.join("workspace");
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        test_remove_env("ZEROCLAW_WORKSPACE");
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -7228,8 +7258,8 @@ default_temperature = 0.7
         let workspace_dir = temp_home.join("profile-a");
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        test_set_env("HOME", &temp_home);
+        test_set_env("ZEROCLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -7237,11 +7267,11 @@ default_temperature = 0.7
         assert_eq!(config.config_path, workspace_dir.join("config.toml"));
         assert!(workspace_dir.join("config.toml").exists());
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        test_remove_env("ZEROCLAW_WORKSPACE");
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            test_set_env("HOME", home);
         } else {
-            std::env::remove_var("HOME");
+            test_remove_env("HOME");
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -7255,8 +7285,8 @@ default_temperature = 0.7
         let legacy_config_path = temp_home.join(".openprx").join("config.toml");
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        test_set_env("HOME", &temp_home);
+        test_set_env("ZEROCLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -7264,11 +7294,11 @@ default_temperature = 0.7
         assert_eq!(config.config_path, legacy_config_path);
         assert!(config.config_path.exists());
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        test_remove_env("ZEROCLAW_WORKSPACE");
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            test_set_env("HOME", home);
         } else {
-            std::env::remove_var("HOME");
+            test_remove_env("HOME");
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -7293,8 +7323,8 @@ default_model = "legacy-model"
         .unwrap();
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        test_set_env("HOME", &temp_home);
+        test_set_env("ZEROCLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -7302,11 +7332,11 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, legacy_config_path);
         assert_eq!(config.default_model.as_deref(), Some("legacy-model"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        test_remove_env("ZEROCLAW_WORKSPACE");
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            test_set_env("HOME", home);
         } else {
-            std::env::remove_var("HOME");
+            test_remove_env("HOME");
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -7327,8 +7357,8 @@ default_model = "legacy-model"
         .unwrap();
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        test_set_env("HOME", &temp_home);
+        test_remove_env("ZEROCLAW_WORKSPACE");
 
         persist_active_workspace_config_dir(&custom_config_dir)
             .await
@@ -7341,9 +7371,9 @@ default_model = "legacy-model"
         assert_eq!(config.default_model.as_deref(), Some("persisted-profile"));
 
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            test_set_env("HOME", home);
         } else {
-            std::env::remove_var("HOME");
+            test_remove_env("HOME");
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -7365,22 +7395,22 @@ default_model = "legacy-model"
         .unwrap();
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
+        test_set_env("HOME", &temp_home);
         persist_active_workspace_config_dir(&marker_config_dir)
             .await
             .unwrap();
-        std::env::set_var("ZEROCLAW_WORKSPACE", &env_workspace_dir);
+        test_set_env("ZEROCLAW_WORKSPACE", &env_workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
         assert_eq!(config.workspace_dir, env_workspace_dir.join("workspace"));
         assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        test_remove_env("ZEROCLAW_WORKSPACE");
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            test_set_env("HOME", home);
         } else {
-            std::env::remove_var("HOME");
+            test_remove_env("HOME");
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -7395,7 +7425,7 @@ default_model = "legacy-model"
         let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
+        test_set_env("HOME", &temp_home);
 
         persist_active_workspace_config_dir(&custom_config_dir)
             .await
@@ -7408,9 +7438,9 @@ default_model = "legacy-model"
         assert!(!marker_path.exists());
 
         if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+            test_set_env("HOME", home);
         } else {
-            std::env::remove_var("HOME");
+            test_remove_env("HOME");
         }
         let _ = fs::remove_dir_all(temp_home).await;
     }
@@ -7421,11 +7451,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         let original_provider = config.default_provider.clone();
 
-        std::env::set_var("ZEROCLAW_PROVIDER", "");
+        test_set_env("ZEROCLAW_PROVIDER", "");
         config.apply_env_overrides();
         assert_eq!(config.default_provider, original_provider);
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
+        test_remove_env("ZEROCLAW_PROVIDER");
     }
 
     #[test]
@@ -7434,11 +7464,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.gateway.port, 16830);
 
-        std::env::set_var("ZEROCLAW_GATEWAY_PORT", "8080");
+        test_set_env("ZEROCLAW_GATEWAY_PORT", "8080");
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, 8080);
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
+        test_remove_env("ZEROCLAW_GATEWAY_PORT");
     }
 
     #[test]
@@ -7446,12 +7476,12 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
-        std::env::set_var("PORT", "9000");
+        test_remove_env("ZEROCLAW_GATEWAY_PORT");
+        test_set_env("PORT", "9000");
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, 9000);
 
-        std::env::remove_var("PORT");
+        test_remove_env("PORT");
     }
 
     #[test]
@@ -7460,11 +7490,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.gateway.host, "127.0.0.1");
 
-        std::env::set_var("ZEROCLAW_GATEWAY_HOST", "0.0.0.0");
+        test_set_env("ZEROCLAW_GATEWAY_HOST", "0.0.0.0");
         config.apply_env_overrides();
         assert_eq!(config.gateway.host, "0.0.0.0");
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_HOST");
+        test_remove_env("ZEROCLAW_GATEWAY_HOST");
     }
 
     #[test]
@@ -7472,12 +7502,12 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_HOST");
-        std::env::set_var("HOST", "0.0.0.0");
+        test_remove_env("ZEROCLAW_GATEWAY_HOST");
+        test_set_env("HOST", "0.0.0.0");
         config.apply_env_overrides();
         assert_eq!(config.gateway.host, "0.0.0.0");
 
-        std::env::remove_var("HOST");
+        test_remove_env("HOST");
     }
 
     #[test]
@@ -7485,31 +7515,31 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_TEMPERATURE", "0.5");
+        test_set_env("ZEROCLAW_TEMPERATURE", "0.5");
         config.apply_env_overrides();
         assert!((config.default_temperature - 0.5).abs() < f64::EPSILON);
 
-        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+        test_remove_env("ZEROCLAW_TEMPERATURE");
     }
 
     #[test]
     async fn env_override_temperature_out_of_range_ignored() {
         let _env_guard = env_override_lock().await;
         // Clean up any leftover env vars from other tests
-        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+        test_remove_env("ZEROCLAW_TEMPERATURE");
 
         let mut config = Config::default();
         let original_temp = config.default_temperature;
 
         // Temperature > 2.0 should be ignored
-        std::env::set_var("ZEROCLAW_TEMPERATURE", "3.0");
+        test_set_env("ZEROCLAW_TEMPERATURE", "3.0");
         config.apply_env_overrides();
         assert!(
             (config.default_temperature - original_temp).abs() < f64::EPSILON,
             "Temperature 3.0 should be ignored (out of range)"
         );
 
-        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+        test_remove_env("ZEROCLAW_TEMPERATURE");
     }
 
     #[test]
@@ -7518,15 +7548,15 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.runtime.reasoning_enabled, None);
 
-        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "false");
+        test_set_env("ZEROCLAW_REASONING_ENABLED", "false");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
-        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "true");
+        test_set_env("ZEROCLAW_REASONING_ENABLED", "true");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(true));
 
-        std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+        test_remove_env("ZEROCLAW_REASONING_ENABLED");
     }
 
     #[test]
@@ -7535,11 +7565,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         config.runtime.reasoning_enabled = Some(false);
 
-        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "maybe");
+        test_set_env("ZEROCLAW_REASONING_ENABLED", "maybe");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
-        std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+        test_remove_env("ZEROCLAW_REASONING_ENABLED");
     }
 
     #[test]
@@ -7548,11 +7578,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         let original_port = config.gateway.port;
 
-        std::env::set_var("PORT", "not_a_number");
+        test_set_env("PORT", "not_a_number");
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, original_port);
 
-        std::env::remove_var("PORT");
+        test_remove_env("PORT");
     }
 
     #[test]
@@ -7560,11 +7590,11 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("WEB_SEARCH_ENABLED", "false");
-        std::env::set_var("WEB_SEARCH_PROVIDER", "brave");
-        std::env::set_var("WEB_SEARCH_MAX_RESULTS", "7");
-        std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "20");
-        std::env::set_var("BRAVE_API_KEY", "brave-test-key");
+        test_set_env("WEB_SEARCH_ENABLED", "false");
+        test_set_env("WEB_SEARCH_PROVIDER", "brave");
+        test_set_env("WEB_SEARCH_MAX_RESULTS", "7");
+        test_set_env("WEB_SEARCH_TIMEOUT_SECS", "20");
+        test_set_env("BRAVE_API_KEY", "brave-test-key");
 
         config.apply_env_overrides();
 
@@ -7577,11 +7607,11 @@ default_model = "legacy-model"
             Some("brave-test-key")
         );
 
-        std::env::remove_var("WEB_SEARCH_ENABLED");
-        std::env::remove_var("WEB_SEARCH_PROVIDER");
-        std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
-        std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
-        std::env::remove_var("BRAVE_API_KEY");
+        test_remove_env("WEB_SEARCH_ENABLED");
+        test_remove_env("WEB_SEARCH_PROVIDER");
+        test_remove_env("WEB_SEARCH_MAX_RESULTS");
+        test_remove_env("WEB_SEARCH_TIMEOUT_SECS");
+        test_remove_env("BRAVE_API_KEY");
     }
 
     #[test]
@@ -7591,16 +7621,16 @@ default_model = "legacy-model"
         let original_max_results = config.web_search.max_results;
         let original_timeout = config.web_search.timeout_secs;
 
-        std::env::set_var("WEB_SEARCH_MAX_RESULTS", "99");
-        std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "0");
+        test_set_env("WEB_SEARCH_MAX_RESULTS", "99");
+        test_set_env("WEB_SEARCH_TIMEOUT_SECS", "0");
 
         config.apply_env_overrides();
 
         assert_eq!(config.web_search.max_results, original_max_results);
         assert_eq!(config.web_search.timeout_secs, original_timeout);
 
-        std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
-        std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
+        test_remove_env("WEB_SEARCH_MAX_RESULTS");
+        test_remove_env("WEB_SEARCH_TIMEOUT_SECS");
     }
 
     #[test]
@@ -7608,9 +7638,9 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_STORAGE_PROVIDER", "postgres");
-        std::env::set_var("ZEROCLAW_STORAGE_DB_URL", "postgres://example/db");
-        std::env::set_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
+        test_set_env("ZEROCLAW_STORAGE_PROVIDER", "postgres");
+        test_set_env("ZEROCLAW_STORAGE_DB_URL", "postgres://example/db");
+        test_set_env("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
 
         config.apply_env_overrides();
 
@@ -7624,9 +7654,9 @@ default_model = "legacy-model"
             Some(15)
         );
 
-        std::env::remove_var("ZEROCLAW_STORAGE_PROVIDER");
-        std::env::remove_var("ZEROCLAW_STORAGE_DB_URL");
-        std::env::remove_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS");
+        test_remove_env("ZEROCLAW_STORAGE_PROVIDER");
+        test_remove_env("ZEROCLAW_STORAGE_DB_URL");
+        test_remove_env("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS");
     }
 
     #[test]
@@ -7634,20 +7664,20 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL", "true");
-        std::env::set_var("ZEROCLAW_CONCURRENCY_ROLLOUT_STAGE", "stage_c");
-        std::env::set_var("ZEROCLAW_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT", "40");
-        std::env::set_var("ZEROCLAW_CONCURRENCY_ROLLOUT_CHANNELS", "telegram,discord");
-        std::env::set_var("ZEROCLAW_CONCURRENCY_AUTO_ROLLBACK_ENABLED", "false");
-        std::env::set_var(
+        test_set_env("ZEROCLAW_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL", "true");
+        test_set_env("ZEROCLAW_CONCURRENCY_ROLLOUT_STAGE", "stage_c");
+        test_set_env("ZEROCLAW_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT", "40");
+        test_set_env("ZEROCLAW_CONCURRENCY_ROLLOUT_CHANNELS", "telegram,discord");
+        test_set_env("ZEROCLAW_CONCURRENCY_AUTO_ROLLBACK_ENABLED", "false");
+        test_set_env(
             "ZEROCLAW_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD",
             "0.31",
         );
-        std::env::set_var(
+        test_set_env(
             "ZEROCLAW_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD",
             "0.32",
         );
-        std::env::set_var("ZEROCLAW_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD", "0.33");
+        test_set_env("ZEROCLAW_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD", "0.33");
 
         config.apply_env_overrides();
 
@@ -7663,14 +7693,14 @@ default_model = "legacy-model"
         assert!((config.agent.concurrency_rollback_cancel_rate_threshold - 0.32).abs() < 1e-9);
         assert!((config.agent.concurrency_rollback_error_rate_threshold - 0.33).abs() < 1e-9);
 
-        std::env::remove_var("ZEROCLAW_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL");
-        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLOUT_STAGE");
-        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT");
-        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLOUT_CHANNELS");
-        std::env::remove_var("ZEROCLAW_CONCURRENCY_AUTO_ROLLBACK_ENABLED");
-        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD");
-        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD");
-        std::env::remove_var("ZEROCLAW_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD");
+        test_remove_env("ZEROCLAW_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL");
+        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLOUT_STAGE");
+        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT");
+        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLOUT_CHANNELS");
+        test_remove_env("ZEROCLAW_CONCURRENCY_AUTO_ROLLBACK_ENABLED");
+        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD");
+        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD");
+        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD");
     }
 
     #[test]
@@ -7695,13 +7725,13 @@ default_model = "legacy-model"
         clear_proxy_env_test_vars();
 
         let mut config = Config::default();
-        std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true");
-        std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
-        std::env::set_var(
+        test_set_env("ZEROCLAW_PROXY_ENABLED", "true");
+        test_set_env("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
+        test_set_env(
             "ZEROCLAW_PROXY_SERVICES",
             "provider.openai, tool.http_request",
         );
-        std::env::set_var("ZEROCLAW_PROXY_SCOPE", "services");
+        test_set_env("ZEROCLAW_PROXY_SCOPE", "services");
 
         config.apply_env_overrides();
 
@@ -7724,11 +7754,11 @@ default_model = "legacy-model"
         clear_proxy_env_test_vars();
 
         let mut config = Config::default();
-        std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true");
-        std::env::set_var("ZEROCLAW_PROXY_SCOPE", "environment");
-        std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
-        std::env::set_var("ZEROCLAW_HTTPS_PROXY", "http://127.0.0.1:7891");
-        std::env::set_var("ZEROCLAW_NO_PROXY", "localhost,127.0.0.1");
+        test_set_env("ZEROCLAW_PROXY_ENABLED", "true");
+        test_set_env("ZEROCLAW_PROXY_SCOPE", "environment");
+        test_set_env("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
+        test_set_env("ZEROCLAW_HTTPS_PROXY", "http://127.0.0.1:7891");
+        test_set_env("ZEROCLAW_NO_PROXY", "localhost,127.0.0.1");
 
         config.apply_env_overrides();
 
@@ -7779,8 +7809,15 @@ default_model = "legacy-model"
         }
     }
 
+    /// Serialise tests that mutate the global `RUNTIME_PROXY_CLIENT_CACHE` so
+    /// they cannot race against each other.
+    static PROXY_CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
+        let _guard = PROXY_CACHE_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let service_key = format!(
             "provider.cache_test.{}",
             std::time::SystemTime::now()
@@ -7802,6 +7839,9 @@ default_model = "legacy-model"
 
     #[test]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
+        let _guard = PROXY_CACHE_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let service_key = format!(
             "provider.cache_timeout_test.{}",
             std::time::SystemTime::now()

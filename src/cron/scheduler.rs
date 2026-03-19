@@ -4,8 +4,9 @@ use crate::channels::{
 };
 use crate::config::Config;
 use crate::cron::{
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    claim_job, due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job,
+    reschedule_after_run, update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule,
+    SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -125,6 +126,19 @@ async fn execute_and_persist_job(
     job: &CronJob,
     component: &str,
 ) -> (String, bool) {
+    // Atomically claim the job to prevent double-execution across instances.
+    match claim_job(config, &job.id) {
+        Ok(true) => {} // claimed successfully
+        Ok(false) => {
+            tracing::debug!(job_id = %job.id, "cron job already claimed, skipping");
+            return (job.id.clone(), true);
+        }
+        Err(e) => {
+            tracing::warn!(job_id = %job.id, "failed to claim cron job: {e}");
+            return (job.id.clone(), false);
+        }
+    }
+
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
@@ -220,7 +234,7 @@ async fn persist_job_result(
         }
     }
 
-    let _ = record_run(
+    if let Err(e) = record_run(
         config,
         &job.id,
         started_at,
@@ -228,7 +242,9 @@ async fn persist_job_result(
         if success { "ok" } else { "error" },
         Some(output),
         duration_ms,
-    );
+    ) {
+        tracing::warn!(job_id = %job.id, "Failed to persist cron run record: {e}");
+    }
 
     if is_one_shot_auto_delete(job) {
         if success {
@@ -236,7 +252,9 @@ async fn persist_job_result(
                 tracing::warn!("Failed to remove one-shot cron job after success: {e}");
             }
         } else {
-            let _ = record_last_run(config, &job.id, finished_at, false, output);
+            if let Err(e) = record_last_run(config, &job.id, finished_at, false, output) {
+                tracing::warn!(job_id = %job.id, "Failed to persist one-shot last_run: {e}");
+            }
             if let Err(e) = update_job(
                 config,
                 &job.id,
@@ -252,7 +270,9 @@ async fn persist_job_result(
     }
 
     if !success && should_disable_after_deterministic_failure(job, output) {
-        let _ = record_last_run(config, &job.id, finished_at, false, output);
+        if let Err(e) = record_last_run(config, &job.id, finished_at, false, output) {
+            tracing::warn!(job_id = %job.id, "Failed to persist last_run before disable: {e}");
+        }
         if let Err(e) = update_job(
             config,
             &job.id,

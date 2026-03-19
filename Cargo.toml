@@ -4,8 +4,8 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.2.1"
-edition = "2021"
+version = "0.3.0"
+edition = "2024"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "OpenPRX: high-performance Rust-first autonomous agent runtime."
@@ -19,7 +19,7 @@ name = "openprx"
 path = "src/lib.rs"
 
 [[bin]]
-name = "openprx"
+name = "prx"
 path = "src/main.rs"
 
 [dependencies]
@@ -120,6 +120,15 @@ cron = "0.15"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 console = "0.16"
 
+# Terminal chat UI
+crossterm = { version = "0.28", default-features = false, features = ["events", "bracketed-paste"] }
+reedline = "0.38"
+
+# TUI advanced features (Phase 3) — gated behind terminal-tui feature
+ratatui = { version = "0.29", optional = true, default-features = false, features = ["crossterm"] }
+syntect = { version = "5.2", optional = true, default-features = false, features = ["default-fancy"] }
+unicode-width = { version = "0.2", optional = true }
+
 # Binary discovery (init system detection)
 which = "7.0"
 
@@ -208,6 +217,8 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 # WASM plugin system (wasmtime + Component Model)
 wasm-plugins = ["dep:wasmtime", "dep:wasmtime-wasi"]
 llm-router = ["dep:skillratings", "dep:tiktoken-rs"]
+# Terminal TUI advanced features (Phase 3): ratatui layout, syntect highlighting, CJK width
+terminal-tui = ["dep:ratatui", "dep:syntect", "dep:unicode-width"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size

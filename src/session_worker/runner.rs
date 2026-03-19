@@ -222,6 +222,7 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
             None,
             None,
             scope_ctx.as_ref(),
+            None,
         )
         .await
     };

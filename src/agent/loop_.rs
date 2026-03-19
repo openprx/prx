@@ -25,6 +25,15 @@ use uuid::Uuid;
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
 
+/// Lightweight notification for tool call progress (used by chat/TUI integration).
+#[derive(Debug, Clone)]
+pub(crate) enum ToolCallNotification {
+    /// A tool call is about to be executed.
+    Started { name: String, args_summary: String },
+    /// A tool call has finished executing.
+    Finished { name: String, success: bool },
+}
+
 /// Context for scope-based tool access control.
 /// When present, `run_tool_call_loop` will check each tool call against
 /// the security policy's scope rules before execution.
@@ -89,6 +98,17 @@ const COMPACTION_TIMEOUT_SECS: u64 = 300;
 
 /// Maximum number of times to retry an LLM call after a context overflow error.
 const MAX_OVERFLOW_RETRIES: usize = 3;
+
+/// Hard cap on `max_tool_iterations` to prevent unbounded tool-call loops
+/// even when the user passes an unreasonably large config value.
+const MAX_TOOL_ITERATIONS_CAP: usize = 1000;
+
+/// Fraction of `max_context_tokens` above which a pre-turn memory flush is triggered.
+const PRE_TURN_FLUSH_THRESHOLD: f64 = 0.85;
+
+/// Fallback count-based safety net: if history grows beyond this many messages
+/// and no compaction config is available, trim back to `DEFAULT_MAX_HISTORY_MESSAGES`.
+const HISTORY_SAFETY_NET_LIMIT: usize = 200;
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -174,6 +194,43 @@ fn sanitize_tool_parse_log_preview(input: &str) -> String {
         .collect()
 }
 
+/// Sensitive JSON field names whose values are redacted in tool argument logging.
+static SENSITIVE_JSON_KEYS: LazyLock<regex::RegexSet> = LazyLock::new(|| {
+    regex::RegexSet::new([
+        r"(?i)^(api[_-]?key|apikey)$",
+        r"(?i)^(token|access[_-]?token|refresh[_-]?token|auth[_-]?token)$",
+        r"(?i)^(password|passwd|pwd)$",
+        r"(?i)^(secret|client[_-]?secret|secret[_-]?key)$",
+        r"(?i)^(credential|credentials)$",
+        r"(?i)^(authorization|auth[_-]?header)$",
+        r"(?i)^(private[_-]?key|signing[_-]?key)$",
+    ])
+    .expect("compile regex set: sensitive JSON keys")
+});
+
+/// Walk a JSON value and replace values of sensitive keys with `"[REDACTED]"`.
+pub(crate) fn redact_sensitive_json_keys(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let redacted: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| {
+                    if SENSITIVE_JSON_KEYS.is_match(k) {
+                        (k.clone(), serde_json::Value::String("[REDACTED]".into()))
+                    } else {
+                        (k.clone(), redact_sensitive_json_keys(v))
+                    }
+                })
+                .collect();
+            serde_json::Value::Object(redacted)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(redact_sensitive_json_keys).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
@@ -189,9 +246,9 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 const MEMORY_FLUSH_MAX_CHARS: usize = 800;
 
-struct RecalledMemoryContext {
-    preamble: String,
-    ids: Vec<String>,
+pub(crate) struct RecalledMemoryContext {
+    pub(crate) preamble: String,
+    pub(crate) ids: Vec<String>,
 }
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
@@ -607,7 +664,7 @@ async fn auto_compact_history(
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
-async fn build_context(
+pub(crate) async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
@@ -648,7 +705,7 @@ async fn build_context(
     }
 }
 
-async fn increment_recalled_useful_counts(mem: &dyn Memory, recalled_ids: &[String]) {
+pub(crate) async fn increment_recalled_useful_counts(mem: &dyn Memory, recalled_ids: &[String]) {
     let unique_ids: BTreeSet<&str> = recalled_ids.iter().map(String::as_str).collect();
     for id in unique_ids {
         if let Err(error) = mem.increment_useful_count(id).await {
@@ -657,7 +714,7 @@ async fn increment_recalled_useful_counts(mem: &dyn Memory, recalled_ids: &[Stri
     }
 }
 
-async fn select_prompt_skills(
+pub(crate) async fn select_prompt_skills(
     query: &str,
     skills: &[crate::skills::Skill],
     config: &Config,
@@ -670,7 +727,7 @@ async fn select_prompt_skills(
     crate::skills::select_skills_by_relevance(query, skills, config.skill_rag.top_k, embedder).await
 }
 
-fn build_runtime_system_prompt(
+pub(crate) fn build_runtime_system_prompt(
     config: &Config,
     model_name: &str,
     tool_descs: &[(&str, &str)],
@@ -1525,7 +1582,14 @@ fn tool_barrier_key(name: &str) -> Option<&'static str> {
     }
 }
 
-async fn acquire_tool_barrier(key: &'static str) -> tokio::sync::OwnedMutexGuard<()> {
+/// Timeout for acquiring a tool barrier lock. If the lock holder panics or
+/// hangs, we proceed without serialisation rather than deadlocking forever.
+const TOOL_BARRIER_TIMEOUT_SECS: u64 = 60;
+
+async fn acquire_tool_barrier(
+    key: &'static str,
+    tool_name: &str,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     let barrier = {
         let mut barriers = TOOL_BARRIERS.lock();
         barriers
@@ -1534,7 +1598,22 @@ async fn acquire_tool_barrier(key: &'static str) -> tokio::sync::OwnedMutexGuard
             .clone()
     };
 
-    barrier.lock_owned().await
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(TOOL_BARRIER_TIMEOUT_SECS),
+        barrier.lock_owned(),
+    )
+    .await
+    {
+        Ok(guard) => Some(guard),
+        Err(_) => {
+            tracing::warn!(
+                tool = %tool_name,
+                barrier_key = key,
+                "Tool barrier lock timed out after {TOOL_BARRIER_TIMEOUT_SECS}s, proceeding without barrier",
+            );
+            None
+        }
+    }
 }
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
@@ -1584,6 +1663,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1627,10 +1707,29 @@ async fn execute_one_tool(
     }
 
     let _barrier_guard = if let Some(key) = tool_barrier_key(call_name) {
-        Some(acquire_tool_barrier(key).await)
+        acquire_tool_barrier(key, call_name).await
     } else {
         None
     };
+
+    // Lightweight pre-execution validation: check that all `required` fields
+    // declared in the tool's JSON schema are present in the arguments object.
+    let schema = tool.parameters_schema();
+    if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
+        if let Some(args_obj) = call_arguments.as_object() {
+            let missing: Vec<&str> = required
+                .iter()
+                .filter_map(|r| r.as_str())
+                .filter(|key| !args_obj.contains_key(*key))
+                .collect();
+            if !missing.is_empty() {
+                return Ok(format!(
+                    "Error: missing required argument(s) for tool '{call_name}': {}",
+                    missing.join(", ")
+                ));
+            }
+        }
+    }
 
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
@@ -2221,11 +2320,12 @@ pub(crate) async fn run_tool_call_loop(
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     scope_ctx: Option<&ScopeContext<'_>>,
+    on_tool_call: Option<tokio::sync::mpsc::Sender<ToolCallNotification>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
-        max_tool_iterations.min(1000)
+        max_tool_iterations.min(MAX_TOOL_ITERATIONS_CAP)
     };
 
     let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
@@ -2271,7 +2371,7 @@ pub(crate) async fn run_tool_call_loop(
     // if the context is already above 85% of the token budget.
     if let Some(config) = compaction_config {
         let token_estimate = estimate_history_tokens(history);
-        let threshold = (config.max_context_tokens as f64 * 0.85) as usize;
+        let threshold = (config.max_context_tokens as f64 * PRE_TURN_FLUSH_THRESHOLD) as usize;
         if token_estimate > threshold {
             tracing::info!(
                 token_estimate,
@@ -2318,9 +2418,15 @@ pub(crate) async fn run_tool_call_loop(
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
+                    // TODO: add memory reference to run_tool_call_loop to enable
+                    // pre-flush of recent context before aggressive trim.
                     tracing::warn!(
-                        "Compaction timed out after {}s, falling back to aggressive trim",
-                        COMPACTION_TIMEOUT_SECS
+                        history_len = history.len(),
+                        keep_recent = config.keep_recent_messages,
+                        "Compaction timed out after {COMPACTION_TIMEOUT_SECS}s; \
+                         recent context may be lost. Applying aggressive trim \
+                         (keeping last {} messages)",
+                        config.keep_recent_messages,
                     );
                     apply_aggressive_trim(history, config.keep_recent_messages);
                 }
@@ -2584,10 +2690,20 @@ pub(crate) async fn run_tool_call_loop(
                     HookEvent::ToolCallStart,
                     serde_json::json!({
                         "tool": call.name,
-                        "arguments": call.arguments,
+                        "arguments": redact_sensitive_json_keys(&call.arguments),
                     }),
                 )
                 .await;
+            if let Some(ref tx) = on_tool_call {
+                let args_str = scrub_credentials(&call.arguments.to_string());
+                let args_summary = truncate_with_ellipsis(&args_str, 80);
+                let _ = tx
+                    .send(ToolCallNotification::Started {
+                        name: call.name.clone(),
+                        args_summary,
+                    })
+                    .await;
+            }
         }
 
         let individual_results = execute_tools_with_policy(
@@ -2614,6 +2730,14 @@ pub(crate) async fn run_tool_call_loop(
                     }),
                 )
                 .await;
+            if let Some(ref tx) = on_tool_call {
+                let _ = tx
+                    .send(ToolCallNotification::Finished {
+                        name: call.name.clone(),
+                        success,
+                    })
+                    .await;
+            }
             if !success {
                 hooks
                     .emit(HookEvent::Error, payload_error("tool", result))
@@ -2664,7 +2788,7 @@ pub(crate) async fn run_tool_call_loop(
             }
         }
         // Secondary count-based safety net to catch cases with no compaction config.
-        if history.len() > 200 {
+        if history.len() > HISTORY_SAFETY_NET_LIMIT {
             let before = history.len();
             trim_history(history, DEFAULT_MAX_HISTORY_MESSAGES);
             tracing::info!(
@@ -2980,6 +3104,7 @@ pub async fn run(
             None,
             None,
             None,
+            None,
         )
         .await?;
         increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
@@ -3163,6 +3288,7 @@ pub async fn run(
                         .concurrency_rollback_error_rate_threshold,
                 },
                 Some(&config.agent.compaction),
+                None,
                 None,
                 None,
                 None,
@@ -3652,6 +3778,7 @@ mod tests {
             None,
             None,
             None, // no scope context
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3705,6 +3832,7 @@ mod tests {
             None,
             None,
             None, // no scope context
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3752,6 +3880,7 @@ mod tests {
             None,
             None,
             None, // no scope context
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3941,6 +4070,7 @@ mod tests {
             None,
             None,
             None, // no scope context
+            None,
         )
         .await
         .expect("read-only parallel execution should complete");
@@ -4043,6 +4173,7 @@ mod tests {
             None,
             None,
             None, // no scope context
+            None,
         )
         .await
         .expect("stateful serial execution should complete");
@@ -4136,11 +4267,11 @@ mod tests {
         let calls = vec![
             ParsedToolCall {
                 name: "file_read".to_string(),
-                arguments: serde_json::json!({"id": 1}),
+                arguments: serde_json::json!({"value": "1"}),
             },
             ParsedToolCall {
                 name: "file_read".to_string(),
-                arguments: serde_json::json!({"id": 2}),
+                arguments: serde_json::json!({"value": "2"}),
             },
             ParsedToolCall {
                 name: "shell".to_string(),
@@ -4148,7 +4279,7 @@ mod tests {
             },
             ParsedToolCall {
                 name: "file_read".to_string(),
-                arguments: serde_json::json!({"id": 3}),
+                arguments: serde_json::json!({"value": "3"}),
             },
         ];
 

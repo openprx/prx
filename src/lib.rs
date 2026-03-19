@@ -120,6 +120,7 @@ pub mod tools;
 pub(crate) mod tunnel;
 pub(crate) mod util;
 pub mod webhook;
+pub(crate) mod xin;
 
 pub use config::Config;
 
@@ -159,8 +160,8 @@ configuration keys for that channel type.
 Supported types: telegram, discord, slack, whatsapp, matrix, imessage, email.
 
 Examples:
-  openprx channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
-  openprx channel add discord '{\"bot_token\":\"...\",\"name\":\"my-discord\"}'")]
+  prx channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
+  prx channel add discord '{\"bot_token\":\"...\",\"name\":\"my-discord\"}'")]
     Add {
         /// Channel type (telegram, discord, slack, whatsapp, matrix, imessage, email)
         channel_type: String,
@@ -181,8 +182,8 @@ ID to the channel allowlist so the agent will respond to messages \
 from that identity.
 
 Examples:
-  openprx channel bind-telegram openprx_user
-  openprx channel bind-telegram 123456789")]
+  prx channel bind-telegram openprx_user
+  prx channel bind-telegram 123456789")]
     BindTelegram {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
@@ -235,8 +236,8 @@ Times are evaluated in UTC by default; use --tz with an IANA \
 timezone name to override.
 
 Examples:
-  openprx cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  openprx cron add '*/30 * * * *' 'Check system health'")]
+  prx cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
+  prx cron add '*/30 * * * *' 'Check system health'")]
     Add {
         /// Cron expression
         expression: String,
@@ -253,8 +254,8 @@ Add a one-shot task that fires at a specific UTC timestamp.
 The timestamp must be in RFC 3339 format (e.g. 2025-01-15T14:00:00Z).
 
 Examples:
-  openprx cron add-at 2025-01-15T14:00:00Z 'Send reminder'
-  openprx cron add-at 2025-12-31T23:59:00Z 'Happy New Year!'")]
+  prx cron add-at 2025-01-15T14:00:00Z 'Send reminder'
+  prx cron add-at 2025-12-31T23:59:00Z 'Happy New Year!'")]
     AddAt {
         /// One-shot timestamp in RFC3339 format
         at: String,
@@ -268,8 +269,8 @@ Add a task that repeats at a fixed interval.
 Interval is specified in milliseconds. For example, 60000 = 1 minute.
 
 Examples:
-  openprx cron add-every 60000 'Ping heartbeat'     # every minute
-  openprx cron add-every 3600000 'Hourly report'    # every hour")]
+  prx cron add-every 60000 'Ping heartbeat'     # every minute
+  prx cron add-every 3600000 'Hourly report'    # every hour")]
     AddEvery {
         /// Interval in milliseconds
         every_ms: u64,
@@ -284,9 +285,9 @@ Accepts human-readable durations: s (seconds), m (minutes), \
 h (hours), d (days).
 
 Examples:
-  openprx cron once 30m 'Run backup in 30 minutes'
-  openprx cron once 2h 'Follow up on deployment'
-  openprx cron once 1d 'Daily check'")]
+  prx cron once 30m 'Run backup in 30 minutes'
+  prx cron once 2h 'Follow up on deployment'
+  prx cron once 1d 'Daily check'")]
     Once {
         /// Delay duration
         delay: String,
@@ -305,9 +306,9 @@ Update one or more fields of an existing scheduled task.
 Only the fields you specify are changed; others remain unchanged.
 
 Examples:
-  openprx cron update <task-id> --expression '0 8 * * *'
-  openprx cron update <task-id> --tz Europe/London --name 'Morning check'
-  openprx cron update <task-id> --command 'Updated message'")]
+  prx cron update <task-id> --expression '0 8 * * *'
+  prx cron update <task-id> --tz Europe/London --name 'Morning check'
+  prx cron update <task-id> --command 'Updated message'")]
     Update {
         /// Task ID
         id: String,

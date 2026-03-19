@@ -944,8 +944,8 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
              The agent will read it and follow the instructions.\n\n\
              ## Installing community skills\n\n\
              ```bash\n\
-             openprx skills install <source>\n\
-             openprx skills list\n\
+             prx skills install <source>\n\
+             prx skills list\n\
              ```\n",
         )?;
     }
@@ -1027,7 +1027,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 println!("  Create one: mkdir -p ~/.openprx/workspace/skills/my-skill");
                 println!("              echo '# My Skill' > ~/.openprx/workspace/skills/my-skill/SKILL.md");
                 println!();
-                println!("  Or install: openprx skills install <source>");
+                println!("  Or install: prx skills install <source>");
             } else {
                 println!("Installed skills ({}):", skills.len());
                 println!();
@@ -1075,7 +1075,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                         "  {} Skill installed successfully!",
                         console::style("✓").green().bold()
                     );
-                    println!("  Restart `openprx channel start` to activate.");
+                    println!("  Restart `prx channel start` to activate.");
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     anyhow::bail!("Git clone failed: {stderr}");
@@ -1202,17 +1202,21 @@ mod tests {
     impl EnvVarGuard {
         fn unset(key: &'static str) -> Self {
             let original = std::env::var(key).ok();
-            std::env::remove_var(key);
+            // SAFETY: test-only, single-threaded test runner
+            unsafe { std::env::remove_var(key) };
             Self { key, original }
         }
     }
 
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
-            if let Some(value) = &self.original {
-                std::env::set_var(self.key, value);
-            } else {
-                std::env::remove_var(self.key);
+            // SAFETY: test-only, single-threaded test runner
+            unsafe {
+                if let Some(value) = &self.original {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
             }
         }
     }
@@ -1759,8 +1763,10 @@ description = "Bare minimum"
 
     #[test]
     fn resolve_openclaw_skills_dir_env_takes_priority_over_config() {
+        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
-        std::env::set_var("ZEROCLAW_OPENCLAW_SKILLS_DIR", "/tmp/env-openclaw");
+        // SAFETY: test-only, single-threaded test runner
+        unsafe { std::env::set_var("ZEROCLAW_OPENCLAW_SKILLS_DIR", "/tmp/env-openclaw") };
 
         let result = resolve_openclaw_skills_dir(Some("/tmp/config-openclaw"));
         assert_eq!(result, Some(PathBuf::from("/tmp/env-openclaw")));
@@ -1770,6 +1776,7 @@ description = "Bare minimum"
 
     #[test]
     fn openclaw_skills_not_loaded_when_disabled_via_config() {
+        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
 
         // Disabled in config — should return None without touching filesystem/network.
@@ -1779,8 +1786,10 @@ description = "Bare minimum"
 
     #[test]
     fn openclaw_skills_not_loaded_when_disabled_via_env() {
+        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
-        std::env::set_var("ZEROCLAW_OPENCLAW_SKILLS_ENABLED", "false");
+        // SAFETY: test-only, single-threaded test runner
+        unsafe { std::env::set_var("ZEROCLAW_OPENCLAW_SKILLS_ENABLED", "false") };
 
         // Even if config says enabled, env override wins.
         let result = ensure_openclaw_skills_repo(Some(true), None);
@@ -1791,6 +1800,7 @@ description = "Bare minimum"
 
     #[test]
     fn openclaw_skills_disabled_returns_only_workspace_skills() {
+        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _env_enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
         let _env_dir_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
 
@@ -1809,6 +1819,7 @@ description = "Bare minimum"
 
     #[test]
     fn openclaw_skills_loads_from_local_dir_via_config() {
+        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _env_enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
         let _env_dir_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
         let _open_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_ENABLED");

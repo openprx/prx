@@ -1477,6 +1477,7 @@ async fn run_sub_agent_task(
                 Some(cancel_token_owned),
                 None, // no streaming sender
                 scope_ctx.as_ref(),
+                None,
             )
             .await;
             (task_history, result)

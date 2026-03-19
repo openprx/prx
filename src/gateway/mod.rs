@@ -142,7 +142,7 @@ impl SlidingWindowRateLimiter {
         }
 
         let now = Instant::now();
-        let cutoff = now.checked_sub(self.window).unwrap_or_else(Instant::now);
+        let cutoff = now.checked_sub(self.window).unwrap_or(now);
 
         let mut guard = self.requests.lock();
         let (requests, last_sweep) = &mut *guard;
@@ -1136,6 +1136,7 @@ async fn run_gateway_chat_with_multimodal(
         None, // no cancellation token
         None, // no streaming delta sender
         None, // no scope context for webhooks
+        None, // no tool call notifications
     )
     .await
 }
@@ -1951,7 +1952,7 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("openprx_heartbeat_ticks_total 1"));
+        assert!(text.contains("prx_heartbeat_ticks_total 1"));
     }
 
     #[test]

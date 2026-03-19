@@ -752,7 +752,7 @@ impl OpenAiCodexProvider {
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "OpenAI Codex auth profile not found. Run `openprx auth login --provider openai-codex`."
+                    "OpenAI Codex auth profile not found. Run `prx auth login --provider openai-codex`."
                 )
             })?;
         let profile = self
@@ -763,7 +763,7 @@ impl OpenAiCodexProvider {
             .or_else(|| extract_account_id_from_jwt(&access_token))
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "OpenAI Codex account id not found in auth profile/token. Run `openprx auth login --provider openai-codex` again."
+                    "OpenAI Codex account id not found in auth profile/token. Run `prx auth login --provider openai-codex` again."
                 )
             })?;
         let normalized_model = normalize_model_id(model);

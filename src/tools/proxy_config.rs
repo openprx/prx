@@ -62,7 +62,7 @@ impl ProxyConfigTool {
     fn parse_scope(raw: &str) -> Option<ProxyScope> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "environment" | "env" => Some(ProxyScope::Environment),
-            "openprx" | "internal" | "core" => Some(ProxyScope::Zeroclaw),
+            "prx" | "internal" | "core" => Some(ProxyScope::Zeroclaw),
             "services" | "service" => Some(ProxyScope::Services),
             _ => None,
         }
@@ -186,7 +186,7 @@ impl ProxyConfigTool {
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("'scope' must be a string"))?;
             proxy.scope = Self::parse_scope(scope).ok_or_else(|| {
-                anyhow::anyhow!("Invalid scope '{scope}'. Use environment|openprx|services")
+                anyhow::anyhow!("Invalid scope '{scope}'. Use environment|prx|services")
             })?;
         }
 
@@ -343,7 +343,7 @@ impl Tool for ProxyConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage ZeroClaw proxy settings (scope: environment | openprx | services), including runtime and process env application"
+        "Manage ZeroClaw proxy settings (scope: environment | prx | services), including runtime and process env application"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -361,7 +361,7 @@ impl Tool for ProxyConfigTool {
                 },
                 "scope": {
                     "type": "string",
-                    "description": "Proxy scope: environment | openprx | services"
+                    "description": "Proxy scope: environment | prx | services"
                 },
                 "http_proxy": {
                     "type": ["string", "null"],

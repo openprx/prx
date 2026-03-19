@@ -363,7 +363,11 @@ pub async fn get_sessions(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
-    let fetch_batch = limit.clamp(DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT);
+    let fetch_batch = if limit == 0 {
+        DEFAULT_PAGE_LIMIT
+    } else {
+        limit.min(MAX_PAGE_LIMIT)
+    };
     let mut response = Vec::with_capacity(limit);
     let mut source_offset = 0usize;
     let mut filtered_offset = 0usize;
@@ -634,11 +638,16 @@ pub async fn get_session_media(
     };
 
     let raw_path = PathBuf::from(requested_path);
-    let candidate_path = if raw_path.is_absolute() {
-        raw_path
-    } else {
-        uploads_root.join(raw_path)
-    };
+    if raw_path.is_absolute() {
+        return json_error(StatusCode::BAD_REQUEST, "Absolute paths are not allowed");
+    }
+    if raw_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return json_error(StatusCode::BAD_REQUEST, "Path traversal is not allowed");
+    }
+    let candidate_path = uploads_root.join(raw_path);
 
     let resolved_path = match fs::canonicalize(&candidate_path).await {
         Ok(path) => path,

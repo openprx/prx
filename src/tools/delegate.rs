@@ -501,6 +501,7 @@ impl DelegateTool {
                 None,
                 None,
                 scope_ctx.as_ref(),
+                None,
             ),
         )
         .await;

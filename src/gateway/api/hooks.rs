@@ -106,15 +106,17 @@ fn read_hooks_file(state: &AppState) -> Result<HooksFile, (StatusCode, Json<serd
         return Ok(HooksFile::default());
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| {
+        tracing::warn!("Failed to read hooks.json: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to read hooks.json: {e}")})),
+            Json(serde_json::json!({"error": "Failed to read hooks configuration"})),
         )
     })?;
     serde_json::from_str(&raw).map_err(|e| {
+        tracing::warn!("Failed to parse hooks.json: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to parse hooks.json: {e}")})),
+            Json(serde_json::json!({"error": "Invalid hooks configuration format"})),
         )
     })
 }
@@ -125,15 +127,17 @@ fn write_hooks_file(
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let path = hooks_json_path(state);
     let content = serde_json::to_string_pretty(file).map_err(|e| {
+        tracing::warn!("Failed to serialize hooks: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to serialize hooks: {e}")})),
+            Json(serde_json::json!({"error": "Failed to save hooks configuration"})),
         )
     })?;
     std::fs::write(&path, content).map_err(|e| {
+        tracing::warn!("Failed to write hooks.json: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to write hooks.json: {e}")})),
+            Json(serde_json::json!({"error": "Failed to save hooks configuration"})),
         )
     })
 }

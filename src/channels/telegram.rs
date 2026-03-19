@@ -412,7 +412,7 @@ impl TelegramChannel {
             anyhow::bail!(
                 "Missing [channels.telegram] section in config.toml. \
                 Add bot_token and allowed_users under [channels.telegram], \
-                or run `openprx onboard --channels-only` to configure interactively"
+                or run `prx onboard --channels-only` to configure interactively"
             );
         };
 
@@ -736,7 +736,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let _ = self
             .send(&SendMessage::new(
                 format!(
-                    "🔐 This bot requires operator approval.\n\nCopy this command to operator terminal:\n`openprx channel bind-telegram {suggested_identity}`\n\nAfter operator runs it, send your message again."
+                    "🔐 This bot requires operator approval.\n\nCopy this command to operator terminal:\n`prx channel bind-telegram {suggested_identity}`\n\nAfter operator runs it, send your message again."
                 ),
                 &chat_id,
             ))

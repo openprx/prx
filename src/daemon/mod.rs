@@ -101,7 +101,32 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
-    if config.self_system.enabled {
+    // ── Xin (心) autonomous task engine ──
+    if config.xin.enabled {
+        let xin_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "xin",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = xin_cfg.clone();
+                async move { crate::xin::runner::run(cfg).await }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("xin");
+        tracing::info!("Xin disabled; xin supervisor not started");
+    }
+
+    // ── Self-system fitness ──
+    // Xin takes over fitness only when ALL three flags are true:
+    // xin.enabled + xin.builtin_tasks + xin.evolution_integration.
+    // If builtin_tasks is false, xin won't register the fitness task, so
+    // the standalone worker must still run.
+    let xin_manages_evolution =
+        config.xin.enabled && config.xin.builtin_tasks && config.xin.evolution_integration;
+    let spawn_fitness = config.self_system.enabled && !xin_manages_evolution;
+    if spawn_fitness {
         let fitness_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "self_system_fitness",
@@ -114,10 +139,17 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     } else {
         crate::health::mark_component_ok("self_system_fitness");
-        tracing::info!("Self-system fitness disabled; fitness supervisor not started");
+        if xin_manages_evolution {
+            tracing::info!("Fitness managed by xin; standalone fitness supervisor not started");
+        } else {
+            tracing::info!("Self-system fitness disabled; fitness supervisor not started");
+        }
     }
 
-    if config.self_system.evolution_enabled {
+    // ── Evolution scheduler ──
+    // Same guard: xin takes over evolution only when all three flags are on.
+    let spawn_evolution = config.self_system.evolution_enabled && !xin_manages_evolution;
+    if spawn_evolution {
         let evolution_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "evolution_scheduler",
@@ -130,7 +162,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     } else {
         crate::health::mark_component_ok("evolution_scheduler");
-        tracing::info!("Evolution scheduler disabled; evolution supervisor not started");
+        if xin_manages_evolution {
+            tracing::info!("Evolution managed by xin; standalone evolution supervisor not started");
+        } else {
+            tracing::info!("Evolution scheduler disabled; evolution supervisor not started");
+        }
     }
 
     if config.webhook.enabled {
@@ -165,7 +201,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("🧠 OpenPRX daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!(
-        "   Components: gateway, channels, heartbeat, scheduler, self_system_fitness, evolution_scheduler, webhook_receiver"
+        "   Components: gateway, channels, heartbeat, scheduler, xin, self_system_fitness, evolution_scheduler, webhook_receiver"
     );
     println!("   Ctrl+C to stop");
 
@@ -194,7 +230,9 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
     tokio::spawn(async move {
         let path = state_file_path(&config);
         if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                tracing::warn!("Failed to create daemon state directory: {e}");
+            }
         }
 
         let mut interval = tokio::time::interval(Duration::from_secs(STATUS_FLUSH_SECONDS));
@@ -208,7 +246,9 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
                 );
             }
             let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
-            let _ = tokio::fs::write(&path, data).await;
+            if let Err(e) = tokio::fs::write(&path, &data).await {
+                tracing::warn!("Failed to write daemon state file: {e}");
+            }
         }
     })
 }

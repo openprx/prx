@@ -9,6 +9,7 @@ use schemars::schema_for;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
+use tracing::warn;
 
 const REDACTION_MASK: &str = "***";
 
@@ -47,9 +48,10 @@ pub async fn post_config(State(state): State<AppState>, Json(incoming): Json<Val
     let mut current_value = match serde_json::to_value(&config) {
         Ok(v) => v,
         Err(e) => {
+            warn!("Failed to serialize current config: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to serialize current config: {e}")})),
+                Json(serde_json::json!({"error": "Internal error processing config"})),
             )
                 .into_response();
         }
@@ -84,16 +86,20 @@ pub async fn post_config(State(state): State<AppState>, Json(incoming): Json<Val
 
     // 5. Save to disk (Config::save handles backup + atomic write)
     if let Err(e) = merged_config.save().await {
+        warn!("Failed to save config: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+            Json(serde_json::json!({"error": "Failed to save configuration"})),
         )
             .into_response();
     }
 
-    // 6. Update in-memory config
-    *state.config.lock() = merged_config.clone();
-    state.shared_config.store(Arc::new(merged_config));
+    // 6. Update in-memory config (hold Mutex while updating both stores atomically)
+    {
+        let mut guard = state.config.lock();
+        *guard = merged_config.clone();
+        state.shared_config.store(Arc::new(merged_config));
+    }
 
     Json(serde_json::json!({
         "status": "ok",
@@ -126,9 +132,10 @@ pub async fn get_config(State(state): State<AppState>) -> Response {
     let mut value = match serde_json::to_value(config) {
         Ok(value) => value,
         Err(error) => {
+            warn!("Failed to serialize config: {error}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to serialize config: {error}")})),
+                Json(serde_json::json!({"error": "Internal error processing config"})),
             )
                 .into_response();
         }
@@ -142,11 +149,14 @@ pub async fn get_config_files(State(state): State<AppState>) -> Response {
     let config = state.config.lock().clone();
     match collect_config_files(&config.config_path) {
         Ok(files) => Json(files).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to read config files: {error}")})),
-        )
-            .into_response(),
+        Err(error) => {
+            warn!("Failed to read config files: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to read configuration files"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -191,21 +201,22 @@ pub async fn put_config_file(
                 if metadata.file_type().is_symlink() {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": format!("config.d path must not be a symlink: {}", parent.display())})),
+                        Json(serde_json::json!({"error": "config.d path must not be a symlink"})),
                     )
                         .into_response();
                 }
                 if !metadata.is_dir() {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": format!("config.d path is not a directory: {}", parent.display())})),
+                        Json(serde_json::json!({"error": "config.d path is not a directory"})),
                     )
                         .into_response();
                 }
             } else if let Err(error) = tokio::fs::create_dir_all(parent).await {
+                warn!("Failed to create config.d directory: {error}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Failed to create config.d directory: {error}")})),
+                    Json(serde_json::json!({"error": "Failed to create configuration directory"})),
                 )
                     .into_response();
             }
@@ -215,9 +226,10 @@ pub async fn put_config_file(
     if let Err(error) =
         crate::config::schema::write_toml_string_atomic(&target_path, &payload.content).await
     {
+        warn!("Failed to save config file: {error}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config file: {error}")})),
+            Json(serde_json::json!({"error": "Failed to save configuration file"})),
         )
             .into_response();
     }
@@ -228,16 +240,21 @@ pub async fn put_config_file(
     ) {
         Ok(config) => config,
         Err(error) => {
+            warn!("Saved file but merged config is invalid: {error}");
             return (
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("Saved file but merged config is invalid: {error}")})),
+                    Json(serde_json::json!({"error": "Saved file but merged configuration is invalid — check TOML syntax"})),
                 )
                     .into_response();
         }
     };
 
-    *state.config.lock() = refreshed.clone();
-    state.shared_config.store(Arc::new(refreshed));
+    // Atomic dual-store update: hold Mutex while swapping ArcSwap
+    {
+        let mut guard = state.config.lock();
+        *guard = refreshed.clone();
+        state.shared_config.store(Arc::new(refreshed));
+    }
 
     Json(serde_json::json!({
         "status": "ok",
@@ -353,10 +370,23 @@ fn is_sensitive_key(key: &str) -> bool {
         || key == "password"
         || key == "paired_tokens"
         || key == "db_url"
+        || key == "private_key"
+        || key == "access_key"
+        || key == "credential"
+        || key == "credentials"
+        || key == "connection_string"
+        || key == "signing_secret"
+        || key == "webhook_secret"
+        || key == "app_secret"
         || key.ends_with("_api_key")
         || key.ends_with("_api_keys")
         || key.ends_with("_token")
         || key.ends_with("_secret")
         || key.ends_with("_password")
+        || key.ends_with("_key")
+        || key.ends_with("_credential")
+        || key.ends_with("_credentials")
         || key.contains("password")
+        || key.contains("secret")
+        || key.contains("private_key")
 }

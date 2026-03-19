@@ -329,7 +329,7 @@ impl Tool for GatewayTool {
                     match std::fs::read(&cmdline_path) {
                         Ok(data) => {
                             let cmdline = String::from_utf8_lossy(&data);
-                            if !cmdline.contains("openprx") && !cmdline.contains("prx") {
+                            if !cmdline.contains("prx") {
                                 return Ok(ToolResult {
                                     success: false,
                                     output: String::new(),

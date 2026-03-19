@@ -157,11 +157,12 @@ impl SqliteMemory {
         // cache 2 MB: keep ~500 hot pages in-process
         // temp_store memory: temp tables never hit disk
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous  = NORMAL;
-             PRAGMA mmap_size    = 8388608;
-             PRAGMA cache_size   = -2000;
-             PRAGMA temp_store   = MEMORY;",
+            "PRAGMA journal_mode  = WAL;
+             PRAGMA synchronous   = NORMAL;
+             PRAGMA foreign_keys  = ON;
+             PRAGMA mmap_size     = 8388608;
+             PRAGMA cache_size    = -2000;
+             PRAGMA temp_store    = MEMORY;",
         )?;
 
         Self::init_schema(&conn)?;
@@ -396,7 +397,8 @@ impl SqliteMemory {
                 operator      TEXT NOT NULL,
                 created_at    TEXT NOT NULL,
                 PRIMARY KEY (from_topic_id),
-                FOREIGN KEY (to_topic_id) REFERENCES topics(id)
+                FOREIGN KEY (from_topic_id) REFERENCES topics(id) ON DELETE CASCADE,
+                FOREIGN KEY (to_topic_id) REFERENCES topics(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS access_audit_log (
@@ -488,7 +490,21 @@ impl SqliteMemory {
         ];
         for (name, alter_sql) in missing_columns {
             if !names.contains(name) {
-                conn.execute_batch(alter_sql)?;
+                match conn.execute_batch(alter_sql) {
+                    Ok(()) => {}
+                    Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
+                        if msg.contains("duplicate column name") =>
+                    {
+                        tracing::debug!(
+                            "Column memories.{name} already exists (concurrent migration): {err}"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Failed to add memories.{name}: {e}"
+                        ));
+                    }
+                }
             }
         }
 
@@ -726,15 +742,14 @@ impl SqliteMemory {
     fn content_hash(text: &str) -> String {
         use sha2::{Digest, Sha256};
         let hash = Sha256::digest(text.as_bytes());
-        // First 8 bytes → 16 hex chars, matching previous format length
-        format!(
-            "{:016x}",
-            u64::from_be_bytes(
-                hash[..8]
-                    .try_into()
-                    .expect("SHA-256 always produces >= 8 bytes")
-            )
-        )
+        // First 16 bytes → 32 hex chars. 128-bit hash reduces collision risk
+        // to negligible levels (~2^-64 birthday bound vs ~2^-32 with 64-bit).
+        let mut hex = String::with_capacity(32);
+        for byte in &hash[..16] {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
     }
 
     /// Get embedding from cache, or compute + cache it
@@ -785,14 +800,23 @@ impl SqliteMemory {
                  VALUES (?1, ?2, ?3, ?4)",
                 params![hash, bytes, now, now],
             )?;
-            conn.execute(
-                "DELETE FROM embedding_cache WHERE content_hash IN (
-                    SELECT content_hash FROM embedding_cache
-                    ORDER BY accessed_at ASC
-                    LIMIT MAX(0, (SELECT COUNT(*) FROM embedding_cache) - ?1)
-                )",
-                params![cache_max],
+            // Two-step LRU eviction: count first, then delete oldest if over limit.
+            // Avoids relying on MAX() as a scalar function in a LIMIT clause.
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM embedding_cache",
+                [],
+                |row| row.get(0),
             )?;
+            if count > cache_max {
+                let to_delete = count - cache_max;
+                conn.execute(
+                    "DELETE FROM embedding_cache WHERE content_hash IN (
+                        SELECT content_hash FROM embedding_cache
+                        ORDER BY accessed_at ASC LIMIT ?1
+                    )",
+                    params![to_delete],
+                )?;
+            }
             Ok(())
         })
         .await??;
@@ -1003,11 +1027,23 @@ impl Memory for SqliteMemory {
             let session_ref = sid.as_deref();
 
             // FTS5 BM25 keyword search
-            let keyword_results = Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default();
+            let keyword_results = match Self::fts5_search(&conn, &query, limit * 2) {
+                Ok(results) => results,
+                Err(e) => {
+                    tracing::warn!("FTS5 search failed (returning empty): {e}");
+                    Vec::new()
+                }
+            };
 
             // Vector similarity search (if embeddings available)
             let vector_results = if let Some(ref qe) = query_embedding {
-                Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
+                match Self::vector_search(&conn, qe, limit * 2, None, session_ref) {
+                    Ok(results) => results,
+                    Err(e) => {
+                        tracing::warn!("Vector search failed (returning empty): {e}");
+                        Vec::new()
+                    }
+                }
             } else {
                 Vec::new()
             };
@@ -2648,7 +2684,7 @@ mod tests {
     fn content_hash_empty_string() {
         let h = SqliteMemory::content_hash("");
         assert!(!h.is_empty());
-        assert_eq!(h.len(), 16); // 16 hex chars
+        assert_eq!(h.len(), 32); // 128-bit = 16 bytes = 32 hex chars
     }
 
     #[test]
@@ -2664,7 +2700,7 @@ mod tests {
     fn content_hash_long_input() {
         let long = "a".repeat(1_000_000);
         let h = SqliteMemory::content_hash(&long);
-        assert_eq!(h.len(), 16);
+        assert_eq!(h.len(), 32); // 128-bit = 16 bytes = 32 hex chars
     }
 
     // ── Edge cases: category helpers ─────────────────────────────

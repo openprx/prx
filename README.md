@@ -9,11 +9,13 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 - **9 LLM providers** — Anthropic, OpenAI, Google Gemini, GitHub Copilot, Ollama, AWS Bedrock, GLM, OpenAI Codex, and OpenAI-compatible endpoints
 - **LLM Router** — heuristic routing (capability + Elo + cost + latency), KNN semantic routing (cold-start guard + 100ms timeout fallback), and Automix low-confidence auto-upgrade
 - **19 messaging channels** — Signal, WhatsApp, Telegram, Discord, Slack, Matrix, and more
-- **43 built-in tools** — shell, browser, MCP, memory, scheduling, remote nodes
+- **43+ built-in tools** — shell, browser, MCP, memory, scheduling, remote nodes
+- **Xin (心) task engine** — autonomous heartbeat scheduler with 3 execution modes (Rust/LLM/Shell), 5 built-in system tasks, SQLite persistence
 - **Web Console** — browser-based management interface (`console/`)
 - **Remote Nodes** — control macOS/Linux/Pi devices via `prx-node` agent
-- **Self-Evolution** — autonomous prompt/memory/strategy improvement
+- **Self-Evolution** — autonomous prompt/memory/strategy improvement with xin-managed scheduling
 - **Subagent Governance** — concurrency limits, depth control, config inheritance
+- **3,400+ tests** — comprehensive test coverage across all modules
 
 ### LLM Router Flags
 
@@ -50,13 +52,13 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 ## Architecture
 
 ```
-         Channels (19)          Tools (43)            Remote Nodes
+         Channels (19)          Tools (43+)           Remote Nodes
     Signal · WA · TG · ...    Shell · MCP · ...     macOS · Pi · ...
               │                      │                     │
               ▼                      ▼                     ▼
          ┌─────────────────────────────────────────────────────┐
          │                    openprx daemon                    │
-         │  Agent Loop · Gateway · Cron · Subagents · Memory   │
+         │  Agent Loop · Gateway · Cron · Xin · Memory · Evo  │
          └──────────────────────┬──────────────────────────────┘
                                 │
                      Providers (9 LLMs)

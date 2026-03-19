@@ -94,7 +94,7 @@ pub fn run(config: &Config) -> Result<()> {
     println!("  Summary: {oks} ok, {warns} warnings, {errors} errors");
 
     if errors > 0 {
-        println!("  💡 Fix the errors above, then run `openprx doctor` again.");
+        println!("  💡 Fix the errors above, then run `prx doctor` again.");
     }
 
     Ok(())
@@ -488,7 +488,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     } else {
         items.push(DiagItem::warn(
             cat,
-            "no channels configured — run `openprx onboard` to set one up",
+            "no channels configured — run `prx onboard` to set one up",
         ));
     }
 
