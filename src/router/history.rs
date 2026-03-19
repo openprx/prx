@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::memory::embeddings::EmbeddingProvider;
 
-use super::knn::{weighted_model_score, KnnStore, QueryRecord, MIN_RECORDS_FOR_KNN};
+use super::knn::{KnnStore, MIN_RECORDS_FOR_KNN, QueryRecord, weighted_model_score};
 
 const DEFAULT_KNN_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_KNN_K: usize = 7;

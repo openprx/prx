@@ -1,9 +1,9 @@
-use crate::config::{new_shared, Config, HotReloadManager};
+use crate::config::{Config, HotReloadManager, new_shared};
 use crate::self_system::evolution::{
-    new_shared_evolution_config, AsyncJsonlWriter, EvolutionAnalyzer, EvolutionConfig,
-    EvolutionPipeline, EvolutionRetentionConfig, EvolutionRuntimeConfig, EvolutionScheduler,
-    JsonlRetentionPolicy, JsonlStoragePaths, MemoryEvolutionEngine, PromptEvolutionEngine,
-    StrategyEvolutionEngine,
+    AsyncJsonlWriter, EvolutionAnalyzer, EvolutionConfig, EvolutionPipeline,
+    EvolutionRetentionConfig, EvolutionRuntimeConfig, EvolutionScheduler, JsonlRetentionPolicy,
+    JsonlStoragePaths, MemoryEvolutionEngine, PromptEvolutionEngine, StrategyEvolutionEngine,
+    new_shared_evolution_config,
 };
 use anyhow::{Context, Result};
 use chrono::{Timelike, Utc};
@@ -627,10 +627,12 @@ mod tests {
         let component = &snapshot["components"]["daemon-test-fail"];
         assert_eq!(component["status"], "error");
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
-        assert!(component["last_error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("boom"));
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("boom")
+        );
     }
 
     #[tokio::test]
@@ -645,10 +647,12 @@ mod tests {
         let component = &snapshot["components"]["daemon-test-exit"];
         assert_eq!(component["status"], "error");
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
-        assert!(component["last_error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("component exited unexpectedly"));
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("component exited unexpectedly")
+        );
     }
 
     #[test]

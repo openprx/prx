@@ -7,8 +7,8 @@
 //! - Quote reply to specific messages
 
 use super::traits::{Tool, ToolResult};
-use crate::channels::traits::{Channel, SendMessage};
 use crate::channels::SignalChannel;
+use crate::channels::traits::{Channel, SendMessage};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -334,8 +334,10 @@ impl Tool for MessageSendTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some("Missing required 'emoji' parameter for react action.".into()),
-                        })
+                            error: Some(
+                                "Missing required 'emoji' parameter for react action.".into(),
+                            ),
+                        });
                     }
                 };
 
@@ -346,25 +348,25 @@ impl Tool for MessageSendTool {
                             success: false,
                             output: String::new(),
                             error: Some(
-                                "Missing required 'target_author' parameter for react action.".into(),
+                                "Missing required 'target_author' parameter for react action."
+                                    .into(),
                             ),
-                        })
+                        });
                     }
                 };
 
-                let target_timestamp = match args["target_timestamp"].as_u64() {
-                    Some(ts) => ts,
-                    None => {
-                        return Ok(ToolResult {
+                let target_timestamp =
+                    match args["target_timestamp"].as_u64() {
+                        Some(ts) => ts,
+                        None => return Ok(ToolResult {
                             success: false,
                             output: String::new(),
                             error: Some(
                                 "Missing required 'target_timestamp' parameter for react action."
                                     .into(),
                             ),
-                        })
-                    }
-                };
+                        }),
+                    };
 
                 match &self.signal {
                     Some(signal) => {
@@ -420,7 +422,10 @@ impl Tool for MessageSendTool {
                     }
                 };
                 let new_text = args["message"].as_str().unwrap_or("");
-                match channel.edit_message(&recipient, &message_id, new_text).await {
+                match channel
+                    .edit_message(&recipient, &message_id, new_text)
+                    .await
+                {
                     Ok(()) => Ok(ToolResult {
                         success: true,
                         output: format!("Message {message_id} edited."),
@@ -493,7 +498,10 @@ impl Tool for MessageSendTool {
                     }
                 };
                 let message = args["message"].as_str().unwrap_or("");
-                match channel.send_thread_reply(&recipient, &thread_id, message).await {
+                match channel
+                    .send_thread_reply(&recipient, &thread_id, message)
+                    .await
+                {
                     Ok(()) => Ok(ToolResult {
                         success: true,
                         output: format!("Thread reply sent to thread {thread_id}."),

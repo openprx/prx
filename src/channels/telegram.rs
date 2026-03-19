@@ -386,11 +386,7 @@ impl TelegramChannel {
                 primary
             } else {
                 let legacy = home.join(".openprx");
-                if legacy.exists() {
-                    legacy
-                } else {
-                    primary
-                }
+                if legacy.exists() { legacy } else { primary }
             }
         };
         let config_path = openprx_dir.join("config.toml");

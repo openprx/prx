@@ -4,10 +4,10 @@
 //! - `POST /api/plugins/{name}/reload` — reload a plugin by name
 
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 
 use super::super::AppState;

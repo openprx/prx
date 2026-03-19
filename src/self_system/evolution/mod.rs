@@ -26,21 +26,21 @@ pub use analyzer::{
     MetricShift, NoiseMemoryPattern, TaskTypeDigest, TaskTypeWeakness, TrendAnalysis,
     UserCorrectionCluster,
 };
-#[allow(unused_imports)]
-pub use config::{
-    new_shared_evolution_config, EvolutionRetrievalConfig, RetrievalScoreWeights,
-    SharedEvolutionConfig,
-};
 pub use config::{
     DataThresholds, EvolutionConfig, EvolutionGateConfig, EvolutionMode, EvolutionRetentionConfig,
     EvolutionRuntimeConfig, EvolutionRuntimeConfigManager, MemoryEvolutionConfig,
     PromptEvolutionConfig, RetrievalFusionWeights, RollbackConfig, StrategyEvolutionConfig,
 };
+#[allow(unused_imports)]
+pub use config::{
+    EvolutionRetrievalConfig, RetrievalScoreWeights, SharedEvolutionConfig,
+    new_shared_evolution_config,
+};
 pub use cycle_types::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
     EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
-pub use engine::{run_engine_cycle, CycleResult, EngineCycleInput, EvolutionEngine};
+pub use engine::{CycleResult, EngineCycleInput, EvolutionEngine, run_engine_cycle};
 #[allow(unused_imports)]
 pub use gate::{EvolutionGate, GateMetrics, GateRejection, GateResult};
 #[allow(unused_imports)]
@@ -74,5 +74,5 @@ pub use scheduler::{EvolutionScheduler, SchedulerRunSummary, SchedulerState};
 pub use storage::{AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths};
 pub use strategy_evolution::{StrategyEvolutionEngine, TaskDailySummary};
 pub use trace::{
-    current_trace, generate_experiment_id, generate_trace_id, with_trace, TraceContext,
+    TraceContext, current_trace, generate_experiment_id, generate_trace_id, with_trace,
 };

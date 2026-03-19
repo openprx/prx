@@ -342,9 +342,7 @@ impl Tool for GatewayTool {
                         Err(e) => {
                             // /proc may not exist (non-Linux), fall through since
                             // std::process::id() is inherently our own PID.
-                            tracing::warn!(
-                                "Could not read {cmdline_path} for PID validation: {e}"
-                            );
+                            tracing::warn!("Could not read {cmdline_path} for PID validation: {e}");
                         }
                     }
 
@@ -355,7 +353,9 @@ impl Tool for GatewayTool {
                     if ret == 0 {
                         Ok(ToolResult {
                             success: true,
-                            output: format!("SIGHUP sent to PID {pid} — daemon will restart gracefully."),
+                            output: format!(
+                                "SIGHUP sent to PID {pid} — daemon will restart gracefully."
+                            ),
                             error: None,
                         })
                     } else {
@@ -372,7 +372,10 @@ impl Tool for GatewayTool {
                     Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some("Graceful restart via SIGHUP is only supported on Unix systems.".to_string()),
+                        error: Some(
+                            "Graceful restart via SIGHUP is only supported on Unix systems."
+                                .to_string(),
+                        ),
                     })
                 }
             }
@@ -391,7 +394,7 @@ impl Tool for GatewayTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_shared, Config};
+    use crate::config::{Config, new_shared};
     use tempfile::TempDir;
 
     fn make_tool(tmp: &TempDir) -> GatewayTool {
@@ -470,10 +473,12 @@ mod tests {
         let tool = make_tool(&tmp);
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Missing 'action'"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Missing 'action'")
+        );
     }
 
     #[tokio::test]

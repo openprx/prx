@@ -16,8 +16,8 @@ pub mod vector;
 
 #[allow(unused_imports)]
 pub use backend::{
-    classify_memory_backend, default_memory_backend_key, memory_backend_profile,
-    selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
+    MemoryBackendKind, MemoryBackendProfile, classify_memory_backend, default_memory_backend_key,
+    memory_backend_profile, selectable_memory_backends,
 };
 pub use filter::should_autosave_content;
 pub use lucid::LucidMemory;
@@ -38,7 +38,7 @@ use crate::config::{
 };
 use anyhow::Context;
 use chrono::Local;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;

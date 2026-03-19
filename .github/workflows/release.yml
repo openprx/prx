@@ -91,23 +91,23 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --profile ci --bin openprx --bin prx-node --target ${{ matrix.target }}
+        run: cross build --profile ci --bin prx --bin prx-node --target ${{ matrix.target }}
 
       - name: Build (native)
         if: "!matrix.use_cross"
         env:
           CARGO_BUILD_JOBS: "2"
-        run: cargo build --profile ci --bin openprx --bin prx-node --target ${{ matrix.target }}
+        run: cargo build --profile ci --bin prx --bin prx-node --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/ci
-          chmod +x openprx prx-node
-          tar czf ../../../openprx-${{ matrix.suffix }}.tar.gz openprx
+          chmod +x prx prx-node
+          tar czf ../../../prx-${{ matrix.suffix }}.tar.gz prx
           tar czf ../../../prx-node-${{ matrix.suffix }}.tar.gz prx-node
           cd ../../..
-          sha256sum openprx-${{ matrix.suffix }}.tar.gz > openprx-${{ matrix.suffix }}.tar.gz.sha256
+          sha256sum prx-${{ matrix.suffix }}.tar.gz > prx-${{ matrix.suffix }}.tar.gz.sha256
           sha256sum prx-node-${{ matrix.suffix }}.tar.gz > prx-node-${{ matrix.suffix }}.tar.gz.sha256
 
       - name: Package (Windows)
@@ -115,18 +115,18 @@ jobs:
         shell: pwsh
         run: |
           cd target/${{ matrix.target }}/ci
-          Compress-Archive -Path openprx.exe -DestinationPath ../../../openprx-${{ matrix.suffix }}.zip
+          Compress-Archive -Path prx.exe -DestinationPath ../../../prx-${{ matrix.suffix }}.zip
           Compress-Archive -Path prx-node.exe -DestinationPath ../../../prx-node-${{ matrix.suffix }}.zip
           cd ../../..
-          Get-FileHash openprx-${{ matrix.suffix }}.zip -Algorithm SHA256 | Format-List Hash | Out-File openprx-${{ matrix.suffix }}.zip.sha256
+          Get-FileHash prx-${{ matrix.suffix }}.zip -Algorithm SHA256 | Format-List Hash | Out-File prx-${{ matrix.suffix }}.zip.sha256
           Get-FileHash prx-node-${{ matrix.suffix }}.zip -Algorithm SHA256 | Format-List Hash | Out-File prx-node-${{ matrix.suffix }}.zip.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openprx-${{ matrix.suffix }}
+          name: prx-${{ matrix.suffix }}
           path: |
-            openprx-${{ matrix.suffix }}.*
+            prx-${{ matrix.suffix }}.*
             prx-node-${{ matrix.suffix }}.*
           if-no-files-found: ignore
 
@@ -152,21 +152,21 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: OpenPRX ${{ steps.tag.outputs.tag }}
+          name: PRX ${{ steps.tag.outputs.tag }}
           files: artifacts/*
           body: |
-            ## OpenPRX ${{ steps.tag.outputs.tag }}
+            ## PRX ${{ steps.tag.outputs.tag }}
 
             Self-evolving AI assistant framework.
 
-            ### openprx (AI daemon)
+            ### prx (AI daemon)
             | Platform | Architecture | File |
             |----------|-------------|------|
-            | Linux | x86_64 | `openprx-linux-amd64.tar.gz` |
-            | Linux | ARM64 | `openprx-linux-arm64.tar.gz` |
-            | macOS | Intel | `openprx-macos-amd64.tar.gz` |
-            | macOS | Apple Silicon | `openprx-macos-arm64.tar.gz` |
-            | Windows | x86_64 | `openprx-windows-amd64.zip` |
+            | Linux | x86_64 | `prx-linux-amd64.tar.gz` |
+            | Linux | ARM64 | `prx-linux-arm64.tar.gz` |
+            | macOS | Intel | `prx-macos-amd64.tar.gz` |
+            | macOS | Apple Silicon | `prx-macos-arm64.tar.gz` |
+            | Windows | x86_64 | `prx-windows-amd64.zip` |
 
             ### prx-node (remote node agent)
             | Platform | Architecture | File |

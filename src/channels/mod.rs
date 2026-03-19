@@ -65,7 +65,7 @@ pub use whatsapp::WhatsAppChannel;
 pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
-    build_tool_instructions, run_tool_call_loop, ScopeContext, ToolConcurrencyGovernanceConfig,
+    ScopeContext, ToolConcurrencyGovernanceConfig, build_tool_instructions, run_tool_call_loop,
 };
 use crate::config::Config;
 use crate::hooks::HookManager;
@@ -2364,10 +2364,7 @@ async fn process_channel_message(
     let tool_event_forwarder = tokio::spawn(async move {
         while let Some(notif) = tool_event_rx.recv().await {
             match notif {
-                crate::agent::loop_::ToolCallNotification::Started {
-                    name,
-                    args_summary,
-                } => {
+                crate::agent::loop_::ToolCallNotification::Started { name, args_summary } => {
                     tracing::info!(
                         channel = %tool_event_channel_name,
                         sender = %tool_event_sender_name,
@@ -2465,7 +2462,7 @@ async fn process_channel_message(
                 break LlmFinalOutcome::Success {
                     response,
                     history_len_before_tools,
-                }
+                };
             }
             LlmExecutionResult::Completed(Ok(Err(e))) => {
                 if crate::agent::loop_::is_tool_loop_cancelled(&e)
@@ -3453,7 +3450,9 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                         )),
                     ));
                 } else {
-                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
+                    tracing::warn!(
+                        "WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)"
+                    );
                 }
             }
             "web" => {
@@ -3474,11 +3473,15 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
-                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
+                    tracing::warn!(
+                        "WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web"
+                    );
                 }
             }
             _ => {
-                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
+                tracing::warn!(
+                    "WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set"
+                );
             }
         }
     }
@@ -3934,7 +3937,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
                         wa.allowed_numbers.clone(),
                     )));
                 } else {
-                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
+                    tracing::warn!(
+                        "WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)"
+                    );
                 }
             }
             "web" => {
@@ -3952,11 +3957,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
-                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
+                    tracing::warn!(
+                        "WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web"
+                    );
                 }
             }
             _ => {
-                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
+                tracing::warn!(
+                    "WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set"
+                );
             }
         }
     }
@@ -4372,8 +4381,8 @@ mod tests {
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     fn make_workspace() -> TempDir {
@@ -6403,12 +6412,16 @@ BTC is currently around $65,000 based on latest tool output."#
         let calls = provider_impl.calls.lock();
         assert_eq!(calls.len(), 2);
         let second_call = &calls[1];
-        assert!(second_call
-            .iter()
-            .any(|(role, content)| { role == "user" && content.contains("forwarded content") }));
-        assert!(second_call
-            .iter()
-            .any(|(role, content)| { role == "user" && content.contains("summarize this") }));
+        assert!(
+            second_call
+                .iter()
+                .any(|(role, content)| { role == "user" && content.contains("forwarded content") })
+        );
+        assert!(
+            second_call
+                .iter()
+                .any(|(role, content)| { role == "user" && content.contains("summarize this") })
+        );
         assert!(
             !second_call.iter().any(|(role, _)| role == "assistant"),
             "cancelled turn should not persist an assistant response"
@@ -6776,8 +6789,11 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<description>Review code for bugs</description>"));
         assert!(prompt.contains("SKILL.md</location>"));
         assert!(prompt.contains("<instructions>"));
-        assert!(prompt
-            .contains("<instruction>Always run cargo test before final response.</instruction>"));
+        assert!(
+            prompt.contains(
+                "<instruction>Always run cargo test before final response.</instruction>"
+            )
+        );
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains("<name>lint</name>"));
         assert!(prompt.contains("<kind>shell</kind>"));
@@ -7640,10 +7656,12 @@ After"#;
         let component = &snapshot["components"]["channel:test-supervised-fail"];
         assert_eq!(component["status"], "error");
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
-        assert!(component["last_error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("listen boom"));
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("listen boom")
+        );
         assert!(calls.load(Ordering::SeqCst) >= 1);
     }
 
@@ -7667,19 +7685,19 @@ After"#;
         );
 
         tokio::time::sleep(Duration::from_millis(35)).await;
-        let first_last_ok = crate::health::snapshot_json()["components"][&component_name]
-            ["last_ok"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let first_last_ok =
+            crate::health::snapshot_json()["components"][&component_name]["last_ok"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
         assert!(!first_last_ok.is_empty());
 
         tokio::time::sleep(Duration::from_millis(70)).await;
-        let second_last_ok = crate::health::snapshot_json()["components"][&component_name]
-            ["last_ok"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let second_last_ok =
+            crate::health::snapshot_json()["components"][&component_name]["last_ok"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
         let first = chrono::DateTime::parse_from_rfc3339(&first_last_ok)
             .expect("last_ok should be valid RFC3339");
         let second = chrono::DateTime::parse_from_rfc3339(&second_last_ok)
@@ -7694,14 +7712,8 @@ After"#;
 
     #[test]
     fn maybe_restart_daemon_systemd_args_regression() {
-        assert_eq!(
-            SYSTEMD_STATUS_ARGS,
-            ["--user", "is-active", "prx.service"]
-        );
-        assert_eq!(
-            SYSTEMD_RESTART_ARGS,
-            ["--user", "restart", "prx.service"]
-        );
+        assert_eq!(SYSTEMD_STATUS_ARGS, ["--user", "is-active", "prx.service"]);
+        assert_eq!(SYSTEMD_RESTART_ARGS, ["--user", "restart", "prx.service"]);
     }
 
     #[test]

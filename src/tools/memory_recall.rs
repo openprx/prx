@@ -195,10 +195,12 @@ mod tests {
         let tool = MemoryRecallTool::new(mem, true);
         let result = tool.execute(json!({"query": "Rust"})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .is_some_and(|msg| msg.contains("disabled when memory ACL is enabled")));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("disabled when memory ACL is enabled"))
+        );
     }
 
     #[test]
@@ -219,9 +221,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .is_some_and(|msg| msg.contains("session_id=\"self_system\"")));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("session_id=\"self_system\""))
+        );
     }
 }

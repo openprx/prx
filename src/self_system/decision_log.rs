@@ -398,16 +398,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(memory
-            .get(&format!("self/decisions/{day}/proposal_2"))
-            .await
-            .unwrap()
-            .is_some());
-        assert!(memory
-            .get(&format!("self/decisions/{day}/proposal_3"))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            memory
+                .get(&format!("self/decisions/{day}/proposal_2"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            memory
+                .get(&format!("self/decisions/{day}/proposal_3"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -426,15 +430,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(memory
-            .get(&format!("self/decisions/{day}/proposal_2"))
-            .await
-            .unwrap()
-            .is_some());
-        assert!(memory
-            .get(&format!("self/decisions/{day}/proposal_3"))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            memory
+                .get(&format!("self/decisions/{day}/proposal_2"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            memory
+                .get(&format!("self/decisions/{day}/proposal_3"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

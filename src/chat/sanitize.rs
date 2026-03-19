@@ -16,14 +16,14 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
         r"(?i)(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?token|bearer)\s*[:=]\s*\S{8,}",
         r"(?i)(password|passwd|pwd)\s*[:=]\s*\S{4,}",
-        r"sk-[a-zA-Z0-9]{20,}",          // OpenAI-style keys
-        r"sk-ant-[a-zA-Z0-9-]{20,}",     // Anthropic keys
-        r"ghp_[a-zA-Z0-9]{36}",           // GitHub PAT
-        r"gho_[a-zA-Z0-9]{36}",           // GitHub OAuth
-        r"glpat-[a-zA-Z0-9_-]{20,}",     // GitLab PAT
-        r"xoxb-[a-zA-Z0-9-]+",            // Slack bot tokens
-        r"xoxp-[a-zA-Z0-9-]+",            // Slack user tokens
-        r"AKIA[0-9A-Z]{16}",              // AWS access key IDs
+        r"sk-[a-zA-Z0-9]{20,}",      // OpenAI-style keys
+        r"sk-ant-[a-zA-Z0-9-]{20,}", // Anthropic keys
+        r"ghp_[a-zA-Z0-9]{36}",      // GitHub PAT
+        r"gho_[a-zA-Z0-9]{36}",      // GitHub OAuth
+        r"glpat-[a-zA-Z0-9_-]{20,}", // GitLab PAT
+        r"xoxb-[a-zA-Z0-9-]+",       // Slack bot tokens
+        r"xoxp-[a-zA-Z0-9-]+",       // Slack user tokens
+        r"AKIA[0-9A-Z]{16}",         // AWS access key IDs
     ]
     .iter()
     .filter_map(|p| Regex::new(p).ok())

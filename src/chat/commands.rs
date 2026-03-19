@@ -3,9 +3,9 @@
 //! Each command is a pure function that prints output and returns a
 //! [`CommandResult`] so the caller knows whether to `continue` the loop.
 
+use super::session;
 use crate::memory::{Memory, MemoryCategory};
 use crate::tools::Tool;
-use super::session;
 use anyhow::Result;
 
 /// Outcome of a slash-command dispatch.
@@ -102,10 +102,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
                             .map(|s| format!(" ({s:.2})"))
                             .unwrap_or_default();
                         let preview = if entry.content.chars().count() > 80 {
-                            format!(
-                                "{}...",
-                                entry.content.chars().take(80).collect::<String>()
-                            )
+                            format!("{}...", entry.content.chars().take(80).collect::<String>())
                         } else {
                             entry.content.clone()
                         };
@@ -120,10 +117,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
             CommandResult::Handled
         }
         _ if input.starts_with("/export") => {
-            let format = input
-                .strip_prefix("/export")
-                .unwrap_or_default()
-                .trim();
+            let format = input.strip_prefix("/export").unwrap_or_default().trim();
             let format = if format.is_empty() { "md" } else { format };
             match export_session(ctx.chat_session, format) {
                 Ok(path) => println!("Exported to: {path}\n"),
@@ -149,10 +143,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
 /// When `session_id` is provided, only deletes conversation-scoped memory entries
 /// that do **not** belong to other saved sessions (`chat_session:*` keys for other IDs
 /// are preserved). This prevents `/clear` from wiping unrelated sessions.
-pub async fn handle_clear(
-    mem: &dyn Memory,
-    session_id: Option<&str>,
-) -> u32 {
+pub async fn handle_clear(mem: &dyn Memory, session_id: Option<&str>) -> u32 {
     let mut cleared = 0u32;
     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
         let entries = mem.list(Some(&category), None).await.unwrap_or_default();
@@ -219,7 +210,6 @@ fn export_session(session: &session::ChatSession, format: &str) -> Result<String
         }
     };
 
-    std::fs::write(&filename, &content)
-        .map_err(|e| anyhow::anyhow!("write {filename}: {e}"))?;
+    std::fs::write(&filename, &content).map_err(|e| anyhow::anyhow!("write {filename}: {e}"))?;
     Ok(filename)
 }

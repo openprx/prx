@@ -1,12 +1,12 @@
 use super::AppState;
 use crate::config::Config;
 use axum::{
+    Json, Router,
     extract::{ConnectInfo, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
-    Json, Router,
 };
 
 mod channels;

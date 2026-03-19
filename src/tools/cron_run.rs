@@ -153,7 +153,7 @@ impl Tool for CronRunTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_shared, Config};
+    use crate::config::{Config, new_shared};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
@@ -244,10 +244,12 @@ mod tests {
 
         let denied = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .unwrap_or_default()
+                .contains("explicit approval")
+        );
 
         let approved = tool
             .execute(json!({ "job_id": job.id, "approved": true }))

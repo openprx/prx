@@ -1,10 +1,10 @@
 use crate::config::Config;
 use crate::self_system::evolution::{
-    new_shared_evolution_config, AsyncJsonlWriter, CircuitBreakerState, EvolutionAnalyzer,
-    EvolutionConfig, EvolutionLayer, EvolutionLog, EvolutionMode, EvolutionPipeline,
-    EvolutionResult, EvolutionRetentionConfig, EvolutionRuntimeConfig, EvolutionTrigger,
-    JsonlRetentionPolicy, JsonlStoragePaths, MemoryAccessLog, MemoryEvolutionEngine,
-    PromptEvolutionEngine, StrategyEvolutionEngine,
+    AsyncJsonlWriter, CircuitBreakerState, EvolutionAnalyzer, EvolutionConfig, EvolutionLayer,
+    EvolutionLog, EvolutionMode, EvolutionPipeline, EvolutionResult, EvolutionRetentionConfig,
+    EvolutionRuntimeConfig, EvolutionTrigger, JsonlRetentionPolicy, JsonlStoragePaths,
+    MemoryAccessLog, MemoryEvolutionEngine, PromptEvolutionEngine, StrategyEvolutionEngine,
+    new_shared_evolution_config,
 };
 use crate::{EvolutionCommands, EvolutionLayerArg};
 use anyhow::{Context, Result};
@@ -517,11 +517,7 @@ where
 }
 
 fn bool_flag(v: bool) -> &'static str {
-    if v {
-        "yes"
-    } else {
-        "no"
-    }
+    if v { "yes" } else { "no" }
 }
 
 fn debug_value<T: Debug>(v: &T) -> String {

@@ -8,7 +8,7 @@ use crate::auth::codex_auth::{
 };
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
-    profile_id, AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore,
+    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, profile_id,
 };
 use crate::config::Config;
 use anyhow::Result;

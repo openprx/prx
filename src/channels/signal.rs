@@ -1,6 +1,6 @@
 use crate::channels::traits::{
-    extract_outgoing_media, guess_audio_mime, guess_mime_from_path, Channel, ChannelMessage,
-    SendMessage,
+    Channel, ChannelMessage, SendMessage, extract_outgoing_media, guess_audio_mime,
+    guess_mime_from_path,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

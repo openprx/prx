@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message as WsMsg};
+use tokio_tungstenite::tungstenite::{Message as WsMsg, protocol::WebSocketConfig};
 use uuid::Uuid;
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
@@ -811,7 +811,7 @@ impl LarkChannel {
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
-        use axum::{extract::State, routing::post, Json, Router};
+        use axum::{Json, Router, extract::State, routing::post};
 
         #[derive(Clone)]
         struct AppState {

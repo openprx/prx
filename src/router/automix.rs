@@ -91,7 +91,7 @@ pub fn is_cheap_model_target(model: &str, cheap_model_tiers: &[String]) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::{is_cheap_model_target, should_escalate, ConfidenceChecker};
+    use super::{ConfidenceChecker, is_cheap_model_target, should_escalate};
 
     #[test]
     fn test_confidence_low_triggers_escalation() {

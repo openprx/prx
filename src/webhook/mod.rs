@@ -3,14 +3,14 @@ use crate::memory::traits::MemoryCategory;
 use crate::memory::{Memory, SqliteMemory};
 use anyhow::{Context, Result};
 use axum::{
+    Json, Router,
     extract::State,
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::IntoResponse,
     routing::post,
-    Json, Router,
 };
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -690,7 +690,7 @@ fn ensure_memory_schema(db_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use serde_json::json;
     use std::net::SocketAddr;

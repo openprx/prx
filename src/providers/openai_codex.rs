@@ -1,10 +1,10 @@
-use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
+use crate::auth::openai_oauth::extract_account_id_from_jwt;
+use crate::providers::ProviderRuntimeOptions;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     Provider, ToolCall as ProviderToolCall,
 };
-use crate::providers::ProviderRuntimeOptions;
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -138,11 +138,7 @@ fn default_openprx_dir() -> PathBuf {
                 primary
             } else {
                 let legacy = dirs.home_dir().join(".openprx");
-                if legacy.exists() {
-                    legacy
-                } else {
-                    primary
-                }
+                if legacy.exists() { legacy } else { primary }
             }
         },
     )

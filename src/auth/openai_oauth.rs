@@ -410,7 +410,7 @@ fn parse_query_params(input: &str) -> BTreeMap<String, String> {
 }
 
 fn random_base64url(byte_len: usize) -> String {
-    use chacha20poly1305::aead::{rand_core::RngCore, OsRng};
+    use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
 
     let mut bytes = vec![0_u8; byte_len];
     OsRng.fill_bytes(&mut bytes);
@@ -504,9 +504,10 @@ mod tests {
             Some("xyz"),
         )
         .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("OpenAI OAuth error: access_denied"));
+        assert!(
+            err.to_string()
+                .contains("OpenAI OAuth error: access_denied")
+        );
     }
 
     #[test]

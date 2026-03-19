@@ -1,4 +1,4 @@
-use crate::cron::{next_run_for_schedule, Schedule};
+use crate::cron::{Schedule, next_run_for_schedule};
 use crate::self_system::evolution::analyzer::{DailyDigest, EvolutionAnalyzer};
 use crate::self_system::evolution::config::{EvolutionMode, SharedEvolutionConfig};
 use crate::self_system::evolution::engine::EvolutionEngine;
@@ -8,7 +8,7 @@ use crate::self_system::evolution::pipeline::{
 use crate::self_system::evolution::record::EvolutionLayer;
 use crate::self_system::evolution::rollback::CircuitBreaker;
 use crate::self_system::evolution::safety_utils::atomic_write;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -325,7 +325,7 @@ fn parse_ts(raw: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::self_system::evolution::config::{
-        new_shared_evolution_config, EvolutionConfig, EvolutionMode,
+        EvolutionConfig, EvolutionMode, new_shared_evolution_config,
     };
     use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput};
     use crate::self_system::evolution::record::{

@@ -2,7 +2,7 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[derive(Debug, Default)]
@@ -488,10 +488,12 @@ mod tests {
         assert!(result.success);
         let out: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(out["action"], "eval");
-        assert!(out["result"]["value"]
-            .as_str()
-            .unwrap_or("")
-            .contains("14 characters"));
+        assert!(
+            out["result"]["value"]
+                .as_str()
+                .unwrap_or("")
+                .contains("14 characters")
+        );
     }
 
     #[tokio::test]
@@ -531,10 +533,12 @@ mod tests {
         assert_eq!(out["visible"], true);
         assert_eq!(out["content"], "snap-test");
         assert_eq!(out["current_url"], "https://x.com");
-        assert!(out["snapshot_id"]
-            .as_str()
-            .unwrap_or("")
-            .starts_with("canvas-snapshot-"));
+        assert!(
+            out["snapshot_id"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("canvas-snapshot-")
+        );
     }
 
     #[tokio::test]
@@ -555,11 +559,13 @@ mod tests {
         let tool = canvas(AutonomyLevel::Full);
         let result = tool.execute(json!({"action": "destroy"})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Unsupported"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Unsupported")
+        );
     }
 
     // ── State continuity across actions ─────────────────────────

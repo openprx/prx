@@ -1,6 +1,6 @@
 use crate::memory::{Memory, MemoryCategory};
 use crate::self_system::SELF_SYSTEM_SESSION_ID;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

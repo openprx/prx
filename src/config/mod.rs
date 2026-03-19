@@ -2,12 +2,10 @@ pub mod files;
 pub mod hotreload;
 pub mod schema;
 
-pub use hotreload::{new_shared, HotReloadManager, SharedConfig};
+pub use hotreload::{HotReloadManager, SharedConfig, new_shared};
 
 #[allow(unused_imports)]
 pub use schema::{
-    apply_runtime_proxy_to_builder, build_runtime_proxy_client,
-    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
     AgentCompactionConfig, AgentCompactionMode, AgentConfig, AuditConfig, AuthConfig,
     AutomixConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, ChannelsConfig,
     ClassificationRule, ComposioConfig, Config, CostConfig, CronConfig, DelegateAgentConfig,
@@ -21,7 +19,9 @@ pub use schema::{
     SecretsConfig, SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig,
     SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
     TaskRoutingConfig, TaskRoutingIntentConfig, TaskRoutingRule, TelegramConfig, ToolPolicyConfig,
-    TunnelConfig, UserPolicyConfig, WebSearchConfig, WebhookConfig,
+    TunnelConfig, UserPolicyConfig, WebSearchConfig, WebhookConfig, apply_runtime_proxy_to_builder,
+    build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts, runtime_proxy_config,
+    set_runtime_proxy_config,
 };
 
 #[cfg(test)]

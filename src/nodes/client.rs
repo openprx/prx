@@ -5,7 +5,7 @@ use crate::nodes::protocol::{
     WriteFileParams, WriteFileResult,
 };
 use crate::nodes::transport::{NodeTransport, TransportRequest};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -368,10 +368,12 @@ mod tests {
         }
         let blocked = client.ping().await;
         assert!(blocked.is_err());
-        assert!(blocked
-            .unwrap_err()
-            .to_string()
-            .contains("temporarily unhealthy"));
+        assert!(
+            blocked
+                .unwrap_err()
+                .to_string()
+                .contains("temporarily unhealthy")
+        );
     }
 
     #[tokio::test]

@@ -126,12 +126,12 @@ impl ChatTheme {
     /// Monokai-inspired theme.
     pub fn monokai() -> Self {
         Self {
-            user_color: "\x1b[38;2;166;226;46m",  // monokai green
+            user_color: "\x1b[38;2;166;226;46m",       // monokai green
             assistant_color: "\x1b[38;2;102;217;239m", // monokai cyan
-            tool_color: "\x1b[38;2;253;151;31m",  // monokai orange
-            error_color: "\x1b[38;2;249;38;114m", // monokai pink
-            status_color: "\x1b[38;2;248;248;242m", // monokai fg
-            muted_color: "\x1b[38;2;117;113;94m", // monokai comment
+            tool_color: "\x1b[38;2;253;151;31m",       // monokai orange
+            error_color: "\x1b[38;2;249;38;114m",      // monokai pink
+            status_color: "\x1b[38;2;248;248;242m",    // monokai fg
+            muted_color: "\x1b[38;2;117;113;94m",      // monokai comment
         }
     }
 

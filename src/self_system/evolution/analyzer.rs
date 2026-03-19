@@ -892,17 +892,21 @@ mod tests {
 
         assert_eq!(trend.digests.len(), 3);
         assert!(!trend.noise_memories.is_empty());
-        assert!(trend
-            .weakest_task_type
-            .as_ref()
-            .is_some_and(|v| v.task_type == "tool_call"));
+        assert!(
+            trend
+                .weakest_task_type
+                .as_ref()
+                .is_some_and(|v| v.task_type == "tool_call")
+        );
         assert!(trend.lowest_efficiency_config.is_some());
         assert!(!trend.user_correction_clusters.is_empty());
         assert!(!trend.candidates.is_empty());
-        assert!(trend
-            .candidates
-            .iter()
-            .all(|candidate| !candidate.evidence_ids.is_empty()));
+        assert!(
+            trend
+                .candidates
+                .iter()
+                .all(|candidate| !candidate.evidence_ids.is_empty())
+        );
     }
 
     #[test]
@@ -928,9 +932,11 @@ mod tests {
 
         let shifts = compare_daily_digest(&previous, &current, 0.15);
         assert!(shifts.iter().any(|item| item.metric == "total_tasks"));
-        assert!(shifts
-            .iter()
-            .any(|item| item.metric == "avg_tokens_consumed"));
+        assert!(
+            shifts
+                .iter()
+                .any(|item| item.metric == "avg_tokens_consumed")
+        );
     }
 
     #[test]

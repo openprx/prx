@@ -253,10 +253,12 @@ mod tests {
         );
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["command"].is_object());
-        assert!(schema["required"]
-            .as_array()
-            .expect("schema required field should be an array")
-            .contains(&json!("command")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .expect("schema required field should be an array")
+                .contains(&json!("command"))
+        );
         assert!(schema["properties"]["approved"].is_object());
     }
 
@@ -304,11 +306,13 @@ mod tests {
             .await
             .expect("readonly command execution should return a result");
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_ref()
-            .expect("error field should be present for blocked command")
-            .contains("not allowed"));
+        assert!(
+            result
+                .error
+                .as_ref()
+                .expect("error field should be present for blocked command")
+                .contains("not allowed")
+        );
     }
 
     #[tokio::test]
@@ -446,11 +450,13 @@ mod tests {
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("explicit approval")
+        );
 
         let allowed = tool
             .execute(json!({
@@ -538,11 +544,13 @@ mod tests {
             .await
             .expect("acl-protected command should return a result");
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("ACL-protected memory path"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("ACL-protected memory path")
+        );
     }
 
     // ── PATH override verification ──────────────────────────────

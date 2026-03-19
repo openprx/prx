@@ -9,8 +9,7 @@ pub const SELF_SYSTEM_SESSION_ID: &str = "self_system";
 pub use decision_log::{log_change_outcome, log_change_proposal};
 #[allow(unused_imports)]
 pub use evolution::{
-    current_trace, generate_experiment_id, generate_trace_id, run_engine_cycle, with_trace, Actor,
-    AnnotationSource, AsyncJsonlWriter, CandidatePriority, ChangeOperation, ChangeTarget,
+    Actor, AnnotationSource, AsyncJsonlWriter, CandidatePriority, ChangeOperation, ChangeTarget,
     ChangeType, CircuitBreaker, CircuitBreakerState, ConfigEfficiencyIssue, CycleOutcome,
     CycleResult, DailyDigest, DataBasis, DataThresholds, DecisionLog, DecisionType,
     EngineCycleInput, EvolutionAnalyzer, EvolutionCandidate, EvolutionConfig, EvolutionCycle,
@@ -25,11 +24,12 @@ pub use evolution::{
     PromptMutationType, RetrievalFusionWeights, RiskLevel, RollbackConfig, RollbackManager,
     SchedulerRunSummary, SchedulerState, StrategyEvolutionConfig, StrategyEvolutionEngine,
     StructuredScores, TaskDailySummary, TaskType, TaskTypeDigest, TaskTypeWeakness, TraceContext,
-    TrendAnalysis, UserCorrectionCluster, ValidationStatus, VersionSnapshot,
+    TrendAnalysis, UserCorrectionCluster, ValidationStatus, VersionSnapshot, current_trace,
+    generate_experiment_id, generate_trace_id, run_engine_cycle, with_trace,
 };
 #[allow(unused_imports)]
 pub use experiment::{
-    complete_experiment, rollback_experiment, start_experiment, ExperimentRecord, ExperimentStatus,
+    ExperimentRecord, ExperimentStatus, complete_experiment, rollback_experiment, start_experiment,
 };
 #[allow(unused_imports)]
 pub use fitness::run_fitness_report;

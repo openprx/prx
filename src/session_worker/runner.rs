@@ -1,4 +1,4 @@
-use crate::agent::loop_::{run_tool_call_loop, ScopeContext, ToolConcurrencyGovernanceConfig};
+use crate::agent::loop_::{ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
 use crate::channels::build_identity_prompt;
 use crate::config::Config;
 use crate::hooks::HookManager;
@@ -354,9 +354,11 @@ mod tests {
     #[test]
     fn parse_tools_override_rejects_invalid_json_shape() {
         let error = parse_tools_override(r#"{"tool":"shell"}"#).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("parse --tools JSON as string array"));
+        assert!(
+            error
+                .to_string()
+                .contains("parse --tools JSON as string array")
+        );
     }
 
     #[tokio::test]

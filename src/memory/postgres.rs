@@ -1,4 +1,4 @@
-use super::traits::{validate_memory_write_target, Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, validate_memory_write_target};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

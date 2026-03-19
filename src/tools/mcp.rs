@@ -5,7 +5,7 @@ use anyhow::bail;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
-use rmcp::{model::CallToolRequestParams, ServiceExt};
+use rmcp::{ServiceExt, model::CallToolRequestParams};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -578,8 +578,8 @@ impl McpTool {
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                    "Tool '{tool_name}' not found on MCP server '{server_name}'. Available: [{available}]"
-                );
+                "Tool '{tool_name}' not found on MCP server '{server_name}'. Available: [{available}]"
+            );
         }
 
         match server.transport {

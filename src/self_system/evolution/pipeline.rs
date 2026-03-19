@@ -476,7 +476,7 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::self_system::evolution::config::{
-        new_shared_evolution_config, EvolutionConfig, EvolutionMode,
+        EvolutionConfig, EvolutionMode, new_shared_evolution_config,
     };
     use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput};
     use crate::self_system::evolution::record::{

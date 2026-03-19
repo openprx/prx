@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
-use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
+use syntect::util::{LinesWithEndings, as_24_bit_terminal_escaped};
 
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
@@ -24,16 +24,13 @@ pub fn highlight_code_block(code: &str, language: Option<&str>) -> String {
         .and_then(|lang| SYNTAX_SET.find_syntax_by_token(lang))
         .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
 
-    let theme = THEME_SET
-        .themes
-        .get(DEFAULT_THEME)
-        .unwrap_or_else(|| {
-            THEME_SET
-                .themes
-                .values()
-                .next()
-                .unwrap_or_else(|| &THEME_SET.themes["base16-ocean.dark"])
-        });
+    let theme = THEME_SET.themes.get(DEFAULT_THEME).unwrap_or_else(|| {
+        THEME_SET
+            .themes
+            .values()
+            .next()
+            .unwrap_or_else(|| &THEME_SET.themes["base16-ocean.dark"])
+    });
 
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut output = String::new();
@@ -68,7 +65,11 @@ pub fn render_markdown_with_highlighting(text: &str) -> String {
         if !in_code_block && (line.starts_with("```") || line.starts_with("~~~")) {
             // Start of code block
             in_code_block = true;
-            let fence = if line.starts_with("```") { "```" } else { "~~~" };
+            let fence = if line.starts_with("```") {
+                "```"
+            } else {
+                "~~~"
+            };
             let lang = line[fence.len()..].trim();
             code_language = if lang.is_empty() {
                 None
@@ -85,8 +86,7 @@ pub fn render_markdown_with_highlighting(text: &str) -> String {
             result.push('\n');
         } else if in_code_block && (line.starts_with("```") || line.starts_with("~~~")) {
             // End of code block — highlight and append
-            let highlighted =
-                highlight_code_block(&code_buffer, code_language.as_deref());
+            let highlighted = highlight_code_block(&code_buffer, code_language.as_deref());
             for hl_line in highlighted.lines() {
                 result.push_str("  │ ");
                 result.push_str(hl_line);
@@ -107,8 +107,7 @@ pub fn render_markdown_with_highlighting(text: &str) -> String {
 
     // Handle unclosed code block
     if in_code_block && !code_buffer.is_empty() {
-        let highlighted =
-            highlight_code_block(&code_buffer, code_language.as_deref());
+        let highlighted = highlight_code_block(&code_buffer, code_language.as_deref());
         for hl_line in highlighted.lines() {
             result.push_str("  │ ");
             result.push_str(hl_line);

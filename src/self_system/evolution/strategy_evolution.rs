@@ -12,7 +12,7 @@ use crate::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
     EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -420,7 +420,7 @@ fn build_task_daily_summary(decisions: &[DecisionLog]) -> Vec<TaskDailySummary> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::self_system::evolution::config::{new_shared_evolution_config, EvolutionConfig};
+    use crate::self_system::evolution::config::{EvolutionConfig, new_shared_evolution_config};
     use crate::self_system::evolution::storage::{
         AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths,
     };

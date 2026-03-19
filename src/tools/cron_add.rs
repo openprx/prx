@@ -345,7 +345,7 @@ impl Tool for CronAddTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_shared, Config};
+    use crate::config::{Config, new_shared};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
@@ -469,10 +469,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .unwrap_or_default()
+                .contains("explicit approval")
+        );
 
         let approved = tool
             .execute(json!({
@@ -503,10 +505,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("every_ms must be > 0"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("every_ms must be > 0")
+        );
     }
 
     #[tokio::test]

@@ -472,7 +472,7 @@ fn default_candidate() -> EvolutionCandidate {
 mod tests {
     use super::*;
     use crate::self_system::evolution::config::{
-        new_shared_evolution_config, EvolutionConfig, EvolutionMode,
+        EvolutionConfig, EvolutionMode, new_shared_evolution_config,
     };
     use tempfile::tempdir;
 

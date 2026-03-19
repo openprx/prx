@@ -56,18 +56,12 @@ impl PrometheusObserver {
         )
         .expect("valid metric");
         let tool_cancellations = IntCounterVec::new(
-            prometheus::Opts::new(
-                "prx_tool_cancellations_total",
-                "Total tool cancellations",
-            ),
+            prometheus::Opts::new("prx_tool_cancellations_total", "Total tool cancellations"),
             &["rollout_stage"],
         )
         .expect("valid metric");
         let tool_degrades = IntCounterVec::new(
-            prometheus::Opts::new(
-                "prx_tool_degrades_total",
-                "Total scheduler degradations",
-            ),
+            prometheus::Opts::new("prx_tool_degrades_total", "Total scheduler degradations"),
             &["rollout_stage"],
         )
         .expect("valid metric");
@@ -114,19 +108,14 @@ impl PrometheusObserver {
         .expect("valid metric");
 
         let request_latency = Histogram::with_opts(
-            HistogramOpts::new(
-                "prx_request_latency_seconds",
-                "Request latency in seconds",
-            )
-            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+            HistogramOpts::new("prx_request_latency_seconds", "Request latency in seconds")
+                .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
         )
         .expect("valid metric");
 
-        let tokens_used = prometheus::IntGauge::new(
-            "prx_tokens_used_last",
-            "Tokens used in the last request",
-        )
-        .expect("valid metric");
+        let tokens_used =
+            prometheus::IntGauge::new("prx_tokens_used_last", "Tokens used in the last request")
+                .expect("valid metric");
 
         let active_sessions = GaugeVec::new(
             prometheus::Opts::new("prx_active_sessions", "Number of active sessions"),

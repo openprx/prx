@@ -117,7 +117,7 @@ fn truncate(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_shared, Config};
+    use crate::config::{Config, new_shared};
     use chrono::{Duration as ChronoDuration, Utc};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -171,9 +171,11 @@ mod tests {
         let tool = CronRunsTool::new(cfg);
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Missing 'job_id'"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Missing 'job_id'")
+        );
     }
 }
