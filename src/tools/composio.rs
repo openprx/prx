@@ -7,8 +7,8 @@
 // The Composio API key is stored in the encrypted secret store.
 
 use super::traits::{Tool, ToolResult};
-use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -781,13 +781,15 @@ impl Tool for ComposioTool {
                     Ok(link) => {
                         let target =
                             app.unwrap_or(auth_config_id.unwrap_or("provided auth config"));
-                        let mut output = format!(
-                            "Open this URL to connect {target}:\n{}",
-                            link.redirect_url
-                        );
+                        let mut output =
+                            format!("Open this URL to connect {target}:\n{}", link.redirect_url);
                         if let Some(connected_account_id) = link.connected_account_id.as_deref() {
                             if let Some(app_name) = app {
-                                self.cache_connected_account(app_name, entity_id, connected_account_id);
+                                self.cache_connected_account(
+                                    app_name,
+                                    entity_id,
+                                    connected_account_id,
+                                );
                             }
                             output.push_str(&format!(
                                 "\nConnected account ID: {connected_account_id}"
@@ -1215,11 +1217,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("read-only mode"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("read-only mode")
+        );
     }
 
     #[tokio::test]
@@ -1237,11 +1241,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Rate limit exceeded")
+        );
     }
 
     // ── API response parsing ──────────────────────────────────

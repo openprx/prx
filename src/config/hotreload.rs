@@ -20,8 +20,8 @@ use arc_swap::ArcSwap;
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -77,7 +77,7 @@ fn run_watcher(
     reload_version: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     use notify::RecursiveMode;
-    use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
+    use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
 
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
     let debounce_ms = std::time::Duration::from_secs(1);

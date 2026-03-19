@@ -1,6 +1,6 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
-use crate::hooks::{payload_error, HookEvent, HookManager};
+use crate::hooks::{HookEvent, HookManager, payload_error};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent};
@@ -13,7 +13,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
-use std::collections::{hash_map::DefaultHasher, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, hash_map::DefaultHasher};
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::io::Write as _;
@@ -3531,7 +3531,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -3557,8 +3557,8 @@ mod tests {
     }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::traits::ProviderCapabilities;
     use crate::providers::ChatResponse;
+    use crate::providers::traits::ProviderCapabilities;
     use tempfile::TempDir;
 
     struct NonVisionProvider {
@@ -3837,9 +3837,10 @@ mod tests {
         .await
         .expect_err("oversized payload must fail");
 
-        assert!(err
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
+        assert!(
+            err.to_string()
+                .contains("multimodal image size limit exceeded")
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -4794,7 +4795,7 @@ ls -la
         assert_eq!(history[0].content, "system prompt");
         // Trimmed to limit
         assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
-                                                                     // Most recent messages preserved
+        // Most recent messages preserved
         let last = &history[history.len() - 1];
         assert_eq!(
             last.content,
@@ -4900,9 +4901,11 @@ ls -la
             .await
             .unwrap();
         assert!(compacted);
-        assert!(history
-            .iter()
-            .any(|msg| msg.content.contains("[Memory flush at")));
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.content.contains("[Memory flush at"))
+        );
     }
 
     #[test]
@@ -5212,10 +5215,12 @@ Done."#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "shell");
         assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
-        assert!(calls[0].1["command"]
-            .as_str()
-            .unwrap()
-            .contains("example.com"));
+        assert!(
+            calls[0].1["command"]
+                .as_str()
+                .unwrap()
+                .contains("example.com")
+        );
     }
 
     #[test]

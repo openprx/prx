@@ -15,29 +15,29 @@ pub mod renderer;
 pub mod tui;
 
 use crate::agent::loop_::{
-    build_context, build_runtime_system_prompt, increment_recalled_useful_counts,
-    is_tool_loop_cancelled, run_tool_call_loop, select_prompt_skills, ScopeContext,
-    ToolCallNotification, ToolConcurrencyGovernanceConfig,
+    ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig, build_context,
+    build_runtime_system_prompt, increment_recalled_useful_counts, is_tool_loop_cancelled,
+    run_tool_call_loop, select_prompt_skills,
 };
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
 use crate::channels::{
-    extract_tool_context_summary, is_context_window_overflow_error, sanitize_channel_response,
-    Channel, SendMessage, TerminalChannel,
+    Channel, SendMessage, TerminalChannel, extract_tool_context_summary,
+    is_context_window_overflow_error, sanitize_channel_response,
 };
-use crate::security::PolicyPipeline;
 use crate::config::Config;
-use crate::hooks::{payload_error, HookEvent, HookManager};
+use crate::hooks::{HookEvent, HookManager, payload_error};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
+use crate::security::PolicyPipeline;
 use crate::security::SecurityPolicy;
 use crate::tools;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -87,10 +87,7 @@ fn compact_chat_history(history: &mut Vec<ChatMessage>) {
     }
 
     // Separate system prompt from conversation turns
-    let has_system = history
-        .first()
-        .map(|m| m.role == "system")
-        .unwrap_or(false);
+    let has_system = history.first().map(|m| m.role == "system").unwrap_or(false);
     let start = if has_system { 1 } else { 0 };
 
     // Keep only the last COMPACT_KEEP_MESSAGES conversation turns
@@ -172,16 +169,15 @@ pub async fn run(
     ));
 
     // ── Memory ───────────────────────────────────────────────────
-    let mem: Arc<dyn Memory> =
-        Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
-            &config.memory,
-            &config.embedding_routes,
-            Some(&config.storage.provider.config),
-            &config.workspace_dir,
-            config.api_key.as_deref(),
-            &config.identity_bindings,
-            &config.user_policies,
-        )?);
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
+        &config.memory,
+        &config.embedding_routes,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+        &config.identity_bindings,
+        &config.user_policies,
+    )?);
     info!(backend = mem.name(), "Memory initialized");
 
     // ── List sessions (early return) ─────────────────────────────
@@ -283,30 +279,26 @@ pub async fn run(
 
     // ── Session: resume or create new ───────────────────────────
     let mut chat_session = match session_id.as_deref() {
-        Some("last") => {
-            match load_latest_session(mem.as_ref()).await {
-                Some(s) => {
-                    info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
-                    s
-                }
-                None => {
-                    info!("No previous session found, starting new");
-                    session::ChatSession::new(provider_name, model_name)
-                }
+        Some("last") => match load_latest_session(mem.as_ref()).await {
+            Some(s) => {
+                info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
+                s
             }
-        }
-        Some(id) => {
-            match load_session_by_id(mem.as_ref(), id).await {
-                Some(s) => {
-                    info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
-                    s
-                }
-                None => {
-                    eprintln!("Session '{id}' not found, starting new session.");
-                    session::ChatSession::new(provider_name, model_name)
-                }
+            None => {
+                info!("No previous session found, starting new");
+                session::ChatSession::new(provider_name, model_name)
             }
-        }
+        },
+        Some(id) => match load_session_by_id(mem.as_ref(), id).await {
+            Some(s) => {
+                info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
+                s
+            }
+            None => {
+                eprintln!("Session '{id}' not found, starting new session.");
+                session::ChatSession::new(provider_name, model_name)
+            }
+        },
         None => session::ChatSession::new(provider_name, model_name),
     };
 
@@ -510,10 +502,7 @@ pub async fn run(
         let (delta_tx, delta_rx) = mpsc::channel::<String>(DELTA_CHANNEL_CAPACITY);
 
         // Start a streaming draft on the terminal
-        let draft_id = match terminal
-            .send_draft(&SendMessage::new("", "user"))
-            .await
-        {
+        let draft_id = match terminal.send_draft(&SendMessage::new("", "user")).await {
             Ok(id) => id,
             Err(e) => {
                 tracing::debug!("Failed to start draft: {e}");
@@ -543,9 +532,9 @@ pub async fn run(
         } else {
             // No draft — consume delta_rx so the sender doesn't block
             let mut rx = delta_rx;
-            Some(tokio::spawn(async move {
-                while rx.recv().await.is_some() {}
-            }))
+            Some(tokio::spawn(
+                async move { while rx.recv().await.is_some() {} },
+            ))
         };
 
         // Register this turn's cancellation token so the Ctrl+C handler can cancel it.
@@ -585,8 +574,12 @@ pub async fn run(
 
         // ── Timeout budget ───────────────────────────────────────
         let timeout_budget = {
-            let base = config.channels_config.message_timeout_secs.max(TIMEOUT_MIN_BASE_SECS);
-            let scale = (config.agent.max_tool_iterations.max(1) as u64).min(TIMEOUT_MAX_SCALE_FACTOR);
+            let base = config
+                .channels_config
+                .message_timeout_secs
+                .max(TIMEOUT_MIN_BASE_SECS);
+            let scale =
+                (config.agent.max_tool_iterations.max(1) as u64).min(TIMEOUT_MAX_SCALE_FACTOR);
             Duration::from_secs(base.saturating_mul(scale))
         };
 
@@ -629,20 +622,11 @@ pub async fn run(
                     config.agent.priority_scheduling_enabled,
                     config.agent.low_priority_tools.clone(),
                     ToolConcurrencyGovernanceConfig {
-                        kill_switch_force_serial: config
-                            .agent
-                            .concurrency_kill_switch_force_serial,
+                        kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
                         rollout_stage: config.agent.concurrency_rollout_stage.clone(),
-                        rollout_sample_percent: config
-                            .agent
-                            .concurrency_rollout_sample_percent,
-                        rollout_channels: config
-                            .agent
-                            .concurrency_rollout_channels
-                            .clone(),
-                        auto_rollback_enabled: config
-                            .agent
-                            .concurrency_auto_rollback_enabled,
+                        rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
+                        rollout_channels: config.agent.concurrency_rollout_channels.clone(),
+                        auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
                         rollback_timeout_rate_threshold: config
                             .agent
                             .concurrency_rollback_timeout_rate_threshold,
@@ -667,9 +651,7 @@ pub async fn run(
                 Err(_elapsed) => {
                     if timeout_retries < 1 {
                         timeout_retries += 1;
-                        tracing::warn!(
-                            "LLM timeout, retrying (attempt {timeout_retries}/1)"
-                        );
+                        tracing::warn!("LLM timeout, retrying (attempt {timeout_retries}/1)");
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
@@ -680,19 +662,14 @@ pub async fn run(
                     }
                     eprintln!("\nError: operation timed out\n");
                     hooks
-                        .emit(
-                            HookEvent::Error,
-                            payload_error("chat-turn", "timeout"),
-                        )
+                        .emit(HookEvent::Error, payload_error("chat-turn", "timeout"))
                         .await;
                     break TurnOutcome::Failed;
                 }
                 // ── Success ───────────────────────────────────────
                 Ok(Ok(resp)) => break TurnOutcome::Success(resp),
                 // ── Cancelled (Ctrl+C) ────────────────────────────
-                Ok(Err(ref e))
-                    if is_tool_loop_cancelled(e) || cancellation.is_cancelled() =>
-                {
+                Ok(Err(ref e)) if is_tool_loop_cancelled(e) || cancellation.is_cancelled() => {
                     if let Some(ref d_id) = draft_id {
                         let _ = terminal.cancel_draft("user", d_id).await;
                     }
@@ -701,10 +678,8 @@ pub async fn run(
                 // ── Context window overflow → compact + retry ─────
                 Ok(Err(ref e)) if is_context_window_overflow_error(e) => {
                     compact_chat_history(&mut history);
-                    let compacted_chars: usize = history
-                        .iter()
-                        .map(|m| m.content.chars().count())
-                        .sum();
+                    let compacted_chars: usize =
+                        history.iter().map(|m| m.content.chars().count()).sum();
                     tracing::warn!(
                         retries = context_overflow_retries,
                         compacted_chars,
@@ -738,10 +713,7 @@ pub async fn run(
                     }
                     eprintln!("\nError: {e}\n");
                     hooks
-                        .emit(
-                            HookEvent::Error,
-                            payload_error("chat-turn", &e.to_string()),
-                        )
+                        .emit(HookEvent::Error, payload_error("chat-turn", &e.to_string()))
                         .await;
                     break TurnOutcome::Failed;
                 }
@@ -772,8 +744,7 @@ pub async fn run(
         let response = sanitize_channel_response(&response, &tools_registry);
 
         // ── Extract tool context summary for LLM awareness on next turn ──
-        let tool_summary =
-            extract_tool_context_summary(&history, history_len_before_tools);
+        let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
         // Always persist the assistant response to history. When tools were
         // invoked, prepend the summary so the LLM retains awareness.
         let history_response = if tool_summary.is_empty() {
@@ -810,16 +781,12 @@ pub async fn run(
             {
                 tracing::warn!("Failed to finalize draft: {e}");
                 let rendered = render_response(display_response);
-                let _ = terminal
-                    .send(&SendMessage::new(rendered, "user"))
-                    .await;
+                let _ = terminal.send(&SendMessage::new(rendered, "user")).await;
             }
         } else {
             // No draft was created — send as a complete message with highlighting
             let rendered = render_response(display_response);
-            let _ = terminal
-                .send(&SendMessage::new(rendered, "user"))
-                .await;
+            let _ = terminal.send(&SendMessage::new(rendered, "user")).await;
         }
 
         // ── Record turn in session + persist ───────────────────
@@ -883,7 +850,9 @@ fn render_response(response: &str) -> String {
 
 /// Save a session to the Memory backend.
 async fn save_session(mem: &dyn Memory, session: &session::ChatSession) -> Result<()> {
-    let json = session.to_json().map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+    let json = session
+        .to_json()
+        .map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
     mem.store(
         &session.memory_key(),
         &json,
@@ -954,4 +923,3 @@ async fn list_saved_sessions(mem: &dyn Memory) -> Result<()> {
     println!("\nResume with: prx chat --session <ID>");
     Ok(())
 }
-

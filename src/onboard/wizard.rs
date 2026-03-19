@@ -14,7 +14,7 @@ use crate::providers::{
     is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
     is_zai_cn_alias,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
@@ -3918,11 +3918,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .with_prompt("  Verification Token (optional, for Webhook mode)")
                         .allow_empty(true)
                         .interact_text()?;
-                    if token.is_empty() {
-                        None
-                    } else {
-                        Some(token)
-                    }
+                    if token.is_empty() { None } else { Some(token) }
                 } else {
                     None
                 };
@@ -4620,10 +4616,8 @@ fn print_summary(config: &Config) {
             );
             println!(
                 "       {}",
-                style(
-                    "or: prx auth paste-token --provider anthropic --auth-kind authorization"
-                )
-                .yellow()
+                style("or: prx auth paste-token --provider anthropic --auth-kind authorization")
+                    .yellow()
             );
         } else {
             let env_var = provider_env_var(provider);
@@ -5691,9 +5685,10 @@ mod tests {
         };
 
         let err = run_models_refresh(&config, None, true).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("does not support live model discovery"));
+        assert!(
+            err.to_string()
+                .contains("does not support live model discovery")
+        );
     }
 
     // ── provider_env_var ────────────────────────────────────────

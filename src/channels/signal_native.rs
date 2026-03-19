@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 /// Signal channel that spawns a local `signal-cli` daemon and communicates
 /// with it over HTTP (SSE for receiving, JSON-RPC for sending).

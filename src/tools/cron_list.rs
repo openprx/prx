@@ -60,7 +60,7 @@ impl Tool for CronListTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_shared, Config};
+    use crate::config::{Config, new_shared};
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> SharedConfig {
@@ -99,9 +99,11 @@ mod tests {
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("cron is disabled"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("cron is disabled")
+        );
     }
 }

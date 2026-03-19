@@ -13,7 +13,7 @@ use crate::xin::store;
 use crate::xin::types::{ExecutionMode, XinTask, XinTickSummary};
 use anyhow::Result;
 use chrono::Utc;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -189,9 +189,15 @@ async fn execute_single_task(
 
     // Record run history
     let status = if success { "ok" } else { "error" };
-    if let Err(e) =
-        store::record_run(config, &task_id, started_at, finished_at, status, Some(&output), duration_ms)
-    {
+    if let Err(e) = store::record_run(
+        config,
+        &task_id,
+        started_at,
+        finished_at,
+        status,
+        Some(&output),
+        duration_ms,
+    ) {
         tracing::warn!(target: "xin", task_id = %task_id, "failed to record run: {e}");
     }
 
@@ -218,11 +224,7 @@ async fn run_internal(
     }
 }
 
-async fn run_agent(
-    config: &Config,
-    security: &SecurityPolicy,
-    task: &XinTask,
-) -> (bool, String) {
+async fn run_agent(config: &Config, security: &SecurityPolicy, task: &XinTask) -> (bool, String) {
     if !security.can_act() {
         return (
             false,
@@ -274,11 +276,7 @@ async fn run_agent(
     }
 }
 
-async fn run_shell(
-    config: &Config,
-    security: &SecurityPolicy,
-    task: &XinTask,
-) -> (bool, String) {
+async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -> (bool, String) {
     if !security.can_act() {
         return (
             false,
@@ -342,10 +340,7 @@ async fn run_shell(
             (output.status.success(), combined)
         }
         Ok(Err(e)) => (false, format!("spawn error: {e}")),
-        Err(_) => (
-            false,
-            format!("task timed out after {SHELL_TIMEOUT_SECS}s"),
-        ),
+        Err(_) => (false, format!("task timed out after {SHELL_TIMEOUT_SECS}s")),
     }
 }
 

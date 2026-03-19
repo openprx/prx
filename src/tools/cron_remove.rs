@@ -110,7 +110,7 @@ impl Tool for CronRemoveTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_shared, Config};
+    use crate::config::{Config, new_shared};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
@@ -155,10 +155,12 @@ mod tests {
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Missing 'job_id'"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Missing 'job_id'")
+        );
     }
 
     #[tokio::test]

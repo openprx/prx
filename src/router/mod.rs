@@ -14,19 +14,19 @@ use std::sync::Arc;
 
 use crate::agent::classifier::TaskIntent;
 use crate::config::{ModelRouteConfig, RouterConfig};
-use crate::memory::embeddings::EmbeddingProvider;
 use crate::memory::Memory;
+use crate::memory::embeddings::EmbeddingProvider;
 
 use self::capability::{
-    append_success_event, filter_models_by_providers, is_model_reachable, load_recent_successes,
-    reachable_provider_names, ModelCapabilityEntry,
+    ModelCapabilityEntry, append_success_event, filter_models_by_providers, is_model_reachable,
+    load_recent_successes, reachable_provider_names,
 };
 use self::elo::update_elo;
 use self::history::RouterHistory;
 use self::intent::infer_router_intent;
 use self::knn::KnnStore;
-use self::scorer::rank_models;
 pub use self::scorer::RouterResult;
+use self::scorer::rank_models;
 
 pub struct RouterEngine {
     config: RouterConfig,
@@ -807,10 +807,12 @@ mod tests {
         let result = router.select_model("same query", &TaskIntent::Simple).await;
 
         assert!(result.chosen_model.is_some());
-        assert!(result
-            .candidates
-            .iter()
-            .all(|candidate| candidate.similarity_score == 0.0));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| candidate.similarity_score == 0.0)
+        );
     }
 
     #[tokio::test]
@@ -1000,10 +1002,12 @@ mod tests {
             .await;
         assert_eq!(result.chosen_provider.as_deref(), Some("anthropic"));
         assert_eq!(result.chosen_model.as_deref(), Some("claude-sonnet"));
-        assert!(result
-            .candidates
-            .iter()
-            .all(|candidate| candidate.provider == "anthropic"));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| candidate.provider == "anthropic")
+        );
     }
 
     #[tokio::test]
@@ -1069,11 +1073,13 @@ mod tests {
         let cheap_snapshot: serde_json::Value = serde_json::from_str(&cheap_elo.content).unwrap();
         assert!(cheap_snapshot["dynamic_elo"].as_f64().unwrap() > 1_000.0);
 
-        assert!(memory
-            .get("router/elo/model-premium")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            memory
+                .get("router/elo/model-premium")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let router_entries = memory
             .list(
@@ -1082,11 +1088,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(router_entries
-            .iter()
-            .any(|entry| entry.key.starts_with("router/success/model-cheap/")));
-        assert!(router_entries
-            .iter()
-            .all(|entry| !entry.key.starts_with("router/success/model-premium/")));
+        assert!(
+            router_entries
+                .iter()
+                .any(|entry| entry.key.starts_with("router/success/model-cheap/"))
+        );
+        assert!(
+            router_entries
+                .iter()
+                .all(|entry| !entry.key.starts_with("router/success/model-premium/"))
+        );
     }
 }

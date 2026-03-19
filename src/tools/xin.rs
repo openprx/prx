@@ -12,9 +12,7 @@ use super::traits::{Tool, ToolResult};
 use crate::config::{Config, SharedConfig};
 use crate::security::SecurityPolicy;
 use crate::xin::store;
-use crate::xin::types::{
-    ExecutionMode, NewXinTask, TaskKind, TaskPriority, XinTask, XinTaskPatch,
-};
+use crate::xin::types::{ExecutionMode, NewXinTask, TaskKind, TaskPriority, XinTask, XinTaskPatch};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -221,11 +219,7 @@ impl Tool for XinTool {
                         let lines: Vec<String> = tasks.iter().map(format_task_line).collect();
                         Ok(ToolResult {
                             success: true,
-                            output: format!(
-                                "Xin tasks ({}):\n{}",
-                                tasks.len(),
-                                lines.join("\n")
-                            ),
+                            output: format!("Xin tasks ({}):\n{}", tasks.len(), lines.join("\n")),
                             error: None,
                         })
                     }
@@ -281,10 +275,7 @@ impl Tool for XinTool {
                 };
                 let active = tasks.iter().filter(|t| t.enabled).count();
                 let paused = tasks.len() - active;
-                let system = tasks
-                    .iter()
-                    .filter(|t| t.kind == TaskKind::System)
-                    .count();
+                let system = tasks.iter().filter(|t| t.kind == TaskKind::System).count();
                 let user = tasks.iter().filter(|t| t.kind == TaskKind::User).count();
                 let agent = tasks.iter().filter(|t| t.kind == TaskKind::Agent).count();
 

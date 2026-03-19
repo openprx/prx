@@ -4,7 +4,7 @@
 //! atomic swaps, simulating the hot-reload path without needing
 //! the actual file-watcher.
 
-use openprx::config::{new_shared, Config};
+use openprx::config::{Config, new_shared};
 
 #[test]
 fn shared_config_initial_load() {

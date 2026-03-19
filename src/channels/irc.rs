@@ -1,9 +1,9 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 // Use tokio_rustls's re-export of rustls types
 use tokio_rustls::rustls;
@@ -104,11 +104,7 @@ impl IrcMessage {
         self.prefix.as_ref().and_then(|p| {
             let end = p.find('!').unwrap_or(p.len());
             let nick = &p[..end];
-            if nick.is_empty() {
-                None
-            } else {
-                Some(nick)
-            }
+            if nick.is_empty() { None } else { Some(nick) }
         })
     }
 }

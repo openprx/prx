@@ -500,11 +500,19 @@ impl Provider for OllamaProvider {
             if let Some(thinking) = &response.message.thinking {
                 tracing::warn!(
                     "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
+                    if thinking.len() > 100 {
+                        &thinking[..100]
+                    } else {
+                        thinking
+                    }
                 );
                 return Ok(format!(
                     "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
+                    if thinking.len() > 200 {
+                        &thinking[..200]
+                    } else {
+                        thinking
+                    }
                 ));
             }
             tracing::warn!("Ollama returned empty content with no tool calls");
@@ -551,12 +559,20 @@ impl Provider for OllamaProvider {
             if let Some(thinking) = &response.message.thinking {
                 tracing::warn!(
                     "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
+                    if thinking.len() > 100 {
+                        &thinking[..100]
+                    } else {
+                        thinking
+                    }
                 );
                 // Return a message indicating the model's thought process but no action
                 return Ok(format!(
                     "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
+                    if thinking.len() > 200 {
+                        &thinking[..200]
+                    } else {
+                        thinking
+                    }
                 ));
             }
             tracing::warn!("Ollama returned empty content with no tool calls");
@@ -623,12 +639,20 @@ impl Provider for OllamaProvider {
             if let Some(thinking) = &response.message.thinking {
                 tracing::warn!(
                     "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
+                    if thinking.len() > 100 {
+                        &thinking[..100]
+                    } else {
+                        thinking
+                    }
                 );
                 return Ok(ChatResponse {
                     text: Some(format!(
                         "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                        if thinking.len() > 200 { &thinking[..200] } else { thinking }
+                        if thinking.len() > 200 {
+                            &thinking[..200]
+                        } else {
+                            thinking
+                        }
                     )),
                     tool_calls: vec![],
                 });
@@ -693,9 +717,11 @@ mod tests {
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should fail on local endpoint");
-        assert!(error
-            .to_string()
-            .contains("requested cloud routing, but Ollama endpoint is local"));
+        assert!(
+            error
+                .to_string()
+                .contains("requested cloud routing, but Ollama endpoint is local")
+        );
     }
 
     #[test]
@@ -704,9 +730,11 @@ mod tests {
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should require API key");
-        assert!(error
-            .to_string()
-            .contains("requested cloud routing, but no API key is configured"));
+        assert!(
+            error
+                .to_string()
+                .contains("requested cloud routing, but no API key is configured")
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use anyhow::Result;
-use skillratings::elo::{elo, EloConfig, EloRating};
 use skillratings::Outcomes;
+use skillratings::elo::{EloConfig, EloRating, elo};
 
 use crate::memory::{Memory, MemoryCategory};
 use crate::self_system::SELF_SYSTEM_SESSION_ID;

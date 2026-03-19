@@ -9,7 +9,7 @@
 //! - `steer` action: inject a message into a running sub-agent's context
 
 use super::traits::{Tool, ToolResult};
-use crate::agent::loop_::{run_tool_call_loop, ScopeContext, ToolConcurrencyGovernanceConfig};
+use crate::agent::loop_::{ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
 use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
 use crate::config::{
@@ -18,8 +18,8 @@ use crate::config::{
 use crate::hooks::HookManager;
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider};
-use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use crate::session_worker::protocol::{WorkerManifest, WorkerResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -2163,10 +2163,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("max_children_per_agent"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("max_children_per_agent")
+        );
     }
 
     #[tokio::test]
@@ -2384,10 +2386,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("spawn_enabled=false"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("spawn_enabled=false")
+        );
     }
 
     #[tokio::test]
@@ -2479,10 +2483,12 @@ mod tests {
         let result =
             wait_with_parent_timeout(&mut child, std::time::Duration::from_millis(50)).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("session-worker exceeded parent timeout"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("session-worker exceeded parent timeout")
+        );
     }
 
     #[test]

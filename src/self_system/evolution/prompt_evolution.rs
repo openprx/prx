@@ -12,7 +12,7 @@ use crate::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
     EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -392,7 +392,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
 mod tests {
     use super::*;
     use crate::self_system::evolution::config::{
-        new_shared_evolution_config, EvolutionConfig, EvolutionMode,
+        EvolutionConfig, EvolutionMode, new_shared_evolution_config,
     };
     use tempfile::tempdir;
 

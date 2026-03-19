@@ -1,6 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
-use rusqlite::{params, types::Value, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params, types::Value};
 use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;

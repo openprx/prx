@@ -4,15 +4,15 @@ use crate::nodes::protocol::{
     JsonRpcResponse, MetricsResult, PingResult, ReadFileParams, ReadFileResult, TaskListItem,
     TaskListResult, TaskStatusParams, TaskStatusResult, WriteFileParams, WriteFileResult,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::{routing::get, routing::post, Json, Router};
+use axum::{Json, Router, routing::get, routing::post};
 use chrono::Utc;
 use constant_time_eq::constant_time_eq;
 use hmac::{Hmac, Mac};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -223,7 +223,7 @@ async fn handle_rpc(
                     -32700,
                     format!("invalid JSON payload: {error}"),
                 )),
-            )
+            );
         }
     };
 

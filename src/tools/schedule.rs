@@ -585,11 +585,13 @@ mod tests {
             .unwrap();
 
         assert!(!create.success);
-        assert!(create
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("cron is disabled"));
+        assert!(
+            create
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cron is disabled")
+        );
     }
 
     #[tokio::test]
@@ -619,11 +621,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("not allowed"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not allowed")
+        );
     }
 
     #[tokio::test]
@@ -652,11 +656,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("explicit approval")
+        );
 
         let approved = tool
             .execute(json!({

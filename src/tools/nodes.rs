@@ -3,9 +3,9 @@ use crate::config::{RemoteNodeConfig, SharedConfig};
 use crate::nodes::client::RemoteNodeClient;
 use crate::nodes::transport::H2Transport;
 use crate::security::SecurityPolicy;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -310,7 +310,7 @@ impl Tool for NodesTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_shared, Config, RemoteNodeConfig};
+    use crate::config::{Config, RemoteNodeConfig, new_shared};
     use crate::security::AutonomyLevel;
 
     fn make_tool() -> NodesTool {
@@ -592,9 +592,11 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Missing or invalid 'command' parameter"));
+        assert!(
+            error
+                .to_string()
+                .contains("Missing or invalid 'command' parameter")
+        );
     }
 
     #[tokio::test]
@@ -609,9 +611,11 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("'offset' must be an unsigned integer"));
+        assert!(
+            error
+                .to_string()
+                .contains("'offset' must be an unsigned integer")
+        );
     }
 
     #[tokio::test]

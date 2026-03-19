@@ -1,8 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use toml::{map::Map, Value};
+use toml::{Value, map::Map};
 
 pub(crate) const SPLIT_FILE_LAYOUT: &[(&str, &[&str])] = &[
     ("channels.toml", &["channels_config"]),

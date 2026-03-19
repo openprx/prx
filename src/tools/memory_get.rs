@@ -1,16 +1,16 @@
 use super::traits::{Tool, ToolResult};
-use crate::memory::principal::{
-    log_access, post_filter, resolve_principal, ChatType, MemoryWriteContext, Principal, Role,
-    Visibility,
-};
 use crate::memory::Memory;
+use crate::memory::principal::{
+    ChatType, MemoryWriteContext, Principal, Role, Visibility, log_access, post_filter,
+    resolve_principal,
+};
 use async_trait::async_trait;
-use rusqlite::{params_from_iter, types::Value, Connection};
+use rusqlite::{Connection, params_from_iter, types::Value};
 use serde_json::json;
 use std::fmt::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const DEFAULT_LINE_COUNT: usize = 50;
 const MAX_LINE_COUNT: usize = 2000;
@@ -584,11 +584,13 @@ mod tests {
         let result = tool.execute(json!({"path": "notes.md"})).await.unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Only MEMORY.md or memory/*.md"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Only MEMORY.md or memory/*.md")
+        );
     }
 
     #[tokio::test]
@@ -794,10 +796,12 @@ mod tests {
         let tool = test_tool(&tmp, false);
         let denied = tool.execute(json!({"path": "router/elo/test"})).await;
         assert!(denied.is_err());
-        assert!(denied
-            .unwrap_err()
-            .to_string()
-            .contains("session_id=\"self_system\""));
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("session_id=\"self_system\"")
+        );
 
         let allowed = tool
             .execute(json!({

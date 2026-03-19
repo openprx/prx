@@ -152,7 +152,7 @@ impl Tool for CronUpdateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_shared, Config};
+    use crate::config::{Config, new_shared};
     use crate::security::AutonomyLevel;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -274,10 +274,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .unwrap_or_default()
+                .contains("explicit approval")
+        );
 
         let approved = tool
             .execute(json!({

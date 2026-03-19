@@ -1,6 +1,6 @@
 use crate::self_system::evolution::record::EvolutionLayer;
 use crate::self_system::evolution::safety_utils::{atomic_write, validate_path_in_workspace};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

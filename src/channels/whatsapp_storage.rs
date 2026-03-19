@@ -15,7 +15,7 @@ use async_trait::async_trait;
 #[cfg(feature = "whatsapp-web")]
 use parking_lot::Mutex;
 #[cfg(feature = "whatsapp-web")]
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 #[cfg(feature = "whatsapp-web")]
 use std::path::Path;
 #[cfg(feature = "whatsapp-web")]
@@ -30,6 +30,8 @@ use wa_rs_core::appstate::hash::HashState;
 #[cfg(feature = "whatsapp-web")]
 use wa_rs_core::appstate::processor::AppStateMutationMAC;
 #[cfg(feature = "whatsapp-web")]
+use wa_rs_core::store::Device as CoreDevice;
+#[cfg(feature = "whatsapp-web")]
 use wa_rs_core::store::traits::DeviceInfo;
 #[cfg(feature = "whatsapp-web")]
 use wa_rs_core::store::traits::DeviceStore as DeviceStoreTrait;
@@ -38,8 +40,6 @@ use wa_rs_core::store::traits::{
     AppStateSyncKey, AppSyncStore, DeviceListRecord, LidPnMappingEntry, ProtocolStore, SignalStore,
     TcTokenEntry,
 };
-#[cfg(feature = "whatsapp-web")]
-use wa_rs_core::store::Device as CoreDevice;
 
 /// Custom wa-rs storage backend using rusqlite
 ///
@@ -1336,13 +1336,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(deleted, 1);
-        assert!(ProtocolStore::get_tc_token(&store, "15550000001")
-            .await
-            .unwrap()
-            .is_none());
-        assert!(ProtocolStore::get_tc_token(&store, "15550000002")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            ProtocolStore::get_tc_token(&store, "15550000001")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ProtocolStore::get_tc_token(&store, "15550000002")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

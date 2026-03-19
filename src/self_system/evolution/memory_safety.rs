@@ -247,10 +247,12 @@ mod tests {
         let result = filter.check(content, &source).await;
         assert!(!result.passed);
         assert!(result.issues.iter().any(|i| i.kind == SafetyIssueKind::Pii));
-        assert!(result
-            .issues
-            .iter()
-            .any(|i| i.kind == SafetyIssueKind::PromptInjection));
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|i| i.kind == SafetyIssueKind::PromptInjection)
+        );
     }
 
     #[test]

@@ -427,11 +427,7 @@ fn parse_date_from_file_path(path: &Path) -> Option<NaiveDate> {
 fn age_days(date: NaiveDate) -> u32 {
     let today = Utc::now().date_naive();
     let days = (today - date).num_days();
-    if days <= 0 {
-        0
-    } else {
-        days as u32
-    }
+    if days <= 0 { 0 } else { days as u32 }
 }
 
 fn parse_timestamp_utc(raw: &str) -> Option<DateTime<Utc>> {
@@ -575,22 +571,26 @@ mod tests {
             .unwrap();
         writer.flush().await.unwrap();
 
-        assert!(path_exists(
-            &dir.path()
-                .join("memory_access")
-                .join("hot")
-                .join("2026-02-24.jsonl")
-        )
-        .await
-        .unwrap());
-        assert!(path_exists(
-            &dir.path()
-                .join("evolution")
-                .join("hot")
-                .join("2026-02-24.jsonl")
-        )
-        .await
-        .unwrap());
+        assert!(
+            path_exists(
+                &dir.path()
+                    .join("memory_access")
+                    .join("hot")
+                    .join("2026-02-24.jsonl")
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            path_exists(
+                &dir.path()
+                    .join("evolution")
+                    .join("hot")
+                    .join("2026-02-24.jsonl")
+            )
+            .await
+            .unwrap()
+        );
     }
 
     #[tokio::test]

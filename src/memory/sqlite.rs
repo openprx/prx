@@ -1,24 +1,24 @@
 use super::embeddings::EmbeddingProvider;
 use super::principal::{
-    classify_memory, resolve_principal, ChatType, MemoryWriteContext, Principal, Role, Visibility,
+    ChatType, MemoryWriteContext, Principal, Role, Visibility, classify_memory, resolve_principal,
 };
 use super::topic::resolve_topic;
 use super::traits::{
-    validate_memory_write_target, ConversationSessionSummary, ConversationTurn, Memory,
-    MemoryCategory, MemoryEntry,
+    ConversationSessionSummary, ConversationTurn, Memory, MemoryCategory, MemoryEntry,
+    validate_memory_write_target,
 };
 use super::vector;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Local, Utc};
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -500,9 +500,7 @@ impl SqliteMemory {
                         );
                     }
                     Err(e) => {
-                        return Err(anyhow::anyhow!(
-                            "Failed to add memories.{name}: {e}"
-                        ));
+                        return Err(anyhow::anyhow!("Failed to add memories.{name}: {e}"));
                     }
                 }
             }
@@ -1767,9 +1765,11 @@ mod tests {
 
         let results = mem.recall("Rust", 10, None).await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results
-            .iter()
-            .all(|r| r.content.to_lowercase().contains("rust")));
+        assert!(
+            results
+                .iter()
+                .all(|r| r.content.to_lowercase().contains("rust"))
+        );
     }
 
     #[tokio::test]
@@ -2673,7 +2673,7 @@ mod tests {
         mem.reindex().await.unwrap();
         let count = mem.reindex().await.unwrap();
         assert_eq!(count, 0); // Noop embedder → nothing to re-embed
-                              // Data should still be intact
+        // Data should still be intact
         let results = mem.recall("reindex", 10, None).await.unwrap();
         assert_eq!(results.len(), 1);
     }
@@ -2842,9 +2842,11 @@ mod tests {
         // List with session-a filter
         let results = mem.list(None, Some("sess-a")).await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results
-            .iter()
-            .all(|e| e.session_id.as_deref() == Some("sess-a")));
+        assert!(
+            results
+                .iter()
+                .all(|e| e.session_id.as_deref() == Some("sess-a"))
+        );
 
         // List with session-a + category filter
         let results = mem

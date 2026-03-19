@@ -1,0 +1,5 @@
+config:
+  line-length: false
+  no-duplicate-heading: false
+  fenced-code-language: false
+  table-column-style: false

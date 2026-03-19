@@ -264,7 +264,7 @@ impl WasmProvider {
             _ => {
                 return Err(PluginError::Runtime(
                     "chat-response is not a record".to_string(),
-                ))
+                ));
             }
         };
 

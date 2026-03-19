@@ -332,7 +332,7 @@ impl Tool for ConfigReloadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_shared, Config};
+    use crate::config::{Config, new_shared};
 
     fn make_tool_with_config(cfg: Config) -> ConfigReloadTool {
         ConfigReloadTool::new(new_shared(cfg))

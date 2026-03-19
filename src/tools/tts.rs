@@ -353,11 +353,13 @@ mod tests {
         let result = tool.execute(json!({"text": "test speech"})).await.unwrap();
         // auto_generate_voice fails → graceful error, not panic
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("TTS generation failed"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("TTS generation failed")
+        );
     }
 
     #[tokio::test]

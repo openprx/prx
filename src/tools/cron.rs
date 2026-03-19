@@ -362,7 +362,9 @@ impl Tool for CronTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some("Missing 'expression' parameter for add action".to_string()),
+                            error: Some(
+                                "Missing 'expression' parameter for add action".to_string(),
+                            ),
                         });
                     }
                 };
@@ -455,19 +457,16 @@ impl Tool for CronTool {
                         }),
                     },
                     (None, Some(at)) => {
-                        let run_at_parsed: DateTime<Utc> =
-                            match DateTime::parse_from_rfc3339(at) {
-                                Ok(v) => v.with_timezone(&Utc),
-                                Err(e) => {
-                                    return Ok(ToolResult {
-                                        success: false,
-                                        output: String::new(),
-                                        error: Some(format!(
-                                            "Invalid run_at timestamp: {e}"
-                                        )),
-                                    });
-                                }
-                            };
+                        let run_at_parsed: DateTime<Utc> = match DateTime::parse_from_rfc3339(at) {
+                            Ok(v) => v.with_timezone(&Utc),
+                            Err(e) => {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(format!("Invalid run_at timestamp: {e}")),
+                                });
+                            }
+                        };
                         match cron::add_once_at(&cfg, run_at_parsed, command) {
                             Ok(job) => Ok(ToolResult {
                                 success: true,
@@ -563,8 +562,7 @@ impl Tool for CronTool {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if let Some(command) = &patch.command {
-                    if let Err(reason) =
-                        self.security.validate_command_execution(command, approved)
+                    if let Err(reason) = self.security.validate_command_execution(command, approved)
                     {
                         return Ok(ToolResult {
                             success: false,
@@ -635,8 +633,9 @@ impl Tool for CronTool {
                     }
                 };
                 if matches!(job.job_type, JobType::Shell) {
-                    if let Err(reason) =
-                        self.security.validate_command_execution(&job.command, approved)
+                    if let Err(reason) = self
+                        .security
+                        .validate_command_execution(&job.command, approved)
                     {
                         return Ok(ToolResult {
                             success: false,
@@ -653,8 +652,7 @@ impl Tool for CronTool {
                     });
                 }
                 let started_at = Utc::now();
-                let (success, output) =
-                    cron::scheduler::execute_job_now(&cfg, &job).await;
+                let (success, output) = cron::scheduler::execute_job_now(&cfg, &job).await;
                 let finished_at = Utc::now();
                 let duration_ms = (finished_at - started_at).num_milliseconds();
                 let status = if success { "ok" } else { "error" };
@@ -667,13 +665,7 @@ impl Tool for CronTool {
                     Some(&output),
                     duration_ms,
                 );
-                let _ = cron::record_last_run(
-                    &cfg,
-                    &job.id,
-                    finished_at,
-                    success,
-                    &output,
-                );
+                let _ = cron::record_last_run(&cfg, &job.id, finished_at, success, &output);
                 Ok(ToolResult {
                     success,
                     output: serde_json::to_string_pretty(&json!({
@@ -760,7 +752,7 @@ impl Tool for CronTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_shared, Config, SharedConfig};
+    use crate::config::{Config, SharedConfig, new_shared};
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
@@ -884,10 +876,12 @@ mod tests {
         let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("cron is disabled"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("cron is disabled")
+        );
     }
 
     #[tokio::test]

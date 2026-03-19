@@ -2,12 +2,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use openprx::self_system::evolution::{
-    with_trace, Actor, AsyncJsonlWriter, CandidatePriority, ChangeType, CircuitBreaker,
-    CircuitBreakerState, DataBasis, DecisionLog, DecisionType, EngineCycleInput, EvolutionAnalyzer,
-    EvolutionCandidate, EvolutionConfig, EvolutionEngine, EvolutionLayer, EvolutionLog,
-    EvolutionMode, EvolutionPipeline, EvolutionResult, EvolutionTrigger, JsonlRetentionPolicy,
-    JsonlStoragePaths, MemoryAccessLog, MemoryAction, MemoryEvolutionEngine, Outcome,
-    RollbackManager, TaskType,
+    Actor, AsyncJsonlWriter, CandidatePriority, ChangeType, CircuitBreaker, CircuitBreakerState,
+    DataBasis, DecisionLog, DecisionType, EngineCycleInput, EvolutionAnalyzer, EvolutionCandidate,
+    EvolutionConfig, EvolutionEngine, EvolutionLayer, EvolutionLog, EvolutionMode,
+    EvolutionPipeline, EvolutionResult, EvolutionTrigger, JsonlRetentionPolicy, JsonlStoragePaths,
+    MemoryAccessLog, MemoryAction, MemoryEvolutionEngine, Outcome, RollbackManager, TaskType,
+    with_trace,
 };
 use openprx::self_system::evolution::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,

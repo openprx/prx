@@ -23,18 +23,18 @@
 //! implementation simple and avoids shared state for the send path.
 
 use super::traits::{
-    extract_outgoing_media, Channel, ChannelCapabilities, ChannelMessage, SendMessage,
+    Channel, ChannelCapabilities, ChannelMessage, SendMessage, extract_outgoing_media,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 // ── JSON-RPC 2.0 types ──────────────────────────────────────────────────────
 

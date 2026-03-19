@@ -248,7 +248,7 @@ fn proactive_from_cron_runs(
                     "error": error.to_string(),
                     "fallback": true
                 }),
-            )
+            );
         }
     };
 
@@ -329,7 +329,7 @@ async fn learning_from_memory(
                     "error": error.to_string(),
                     "fallback": true
                 }),
-            )
+            );
         }
     };
 
@@ -344,7 +344,7 @@ async fn learning_from_memory(
                     "error": error.to_string(),
                     "fallback": true
                 }),
-            )
+            );
         }
     };
     entries.extend(
@@ -406,7 +406,7 @@ fn efficiency_from_cost(
                     "error": error.to_string(),
                     "fallback": true
                 }),
-            )
+            );
         }
     };
 

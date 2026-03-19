@@ -4,14 +4,14 @@ use crate::agent::dispatcher::{
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
-use crate::hooks::{payload_error, HookEvent, HookManager};
+use crate::hooks::{HookEvent, HookManager, payload_error};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 #[cfg(feature = "llm-router")]
-use crate::router::automix::{is_cheap_model_target, should_escalate, ConfidenceChecker};
-#[cfg(feature = "llm-router")]
 use crate::router::RouterEngine;
+#[cfg(feature = "llm-router")]
+use crate::router::automix::{ConfidenceChecker, is_cheap_model_target, should_escalate};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 #[cfg(feature = "llm-router")]
@@ -1356,10 +1356,12 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "done");
-        assert!(agent
-            .history()
-            .iter()
-            .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
+        assert!(
+            agent
+                .history()
+                .iter()
+                .any(|msg| matches!(msg, ConversationMessage::ToolResults(_)))
+        );
     }
 
     #[cfg(feature = "llm-router")]
@@ -1800,11 +1802,13 @@ mod tests {
         let cheap_snapshot: serde_json::Value = serde_json::from_str(&cheap_elo.content).unwrap();
         assert!(cheap_snapshot["dynamic_elo"].as_f64().unwrap() > 1_000.0);
 
-        assert!(memory
-            .get("router/elo/model-premium")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            memory
+                .get("router/elo/model-premium")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let router_entries = memory
             .list(
@@ -1813,12 +1817,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(router_entries
-            .iter()
-            .any(|entry| entry.key.starts_with("router/success/model-cheap/")));
-        assert!(router_entries
-            .iter()
-            .all(|entry| !entry.key.starts_with("router/success/model-premium/")));
+        assert!(
+            router_entries
+                .iter()
+                .any(|entry| entry.key.starts_with("router/success/model-cheap/"))
+        );
+        assert!(
+            router_entries
+                .iter()
+                .all(|entry| !entry.key.starts_with("router/success/model-premium/"))
+        );
     }
 
     #[cfg(feature = "llm-router")]

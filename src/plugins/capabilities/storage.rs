@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use wasmtime::AsContextMut;
 
-use crate::memory::traits::{validate_memory_write_target, MemoryCategory, MemoryEntry};
+use crate::memory::traits::{MemoryCategory, MemoryEntry, validate_memory_write_target};
 use crate::plugins::error::{PluginError, PluginResult};
 use crate::plugins::host::HostState;
 use crate::plugins::manifest::PluginManifest;
@@ -532,7 +532,7 @@ impl WasmStorage {
             _ => {
                 return Err(PluginError::Runtime(
                     "recall-memory result is not a list".to_string(),
-                ))
+                ));
             }
         };
 
@@ -550,7 +550,7 @@ impl WasmStorage {
             _ => {
                 return Err(PluginError::Runtime(
                     "memory-entry is not a record".to_string(),
-                ))
+                ));
             }
         };
 

@@ -6,7 +6,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 // We test both backends through the public memory module
-use openprx::memory::{markdown::MarkdownMemory, sqlite::SqliteMemory, Memory, MemoryCategory};
+use openprx::memory::{Memory, MemoryCategory, markdown::MarkdownMemory, sqlite::SqliteMemory};
 
 // ── Helpers ────────────────────────────────────────────────────
 

@@ -1,5 +1,5 @@
-use super::{configured_channel_names, resolve_memory_backend, AppState};
-use axum::{extract::State, Json};
+use super::{AppState, configured_channel_names, resolve_memory_backend};
+use axum::{Json, extract::State};
 use serde::Serialize;
 
 #[derive(Serialize)]

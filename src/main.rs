@@ -77,13 +77,13 @@
     dead_code
 )]
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
@@ -921,7 +921,16 @@ async fn main() -> Result<()> {
             session,
             list_sessions,
         } => {
-            chat::run(config, provider, model, temperature, plain, session, list_sessions).await
+            chat::run(
+                config,
+                provider,
+                model,
+                temperature,
+                plain,
+                session,
+                list_sessions,
+            )
+            .await
         }
 
         Commands::Gateway { port, host } => {
@@ -1383,8 +1392,8 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 Err(e) => {
                     println!("Callback capture failed: {e}");
                     println!(
-                            "Run `prx auth paste-redirect --provider openai-codex --profile {profile}`"
-                        );
+                        "Run `prx auth paste-redirect --provider openai-codex --profile {profile}`"
+                    );
                     return Ok(());
                 }
             };

@@ -10,7 +10,7 @@
 mod api;
 mod ui;
 
-use crate::agent::loop_::{run_tool_call_loop, ToolConcurrencyGovernanceConfig};
+use crate::agent::loop_::{ToolConcurrencyGovernanceConfig, run_tool_call_loop};
 use crate::channels::{
     Channel, LinqChannel, NextcloudTalkChannel, SendMessage, SignalChannel, WhatsAppChannel,
 };
@@ -20,18 +20,18 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
 use crate::runtime;
-use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
+use crate::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use crate::tools::{self, McpTool, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
+    Router,
     body::Bytes,
     extract::{ConnectInfo, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{get, post},
-    Router,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -933,7 +933,9 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
     {
         prom.encode()
     } else {
-        String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+        String::from(
+            "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n",
+        )
     };
 
     (

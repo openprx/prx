@@ -15,7 +15,7 @@ use std::collections::HashMap;
 #[cfg(feature = "wasm-plugins")]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "wasm-plugins")]
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 
 /// Maximum payload size: 64 KB.
 #[cfg(feature = "wasm-plugins")]
@@ -278,7 +278,7 @@ impl Default for EventBus {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     /// Helper: receive one message from `rx` with a short timeout.
     async fn recv_one(rx: &mut mpsc::UnboundedReceiver<EventMessage>) -> Option<EventMessage> {

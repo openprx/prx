@@ -507,11 +507,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("cannot be steered"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot be steered")
+        );
     }
 
     #[tokio::test]
@@ -541,11 +543,13 @@ mod tests {
         let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
         let result = tool.execute(json!({"action": "nuke"})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Unsupported"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Unsupported")
+        );
     }
 
     // ── Output formatting ───────────────────────────────────────

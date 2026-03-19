@@ -9,8 +9,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::{execute, style, terminal};
 use std::io::{self, Write as _};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -235,7 +235,10 @@ impl UiActor {
                 // On first token, clear the "Thinking..." indicator
                 if self.draft_buffer.is_empty() {
                     print!("\r");
-                    let _ = execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine));
+                    let _ = execute!(
+                        io::stdout(),
+                        terminal::Clear(terminal::ClearType::CurrentLine)
+                    );
                 }
 
                 // Compute delta from accumulated text (safe char-boundary slicing)
@@ -300,7 +303,10 @@ impl UiActor {
                 if self.active_draft_id.as_deref() == Some(&draft_id) {
                     // Clear current line
                     print!("\r");
-                    let _ = execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine));
+                    let _ = execute!(
+                        io::stdout(),
+                        terminal::Clear(terminal::ClearType::CurrentLine)
+                    );
                     if !self.draft_buffer.is_empty() {
                         println!();
                         if !self.plain_mode {
@@ -372,7 +378,10 @@ impl UiActor {
 
             UiEvent::TypingStop => {
                 print!("\r");
-                let _ = execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine));
+                let _ = execute!(
+                    io::stdout(),
+                    terminal::Clear(terminal::ClearType::CurrentLine)
+                );
                 let _ = io::stdout().flush();
             }
 
@@ -464,12 +473,7 @@ impl Channel for TerminalChannel {
         Ok(Some(draft_id))
     }
 
-    async fn update_draft(
-        &self,
-        _recipient: &str,
-        message_id: &str,
-        text: &str,
-    ) -> Result<()> {
+    async fn update_draft(&self, _recipient: &str, message_id: &str, text: &str) -> Result<()> {
         // Use the caller-provided message_id; verify it matches the active draft
         let active = self.active_draft_id.lock().clone();
         if active.as_deref() == Some(message_id) {
@@ -486,12 +490,7 @@ impl Channel for TerminalChannel {
         Ok(())
     }
 
-    async fn finalize_draft(
-        &self,
-        _recipient: &str,
-        message_id: &str,
-        text: &str,
-    ) -> Result<()> {
+    async fn finalize_draft(&self, _recipient: &str, message_id: &str, text: &str) -> Result<()> {
         // Check + clear under lock, then send without holding the guard
         let matched = {
             let mut active = self.active_draft_id.lock();
@@ -695,9 +694,7 @@ mod tests {
     #[tokio::test]
     async fn send_draft_returns_id() {
         let ch = TerminalChannel::new(true);
-        let result = ch
-            .send_draft(&SendMessage::new("test", "user"))
-            .await;
+        let result = ch.send_draft(&SendMessage::new("test", "user")).await;
         assert!(result.is_ok());
         let draft_id = result.unwrap();
         assert!(draft_id.is_some());
@@ -729,9 +726,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        ch.update_draft("user", &draft_id, "partial")
-            .await
-            .unwrap();
+        ch.update_draft("user", &draft_id, "partial").await.unwrap();
         ch.cancel_draft("user", &draft_id).await.unwrap();
     }
 

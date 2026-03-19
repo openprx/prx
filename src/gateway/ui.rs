@@ -1,11 +1,11 @@
 use super::AppState;
 use axum::{
+    Router,
     body::Body,
     extract::Path,
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 use rust_embed::RustEmbed;
 

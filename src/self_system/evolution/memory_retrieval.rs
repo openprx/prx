@@ -1,10 +1,10 @@
 use crate::memory::{LifecycleState, Memory, MemoryCategory, MemoryEntry};
+use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use crate::self_system::evolution::safety_utils::{is_raw_debug_enabled, sha256_hex};
 use crate::self_system::evolution::{
-    current_trace, Actor, AsyncJsonlWriter, EvolutionConfig, MemoryAccessLog, MemoryAction,
-    SharedEvolutionConfig, TaskType,
+    Actor, AsyncJsonlWriter, EvolutionConfig, MemoryAccessLog, MemoryAction, SharedEvolutionConfig,
+    TaskType, current_trace,
 };
-use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -241,7 +241,7 @@ mod tests {
     use crate::self_system::evolution::storage::{
         AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths,
     };
-    use crate::self_system::evolution::{new_shared_evolution_config, EvolutionConfig};
+    use crate::self_system::evolution::{EvolutionConfig, new_shared_evolution_config};
     use anyhow::Result;
     use async_trait::async_trait;
     use chrono::{Duration, Utc};

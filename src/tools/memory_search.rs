@@ -1,17 +1,17 @@
 use super::traits::{Tool, ToolResult};
+use crate::memory::Memory;
 use crate::memory::principal::{
-    log_access, post_filter, resolve_principal, ChatType, MemoryWriteContext, Principal, Role,
-    Visibility,
+    ChatType, MemoryWriteContext, Principal, Role, Visibility, log_access, post_filter,
+    resolve_principal,
 };
 use crate::memory::topic;
-use crate::memory::Memory;
 use async_trait::async_trait;
-use rusqlite::{params_from_iter, types::Value, Connection};
+use rusqlite::{Connection, params_from_iter, types::Value};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const DEFAULT_MAX_RESULTS: usize = 5;
 const MAX_RESULTS_LIMIT: usize = 100;

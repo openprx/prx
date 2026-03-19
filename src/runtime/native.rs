@@ -32,11 +32,7 @@ impl RuntimeAdapter for NativeRuntime {
                     primary
                 } else {
                     let legacy = u.home_dir().join(".openprx");
-                    if legacy.exists() {
-                        legacy
-                    } else {
-                        primary
-                    }
+                    if legacy.exists() { legacy } else { primary }
                 }
             },
         )

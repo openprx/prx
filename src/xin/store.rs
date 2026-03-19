@@ -9,7 +9,7 @@ use crate::xin::types::{
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
@@ -23,17 +23,12 @@ pub fn add_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
     let max = config.xin.max_tasks;
     if max > 0 {
         let current = with_connection(config, |conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM xin_tasks",
-                [],
-                |row| row.get(0),
-            )?;
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM xin_tasks", [], |row| row.get(0))?;
             Ok(count)
         })?;
         if current >= max as i64 {
-            anyhow::bail!(
-                "Xin task limit reached ({max}). Remove completed/disabled tasks first."
-            );
+            anyhow::bail!("Xin task limit reached ({max}). Remove completed/disabled tasks first.");
         }
     }
 
@@ -169,25 +164,26 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
     let previous_updated_at = task.updated_at;
     task.updated_at = now;
     with_connection(config, |conn| {
-        let changed = conn.execute(
-            "UPDATE xin_tasks
+        let changed = conn
+            .execute(
+                "UPDATE xin_tasks
              SET name = ?1, description = ?2, priority = ?3, payload = ?4,
                  interval_secs = ?5, enabled = ?6, max_failures = ?7, updated_at = ?8
              WHERE id = ?9 AND updated_at = ?10",
-            params![
-                task.name,
-                task.description,
-                task.priority.as_i32(),
-                task.payload,
-                i64::try_from(task.interval_secs).unwrap_or(i64::MAX),
-                if task.enabled { 1 } else { 0 },
-                i64::from(task.max_failures),
-                now.to_rfc3339(),
-                task_id,
-                previous_updated_at.to_rfc3339(),
-            ],
-        )
-        .context("Failed to update xin task")?;
+                params![
+                    task.name,
+                    task.description,
+                    task.priority.as_i32(),
+                    task.payload,
+                    i64::try_from(task.interval_secs).unwrap_or(i64::MAX),
+                    if task.enabled { 1 } else { 0 },
+                    i64::from(task.max_failures),
+                    now.to_rfc3339(),
+                    task_id,
+                    previous_updated_at.to_rfc3339(),
+                ],
+            )
+            .context("Failed to update xin task")?;
         if changed == 0 {
             anyhow::bail!(
                 "xin task '{task_id}' was modified by another process (optimistic concurrency conflict)"
@@ -223,14 +219,15 @@ pub fn mark_completed(config: &Config, task_id: &str, output: &str) -> Result<()
     let now = Utc::now();
     let bounded = truncate_output(output);
     with_connection(config, |conn| {
-        let changed = conn.execute(
-            "UPDATE xin_tasks
+        let changed = conn
+            .execute(
+                "UPDATE xin_tasks
              SET status = 'completed', last_run_at = ?1, last_status = 'ok',
                  last_output = ?2, run_count = run_count + 1, updated_at = ?3
              WHERE id = ?4",
-            params![now.to_rfc3339(), bounded, now.to_rfc3339(), task_id],
-        )
-        .context("Failed to mark xin task completed")?;
+                params![now.to_rfc3339(), bounded, now.to_rfc3339(), task_id],
+            )
+            .context("Failed to mark xin task completed")?;
         if changed == 0 {
             tracing::warn!(task_id = %task_id, "mark_completed: no rows affected (task may have been deleted)");
         }
@@ -244,15 +241,16 @@ pub fn mark_failed(config: &Config, task_id: &str, output: &str) -> Result<()> {
     let bounded = truncate_output(output);
     with_connection(config, |conn| {
         // Increment fail_count first
-        let changed = conn.execute(
-            "UPDATE xin_tasks
+        let changed = conn
+            .execute(
+                "UPDATE xin_tasks
              SET status = 'failed', last_run_at = ?1, last_status = 'error',
                  last_output = ?2, run_count = run_count + 1, fail_count = fail_count + 1,
                  updated_at = ?3
              WHERE id = ?4",
-            params![now.to_rfc3339(), bounded, now.to_rfc3339(), task_id],
-        )
-        .context("Failed to mark xin task failed")?;
+                params![now.to_rfc3339(), bounded, now.to_rfc3339(), task_id],
+            )
+            .context("Failed to mark xin task failed")?;
         if changed == 0 {
             tracing::warn!(task_id = %task_id, "mark_failed: no rows affected (task may have been deleted)");
         }
@@ -335,9 +333,8 @@ pub fn mark_stale(config: &Config, stale_timeout_minutes: u32) -> Result<usize> 
 pub fn ensure_system_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
     // Check if a system task with this name already exists
     let existing = with_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM xin_tasks WHERE name = ?1 AND kind = 'system'",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id FROM xin_tasks WHERE name = ?1 AND kind = 'system'")?;
         let mut rows = stmt.query(params![new.name])?;
         if let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
@@ -404,7 +401,8 @@ pub fn record_run(
         )
         .context("Failed to prune xin run history")?;
 
-        tx.commit().context("Failed to commit xin run transaction")?;
+        tx.commit()
+            .context("Failed to commit xin run transaction")?;
         Ok(())
     })
 }

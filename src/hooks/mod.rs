@@ -594,10 +594,12 @@ mod tests {
             .run_action(HookEvent::Error, &json!({}), 2000, &action)
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("exited with status"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exited with status")
+        );
     }
 
     #[tokio::test]

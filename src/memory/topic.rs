@@ -2,7 +2,7 @@ use crate::memory::principal::Principal;
 use anyhow::Result;
 use chrono::Utc;
 use regex::Regex;
-use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -456,8 +456,8 @@ pub fn merge_topic_memories(memories: Vec<TopicMemory>) -> Vec<TopicMemory> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::principal::{ChatType, Role, Visibility};
     use crate::memory::SqliteMemory;
+    use crate::memory::principal::{ChatType, Role, Visibility};
     use tempfile::TempDir;
 
     fn setup_conn() -> (TempDir, Connection) {

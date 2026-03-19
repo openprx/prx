@@ -5,7 +5,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
+use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use uuid::Uuid;
 
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";

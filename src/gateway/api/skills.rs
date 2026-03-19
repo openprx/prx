@@ -1,8 +1,8 @@
 use super::AppState;
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -111,7 +111,7 @@ pub async fn discover_skills(
                     return Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": e.to_string()})),
-                    ))
+                    ));
                 }
             };
             if let Some(ref q) = params.query {
@@ -207,7 +207,9 @@ pub async fn install_skill(
     if !is_allowed_skill_url(&req.url) {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Only GitHub and HuggingFace HTTPS URLs are supported"})),
+            Json(
+                serde_json::json!({"error": "Only GitHub and HuggingFace HTTPS URLs are supported"}),
+            ),
         ));
     }
 

@@ -11,8 +11,8 @@
 //! platform. We generate all cache files ourselves, so this is acceptable.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Metrics for the precompile cache.
 #[derive(Debug, Default)]

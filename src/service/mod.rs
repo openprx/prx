@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -183,8 +183,7 @@ fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
 fn stop_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let _ =
-                run_checked(Command::new("systemctl").args(["--user", "stop", "prx.service"]));
+            let _ = run_checked(Command::new("systemctl").args(["--user", "stop", "prx.service"]));
         }
         InitSystem::Openrc => {
             let _ = run_checked(Command::new("rc-service").args(["prx", "stop"]));
@@ -285,12 +284,9 @@ fn status(config: &Config, init_system: InitSystem) -> Result<()> {
 fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let out = run_capture(Command::new("systemctl").args([
-                "--user",
-                "is-active",
-                "prx.service",
-            ]))
-            .unwrap_or_else(|_| "unknown".into());
+            let out =
+                run_capture(Command::new("systemctl").args(["--user", "is-active", "prx.service"]))
+                    .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
             println!("Unit: {}", linux_service_file(config)?.display());
         }
@@ -497,7 +493,9 @@ fn check_openprx_user() -> Result<()> {
                     bail!(
                         "User 'prx' exists but has unexpected UID {} (expected system UID < 1000).\n\
                          Recreate with: sudo {} && sudo {}",
-                        uid, del_cmd, add_cmd
+                        uid,
+                        del_cmd,
+                        add_cmd
                     );
                 }
 
@@ -554,16 +552,7 @@ fn ensure_openprx_user() -> Result<()> {
         }
 
         let output = Command::new("adduser")
-            .args([
-                "-S",
-                "-s",
-                "/sbin/nologin",
-                "-H",
-                "-D",
-                "-G",
-                "prx",
-                "prx",
-            ])
+            .args(["-S", "-s", "/sbin/nologin", "-H", "-D", "-G", "prx", "prx"])
             .output()
             .context("Failed to create prx user")?;
 
@@ -1238,8 +1227,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn openrc_writability_probe_prefers_runuser_when_available() {
-        let (program, args) =
-            build_openrc_writability_probe_command(Path::new("/etc/prx"), true);
+        let (program, args) = build_openrc_writability_probe_command(Path::new("/etc/prx"), true);
         assert_eq!(program, "runuser");
         assert_eq!(
             args,

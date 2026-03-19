@@ -1,4 +1,4 @@
-use super::traits::{validate_memory_write_target, Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, validate_memory_write_target};
 use async_trait::async_trait;
 use chrono::Local;
 use serde_json::Value;
@@ -333,9 +333,11 @@ mod tests {
 
         let results = mem.recall("Rust", 10, None).await.unwrap();
         assert!(results.len() >= 2);
-        assert!(results
-            .iter()
-            .all(|r| r.content.to_lowercase().contains("rust")));
+        assert!(
+            results
+                .iter()
+                .all(|r| r.content.to_lowercase().contains("rust"))
+        );
     }
 
     #[tokio::test]
@@ -420,11 +422,12 @@ mod tests {
             .expect("structured entry");
 
         assert_eq!(entry.content, r#"{"score":0.9,"note":"legacy"}"#);
-        assert!(mem
-            .get("self/fitness/daily/2026-03-10")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            mem.get("self/fitness/daily/2026-03-10")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

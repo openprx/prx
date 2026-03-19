@@ -5,7 +5,7 @@ use std::fmt::Write;
 #[async_trait]
 pub trait MemoryLoader: Send + Sync {
     async fn load_context(&self, memory: &dyn Memory, user_message: &str)
-        -> anyhow::Result<String>;
+    -> anyhow::Result<String>;
 }
 
 pub struct DefaultMemoryLoader {
