@@ -827,18 +827,15 @@ impl LarkChannel {
             use axum::http::StatusCode;
             use axum::response::IntoResponse;
 
+            // Verify token on ALL events, not just challenge
+            let event_token = payload.get("token").and_then(|t| t.as_str()).unwrap_or("");
+            if event_token != state.verification_token {
+                tracing::warn!("Lark webhook: invalid verification token");
+                return (StatusCode::FORBIDDEN, "invalid token").into_response();
+            }
+
             // URL verification challenge
             if let Some(challenge) = payload.get("challenge").and_then(|c| c.as_str()) {
-                // Verify token if present
-                let token_ok = payload
-                    .get("token")
-                    .and_then(|t| t.as_str())
-                    .map_or(true, |t| t == state.verification_token);
-
-                if !token_ok {
-                    return (StatusCode::FORBIDDEN, "invalid token").into_response();
-                }
-
                 let resp = serde_json::json!({ "challenge": challenge });
                 return (StatusCode::OK, Json(resp)).into_response();
             }

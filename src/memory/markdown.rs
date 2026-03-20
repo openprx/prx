@@ -42,25 +42,34 @@ impl MarkdownMemory {
     async fn append_to_file(&self, path: &Path, content: &str) -> anyhow::Result<()> {
         self.ensure_dirs().await?;
 
-        let existing = if path.exists() {
-            fs::read_to_string(path).await.unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let needs_header = !path.exists()
+            || fs::metadata(path)
+                .await
+                .map(|m| m.len() == 0)
+                .unwrap_or(true);
 
-        let updated = if existing.is_empty() {
+        if needs_header {
             let header = if path == self.core_path() {
                 "# Long-Term Memory\n\n"
             } else {
                 let date = Local::now().format("%Y-%m-%d").to_string();
                 &format!("# Daily Log — {date}\n\n")
             };
-            format!("{header}{content}\n")
+            fs::write(path, format!("{header}{content}\n")).await?;
         } else {
-            format!("{existing}\n{content}\n")
-        };
+            // Use append mode to avoid read-modify-write race conditions.
+            // Multiple concurrent writers will serialize at the OS level.
+            let path = path.to_path_buf();
+            let data = format!("\n{content}\n");
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+                write!(file, "{data}")?;
+                Ok(())
+            })
+            .await??;
+        }
 
-        fs::write(path, updated).await?;
         Ok(())
     }
 

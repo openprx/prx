@@ -145,8 +145,10 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
         CREATE TABLE IF NOT EXISTS embedding_cache (
             content_hash TEXT PRIMARY KEY,
             embedding    BLOB NOT NULL,
-            created_at   TEXT NOT NULL
+            created_at   TEXT NOT NULL,
+            accessed_at  TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);
 
         CREATE TABLE IF NOT EXISTS identity_bindings (
             id              TEXT PRIMARY KEY,
@@ -243,6 +245,12 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
         CREATE INDEX IF NOT EXISTS idx_audit_time ON access_audit_log(timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_audit_requester ON access_audit_log(requester);",
     )?;
+
+    // Safety migration: if embedding_cache was created by an older schema without
+    // accessed_at, add the column. Ignore the error if it already exists.
+    let _ = conn.execute_batch(
+        "ALTER TABLE embedding_cache ADD COLUMN accessed_at TEXT NOT NULL DEFAULT ''",
+    );
 
     let now = Local::now().to_rfc3339();
     let mut hydrated = 0;

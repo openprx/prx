@@ -59,6 +59,13 @@ impl SecretStore {
         }
 
         let key_bytes = self.load_or_create_key()?;
+        if key_bytes.len() != KEY_LEN {
+            anyhow::bail!(
+                "Secret key has invalid length ({} bytes, expected {}). Key file may be corrupt.",
+                key_bytes.len(),
+                KEY_LEN
+            );
+        }
         let key = Key::from_slice(&key_bytes);
         let cipher = ChaCha20Poly1305::new(key);
 
@@ -136,6 +143,13 @@ impl SecretStore {
         let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
         let nonce = Nonce::from_slice(nonce_bytes);
         let key_bytes = self.load_or_create_key()?;
+        if key_bytes.len() != KEY_LEN {
+            anyhow::bail!(
+                "Secret key has invalid length ({} bytes, expected {}). Key file may be corrupt.",
+                key_bytes.len(),
+                KEY_LEN
+            );
+        }
         let key = Key::from_slice(&key_bytes);
         let cipher = ChaCha20Poly1305::new(key);
 

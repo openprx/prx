@@ -25,8 +25,9 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     }
                 }
             }
-            tracing::warn!(
-                "Landlock requested but not available, falling back to application-layer"
+            tracing::error!(
+                "SECURITY DEGRADED: Landlock sandbox explicitly requested but not available \
+                 — falling back to NoopSandbox (no OS-level isolation)"
             );
             Arc::new(super::traits::NoopSandbox)
         }
@@ -37,8 +38,9 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     return Arc::new(sandbox);
                 }
             }
-            tracing::warn!(
-                "Firejail requested but not available, falling back to application-layer"
+            tracing::error!(
+                "SECURITY DEGRADED: Firejail sandbox explicitly requested but not available \
+                 — falling back to NoopSandbox (no OS-level isolation)"
             );
             Arc::new(super::traits::NoopSandbox)
         }
@@ -52,8 +54,9 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     }
                 }
             }
-            tracing::warn!(
-                "Bubblewrap requested but not available, falling back to application-layer"
+            tracing::error!(
+                "SECURITY DEGRADED: Bubblewrap sandbox explicitly requested but not available \
+                 — falling back to NoopSandbox (no OS-level isolation)"
             );
             Arc::new(super::traits::NoopSandbox)
         }
@@ -61,7 +64,10 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
             if let Ok(sandbox) = super::docker::DockerSandbox::new() {
                 return Arc::new(sandbox);
             }
-            tracing::warn!("Docker requested but not available, falling back to application-layer");
+            tracing::error!(
+                "SECURITY DEGRADED: Docker sandbox explicitly requested but not available \
+                 — falling back to NoopSandbox (no OS-level isolation)"
+            );
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Auto | SandboxBackend::None => {

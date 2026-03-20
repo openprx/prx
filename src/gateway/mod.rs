@@ -194,7 +194,7 @@ pub struct GatewayRateLimiter {
 }
 
 impl GatewayRateLimiter {
-    fn new(
+    pub fn new(
         pair_per_minute: u32,
         webhook_per_minute: u32,
         api_per_minute: u32,
@@ -213,7 +213,7 @@ impl GatewayRateLimiter {
         self.pair.allow(key)
     }
 
-    fn allow_webhook(&self, key: &str) -> bool {
+    pub fn allow_webhook(&self, key: &str) -> bool {
         self.webhook.allow(key)
     }
 
@@ -234,7 +234,7 @@ pub struct IdempotencyStore {
 }
 
 impl IdempotencyStore {
-    fn new(ttl: Duration, max_keys: usize) -> Self {
+    pub fn new(ttl: Duration, max_keys: usize) -> Self {
         Self {
             ttl,
             max_keys: max_keys.max(1),
@@ -846,7 +846,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
-        .route("/config/reload", post(handle_config_reload))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
 
     let api_routes =
@@ -887,37 +886,6 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
-}
-
-/// POST /config/reload — hot-reload configuration from config.toml.
-async fn handle_config_reload(State(state): State<AppState>) -> impl IntoResponse {
-    let tool = tools::ConfigReloadTool::new(Arc::clone(&state.shared_config));
-    match tool.execute(serde_json::json!({})).await {
-        Ok(result) if result.success => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "success": true,
-                "message": result.output,
-            })),
-        )
-            .into_response(),
-        Ok(result) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": result.error.unwrap_or_else(|| "Unknown error".into()),
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": e.to_string(),
-            })),
-        )
-            .into_response(),
-    }
 }
 
 /// Prometheus content type for text exposition format.
@@ -1455,8 +1423,20 @@ async fn handle_whatsapp_message(
         );
     };
 
-    // ── Security: Verify X-Hub-Signature-256 if app_secret is configured ──
-    if let Some(ref app_secret) = state.whatsapp_app_secret {
+    // ── Security: Verify X-Hub-Signature-256 — reject if signing secret not configured ──
+    let app_secret = match &state.whatsapp_app_secret {
+        Some(secret) => secret,
+        None => {
+            tracing::error!(
+                "WhatsApp webhook received but signing secret not configured — rejecting"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Webhook signing secret not configured"})),
+            );
+        }
+    };
+    {
         let signature = headers
             .get("X-Hub-Signature-256")
             .and_then(|v| v.to_str().ok())
@@ -1559,8 +1539,18 @@ async fn handle_linq_webhook(
 
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
-    if let Some(ref signing_secret) = state.linq_signing_secret {
+    // ── Security: Verify X-Webhook-Signature — reject if signing secret not configured ──
+    let signing_secret = match &state.linq_signing_secret {
+        Some(secret) => secret,
+        None => {
+            tracing::error!("Linq webhook received but signing secret not configured — rejecting");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Webhook signing secret not configured"})),
+            );
+        }
+    };
+    {
         let timestamp = headers
             .get("X-Webhook-Timestamp")
             .and_then(|v| v.to_str().ok())
@@ -1674,8 +1664,20 @@ async fn handle_nextcloud_talk_webhook(
 
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
-    if let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret {
+    // ── Security: Verify Nextcloud Talk HMAC signature — reject if secret not configured ──
+    let webhook_secret = match &state.nextcloud_talk_webhook_secret {
+        Some(secret) => secret,
+        None => {
+            tracing::error!(
+                "Nextcloud Talk webhook received but signing secret not configured — rejecting"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Webhook signing secret not configured"})),
+            );
+        }
+    };
+    {
         let random = headers
             .get("X-Nextcloud-Talk-Random")
             .and_then(|v| v.to_str().ok())

@@ -164,8 +164,10 @@ pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
+    let sandbox: Arc<dyn crate::security::traits::Sandbox> =
+        Arc::new(crate::security::traits::NoopSandbox);
     vec![
-        Box::new(ShellTool::new(security.clone(), runtime, false)),
+        Box::new(ShellTool::new(security.clone(), runtime, sandbox, false)),
         Box::new(FileReadTool::new(security.clone(), false)),
         Box::new(FileWriteTool::new(security)),
     ]
@@ -265,10 +267,15 @@ pub fn all_tools_with_runtime_ext(
     let shared_config: crate::config::SharedConfig =
         Arc::new(arc_swap::ArcSwap::from(config.clone()));
 
+    // Create a sandbox from the security configuration for shell command isolation.
+    let sandbox: Arc<dyn crate::security::traits::Sandbox> =
+        crate::security::create_sandbox(&root_config.security);
+
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(
             security.clone(),
             runtime,
+            sandbox,
             config.memory.acl_enabled,
         )),
         Arc::new(FileReadTool::new(

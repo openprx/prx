@@ -1225,6 +1225,31 @@ mod native_backend {
                     });
 
                     if let Some(path_str) = path {
+                        // Validate that the screenshot path stays within the
+                        // current working directory (workspace confinement).
+                        let requested = std::path::Path::new(&path_str);
+                        let cwd = std::env::current_dir()
+                            .context("Failed to determine current working directory")?;
+                        // Resolve parent so we can canonicalize even when the
+                        // target file does not yet exist.
+                        let parent = requested.parent().unwrap_or(std::path::Path::new("."));
+                        let canonical_parent =
+                            tokio::fs::canonicalize(parent).await.with_context(|| {
+                                format!(
+                                    "Screenshot parent directory does not exist: {}",
+                                    parent.display()
+                                )
+                            })?;
+                        let canonical_path =
+                            canonical_parent.join(requested.file_name().unwrap_or_default());
+                        let canonical_cwd = tokio::fs::canonicalize(&cwd).await.unwrap_or(cwd);
+                        if !canonical_path.starts_with(&canonical_cwd) {
+                            anyhow::bail!(
+                                "Screenshot path escapes workspace boundary: {}",
+                                path_str
+                            );
+                        }
+
                         tokio::fs::write(&path_str, &png)
                             .await
                             .with_context(|| format!("Failed to write screenshot to {path_str}"))?;

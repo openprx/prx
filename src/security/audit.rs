@@ -167,7 +167,28 @@ pub struct CommandExecutionLog<'a> {
 impl AuditLogger {
     /// Create a new audit logger
     pub fn new(config: AuditConfig, openprx_dir: PathBuf) -> Result<Self> {
-        let log_path = openprx_dir.join(&config.log_path);
+        let configured = std::path::Path::new(&config.log_path);
+        let log_path = if configured.is_absolute() {
+            tracing::error!(
+                path = %config.log_path,
+                "Audit log path must be relative, got absolute path — using safe default"
+            );
+            openprx_dir.join("audit.log")
+        } else {
+            let joined = openprx_dir.join(configured);
+            // Verify the resolved path does not escape the base directory via ../ traversal.
+            // canonicalize may fail if the file does not yet exist, so fall back to the joined path.
+            let canonical = joined.canonicalize().unwrap_or_else(|_| joined.clone());
+            if !canonical.starts_with(&openprx_dir) {
+                tracing::error!(
+                    path = %config.log_path,
+                    "Audit log path escapes base directory — using safe default"
+                );
+                openprx_dir.join("audit.log")
+            } else {
+                joined
+            }
+        };
         Ok(Self {
             log_path,
             config,

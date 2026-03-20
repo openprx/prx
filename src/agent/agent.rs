@@ -489,8 +489,20 @@ impl Agent {
             )
             .await;
 
+        // Strip scope markers before passing to tools — the trusted scope context
+        // is injected by run_tool_call_loop in loop_.rs, and user-provided values
+        // must never leak through to tool execution.
+        let mut sanitized_args = call.arguments.clone();
+        if let Some(obj) = sanitized_args.as_object_mut() {
+            obj.remove("_prx_scope");
+            obj.insert(
+                "_prx_scope_trusted".to_string(),
+                serde_json::Value::Bool(false),
+            );
+        }
+
         let result = if let Some(tool) = self.tools.iter().find(|t| t.supports_name(&call.name)) {
-            match tool.execute_named(&call.name, call.arguments.clone()).await {
+            match tool.execute_named(&call.name, sanitized_args).await {
                 Ok(r) => {
                     self.hooks
                         .emit(

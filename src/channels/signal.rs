@@ -1553,8 +1553,15 @@ impl SignalChannel {
         let is_group_message =
             data_msg.and_then(|dm| dm.group_info.as_ref()).is_some() || sync_group_id.is_some();
 
-        if !is_group_message && !self.is_sender_allowed(&sender) {
-            return None;
+        if !self.is_sender_allowed(&sender) {
+            if !is_group_message {
+                return None;
+            }
+            // For group messages, also reject when an explicit allowlist is configured
+            if !self.allowed_from.is_empty() {
+                tracing::debug!(sender = %sender, "Rejecting group message from non-allowed sender");
+                return None;
+            }
         }
 
         if let Some(data_msg) = data_msg {

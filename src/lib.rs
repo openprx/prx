@@ -110,7 +110,7 @@ pub mod rag;
 #[cfg(feature = "llm-router")]
 pub mod router;
 pub mod runtime;
-pub(crate) mod security;
+pub mod security;
 pub mod self_system;
 pub(crate) mod service;
 pub mod session_worker;
@@ -123,6 +123,14 @@ pub mod webhook;
 pub(crate) mod xin;
 
 pub use config::Config;
+
+// Re-export security types for integration tests.
+pub use security::pairing::{PairingGuard, constant_time_eq};
+pub use security::policy::{ActionTracker, AutonomyLevel, SecurityPolicy};
+pub use security::policy_pipeline::{EvalContext, PolicyPipeline};
+
+// Re-export HookManager for integration tests (gateway AppState requires it).
+pub use hooks::HookManager;
 
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

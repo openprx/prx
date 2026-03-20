@@ -299,47 +299,47 @@ fn sanitize_codex_tool_name(name: &str) -> String {
 
 fn sanitize_codex_tools(
     tools: Option<Vec<serde_json::Value>>,
-) -> (Option<Vec<serde_json::Value>>, HashMap<String, String>) {
+) -> anyhow::Result<(Option<Vec<serde_json::Value>>, HashMap<String, String>)> {
     let mut tool_name_map = HashMap::new();
     let Some(items) = tools else {
-        return (None, tool_name_map);
+        return Ok((None, tool_name_map));
     };
 
-    let sanitized_items = items
-        .into_iter()
-        .map(|mut tool| {
-            let Some(obj) = tool.as_object_mut() else {
-                return tool;
-            };
-            let Some(name) = obj.get("name").and_then(Value::as_str) else {
-                return tool;
-            };
+    let mut sanitized_items = Vec::with_capacity(items.len());
+    for mut tool in items {
+        let Some(obj) = tool.as_object_mut() else {
+            sanitized_items.push(tool);
+            continue;
+        };
+        let Some(name) = obj.get("name").and_then(Value::as_str) else {
+            sanitized_items.push(tool);
+            continue;
+        };
 
-            let sanitized = sanitize_codex_tool_name(name);
-            if sanitized != name {
-                tracing::warn!(
-                    original_tool_name = name,
-                    sanitized_tool_name = sanitized,
-                    "OpenAI Codex tool name sanitized to satisfy API pattern"
-                );
-                if let Some(existing) = tool_name_map.insert(sanitized.clone(), name.to_string()) {
-                    if existing != name {
-                        tracing::warn!(
-                            sanitized_tool_name = sanitized,
-                            existing_original_tool_name = existing,
-                            conflicting_original_tool_name = name,
-                            "OpenAI Codex tool name sanitization collision detected"
-                        );
-                    }
+        let sanitized = sanitize_codex_tool_name(name);
+        if sanitized != name {
+            tracing::warn!(
+                original_tool_name = name,
+                sanitized_tool_name = sanitized,
+                "OpenAI Codex tool name sanitized to satisfy API pattern"
+            );
+            if let Some(existing) = tool_name_map.insert(sanitized.clone(), name.to_string()) {
+                if existing != name {
+                    anyhow::bail!(
+                        "Tool name collision after sanitization: '{}' and '{}' both map to '{}'",
+                        existing,
+                        name,
+                        sanitized
+                    );
                 }
-                obj.insert("name".to_string(), Value::String(sanitized));
             }
+            obj.insert("name".to_string(), Value::String(sanitized));
+        }
 
-            tool
-        })
-        .collect();
+        sanitized_items.push(tool);
+    }
 
-    (Some(sanitized_items), tool_name_map)
+    Ok((Some(sanitized_items), tool_name_map))
 }
 
 fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -863,7 +863,7 @@ impl Provider for OpenAiCodexProvider {
         _temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
         let (instructions, input) = build_responses_input(request.messages);
-        let (tools, tool_name_map) = sanitize_codex_tools(convert_tools(request.tools));
+        let (tools, tool_name_map) = sanitize_codex_tools(convert_tools(request.tools))?;
         let parsed = self
             .send_and_decode_full_response(input, instructions, model, tools)
             .await?;
@@ -892,7 +892,7 @@ impl Provider for OpenAiCodexProvider {
                     .collect::<Result<Vec<_>, _>>()?,
             )
         };
-        let (native_tools, tool_name_map) = sanitize_codex_tools(native_tools);
+        let (native_tools, tool_name_map) = sanitize_codex_tools(native_tools)?;
         let parsed = self
             .send_and_decode_full_response(input, instructions, model, native_tools)
             .await?;
@@ -1137,7 +1137,7 @@ data: [DONE]
             "parameters": {"type":"object"}
         })]);
 
-        let (sanitized, mapping) = sanitize_codex_tools(tools);
+        let (sanitized, mapping) = sanitize_codex_tools(tools).expect("sanitize should succeed");
         let sanitized = sanitized.expect("sanitized tools must exist");
         assert_eq!(sanitized[0]["name"], "email_execute");
         assert_eq!(
