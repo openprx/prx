@@ -165,6 +165,18 @@ async fn open_in_brave(url: &str) -> anyhow::Result<()> {
 
     #[cfg(target_os = "windows")]
     {
+        // Reject URLs containing cmd.exe metacharacters that could lead to
+        // command injection when passed through `cmd /C start`.
+        // Valid HTTPS URLs may contain & in query strings, but these are
+        // dangerous inside cmd.exe's command parser.
+        const CMD_META: &[char] = &['&', '|', '<', '>', '^', '(', ')', '%', '!'];
+        if url.contains(CMD_META) {
+            anyhow::bail!(
+                "URL contains characters unsafe for Windows cmd.exe shell; \
+                 open it manually in Brave"
+            );
+        }
+
         let status = tokio::process::Command::new("cmd")
             .args(["/C", "start", "", "brave", url])
             .status()

@@ -11,6 +11,38 @@ use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
 use tracing::warn;
 
+/// POST /api/config/reload — hot-reload configuration from config.toml (authenticated).
+pub async fn post_config_reload(State(state): State<AppState>) -> Response {
+    use crate::tools::Tool as _;
+    let tool = crate::tools::ConfigReloadTool::new(Arc::clone(&state.shared_config));
+    match tool.execute(serde_json::json!({})).await {
+        Ok(result) if result.success => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "message": result.output,
+            })),
+        )
+            .into_response(),
+        Ok(result) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": result.error.unwrap_or_else(|| "Unknown error".into()),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": e.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 const REDACTION_MASK: &str = "***";
 
 #[derive(Serialize)]

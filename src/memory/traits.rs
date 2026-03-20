@@ -65,10 +65,7 @@ pub enum MemoryCategory {
     Custom(String),
 }
 
-pub(crate) fn validate_memory_write_target(
-    key: &str,
-    session_id: Option<&str>,
-) -> anyhow::Result<()> {
+pub fn validate_memory_write_target(key: &str, session_id: Option<&str>) -> anyhow::Result<()> {
     const RESERVED_PREFIXES: &[&str] = &["self/", "router/"];
 
     if RESERVED_PREFIXES

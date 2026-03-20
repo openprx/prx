@@ -258,9 +258,10 @@ impl Tool for WebFetchTool {
 
         // Truncate if needed, appending a note
         let output = if output.len() > max_chars {
+            let safe_end = output.floor_char_boundary(max_chars);
             format!(
                 "{}\n\n[Truncated: output exceeded {} characters. Use a smaller range or a more specific URL.]",
-                &output[..max_chars],
+                &output[..safe_end],
                 max_chars
             )
         } else {

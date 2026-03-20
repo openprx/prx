@@ -424,11 +424,31 @@ fn normalize_qwen_oauth_base_url(raw: &str) -> Option<String> {
         return None;
     }
 
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    // Reject plain HTTP — enforce HTTPS only
+    if trimmed.starts_with("http://") {
+        tracing::error!("Qwen OAuth base URL must use HTTPS, got http://");
+        return None;
+    }
+
+    let with_scheme = if trimmed.starts_with("https://") {
         trimmed.to_string()
     } else {
         format!("https://{trimmed}")
     };
+
+    // Extract host and reject private/loopback addresses (SSRF defense)
+    let host = with_scheme
+        .strip_prefix("https://")
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host_no_port = host.split(':').next().unwrap_or(host);
+
+    if is_private_or_loopback_host(host_no_port) {
+        tracing::error!(host = %host, "Qwen OAuth base URL points to private/loopback address");
+        return None;
+    }
 
     let normalized = with_scheme.trim_end_matches('/').to_string();
     if normalized.ends_with("/v1") {
@@ -436,6 +456,59 @@ fn normalize_qwen_oauth_base_url(raw: &str) -> Option<String> {
     } else {
         Some(format!("{normalized}/v1"))
     }
+}
+
+/// Check whether a hostname or IP literal is a private or loopback address.
+fn is_private_or_loopback_host(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let lower = bare.to_lowercase();
+
+    if lower == "localhost" || lower.ends_with(".localhost") || lower == "::1" || lower == "0.0.0.0"
+    {
+        return true;
+    }
+
+    // Check .local TLD
+    if lower.rsplit('.').next().is_some_and(|tld| tld == "local") {
+        return true;
+    }
+
+    // Parse as IPv4 and check private/loopback ranges
+    if let Ok(v4) = bare.parse::<std::net::Ipv4Addr>() {
+        let [a, b, _, _] = v4.octets();
+        return a == 0            // 0.0.0.0/8
+            || a == 10           // 10.0.0.0/8
+            || a == 127          // 127.0.0.0/8
+            || (a == 169 && b == 254)  // 169.254.0.0/16
+            || (a == 172 && (16..=31).contains(&b))  // 172.16.0.0/12
+            || (a == 192 && b == 168)  // 192.168.0.0/16
+            || (a == 100 && (64..=127).contains(&b))  // 100.64.0.0/10 (CGNAT)
+            || a >= 240; // 240.0.0.0/4 (reserved/broadcast)
+    }
+
+    // Parse as IPv6 and check private/loopback ranges
+    if let Ok(v6) = bare.parse::<std::net::Ipv6Addr>() {
+        let segs = v6.segments();
+        return v6.is_loopback()
+            || v6.is_unspecified()
+            || v6.is_multicast()
+            || (segs[0] & 0xfe00) == 0xfc00  // unique local (fc00::/7)
+            || (segs[0] & 0xffc0) == 0xfe80  // link-local (fe80::/10)
+            || v6.to_ipv4_mapped().is_some_and(|v4| {
+                let [a, b, _, _] = v4.octets();
+                a == 0 || a == 10 || a == 127
+                    || (a == 169 && b == 254)
+                    || (a == 172 && (16..=31).contains(&b))
+                    || (a == 192 && b == 168)
+                    || (a == 100 && (64..=127).contains(&b))
+                    || a >= 240
+            });
+    }
+
+    false
 }
 
 fn read_qwen_oauth_cached_credentials() -> Option<QwenOauthCredentials> {

@@ -1182,6 +1182,18 @@ impl DeviceStoreTrait for RusqliteStore {
 
                 let mut signature = [0u8; 64];
                 let mut adv_secret = [0u8; 32];
+                if signature_bytes.len() != 64 {
+                    return Err(rusqlite::Error::InvalidParameterName(format!(
+                        "signed_pre_key_signature has invalid length ({}, expected 64)",
+                        signature_bytes.len()
+                    )));
+                }
+                if adv_secret_bytes.len() != 32 {
+                    return Err(rusqlite::Error::InvalidParameterName(format!(
+                        "adv_secret_key has invalid length ({}, expected 32)",
+                        adv_secret_bytes.len()
+                    )));
+                }
                 signature.copy_from_slice(&signature_bytes);
                 adv_secret.copy_from_slice(&adv_secret_bytes);
 

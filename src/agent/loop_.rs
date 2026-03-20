@@ -246,6 +246,12 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 const MEMORY_FLUSH_MAX_CHARS: usize = 800;
 
+/// Maximum bytes for the total memory context preamble injected into prompts.
+const MAX_MEMORY_PREAMBLE_BYTES: usize = 4096;
+
+/// Maximum bytes for a single memory entry within the preamble.
+const MAX_MEMORY_ENTRY_BYTES: usize = 512;
+
 pub(crate) struct RecalledMemoryContext {
     pub(crate) preamble: String,
     pub(crate) ids: Vec<String>,
@@ -562,7 +568,9 @@ async fn pre_compaction_flush(
         .iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
         .map(|m| {
-            let snippet = &m.content[..m.content.len().min(500)];
+            let end = m.content.len().min(500);
+            let safe_end = m.content.floor_char_boundary(end);
+            let snippet = &m.content[..safe_end];
             format!("[{}]: {}", m.role, snippet)
         })
         .collect::<Vec<_>>()
@@ -689,7 +697,22 @@ pub(crate) async fn build_context(
                     continue;
                 }
                 ids.push(entry.id.clone());
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
+
+                // Cap each entry to avoid a single huge memory dominating the preamble
+                let content = if entry.content.len() > MAX_MEMORY_ENTRY_BYTES {
+                    let end = entry.content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
+                    format!("{}...", &entry.content[..end])
+                } else {
+                    entry.content.clone()
+                };
+
+                let line = format!("- {}: {}\n", entry.key, content);
+
+                // Cap total preamble size
+                if context.len() + line.len() > MAX_MEMORY_PREAMBLE_BYTES {
+                    break;
+                }
+                context.push_str(&line);
             }
             if context != "[Memory context]\n" {
                 context.push('\n');

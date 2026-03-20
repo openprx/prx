@@ -195,6 +195,25 @@ impl Tool for GatewayTool {
             }
         };
 
+        // Destructive actions require a trusted scope marker to prevent
+        // unauthorized callers from mutating config or restarting the daemon.
+        if action == "config.patch" || action == "restart" {
+            let trusted = args
+                .get("_prx_scope_trusted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !trusted {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "Destructive gateway action requires trusted scope (_prx_scope_trusted=true)"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+
         let cfg = self.config.load_full();
         match action {
             "config.get" => {
@@ -520,6 +539,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "config.patch",
+                "_prx_scope_trusted": true,
                 "patch": {
                     "gateway": {
                         "port": 3300
@@ -534,5 +554,29 @@ mod tests {
         let contents = tokio::fs::read_to_string(config_path).await.unwrap();
         let parsed: Config = toml::from_str(&contents).unwrap();
         assert_eq!(parsed.gateway.port, 3300);
+    }
+
+    #[tokio::test]
+    async fn config_patch_rejects_untrusted() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+        let result = tool
+            .execute(json!({
+                "action": "config.patch",
+                "patch": { "gateway": { "port": 9999 } }
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("trusted scope"));
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_untrusted() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+        let result = tool.execute(json!({ "action": "restart" })).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("trusted scope"));
     }
 }

@@ -57,7 +57,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 /// Top-level OpenPRX configuration, loaded from `config.toml`.
 ///
-/// Resolution order: `OPENPRX_WORKSPACE` (legacy: `ZEROCLAW_WORKSPACE`) env
+/// Resolution order: `OPENPRX_WORKSPACE` (legacy: `OPENPRX_WORKSPACE`) env
 /// → `active_workspace.toml` marker
 /// → `~/.openprx/config.toml` (fallback `~/.openprx/config.toml`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -68,7 +68,7 @@ pub struct Config {
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
     pub config_path: PathBuf,
-    /// API key for the selected provider. Overridden by `OPENPRX_API_KEY`, `OPENPRX_API_KEY / ZEROCLAW_API_KEY`, or `API_KEY` env vars.
+    /// API key for the selected provider. Overridden by `OPENPRX_API_KEY`, `OPENPRX_API_KEY / OPENPRX_API_KEY`, or `API_KEY` env vars.
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
@@ -1932,7 +1932,7 @@ impl ProxyConfig {
                 }
                 Err(error) => {
                     tracing::warn!(
-                        proxy_url = %url,
+                        proxy_url = %redact_url_credentials(&url),
                         service_key,
                         "Ignoring invalid all_proxy URL: {error}"
                     );
@@ -1947,7 +1947,7 @@ impl ProxyConfig {
                 }
                 Err(error) => {
                     tracing::warn!(
-                        proxy_url = %url,
+                        proxy_url = %redact_url_credentials(&url),
                         service_key,
                         "Ignoring invalid http_proxy URL: {error}"
                     );
@@ -1962,7 +1962,7 @@ impl ProxyConfig {
                 }
                 Err(error) => {
                     tracing::warn!(
-                        proxy_url = %url,
+                        proxy_url = %redact_url_credentials(&url),
                         service_key,
                         "Ignoring invalid https_proxy URL: {error}"
                     );
@@ -2003,6 +2003,21 @@ impl ProxyConfig {
 
 fn apply_no_proxy(proxy: reqwest::Proxy, no_proxy: Option<reqwest::NoProxy>) -> reqwest::Proxy {
     proxy.no_proxy(no_proxy)
+}
+
+/// Redact credentials (user:pass) from a proxy URL before logging.
+///
+/// Turns `http://user:pass@host:port/path` into `http://[REDACTED]@host:port/path`.
+/// Returns the original string unchanged if no credentials are present.
+fn redact_url_credentials(url: &str) -> String {
+    if let Some(at_pos) = url.find('@') {
+        if let Some(scheme_end) = url.find("://") {
+            let scheme = &url[..scheme_end + 3];
+            let after_at = &url[at_pos + 1..];
+            return format!("{scheme}[REDACTED]@{after_at}");
+        }
+    }
+    url.to_string()
 }
 
 fn normalize_proxy_url_option(raw: Option<&str>) -> Option<String> {
@@ -2069,8 +2084,9 @@ fn service_selector_matches(selector: &str, service_key: &str) -> bool {
 }
 
 fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
+    let redacted = redact_url_credentials(url);
     let parsed = reqwest::Url::parse(url)
-        .with_context(|| format!("Invalid {field} URL: '{url}' is not a valid URL"))?;
+        .with_context(|| format!("Invalid {field} URL: '{redacted}' is not a valid URL"))?;
 
     match parsed.scheme() {
         "http" | "https" | "socks5" | "socks5h" => {}
@@ -3595,7 +3611,7 @@ pub struct WhatsAppConfig {
     #[serde(default)]
     pub verify_token: Option<String>,
     /// App secret from Meta Business Suite (for webhook signature verification)
-    /// Can also be set via `OPENPRX_WHATSAPP_APP_SECRET` (legacy: `ZEROCLAW_WHATSAPP_APP_SECRET`) environment variable
+    /// Can also be set via `OPENPRX_WHATSAPP_APP_SECRET` (legacy: `OPENPRX_WHATSAPP_APP_SECRET`) environment variable
     /// Only used in Cloud API mode
     #[serde(default)]
     pub app_secret: Option<String>,
@@ -3655,7 +3671,7 @@ pub struct NextcloudTalkConfig {
     pub app_token: String,
     /// Shared secret for webhook signature verification.
     ///
-    /// Can also be set via `OPENPRX_NEXTCLOUD_TALK_WEBHOOK_SECRET` (legacy: `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`).
+    /// Can also be set via `OPENPRX_NEXTCLOUD_TALK_WEBHOOK_SECRET` (legacy: `OPENPRX_NEXTCLOUD_TALK_WEBHOOK_SECRET`).
     #[serde(default)]
     pub webhook_secret: Option<String>,
     /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
@@ -4334,24 +4350,23 @@ enum ConfigResolutionSource {
 impl ConfigResolutionSource {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::EnvConfigDir => "OPENPRX_CONFIG_DIR (legacy: ZEROCLAW_CONFIG_DIR)",
-            Self::EnvWorkspace => "OPENPRX_WORKSPACE (legacy: ZEROCLAW_WORKSPACE)",
+            Self::EnvConfigDir => "OPENPRX_CONFIG_DIR",
+            Self::EnvWorkspace => "OPENPRX_WORKSPACE",
             Self::ActiveWorkspaceMarker => "active_workspace.toml",
             Self::DefaultConfigDir => "default",
         }
     }
 }
 
-fn env_openprx_or_openprx(name_suffix: &str) -> std::result::Result<String, std::env::VarError> {
+fn env_openprx(name_suffix: &str) -> std::result::Result<String, std::env::VarError> {
     std::env::var(format!("OPENPRX_{name_suffix}"))
-        .or_else(|_| std::env::var(format!("ZEROCLAW_{name_suffix}")))
 }
 
 async fn resolve_runtime_config_dirs(
     default_openprx_dir: &Path,
     default_workspace_dir: &Path,
 ) -> Result<(PathBuf, PathBuf, ConfigResolutionSource)> {
-    if let Ok(custom_config_dir) = env_openprx_or_openprx("CONFIG_DIR") {
+    if let Ok(custom_config_dir) = env_openprx("CONFIG_DIR") {
         let custom_config_dir = custom_config_dir.trim();
         if !custom_config_dir.is_empty() {
             let openprx_dir = PathBuf::from(custom_config_dir);
@@ -4363,7 +4378,7 @@ async fn resolve_runtime_config_dirs(
         }
     }
 
-    if let Ok(custom_workspace) = env_openprx_or_openprx("WORKSPACE") {
+    if let Ok(custom_workspace) = env_openprx("WORKSPACE") {
         if !custom_workspace.is_empty() {
             let (openprx_dir, workspace_dir) =
                 resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
@@ -4653,8 +4668,8 @@ impl Config {
 
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
-        // API Key: OPENPRX_API_KEY / ZEROCLAW_API_KEY or API_KEY (generic)
-        if let Ok(key) = env_openprx_or_openprx("API_KEY").or_else(|_| std::env::var("API_KEY")) {
+        // API Key: OPENPRX_API_KEY / OPENPRX_API_KEY or API_KEY (generic)
+        if let Ok(key) = env_openprx("API_KEY").or_else(|_| std::env::var("API_KEY")) {
             if !key.is_empty() {
                 self.api_key = Some(key);
             }
@@ -4678,11 +4693,11 @@ impl Config {
         }
 
         // Provider override precedence:
-        // 1) OPENPRX_PROVIDER / ZEROCLAW_PROVIDER always wins when set.
+        // 1) OPENPRX_PROVIDER / OPENPRX_PROVIDER always wins when set.
         // 2) Legacy PROVIDER is only honored when config still uses the
         //    default provider (openrouter) or provider is unset. This prevents
         //    container defaults from overriding explicit custom providers.
-        if let Ok(provider) = env_openprx_or_openprx("PROVIDER") {
+        if let Ok(provider) = env_openprx("PROVIDER") {
             if !provider.is_empty() {
                 self.default_provider = Some(provider);
             }
@@ -4696,15 +4711,15 @@ impl Config {
             }
         }
 
-        // Model: OPENPRX_MODEL / ZEROCLAW_MODEL or MODEL
-        if let Ok(model) = env_openprx_or_openprx("MODEL").or_else(|_| std::env::var("MODEL")) {
+        // Model: OPENPRX_MODEL / OPENPRX_MODEL or MODEL
+        if let Ok(model) = env_openprx("MODEL").or_else(|_| std::env::var("MODEL")) {
             if !model.is_empty() {
                 self.default_model = Some(model);
             }
         }
 
-        // Workspace directory: ZEROCLAW_WORKSPACE
-        if let Ok(workspace) = env_openprx_or_openprx("WORKSPACE") {
+        // Workspace directory: OPENPRX_WORKSPACE
+        if let Ok(workspace) = env_openprx("WORKSPACE") {
             if !workspace.is_empty() {
                 let (_, workspace_dir) =
                     resolve_config_dir_for_workspace(&PathBuf::from(workspace));
@@ -4712,72 +4727,69 @@ impl Config {
             }
         }
 
-        // Open-skills opt-in flag: ZEROCLAW_OPEN_SKILLS_ENABLED
-        if let Ok(flag) = env_openprx_or_openprx("OPEN_SKILLS_ENABLED") {
+        // Open-skills opt-in flag: OPENPRX_OPEN_SKILLS_ENABLED
+        if let Ok(flag) = env_openprx("OPEN_SKILLS_ENABLED") {
             if !flag.trim().is_empty() {
                 match flag.trim().to_ascii_lowercase().as_str() {
                     "1" | "true" | "yes" | "on" => self.skills.open_skills_enabled = true,
                     "0" | "false" | "no" | "off" => self.skills.open_skills_enabled = false,
                     _ => tracing::warn!(
-                        "Ignoring invalid ZEROCLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
+                        "Ignoring invalid OPENPRX_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
                     ),
                 }
             }
         }
 
-        // Open-skills directory override: ZEROCLAW_OPEN_SKILLS_DIR
-        if let Ok(path) = env_openprx_or_openprx("OPEN_SKILLS_DIR") {
+        // Open-skills directory override: OPENPRX_OPEN_SKILLS_DIR
+        if let Ok(path) = env_openprx("OPEN_SKILLS_DIR") {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 self.skills.open_skills_dir = Some(trimmed.to_string());
             }
         }
 
-        // OpenClaw skills opt-in flag: ZEROCLAW_OPENCLAW_SKILLS_ENABLED
-        if let Ok(flag) = env_openprx_or_openprx("OPENCLAW_SKILLS_ENABLED") {
+        // OpenClaw skills opt-in flag: OPENPRX_OPENCLAW_SKILLS_ENABLED
+        if let Ok(flag) = env_openprx("OPENCLAW_SKILLS_ENABLED") {
             if !flag.trim().is_empty() {
                 match flag.trim().to_ascii_lowercase().as_str() {
                     "1" | "true" | "yes" | "on" => self.skills.openclaw_skills_enabled = true,
                     "0" | "false" | "no" | "off" => self.skills.openclaw_skills_enabled = false,
                     _ => tracing::warn!(
-                        "Ignoring invalid ZEROCLAW_OPENCLAW_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
+                        "Ignoring invalid OPENPRX_OPENCLAW_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
                     ),
                 }
             }
         }
 
-        // OpenClaw skills directory override: ZEROCLAW_OPENCLAW_SKILLS_DIR
-        if let Ok(path) = env_openprx_or_openprx("OPENCLAW_SKILLS_DIR") {
+        // OpenClaw skills directory override: OPENPRX_OPENCLAW_SKILLS_DIR
+        if let Ok(path) = env_openprx("OPENCLAW_SKILLS_DIR") {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 self.skills.openclaw_skills_dir = Some(trimmed.to_string());
             }
         }
 
-        // Gateway port: ZEROCLAW_GATEWAY_PORT or PORT
-        if let Ok(port_str) =
-            env_openprx_or_openprx("GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
-        {
+        // Gateway port: OPENPRX_GATEWAY_PORT or PORT
+        if let Ok(port_str) = env_openprx("GATEWAY_PORT").or_else(|_| std::env::var("PORT")) {
             if let Ok(port) = port_str.parse::<u16>() {
                 self.gateway.port = port;
             }
         }
 
-        // Gateway host: ZEROCLAW_GATEWAY_HOST or HOST
-        if let Ok(host) = env_openprx_or_openprx("GATEWAY_HOST").or_else(|_| std::env::var("HOST"))
-        {
+        // Gateway host: OPENPRX_GATEWAY_HOST or HOST
+        if let Ok(host) = env_openprx("GATEWAY_HOST").or_else(|_| std::env::var("HOST")) {
             if !host.is_empty() {
                 self.gateway.host = host;
             }
         }
 
-        // Allow public bind: ZEROCLAW_ALLOW_PUBLIC_BIND
-        if let Ok(val) = env_openprx_or_openprx("ALLOW_PUBLIC_BIND") {
+        // Allow public bind: OPENPRX_ALLOW_PUBLIC_BIND
+        if let Ok(val) = env_openprx("ALLOW_PUBLIC_BIND") {
             self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
         }
 
-        // Temperature: ZEROCLAW_TEMPERATURE
-        if let Ok(temp_str) = env_openprx_or_openprx("TEMPERATURE") {
+        // Temperature: OPENPRX_TEMPERATURE
+        if let Ok(temp_str) = env_openprx("TEMPERATURE") {
             if let Ok(temp) = temp_str.parse::<f64>() {
                 if (0.0..=2.0).contains(&temp) {
                     self.default_temperature = temp;
@@ -4786,29 +4798,29 @@ impl Config {
         }
 
         // Agent read-only tool scheduler tuning.
-        if let Ok(window) = env_openprx_or_openprx("READ_ONLY_TOOL_CONCURRENCY_WINDOW") {
+        if let Ok(window) = env_openprx("READ_ONLY_TOOL_CONCURRENCY_WINDOW") {
             if let Ok(window) = window.parse::<usize>() {
                 if window > 0 {
                     self.agent.read_only_tool_concurrency_window = window;
                 }
             }
         }
-        if let Ok(timeout_secs) = env_openprx_or_openprx("READ_ONLY_TOOL_TIMEOUT_SECS") {
+        if let Ok(timeout_secs) = env_openprx("READ_ONLY_TOOL_TIMEOUT_SECS") {
             if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
                 if timeout_secs > 0 {
                     self.agent.read_only_tool_timeout_secs = timeout_secs;
                 }
             }
         }
-        if let Ok(enabled) = env_openprx_or_openprx("PRIORITY_SCHEDULING_ENABLED") {
+        if let Ok(enabled) = env_openprx("PRIORITY_SCHEDULING_ENABLED") {
             self.agent.priority_scheduling_enabled =
                 enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
-        if let Ok(enabled) = env_openprx_or_openprx("CONCURRENCY_KILL_SWITCH_FORCE_SERIAL") {
+        if let Ok(enabled) = env_openprx("CONCURRENCY_KILL_SWITCH_FORCE_SERIAL") {
             self.agent.concurrency_kill_switch_force_serial =
                 enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
-        if let Ok(stage) = env_openprx_or_openprx("CONCURRENCY_ROLLOUT_STAGE") {
+        if let Ok(stage) = env_openprx("CONCURRENCY_ROLLOUT_STAGE") {
             let stage = stage.trim().to_ascii_lowercase();
             if matches!(
                 stage.as_str(),
@@ -4817,12 +4829,12 @@ impl Config {
                 self.agent.concurrency_rollout_stage = stage;
             }
         }
-        if let Ok(percent) = env_openprx_or_openprx("CONCURRENCY_ROLLOUT_SAMPLE_PERCENT") {
+        if let Ok(percent) = env_openprx("CONCURRENCY_ROLLOUT_SAMPLE_PERCENT") {
             if let Ok(percent) = percent.parse::<u8>() {
                 self.agent.concurrency_rollout_sample_percent = percent;
             }
         }
-        if let Ok(channels) = env_openprx_or_openprx("CONCURRENCY_ROLLOUT_CHANNELS") {
+        if let Ok(channels) = env_openprx("CONCURRENCY_ROLLOUT_CHANNELS") {
             let parsed = channels
                 .split(',')
                 .map(str::trim)
@@ -4831,27 +4843,25 @@ impl Config {
                 .collect::<Vec<_>>();
             self.agent.concurrency_rollout_channels = parsed;
         }
-        if let Ok(enabled) = env_openprx_or_openprx("CONCURRENCY_AUTO_ROLLBACK_ENABLED") {
+        if let Ok(enabled) = env_openprx("CONCURRENCY_AUTO_ROLLBACK_ENABLED") {
             self.agent.concurrency_auto_rollback_enabled =
                 enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
-        if let Ok(threshold) = env_openprx_or_openprx("CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD")
-        {
+        if let Ok(threshold) = env_openprx("CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD") {
             if let Ok(threshold) = threshold.parse::<f64>() {
                 if (0.0..=1.0).contains(&threshold) {
                     self.agent.concurrency_rollback_timeout_rate_threshold = threshold;
                 }
             }
         }
-        if let Ok(threshold) = env_openprx_or_openprx("CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD")
-        {
+        if let Ok(threshold) = env_openprx("CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD") {
             if let Ok(threshold) = threshold.parse::<f64>() {
                 if (0.0..=1.0).contains(&threshold) {
                     self.agent.concurrency_rollback_cancel_rate_threshold = threshold;
                 }
             }
         }
-        if let Ok(threshold) = env_openprx_or_openprx("CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD") {
+        if let Ok(threshold) = env_openprx("CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD") {
             if let Ok(threshold) = threshold.parse::<f64>() {
                 if (0.0..=1.0).contains(&threshold) {
                     self.agent.concurrency_rollback_error_rate_threshold = threshold;
@@ -4859,9 +4869,9 @@ impl Config {
             }
         }
 
-        // Reasoning override: ZEROCLAW_REASONING_ENABLED or REASONING_ENABLED
-        if let Ok(flag) = env_openprx_or_openprx("REASONING_ENABLED")
-            .or_else(|_| std::env::var("REASONING_ENABLED"))
+        // Reasoning override: OPENPRX_REASONING_ENABLED or REASONING_ENABLED
+        if let Ok(flag) =
+            env_openprx("REASONING_ENABLED").or_else(|_| std::env::var("REASONING_ENABLED"))
         {
             let normalized = flag.trim().to_ascii_lowercase();
             match normalized.as_str() {
@@ -4871,16 +4881,16 @@ impl Config {
             }
         }
 
-        // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
-        if let Ok(enabled) = env_openprx_or_openprx("WEB_SEARCH_ENABLED")
-            .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
+        // Web search enabled: OPENPRX_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
+        if let Ok(enabled) =
+            env_openprx("WEB_SEARCH_ENABLED").or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
         {
             self.web_search.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
 
-        // Web search provider: ZEROCLAW_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
-        if let Ok(provider) = env_openprx_or_openprx("WEB_SEARCH_PROVIDER")
-            .or_else(|_| std::env::var("WEB_SEARCH_PROVIDER"))
+        // Web search provider: OPENPRX_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
+        if let Ok(provider) =
+            env_openprx("WEB_SEARCH_PROVIDER").or_else(|_| std::env::var("WEB_SEARCH_PROVIDER"))
         {
             let provider = provider.trim();
             if !provider.is_empty() {
@@ -4888,9 +4898,9 @@ impl Config {
             }
         }
 
-        // Brave API key: ZEROCLAW_BRAVE_API_KEY or BRAVE_API_KEY
+        // Brave API key: OPENPRX_BRAVE_API_KEY or BRAVE_API_KEY
         if let Ok(api_key) =
-            env_openprx_or_openprx("BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY"))
+            env_openprx("BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY"))
         {
             let api_key = api_key.trim();
             if !api_key.is_empty() {
@@ -4898,8 +4908,8 @@ impl Config {
             }
         }
 
-        // Web search max results: ZEROCLAW_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
-        if let Ok(max_results) = env_openprx_or_openprx("WEB_SEARCH_MAX_RESULTS")
+        // Web search max results: OPENPRX_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
+        if let Ok(max_results) = env_openprx("WEB_SEARCH_MAX_RESULTS")
             .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
         {
             if let Ok(max_results) = max_results.parse::<usize>() {
@@ -4909,8 +4919,8 @@ impl Config {
             }
         }
 
-        // Web search timeout: ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS or WEB_SEARCH_TIMEOUT_SECS
-        if let Ok(timeout_secs) = env_openprx_or_openprx("WEB_SEARCH_TIMEOUT_SECS")
+        // Web search timeout: OPENPRX_WEB_SEARCH_TIMEOUT_SECS or WEB_SEARCH_TIMEOUT_SECS
+        if let Ok(timeout_secs) = env_openprx("WEB_SEARCH_TIMEOUT_SECS")
             .or_else(|_| std::env::var("WEB_SEARCH_TIMEOUT_SECS"))
         {
             if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
@@ -4920,32 +4930,32 @@ impl Config {
             }
         }
 
-        // Storage provider key (optional backend override): ZEROCLAW_STORAGE_PROVIDER
-        if let Ok(provider) = env_openprx_or_openprx("STORAGE_PROVIDER") {
+        // Storage provider key (optional backend override): OPENPRX_STORAGE_PROVIDER
+        if let Ok(provider) = env_openprx("STORAGE_PROVIDER") {
             let provider = provider.trim();
             if !provider.is_empty() {
                 self.storage.provider.config.provider = provider.to_string();
             }
         }
 
-        // Storage connection URL (for remote backends): ZEROCLAW_STORAGE_DB_URL
-        if let Ok(db_url) = env_openprx_or_openprx("STORAGE_DB_URL") {
+        // Storage connection URL (for remote backends): OPENPRX_STORAGE_DB_URL
+        if let Ok(db_url) = env_openprx("STORAGE_DB_URL") {
             let db_url = db_url.trim();
             if !db_url.is_empty() {
                 self.storage.provider.config.db_url = Some(db_url.to_string());
             }
         }
 
-        // Storage connect timeout: ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS
-        if let Ok(timeout_secs) = env_openprx_or_openprx("STORAGE_CONNECT_TIMEOUT_SECS") {
+        // Storage connect timeout: OPENPRX_STORAGE_CONNECT_TIMEOUT_SECS
+        if let Ok(timeout_secs) = env_openprx("STORAGE_CONNECT_TIMEOUT_SECS") {
             if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
                 if timeout_secs > 0 {
                     self.storage.provider.config.connect_timeout_secs = Some(timeout_secs);
                 }
             }
         }
-        // Proxy enabled flag: ZEROCLAW_PROXY_ENABLED
-        let explicit_proxy_enabled = env_openprx_or_openprx("PROXY_ENABLED")
+        // Proxy enabled flag: OPENPRX_PROXY_ENABLED
+        let explicit_proxy_enabled = env_openprx("PROXY_ENABLED")
             .ok()
             .as_deref()
             .and_then(parse_proxy_enabled);
@@ -4953,29 +4963,22 @@ impl Config {
             self.proxy.enabled = enabled;
         }
 
-        // Proxy URLs: ZEROCLAW_* wins, then generic *PROXY vars.
+        // Proxy URLs: OPENPRX_* wins, then generic *PROXY vars.
         let mut proxy_url_overridden = false;
-        if let Ok(proxy_url) =
-            env_openprx_or_openprx("HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
-        {
+        if let Ok(proxy_url) = env_openprx("HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY")) {
             self.proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
-        if let Ok(proxy_url) =
-            env_openprx_or_openprx("HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
+        if let Ok(proxy_url) = env_openprx("HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
         {
             self.proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
-        if let Ok(proxy_url) =
-            env_openprx_or_openprx("ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY"))
-        {
+        if let Ok(proxy_url) = env_openprx("ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY")) {
             self.proxy.all_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
-        if let Ok(no_proxy) =
-            env_openprx_or_openprx("NO_PROXY").or_else(|_| std::env::var("NO_PROXY"))
-        {
+        if let Ok(no_proxy) = env_openprx("NO_PROXY").or_else(|_| std::env::var("NO_PROXY")) {
             self.proxy.no_proxy = normalize_no_proxy_list(vec![no_proxy]);
         }
 
@@ -4987,18 +4990,18 @@ impl Config {
         }
 
         // Proxy scope and service selectors.
-        if let Ok(scope_raw) = env_openprx_or_openprx("PROXY_SCOPE") {
+        if let Ok(scope_raw) = env_openprx("PROXY_SCOPE") {
             if let Some(scope) = parse_proxy_scope(&scope_raw) {
                 self.proxy.scope = scope;
             } else {
                 tracing::warn!(
                     scope = %scope_raw,
-                    "Ignoring invalid ZEROCLAW_PROXY_SCOPE (valid: environment|prx|services)"
+                    "Ignoring invalid OPENPRX_PROXY_SCOPE (valid: environment|prx|services)"
                 );
             }
         }
 
-        if let Ok(services_raw) = env_openprx_or_openprx("PROXY_SERVICES") {
+        if let Ok(services_raw) = env_openprx("PROXY_SERVICES") {
             self.proxy.services = normalize_service_list(vec![services_raw]);
         }
 
@@ -5874,6 +5877,7 @@ model = "override-beta"
 
     #[tokio::test]
     async fn config_split_and_reload_roundtrip_matches_original() {
+        let _env_guard = env_override_lock().await;
         let dir = std::env::temp_dir().join(format!(
             "openprx_test_split_reload_{}",
             uuid::Uuid::new_v4()
@@ -6936,13 +6940,13 @@ default_temperature = 0.7
 
     fn clear_proxy_env_test_vars() {
         for key in [
-            "ZEROCLAW_PROXY_ENABLED",
-            "ZEROCLAW_HTTP_PROXY",
-            "ZEROCLAW_HTTPS_PROXY",
-            "ZEROCLAW_ALL_PROXY",
-            "ZEROCLAW_NO_PROXY",
-            "ZEROCLAW_PROXY_SCOPE",
-            "ZEROCLAW_PROXY_SERVICES",
+            "OPENPRX_PROXY_ENABLED",
+            "OPENPRX_HTTP_PROXY",
+            "OPENPRX_HTTPS_PROXY",
+            "OPENPRX_ALL_PROXY",
+            "OPENPRX_NO_PROXY",
+            "OPENPRX_PROXY_SCOPE",
+            "OPENPRX_PROXY_SERVICES",
             "HTTP_PROXY",
             "HTTPS_PROXY",
             "ALL_PROXY",
@@ -6962,11 +6966,11 @@ default_temperature = 0.7
         let mut config = Config::default();
         assert!(config.api_key.is_none());
 
-        test_set_env("ZEROCLAW_API_KEY", "sk-test-env-key");
+        test_set_env("OPENPRX_API_KEY", "sk-test-env-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("sk-test-env-key"));
 
-        test_remove_env("ZEROCLAW_API_KEY");
+        test_remove_env("OPENPRX_API_KEY");
     }
 
     #[test]
@@ -6974,7 +6978,7 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        test_remove_env("ZEROCLAW_API_KEY");
+        test_remove_env("OPENPRX_API_KEY");
         test_set_env("API_KEY", "sk-fallback-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("sk-fallback-key"));
@@ -6987,11 +6991,11 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        test_set_env("ZEROCLAW_PROVIDER", "anthropic");
+        test_set_env("OPENPRX_PROVIDER", "anthropic");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
 
-        test_remove_env("ZEROCLAW_PROVIDER");
+        test_remove_env("OPENPRX_PROVIDER");
     }
 
     #[test]
@@ -7001,8 +7005,8 @@ default_temperature = 0.7
         assert!(!config.skills.open_skills_enabled);
         assert!(config.skills.open_skills_dir.is_none());
 
-        test_set_env("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
-        test_set_env("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
+        test_set_env("OPENPRX_OPEN_SKILLS_ENABLED", "true");
+        test_set_env("OPENPRX_OPEN_SKILLS_DIR", "/tmp/open-skills");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
@@ -7011,8 +7015,8 @@ default_temperature = 0.7
             Some("/tmp/open-skills")
         );
 
-        test_remove_env("ZEROCLAW_OPEN_SKILLS_ENABLED");
-        test_remove_env("ZEROCLAW_OPEN_SKILLS_DIR");
+        test_remove_env("OPENPRX_OPEN_SKILLS_ENABLED");
+        test_remove_env("OPENPRX_OPEN_SKILLS_DIR");
     }
 
     #[test]
@@ -7021,11 +7025,11 @@ default_temperature = 0.7
         let mut config = Config::default();
         config.skills.open_skills_enabled = true;
 
-        test_set_env("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
+        test_set_env("OPENPRX_OPEN_SKILLS_ENABLED", "maybe");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
-        test_remove_env("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        test_remove_env("OPENPRX_OPEN_SKILLS_ENABLED");
     }
 
     #[test]
@@ -7033,7 +7037,7 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        test_remove_env("ZEROCLAW_PROVIDER");
+        test_remove_env("OPENPRX_PROVIDER");
         test_set_env("PROVIDER", "openai");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
@@ -7049,7 +7053,7 @@ default_temperature = 0.7
             ..Config::default()
         };
 
-        test_remove_env("ZEROCLAW_PROVIDER");
+        test_remove_env("OPENPRX_PROVIDER");
         test_set_env("PROVIDER", "openrouter");
         config.apply_env_overrides();
         assert_eq!(
@@ -7068,12 +7072,12 @@ default_temperature = 0.7
             ..Config::default()
         };
 
-        test_set_env("ZEROCLAW_PROVIDER", "openrouter");
+        test_set_env("OPENPRX_PROVIDER", "openrouter");
         test_set_env("PROVIDER", "anthropic");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
 
-        test_remove_env("ZEROCLAW_PROVIDER");
+        test_remove_env("OPENPRX_PROVIDER");
         test_remove_env("PROVIDER");
     }
 
@@ -7112,11 +7116,11 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        test_set_env("ZEROCLAW_MODEL", "gpt-4o");
+        test_set_env("OPENPRX_MODEL", "gpt-4o");
         config.apply_env_overrides();
         assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
 
-        test_remove_env("ZEROCLAW_MODEL");
+        test_remove_env("OPENPRX_MODEL");
     }
 
     #[test]
@@ -7124,7 +7128,7 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        test_remove_env("ZEROCLAW_MODEL");
+        test_remove_env("OPENPRX_MODEL");
         test_set_env("MODEL", "anthropic/claude-3.5-sonnet");
         config.apply_env_overrides();
         assert_eq!(
@@ -7140,11 +7144,11 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        test_set_env("ZEROCLAW_WORKSPACE", "/custom/workspace");
+        test_set_env("OPENPRX_WORKSPACE", "/custom/workspace");
         config.apply_env_overrides();
         assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
 
-        test_remove_env("ZEROCLAW_WORKSPACE");
+        test_remove_env("OPENPRX_WORKSPACE");
     }
 
     #[test]
@@ -7154,7 +7158,7 @@ default_temperature = 0.7
         let default_workspace_dir = default_config_dir.join("workspace");
         let workspace_dir = default_config_dir.join("profile-a");
 
-        test_set_env("ZEROCLAW_WORKSPACE", &workspace_dir);
+        test_set_env("OPENPRX_WORKSPACE", &workspace_dir);
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -7164,7 +7168,7 @@ default_temperature = 0.7
         assert_eq!(config_dir, workspace_dir);
         assert_eq!(resolved_workspace_dir, workspace_dir.join("workspace"));
 
-        test_remove_env("ZEROCLAW_WORKSPACE");
+        test_remove_env("OPENPRX_WORKSPACE");
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -7185,8 +7189,8 @@ default_temperature = 0.7
             .await
             .unwrap();
 
-        test_set_env("ZEROCLAW_CONFIG_DIR", &explicit_config_dir);
-        test_remove_env("ZEROCLAW_WORKSPACE");
+        test_set_env("OPENPRX_CONFIG_DIR", &explicit_config_dir);
+        test_remove_env("OPENPRX_WORKSPACE");
 
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
@@ -7200,7 +7204,7 @@ default_temperature = 0.7
             explicit_config_dir.join("workspace")
         );
 
-        test_remove_env("ZEROCLAW_CONFIG_DIR");
+        test_remove_env("OPENPRX_CONFIG_DIR");
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -7212,7 +7216,7 @@ default_temperature = 0.7
         let marker_config_dir = default_config_dir.join("profiles").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
-        test_remove_env("ZEROCLAW_WORKSPACE");
+        test_remove_env("OPENPRX_WORKSPACE");
         fs::create_dir_all(&default_config_dir).await.unwrap();
         let state = ActiveWorkspaceState {
             config_dir: marker_config_dir.to_string_lossy().into_owned(),
@@ -7239,7 +7243,7 @@ default_temperature = 0.7
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let default_workspace_dir = default_config_dir.join("workspace");
 
-        test_remove_env("ZEROCLAW_WORKSPACE");
+        test_remove_env("OPENPRX_WORKSPACE");
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -7261,7 +7265,7 @@ default_temperature = 0.7
 
         let original_home = std::env::var("HOME").ok();
         test_set_env("HOME", &temp_home);
-        test_set_env("ZEROCLAW_WORKSPACE", &workspace_dir);
+        test_set_env("OPENPRX_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -7269,7 +7273,7 @@ default_temperature = 0.7
         assert_eq!(config.config_path, workspace_dir.join("config.toml"));
         assert!(workspace_dir.join("config.toml").exists());
 
-        test_remove_env("ZEROCLAW_WORKSPACE");
+        test_remove_env("OPENPRX_WORKSPACE");
         if let Some(home) = original_home {
             test_set_env("HOME", home);
         } else {
@@ -7288,7 +7292,7 @@ default_temperature = 0.7
 
         let original_home = std::env::var("HOME").ok();
         test_set_env("HOME", &temp_home);
-        test_set_env("ZEROCLAW_WORKSPACE", &workspace_dir);
+        test_set_env("OPENPRX_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -7296,7 +7300,7 @@ default_temperature = 0.7
         assert_eq!(config.config_path, legacy_config_path);
         assert!(config.config_path.exists());
 
-        test_remove_env("ZEROCLAW_WORKSPACE");
+        test_remove_env("OPENPRX_WORKSPACE");
         if let Some(home) = original_home {
             test_set_env("HOME", home);
         } else {
@@ -7326,7 +7330,7 @@ default_model = "legacy-model"
 
         let original_home = std::env::var("HOME").ok();
         test_set_env("HOME", &temp_home);
-        test_set_env("ZEROCLAW_WORKSPACE", &workspace_dir);
+        test_set_env("OPENPRX_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -7334,7 +7338,7 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, legacy_config_path);
         assert_eq!(config.default_model.as_deref(), Some("legacy-model"));
 
-        test_remove_env("ZEROCLAW_WORKSPACE");
+        test_remove_env("OPENPRX_WORKSPACE");
         if let Some(home) = original_home {
             test_set_env("HOME", home);
         } else {
@@ -7360,7 +7364,7 @@ default_model = "legacy-model"
 
         let original_home = std::env::var("HOME").ok();
         test_set_env("HOME", &temp_home);
-        test_remove_env("ZEROCLAW_WORKSPACE");
+        test_remove_env("OPENPRX_WORKSPACE");
 
         persist_active_workspace_config_dir(&custom_config_dir)
             .await
@@ -7401,14 +7405,14 @@ default_model = "legacy-model"
         persist_active_workspace_config_dir(&marker_config_dir)
             .await
             .unwrap();
-        test_set_env("ZEROCLAW_WORKSPACE", &env_workspace_dir);
+        test_set_env("OPENPRX_WORKSPACE", &env_workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
         assert_eq!(config.workspace_dir, env_workspace_dir.join("workspace"));
         assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));
 
-        test_remove_env("ZEROCLAW_WORKSPACE");
+        test_remove_env("OPENPRX_WORKSPACE");
         if let Some(home) = original_home {
             test_set_env("HOME", home);
         } else {
@@ -7453,11 +7457,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         let original_provider = config.default_provider.clone();
 
-        test_set_env("ZEROCLAW_PROVIDER", "");
+        test_set_env("OPENPRX_PROVIDER", "");
         config.apply_env_overrides();
         assert_eq!(config.default_provider, original_provider);
 
-        test_remove_env("ZEROCLAW_PROVIDER");
+        test_remove_env("OPENPRX_PROVIDER");
     }
 
     #[test]
@@ -7466,11 +7470,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.gateway.port, 16830);
 
-        test_set_env("ZEROCLAW_GATEWAY_PORT", "8080");
+        test_set_env("OPENPRX_GATEWAY_PORT", "8080");
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, 8080);
 
-        test_remove_env("ZEROCLAW_GATEWAY_PORT");
+        test_remove_env("OPENPRX_GATEWAY_PORT");
     }
 
     #[test]
@@ -7478,7 +7482,7 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        test_remove_env("ZEROCLAW_GATEWAY_PORT");
+        test_remove_env("OPENPRX_GATEWAY_PORT");
         test_set_env("PORT", "9000");
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, 9000);
@@ -7492,11 +7496,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.gateway.host, "127.0.0.1");
 
-        test_set_env("ZEROCLAW_GATEWAY_HOST", "0.0.0.0");
+        test_set_env("OPENPRX_GATEWAY_HOST", "0.0.0.0");
         config.apply_env_overrides();
         assert_eq!(config.gateway.host, "0.0.0.0");
 
-        test_remove_env("ZEROCLAW_GATEWAY_HOST");
+        test_remove_env("OPENPRX_GATEWAY_HOST");
     }
 
     #[test]
@@ -7504,7 +7508,7 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        test_remove_env("ZEROCLAW_GATEWAY_HOST");
+        test_remove_env("OPENPRX_GATEWAY_HOST");
         test_set_env("HOST", "0.0.0.0");
         config.apply_env_overrides();
         assert_eq!(config.gateway.host, "0.0.0.0");
@@ -7517,31 +7521,31 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        test_set_env("ZEROCLAW_TEMPERATURE", "0.5");
+        test_set_env("OPENPRX_TEMPERATURE", "0.5");
         config.apply_env_overrides();
         assert!((config.default_temperature - 0.5).abs() < f64::EPSILON);
 
-        test_remove_env("ZEROCLAW_TEMPERATURE");
+        test_remove_env("OPENPRX_TEMPERATURE");
     }
 
     #[test]
     async fn env_override_temperature_out_of_range_ignored() {
         let _env_guard = env_override_lock().await;
         // Clean up any leftover env vars from other tests
-        test_remove_env("ZEROCLAW_TEMPERATURE");
+        test_remove_env("OPENPRX_TEMPERATURE");
 
         let mut config = Config::default();
         let original_temp = config.default_temperature;
 
         // Temperature > 2.0 should be ignored
-        test_set_env("ZEROCLAW_TEMPERATURE", "3.0");
+        test_set_env("OPENPRX_TEMPERATURE", "3.0");
         config.apply_env_overrides();
         assert!(
             (config.default_temperature - original_temp).abs() < f64::EPSILON,
             "Temperature 3.0 should be ignored (out of range)"
         );
 
-        test_remove_env("ZEROCLAW_TEMPERATURE");
+        test_remove_env("OPENPRX_TEMPERATURE");
     }
 
     #[test]
@@ -7550,15 +7554,15 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.runtime.reasoning_enabled, None);
 
-        test_set_env("ZEROCLAW_REASONING_ENABLED", "false");
+        test_set_env("OPENPRX_REASONING_ENABLED", "false");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
-        test_set_env("ZEROCLAW_REASONING_ENABLED", "true");
+        test_set_env("OPENPRX_REASONING_ENABLED", "true");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(true));
 
-        test_remove_env("ZEROCLAW_REASONING_ENABLED");
+        test_remove_env("OPENPRX_REASONING_ENABLED");
     }
 
     #[test]
@@ -7567,11 +7571,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         config.runtime.reasoning_enabled = Some(false);
 
-        test_set_env("ZEROCLAW_REASONING_ENABLED", "maybe");
+        test_set_env("OPENPRX_REASONING_ENABLED", "maybe");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
-        test_remove_env("ZEROCLAW_REASONING_ENABLED");
+        test_remove_env("OPENPRX_REASONING_ENABLED");
     }
 
     #[test]
@@ -7640,9 +7644,9 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        test_set_env("ZEROCLAW_STORAGE_PROVIDER", "postgres");
-        test_set_env("ZEROCLAW_STORAGE_DB_URL", "postgres://example/db");
-        test_set_env("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
+        test_set_env("OPENPRX_STORAGE_PROVIDER", "postgres");
+        test_set_env("OPENPRX_STORAGE_DB_URL", "postgres://example/db");
+        test_set_env("OPENPRX_STORAGE_CONNECT_TIMEOUT_SECS", "15");
 
         config.apply_env_overrides();
 
@@ -7656,9 +7660,9 @@ default_model = "legacy-model"
             Some(15)
         );
 
-        test_remove_env("ZEROCLAW_STORAGE_PROVIDER");
-        test_remove_env("ZEROCLAW_STORAGE_DB_URL");
-        test_remove_env("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS");
+        test_remove_env("OPENPRX_STORAGE_PROVIDER");
+        test_remove_env("OPENPRX_STORAGE_DB_URL");
+        test_remove_env("OPENPRX_STORAGE_CONNECT_TIMEOUT_SECS");
     }
 
     #[test]
@@ -7666,20 +7670,17 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        test_set_env("ZEROCLAW_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL", "true");
-        test_set_env("ZEROCLAW_CONCURRENCY_ROLLOUT_STAGE", "stage_c");
-        test_set_env("ZEROCLAW_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT", "40");
-        test_set_env("ZEROCLAW_CONCURRENCY_ROLLOUT_CHANNELS", "telegram,discord");
-        test_set_env("ZEROCLAW_CONCURRENCY_AUTO_ROLLBACK_ENABLED", "false");
+        test_set_env("OPENPRX_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL", "true");
+        test_set_env("OPENPRX_CONCURRENCY_ROLLOUT_STAGE", "stage_c");
+        test_set_env("OPENPRX_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT", "40");
+        test_set_env("OPENPRX_CONCURRENCY_ROLLOUT_CHANNELS", "telegram,discord");
+        test_set_env("OPENPRX_CONCURRENCY_AUTO_ROLLBACK_ENABLED", "false");
         test_set_env(
-            "ZEROCLAW_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD",
+            "OPENPRX_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD",
             "0.31",
         );
-        test_set_env(
-            "ZEROCLAW_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD",
-            "0.32",
-        );
-        test_set_env("ZEROCLAW_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD", "0.33");
+        test_set_env("OPENPRX_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD", "0.32");
+        test_set_env("OPENPRX_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD", "0.33");
 
         config.apply_env_overrides();
 
@@ -7695,14 +7696,14 @@ default_model = "legacy-model"
         assert!((config.agent.concurrency_rollback_cancel_rate_threshold - 0.32).abs() < 1e-9);
         assert!((config.agent.concurrency_rollback_error_rate_threshold - 0.33).abs() < 1e-9);
 
-        test_remove_env("ZEROCLAW_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL");
-        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLOUT_STAGE");
-        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT");
-        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLOUT_CHANNELS");
-        test_remove_env("ZEROCLAW_CONCURRENCY_AUTO_ROLLBACK_ENABLED");
-        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD");
-        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD");
-        test_remove_env("ZEROCLAW_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD");
+        test_remove_env("OPENPRX_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL");
+        test_remove_env("OPENPRX_CONCURRENCY_ROLLOUT_STAGE");
+        test_remove_env("OPENPRX_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT");
+        test_remove_env("OPENPRX_CONCURRENCY_ROLLOUT_CHANNELS");
+        test_remove_env("OPENPRX_CONCURRENCY_AUTO_ROLLBACK_ENABLED");
+        test_remove_env("OPENPRX_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD");
+        test_remove_env("OPENPRX_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD");
+        test_remove_env("OPENPRX_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD");
     }
 
     #[test]
@@ -7727,13 +7728,13 @@ default_model = "legacy-model"
         clear_proxy_env_test_vars();
 
         let mut config = Config::default();
-        test_set_env("ZEROCLAW_PROXY_ENABLED", "true");
-        test_set_env("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
+        test_set_env("OPENPRX_PROXY_ENABLED", "true");
+        test_set_env("OPENPRX_HTTP_PROXY", "http://127.0.0.1:7890");
         test_set_env(
-            "ZEROCLAW_PROXY_SERVICES",
+            "OPENPRX_PROXY_SERVICES",
             "provider.openai, tool.http_request",
         );
-        test_set_env("ZEROCLAW_PROXY_SCOPE", "services");
+        test_set_env("OPENPRX_PROXY_SCOPE", "services");
 
         config.apply_env_overrides();
 
@@ -7756,11 +7757,11 @@ default_model = "legacy-model"
         clear_proxy_env_test_vars();
 
         let mut config = Config::default();
-        test_set_env("ZEROCLAW_PROXY_ENABLED", "true");
-        test_set_env("ZEROCLAW_PROXY_SCOPE", "environment");
-        test_set_env("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
-        test_set_env("ZEROCLAW_HTTPS_PROXY", "http://127.0.0.1:7891");
-        test_set_env("ZEROCLAW_NO_PROXY", "localhost,127.0.0.1");
+        test_set_env("OPENPRX_PROXY_ENABLED", "true");
+        test_set_env("OPENPRX_PROXY_SCOPE", "environment");
+        test_set_env("OPENPRX_HTTP_PROXY", "http://127.0.0.1:7890");
+        test_set_env("OPENPRX_HTTPS_PROXY", "http://127.0.0.1:7891");
+        test_set_env("OPENPRX_NO_PROXY", "localhost,127.0.0.1");
 
         config.apply_env_overrides();
 

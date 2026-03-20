@@ -4,7 +4,6 @@ firmware/*/target
 *.db-journal
 .DS_Store
 ._*
-.wt-pr37/
 __pycache__/
 *.pyc
 docker-compose.override.yml
@@ -30,7 +29,6 @@ venv/
 credentials.json
 .worktrees/
 
-# Web console
-web/node_modules/
-web/.svelte-kit/
+# Console UI build output
+console/dist/
 pdk/rust/examples/voice-talk-realtime/target/

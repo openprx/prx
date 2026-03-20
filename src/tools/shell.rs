@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
+use crate::security::traits::Sandbox;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    sandbox: Arc<dyn Sandbox>,
     acl_enabled: bool,
 }
 
@@ -27,11 +29,13 @@ impl ShellTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
         runtime: Arc<dyn RuntimeAdapter>,
+        sandbox: Arc<dyn Sandbox>,
         acl_enabled: bool,
     ) -> Self {
         Self {
             security,
             runtime,
+            sandbox,
             acl_enabled,
         }
     }
@@ -162,6 +166,17 @@ impl Tool for ShellTool {
             cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
         }
 
+        // Apply sandbox isolation before execution.
+        // The Sandbox trait operates on std::process::Command, so we use
+        // as_std_mut() to access the inner command from tokio::process::Command.
+        if let Err(e) = self.sandbox.wrap_command(cmd.as_std_mut()) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Sandbox failed to wrap command: {e}")),
+            });
+        }
+
         let result =
             tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
 
@@ -210,6 +225,7 @@ impl Tool for ShellTool {
 mod tests {
     use super::*;
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
+    use crate::security::traits::NoopSandbox;
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
@@ -224,11 +240,16 @@ mod tests {
         Arc::new(NativeRuntime::new())
     }
 
+    fn test_sandbox() -> Arc<dyn Sandbox> {
+        Arc::new(NoopSandbox)
+    }
+
     #[test]
     fn shell_tool_name() {
         let tool = ShellTool::new(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
+            test_sandbox(),
             false,
         );
         assert_eq!(tool.name(), "shell");
@@ -239,6 +260,7 @@ mod tests {
         let tool = ShellTool::new(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
+            test_sandbox(),
             false,
         );
         assert!(!tool.description().is_empty());
@@ -249,6 +271,7 @@ mod tests {
         let tool = ShellTool::new(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
+            test_sandbox(),
             false,
         );
         let schema = tool.parameters_schema();
@@ -267,6 +290,7 @@ mod tests {
         let tool = ShellTool::new(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
+            test_sandbox(),
             false,
         );
         let result = tool
@@ -283,6 +307,7 @@ mod tests {
         let tool = ShellTool::new(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
+            test_sandbox(),
             false,
         );
         let result = tool
@@ -299,6 +324,7 @@ mod tests {
         let tool = ShellTool::new(
             test_security(AutonomyLevel::ReadOnly),
             test_runtime(),
+            test_sandbox(),
             false,
         );
         let result = tool
@@ -320,6 +346,7 @@ mod tests {
         let tool = ShellTool::new(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
+            test_sandbox(),
             false,
         );
         let result = tool.execute(json!({})).await;
@@ -332,6 +359,7 @@ mod tests {
         let tool = ShellTool::new(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
+            test_sandbox(),
             false,
         );
         let result = tool.execute(json!({"command": 123})).await;
@@ -343,6 +371,7 @@ mod tests {
         let tool = ShellTool::new(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
+            test_sandbox(),
             false,
         );
         let result = tool
@@ -394,7 +423,12 @@ mod tests {
         let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
         let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
 
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime(), false);
+        let tool = ShellTool::new(
+            test_security_with_env_cmd(),
+            test_runtime(),
+            test_sandbox(),
+            false,
+        );
         let result = tool
             .execute(json!({"command": "env"}))
             .await
@@ -412,7 +446,12 @@ mod tests {
 
     #[tokio::test]
     async fn shell_preserves_path_and_home() {
-        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime(), false);
+        let tool = ShellTool::new(
+            test_security_with_env_cmd(),
+            test_runtime(),
+            test_sandbox(),
+            false,
+        );
 
         let result = tool
             .execute(json!({"command": "echo $HOME"}))
@@ -444,7 +483,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
 
-        let tool = ShellTool::new(security.clone(), test_runtime(), false);
+        let tool = ShellTool::new(security.clone(), test_runtime(), test_sandbox(), false);
         let denied = tool
             .execute(json!({"command": "touch openprx_shell_approval_test"}))
             .await
@@ -471,7 +510,7 @@ mod tests {
             tokio::fs::remove_file(std::env::temp_dir().join("openprx_shell_approval_test")).await;
     }
 
-    // ── §5.2 Shell timeout enforcement tests ─────────────────
+    // -- Shell timeout enforcement tests --
 
     #[test]
     fn shell_timeout_constant_is_reasonable() {
@@ -486,7 +525,7 @@ mod tests {
         );
     }
 
-    // ── §5.3 Non-UTF8 binary output tests ────────────────────
+    // -- Non-UTF8 binary output tests --
 
     #[test]
     fn shell_safe_env_vars_excludes_secrets() {
@@ -523,7 +562,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = ShellTool::new(security, test_runtime(), false);
+        let tool = ShellTool::new(security, test_runtime(), test_sandbox(), false);
         let result = tool
             .execute(json!({"command": "echo test"}))
             .await
@@ -537,6 +576,7 @@ mod tests {
         let tool = ShellTool::new(
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
+            test_sandbox(),
             true,
         );
         let result = tool
@@ -553,12 +593,17 @@ mod tests {
         );
     }
 
-    // ── PATH override verification ──────────────────────────────
+    // -- PATH override verification --
 
     #[tokio::test]
     async fn shell_overrides_path_with_safe_default() {
         // Execute 'echo $PATH' and verify it uses the hardcoded safe PATH
-        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime(), false);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Full),
+            test_runtime(),
+            test_sandbox(),
+            false,
+        );
         let result = tool
             .execute(json!({"command": "echo $PATH"}))
             .await
@@ -579,7 +624,12 @@ mod tests {
 
     #[tokio::test]
     async fn shell_env_does_not_leak_api_keys() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime(), false);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Full),
+            test_runtime(),
+            test_sandbox(),
+            false,
+        );
         // Try to read an env var that should NOT be passed through
         let result = tool
             .execute(json!({"command": "echo ${OPENPRX_API_KEY:-unset}"}))
@@ -595,7 +645,12 @@ mod tests {
 
     #[tokio::test]
     async fn shell_fast_command_succeeds() {
-        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime(), false);
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Full),
+            test_runtime(),
+            test_sandbox(),
+            false,
+        );
         let result = tool
             .execute(json!({"command": "echo done"}))
             .await
