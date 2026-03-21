@@ -45,6 +45,9 @@ pub enum MultimodalError {
     #[error("invalid multimodal image marker '{input}': {reason}")]
     InvalidMarker { input: String, reason: String },
 
+    #[error("SSRF blocked: image URL targets a private/local address '{input}' (host: {host})")]
+    SsrfBlocked { input: String, host: String },
+
     #[error("failed to download remote image '{input}': {reason}")]
     RemoteFetchFailed { input: String, reason: String },
 
@@ -137,7 +140,7 @@ pub async fn prepare_messages_for_provider(
         });
     }
 
-    let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
+    let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10)?;
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
     for message in messages {
@@ -264,6 +267,16 @@ async fn normalize_remote_image(
     max_bytes: usize,
     remote_client: &Client,
 ) -> anyhow::Result<String> {
+    // SSRF protection: block requests to private/local addresses
+    let host = crate::tools::http_request::extract_host(source)?;
+    if crate::tools::http_request::is_private_or_local_host(&host) {
+        return Err(MultimodalError::SsrfBlocked {
+            input: source.to_string(),
+            host,
+        }
+        .into());
+    }
+
     let response = remote_client.get(source).send().await.map_err(|error| {
         MultimodalError::RemoteFetchFailed {
             input: source.to_string(),
@@ -605,5 +618,102 @@ mod tests {
         let payload = extract_ollama_image_payload("data:image/png;base64,abcd==")
             .expect("payload should be extracted");
         assert_eq!(payload, "abcd==");
+    }
+
+    #[tokio::test]
+    async fn ssrf_blocks_localhost_image_url() {
+        let client = Client::new();
+        let err = normalize_remote_image("http://localhost/evil.png", 1024 * 1024, &client)
+            .await
+            .expect_err("should block localhost SSRF");
+        assert!(
+            err.to_string().contains("SSRF blocked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_blocks_private_ipv4_10_x() {
+        let client = Client::new();
+        let err = normalize_remote_image("http://10.0.0.1/secret.png", 1024 * 1024, &client)
+            .await
+            .expect_err("should block 10.x.x.x SSRF");
+        assert!(
+            err.to_string().contains("SSRF blocked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_blocks_private_ipv4_192_168() {
+        let client = Client::new();
+        let err =
+            normalize_remote_image("http://192.168.1.1/admin.png", 1024 * 1024, &client)
+                .await
+                .expect_err("should block 192.168.x.x SSRF");
+        assert!(
+            err.to_string().contains("SSRF blocked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_blocks_cloud_metadata_endpoint() {
+        let client = Client::new();
+        let err = normalize_remote_image(
+            "http://169.254.169.254/latest/meta-data/",
+            1024 * 1024,
+            &client,
+        )
+        .await
+        .expect_err("should block cloud metadata SSRF");
+        assert!(
+            err.to_string().contains("SSRF blocked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_blocks_private_ipv4_172_16() {
+        let client = Client::new();
+        let err = normalize_remote_image("http://172.16.0.1/img.png", 1024 * 1024, &client)
+            .await
+            .expect_err("should block 172.16.x.x SSRF");
+        assert!(
+            err.to_string().contains("SSRF blocked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_blocks_loopback_127_0_0_1() {
+        let client = Client::new();
+        let err =
+            normalize_remote_image("http://127.0.0.1:8080/img.png", 1024 * 1024, &client)
+                .await
+                .expect_err("should block 127.0.0.1 SSRF");
+        assert!(
+            err.to_string().contains("SSRF blocked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_allows_public_url() {
+        // A public URL should NOT be blocked by SSRF check.
+        // It will fail at the HTTP fetch stage (connection error or non-image),
+        // but that error should NOT be "SSRF blocked".
+        let client = Client::new();
+        let result =
+            normalize_remote_image("https://example.com/image.png", 1024 * 1024, &client).await;
+        match result {
+            Ok(_) => {} // unlikely but acceptable
+            Err(err) => {
+                assert!(
+                    !err.to_string().contains("SSRF blocked"),
+                    "public URL should not trigger SSRF block: {err}"
+                );
+            }
+        }
     }
 }

@@ -2,6 +2,7 @@ use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};
+#[cfg(test)]
 use std::path::Path;
 use tokio::sync::mpsc;
 
@@ -262,6 +263,7 @@ end tell"#
 
 /// Get the current max ROWID from the messages table.
 /// Uses rusqlite with parameterized queries for security (CWE-89 prevention).
+#[cfg(test)]
 async fn get_max_rowid(db_path: &Path) -> anyhow::Result<i64> {
     let path = db_path.to_path_buf();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
@@ -280,6 +282,7 @@ async fn get_max_rowid(db_path: &Path) -> anyhow::Result<i64> {
 /// Fetch messages newer than `since_rowid`.
 /// Uses rusqlite with parameterized queries for security (CWE-89 prevention).
 /// The `since_rowid` parameter is bound safely, preventing SQL injection.
+#[cfg(test)]
 async fn fetch_new_messages(
     db_path: &Path,
     since_rowid: i64,

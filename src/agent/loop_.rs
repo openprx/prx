@@ -81,10 +81,6 @@ impl Default for ToolConcurrencyGovernanceConfig {
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
-/// Mid-turn history length threshold: trim immediately inside the tool-call loop when history
-/// exceeds this value, rather than waiting for the turn to finish.
-const MID_TURN_COMPACT_THRESHOLD: usize = 80;
-
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
@@ -109,19 +105,6 @@ const PRE_TURN_FLUSH_THRESHOLD: f64 = 0.85;
 /// Fallback count-based safety net: if history grows beyond this many messages
 /// and no compaction config is available, trim back to `DEFAULT_MAX_HISTORY_MESSAGES`.
 const HISTORY_SAFETY_NET_LIMIT: usize = 200;
-
-static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
-    RegexSet::new([
-        r"(?i)token",
-        r"(?i)api[_-]?key",
-        r"(?i)password",
-        r"(?i)secret",
-        r"(?i)user[_-]?key",
-        r"(?i)bearer",
-        r"(?i)credential",
-    ])
-    .expect("compile regex set: sensitive key name patterns")
-});
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).expect("compile regex: sensitive key-value pair pattern")
@@ -255,23 +238,6 @@ const MAX_MEMORY_ENTRY_BYTES: usize = 512;
 pub(crate) struct RecalledMemoryContext {
     pub(crate) preamble: String,
     pub(crate) ids: Vec<String>,
-}
-
-/// Convert a tool registry to OpenAI function-calling format for native tool support.
-fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
-    tools_registry
-        .iter()
-        .map(|tool| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name(),
-                    "description": tool.description(),
-                    "parameters": tool.parameters_schema()
-                }
-            })
-        })
-        .collect()
 }
 
 fn autosave_memory_key(prefix: &str) -> String {
@@ -1542,27 +1508,6 @@ fn build_native_assistant_history(text: &str, tool_calls: &[ToolCall]) -> String
         "tool_calls": calls_json,
     })
     .to_string()
-}
-
-fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) -> String {
-    let mut parts = Vec::new();
-
-    if !text.trim().is_empty() {
-        parts.push(text.trim().to_string());
-    }
-
-    for call in tool_calls {
-        let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
-            .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
-        let payload = serde_json::json!({
-            "id": call.id,
-            "name": call.name,
-            "arguments": arguments,
-        });
-        parts.push(format!("<tool_call>\n{payload}\n</tool_call>"));
-    }
-
-    parts.join("\n")
 }
 
 #[derive(Debug, Clone)]
@@ -3559,6 +3504,22 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
+        tools_registry
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name(),
+                        "description": tool.description(),
+                        "parameters": tool.parameters_schema()
+                    }
+                })
+            })
+            .collect()
+    }
 
     #[test]
     fn test_scrub_credentials() {

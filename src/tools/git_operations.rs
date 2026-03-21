@@ -58,6 +58,7 @@ impl GitOperationsTool {
     }
 
     /// Check if an operation is read-only
+    #[cfg(test)]
     fn is_read_only(&self, operation: &str) -> bool {
         matches!(
             operation,

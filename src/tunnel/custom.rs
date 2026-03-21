@@ -123,7 +123,13 @@ impl Tunnel for CustomTunnel {
     async fn health_check(&self) -> bool {
         // If a health URL is configured, try to reach it
         if let Some(ref url) = self.health_url {
-            return crate::config::build_runtime_proxy_client("tunnel.custom")
+            let client = crate::config::build_runtime_proxy_client("tunnel.custom")
+                .map_err(|e| {
+                    tracing::error!("proxy build failed for tunnel.custom health check: {e}");
+                    e
+                })
+                .unwrap_or_else(|_| reqwest::Client::new());
+            return client
                 .get(url)
                 .timeout(std::time::Duration::from_secs(5))
                 .send()

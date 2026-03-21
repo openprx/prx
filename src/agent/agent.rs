@@ -501,7 +501,9 @@ impl Agent {
             );
         }
 
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.supports_name(&call.name)) {
+        let (result, success) = if let Some(tool) =
+            self.tools.iter().find(|t| t.supports_name(&call.name))
+        {
             match tool.execute_named(&call.name, sanitized_args).await {
                 Ok(r) => {
                     self.hooks
@@ -521,11 +523,13 @@ impl Agent {
                         duration: start.elapsed(),
                         success: r.success,
                     });
-                    if r.success {
+                    let actual_success = r.success;
+                    let output = if r.success {
                         r.output
                     } else {
                         format!("Error: {}", r.error.unwrap_or(r.output))
-                    }
+                    };
+                    (output, actual_success)
                 }
                 Err(e) => {
                     let message = format!("Error executing {}: {e}", call.name);
@@ -537,7 +541,7 @@ impl Agent {
                         duration: start.elapsed(),
                         success: false,
                     });
-                    message
+                    (message, false)
                 }
             }
         } else {
@@ -545,13 +549,13 @@ impl Agent {
             self.hooks
                 .emit(HookEvent::Error, payload_error("tool", &message))
                 .await;
-            message
+            (message, false)
         };
 
         ToolExecutionResult {
             name: call.name.clone(),
             output: result,
-            success: true,
+            success,
             tool_call_id: call.tool_call_id.clone(),
         }
     }

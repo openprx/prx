@@ -77,6 +77,58 @@ have_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# Portable SHA-256 checksum: works on Linux (sha256sum) and macOS (shasum).
+# Prints "<hex_hash>  <file>" to stdout; returns non-zero on failure.
+compute_sha256() {
+  local file="$1"
+  if have_cmd sha256sum; then
+    sha256sum "$file"
+  elif have_cmd shasum; then
+    shasum -a 256 "$file"
+  else
+    error "Neither sha256sum nor shasum found. Cannot verify download integrity."
+    return 1
+  fi
+}
+
+# Verify a downloaded file against a companion .sha256 checksum file.
+#   $1 = path to the downloaded file
+#   $2 = path to the .sha256 sidecar (format: "<hash>  <filename>" or "<hash> <filename>")
+# Returns 0 on match, 1 on mismatch / missing tool.
+verify_sha256() {
+  local file="$1" checksum_file="$2"
+  local expected actual
+
+  if [[ ! -f "$checksum_file" ]]; then
+    error "Checksum file not found: $checksum_file"
+    return 1
+  fi
+
+  # Extract the hex digest (first field) from the checksum sidecar.
+  expected="$(awk '{print $1}' "$checksum_file" | tr '[:upper:]' '[:lower:]')"
+  if [[ -z "$expected" || ${#expected} -ne 64 ]]; then
+    error "Malformed SHA-256 hash in checksum file: $checksum_file"
+    return 1
+  fi
+
+  actual="$(compute_sha256 "$file" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+  if [[ -z "$actual" ]]; then
+    error "Failed to compute SHA-256 of $file"
+    return 1
+  fi
+
+  if [[ "$expected" != "$actual" ]]; then
+    error "SHA-256 mismatch for $(basename "$file")"
+    error "  expected: $expected"
+    error "  actual:   $actual"
+    error "The downloaded file may have been tampered with. Aborting."
+    return 1
+  fi
+
+  info "SHA-256 verified: $(basename "$file")"
+  return 0
+}
+
 get_total_memory_mb() {
   case "$(uname -s)" in
     Linux)
@@ -186,12 +238,28 @@ install_prebuilt_binary() {
   fi
 
   archive_url="https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-${target}.tar.gz"
+  local checksum_url="${archive_url}.sha256"
   temp_dir="$(mktemp -d -t zeroclaw-prebuilt-XXXXXX)"
   archive_path="$temp_dir/zeroclaw-${target}.tar.gz"
+  local checksum_path="${archive_path}.sha256"
 
   info "Attempting pre-built binary install for target: $target"
   if ! curl -fsSL "$archive_url" -o "$archive_path"; then
     warn "Could not download release asset: $archive_url"
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  # Download and verify SHA-256 checksum (supply-chain integrity check)
+  if ! curl -fsSL "$checksum_url" -o "$checksum_path"; then
+    warn "Could not download checksum file: $checksum_url"
+    warn "Refusing to install unverified binary."
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  if ! verify_sha256 "$archive_path" "$checksum_path"; then
+    error "Integrity verification failed for pre-built binary."
     rm -rf "$temp_dir"
     return 1
   fi
@@ -417,7 +485,51 @@ install_rust_toolchain() {
   fi
 
   info "Installing Rust via rustup"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+  # Download rustup-init to a temporary file and verify its SHA-256 before execution.
+  # This prevents pipe-to-shell attacks where a MITM or CDN compromise could inject
+  # arbitrary code. The checksum is published at the canonical rustup URL.
+  local rustup_tmp rustup_sha_tmp
+  rustup_tmp="$(mktemp -t rustup-init-XXXXXX)"
+  rustup_sha_tmp="$(mktemp -t rustup-init-sha256-XXXXXX)"
+
+  local rustup_arch
+  case "$(uname -s):$(uname -m)" in
+    Linux:x86_64)   rustup_arch="x86_64-unknown-linux-gnu" ;;
+    Linux:aarch64)   rustup_arch="aarch64-unknown-linux-gnu" ;;
+    Darwin:x86_64)   rustup_arch="x86_64-apple-darwin" ;;
+    Darwin:arm64)    rustup_arch="aarch64-apple-darwin" ;;
+    *)               rustup_arch="" ;;
+  esac
+
+  if [[ -n "$rustup_arch" ]]; then
+    local rustup_bin_url="https://static.rust-lang.org/rustup/dist/${rustup_arch}/rustup-init"
+    local rustup_sha_url="${rustup_bin_url}.sha256"
+
+    if ! curl --proto '=https' --tlsv1.2 -sSf "$rustup_bin_url" -o "$rustup_tmp"; then
+      error "Failed to download rustup-init binary."
+      rm -f "$rustup_tmp" "$rustup_sha_tmp"
+      exit 1
+    fi
+
+    if curl --proto '=https' --tlsv1.2 -sSf "$rustup_sha_url" -o "$rustup_sha_tmp" 2>/dev/null; then
+      if ! verify_sha256 "$rustup_tmp" "$rustup_sha_tmp"; then
+        error "rustup-init integrity verification failed. Aborting."
+        rm -f "$rustup_tmp" "$rustup_sha_tmp"
+        exit 1
+      fi
+    else
+      warn "Could not download rustup-init checksum. Continuing with TLS-only verification."
+    fi
+
+    chmod +x "$rustup_tmp"
+    "$rustup_tmp" -y
+    rm -f "$rustup_tmp" "$rustup_sha_tmp"
+  else
+    # Fallback: platform not in our mapping — use the traditional installer with TLS pinning.
+    warn "Unknown platform for rustup binary download; falling back to curl | sh with TLS 1.2."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  fi
 
   if [[ -f "$HOME/.cargo/env" ]]; then
     # shellcheck disable=SC1090

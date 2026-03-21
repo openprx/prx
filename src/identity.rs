@@ -988,10 +988,6 @@ pub fn is_aieos_configured(config: &IdentityConfig) -> bool {
 mod tests {
     use super::*;
 
-    fn test_workspace_dir() -> PathBuf {
-        std::env::temp_dir().join("openprx-test-identity")
-    }
-
     #[test]
     fn aieos_identity_parse_minimal() {
         let json = r#"{"identity":{"names":{"first":"Nova"}}}"#;

@@ -37,15 +37,19 @@ impl WasmStorage {
     /// 1. Build `HostState` from the manifest permissions/config.
     /// 2. Instantiate the component.
     /// 3. Call `name()` export to cache the storage backend name.
+    ///
+    /// `granted_permissions` must come from `LoadedPlugin.granted_permissions`
+    /// (policy-filtered), NOT directly from the manifest.
     pub async fn new(
         engine: &wasmtime::Engine,
         component: &wasmtime::component::Component,
         manifest: &PluginManifest,
+        granted_permissions: HashSet<String>,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginResult<Self> {
         let timeout_ms = manifest.resources.max_execution_time_ms;
 
-        let granted: HashSet<String> = manifest.permissions.required.iter().cloned().collect();
+        let granted: HashSet<String> = granted_permissions;
         let optional: HashSet<String> = manifest.permissions.optional.iter().cloned().collect();
         let mut host_state = HostState::new(
             manifest.plugin.name.clone(),

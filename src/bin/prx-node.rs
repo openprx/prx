@@ -128,5 +128,5 @@ async fn main() -> Result<()> {
         bail!("bearer token is required (set --token or config nodes.server.bearer_token)");
     }
 
-    openprx::nodes::run_node_server(cfg).await
+    openprx::nodes::server::run_node_server(cfg).await
 }

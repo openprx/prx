@@ -238,11 +238,7 @@ fn fetch_fts_with_scope(
     scope_sql: &str,
     scope_params: &[Value],
 ) -> anyhow::Result<Vec<MatchRow>> {
-    let fts_query: String = query
-        .split_whitespace()
-        .map(|w| format!("\"{w}\""))
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    let fts_query: String = crate::memory::topic::build_safe_fts_query(query);
 
     if fts_query.is_empty() {
         return Ok(Vec::new());

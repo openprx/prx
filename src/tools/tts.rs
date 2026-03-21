@@ -108,8 +108,28 @@ impl Tool for TtsTool {
 
         let voice = args["voice"]
             .as_str()
-            .unwrap_or("zh-CN-YunxiNeural")
-            .to_owned();
+            .unwrap_or("zh-CN-YunxiNeural");
+
+        // Validate voice name: only allow alphanumeric, hyphens, underscores, spaces,
+        // and dots (e.g. "zh-CN-YunxiNeural", "en-US-AriaNeural").
+        // This prevents template injection even before the JS-level escaping in
+        // `auto_generate_voice`.
+        if !voice
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b' ' || b == b'.')
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Invalid 'voice' parameter: only alphanumeric characters, hyphens, \
+                     underscores, spaces, and dots are allowed (e.g. 'zh-CN-YunxiNeural')."
+                        .into(),
+                ),
+            });
+        }
+
+        let voice = voice.to_owned();
 
         // Resolve recipient
         let default = self.default_recipient.read().await.clone();
@@ -194,12 +214,6 @@ mod tests {
             Arc::new(Self {
                 sent: ParkingMutex::new(Vec::new()),
                 fail_send: false,
-            })
-        }
-        fn failing() -> Arc<Self> {
-            Arc::new(Self {
-                sent: ParkingMutex::new(Vec::new()),
-                fail_send: true,
             })
         }
     }

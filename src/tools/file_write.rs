@@ -4,6 +4,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 /// Write file contents with path sandboxing
 pub struct FileWriteTool {
     security: Arc<SecurityPolicy>,
@@ -124,20 +127,6 @@ impl Tool for FileWriteTool {
 
         let resolved_target = resolved_parent.join(file_name);
 
-        // If the target already exists and is a symlink, refuse to follow it
-        if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
-            if meta.file_type().is_symlink() {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Refusing to write through symlink: {}",
-                        resolved_target.display()
-                    )),
-                });
-            }
-        }
-
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
@@ -146,11 +135,40 @@ impl Tool for FileWriteTool {
             });
         }
 
-        match tokio::fs::write(&resolved_target, content).await {
-            Ok(()) => Ok(ToolResult {
+        // Use O_NOFOLLOW on Unix to atomically reject symlinks during open,
+        // eliminating the TOCTOU race between symlink check and write.
+        let target = resolved_target.clone();
+        let data = content.to_string();
+        let write_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            opts.custom_flags(libc::O_NOFOLLOW);
+
+            let mut file = opts.open(&target).map_err(|e| {
+                #[cfg(unix)]
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    return format!("Refusing to write through symlink: {}", target.display());
+                }
+                format!("Failed to write file: {e}")
+            })?;
+            file.write_all(data.as_bytes())
+                .map_err(|e| format!("Failed to write file: {e}"))?;
+            Ok(())
+        })
+        .await;
+
+        match write_result {
+            Ok(Ok(())) => Ok(ToolResult {
                 success: true,
                 output: format!("Written {} bytes to {path}", content.len()),
                 error: None,
+            }),
+            Ok(Err(e)) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,

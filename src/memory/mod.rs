@@ -14,9 +14,8 @@ pub mod topic;
 pub mod traits;
 pub mod vector;
 
-#[allow(unused_imports)]
 pub use backend::{
-    MemoryBackendKind, MemoryBackendProfile, classify_memory_backend, default_memory_backend_key,
+    MemoryBackendKind, classify_memory_backend, default_memory_backend_key,
     memory_backend_profile, selectable_memory_backends,
 };
 pub use filter::should_autosave_content;
@@ -27,10 +26,8 @@ pub use postgres::PostgresMemory;
 pub use principal::MemoryWriteContext;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
-#[allow(unused_imports)]
-pub use traits::{ConversationSessionSummary, ConversationTurn, MemoryCategory, MemoryEntry};
-#[allow(unused_imports)]
-pub use traits::{LifecycleState, VerificationStatus};
+pub use traits::{ConversationSessionSummary, MemoryCategory, MemoryEntry};
+pub use traits::LifecycleState;
 
 use crate::config::{
     EmbeddingRouteConfig, IdentityBindingConfig, MemoryConfig, StorageProviderConfig,

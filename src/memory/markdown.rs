@@ -42,33 +42,44 @@ impl MarkdownMemory {
     async fn append_to_file(&self, path: &Path, content: &str) -> anyhow::Result<()> {
         self.ensure_dirs().await?;
 
-        let needs_header = !path.exists()
-            || fs::metadata(path)
-                .await
-                .map(|m| m.len() == 0)
-                .unwrap_or(true);
+        // Always use create+append to avoid truncation races when multiple
+        // concurrent writers hit the same file. O_APPEND serialises writes at
+        // the kernel level so no entry is lost.
+        let path_buf = path.to_path_buf();
+        let is_core = path == self.core_path();
+        let data = content.to_string();
 
-        if needs_header {
-            let header = if path == self.core_path() {
-                "# Long-Term Memory\n\n"
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path_buf)?;
+
+            // NOTE: TOCTOU benign — the length check only decides whether to
+            // prepend a Markdown header. A race at worst produces a duplicate
+            // header line (cosmetic only, no data loss or security impact).
+            let needs_header = file.metadata().map(|m| m.len() == 0).unwrap_or(true);
+
+            // Build the full payload as one buffer so a single write() syscall
+            // (atomic under O_APPEND for sizes < PIPE_BUF) emits the entry
+            // without interleaving from concurrent writers.
+            let payload = if needs_header {
+                let header = if is_core {
+                    "# Long-Term Memory\n\n".to_string()
+                } else {
+                    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    format!("# Daily Log — {date}\n\n")
+                };
+                format!("{header}{data}\n")
             } else {
-                let date = Local::now().format("%Y-%m-%d").to_string();
-                &format!("# Daily Log — {date}\n\n")
+                format!("\n{data}\n")
             };
-            fs::write(path, format!("{header}{content}\n")).await?;
-        } else {
-            // Use append mode to avoid read-modify-write race conditions.
-            // Multiple concurrent writers will serialize at the OS level.
-            let path = path.to_path_buf();
-            let data = format!("\n{content}\n");
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                use std::io::Write as _;
-                let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
-                write!(file, "{data}")?;
-                Ok(())
-            })
-            .await??;
-        }
+
+            file.write_all(payload.as_bytes())?;
+            Ok(())
+        })
+        .await??;
 
         Ok(())
     }
@@ -121,6 +132,8 @@ impl MarkdownMemory {
         let mut entries = Vec::new();
 
         // Read MEMORY.md (core)
+        // NOTE: TOCTOU safe — read-only probe; if the file vanishes before
+        // `read_to_string`, the I/O error is propagated via `?`.
         let core_path = self.core_path();
         if core_path.exists() {
             let content = fs::read_to_string(&core_path).await?;
@@ -132,6 +145,8 @@ impl MarkdownMemory {
         }
 
         // Read daily logs
+        // NOTE: TOCTOU safe — read-only directory probe; if the directory
+        // vanishes between check and read_dir, the I/O error is propagated.
         let mem_dir = self.memory_dir();
         if mem_dir.exists() {
             let mut dir = fs::read_dir(&mem_dir).await?;
@@ -279,6 +294,7 @@ impl Memory for MarkdownMemory {
     }
 
     async fn health_check(&self) -> bool {
+        // NOTE: TOCTOU safe — read-only liveness probe, no security decision depends on this.
         self.workspace_dir.exists()
     }
 }

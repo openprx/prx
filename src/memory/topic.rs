@@ -352,7 +352,7 @@ fn extract_external_ref(content: &str) -> Option<String> {
         })
 }
 
-fn build_safe_fts_query(query: &str) -> String {
+pub(crate) fn build_safe_fts_query(query: &str) -> String {
     query
         .split_whitespace()
         .map(sanitize_fts_token)
@@ -362,7 +362,7 @@ fn build_safe_fts_query(query: &str) -> String {
         .join(" OR ")
 }
 
-fn sanitize_fts_token(token: &str) -> String {
+pub(crate) fn sanitize_fts_token(token: &str) -> String {
     token
         .chars()
         .filter(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '-')

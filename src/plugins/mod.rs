@@ -60,16 +60,19 @@ pub struct PluginMetrics {
 }
 
 impl PluginMetrics {
+    #[cfg(test)]
     fn record_compilation(&self, compile_ms: u64) {
         self.compilations.fetch_add(1, Ordering::Relaxed);
         self.total_compile_ms
             .fetch_add(compile_ms, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn record_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
@@ -336,7 +339,7 @@ impl PluginManager {
                 continue;
             }
 
-            // Get the manifest and the already-compiled component from the registry.
+            // Get the manifest, component, and policy-filtered permissions from the registry.
             let manifest = match self.registry.get_manifest(&info.name).await {
                 Some(m) => m,
                 None => continue,
@@ -350,12 +353,21 @@ impl PluginManager {
                 }
             };
 
+            let granted_permissions: std::collections::HashSet<String> = self
+                .registry
+                .get_granted_permissions(&info.name)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+
             self.metrics.record_instantiation();
 
             match capabilities::tool::WasmToolAdapter::new_with_memory(
                 &self.engine,
                 &component,
                 &manifest,
+                granted_permissions,
                 memory.clone(),
                 event_bus.clone(),
             )
@@ -413,6 +425,14 @@ impl PluginManager {
                 }
             };
 
+            let granted_permissions: std::collections::HashSet<String> = self
+                .registry
+                .get_granted_permissions(&info.name)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+
             self.metrics.record_instantiation();
 
             let priority = manifest
@@ -426,6 +446,7 @@ impl PluginManager {
                 &self.engine,
                 &component,
                 &manifest,
+                granted_permissions,
                 priority,
                 event_bus.clone(),
             )
@@ -479,6 +500,14 @@ impl PluginManager {
                 }
             };
 
+            let granted_permissions: std::collections::HashSet<String> = self
+                .registry
+                .get_granted_permissions(&info.name)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+
             self.metrics.record_instantiation();
 
             let events: std::collections::HashSet<String> = manifest
@@ -492,6 +521,7 @@ impl PluginManager {
                 &self.engine,
                 &component,
                 &manifest,
+                granted_permissions,
                 events,
                 event_bus.clone(),
             )
@@ -541,6 +571,14 @@ impl PluginManager {
                 }
             };
 
+            let granted_permissions: std::collections::HashSet<String> = self
+                .registry
+                .get_granted_permissions(&info.name)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+
             self.metrics.record_instantiation();
 
             let schedule = manifest
@@ -559,6 +597,7 @@ impl PluginManager {
                 &self.engine,
                 &component,
                 &manifest,
+                granted_permissions,
                 schedule.clone(),
                 event_bus.clone(),
             )
@@ -611,12 +650,21 @@ impl PluginManager {
                 }
             };
 
+            let granted_permissions: std::collections::HashSet<String> = self
+                .registry
+                .get_granted_permissions(&info.name)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+
             self.metrics.record_instantiation();
 
             match capabilities::provider::WasmProvider::new(
                 &self.engine,
                 &component,
                 &manifest,
+                granted_permissions,
                 event_bus.clone(),
             )
             .await
@@ -672,12 +720,21 @@ impl PluginManager {
                 }
             };
 
+            let granted_permissions: std::collections::HashSet<String> = self
+                .registry
+                .get_granted_permissions(&info.name)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+
             self.metrics.record_instantiation();
 
             match capabilities::storage::WasmStorage::new(
                 &self.engine,
                 &component,
                 &manifest,
+                granted_permissions,
                 event_bus.clone(),
             )
             .await

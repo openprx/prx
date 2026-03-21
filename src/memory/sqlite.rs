@@ -569,6 +569,9 @@ impl SqliteMemory {
             }
         }
 
+        // NOTE: TOCTOU benign — the exists() check only decides whether to
+        // prepend a header. The file is opened with O_CREAT | O_APPEND below,
+        // so a race at worst produces a missing or duplicate header (cosmetic).
         let header = if path.exists() {
             None
         } else if matches!(category, MemoryCategory::Core) {
@@ -829,11 +832,7 @@ impl SqliteMemory {
         limit: usize,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         // Escape FTS5 special chars and build query
-        let fts_query: String = query
-            .split_whitespace()
-            .map(|w| format!("\"{w}\""))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let fts_query: String = super::topic::build_safe_fts_query(query);
 
         if fts_query.is_empty() {
             return Ok(Vec::new());

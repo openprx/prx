@@ -490,6 +490,9 @@ fn discover_evolution_config_path(config: &Config) -> PathBuf {
     ];
 
     for candidate in &candidates {
+        // NOTE: TOCTOU safe — read-only config discovery. If the file disappears
+        // between this check and the subsequent read, `EvolutionConfig::load_from_path`
+        // will return an error that is handled by the caller. No security impact.
         if candidate.exists() {
             return candidate.clone();
         }

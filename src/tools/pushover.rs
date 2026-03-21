@@ -177,7 +177,7 @@ impl Tool for PushoverTool {
             "tool.pushover",
             PUSHOVER_REQUEST_TIMEOUT_SECS,
             10,
-        );
+        )?;
         let response = client.post(PUSHOVER_API_URL).multipart(form).send().await?;
 
         let status = response.status();

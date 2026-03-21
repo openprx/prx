@@ -255,6 +255,11 @@ impl LarkChannel {
 
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_runtime_proxy_client("channel.lark")
+            .map_err(|e| {
+                tracing::error!("proxy build failed for channel.lark, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| reqwest::Client::new())
     }
 
     fn api_base(&self) -> &'static str {

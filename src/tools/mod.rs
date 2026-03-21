@@ -94,8 +94,6 @@ pub use nodes::NodesTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
-#[allow(unused_imports)]
-pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use session_status::SessionStatusTool;
 pub use sessions_history::SessionsHistoryTool;
@@ -105,7 +103,6 @@ pub use sessions_spawn::SessionsSpawnTool;
 pub use shell::ShellTool;
 pub use subagents::SubagentsTool;
 pub use traits::Tool;
-#[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use tts::TtsTool;
 pub use web_fetch::WebFetchTool;

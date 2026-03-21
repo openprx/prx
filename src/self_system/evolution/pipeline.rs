@@ -58,7 +58,7 @@ pub struct EvolutionPipeline {
     judge: JudgeEngine<MockJudgeModel>,
     shared_config: SharedEvolutionConfig,
     workspace_root: PathBuf,
-    judge_pass_threshold: f64,
+    _judge_pass_threshold: f64,
 }
 
 impl EvolutionPipeline {
@@ -77,7 +77,7 @@ impl EvolutionPipeline {
             judge: JudgeEngine::new(JudgeConfig::default(), MockJudgeModel),
             shared_config,
             workspace_root: workspace_root.as_ref().to_path_buf(),
-            judge_pass_threshold: JUDGE_PASS_THRESHOLD,
+            _judge_pass_threshold: JUDGE_PASS_THRESHOLD,
         }
     }
 

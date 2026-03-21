@@ -43,22 +43,27 @@ impl WasmToolAdapter {
         engine: &wasmtime::Engine,
         component: &wasmtime::component::Component,
         manifest: &PluginManifest,
+        granted_permissions: HashSet<String>,
     ) -> Result<Self, PluginError> {
-        Self::new_with_memory(engine, component, manifest, None, None).await
+        Self::new_with_memory(engine, component, manifest, granted_permissions, None, None).await
     }
 
     /// Create a new WasmToolAdapter with an optional memory backend.
+    ///
+    /// `granted_permissions` must come from `LoadedPlugin.granted_permissions`
+    /// (policy-filtered), NOT directly from the manifest.
     pub async fn new_with_memory(
         engine: &wasmtime::Engine,
         component: &wasmtime::component::Component,
         manifest: &PluginManifest,
+        granted_permissions: HashSet<String>,
         memory: Option<Arc<dyn crate::memory::traits::Memory>>,
         event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
     ) -> Result<Self, PluginError> {
         let timeout_ms = manifest.resources.max_execution_time_ms;
 
-        // Build HostState from manifest
-        let granted: HashSet<String> = manifest.permissions.required.iter().cloned().collect();
+        // Build HostState using policy-filtered permissions (not raw manifest).
+        let granted: HashSet<String> = granted_permissions;
         let optional: HashSet<String> = manifest.permissions.optional.iter().cloned().collect();
         let mut host_state = HostState::new(
             manifest.plugin.name.clone(),

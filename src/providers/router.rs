@@ -22,7 +22,7 @@ pub struct RouterProvider {
     routes: HashMap<String, (usize, String)>, // hint → (provider_index, model)
     providers: Vec<(String, Box<dyn Provider>)>,
     default_index: usize,
-    default_model: String,
+    _default_model: String,
 }
 
 impl RouterProvider {
@@ -65,7 +65,7 @@ impl RouterProvider {
             routes: resolved_routes,
             providers,
             default_index: 0,
-            default_model,
+            _default_model: default_model,
         }
     }
 

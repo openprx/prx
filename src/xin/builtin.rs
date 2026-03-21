@@ -46,6 +46,7 @@ impl BuiltinRegistry {
     }
 
     /// Check if a handler exists for the given name.
+    #[cfg(test)]
     pub fn has_handler(&self, name: &str) -> bool {
         self.handlers.contains_key(name)
     }

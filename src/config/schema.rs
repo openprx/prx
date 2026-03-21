@@ -60,7 +60,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 /// Resolution order: `OPENPRX_WORKSPACE` (legacy: `OPENPRX_WORKSPACE`) env
 /// → `active_workspace.toml` marker
 /// → `~/.openprx/config.toml` (fallback `~/.openprx/config.toml`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
     /// Workspace directory - computed from home, not serialized
     #[serde(skip)]
@@ -242,6 +242,61 @@ pub struct Config {
     /// Security configuration: sandboxing, resource limits, audit, tool policy (`[security]`).
     #[serde(default)]
     pub security: SecurityConfig,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("workspace_dir", &self.workspace_dir)
+            .field("config_path", &self.config_path)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("api_url", &self.api_url)
+            .field("default_provider", &self.default_provider)
+            .field("default_model", &self.default_model)
+            .field("default_temperature", &self.default_temperature)
+            .field("observability", &self.observability)
+            .field("autonomy", &self.autonomy)
+            .field("runtime", &self.runtime)
+            .field("reliability", &self.reliability)
+            .field("scheduler", &self.scheduler)
+            .field("agent", &self.agent)
+            .field("sessions_spawn", &self.sessions_spawn)
+            .field("self_system", &self.self_system)
+            .field("skills", &self.skills)
+            .field("skill_rag", &self.skill_rag)
+            .field("model_routes", &self.model_routes)
+            .field("embedding_routes", &self.embedding_routes)
+            .field("query_classification", &self.query_classification)
+            .field("task_routing", &self.task_routing)
+            .field("router", &self.router)
+            .field("heartbeat", &self.heartbeat)
+            .field("xin", &self.xin)
+            .field("cron", &self.cron)
+            .field("channels_config", &self.channels_config)
+            .field("memory", &self.memory)
+            .field("identity_bindings", &self.identity_bindings)
+            .field("user_policies", &self.user_policies)
+            .field("storage", &self.storage)
+            .field("tunnel", &self.tunnel)
+            .field("gateway", &self.gateway)
+            .field("webhook", &self.webhook)
+            .field("composio", &self.composio)
+            .field("mcp", &self.mcp)
+            .field("auth", &self.auth)
+            .field("secrets", &self.secrets)
+            .field("browser", &self.browser)
+            .field("http_request", &self.http_request)
+            .field("multimodal", &self.multimodal)
+            .field("web_search", &self.web_search)
+            .field("proxy", &self.proxy)
+            .field("identity", &self.identity)
+            .field("cost", &self.cost)
+            .field("nodes", &self.nodes)
+            .field("agents", &self.agents)
+            .field("media", &self.media)
+            .field("security", &self.security)
+            .finish()
+    }
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -516,7 +571,7 @@ impl Default for NodesConfig {
 }
 
 /// A remote node target for core-side node proxy calls.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RemoteNodeConfig {
     /// Stable node ID used by the nodes tool.
     #[serde(alias = "name")]
@@ -540,12 +595,26 @@ pub struct RemoteNodeConfig {
     pub retry_max: Option<u8>,
 }
 
+impl std::fmt::Debug for RemoteNodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteNodeConfig")
+            .field("id", &self.id)
+            .field("endpoint", &self.endpoint)
+            .field("bearer_token", &"[REDACTED]")
+            .field("hmac_secret", &self.hmac_secret.as_ref().map(|_| "[REDACTED]"))
+            .field("enabled", &self.enabled)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("retry_max", &self.retry_max)
+            .finish()
+    }
+}
+
 fn default_nodes_enabled() -> bool {
     true
 }
 
 /// Node daemon runtime config used by `prx-node`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NodeServerConfig {
     /// Listen address for node daemon.
     #[serde(default = "default_node_server_listen_addr", alias = "bind")]
@@ -590,6 +659,26 @@ pub struct NodeServerConfig {
     /// TLS private key path (PEM).
     #[serde(default)]
     pub tls_key: Option<String>,
+}
+
+impl std::fmt::Debug for NodeServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeServerConfig")
+            .field("listen_addr", &self.listen_addr)
+            .field("bearer_token", &"[REDACTED]")
+            .field("hmac_secret", &self.hmac_secret.as_ref().map(|_| "[REDACTED]"))
+            .field("sandbox_root", &self.sandbox_root)
+            .field("exec_timeout_ms", &self.exec_timeout_ms)
+            .field("max_output_bytes", &self.max_output_bytes)
+            .field("max_concurrent_tasks", &self.max_concurrent_tasks)
+            .field("task_result_ttl_ms", &self.task_result_ttl_ms)
+            .field("allowed_commands", &self.allowed_commands)
+            .field("blocked_commands", &self.blocked_commands)
+            .field("tls_required", &self.tls_required)
+            .field("tls_cert", &self.tls_cert)
+            .field("tls_key", &self.tls_key)
+            .finish()
+    }
 }
 
 fn default_node_server_listen_addr() -> String {
@@ -2212,45 +2301,40 @@ pub fn apply_runtime_proxy_to_builder(
     runtime_proxy_config().apply_to_reqwest_builder(builder, service_key)
 }
 
-pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
+pub fn build_runtime_proxy_client(service_key: &str) -> Result<reqwest::Client> {
     let cache_key = runtime_proxy_cache_key(service_key, None, None);
     if let Some(client) = runtime_proxy_cached_client(&cache_key) {
-        return client;
+        return Ok(client);
     }
 
     let builder = apply_runtime_proxy_to_builder(reqwest::Client::builder(), service_key);
-    let client = builder.build().unwrap_or_else(|error| {
-        tracing::warn!(service_key, "Failed to build proxied client: {error}");
-        reqwest::Client::new()
-    });
+    let client = builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("proxy client build failed for {service_key}: {e}"))?;
     set_runtime_proxy_cached_client(cache_key, client.clone());
-    client
+    Ok(client)
 }
 
 pub fn build_runtime_proxy_client_with_timeouts(
     service_key: &str,
     timeout_secs: u64,
     connect_timeout_secs: u64,
-) -> reqwest::Client {
+) -> Result<reqwest::Client> {
     let cache_key =
         runtime_proxy_cache_key(service_key, Some(timeout_secs), Some(connect_timeout_secs));
     if let Some(client) = runtime_proxy_cached_client(&cache_key) {
-        return client;
+        return Ok(client);
     }
 
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
     let builder = apply_runtime_proxy_to_builder(builder, service_key);
-    let client = builder.build().unwrap_or_else(|error| {
-        tracing::warn!(
-            service_key,
-            "Failed to build proxied timeout client: {error}"
-        );
-        reqwest::Client::new()
-    });
+    let client = builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("proxy client build failed for {service_key}: {e}"))?;
     set_runtime_proxy_cached_client(cache_key, client.clone());
-    client
+    Ok(client)
 }
 
 fn parse_proxy_scope(raw: &str) -> Option<ProxyScope> {
@@ -5067,7 +5151,7 @@ impl Config {
         toml::to_string_pretty(&value).context("Failed to serialize config")
     }
 
-    pub(crate) fn to_split_toml_strings(&self) -> Result<(String, Vec<(String, String)>)> {
+    pub fn to_split_toml_strings(&self) -> Result<(String, Vec<(String, String)>)> {
         let value = self.to_stored_toml_value()?;
         let (main_value, fragment_values) = build_split_tables(&value)?;
         let main =
@@ -7835,10 +7919,10 @@ default_model = "legacy-model"
         clear_runtime_proxy_client_cache();
         assert!(!runtime_proxy_cache_contains(&cache_key));
 
-        let _ = build_runtime_proxy_client(&service_key);
+        build_runtime_proxy_client(&service_key).expect("test: proxy client build");
         assert!(runtime_proxy_cache_contains(&cache_key));
 
-        let _ = build_runtime_proxy_client(&service_key);
+        build_runtime_proxy_client(&service_key).expect("test: proxy client build (cached)");
         assert!(runtime_proxy_cache_contains(&cache_key));
     }
 
@@ -7857,7 +7941,8 @@ default_model = "legacy-model"
         let cache_key = runtime_proxy_cache_key(&service_key, Some(30), Some(5));
 
         clear_runtime_proxy_client_cache();
-        let _ = build_runtime_proxy_client_with_timeouts(&service_key, 30, 5);
+        build_runtime_proxy_client_with_timeouts(&service_key, 30, 5)
+            .expect("test: proxy client with timeouts build");
         assert!(runtime_proxy_cache_contains(&cache_key));
 
         set_runtime_proxy_config(ProxyConfig::default());

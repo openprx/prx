@@ -8,11 +8,9 @@ mod types;
 
 pub mod scheduler;
 
-#[allow(unused_imports)]
 pub use schedule::{
     next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
 };
-#[allow(unused_imports)]
 pub use store::{
     add_agent_job, add_job, add_shell_job, claim_job, due_jobs, get_job, list_jobs, list_runs,
     record_last_run, record_run, remove_job, reschedule_after_run, update_job,

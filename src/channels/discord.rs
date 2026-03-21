@@ -37,6 +37,11 @@ impl DiscordChannel {
 
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_runtime_proxy_client("channel.discord")
+            .map_err(|e| {
+                tracing::error!("proxy build failed for channel.discord, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| reqwest::Client::new())
     }
 
     /// Check if a Discord user ID is in the allowlist.

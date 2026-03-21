@@ -49,16 +49,19 @@ struct WasmMiddlewareInner {
 
 impl WasmMiddleware {
     /// Create a new middleware adapter from a compiled WASM component.
+    /// `granted_permissions` must come from `LoadedPlugin.granted_permissions`
+    /// (policy-filtered), NOT directly from the manifest.
     pub async fn new(
         engine: &wasmtime::Engine,
         component: &wasmtime::component::Component,
         manifest: &PluginManifest,
+        granted_permissions: std::collections::HashSet<String>,
         priority: i32,
         event_bus: Option<std::sync::Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginResult<Self> {
         let timeout_ms = manifest.resources.max_execution_time_ms;
 
-        let granted = manifest.permissions.required.iter().cloned().collect();
+        let granted = granted_permissions;
         let optional = manifest.permissions.optional.iter().cloned().collect();
         let mut host_state = HostState::new(
             manifest.plugin.name.clone(),

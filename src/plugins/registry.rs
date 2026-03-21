@@ -44,21 +44,64 @@ pub struct LoadedPlugin {
 }
 
 impl LoadedPlugin {
+    /// Permissions that are safe to auto-grant without user approval.
+    /// Sensitive permissions like network, filesystem, and shell access
+    /// require explicit approval via the plugin trust configuration.
+    const AUTO_GRANT_SAFE: &[&str] = &["log", "storage", "config", "kv"];
+
     /// Create a new loaded plugin entry.
+    ///
+    /// Only safe permissions (log, storage, config, kv) are auto-granted.
+    /// Sensitive permissions (http-outbound, network, filesystem, shell) are
+    /// denied by default and logged as warnings so administrators can review.
     pub fn new(
         manifest: PluginManifest,
         source_dir: std::path::PathBuf,
         component: Option<wasmtime::component::Component>,
     ) -> Self {
-        // TODO(P3): implement interactive approval flow for plugin permissions.
-        // Currently all required permissions are auto-granted, which means a
-        // malicious plugin manifest can claim any permission without user consent.
-        let granted = manifest.permissions.required.clone();
-        if !granted.is_empty() {
+        let mut granted = Vec::new();
+        let mut denied = Vec::new();
+
+        for perm in &manifest.permissions.required {
+            if Self::AUTO_GRANT_SAFE.contains(&perm.as_str()) {
+                granted.push(perm.clone());
+            } else {
+                denied.push(perm.clone());
+            }
+        }
+
+        if !denied.is_empty() {
             tracing::warn!(
                 plugin = %manifest.plugin.name,
+                denied_permissions = ?denied,
+                granted_permissions = ?granted,
+                "plugin requests sensitive permissions that are not auto-granted; \
+                 add to trusted_plugins config to approve"
+            );
+        }
+
+        Self {
+            manifest,
+            status: PluginStatus::Active,
+            source_dir,
+            component,
+            granted_permissions: granted,
+        }
+    }
+
+    /// Create a loaded plugin with explicit trust -- all requested permissions
+    /// are granted. Use only for plugins listed in the trusted_plugins config.
+    pub fn new_trusted(
+        manifest: PluginManifest,
+        source_dir: std::path::PathBuf,
+        component: Option<wasmtime::component::Component>,
+    ) -> Self {
+        let granted = manifest.permissions.required.clone();
+        if !granted.is_empty() {
+            tracing::info!(
+                plugin = %manifest.plugin.name,
                 permissions = ?granted,
-                "auto-granting all required plugin permissions (approval flow not yet implemented)"
+                "granting all permissions to trusted plugin"
             );
         }
         Self {
@@ -167,6 +210,15 @@ impl PluginRegistry {
     pub async fn get_component(&self, name: &str) -> Option<wasmtime::component::Component> {
         let plugins = self.plugins.read().await;
         plugins.get(name).and_then(|p| p.component.clone())
+    }
+
+    /// Get the granted (policy-filtered) permissions for a plugin.
+    ///
+    /// These are the permissions that passed through `LoadedPlugin::new()`
+    /// security filtering, NOT the raw manifest permissions.
+    pub async fn get_granted_permissions(&self, name: &str) -> Option<Vec<String>> {
+        let plugins = self.plugins.read().await;
+        plugins.get(name).map(|p| p.granted_permissions.clone())
     }
 
     /// Get the number of loaded plugins.

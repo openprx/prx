@@ -119,18 +119,49 @@ impl Tool for ImageTool {
             });
         }
 
-        // Security check for local paths (skip for HTTP(S) URLs)
+        // Security check for local paths (skip for HTTP(S) URLs and data URIs)
         for ref_str in &image_refs {
-            if !ref_str.starts_with("http://") && !ref_str.starts_with("https://") {
-                if !self.security.is_path_allowed(ref_str) {
+            if ref_str.starts_with("http://")
+                || ref_str.starts_with("https://")
+                || ref_str.starts_with("data:")
+            {
+                continue;
+            }
+
+            if !self.security.is_path_allowed(ref_str) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Path not allowed: {ref_str} (must be within workspace)"
+                    )),
+                });
+            }
+
+            // Canonicalize to block symlink escapes outside workspace
+            let full_path = self.security.workspace_dir.join(ref_str);
+            let resolved = match tokio::fs::canonicalize(&full_path).await {
+                Ok(p) => p,
+                Err(e) => {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!(
-                            "Path not allowed: {ref_str} (must be within workspace)"
+                            "Failed to resolve image path: {ref_str} ({e})"
                         )),
                     });
                 }
+            };
+
+            if !self.security.is_resolved_path_allowed(&resolved) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Resolved path escapes workspace: {}",
+                        resolved.display()
+                    )),
+                });
             }
         }
 

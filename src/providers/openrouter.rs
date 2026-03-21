@@ -222,6 +222,11 @@ impl OpenRouterProvider {
 
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.openrouter", 120, 10)
+            .map_err(|e| {
+                tracing::error!("proxy build failed for provider.openrouter, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| Client::new())
     }
 }
 

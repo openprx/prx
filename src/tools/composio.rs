@@ -55,6 +55,11 @@ impl ComposioTool {
 
     fn client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("tool.composio", 60, 10)
+            .map_err(|e| {
+                tracing::error!("proxy build failed for tool.composio, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| Client::new())
     }
 
     /// List available Composio apps/actions for the authenticated user.

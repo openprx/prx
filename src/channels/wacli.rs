@@ -69,8 +69,8 @@ struct RpcError {
 /// A server-initiated notification pushed by the wacli daemon.
 #[derive(Debug, Deserialize)]
 struct RpcNotification {
-    #[serde(default)]
-    method: String,
+    #[serde(default, rename = "method")]
+    _method: String,
     params: Option<Value>,
 }
 
@@ -698,7 +698,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         let notif = RpcNotification {
-            method: "event".into(),
+            _method: "event".into(),
             params: Some(serde_json::json!({
                 "type": "message.received",
                 "payload": {
@@ -728,7 +728,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         let notif = RpcNotification {
-            method: "event".into(),
+            _method: "event".into(),
             params: Some(serde_json::json!({
                 "type": "message.received",
                 "payload": {
@@ -750,7 +750,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         let notif = RpcNotification {
-            method: "event".into(),
+            _method: "event".into(),
             params: Some(serde_json::json!({
                 "type": "presence.update",
                 "payload": {}
@@ -767,7 +767,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         let notif = RpcNotification {
-            method: "event".into(),
+            _method: "event".into(),
             params: Some(serde_json::json!({
                 "type": "message.received",
                 "payload": {
@@ -793,7 +793,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         let notif = RpcNotification {
-            method: "event".into(),
+            _method: "event".into(),
             params: Some(serde_json::json!({
                 "type": "message.received",
                 "payload": {
@@ -818,7 +818,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         let notif = RpcNotification {
-            method: "event".into(),
+            _method: "event".into(),
             params: Some(serde_json::json!({
                 "type": "message.received",
                 "payload": {
@@ -846,7 +846,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         let notif = RpcNotification {
-            method: "event".into(),
+            _method: "event".into(),
             params: Some(serde_json::json!({
                 "type": "message.received",
                 "payload": {
@@ -877,7 +877,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         let notif = RpcNotification {
-            method: "event".into(),
+            _method: "event".into(),
             params: Some(serde_json::json!({
                 "type": "message.received",
                 "payload": {
@@ -903,7 +903,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
 
         let notif = RpcNotification {
-            method: "event".into(),
+            _method: "event".into(),
             params: None,
         };
 
