@@ -279,6 +279,7 @@ fn hex_encode(data: &[u8]) -> String {
 
 /// Build the `/grant` argument for `icacls` using a normalized username.
 /// Returns `None` when the username is empty or whitespace-only.
+#[cfg(any(windows, test))]
 fn build_windows_icacls_grant_arg(username: &str) -> Option<String> {
     let normalized = username.trim();
     if normalized.is_empty() {

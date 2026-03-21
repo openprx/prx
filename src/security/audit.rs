@@ -149,7 +149,7 @@ impl AuditEvent {
 pub struct AuditLogger {
     log_path: PathBuf,
     config: AuditConfig,
-    buffer: Mutex<Vec<AuditEvent>>,
+    _buffer: Mutex<Vec<AuditEvent>>,
 }
 
 /// Structured command execution details for audit logging.
@@ -192,7 +192,7 @@ impl AuditLogger {
         Ok(Self {
             log_path,
             config,
-            buffer: Mutex::new(Vec::new()),
+            _buffer: Mutex::new(Vec::new()),
         })
     }
 

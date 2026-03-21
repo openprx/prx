@@ -74,35 +74,34 @@
     clippy::unused_self,
     clippy::cast_precision_loss,
     clippy::unnecessary_wraps,
-    clippy::assertions_on_constants,
-    dead_code
+    clippy::assertions_on_constants
 )]
 
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
 pub mod agent;
-pub(crate) mod approval;
-pub(crate) mod auth;
+pub mod approval;
+pub mod auth;
 pub mod channels;
 pub mod config;
-pub(crate) mod cost;
-pub(crate) mod cron;
-pub(crate) mod daemon;
-pub(crate) mod doctor;
+pub mod cost;
+pub mod cron;
+pub mod daemon;
+pub mod doctor;
 pub mod gateway;
-pub(crate) mod health;
-pub(crate) mod heartbeat;
-pub(crate) mod hooks;
-pub(crate) mod identity;
-pub(crate) mod integrations;
+pub mod health;
+pub mod heartbeat;
+pub mod hooks;
+pub mod identity;
+pub mod integrations;
 pub mod media;
 pub mod memory;
-pub(crate) mod migration;
-pub(crate) mod multimodal;
+pub mod migration;
+pub mod multimodal;
 pub mod nodes;
 pub mod observability;
-pub(crate) mod onboard;
+pub mod onboard;
 #[cfg(feature = "wasm-plugins")]
 pub mod plugins;
 pub mod providers;
@@ -112,15 +111,15 @@ pub mod router;
 pub mod runtime;
 pub mod security;
 pub mod self_system;
-pub(crate) mod service;
+pub mod service;
 pub mod session_worker;
-pub(crate) mod skillforge;
-pub(crate) mod skills;
+pub mod skillforge;
+pub mod skills;
 pub mod tools;
-pub(crate) mod tunnel;
-pub(crate) mod util;
+pub mod tunnel;
+pub mod util;
 pub mod webhook;
-pub(crate) mod xin;
+pub mod xin;
 
 pub use config::Config;
 
@@ -134,7 +133,7 @@ pub use hooks::HookManager;
 
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum ServiceCommands {
+pub enum ServiceCommands {
     /// Install daemon service unit for auto-start and restart
     Install,
     /// Start daemon service
@@ -151,7 +150,7 @@ pub(crate) enum ServiceCommands {
 
 /// Channel management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum ChannelCommands {
+pub enum ChannelCommands {
     /// List all configured channels
     List,
     /// Start all configured channels (handled in main.rs for async)
@@ -200,7 +199,7 @@ Examples:
 
 /// Skills management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum SkillCommands {
+pub enum SkillCommands {
     /// List all installed skills
     List,
     /// Install a new skill from a git URL (HTTPS/SSH) or local path
@@ -217,7 +216,7 @@ pub(crate) enum SkillCommands {
 
 /// Migration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum MigrateCommands {
+pub enum MigrateCommands {
     /// Import memory from an `OpenClaw` workspace into this `OpenPRX` workspace
     Openclaw {
         /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
@@ -232,7 +231,7 @@ pub(crate) enum MigrateCommands {
 
 /// Cron subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum CronCommands {
+pub enum CronCommands {
     /// List all scheduled tasks
     List,
     /// Add a new scheduled task
@@ -347,7 +346,7 @@ Examples:
 
 /// Integration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum IntegrationCommands {
+pub enum IntegrationCommands {
     /// Show details about a specific integration
     Info {
         /// Integration name

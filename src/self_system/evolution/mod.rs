@@ -26,6 +26,7 @@ pub use analyzer::{
     MetricShift, NoiseMemoryPattern, TaskTypeDigest, TaskTypeWeakness, TrendAnalysis,
     UserCorrectionCluster,
 };
+#[allow(unused_imports)]
 pub use config::{
     DataThresholds, EvolutionConfig, EvolutionGateConfig, EvolutionMode, EvolutionRetentionConfig,
     EvolutionRuntimeConfig, EvolutionRuntimeConfigManager, MemoryEvolutionConfig,
@@ -40,6 +41,7 @@ pub use cycle_types::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
     EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
+#[allow(unused_imports)]
 pub use engine::{CycleResult, EngineCycleInput, EvolutionEngine, run_engine_cycle};
 #[allow(unused_imports)]
 pub use gate::{EvolutionGate, GateMetrics, GateRejection, GateResult};
@@ -63,16 +65,21 @@ pub use memory_safety::{
 };
 #[allow(unused_imports)]
 pub use pipeline::{EvolutionPipeline, EvolutionTrigger, PipelineRunReport};
+#[allow(unused_imports)]
 pub use prompt_evolution::{PromptEvolutionEngine, PromptMutationType};
+#[allow(unused_imports)]
 pub use record::{
     Actor, AnnotationSource, ChangeType, DataBasis, DecisionLog, DecisionType, EvolutionLayer,
     EvolutionLog, EvolutionResult, MemoryAccessLog, MemoryAction, Outcome, TaskType,
 };
+#[allow(unused_imports)]
 pub use rollback::{CircuitBreaker, CircuitBreakerState, RollbackManager, VersionSnapshot};
 #[allow(unused_imports)]
 pub use scheduler::{EvolutionScheduler, SchedulerRunSummary, SchedulerState};
 pub use storage::{AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths};
+#[allow(unused_imports)]
 pub use strategy_evolution::{StrategyEvolutionEngine, TaskDailySummary};
+#[allow(unused_imports)]
 pub use trace::{
     TraceContext, current_trace, generate_experiment_id, generate_trace_id, with_trace,
 };

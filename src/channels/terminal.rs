@@ -131,7 +131,6 @@ enum UiEvent {
     TypingStop,
 
     // === Control events (highest priority) ===
-    Resize(u16, u16),
     Shutdown,
 }
 
@@ -164,15 +163,12 @@ struct UiActor {
     last_repaint: Instant,
     /// Repaint interval in milliseconds (~30fps)
     repaint_interval_ms: u64,
-    /// Terminal width for formatting
-    term_width: u16,
     /// Plain text mode (no ANSI escapes)
     plain_mode: bool,
 }
 
 impl UiActor {
     fn new(event_rx: mpsc::Receiver<UiEvent>, plain_mode: bool) -> Self {
-        let (cols, _) = terminal::size().unwrap_or((80, 24));
         Self {
             state: UiState::Idle,
             event_rx,
@@ -181,7 +177,6 @@ impl UiActor {
             last_seq: 0,
             last_repaint: Instant::now(),
             repaint_interval_ms: 33,
-            term_width: cols,
             plain_mode,
         }
     }
@@ -383,10 +378,6 @@ impl UiActor {
                     terminal::Clear(terminal::ClearType::CurrentLine)
                 );
                 let _ = io::stdout().flush();
-            }
-
-            UiEvent::Resize(cols, _rows) => {
-                self.term_width = cols;
             }
 
             UiEvent::Shutdown => {

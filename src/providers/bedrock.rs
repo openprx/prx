@@ -325,6 +325,8 @@ struct ConverseOutputMessage {
 enum ResponseContentBlock {
     ToolUse(ResponseToolUseWrapper),
     Text(TextBlock),
+    // Serde catch-all: the inner Value is required for deserialization but never read.
+    #[allow(dead_code)]
     Other(serde_json::Value),
 }
 
@@ -349,6 +351,11 @@ impl BedrockProvider {
 
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.bedrock", 120, 10)
+            .map_err(|e| {
+                tracing::error!("proxy build failed for provider.bedrock, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| Client::new())
     }
 
     /// Percent-encode the model ID for URL path: only encode `:` to `%3A`.
@@ -558,7 +565,9 @@ impl BedrockProvider {
                                 });
                             }
                         }
-                        ResponseContentBlock::Other(_) => {}
+                        ResponseContentBlock::Other(_) => {
+                            // Serde catch-all: unknown block types are deserialized but discarded.
+                        }
                     }
                 }
             }

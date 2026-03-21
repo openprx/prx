@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use toml::{Value, map::Map};
 
-pub(crate) const SPLIT_FILE_LAYOUT: &[(&str, &[&str])] = &[
+pub const SPLIT_FILE_LAYOUT: &[(&str, &[&str])] = &[
     ("channels.toml", &["channels_config"]),
     ("memory.toml", &["memory", "storage"]),
     ("security.toml", &["security", "autonomy"]),
@@ -17,23 +17,23 @@ pub(crate) const SPLIT_FILE_LAYOUT: &[(&str, &[&str])] = &[
     ("scheduler.toml", &["scheduler", "cron", "heartbeat"]),
 ];
 
-pub(crate) fn config_dir_path(config_path: &Path) -> PathBuf {
+pub fn config_dir_path(config_path: &Path) -> PathBuf {
     config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("config.d")
 }
 
-pub(crate) fn is_relevant_config_path(config_path: &Path, candidate: &Path) -> bool {
+pub fn is_relevant_config_path(config_path: &Path, candidate: &Path) -> bool {
     let config_dir = config_dir_path(config_path);
     candidate == config_path || candidate == config_dir || candidate.starts_with(&config_dir)
 }
 
-pub(crate) fn managed_fragment_names() -> Vec<&'static str> {
+pub fn managed_fragment_names() -> Vec<&'static str> {
     SPLIT_FILE_LAYOUT.iter().map(|(name, _)| *name).collect()
 }
 
-pub(crate) fn list_config_fragment_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
+pub fn list_config_fragment_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
     let config_dir = config_dir_path(config_path);
     if !config_dir.exists() {
         return Ok(Vec::new());
@@ -80,7 +80,7 @@ pub(crate) fn list_config_fragment_paths(config_path: &Path) -> Result<Vec<PathB
     Ok(fragments)
 }
 
-pub(crate) fn list_unmanaged_fragment_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
+pub fn list_unmanaged_fragment_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
     let managed_names = managed_fragment_names();
     let mut unmanaged = Vec::new();
     for path in list_config_fragment_paths(config_path)? {
@@ -95,7 +95,7 @@ pub(crate) fn list_unmanaged_fragment_paths(config_path: &Path) -> Result<Vec<Pa
     Ok(unmanaged)
 }
 
-pub(crate) fn read_merged_toml(config_path: &Path) -> Result<Value> {
+pub fn read_merged_toml(config_path: &Path) -> Result<Value> {
     let mut merged = read_toml_file(config_path)?;
     for fragment in list_config_fragment_paths(config_path)? {
         let value = read_toml_file(&fragment)?;
@@ -112,7 +112,7 @@ pub(crate) fn read_merged_toml(config_path: &Path) -> Result<Value> {
     Ok(merged)
 }
 
-pub(crate) fn compute_config_fingerprint(config_path: &Path) -> Result<Vec<u8>> {
+pub fn compute_config_fingerprint(config_path: &Path) -> Result<Vec<u8>> {
     let mut hasher = Sha256::new();
     for path in config_layer_paths(config_path)? {
         hasher.update(path.to_string_lossy().as_bytes());
@@ -124,7 +124,7 @@ pub(crate) fn compute_config_fingerprint(config_path: &Path) -> Result<Vec<u8>> 
     Ok(hasher.finalize().to_vec())
 }
 
-pub(crate) fn build_split_tables(root: &Value) -> Result<(Value, Vec<(String, Value)>)> {
+pub fn build_split_tables(root: &Value) -> Result<(Value, Vec<(String, Value)>)> {
     let table = root
         .as_table()
         .context("Config split expects a TOML table at the root")?;
@@ -147,11 +147,7 @@ pub(crate) fn build_split_tables(root: &Value) -> Result<(Value, Vec<(String, Va
     Ok((Value::Table(main_table), split_tables))
 }
 
-pub(crate) fn render_toml(value: &Value) -> Result<String> {
-    toml::to_string_pretty(value).context("Failed to serialize TOML")
-}
-
-pub(crate) async fn write_split_config(
+pub async fn write_split_config(
     config: &crate::config::schema::Config,
     dry_run: bool,
 ) -> Result<String> {
@@ -181,7 +177,7 @@ pub(crate) async fn write_split_config(
     Ok(preview)
 }
 
-pub(crate) async fn merge_split_config(config: &crate::config::schema::Config) -> Result<()> {
+pub async fn merge_split_config(config: &crate::config::schema::Config) -> Result<()> {
     let unmanaged = list_unmanaged_fragment_paths(&config.config_path)?;
     if !unmanaged.is_empty() {
         let names = unmanaged
@@ -215,7 +211,7 @@ pub(crate) async fn merge_split_config(config: &crate::config::schema::Config) -
     Ok(())
 }
 
-pub(crate) fn deep_merge_toml(target: &mut Value, overlay: Value) {
+pub fn deep_merge_toml(target: &mut Value, overlay: Value) {
     match (target, overlay) {
         (Value::Table(target_map), Value::Table(source_map)) => {
             for (key, source_value) in source_map {

@@ -869,11 +869,11 @@ async fn main() -> Result<()> {
             bail!("--channels-only does not accept --api-key, --provider, --model, or --memory");
         }
         let config = if channels_only {
-            onboard::run_channels_repair_wizard().await
+            onboard::wizard::run_channels_repair_wizard().await
         } else if interactive {
-            onboard::run_wizard().await
+            onboard::wizard::run_wizard().await
         } else {
-            onboard::run_quick_setup(
+            onboard::wizard::run_quick_setup(
                 api_key.as_deref(),
                 provider.as_deref(),
                 model.as_deref(),

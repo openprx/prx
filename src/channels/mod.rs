@@ -106,9 +106,6 @@ const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
 const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
-/// Default timeout for processing a single channel message (LLM + tools).
-/// Used as fallback when not configured in channels_config.message_timeout_secs.
-const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 /// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
@@ -3245,7 +3242,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     Ok(false)
 }
 
-pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
+pub async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
         crate::ChannelCommands::Start => {
             anyhow::bail!("Start must be handled in main.rs (requires async runtime)")
@@ -4383,6 +4380,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
     use tempfile::TempDir;
 
     fn make_workspace() -> TempDir {

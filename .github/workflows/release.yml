@@ -45,10 +45,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.use_cross }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -85,7 +85,7 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install protoc --yes
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           key: ${{ matrix.target }}-ci
 
@@ -122,7 +122,7 @@ jobs:
           Get-FileHash prx-node-${{ matrix.suffix }}.zip -Algorithm SHA256 | Format-List Hash | Out-File prx-node-${{ matrix.suffix }}.zip.sha256
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: prx-${{ matrix.suffix }}
           path: |
@@ -135,8 +135,8 @@ jobs:
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
         with:
           path: artifacts
           merge-multiple: true
@@ -149,7 +149,7 @@ jobs:
             echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
       - name: Create or Update Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: PRX ${{ steps.tag.outputs.tag }}

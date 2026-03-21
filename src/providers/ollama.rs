@@ -125,6 +125,11 @@ impl OllamaProvider {
 
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.ollama", 300, 10)
+            .map_err(|e| {
+                tracing::error!("proxy build failed for provider.ollama, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| Client::new())
     }
 
     fn resolve_request_details(&self, model: &str) -> anyhow::Result<(String, bool)> {

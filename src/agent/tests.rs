@@ -62,9 +62,6 @@ impl ScriptedProvider {
         }
     }
 
-    fn request_count(&self) -> usize {
-        self.requests.lock().unwrap().len()
-    }
 }
 
 #[async_trait]

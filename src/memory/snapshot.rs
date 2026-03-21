@@ -28,6 +28,8 @@ const SNAPSHOT_HEADER: &str = "# 🧠 OpenPRX Memory Snapshot\n\n\
 /// Returns the number of entries exported.
 pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let db_path = workspace_dir.join("memory").join("brain.db");
+    // NOTE: TOCTOU safe — read-only probe. If the DB disappears between
+    // this check and `Connection::open`, rusqlite will return an error.
     if !db_path.exists() {
         tracing::debug!("snapshot export skipped: brain.db does not exist");
         return Ok(0);
@@ -296,6 +298,11 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
 /// Returns `true` if:
 /// 1. `brain.db` does NOT exist (or is empty)
 /// 2. `MEMORY_SNAPSHOT.md` DOES exist
+///
+/// NOTE: All `.exists()` checks in this function are TOCTOU safe — they are
+/// read-only probes to decide whether to hydrate. If a file appears/disappears
+/// between the check and a subsequent open, the hydration path will either
+/// proceed with an I/O error (propagated) or skip gracefully.
 pub fn should_hydrate(workspace_dir: &Path) -> bool {
     let db_path = workspace_dir.join("memory").join("brain.db");
     let snapshot = snapshot_path(workspace_dir);
@@ -388,6 +395,7 @@ fn parse_memory_markdown_entries(path_label: &str, input: &str) -> Vec<(String, 
         .collect()
 }
 
+/// NOTE: TOCTOU safe — read-only existence probes; no security decisions.
 fn has_markdown_memory_files(workspace_dir: &Path) -> bool {
     let memory_md = workspace_dir.join("MEMORY.md");
     if memory_md.exists() && memory_md.is_file() {
@@ -408,6 +416,9 @@ fn has_markdown_memory_files(workspace_dir: &Path) -> bool {
     }
 }
 
+/// NOTE: All `.exists()` checks below are TOCTOU safe — read-only probes for
+/// data files. If a file disappears between check and read, `fs::read_to_string`
+/// returns an error that is propagated via `?`.
 fn collect_hydration_entries(workspace_dir: &Path) -> Result<Vec<(String, String, String)>> {
     let mut hydrated: Vec<(String, String, String)> = Vec::new();
     let mut seen_keys = HashSet::new();

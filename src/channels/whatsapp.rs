@@ -46,6 +46,11 @@ impl WhatsAppChannel {
 
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_runtime_proxy_client("channel.whatsapp")
+            .map_err(|e| {
+                tracing::error!("proxy build failed for channel.whatsapp, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| reqwest::Client::new())
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)

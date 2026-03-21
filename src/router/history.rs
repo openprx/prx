@@ -11,6 +11,7 @@ use crate::memory::embeddings::EmbeddingProvider;
 use super::knn::{KnnStore, MIN_RECORDS_FOR_KNN, QueryRecord, weighted_model_score};
 
 const DEFAULT_KNN_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(test)]
 const DEFAULT_KNN_K: usize = 7;
 
 pub struct RouterHistory {
@@ -67,11 +68,6 @@ impl RouterHistory {
             .get(model_id)
             .copied()
             .unwrap_or(0.0)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn store(&self) -> &KnnStore {
-        &self.store
     }
 
     pub async fn similarity_scores(&self, message: &str) -> HashMap<String, f32> {

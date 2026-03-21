@@ -90,6 +90,7 @@ impl HttpRequestTool {
         result
     }
 
+    #[cfg(test)]
     fn redact_headers_for_display(headers: &[(String, String)]) -> Vec<(String, String)> {
         headers
             .iter()
@@ -334,7 +335,7 @@ fn normalize_domain(raw: &str) -> Option<String> {
     Some(d)
 }
 
-fn extract_host(url: &str) -> anyhow::Result<String> {
+pub(crate) fn extract_host(url: &str) -> anyhow::Result<String> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
@@ -381,7 +382,7 @@ fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
     })
 }
 
-fn is_private_or_local_host(host: &str) -> bool {
+pub(crate) fn is_private_or_local_host(host: &str) -> bool {
     // Strip brackets from IPv6 addresses like [::1]
     let bare = host
         .strip_prefix('[')

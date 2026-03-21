@@ -938,6 +938,11 @@ fn resolve_existing_sandbox_path(sandbox_root: &Path, requested_path: &str) -> R
 fn resolve_write_sandbox_path(sandbox_root: &Path, requested_path: &str) -> Result<PathBuf> {
     let normalized = resolve_requested_path(sandbox_root, requested_path)?;
 
+    // NOTE: TOCTOU acknowledged — `.exists()` only selects the code path
+    // (canonicalize the file itself vs. canonicalize the nearest existing ancestor).
+    // Both branches perform canonicalize + sandbox-root containment checks, so a
+    // symlink race between the exists() probe and canonicalize() cannot escape the
+    // sandbox.
     if normalized.exists() {
         let canonical = canonicalize_existing_path(&normalized)?;
         ensure_within_sandbox_root(sandbox_root, &canonical)?;
@@ -954,6 +959,10 @@ fn resolve_write_sandbox_path(sandbox_root: &Path, requested_path: &str) -> Resu
 
 fn canonicalize_existing_ancestor(path: &Path) -> Result<PathBuf> {
     for ancestor in path.ancestors() {
+        // NOTE: TOCTOU safe — the caller (`resolve_write_sandbox_path`) always
+        // re-validates the canonicalized result against the sandbox root, so a
+        // directory appearing/disappearing between this probe and canonicalize()
+        // either succeeds safely or returns an I/O error.
         if ancestor.exists() {
             return canonicalize_existing_path(ancestor);
         }

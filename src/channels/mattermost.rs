@@ -43,6 +43,11 @@ impl MattermostChannel {
 
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_runtime_proxy_client("channel.mattermost")
+            .map_err(|e| {
+                tracing::error!("proxy build failed for channel.mattermost, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| reqwest::Client::new())
     }
 
     /// Check if a user ID is in the allowlist.
@@ -329,6 +334,7 @@ impl MattermostChannel {
     }
 }
 
+#[cfg(test)]
 /// Check whether a Mattermost post contains an @-mention of the bot.
 ///
 /// Checks two sources:

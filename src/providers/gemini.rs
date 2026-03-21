@@ -304,6 +304,11 @@ impl GeminiProvider {
 
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.gemini", 120, 10)
+            .map_err(|e| {
+                tracing::error!("proxy build failed for provider.gemini, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| Client::new())
     }
 
     fn build_generate_content_request(

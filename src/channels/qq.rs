@@ -48,6 +48,11 @@ impl QQChannel {
 
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_runtime_proxy_client("channel.qq")
+            .map_err(|e| {
+                tracing::error!("proxy build failed for channel.qq, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| reqwest::Client::new())
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {

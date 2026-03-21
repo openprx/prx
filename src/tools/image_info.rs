@@ -3,7 +3,6 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
-use std::path::Path;
 use std::sync::Arc;
 
 /// Maximum file size we will read and base64-encode (5 MB).
@@ -156,8 +155,6 @@ impl Tool for ImageInfoTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let path = Path::new(path_str);
-
         // Restrict reads to workspace directory to prevent arbitrary file exfiltration
         if !self.security.is_path_allowed(path_str) {
             return Ok(ToolResult {
@@ -169,15 +166,32 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        if !path.exists() {
+        // Resolve the path within the workspace and canonicalize to block symlink escapes
+        let full_path = self.security.workspace_dir.join(path_str);
+
+        let resolved_path = match tokio::fs::canonicalize(&full_path).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("File not found: {path_str} ({e})")),
+                });
+            }
+        };
+
+        if !self.security.is_resolved_path_allowed(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("File not found: {path_str}")),
+                error: Some(format!(
+                    "Resolved path escapes workspace: {}",
+                    resolved_path.display()
+                )),
             });
         }
 
-        let metadata = tokio::fs::metadata(path)
+        let metadata = tokio::fs::metadata(&resolved_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read file metadata: {e}"))?;
 
@@ -193,7 +207,7 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let bytes = tokio::fs::read(path)
+        let bytes = tokio::fs::read(&resolved_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read image file: {e}"))?;
 

@@ -487,9 +487,7 @@ mod tests {
 
     enum MockReceiveBehavior {
         Message(String),
-        Delay(u64),
         Closed,
-        Error(String),
     }
 
     #[derive(Clone, Default)]
@@ -545,17 +543,9 @@ mod tests {
         async fn recv_text(&mut self) -> Result<Option<String>, String> {
             match self.receive_plan.pop_front() {
                 Some(MockReceiveBehavior::Message(message)) => Ok(Some(message)),
-                Some(MockReceiveBehavior::Delay(delay_ms)) => {
-                    sleep(Duration::from_millis(delay_ms)).await;
-                    Ok(Some("delayed-message".to_string()))
-                }
                 Some(MockReceiveBehavior::Closed) | None => {
                     self.is_closed = true;
                     Ok(None)
-                }
-                Some(MockReceiveBehavior::Error(error)) => {
-                    self.is_closed = true;
-                    Err(error)
                 }
             }
         }

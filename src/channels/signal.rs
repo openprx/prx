@@ -141,12 +141,9 @@ async fn extract_document_text(path: &str, content_type: &str, filename: &str) -
         || content_type.contains("spreadsheet")
         || content_type.contains("ms-excel")
     {
-        let script = format!(
-            "import openpyxl; wb=openpyxl.load_workbook('{}', read_only=True, data_only=True); \
-            [print('\\n=== ' + ws.title + ' ===\\n' + '\\n'.join('\\t'.join(str(c.value or '') for c in row) for row in ws.iter_rows())) for ws in wb.worksheets]",
-            path.replace('\'', "\\'")
-        );
-        if let Some(t) = run_command("python3", &["-c", &script]).await {
+        let script = "import sys; import openpyxl; wb=openpyxl.load_workbook(sys.argv[1], read_only=True, data_only=True); \
+            [print('\\n=== ' + ws.title + ' ===\\n' + '\\n'.join('\\t'.join(str(c.value or '') for c in row) for row in ws.iter_rows())) for ws in wb.worksheets]";
+        if let Some(t) = run_command("python3", &["-c", script, path]).await {
             return Some(t);
         }
         return run_command("xlsx2csv", &[path]).await;
@@ -154,12 +151,9 @@ async fn extract_document_text(path: &str, content_type: &str, filename: &str) -
 
     // DOCX → python-docx or pandoc
     if ext == "docx" || content_type.contains("wordprocessingml") {
-        let script = format!(
-            "from docx import Document; d=Document('{}'); \
-            print('\\n'.join(p.text for p in d.paragraphs if p.text.strip()))",
-            path.replace('\'', "\\'")
-        );
-        if let Some(t) = run_command("python3", &["-c", &script]).await {
+        let script = "import sys; from docx import Document; d=Document(sys.argv[1]); \
+            print('\\n'.join(p.text for p in d.paragraphs if p.text.strip()))";
+        if let Some(t) = run_command("python3", &["-c", script, path]).await {
             return Some(t);
         }
         return run_command("pandoc", &["-t", "plain", path]).await;
@@ -167,12 +161,9 @@ async fn extract_document_text(path: &str, content_type: &str, filename: &str) -
 
     // PPTX → python-pptx or pandoc
     if ext == "pptx" || content_type.contains("presentationml") {
-        let script = format!(
-            "from pptx import Presentation; prs=Presentation('{}'); \
-            [print(shape.text) for slide in prs.slides for shape in slide.shapes if hasattr(shape, 'text') and shape.text.strip()]",
-            path.replace('\'', "\\'")
-        );
-        if let Some(t) = run_command("python3", &["-c", &script]).await {
+        let script = "import sys; from pptx import Presentation; prs=Presentation(sys.argv[1]); \
+            [print(shape.text) for slide in prs.slides for shape in slide.shapes if hasattr(shape, 'text') and shape.text.strip()]";
+        if let Some(t) = run_command("python3", &["-c", script, path]).await {
             return Some(t);
         }
         return run_command("pandoc", &["-t", "plain", path]).await;
@@ -567,7 +558,10 @@ impl SignalChannel {
     fn http_client(&self) -> Client {
         let builder = Client::builder().connect_timeout(Duration::from_secs(10));
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "channel.signal");
-        builder.build().unwrap_or_else(|_| Client::new())
+        builder.build().map_err(|e| {
+            tracing::error!("proxy build failed for channel.signal, using direct: {e}");
+            e
+        }).unwrap_or_else(|_| Client::new())
     }
 
     /// Effective sender: prefer `sourceNumber` (E.164), fall back to `source`.

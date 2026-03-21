@@ -362,6 +362,11 @@ impl TelegramChannel {
 
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_runtime_proxy_client("channel.telegram")
+            .map_err(|e| {
+                tracing::error!("proxy build failed for channel.telegram, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| reqwest::Client::new())
     }
 
     fn normalize_identity(value: &str) -> String {

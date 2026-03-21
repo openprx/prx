@@ -102,7 +102,6 @@ pub fn run(config: &Config) -> Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelProbeOutcome {
-    Ok,
     Skipped,
     AuthOrAccess,
     Error,
@@ -197,9 +196,6 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
                     ModelProbeOutcome::Error => {
                         error_count += 1;
                         println!("    ❌ error: {}", truncate_for_display(&error_text, 160));
-                    }
-                    ModelProbeOutcome::Ok => {
-                        ok_count += 1;
                     }
                 }
             }

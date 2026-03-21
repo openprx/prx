@@ -30,9 +30,17 @@ pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Resu
         .replace('\n', " ")
         .replace('\r', "");
 
+    // Sanitise voice the same way — it is user-controlled in TtsTool and must
+    // not be able to break out of the JS single-quoted string literal.
+    let safe_voice = voice
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', " ")
+        .replace('\r', "");
+
     // 1. Generate MP3 with node-edge-tts
     let tts_script = format!(
-        r#"const{{EdgeTTS}}=require('node-edge-tts');new EdgeTTS().ttsPromise('{safe_text}','{mp3_path}',{{voice:'{voice}'}}).then(()=>console.log('ok')).catch(e=>{{console.error(String(e));process.exit(1)}})"#
+        r#"const{{EdgeTTS}}=require('node-edge-tts');new EdgeTTS().ttsPromise('{safe_text}','{mp3_path}',{{voice:'{safe_voice}'}}).then(()=>console.log('ok')).catch(e=>{{console.error(String(e));process.exit(1)}})"#
     );
 
     // Resolve the global node_modules path so `require('node-edge-tts')` works.

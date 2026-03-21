@@ -181,16 +181,16 @@ impl OpenAiCompatibleProvider {
 
             let builder = self.http_client_builder().default_headers(headers);
 
-            return builder.build().unwrap_or_else(|error| {
-                tracing::warn!("Failed to build proxied timeout client with user-agent: {error}");
-                Client::new()
-            });
+            return builder.build().map_err(|error| {
+                tracing::error!("proxy build failed for provider.compatible (user-agent), using direct: {error}");
+                error
+            }).unwrap_or_else(|_| Client::new());
         }
 
-        self.http_client_builder().build().unwrap_or_else(|error| {
-            tracing::warn!("Failed to build proxied timeout client: {error}");
-            Client::new()
-        })
+        self.http_client_builder().build().map_err(|error| {
+            tracing::error!("proxy build failed for provider.compatible, using direct: {error}");
+            error
+        }).unwrap_or_else(|_| Client::new())
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
@@ -255,6 +255,7 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    #[cfg(test)]
     fn tool_specs_to_openai_format(tools: &[crate::tools::ToolSpec]) -> Vec<serde_json::Value> {
         tools
             .iter()
@@ -483,7 +484,8 @@ struct StreamChunkResponse {
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
     delta: StreamDelta,
-    finish_reason: Option<String>,
+    #[serde(rename = "finish_reason")]
+    _finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
