@@ -250,3 +250,42 @@ panic = "abort"
 tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+undocumented_unsafe_blocks = "deny"
+
+inefficient_to_string = "deny"
+large_futures = "warn"
+
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_precision_loss = "warn"
+cast_lossless = "warn"
+too_many_lines = "allow"
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["probe-rs", "serde-big-array", "tiktoken-rs"]  # optional/feature-gated deps

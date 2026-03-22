@@ -1,13 +1,29 @@
-# Clippy configuration for ZeroClaw.
-# Thresholds tuned to match codebase patterns and reduce noise from
-# existing allow-attributes while still catching genuinely complex code.
+# Clippy configuration — OpenPRX production standard
 
-cognitive-complexity-threshold = 30
+cognitive-complexity-threshold = 25
+too-many-arguments-threshold = 8
+too-many-lines-threshold = 150
+type-complexity-threshold = 250
+excessive-nesting-threshold = 6
 
-too-many-arguments-threshold = 10
-
-too-many-lines-threshold = 200
-
-# Some generated/test-only paths legitimately allocate larger local buffers.
-# Keep linting enabled while reducing false positives from those cases.
+large-error-threshold = 128
+future-size-threshold = 16384
+too-large-for-stack = 200
 array-size-threshold = 65536
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+
+disallowed-methods = [
+    { path = "std::sync::Mutex::new", reason = "Use parking_lot::Mutex (sync) or tokio::sync::Mutex (async)" },
+    { path = "std::sync::RwLock::new", reason = "Use parking_lot::RwLock (sync) or tokio::sync::RwLock (async)" },
+]
+
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "Use parking_lot::Mutex" },
+    { path = "std::sync::RwLock", reason = "Use parking_lot::RwLock" },
+]
+
+doc-valid-idents = ["LLM", "AI", "API", "PRX", "OpenPRX", "SDK", "UUID", "URL", "WASM", "MCP", "WAF", "YARA", "GPIO", "STM32", "OTLP", "IMAP", "SMTP", "OAuth", "WhatsApp", "WebSocket", ".."]

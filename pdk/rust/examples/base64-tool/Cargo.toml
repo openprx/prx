@@ -22,5 +22,8 @@ wit-bindgen = { version = "0.51", default-features = false, features = ["macros"
 # Install: cargo install cargo-component
 # Build:   cargo component build --release
 # Target:  wasm32-wasip2 (WASIp2 component model)
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen"]  # proc-macro used via #[wit_bindgen::generate!]
+
 [package.metadata.component]
 package = "prx:plugin@0.1.0"
