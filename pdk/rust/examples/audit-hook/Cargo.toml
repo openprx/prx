@@ -14,5 +14,8 @@ crate-type = ["cdylib", "rlib"]
 prx-pdk = { path = "../../prx-pdk" }
 wit-bindgen = { version = "0.51", default-features = false, features = ["macros"] }
 
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen"]  # proc-macro used via #[wit_bindgen::generate!]
+
 [package.metadata.component]
 package = "prx:plugin@0.1.0"
