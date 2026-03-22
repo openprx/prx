@@ -80,6 +80,12 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 | [WASM Plugins](docs/plugin-developer-guide.md) | Plugin developer guide (Rust/Python/JS/Go) |
 | [Host Function Reference](docs/host-function-reference.md) | WASM plugin host API reference |
 
+## Links
+
+- [Documentation](https://docs.openprx.dev/en/prx/) — Full PRX documentation (10 languages)
+- [Community](https://community.openprx.dev) — OpenPRX community forum
+- [OpenPRX](https://openprx.dev) — Project homepage
+
 ## Related Projects
 
 | Repository | Description |
