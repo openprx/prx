@@ -11,6 +11,8 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
 #[cfg(feature = "llm-router")]
+use crate::causal_tree::CausalTreeEngine;
+#[cfg(feature = "llm-router")]
 use crate::router::RouterEngine;
 #[cfg(feature = "llm-router")]
 use crate::router::automix::{ConfidenceChecker, is_cheap_model_target, should_escalate};
@@ -52,6 +54,10 @@ pub struct Agent {
     model_routes: Vec<crate::config::ModelRouteConfig>,
     #[cfg(feature = "llm-router")]
     router: Option<RouterEngine>,
+    #[cfg(feature = "llm-router")]
+    cte: Option<CausalTreeEngine>,
+    #[cfg(feature = "llm-router")]
+    cte_session_id: String,
 }
 
 pub struct AgentBuilder {
@@ -77,6 +83,8 @@ pub struct AgentBuilder {
     model_routes: Option<Vec<crate::config::ModelRouteConfig>>,
     #[cfg(feature = "llm-router")]
     router: Option<RouterEngine>,
+    #[cfg(feature = "llm-router")]
+    cte: Option<CausalTreeEngine>,
 }
 
 impl AgentBuilder {
@@ -104,6 +112,8 @@ impl AgentBuilder {
             model_routes: None,
             #[cfg(feature = "llm-router")]
             router: None,
+            #[cfg(feature = "llm-router")]
+            cte: None,
         }
     }
 
@@ -209,6 +219,12 @@ impl AgentBuilder {
         self
     }
 
+    #[cfg(feature = "llm-router")]
+    pub fn cte(mut self, cte: CausalTreeEngine) -> Self {
+        self.cte = Some(cte);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let tools = self.tools.ok_or_else(|| anyhow::anyhow!("tools are required"))?;
         let workspace_dir = self.workspace_dir.unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -246,6 +262,10 @@ impl AgentBuilder {
             model_routes: self.model_routes.unwrap_or_default(),
             #[cfg(feature = "llm-router")]
             router: self.router,
+            #[cfg(feature = "llm-router")]
+            cte: self.cte,
+            #[cfg(feature = "llm-router")]
+            cte_session_id: Uuid::new_v4().to_string(),
         })
     }
 }
@@ -394,6 +414,19 @@ impl Agent {
                 Some(router_embedder),
             ))?;
             builder = builder.router(router);
+        }
+
+        #[cfg(feature = "llm-router")]
+        if config.causal_tree.enabled {
+            let cte = CausalTreeEngine::new(
+                Arc::new(crate::causal_tree::expander::DefaultTreeExpander::new()),
+                Arc::new(crate::causal_tree::rehearsal::DefaultRehearsalEngine::new()),
+                Arc::new(crate::causal_tree::scorer::DefaultBranchScorer::new()),
+                Arc::new(crate::causal_tree::selector::DefaultPathSelector::new()),
+                Arc::new(crate::causal_tree::feedback::LogFeedbackWriter::new()),
+                config.causal_tree.clone(),
+            );
+            builder = builder.cte(cte);
         }
 
         builder.build()
@@ -713,6 +746,43 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
+        // --- CTE: speculative branch prediction (before model selection) ---
+        #[cfg(feature = "llm-router")]
+        let cte_result = if let Some(cte) = &self.cte {
+            if cte.is_enabled() {
+                let causal_state = crate::causal_tree::snapshot::build_causal_state(
+                    &self.cte_session_id,
+                    user_message,
+                    &classify_result,
+                    &self.history,
+                    cte.config().policy.default_side_effect_mode,
+                    &cte.config().policy,
+                );
+                match cte.run(&causal_state).await {
+                    Ok((decision, branch)) => {
+                        tracing::info!(
+                            chosen = %decision.chosen_branch_id,
+                            label = ?branch.label,
+                            session_id = %self.cte_session_id,
+                            "CTE selected branch"
+                        );
+                        Some((decision, branch))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = %self.cte_session_id,
+                            "CTE pipeline failed, falling back to router-direct: {e}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         #[allow(unused_mut)]
         let mut effective_model = {
             #[cfg(feature = "llm-router")]
@@ -764,6 +834,53 @@ impl Agent {
             super::classifier::TaskIntent::Stream => self.config.max_tool_iterations.max(1),
             super::classifier::TaskIntent::Delegate => self.config.max_tool_iterations.max(1),
         };
+
+        // --- CTE: consume branch prediction ---
+        #[cfg(feature = "llm-router")]
+        if let Some((ref _decision, ref cte_branch)) = cte_result {
+            match cte_branch.label {
+                crate::causal_tree::BranchLabel::AskApproval => {
+                    // High-risk action detected — request user confirmation.
+                    let preview: String = user_message.chars().take(200).collect();
+                    let ellipsis = if user_message.chars().count() > 200 {
+                        "..."
+                    } else {
+                        ""
+                    };
+                    let approval_msg = format!(
+                        "This request may involve high-risk actions. \
+                         Please confirm you'd like to proceed, or rephrase your request.\n\n> {preview}{ellipsis}"
+                    );
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            approval_msg.clone(),
+                        )));
+                    self.trim_history();
+                    self.hooks
+                        .emit(
+                            HookEvent::TurnComplete,
+                            serde_json::json!({
+                                "mode": "cte_ask_approval",
+                                "cte_session_id": self.cte_session_id,
+                            }),
+                        )
+                        .await;
+                    return Ok(approval_msg);
+                }
+                crate::causal_tree::BranchLabel::RetrieveThenAnswer => {
+                    tracing::info!(
+                        session_id = %self.cte_session_id,
+                        "CTE recommends retrieval-augmented path"
+                    );
+                }
+                crate::causal_tree::BranchLabel::DirectAnswer => {
+                    tracing::debug!(
+                        session_id = %self.cte_session_id,
+                        "CTE recommends direct answer path"
+                    );
+                }
+            }
+        }
 
         for _ in 0..max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);

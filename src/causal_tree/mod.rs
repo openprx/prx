@@ -15,6 +15,7 @@ pub mod policy;
 pub mod rehearsal;
 pub mod scorer;
 pub mod selector;
+pub mod snapshot;
 pub mod state;
 
 pub use branch::{BranchLabel, CausalBranch, CommitPolicy, CostEstimate, RehearsalLevel};
