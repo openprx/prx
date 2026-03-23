@@ -157,7 +157,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn temperature(mut self, temperature: f64) -> Self {
+    pub const fn temperature(mut self, temperature: f64) -> Self {
         self.temperature = Some(temperature);
         self
     }
@@ -177,7 +177,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn auto_save(mut self, auto_save: bool) -> Self {
+    pub const fn auto_save(mut self, auto_save: bool) -> Self {
         self.auto_save = Some(auto_save);
         self
     }
@@ -337,7 +337,7 @@ impl Agent {
         }
 
         #[cfg(feature = "llm-router")]
-        let mut builder = Agent::builder()
+        let mut builder = Self::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
@@ -352,7 +352,7 @@ impl Agent {
             .workspace_dir(config.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .task_routing_config(config.task_routing.clone())
-            .available_hints(available_hints.clone())
+            .available_hints(available_hints)
             .model_routes(config.model_routes.clone())
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills_with_config(&config.workspace_dir, config))

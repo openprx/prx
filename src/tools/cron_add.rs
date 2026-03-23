@@ -12,7 +12,7 @@ pub struct CronAddTool {
 }
 
 impl CronAddTool {
-    pub fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
+    pub const fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
     }
 

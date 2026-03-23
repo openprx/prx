@@ -383,7 +383,7 @@ impl BedrockProvider {
     // ── Cache heuristics (same thresholds as AnthropicProvider) ──
 
     /// Cache system prompts larger than ~1024 tokens (3KB of text).
-    fn should_cache_system(text: &str) -> bool {
+    const fn should_cache_system(text: &str) -> bool {
         text.len() > 3072
     }
 

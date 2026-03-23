@@ -1508,7 +1508,7 @@ impl SignalChannel {
 
         Some(ChannelMessage {
             id: format!("sig_{timestamp}"),
-            sender: sender.clone(),
+            sender,
             reply_target: target,
             content: content_with_meta,
             channel: "signal".to_string(),

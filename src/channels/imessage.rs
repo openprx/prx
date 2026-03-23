@@ -16,7 +16,7 @@ pub struct IMessageChannel {
 }
 
 impl IMessageChannel {
-    pub fn new(allowed_contacts: Vec<String>) -> Self {
+    pub const fn new(allowed_contacts: Vec<String>) -> Self {
         Self {
             allowed_contacts,
             poll_interval_secs: 3,

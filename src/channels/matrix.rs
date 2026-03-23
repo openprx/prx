@@ -139,7 +139,7 @@ impl MatrixChannel {
     }
 
     fn encode_path_segment(value: &str) -> String {
-        fn should_encode(byte: u8) -> bool {
+        const fn should_encode(byte: u8) -> bool {
             !matches!(
                 byte,
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
@@ -566,7 +566,7 @@ impl Channel for MatrixChannel {
                 }
 
                 let sender = event.sender.to_string();
-                if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
+                if !Self::is_sender_allowed(&allowed_users, &sender) {
                     return;
                 }
 
@@ -576,7 +576,7 @@ impl Channel for MatrixChannel {
                     _ => return,
                 };
 
-                if !MatrixChannel::has_non_empty_body(&body) {
+                if !Self::has_non_empty_body(&body) {
                     return;
                 }
 
@@ -584,7 +584,7 @@ impl Channel for MatrixChannel {
                 {
                     let mut guard = dedupe.lock().await;
                     let (recent_order, recent_lookup) = &mut *guard;
-                    if MatrixChannel::cache_event_id(&event_id, recent_order, recent_lookup) {
+                    if Self::cache_event_id(&event_id, recent_order, recent_lookup) {
                         return;
                     }
                 }

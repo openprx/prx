@@ -150,7 +150,7 @@ impl MemorySafetyFilter {
             Actor::Tool => 0.62,
         };
         let history = source.historical_accuracy.unwrap_or(actor_prior);
-        (0.6 * actor_prior + 0.4 * history).clamp(0.0, 1.0)
+        0.6f64.mul_add(actor_prior, 0.4 * history).clamp(0.0, 1.0)
     }
 }
 
@@ -215,7 +215,7 @@ fn passes_luhn(digits: &str) -> bool {
     sum.is_multiple_of(10)
 }
 
-fn injection_markers() -> &'static [&'static str] {
+const fn injection_markers() -> &'static [&'static str] {
     &[
         "ignore previous instructions",
         "ignore all previous",

@@ -336,7 +336,7 @@ impl TelegramChannel {
     }
 
     /// Configure streaming mode for progressive draft updates.
-    pub fn with_streaming(mut self, stream_mode: StreamMode, draft_update_interval_ms: u64) -> Self {
+    pub const fn with_streaming(mut self, stream_mode: StreamMode, draft_update_interval_ms: u64) -> Self {
         self.stream_mode = stream_mode;
         self.draft_update_interval_ms = draft_update_interval_ms;
         self
@@ -491,7 +491,7 @@ impl TelegramChannel {
         }
     }
 
-    fn is_telegram_username_char(ch: char) -> bool {
+    const fn is_telegram_username_char(ch: char) -> bool {
         ch.is_ascii_alphanumeric() || ch == '_'
     }
 
@@ -1406,10 +1406,7 @@ impl Channel for TelegramChannel {
         });
         if let Some(tid) = thread_id {
             if let Some(m) = body.as_object_mut() {
-                m.insert(
-                    "message_thread_id".to_string(),
-                    serde_json::Value::String(tid.to_string()),
-                );
+                m.insert("message_thread_id".to_string(), serde_json::Value::String(tid));
             }
         }
 

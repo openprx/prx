@@ -17,9 +17,9 @@ pub struct ClassifyResult {
 impl From<TaskRoutingIntentConfig> for TaskIntent {
     fn from(value: TaskRoutingIntentConfig) -> Self {
         match value {
-            TaskRoutingIntentConfig::Simple => TaskIntent::Simple,
-            TaskRoutingIntentConfig::Delegate => TaskIntent::Delegate,
-            TaskRoutingIntentConfig::Stream => TaskIntent::Stream,
+            TaskRoutingIntentConfig::Simple => Self::Simple,
+            TaskRoutingIntentConfig::Delegate => Self::Delegate,
+            TaskRoutingIntentConfig::Stream => Self::Stream,
         }
     }
 }

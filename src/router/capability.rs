@@ -33,7 +33,7 @@ struct RouterSuccessEvent {
     success: bool,
 }
 
-fn default_success_rate() -> f32 {
+const fn default_success_rate() -> f32 {
     1.0
 }
 

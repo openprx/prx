@@ -152,7 +152,7 @@ impl EvolutionAnalyzer {
         self
     }
 
-    pub fn with_thresholds(
+    pub const fn with_thresholds(
         mut self,
         memory_confidence_threshold: f64,
         shift_threshold: f64,

@@ -60,7 +60,7 @@ pub struct Capability {
     pub schedule: Option<String>,
 }
 
-fn default_priority() -> i32 {
+const fn default_priority() -> i32 {
     100
 }
 
@@ -126,23 +126,23 @@ fn default_wasm_path() -> String {
     "plugin.wasm".to_string()
 }
 
-fn default_max_fuel() -> u64 {
+const fn default_max_fuel() -> u64 {
     1_000_000_000
 }
 
-fn default_max_memory_mb() -> u64 {
+const fn default_max_memory_mb() -> u64 {
     64
 }
 
-fn default_timeout_ms() -> u64 {
+const fn default_timeout_ms() -> u64 {
     30_000
 }
 
-fn default_max_http_requests() -> u32 {
+const fn default_max_http_requests() -> u32 {
     10
 }
 
-fn default_max_kv_storage_mb() -> u64 {
+const fn default_max_kv_storage_mb() -> u64 {
     10
 }
 

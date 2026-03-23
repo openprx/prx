@@ -342,7 +342,7 @@ fn contains_bot_mention_mm(text: &str, bot_user_id: &str, bot_username: &str, po
     false
 }
 
-fn is_mattermost_username_char(c: char) -> bool {
+const fn is_mattermost_username_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
 }
 

@@ -40,7 +40,7 @@ pub struct ActionTracker {
 }
 
 impl ActionTracker {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             actions: Mutex::new(Vec::new()),
         }

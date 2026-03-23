@@ -102,11 +102,18 @@ async fn build_and_store_fitness_report(
     let (subscores, confidence, evidence) = compute_subscores(memory, config, cost_tracker, window).await;
 
     let final_score = clamp_0_1(
-        subscores.task_quality * WEIGHT_TASK_QUALITY
-            + subscores.no_repeat * WEIGHT_NO_REPEAT
-            + subscores.proactive * WEIGHT_PROACTIVE
-            + subscores.learning * WEIGHT_LEARNING
-            + subscores.efficiency * WEIGHT_EFFICIENCY,
+        subscores.efficiency.mul_add(
+            WEIGHT_EFFICIENCY,
+            subscores.learning.mul_add(
+                WEIGHT_LEARNING,
+                subscores.proactive.mul_add(
+                    WEIGHT_PROACTIVE,
+                    subscores
+                        .task_quality
+                        .mul_add(WEIGHT_TASK_QUALITY, subscores.no_repeat * WEIGHT_NO_REPEAT),
+                ),
+            ),
+        ),
     );
 
     let report = FitnessReport {
@@ -290,7 +297,7 @@ fn proactive_from_cron_runs(config: &Config, window: WindowBounds) -> (f64, f64,
 
     let success_ratio = (success_count as f64) / (run_count as f64);
     let activity_ratio = (run_count as f64 / HEARTBEAT_TARGET_RUNS_PER_DAY as f64).clamp(0.0, 1.0);
-    let score = clamp_0_1(0.7 * success_ratio + 0.3 * activity_ratio);
+    let score = clamp_0_1(0.7f64.mul_add(success_ratio, 0.3 * activity_ratio));
 
     (
         score,
@@ -448,7 +455,7 @@ fn weighted_confidence(inputs: &[(f64, f64)]) -> f64 {
     clamp_0_1(weighted / weight_sum)
 }
 
-fn clamp_0_1(value: f64) -> f64 {
+const fn clamp_0_1(value: f64) -> f64 {
     value.clamp(0.0, 1.0)
 }
 

@@ -273,12 +273,12 @@ impl HardwareRag {
     }
 
     /// Number of indexed chunks.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.chunks.len()
     }
 
     /// True if no chunks are indexed.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
 }

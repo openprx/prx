@@ -15,7 +15,7 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
@@ -49,7 +49,7 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::System => "system",
             Self::User => "user",
@@ -77,11 +77,11 @@ pub enum TaskPriority {
 }
 
 impl TaskPriority {
-    pub fn as_i32(self) -> i32 {
+    pub const fn as_i32(self) -> i32 {
         self as i32
     }
 
-    pub fn from_i32(v: i32) -> Self {
+    pub const fn from_i32(v: i32) -> Self {
         match v {
             0 => Self::Low,
             2 => Self::High,
@@ -113,7 +113,7 @@ pub enum ExecutionMode {
 }
 
 impl ExecutionMode {
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Internal => "internal",
             Self::AgentSession => "agent_session",

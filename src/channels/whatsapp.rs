@@ -28,7 +28,12 @@ pub struct WhatsAppChannel {
 }
 
 impl WhatsAppChannel {
-    pub fn new(access_token: String, endpoint_id: String, verify_token: String, allowed_numbers: Vec<String>) -> Self {
+    pub const fn new(
+        access_token: String,
+        endpoint_id: String,
+        verify_token: String,
+        allowed_numbers: Vec<String>,
+    ) -> Self {
         Self {
             access_token,
             endpoint_id,

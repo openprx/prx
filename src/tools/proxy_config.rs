@@ -13,7 +13,7 @@ pub struct ProxyConfigTool {
 }
 
 impl ProxyConfigTool {
-    pub fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
+    pub const fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
     }
 

@@ -9,7 +9,7 @@ pub struct CronListTool {
 }
 
 impl CronListTool {
-    pub fn new(config: SharedConfig) -> Self {
+    pub const fn new(config: SharedConfig) -> Self {
         Self { config }
     }
 }

@@ -300,7 +300,7 @@ pub fn all_tools_with_runtime_ext(
             Arc::new(arc_swap::ArcSwap::from_pointee(root_config.clone())),
         )),
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
-        Arc::new(NodesTool::new(shared_config.clone(), security.clone())),
+        Arc::new(NodesTool::new(shared_config, security.clone())),
         Arc::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
     ];

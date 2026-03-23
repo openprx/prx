@@ -6,7 +6,7 @@ use tracing::info;
 pub struct LogObserver;
 
 impl LogObserver {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

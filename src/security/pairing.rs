@@ -75,7 +75,7 @@ impl PairingGuard {
     }
 
     /// Whether pairing is required at all.
-    pub fn require_pairing(&self) -> bool {
+    pub const fn require_pairing(&self) -> bool {
         self.require_pairing
     }
 

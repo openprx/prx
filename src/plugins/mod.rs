@@ -733,7 +733,7 @@ impl PluginManager {
     }
 
     /// Get a reference to the wasmtime engine.
-    pub fn engine(&self) -> &wasmtime::Engine {
+    pub const fn engine(&self) -> &wasmtime::Engine {
         &self.engine
     }
 
@@ -743,7 +743,7 @@ impl PluginManager {
     }
 
     /// Get a reference to the precompile cache.
-    pub fn precompile_cache(&self) -> &PrecompileCache {
+    pub const fn precompile_cache(&self) -> &PrecompileCache {
         &self.precompile_cache
     }
 

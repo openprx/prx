@@ -20,7 +20,7 @@ struct CircuitBreakerState {
 }
 
 impl CircuitBreakerState {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             consecutive_failures: 0,
             unhealthy_until: None,
@@ -36,7 +36,7 @@ impl CircuitBreakerState {
         Ok(())
     }
 
-    fn record_success(&mut self) {
+    const fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.unhealthy_until = None;
     }

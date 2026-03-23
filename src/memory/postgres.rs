@@ -32,7 +32,7 @@ impl PostgresMemory {
         let client = Self::initialize_client(
             db_url.to_string(),
             connect_timeout_secs,
-            schema_ident.clone(),
+            schema_ident,
             qualified_table.clone(),
         )?;
 

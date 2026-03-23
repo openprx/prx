@@ -522,7 +522,7 @@ struct PersistedAuthProfile {
     metadata: BTreeMap<String, String>,
 }
 
-fn default_schema_version() -> u32 {
+const fn default_schema_version() -> u32 {
     CURRENT_SCHEMA_VERSION
 }
 
@@ -538,7 +538,7 @@ fn parse_profile_kind(value: &str) -> Result<AuthProfileKind> {
     }
 }
 
-fn profile_kind_to_string(kind: AuthProfileKind) -> &'static str {
+const fn profile_kind_to_string(kind: AuthProfileKind) -> &'static str {
     match kind {
         AuthProfileKind::OAuth => "oauth",
         AuthProfileKind::Token => "token",

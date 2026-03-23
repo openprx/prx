@@ -53,7 +53,7 @@ impl PromptEvolutionEngine {
         }
     }
 
-    fn select_mutation_type(candidate: Option<&EvolutionCandidate>) -> PromptMutationType {
+    const fn select_mutation_type(candidate: Option<&EvolutionCandidate>) -> PromptMutationType {
         let Some(candidate) = candidate else {
             return PromptMutationType::FineTune;
         };
@@ -111,7 +111,7 @@ impl PromptEvolutionEngine {
         out
     }
 
-    fn severity(kind: &PromptMutationType) -> u8 {
+    const fn severity(kind: &PromptMutationType) -> u8 {
         match kind {
             PromptMutationType::FineTune => 1,
             PromptMutationType::Reorder => 2,

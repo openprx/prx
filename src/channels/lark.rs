@@ -135,7 +135,7 @@ const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 
 /// Returns true when the WebSocket frame indicates live traffic that should
 /// refresh the heartbeat watchdog.
-fn should_refresh_last_recv(msg: &WsMsg) -> bool {
+const fn should_refresh_last_recv(msg: &WsMsg) -> bool {
     matches!(msg, WsMsg::Binary(_) | WsMsg::Ping(_) | WsMsg::Pong(_))
 }
 
@@ -262,7 +262,7 @@ impl LarkChannel {
             .unwrap_or_else(|_| reqwest::Client::new())
     }
 
-    fn api_base(&self) -> &'static str {
+    const fn api_base(&self) -> &'static str {
         if self.use_feishu {
             FEISHU_BASE_URL
         } else {
@@ -270,7 +270,7 @@ impl LarkChannel {
         }
     }
 
-    fn ws_base(&self) -> &'static str {
+    const fn ws_base(&self) -> &'static str {
         if self.use_feishu {
             FEISHU_WS_BASE_URL
         } else {
@@ -852,7 +852,7 @@ impl LarkChannel {
 
         let state = AppState {
             verification_token: self.verification_token.clone(),
-            channel: Arc::new(LarkChannel::new(
+            channel: Arc::new(Self::new(
                 self.app_id.clone(),
                 self.app_secret.clone(),
                 self.verification_token.clone(),
@@ -961,7 +961,7 @@ fn strip_at_placeholders(text: &str) -> String {
 }
 
 /// In group chats, only respond when the bot is explicitly @-mentioned.
-fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
+const fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
     !mentions.is_empty()
 }
 

@@ -10,7 +10,7 @@ use std::any::Any;
 pub struct VerboseObserver;
 
 impl VerboseObserver {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

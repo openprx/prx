@@ -92,7 +92,7 @@ impl IrcMessage {
             params.push(t.to_string());
         }
 
-        Some(IrcMessage {
+        Some(Self {
             prefix,
             command,
             params,

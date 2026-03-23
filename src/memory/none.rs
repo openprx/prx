@@ -9,7 +9,7 @@ use async_trait::async_trait;
 pub struct NoneMemory;
 
 impl NoneMemory {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

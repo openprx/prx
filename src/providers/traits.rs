@@ -60,7 +60,7 @@ pub struct ChatResponse {
 
 impl ChatResponse {
     /// True when the LLM wants to invoke at least one tool.
-    pub fn has_tool_calls(&self) -> bool {
+    pub const fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
     }
 
@@ -121,7 +121,7 @@ impl StreamChunk {
     }
 
     /// Create a final chunk.
-    pub fn final_chunk() -> Self {
+    pub const fn final_chunk() -> Self {
         Self {
             delta: String::new(),
             is_final: true,
@@ -139,7 +139,7 @@ impl StreamChunk {
     }
 
     /// Estimate tokens (rough approximation: ~4 chars per token).
-    pub fn with_token_estimate(mut self) -> Self {
+    pub const fn with_token_estimate(mut self) -> Self {
         self.token_count = self.delta.len().div_ceil(4);
         self
     }
@@ -156,7 +156,7 @@ pub struct StreamOptions {
 
 impl StreamOptions {
     /// Create new streaming options with enabled flag.
-    pub fn new(enabled: bool) -> Self {
+    pub const fn new(enabled: bool) -> Self {
         Self {
             enabled,
             count_tokens: false,
@@ -164,7 +164,7 @@ impl StreamOptions {
     }
 
     /// Enable token counting.
-    pub fn with_token_count(mut self) -> Self {
+    pub const fn with_token_count(mut self) -> Self {
         self.count_tokens = true;
         self
     }

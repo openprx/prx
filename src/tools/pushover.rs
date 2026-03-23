@@ -14,7 +14,7 @@ pub struct PushoverTool {
 }
 
 impl PushoverTool {
-    pub fn new(security: Arc<SecurityPolicy>, workspace_dir: PathBuf) -> Self {
+    pub const fn new(security: Arc<SecurityPolicy>, workspace_dir: PathBuf) -> Self {
         Self {
             security,
             workspace_dir,

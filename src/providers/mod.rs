@@ -202,7 +202,7 @@ enum MinimaxOauthRegion {
 }
 
 impl MinimaxOauthRegion {
-    fn token_endpoint(self) -> &'static str {
+    const fn token_endpoint(self) -> &'static str {
         match self {
             Self::Global => MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT,
             Self::Cn => MINIMAX_OAUTH_CN_TOKEN_ENDPOINT,
@@ -347,7 +347,7 @@ fn read_non_empty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn is_minimax_oauth_placeholder(value: &str) -> bool {
+const fn is_minimax_oauth_placeholder(value: &str) -> bool {
     value.eq_ignore_ascii_case(MINIMAX_OAUTH_PLACEHOLDER) || value.eq_ignore_ascii_case(MINIMAX_OAUTH_CN_PLACEHOLDER)
 }
 
@@ -551,7 +551,7 @@ pub(crate) fn write_claude_code_cached_credentials(credentials: &ClaudeCodeCrede
     Ok(())
 }
 
-fn normalized_qwen_expiry_millis(raw: i64) -> i64 {
+const fn normalized_qwen_expiry_millis(raw: i64) -> i64 {
     if raw < 10_000_000_000 {
         raw.saturating_mul(1000)
     } else {
@@ -769,7 +769,7 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
     let env_resource_url = read_non_empty_env(QWEN_OAUTH_RESOURCE_URL_ENV);
 
     if env_token.is_none() {
-        let refresh_token = env_refresh_token.clone().or_else(|| {
+        let refresh_token = env_refresh_token.or_else(|| {
             cached
                 .as_ref()
                 .and_then(|credentials| credentials.refresh_token.clone())
@@ -1090,7 +1090,7 @@ impl Default for ProviderRuntimeOptions {
     }
 }
 
-fn is_secret_char(c: char) -> bool {
+const fn is_secret_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
 }
 

@@ -31,25 +31,22 @@ enum GeminiAuth {
 
 impl GeminiAuth {
     /// Whether this credential is an API key (sent as `?key=` query param).
-    fn is_api_key(&self) -> bool {
+    const fn is_api_key(&self) -> bool {
         matches!(
             self,
-            GeminiAuth::ExplicitKey(_) | GeminiAuth::EnvGeminiKey(_) | GeminiAuth::EnvGoogleKey(_)
+            Self::ExplicitKey(_) | Self::EnvGeminiKey(_) | Self::EnvGoogleKey(_)
         )
     }
 
     /// Whether this credential is an OAuth token from Gemini CLI.
-    fn is_oauth(&self) -> bool {
-        matches!(self, GeminiAuth::OAuthToken(_))
+    const fn is_oauth(&self) -> bool {
+        matches!(self, Self::OAuthToken(_))
     }
 
     /// The raw credential string.
     fn credential(&self) -> &str {
         match self {
-            GeminiAuth::ExplicitKey(s)
-            | GeminiAuth::EnvGeminiKey(s)
-            | GeminiAuth::EnvGoogleKey(s)
-            | GeminiAuth::OAuthToken(s) => s,
+            Self::ExplicitKey(s) | Self::EnvGeminiKey(s) | Self::EnvGoogleKey(s) | Self::OAuthToken(s) => s,
         }
     }
 }
@@ -113,7 +110,7 @@ struct GenerateContentResponse {
     candidates: Option<Vec<Candidate>>,
     error: Option<ApiError>,
     #[serde(default)]
-    response: Option<Box<GenerateContentResponse>>,
+    response: Option<Box<Self>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,7 +242,7 @@ impl GeminiProvider {
 
     /// Get authentication source description for diagnostics.
     /// Uses the stored enum variant — no env var re-reading at call time.
-    pub fn auth_source(&self) -> &'static str {
+    pub const fn auth_source(&self) -> &'static str {
         match self.auth.as_ref() {
             Some(GeminiAuth::ExplicitKey(_)) => "config",
             Some(GeminiAuth::EnvGeminiKey(_)) => "GEMINI_API_KEY env var",

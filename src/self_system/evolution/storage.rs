@@ -18,7 +18,7 @@ pub struct JsonlStoragePaths {
 
 impl JsonlStoragePaths {
     /// Create path config rooted at `root`.
-    pub fn new(root: PathBuf) -> Self {
+    pub const fn new(root: PathBuf) -> Self {
         Self { root }
     }
 }
@@ -49,7 +49,7 @@ enum LogKind {
 }
 
 impl LogKind {
-    fn as_dir_name(self) -> &'static str {
+    const fn as_dir_name(self) -> &'static str {
         match self {
             Self::MemoryAccess => "memory_access",
             Self::Decisions => "decisions",
@@ -66,7 +66,7 @@ enum RetentionTier {
 }
 
 impl RetentionTier {
-    fn as_dir_name(self) -> &'static str {
+    const fn as_dir_name(self) -> &'static str {
         match self {
             Self::Hot => "hot",
             Self::Warm => "warm",
@@ -334,7 +334,7 @@ impl AsyncJsonlWriter {
         Ok(())
     }
 
-    fn target_tier(&self, age_days: u32) -> Option<RetentionTier> {
+    const fn target_tier(&self, age_days: u32) -> Option<RetentionTier> {
         if age_days <= self.retention.hot_days {
             return Some(RetentionTier::Hot);
         }

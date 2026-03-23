@@ -41,7 +41,7 @@ impl EvolutionGate {
         }
     }
 
-    pub fn from_gate_config(config: EvolutionGateConfig) -> Self {
+    pub const fn from_gate_config(config: EvolutionGateConfig) -> Self {
         Self { config }
     }
 

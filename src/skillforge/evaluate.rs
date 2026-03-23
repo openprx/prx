@@ -21,7 +21,8 @@ pub struct Scores {
 impl Scores {
     /// Weighted total. Weights: compatibility 0.3, quality 0.35, security 0.35.
     pub fn total(&self) -> f64 {
-        self.compatibility * 0.30 + self.quality * 0.35 + self.security * 0.35
+        self.security
+            .mul_add(0.35, self.compatibility.mul_add(0.30, self.quality * 0.35))
     }
 }
 
@@ -84,7 +85,7 @@ fn contains_word(haystack: &str, word: &str) -> bool {
 }
 
 impl Evaluator {
-    pub fn new(min_score: f64) -> Self {
+    pub const fn new(min_score: f64) -> Self {
         Self { min_score }
     }
 

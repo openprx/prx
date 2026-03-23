@@ -84,7 +84,7 @@ fn detect_init_system() -> Result<InitSystem> {
     );
 }
 
-fn windows_task_name() -> &'static str {
+const fn windows_task_name() -> &'static str {
     WINDOWS_TASK_NAME
 }
 

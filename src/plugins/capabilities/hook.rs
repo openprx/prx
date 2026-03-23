@@ -159,7 +159,7 @@ pub struct WasmHookExecutor {
 }
 
 impl WasmHookExecutor {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { hooks: Vec::new() }
     }
 
@@ -185,7 +185,7 @@ impl WasmHookExecutor {
     }
 
     /// Returns true if no hooks are registered.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.hooks.is_empty()
     }
 }

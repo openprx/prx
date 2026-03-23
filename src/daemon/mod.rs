@@ -469,7 +469,7 @@ fn resolve_evolution_storage_root(config: &Config, runtime: &EvolutionRuntimeCon
     }
 }
 
-fn retention_from_runtime(retention: &EvolutionRetentionConfig) -> JsonlRetentionPolicy {
+const fn retention_from_runtime(retention: &EvolutionRetentionConfig) -> JsonlRetentionPolicy {
     JsonlRetentionPolicy {
         hot_days: retention.hot_days,
         warm_days: retention.warm_days,
@@ -477,7 +477,7 @@ fn retention_from_runtime(retention: &EvolutionRetentionConfig) -> JsonlRetentio
     }
 }
 
-fn has_supervised_channels(config: &Config) -> bool {
+const fn has_supervised_channels(config: &Config) -> bool {
     let crate::config::ChannelsConfig {
         cli: _,     // `cli` is used only when running the CLI manually
         webhook: _, // Managed by the gateway

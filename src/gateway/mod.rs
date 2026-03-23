@@ -1314,6 +1314,7 @@ async fn handle_whatsapp_verify(
 }
 
 /// Verify `WhatsApp` webhook signature (`X-Hub-Signature-256`).
+///
 /// Returns true if the signature is valid, false otherwise.
 /// See: <https://developers.facebook.com/docs/graph-api/webhooks/getting-started#verification-requests>
 pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header: &str) -> bool {

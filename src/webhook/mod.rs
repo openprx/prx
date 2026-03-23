@@ -540,7 +540,7 @@ fn persist_event(db_path: &Path, event: &WebhookEvent, acl_enabled: bool) -> Res
         chat_type: Some("webhook".to_string()),
         chat_id: Some(format!("{}:{}", event.source, event.external_id)),
         sender_id: None,
-        raw_sender: Some(system_sender.clone()),
+        raw_sender: Some(system_sender),
     };
 
     // Persist via memory classification path to keep ACL policy consistent.

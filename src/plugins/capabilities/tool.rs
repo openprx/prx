@@ -427,8 +427,8 @@ impl WasmToolAdapter {
             .unwrap_or_else(|_| serde_json::json!({"type": "object", "properties": {}}));
 
         Ok(ToolSpec {
-            name: name.to_string(),
-            description: description.to_string(),
+            name,
+            description,
             parameters,
         })
     }

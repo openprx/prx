@@ -77,9 +77,15 @@ pub fn compute_score(
     let elo_score = normalize_elo(model.dynamic_elo);
     let cost_penalty = model.config.cost_per_million_tokens * estimated_tokens as f32 / 1_000_000.0;
     let latency_penalty = model.recent_latency_ms.min(5_000) as f32 / 5_000.0;
-    let total_score = config.alpha * similarity + config.beta * capability + config.gamma * elo_score
-        - config.delta * cost_penalty
-        - config.epsilon * latency_penalty;
+    let total_score = config.epsilon.mul_add(
+        -latency_penalty,
+        config.delta.mul_add(
+            -cost_penalty,
+            config
+                .gamma
+                .mul_add(elo_score, config.alpha.mul_add(similarity, config.beta * capability)),
+        ),
+    );
 
     ModelScore {
         model_id: model.config.model_id.clone(),

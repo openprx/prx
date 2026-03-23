@@ -49,7 +49,7 @@ pub fn infer_router_intent(task_intent: TaskIntent, message: &str) -> RouterInte
 }
 
 impl RouterIntent {
-    pub fn category_name(&self) -> &'static str {
+    pub const fn category_name(&self) -> &'static str {
         match self {
             Self::Conversation => "conversation",
             Self::Code => "code",

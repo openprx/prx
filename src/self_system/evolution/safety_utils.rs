@@ -125,7 +125,7 @@ fn set_atomic_write_test_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
 }
 
 #[cfg(not(test))]
-fn run_atomic_write_test_hook() {}
+const fn run_atomic_write_test_hook() {}
 
 /// Atomically write content to target within workspace boundary.
 pub async fn atomic_write(workspace_root: &Path, path: &Path, content: &[u8]) -> Result<()> {

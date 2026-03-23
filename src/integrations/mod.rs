@@ -31,7 +31,7 @@ pub enum IntegrationCategory {
 }
 
 impl IntegrationCategory {
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Chat => "Chat Providers",
             Self::AiModel => "AI Models",
@@ -45,7 +45,7 @@ impl IntegrationCategory {
         }
     }
 
-    pub fn all() -> &'static [Self] {
+    pub const fn all() -> &'static [Self] {
         &[
             Self::Chat,
             Self::AiModel,

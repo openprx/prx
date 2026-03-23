@@ -235,7 +235,7 @@ impl RouterEngine {
         result
     }
 
-    pub fn automix_config(&self) -> Option<&crate::config::AutomixConfig> {
+    pub const fn automix_config(&self) -> Option<&crate::config::AutomixConfig> {
         Some(&self.config.automix)
     }
 
