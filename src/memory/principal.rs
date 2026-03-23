@@ -466,6 +466,17 @@ static IPV4_RE: LazyLock<Regex> =
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::needless_collect,
+        clippy::unreadable_literal,
+        clippy::trivial_regex
+    )]
     use super::*;
 
     #[test]

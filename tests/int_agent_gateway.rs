@@ -1,3 +1,19 @@
+#![allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::needless_collect,
+    clippy::unreadable_literal,
+    clippy::unwrap_or_default,
+    clippy::wildcard_in_or_patterns,
+    clippy::default_trait_access,
+    clippy::expect_used,
+    clippy::or_fun_call,
+    clippy::match_wild_err_arm
+)]
 //! P0 integration tests for agent + gateway.
 //!
 //! These tests validate:
@@ -5,7 +21,6 @@
 //! - Gateway auth (bearer token rejection), body size limits, HMAC verification, rate limiting
 //!
 //! Each test uses mock providers and isolated state; no real LLM or network calls.
-#![allow(clippy::expect_used)]
 
 use anyhow::Result;
 use async_trait::async_trait;

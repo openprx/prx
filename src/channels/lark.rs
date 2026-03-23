@@ -967,6 +967,16 @@ const fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::needless_collect,
+        clippy::unreadable_literal
+    )]
     use super::*;
 
     fn make_channel() -> LarkChannel {

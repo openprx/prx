@@ -460,9 +460,18 @@ pub fn all_tools_with_runtime_ext(
     }
 }
 
-#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::needless_collect,
+        clippy::unreadable_literal
+    )]
     use super::*;
     use crate::config::{BrowserConfig, Config, MemoryConfig};
     use tempfile::TempDir;

@@ -1,3 +1,13 @@
+#![allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::needless_collect,
+    clippy::unreadable_literal
+)]
 //! TG4: Agent Loop Robustness Tests
 //!
 //! Prevents: Pattern 4 — Agent loop & tool call processing bugs (13% of user bugs).
@@ -6,7 +16,6 @@
 //! Tests agent behavior with malformed tool calls, empty responses,
 //! max iteration limits, and cascading tool failures using mock providers.
 //! Complements inline `parse_tool_calls` tests in `src/agent/loop_.rs`.
-#![allow(clippy::unwrap_used)]
 
 use anyhow::Result;
 use async_trait::async_trait;

@@ -1780,6 +1780,16 @@ Ensure only one `openprx` process is using this bot token."
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::needless_collect,
+        clippy::unreadable_literal
+    )]
     use super::*;
 
     #[test]

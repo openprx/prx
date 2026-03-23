@@ -664,9 +664,19 @@ impl crate::memory::traits::Memory for WasmStorage {
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
-#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::needless_collect,
+        clippy::unreadable_literal,
+        clippy::option_if_let_else
+    )]
     use super::*;
     use crate::memory::traits::MemoryCategory;
     use wasmtime::component::Val;

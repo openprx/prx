@@ -430,6 +430,16 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::needless_collect,
+        clippy::unreadable_literal
+    )]
     use super::*;
     use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode, new_shared_evolution_config};
     use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput};
@@ -580,7 +590,7 @@ mod tests {
             .analyzer
             .generate_three_day_trend(now.date_naive())
             .await
-            .unwrap_or(TrendAnalysis {
+            .unwrap_or_else(|_| TrendAnalysis {
                 start_date: "".to_string(),
                 end_date: "".to_string(),
                 digests: Vec::new(),

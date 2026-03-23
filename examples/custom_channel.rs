@@ -2,6 +2,16 @@
 //!
 //! Channels let `ZeroClaw` communicate through any messaging platform.
 //! Implement the Channel trait, register it, and the agent works everywhere.
+#![allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::needless_collect,
+    clippy::unreadable_literal
+)]
 
 use anyhow::Result;
 use async_trait::async_trait;

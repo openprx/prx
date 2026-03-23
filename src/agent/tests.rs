@@ -24,7 +24,16 @@
 //!  19. Builder validation (missing required fields)
 //!  20. Idempotent system prompt insertion
 // Test module: JSON indexing and vector indexing in assertions are intentional.
-#![allow(clippy::indexing_slicing)]
+#![allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::needless_collect,
+    clippy::unreadable_literal
+)]
 
 use crate::agent::agent::Agent;
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher};

@@ -2,6 +2,16 @@
 //!
 //! This shows how to add a new tool the agent can use.
 //! Tools are the agent's hands — they let it interact with the world.
+#![allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::needless_collect,
+    clippy::unreadable_literal
+)]
 
 use anyhow::Result;
 use async_trait::async_trait;
