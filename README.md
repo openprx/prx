@@ -8,6 +8,7 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 
 - **9 LLM providers** — Anthropic, OpenAI, Google Gemini, GitHub Copilot, Ollama, AWS Bedrock, GLM, OpenAI Codex, and OpenAI-compatible endpoints
 - **LLM Router** — heuristic routing (capability + Elo + cost + latency), KNN semantic routing (cold-start guard + 100ms timeout fallback), and Automix low-confidence auto-upgrade
+- **Causal Tree Engine** — speculative multi-branch prediction with rehearsal, scoring, and circuit breaker; opt-in via `causal_tree.enabled` (disabled by default)
 - **19 messaging channels** — Signal, WhatsApp, Telegram, Discord, Slack, Matrix, and more
 - **43+ built-in tools** — shell, browser, MCP, memory, scheduling, remote nodes
 - **Xin (心) task engine** — autonomous heartbeat scheduler with 3 execution modes (Rust/LLM/Shell), 5 built-in system tasks, SQLite persistence
@@ -15,13 +16,27 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 - **Remote Nodes** — control macOS/Linux/Pi devices via `prx-node` agent
 - **Self-Evolution** — autonomous prompt/memory/strategy improvement with xin-managed scheduling
 - **Subagent Governance** — concurrency limits, depth control, config inheritance
-- **3,400+ tests** — comprehensive test coverage across all modules
+- **3,500+ tests** — comprehensive test coverage across all modules
 
 ### LLM Router Flags
 
 - `router.enabled` — enable heuristic model routing
 - `router.knn_enabled` — enable semantic KNN scoring (with timeout-safe fallback)
 - `router.automix.enabled` — enable cheap-first, low-confidence upgrade to premium model
+
+### Causal Tree Engine Flags
+
+> **Disabled by default.** Set `causal_tree.enabled = true` to activate.
+
+- `causal_tree.enabled` — master switch for the CTE pipeline (default: `false`)
+- `causal_tree.policy.max_branches` — maximum candidate branches to expand (default: `3`)
+- `causal_tree.policy.commit_threshold` — minimum score to commit a branch (default: `0.62`)
+- `causal_tree.policy.extra_latency_budget_ms` — max additional latency budget in ms (default: `300`)
+- `causal_tree.policy.rehearsal_timeout_ms` — per-rehearsal timeout in ms (default: `5000`)
+- `causal_tree.policy.circuit_breaker_threshold` — consecutive failures before tripping (default: `5`)
+- `causal_tree.w_confidence` — scoring weight for confidence dimension (default: `0.50`)
+- `causal_tree.w_cost` — scoring weight for cost penalty (default: `0.25`)
+- `causal_tree.w_latency` — scoring weight for latency penalty (default: `0.25`)
 
 ## Quick Start
 
@@ -58,7 +73,7 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
               ▼                      ▼                     ▼
          ┌─────────────────────────────────────────────────────┐
          │                    openprx daemon                    │
-         │  Agent Loop · Gateway · Cron · Xin · Memory · Evo  │
+         │  Agent Loop · Gateway · CTE · Xin · Memory · Evo   │
          └──────────────────────┬──────────────────────────────┘
                                 │
                      Providers (9 LLMs)
@@ -77,6 +92,7 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 | [Evolution](docs/evolution.md) | Self-improvement pipeline |
 | [Configuration](docs/configuration.md) | Config reference, workspace files, security |
 | [Router](docs/router.md) | LLM Router config, flow, safety boundaries |
+| [Causal Tree Engine](docs/causal-tree.md) | CTE pipeline, branch prediction, rehearsal, scoring |
 | [WASM Plugins](docs/plugin-developer-guide.md) | Plugin developer guide (Rust/Python/JS/Go) |
 | [Host Function Reference](docs/host-function-reference.md) | WASM plugin host API reference |
 
