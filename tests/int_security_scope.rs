@@ -432,6 +432,7 @@ async fn pairing_guard_constant_time_eq_correctness() {
 ///
 /// Both should take approximately the same time. We use a generous tolerance
 /// (4x ratio) to prevent flaky CI failures.
+#[allow(unsafe_code)]
 #[tokio::test]
 async fn pairing_guard_constant_time_eq_timing_similarity() {
     // Build two 1000-char strings that differ at different positions
@@ -442,6 +443,7 @@ async fn pairing_guard_constant_time_eq_timing_similarity() {
         early_mismatch.as_bytes_mut()[0] = b'z';
     }
     let mut late_mismatch = base.clone();
+    // SAFETY: the string is pure ASCII; replacing one ASCII byte preserves UTF-8 validity.
     unsafe {
         late_mismatch.as_bytes_mut()[999] = b'z';
     }

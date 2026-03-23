@@ -2193,6 +2193,7 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(unsafe_code)]
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
@@ -2211,6 +2212,7 @@ fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     }
 }
 
+#[allow(unsafe_code)]
 fn clear_proxy_env_pair(key: &str) {
     // SAFETY: Called during single-threaded config initialization to clear stale
     // proxy env vars before any concurrent HTTP clients are created.
@@ -5280,12 +5282,14 @@ mod tests {
     use tokio_stream::wrappers::ReadDirStream;
 
     /// Helper to set env vars in tests (unsafe in edition 2024).
+    #[allow(unsafe_code)]
     fn test_set_env(key: impl AsRef<std::ffi::OsStr>, value: impl AsRef<std::ffi::OsStr>) {
         // SAFETY: tests run single-threaded via serial test mutex or unique env keys.
         unsafe { std::env::set_var(key, value) }
     }
 
     /// Helper to remove env vars in tests (unsafe in edition 2024).
+    #[allow(unsafe_code)]
     fn test_remove_env(key: impl AsRef<std::ffi::OsStr>) {
         // SAFETY: tests run single-threaded via serial test mutex or unique env keys.
         unsafe { std::env::remove_var(key) }

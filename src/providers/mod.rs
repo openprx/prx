@@ -2394,6 +2394,7 @@ mod tests {
     }
 
     impl EnvGuard {
+        #[allow(unsafe_code)]
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let original = std::env::var(key).ok();
             // SAFETY: test-only, single-threaded test runner
@@ -2409,6 +2410,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
+        #[allow(unsafe_code)]
         fn drop(&mut self) {
             // SAFETY: test-only, single-threaded test runner
             unsafe {
@@ -3246,6 +3248,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn summarize_provider_availability_marks_openai_codex_available_with_auth_profile() {
         let _guard = provider_availability_env_lock().lock().unwrap();
 
@@ -3306,6 +3309,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn summarize_provider_availability_marks_openai_codex_unavailable_without_auth_profile() {
         let _guard = provider_availability_env_lock().lock().unwrap();
 

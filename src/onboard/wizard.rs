@@ -97,6 +97,7 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
 
 // ── Main wizard entry point ──────────────────────────────────────
 
+#[allow(unsafe_code)]
 pub async fn run_wizard() -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
 
@@ -242,6 +243,7 @@ pub async fn run_wizard() -> Result<Config> {
 }
 
 /// Interactive repair flow: rerun channel setup only without redoing full onboarding.
+#[allow(unsafe_code)]
 pub async fn run_channels_repair_wizard() -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
     println!(

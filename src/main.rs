@@ -783,6 +783,7 @@ enum IntegrationCommands {
 
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
+#[allow(unsafe_code)]
 async fn main() -> Result<()> {
     // Install default crypto provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"

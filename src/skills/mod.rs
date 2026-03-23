@@ -1202,6 +1202,7 @@ mod tests {
     }
 
     impl EnvVarGuard {
+        #[allow(unsafe_code)]
         fn unset(key: &'static str) -> Self {
             let original = std::env::var(key).ok();
             // SAFETY: test-only, single-threaded test runner
@@ -1211,6 +1212,7 @@ mod tests {
     }
 
     impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
         fn drop(&mut self) {
             // SAFETY: test-only, single-threaded test runner
             unsafe {
@@ -1764,6 +1766,7 @@ description = "Bare minimum"
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn resolve_openclaw_skills_dir_env_takes_priority_over_config() {
         let _env_lock = open_skills_env_lock()
             .lock()
@@ -1791,6 +1794,7 @@ description = "Bare minimum"
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn openclaw_skills_not_loaded_when_disabled_via_env() {
         let _env_lock = open_skills_env_lock()
             .lock()

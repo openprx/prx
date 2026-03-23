@@ -452,6 +452,7 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
 
 /// Check if the current process is running as root (Unix only)
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn is_root() -> bool {
     // SAFETY: `getuid()` is a read-only syscall that returns the real user ID
     // of the calling process. It has no side effects and no preconditions.
@@ -1170,7 +1171,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)]
     fn is_root_matches_system_uid() {
+        // SAFETY: libc::getuid() is a read-only syscall with no preconditions.
         assert_eq!(is_root(), unsafe { libc::getuid() == 0 });
     }
 

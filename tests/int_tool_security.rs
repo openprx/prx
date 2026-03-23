@@ -575,6 +575,7 @@ async fn int_ts_10_env_sanitization_excludes_api_keys() {
     }
 
     impl EnvGuard {
+        #[allow(unsafe_code)]
         fn set(key: &'static str, value: &str) -> Self {
             let original = std::env::var(key).ok();
             // SAFETY: test-only, single-threaded test runner
@@ -584,6 +585,7 @@ async fn int_ts_10_env_sanitization_excludes_api_keys() {
     }
 
     impl Drop for EnvGuard {
+        #[allow(unsafe_code)]
         fn drop(&mut self) {
             // SAFETY: test-only, single-threaded test runner
             unsafe {
