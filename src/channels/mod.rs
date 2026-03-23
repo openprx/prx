@@ -14,6 +14,8 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
@@ -927,7 +929,7 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     }
 
     let keep_from = turns.len().saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    let mut compacted = normalize_cached_channel_turns(turns[keep_from..].to_vec());
+    let mut compacted = normalize_cached_channel_turns(turns.get(keep_from..).map(|s| s.to_vec()).unwrap_or_default());
 
     for turn in &mut compacted {
         if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {

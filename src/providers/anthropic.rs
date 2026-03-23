@@ -830,6 +830,7 @@ impl Provider for AnthropicProvider {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 impl AnthropicProvider {
     fn credential(&self) -> Option<String> {
@@ -837,6 +838,7 @@ impl AnthropicProvider {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

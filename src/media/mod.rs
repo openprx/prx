@@ -83,7 +83,12 @@ async fn transcribe_ollama(path: &str, config: &MediaConfig) -> Option<String> {
     }
 
     let json: serde_json::Value = resp.json().await.ok()?;
-    let text = json["message"]["content"].as_str()?.trim().to_string();
+    let text = json
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
     if text.is_empty() { None } else { Some(text) }
 }
 

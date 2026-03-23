@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
@@ -850,7 +852,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
             // Add message_thread_id for forum topic support
             if let Some(tid) = thread_id {
-                markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+                if let Some(m) = markdown_body.as_object_mut() {
+                    m.insert(
+                        "message_thread_id".to_string(),
+                        serde_json::Value::String(tid.to_string()),
+                    );
+                }
             }
 
             let markdown_resp = self
@@ -881,7 +888,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
             // Add message_thread_id for forum topic support
             if let Some(tid) = thread_id {
-                plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+                if let Some(m) = plain_body.as_object_mut() {
+                    m.insert(
+                        "message_thread_id".to_string(),
+                        serde_json::Value::String(tid.to_string()),
+                    );
+                }
             }
             let plain_resp = self
                 .http_client()
@@ -922,14 +934,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let mut body = serde_json::json!({
             "chat_id": chat_id,
         });
-        body[media_field] = serde_json::Value::String(url.to_string());
-
-        if let Some(tid) = thread_id {
-            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
-        }
-
-        if let Some(cap) = caption {
-            body["caption"] = serde_json::Value::String(cap.to_string());
+        if let Some(m) = body.as_object_mut() {
+            m.insert(media_field.to_string(), serde_json::Value::String(url.to_string()));
+            if let Some(tid) = thread_id {
+                m.insert(
+                    "message_thread_id".to_string(),
+                    serde_json::Value::String(tid.to_string()),
+                );
+            }
+            if let Some(cap) = caption {
+                m.insert("caption".to_string(), serde_json::Value::String(cap.to_string()));
+            }
         }
 
         let resp = self.http_client().post(self.api_url(method)).json(&body).send().await?;
@@ -1257,12 +1272,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             "document": url
         });
 
-        if let Some(tid) = thread_id {
-            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
-        }
-
-        if let Some(cap) = caption {
-            body["caption"] = serde_json::Value::String(cap.to_string());
+        if let Some(m) = body.as_object_mut() {
+            if let Some(tid) = thread_id {
+                m.insert(
+                    "message_thread_id".to_string(),
+                    serde_json::Value::String(tid.to_string()),
+                );
+            }
+            if let Some(cap) = caption {
+                m.insert("caption".to_string(), serde_json::Value::String(cap.to_string()));
+            }
         }
 
         let resp = self
@@ -1294,12 +1313,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             "photo": url
         });
 
-        if let Some(tid) = thread_id {
-            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
-        }
-
-        if let Some(cap) = caption {
-            body["caption"] = serde_json::Value::String(cap.to_string());
+        if let Some(m) = body.as_object_mut() {
+            if let Some(tid) = thread_id {
+                m.insert(
+                    "message_thread_id".to_string(),
+                    serde_json::Value::String(tid.to_string()),
+                );
+            }
+            if let Some(cap) = caption {
+                m.insert("caption".to_string(), serde_json::Value::String(cap.to_string()));
+            }
         }
 
         let resp = self
@@ -1382,7 +1405,12 @@ impl Channel for TelegramChannel {
             "text": initial_text,
         });
         if let Some(tid) = thread_id {
-            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+            if let Some(m) = body.as_object_mut() {
+                m.insert(
+                    "message_thread_id".to_string(),
+                    serde_json::Value::String(tid.to_string()),
+                );
+            }
         }
 
         let resp = self.client.post(self.api_url("sendMessage")).json(&body).send().await?;

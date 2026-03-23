@@ -5,6 +5,7 @@
 //! - Gateway auth (bearer token rejection), body size limits, HMAC verification, rate limiting
 //!
 //! Each test uses mock providers and isolated state; no real LLM or network calls.
+#![allow(clippy::expect_used)]
 
 use anyhow::Result;
 use async_trait::async_trait;

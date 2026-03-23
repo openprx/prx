@@ -66,9 +66,16 @@ const BAD_PATTERNS: &[&str] = &["malware", "exploit", "hack", "crack", "keygen",
 /// Check if `haystack` contains `word` as a whole word (bounded by non-alphanumeric chars).
 fn contains_word(haystack: &str, word: &str) -> bool {
     for (i, _) in haystack.match_indices(word) {
-        let before_ok = i == 0 || !haystack.as_bytes()[i - 1].is_ascii_alphanumeric();
+        let before_ok = i == 0
+            || haystack
+                .as_bytes()
+                .get(i - 1)
+                .map_or(true, |b| !b.is_ascii_alphanumeric());
         let after = i + word.len();
-        let after_ok = after >= haystack.len() || !haystack.as_bytes()[after].is_ascii_alphanumeric();
+        let after_ok = haystack
+            .as_bytes()
+            .get(after)
+            .map_or(true, |b| !b.is_ascii_alphanumeric());
         if before_ok && after_ok {
             return true;
         }

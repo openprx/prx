@@ -303,6 +303,9 @@ fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
     }
 
     let mut octets = [0_u8; 4];
+    // SAFETY: parts.len() == 4 (checked above) and octets has 4 elements,
+    // so i is always 0..3
+    #[allow(clippy::indexing_slicing)]
     for (i, part) in parts.iter().enumerate() {
         octets[i] = part.parse::<u8>().ok()?;
     }

@@ -224,6 +224,7 @@ impl Channel for WhatsAppChannel {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

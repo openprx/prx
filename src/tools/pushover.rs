@@ -206,6 +206,7 @@ impl Tool for PushoverTool {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -257,6 +257,7 @@ fn read_toml_file(path: &Path) -> Result<Value> {
     Ok(value)
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -460,6 +460,7 @@ pub fn all_tools_with_runtime_ext(
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

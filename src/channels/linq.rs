@@ -369,6 +369,7 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
     mac.verify_slice(&provided).is_ok()
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

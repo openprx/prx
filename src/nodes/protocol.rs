@@ -187,6 +187,7 @@ pub struct MetricsResult {
     pub uptime_seconds: Option<u64>,
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

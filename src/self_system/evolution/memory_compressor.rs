@@ -41,24 +41,24 @@ impl Default for EmbeddingSimilarityDetector {
 impl SimilarityDetector for EmbeddingSimilarityDetector {
     async fn detect_redundant_ids(&self, entries: &[MemoryEntry]) -> Result<Vec<String>> {
         let mut redundant = HashSet::new();
-        for i in 0..entries.len() {
-            if redundant.contains(&entries[i].id) {
+        for (i, entry_i) in entries.iter().enumerate() {
+            if redundant.contains(&entry_i.id) {
                 continue;
             }
-            for j in (i + 1)..entries.len() {
-                if redundant.contains(&entries[j].id) {
+            for entry_j in entries.iter().skip(i + 1) {
+                if redundant.contains(&entry_j.id) {
                     continue;
                 }
 
-                let similarity = entry_similarity(&entries[i], &entries[j]);
+                let similarity = entry_similarity(entry_i, entry_j);
                 if similarity <= self.threshold {
                     continue;
                 }
 
-                if should_keep_left(&entries[i], &entries[j]) {
-                    redundant.insert(entries[j].id.clone());
+                if should_keep_left(entry_i, entry_j) {
+                    redundant.insert(entry_j.id.clone());
                 } else {
-                    redundant.insert(entries[i].id.clone());
+                    redundant.insert(entry_i.id.clone());
                 }
             }
         }

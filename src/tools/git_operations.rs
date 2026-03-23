@@ -159,7 +159,10 @@ impl GitOperationsTool {
                 }
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 4 {
-                    current_file = parts[3].trim_start_matches("b/").to_string();
+                    // SAFETY: bounds checked above (len >= 4)
+                    #[allow(clippy::indexing_slicing)]
+                    let p3 = parts[3];
+                    current_file = p3.trim_start_matches("b/").to_string();
                     current_hunk.insert("file".to_string(), json!(current_file));
                 }
             } else if line.starts_with("@@ ") {
@@ -219,6 +222,8 @@ impl GitOperationsTool {
         for line in output.lines() {
             let parts: Vec<&str> = line.split('|').collect();
             if parts.len() >= 5 {
+                // SAFETY: bounds checked above (len >= 5)
+                #[allow(clippy::indexing_slicing)]
                 commits.push(json!({
                     "hash": parts[0],
                     "author": parts[1],
@@ -351,6 +356,8 @@ impl GitOperationsTool {
             anyhow::bail!("Invalid branch specification");
         }
 
+        // SAFETY: sanitized is non-empty (checked above)
+        #[allow(clippy::indexing_slicing)]
         let branch_name = &sanitized[0];
 
         // Block dangerous branch names

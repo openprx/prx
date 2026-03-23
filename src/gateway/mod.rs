@@ -7,6 +7,8 @@
 //! - Request timeouts (configurable) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 mod api;
 mod ui;
 
@@ -1791,7 +1793,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
-        let prom = Arc::new(crate::observability::PrometheusObserver::new());
+        let prom = Arc::new(crate::observability::PrometheusObserver::try_new().unwrap());
         crate::observability::Observer::record_event(
             prom.as_ref(),
             &crate::observability::ObserverEvent::HeartbeatTick,

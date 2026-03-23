@@ -98,6 +98,8 @@ impl MemoryEvolutionEngine {
                 ),
             ];
             let index = candidate.evidence_ids.len() % choices.len();
+            // SAFETY: index = N % choices.len() is always < choices.len()
+            #[allow(clippy::indexing_slicing)]
             let (key, value) = choices[index];
             let after = mutate_numeric(value, candidate, key);
             return MutationPlan {
@@ -126,6 +128,8 @@ impl MemoryEvolutionEngine {
             ("memory.retrieval_fusion.metadata", cfg.memory.retrieval_fusion.metadata),
         ];
         let index = candidate.evidence_ids.len() % fusion_choices.len();
+        // SAFETY: index = N % fusion_choices.len() is always < fusion_choices.len()
+        #[allow(clippy::indexing_slicing)]
         let (key, value) = fusion_choices[index];
         MutationPlan {
             key: key.to_string(),

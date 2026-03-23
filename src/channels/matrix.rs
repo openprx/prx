@@ -29,6 +29,7 @@ pub struct MatrixChannel {
     http_client: Client,
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct SyncResponse {
@@ -37,6 +38,7 @@ struct SyncResponse {
     rooms: Rooms,
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 #[derive(Debug, Deserialize, Default)]
 struct Rooms {
@@ -44,6 +46,7 @@ struct Rooms {
     join: std::collections::HashMap<String, JoinedRoom>,
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct JoinedRoom {
@@ -51,6 +54,7 @@ struct JoinedRoom {
     timeline: Timeline,
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 #[derive(Debug, Deserialize, Default)]
 struct Timeline {
@@ -58,6 +62,7 @@ struct Timeline {
     events: Vec<TimelineEvent>,
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct TimelineEvent {
@@ -70,6 +75,7 @@ struct TimelineEvent {
     content: EventContent,
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 #[derive(Debug, Deserialize, Default)]
 struct EventContent {
@@ -157,6 +163,7 @@ impl MatrixChannel {
         format!("Bearer {}", self.access_token)
     }
 
+    #[allow(clippy::indexing_slicing)]
     #[cfg(test)]
     fn is_user_allowed(&self, sender: &str) -> bool {
         Self::is_sender_allowed(&self.allowed_users, sender)
@@ -170,6 +177,7 @@ impl MatrixChannel {
         allowed_users.iter().any(|u| u.eq_ignore_ascii_case(sender))
     }
 
+    #[allow(clippy::indexing_slicing)]
     #[cfg(test)]
     fn is_supported_message_type(msgtype: &str) -> bool {
         matches!(msgtype, "m.text" | "m.notice")
@@ -422,6 +430,7 @@ impl MatrixChannel {
         Ok(())
     }
 
+    #[allow(clippy::indexing_slicing)]
     #[cfg(test)]
     fn sync_filter_for_room(room_id: &str, timeline_limit: usize) -> String {
         let timeline_limit = timeline_limit.max(1);
@@ -633,6 +642,7 @@ impl Channel for MatrixChannel {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

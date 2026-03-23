@@ -33,6 +33,10 @@ struct WasmToolInner {
     instance: wasmtime::component::Instance,
 }
 
+// SAFETY: All results[N] accesses index a Vec that was just constructed with
+// the correct number of elements (e.g. `vec![Val::Bool(false); 1]`),
+// so the index is always valid.
+#[allow(clippy::indexing_slicing)]
 impl WasmToolAdapter {
     /// Create a new WasmToolAdapter by instantiating the WASM component.
     ///
@@ -469,6 +473,8 @@ impl Tool for WasmToolAdapter {
     }
 }
 
+// SAFETY: results[0] accesses a Vec constructed with exactly 1 element
+#[allow(clippy::indexing_slicing)]
 impl WasmToolAdapter {
     async fn execute_inner(&self, args_str: &str) -> Result<ToolResult, PluginError> {
         let mut inner = self.inner.lock().await;

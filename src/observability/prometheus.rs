@@ -29,92 +29,92 @@ pub struct PrometheusObserver {
 }
 
 impl PrometheusObserver {
-    pub fn new() -> Self {
+    pub fn try_new() -> anyhow::Result<Self> {
         let registry = Registry::new();
 
         let agent_starts = IntCounterVec::new(
             prometheus::Opts::new("prx_agent_starts_total", "Total agent invocations"),
             &["provider", "model"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create agent_starts metric: {e}"))?;
 
         let tool_calls = IntCounterVec::new(
             prometheus::Opts::new("prx_tool_calls_total", "Total tool calls"),
             &["tool", "success"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create tool_calls metric: {e}"))?;
         let tool_batches = IntCounterVec::new(
             prometheus::Opts::new("prx_tool_batches_total", "Total read-only tool batches"),
             &["rollout_stage"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create tool_batches metric: {e}"))?;
         let tool_timeouts = IntCounterVec::new(
             prometheus::Opts::new("prx_tool_timeouts_total", "Total tool timeouts"),
             &["rollout_stage"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create tool_timeouts metric: {e}"))?;
         let tool_cancellations = IntCounterVec::new(
             prometheus::Opts::new("prx_tool_cancellations_total", "Total tool cancellations"),
             &["rollout_stage"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create tool_cancellations metric: {e}"))?;
         let tool_degrades = IntCounterVec::new(
             prometheus::Opts::new("prx_tool_degrades_total", "Total scheduler degradations"),
             &["rollout_stage"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create tool_degrades metric: {e}"))?;
         let tool_rollbacks = IntCounterVec::new(
             prometheus::Opts::new("prx_tool_rollbacks_total", "Total scheduler rollbacks"),
             &["rollout_stage"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create tool_rollbacks metric: {e}"))?;
 
         let channel_messages = IntCounterVec::new(
             prometheus::Opts::new("prx_channel_messages_total", "Total channel messages"),
             &["channel", "direction"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create channel_messages metric: {e}"))?;
 
-        let heartbeat_ticks =
-            prometheus::IntCounter::new("prx_heartbeat_ticks_total", "Total heartbeat ticks").expect("valid metric");
+        let heartbeat_ticks = prometheus::IntCounter::new("prx_heartbeat_ticks_total", "Total heartbeat ticks")
+            .map_err(|e| anyhow::anyhow!("failed to create heartbeat_ticks metric: {e}"))?;
 
         let errors = IntCounterVec::new(
             prometheus::Opts::new("prx_errors_total", "Total errors by component"),
             &["component"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create errors metric: {e}"))?;
 
         let agent_duration = HistogramVec::new(
             HistogramOpts::new("prx_agent_duration_seconds", "Agent invocation duration in seconds")
                 .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
             &["provider", "model"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create agent_duration metric: {e}"))?;
 
         let tool_duration = HistogramVec::new(
             HistogramOpts::new("prx_tool_duration_seconds", "Tool execution duration in seconds")
                 .buckets(vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]),
             &["tool"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create tool_duration metric: {e}"))?;
 
         let request_latency = Histogram::with_opts(
             HistogramOpts::new("prx_request_latency_seconds", "Request latency in seconds")
                 .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create request_latency metric: {e}"))?;
 
-        let tokens_used =
-            prometheus::IntGauge::new("prx_tokens_used_last", "Tokens used in the last request").expect("valid metric");
+        let tokens_used = prometheus::IntGauge::new("prx_tokens_used_last", "Tokens used in the last request")
+            .map_err(|e| anyhow::anyhow!("failed to create tokens_used metric: {e}"))?;
 
         let active_sessions = GaugeVec::new(
             prometheus::Opts::new("prx_active_sessions", "Number of active sessions"),
             &[],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create active_sessions metric: {e}"))?;
 
-        let queue_depth =
-            GaugeVec::new(prometheus::Opts::new("prx_queue_depth", "Message queue depth"), &[]).expect("valid metric");
+        let queue_depth = GaugeVec::new(prometheus::Opts::new("prx_queue_depth", "Message queue depth"), &[])
+            .map_err(|e| anyhow::anyhow!("failed to create queue_depth metric: {e}"))?;
 
         // Register all metrics
         registry.register(Box::new(agent_starts.clone())).ok();
@@ -134,7 +134,7 @@ impl PrometheusObserver {
         registry.register(Box::new(active_sessions.clone())).ok();
         registry.register(Box::new(queue_depth.clone())).ok();
 
-        Self {
+        Ok(Self {
             registry,
             agent_starts,
             tool_calls,
@@ -152,7 +152,7 @@ impl PrometheusObserver {
             tokens_used,
             active_sessions,
             queue_depth,
-        }
+        })
     }
 
     /// Encode all registered metrics into Prometheus text exposition format.
@@ -268,12 +268,12 @@ mod tests {
 
     #[test]
     fn prometheus_observer_name() {
-        assert_eq!(PrometheusObserver::new().name(), "prometheus");
+        assert_eq!(PrometheusObserver::try_new().unwrap().name(), "prometheus");
     }
 
     #[test]
     fn records_all_events_without_panic() {
-        let obs = PrometheusObserver::new();
+        let obs = PrometheusObserver::try_new().unwrap();
         obs.record_event(&ObserverEvent::AgentStart {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn records_all_metrics_without_panic() {
-        let obs = PrometheusObserver::new();
+        let obs = PrometheusObserver::try_new().unwrap();
         obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_secs(2)));
         obs.record_metric(&ObserverMetric::TokensUsed(500));
         obs.record_metric(&ObserverMetric::TokensUsed(0));
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn encode_produces_prometheus_text_format() {
-        let obs = PrometheusObserver::new();
+        let obs = PrometheusObserver::try_new().unwrap();
         obs.record_event(&ObserverEvent::AgentStart {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn counters_increment_correctly() {
-        let obs = PrometheusObserver::new();
+        let obs = PrometheusObserver::try_new().unwrap();
 
         for _ in 0..3 {
             obs.record_event(&ObserverEvent::HeartbeatTick);
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn tool_calls_track_success_and_failure_separately() {
-        let obs = PrometheusObserver::new();
+        let obs = PrometheusObserver::try_new().unwrap();
 
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn errors_track_by_component() {
-        let obs = PrometheusObserver::new();
+        let obs = PrometheusObserver::try_new().unwrap();
         obs.record_event(&ObserverEvent::Error {
             component: "provider".into(),
             message: "timeout".into(),
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn gauge_reflects_latest_value() {
-        let obs = PrometheusObserver::new();
+        let obs = PrometheusObserver::try_new().unwrap();
         obs.record_metric(&ObserverMetric::TokensUsed(100));
         obs.record_metric(&ObserverMetric::TokensUsed(200));
 

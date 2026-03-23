@@ -2,7 +2,12 @@ use super::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+#[allow(clippy::expect_used)]
+static RE_STRIP_TAGS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<[^>]+>").expect("BUG: invalid hardcoded strip-tags regex"));
 
 /// Web search tool for searching the internet.
 /// Supports multiple providers: DuckDuckGo (free), Brave (requires API key).
@@ -61,17 +66,16 @@ impl WebSearchTool {
 
         let count = link_matches.len().min(self.max_results);
 
-        for i in 0..count {
-            let caps = &link_matches[i];
-            let url_str = decode_ddg_redirect_url(&caps[1]);
-            let title = strip_tags(&caps[2]);
+        for (i, caps) in link_matches.iter().take(count).enumerate() {
+            let url_str = decode_ddg_redirect_url(caps.get(1).map(|m| m.as_str()).unwrap_or(""));
+            let title = strip_tags(caps.get(2).map(|m| m.as_str()).unwrap_or(""));
 
             lines.push(format!("{}. {}", i + 1, title.trim()));
             lines.push(format!("   {}", url_str.trim()));
 
             // Add snippet if available
-            if i < snippet_matches.len() {
-                let snippet = strip_tags(&snippet_matches[i][1]);
+            if let Some(snippet_caps) = snippet_matches.get(i) {
+                let snippet = strip_tags(snippet_caps.get(1).map(|m| m.as_str()).unwrap_or(""));
                 let snippet = snippet.trim();
                 if !snippet.is_empty() {
                     lines.push(format!("   {}", snippet));
@@ -155,8 +159,7 @@ fn decode_ddg_redirect_url(raw_url: &str) -> String {
 }
 
 fn strip_tags(content: &str) -> String {
-    let re = Regex::new(r"<[^>]+>").expect("compile regex: strip HTML tags");
-    re.replace_all(content, "").to_string()
+    RE_STRIP_TAGS.replace_all(content, "").to_string()
 }
 
 #[async_trait]
@@ -211,6 +214,7 @@ impl Tool for WebSearchTool {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

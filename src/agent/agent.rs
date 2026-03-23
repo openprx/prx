@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
@@ -603,7 +605,9 @@ impl Agent {
         });
 
         if let Some(model) = sub_agent_model.map(str::trim).filter(|value| !value.is_empty()) {
-            args["model"] = serde_json::Value::String(model.to_string());
+            if let Some(m) = args.as_object_mut() {
+                m.insert("model".to_string(), serde_json::Value::String(model.to_string()));
+            }
         }
 
         let result = tool.execute_named("sessions_spawn", args).await?;

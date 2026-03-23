@@ -100,6 +100,7 @@ pub fn snapshot_json() -> serde_json::Value {
     })
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

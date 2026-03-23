@@ -109,6 +109,7 @@ impl Tool for MemoryRecallTool {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

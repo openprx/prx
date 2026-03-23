@@ -1232,13 +1232,16 @@ impl Tool for AllowedToolProxy {
     async fn execute(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if self.public_name == "memory_store" {
             if let Some(prefix) = &self.memory_prefix {
-                if let Some(key) = args
+                let new_key = args
                     .get("key")
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|k| !k.is_empty())
-                {
-                    args["key"] = serde_json::Value::String(memory_key_prefix(prefix, key));
+                    .map(|key| memory_key_prefix(prefix, key));
+                if let Some(new_key) = new_key {
+                    if let Some(m) = args.as_object_mut() {
+                        m.insert("key".to_string(), serde_json::Value::String(new_key));
+                    }
                 }
             }
         }

@@ -404,6 +404,7 @@ fn parse_timestamp_utc(raw: &str) -> Option<DateTime<Utc>> {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

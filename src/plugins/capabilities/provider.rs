@@ -33,6 +33,9 @@ struct WasmProviderInner {
     instance: wasmtime::component::Instance,
 }
 
+// SAFETY: All results[N] accesses index a Vec that was just constructed with
+// the correct number of elements, so the index is always valid.
+#[allow(clippy::indexing_slicing)]
 impl WasmProvider {
     /// Create a new `WasmProvider` from a compiled WASM component.
     ///
@@ -355,6 +358,7 @@ impl Provider for WasmProvider {
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

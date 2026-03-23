@@ -80,6 +80,7 @@ pub trait Tool: Send + Sync {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

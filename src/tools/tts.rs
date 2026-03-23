@@ -95,7 +95,7 @@ impl Tool for TtsTool {
             });
         }
 
-        let text = match args["text"].as_str() {
+        let text = match args.get("text").and_then(|v| v.as_str()) {
             Some(t) if !t.is_empty() => t.to_owned(),
             _ => {
                 return Ok(ToolResult {
@@ -106,7 +106,10 @@ impl Tool for TtsTool {
             }
         };
 
-        let voice = args["voice"].as_str().unwrap_or("zh-CN-YunxiNeural");
+        let voice = args
+            .get("voice")
+            .and_then(|v| v.as_str())
+            .unwrap_or("zh-CN-YunxiNeural");
 
         // Validate voice name: only allow alphanumeric, hyphens, underscores, spaces,
         // and dots (e.g. "zh-CN-YunxiNeural", "en-US-AriaNeural").
@@ -131,7 +134,12 @@ impl Tool for TtsTool {
 
         // Resolve recipient
         let default = self.default_recipient.read().await.clone();
-        let recipient = match args["target"].as_str().map(str::to_owned).or(default) {
+        let recipient = match args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or(default)
+        {
             Some(r) if !r.is_empty() => r,
             _ => {
                 return Ok(ToolResult {
@@ -191,6 +199,7 @@ impl Tool for TtsTool {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

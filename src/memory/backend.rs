@@ -106,6 +106,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

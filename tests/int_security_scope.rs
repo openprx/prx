@@ -5,6 +5,7 @@
 //! SecurityPolicy scope rules, PairingGuard brute-force protection,
 //! scope-injection stripping in Agent::execute_tool_call, reserved memory
 //! namespace enforcement, and concurrent SQLite memory safety.
+#![allow(clippy::indexing_slicing)]
 
 use openprx::config::ScopeRule;
 use openprx::memory::sqlite::SqliteMemory;

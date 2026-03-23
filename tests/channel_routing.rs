@@ -6,6 +6,7 @@
 //! Tests that ChannelMessage fields are used consistently and that the
 //! SendMessage → Channel trait contract preserves correct identity semantics.
 //! Verifies sender/reply_target field contracts to prevent field swaps.
+#![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
 use async_trait::async_trait;
 use openprx::channels::traits::{Channel, ChannelMessage, SendMessage};

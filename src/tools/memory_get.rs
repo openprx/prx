@@ -453,12 +453,13 @@ fn render_range(label: &str, content: &str, from: usize, requested_lines: usize)
     }
 
     let mut output = format!("{label} lines {}-{}:\n", start_idx + 1, end_idx);
-    for (line_no, line_text) in lines[start_idx..end_idx].iter().enumerate() {
+    for (line_no, line_text) in lines.get(start_idx..end_idx).unwrap_or_default().iter().enumerate() {
         let _ = writeln!(output, "{:>6}: {}", start_idx + line_no + 1, line_text);
     }
     output
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

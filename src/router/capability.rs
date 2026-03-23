@@ -236,6 +236,7 @@ async fn load_latency_snapshot(memory: &dyn Memory, model_id: &str) -> Option<Ro
         .and_then(|entry| serde_json::from_str::<RouterLatencySnapshot>(&entry.content).ok())
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

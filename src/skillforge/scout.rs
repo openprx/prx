@@ -79,11 +79,15 @@ impl GitHubScout {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::ACCEPT,
-            "application/vnd.github+json".parse().expect("valid header"),
+            "application/vnd.github+json"
+                .parse()
+                .map_err(|e| anyhow::anyhow!("failed to parse Accept header: {e}"))?,
         );
         headers.insert(
             reqwest::header::USER_AGENT,
-            "OpenPRX-SkillForge/0.1".parse().expect("valid header"),
+            "OpenPRX-SkillForge/0.1"
+                .parse()
+                .map_err(|e| anyhow::anyhow!("failed to parse User-Agent header: {e}"))?,
         );
         if let Some(ref t) = token {
             if let Ok(val) = format!("Bearer {t}").parse() {
@@ -229,6 +233,7 @@ pub fn dedup(results: &mut Vec<ScoutResult>) {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

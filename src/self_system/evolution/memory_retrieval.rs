@@ -216,6 +216,7 @@ fn estimate_tokens(content: &str) -> usize {
     chars.div_ceil(4)
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

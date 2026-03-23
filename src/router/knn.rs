@@ -171,6 +171,7 @@ pub(crate) fn weighted_model_score(neighbors: &[(String, f32)], model_id: &str) 
     (model_weight / total_weight).clamp(0.0, 1.0)
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

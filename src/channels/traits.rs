@@ -1,4 +1,11 @@
 use async_trait::async_trait;
+use std::sync::LazyLock;
+
+#[allow(clippy::expect_used)]
+static RE_OUTGOING_MEDIA: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\[(IMAGE|DOCUMENT|AUDIO|VOICE|VIDEO):([^\]]+)\]")
+        .expect("BUG: invalid hardcoded outgoing media tag regex")
+});
 
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
@@ -192,10 +199,8 @@ pub struct ChannelCapabilities {
 /// assert_eq!(media, vec![("IMAGE".to_string(), "/tmp/cat.png".to_string())]);
 /// ```
 pub fn extract_outgoing_media(text: &str) -> (String, Vec<(String, String)>) {
-    let re = regex::Regex::new(r"\[(IMAGE|DOCUMENT|AUDIO|VOICE|VIDEO):([^\]]+)\]")
-        .expect("compile regex: outgoing media tag pattern");
     let mut media = Vec::new();
-    let clean = re
+    let clean = RE_OUTGOING_MEDIA
         .replace_all(text, |caps: &regex::Captures| {
             media.push((caps[1].to_string(), caps[2].to_string()));
             String::new()

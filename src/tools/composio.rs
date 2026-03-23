@@ -293,10 +293,14 @@ impl ComposioTool {
         });
 
         if let Some(entity) = entity_id {
-            body["user_id"] = json!(entity);
+            if let Some(m) = body.as_object_mut() {
+                m.insert("user_id".to_string(), json!(entity));
+            }
         }
         if let Some(account_ref) = account_ref {
-            body["connected_account_id"] = json!(account_ref);
+            if let Some(m) = body.as_object_mut() {
+                m.insert("connected_account_id".to_string(), json!(account_ref));
+            }
         }
 
         (url, body)
@@ -346,7 +350,9 @@ impl ComposioTool {
         });
 
         if let Some(entity) = entity_id {
-            body["entityId"] = json!(entity);
+            if let Some(m) = body.as_object_mut() {
+                m.insert("entityId".to_string(), json!(entity));
+            }
         }
 
         let resp = self

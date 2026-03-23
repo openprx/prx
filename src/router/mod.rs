@@ -100,6 +100,7 @@ impl RouterEngine {
         })
     }
 
+    #[allow(clippy::indexing_slicing)]
     #[cfg(test)]
     fn new_with_history(
         config: RouterConfig,
@@ -300,6 +301,9 @@ fn filter_reachable_entries(
         .collect()
 }
 
+// SAFETY: chosen_index and other_index are produced by .position()/.enumerate()
+// on the same `models` slice, so they are always valid indices.
+#[allow(clippy::indexing_slicing)]
 fn apply_outcome_update_locked(
     models: &mut [ModelCapabilityEntry],
     model_id: &str,
@@ -358,6 +362,7 @@ fn estimate_tokens(text: &str) -> usize {
     text.chars().count() / 3 + 100
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

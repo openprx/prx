@@ -72,7 +72,9 @@ impl Channel for SlackChannel {
         });
 
         if let Some(ref ts) = message.thread_ts {
-            body["thread_ts"] = serde_json::json!(ts);
+            if let Some(m) = body.as_object_mut() {
+                m.insert("thread_ts".to_string(), serde_json::json!(ts));
+            }
         }
 
         let resp = self

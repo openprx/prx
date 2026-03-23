@@ -427,6 +427,7 @@ impl Tool for ProxyConfigTool {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

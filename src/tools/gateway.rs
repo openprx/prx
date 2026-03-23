@@ -391,6 +391,7 @@ impl Tool for GatewayTool {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

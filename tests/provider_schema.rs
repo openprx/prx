@@ -6,7 +6,7 @@
 //! Tests request/response serialization to verify required fields are present
 //! for each provider's API specification. Validates ChatMessage, ChatResponse,
 //! ToolCall, and AuthStyle serialization contracts.
-#![allow(clippy::useless_vec)]
+#![allow(clippy::useless_vec, clippy::indexing_slicing)]
 
 use openprx::providers::compatible::AuthStyle;
 use openprx::providers::traits::{ChatMessage, ChatResponse, ToolCall};

@@ -91,6 +91,8 @@ impl StrategyEvolutionEngine {
             bail!("decision policy has no mutable scalar parameter");
         }
         let pivot = worst.map(|item| stable_hash(&item.task_type) as usize).unwrap_or(0);
+        // SAFETY: pivot % scalar_params.len() is always < scalar_params.len(), which is non-empty
+        #[allow(clippy::indexing_slicing)]
         let (path, before_value) = scalar_params[pivot % scalar_params.len()].clone();
         let after_value = match before_value {
             toml::Value::Integer(v) => toml::Value::Integer(mutate_numeric(v as f64, mutation_range).round() as i64),
@@ -384,6 +386,7 @@ fn build_task_daily_summary(decisions: &[DecisionLog]) -> Vec<TaskDailySummary> 
         .collect()
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

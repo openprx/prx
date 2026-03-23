@@ -43,8 +43,10 @@ impl Tunnel for TailscaleTunnel {
             }
 
             let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
-            status["Self"]["DNSName"]
-                .as_str()
+            status
+                .get("Self")
+                .and_then(|s| s.get("DNSName"))
+                .and_then(|v| v.as_str())
                 .unwrap_or("localhost")
                 .trim_end_matches('.')
                 .to_string()

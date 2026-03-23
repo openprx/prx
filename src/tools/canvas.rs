@@ -253,6 +253,7 @@ impl Tool for CanvasTool {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

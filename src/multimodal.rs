@@ -427,6 +427,8 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
         return Some("image/gif");
     }
 
+    // SAFETY: bytes.len() >= 12 is checked in the condition
+    #[allow(clippy::indexing_slicing)]
     if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         return Some("image/webp");
     }
@@ -438,6 +440,7 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

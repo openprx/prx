@@ -6,6 +6,7 @@
 //! Tests agent behavior with malformed tool calls, empty responses,
 //! max iteration limits, and cascading tool failures using mock providers.
 //! Complements inline parse_tool_calls tests in `src/agent/loop_.rs`.
+#![allow(clippy::unwrap_used)]
 
 use anyhow::Result;
 use async_trait::async_trait;

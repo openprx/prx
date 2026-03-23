@@ -30,6 +30,10 @@ struct WasmStorageInner {
     instance: wasmtime::component::Instance,
 }
 
+// SAFETY: All results[N] accesses index a Vec that was just constructed with
+// exactly the right number of elements (e.g. `vec![Val::Bool(false)]`),
+// so the index is always valid.
+#[allow(clippy::indexing_slicing)]
 impl WasmStorage {
     /// Create a new `WasmStorage` from a compiled WASM component.
     ///
@@ -662,6 +666,7 @@ impl crate::memory::traits::Memory for WasmStorage {
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

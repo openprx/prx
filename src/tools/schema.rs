@@ -383,6 +383,8 @@ impl SchemaCleanr {
 
         // If only one variant remains after stripping nulls, return it
         if non_null.len() == 1 {
+            // SAFETY: non_null.len() == 1 (checked above)
+            #[allow(clippy::indexing_slicing)]
             return Some(Self::preserve_meta(obj, non_null[0].clone()));
         }
 
@@ -403,6 +405,8 @@ impl SchemaCleanr {
             }
             // { enum: [null] }
             if let Some(Value::Array(arr)) = obj.get("enum") {
+                // SAFETY: arr.len() == 1 is checked before arr[0]
+                #[allow(clippy::indexing_slicing)]
                 if arr.len() == 1 && matches!(arr[0], Value::Null) {
                     return true;
                 }
@@ -436,6 +440,8 @@ impl SchemaCleanr {
                 const_val.clone()
             } else if let Some(Value::Array(arr)) = obj.get("enum") {
                 if arr.len() == 1 {
+                    // SAFETY: arr.len() == 1 (checked above)
+                    #[allow(clippy::indexing_slicing)]
                     arr[0].clone()
                 } else {
                     return None;
@@ -527,6 +533,7 @@ impl SchemaCleanr {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

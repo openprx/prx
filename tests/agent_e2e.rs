@@ -6,6 +6,7 @@
 //! `src/agent/tests.rs` by running at the integration test boundary.
 //!
 //! Ref: https://github.com/openprx-labs/openprx/issues/618 (item 6)
+#![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
 use anyhow::Result;
 use async_trait::async_trait;

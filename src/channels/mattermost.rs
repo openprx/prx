@@ -346,6 +346,9 @@ fn is_mattermost_username_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
 }
 
+// SAFETY: `index + mention_len <= text_bytes.len()` is the loop guard,
+// so text_bytes[index] and text_bytes[index..index+mention_len] are always valid.
+#[allow(clippy::indexing_slicing)]
 fn find_bot_mention_spans(text: &str, bot_username: &str) -> Vec<(usize, usize)> {
     if bot_username.is_empty() {
         return Vec::new();
