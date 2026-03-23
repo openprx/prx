@@ -73,6 +73,7 @@ impl PrecompileCache {
     ///
     /// On a cache miss, the component is compiled from `wasm_bytes` and the
     /// native artifact is written to disk for future use.
+    #[allow(unsafe_code)]
     pub fn get_or_compile(
         &self,
         engine: &wasmtime::Engine,

@@ -64,8 +64,11 @@ pub struct BrowserTool {
     allowed_domains: Vec<String>,
     session_name: Option<String>,
     backend: String,
+    #[cfg_attr(not(feature = "browser-native"), allow(dead_code))]
     native_headless: bool,
+    #[cfg_attr(not(feature = "browser-native"), allow(dead_code))]
     native_webdriver_url: String,
+    #[cfg_attr(not(feature = "browser-native"), allow(dead_code))]
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
     #[cfg(feature = "browser-native")]

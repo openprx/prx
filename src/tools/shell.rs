@@ -398,6 +398,7 @@ mod tests {
     }
 
     impl EnvGuard {
+        #[allow(unsafe_code)]
         fn set(key: &'static str, value: &str) -> Self {
             let original = std::env::var(key).ok();
             // SAFETY: test-only, single-threaded test runner
@@ -407,6 +408,7 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
+        #[allow(unsafe_code)]
         fn drop(&mut self) {
             // SAFETY: test-only, single-threaded test runner
             unsafe {

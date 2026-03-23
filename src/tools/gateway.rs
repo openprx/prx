@@ -183,6 +183,7 @@ impl Tool for GatewayTool {
         })
     }
 
+    #[allow(unsafe_code)]
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = match args.get("action").and_then(|v| v.as_str()) {
             Some(a) => a,
