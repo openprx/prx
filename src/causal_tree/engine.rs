@@ -74,6 +74,11 @@ impl CausalTreeEngine {
         self.config.enabled
     }
 
+    /// Returns a reference to the engine's configuration.
+    pub fn config(&self) -> &CausalTreeConfig {
+        &self.config
+    }
+
     /// Returns a snapshot of the current accumulated metrics.
     pub fn snapshot_metrics(&self) -> CausalTreeMetrics {
         self.metrics.lock().clone()
