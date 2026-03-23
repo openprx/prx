@@ -338,55 +338,55 @@ pub struct DelegateAgentConfig {
     pub spawn_enabled: Option<bool>,
 }
 
-fn default_max_depth() -> u32 {
+const fn default_max_depth() -> u32 {
     3
 }
 
-fn default_max_tool_iterations() -> usize {
+const fn default_max_tool_iterations() -> usize {
     50
 }
 
-fn default_router_alpha() -> f32 {
+const fn default_router_alpha() -> f32 {
     0.0
 }
 
-fn default_router_beta() -> f32 {
+const fn default_router_beta() -> f32 {
     0.5
 }
 
-fn default_router_gamma() -> f32 {
+const fn default_router_gamma() -> f32 {
     0.3
 }
 
-fn default_router_delta() -> f32 {
+const fn default_router_delta() -> f32 {
     0.1
 }
 
-fn default_router_epsilon() -> f32 {
+const fn default_router_epsilon() -> f32 {
     0.1
 }
 
-fn default_router_knn_min_records() -> usize {
+const fn default_router_knn_min_records() -> usize {
     10
 }
 
-fn default_router_knn_k() -> usize {
+const fn default_router_knn_k() -> usize {
     7
 }
 
-fn default_router_max_context() -> usize {
+const fn default_router_max_context() -> usize {
     128_000
 }
 
-fn default_router_latency() -> u32 {
+const fn default_router_latency() -> u32 {
     2_000
 }
 
-fn default_router_elo() -> f32 {
+const fn default_router_elo() -> f32 {
     1_000.0
 }
 
-fn default_automix_confidence_threshold() -> f32 {
+const fn default_automix_confidence_threshold() -> f32 {
     0.7
 }
 
@@ -548,11 +548,11 @@ pub struct NodesConfig {
     pub server: NodeServerConfig,
 }
 
-fn default_nodes_timeout_ms() -> u64 {
+const fn default_nodes_timeout_ms() -> u64 {
     15_000
 }
 
-fn default_nodes_retry_max() -> u8 {
+const fn default_nodes_retry_max() -> u8 {
     2
 }
 
@@ -607,7 +607,7 @@ impl std::fmt::Debug for RemoteNodeConfig {
     }
 }
 
-fn default_nodes_enabled() -> bool {
+const fn default_nodes_enabled() -> bool {
     true
 }
 
@@ -687,19 +687,19 @@ fn default_node_server_sandbox_root() -> String {
     ".".to_string()
 }
 
-fn default_node_server_exec_timeout_ms() -> u64 {
+const fn default_node_server_exec_timeout_ms() -> u64 {
     15_000
 }
 
-fn default_node_server_max_output_bytes() -> usize {
+const fn default_node_server_max_output_bytes() -> usize {
     1_048_576
 }
 
-fn default_node_server_max_concurrent_tasks() -> usize {
+const fn default_node_server_max_concurrent_tasks() -> usize {
     8
 }
 
-fn default_node_server_task_result_ttl_ms() -> u64 {
+const fn default_node_server_task_result_ttl_ms() -> u64 {
     3_600_000
 }
 
@@ -707,7 +707,7 @@ fn default_node_server_allowed_commands() -> Vec<String> {
     vec!["echo".to_string()]
 }
 
-fn default_node_server_tls_required() -> bool {
+const fn default_node_server_tls_required() -> bool {
     true
 }
 
@@ -882,19 +882,19 @@ fn default_sessions_spawn_mode() -> String {
     "task".to_string()
 }
 
-fn default_sessions_spawn_cleanup_on_complete() -> bool {
+const fn default_sessions_spawn_cleanup_on_complete() -> bool {
     true
 }
 
-fn default_sessions_spawn_max_concurrent() -> usize {
+const fn default_sessions_spawn_max_concurrent() -> usize {
     4
 }
 
-fn default_sessions_spawn_max_spawn_depth() -> usize {
+const fn default_sessions_spawn_max_spawn_depth() -> usize {
     2
 }
 
-fn default_sessions_spawn_max_children_per_agent() -> usize {
+const fn default_sessions_spawn_max_children_per_agent() -> usize {
     5
 }
 
@@ -916,11 +916,11 @@ pub struct SelfSystemConfig {
     pub evolution_interval_hours: u32,
 }
 
-fn default_self_system_fitness_interval_hours() -> u64 {
+const fn default_self_system_fitness_interval_hours() -> u64 {
     24
 }
 
-fn default_self_system_evolution_interval_hours() -> u32 {
+const fn default_self_system_evolution_interval_hours() -> u32 {
     24
 }
 
@@ -935,11 +935,11 @@ impl Default for SelfSystemConfig {
     }
 }
 
-fn default_agent_max_tool_iterations() -> usize {
+const fn default_agent_max_tool_iterations() -> usize {
     50
 }
 
-fn default_agent_max_history_messages() -> usize {
+const fn default_agent_max_history_messages() -> usize {
     50
 }
 
@@ -947,11 +947,11 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
-fn default_read_only_tool_concurrency_window() -> usize {
+const fn default_read_only_tool_concurrency_window() -> usize {
     2
 }
 
-fn default_read_only_tool_timeout_secs() -> u64 {
+const fn default_read_only_tool_timeout_secs() -> u64 {
     30
 }
 
@@ -966,19 +966,19 @@ fn default_concurrency_rollout_stage() -> String {
     "off".to_string()
 }
 
-fn default_concurrency_rollback_threshold() -> f64 {
+const fn default_concurrency_rollback_threshold() -> f64 {
     0.20
 }
 
-fn default_agent_compaction_reserve_tokens() -> usize {
+const fn default_agent_compaction_reserve_tokens() -> usize {
     4096
 }
 
-fn default_agent_compaction_keep_recent_messages() -> usize {
+const fn default_agent_compaction_keep_recent_messages() -> usize {
     12
 }
 
-fn default_agent_compaction_max_context_tokens() -> usize {
+const fn default_agent_compaction_max_context_tokens() -> usize {
     128_000
 }
 
@@ -1050,11 +1050,11 @@ pub struct SkillRagConfig {
     pub top_k: usize,
 }
 
-fn default_skill_rag_enabled() -> bool {
+const fn default_skill_rag_enabled() -> bool {
     true
 }
 
-fn default_skill_rag_top_k() -> usize {
+const fn default_skill_rag_top_k() -> usize {
     5
 }
 
@@ -1081,11 +1081,11 @@ pub struct MultimodalConfig {
     pub allow_remote_fetch: bool,
 }
 
-fn default_multimodal_max_images() -> usize {
+const fn default_multimodal_max_images() -> usize {
     4
 }
 
-fn default_multimodal_max_image_size_mb() -> usize {
+const fn default_multimodal_max_image_size_mb() -> usize {
     5
 }
 
@@ -1157,13 +1157,13 @@ fn default_audio_ollama_url() -> String {
 fn default_video_provider() -> String {
     "none".into()
 }
-fn default_video_max_frames() -> usize {
+const fn default_video_max_frames() -> usize {
     4
 }
-fn default_max_audio_size_mb() -> usize {
+const fn default_max_audio_size_mb() -> usize {
     20
 }
-fn default_max_video_size_mb() -> usize {
+const fn default_max_video_size_mb() -> usize {
     50
 }
 
@@ -1255,15 +1255,15 @@ pub struct ModelPricing {
     pub output: f64,
 }
 
-fn default_daily_limit() -> f64 {
+const fn default_daily_limit() -> f64 {
     10.0
 }
 
-fn default_monthly_limit() -> f64 {
+const fn default_monthly_limit() -> f64 {
     100.0
 }
 
-fn default_warn_percent() -> u8 {
+const fn default_warn_percent() -> u8 {
     80
 }
 
@@ -1412,7 +1412,7 @@ pub struct GatewayConfig {
     pub request_timeout_secs: u64,
 }
 
-fn default_gateway_port() -> u16 {
+const fn default_gateway_port() -> u16 {
     16830
 }
 
@@ -1420,35 +1420,35 @@ fn default_gateway_host() -> String {
     "127.0.0.1".into()
 }
 
-fn default_pair_rate_limit() -> u32 {
+const fn default_pair_rate_limit() -> u32 {
     10
 }
 
-fn default_webhook_rate_limit() -> u32 {
+const fn default_webhook_rate_limit() -> u32 {
     60
 }
 
-fn default_api_rate_limit() -> u32 {
+const fn default_api_rate_limit() -> u32 {
     60
 }
 
-fn default_idempotency_ttl_secs() -> u64 {
+const fn default_idempotency_ttl_secs() -> u64 {
     300
 }
 
-fn default_gateway_rate_limit_max_keys() -> usize {
+const fn default_gateway_rate_limit_max_keys() -> usize {
     10_000
 }
 
-fn default_gateway_idempotency_max_keys() -> usize {
+const fn default_gateway_idempotency_max_keys() -> usize {
     10_000
 }
 
-fn default_gateway_request_timeout_secs() -> u64 {
+const fn default_gateway_request_timeout_secs() -> u64 {
     60
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -1602,11 +1602,11 @@ pub struct McpServerConfig {
     pub deny_tools: Vec<String>,
 }
 
-fn default_mcp_startup_timeout_ms() -> u64 {
+const fn default_mcp_startup_timeout_ms() -> u64 {
     10_000
 }
 
-fn default_mcp_request_timeout_ms() -> u64 {
+const fn default_mcp_request_timeout_ms() -> u64 {
     30_000
 }
 
@@ -1702,7 +1702,7 @@ fn default_browser_computer_use_endpoint() -> String {
     "http://127.0.0.1:8787/v1/actions".into()
 }
 
-fn default_browser_computer_use_timeout_ms() -> u64 {
+const fn default_browser_computer_use_timeout_ms() -> u64 {
     15_000
 }
 
@@ -1795,11 +1795,11 @@ pub struct HttpRequestConfig {
     pub timeout_secs: u64,
 }
 
-fn default_http_max_response_size() -> usize {
+const fn default_http_max_response_size() -> usize {
     1_000_000 // 1MB
 }
 
-fn default_http_timeout_secs() -> u64 {
+const fn default_http_timeout_secs() -> u64 {
     30
 }
 
@@ -1835,19 +1835,19 @@ fn default_web_search_provider() -> String {
     "duckduckgo".into()
 }
 
-fn default_web_search_max_results() -> usize {
+const fn default_web_search_max_results() -> usize {
     5
 }
 
-fn default_web_search_timeout_secs() -> u64 {
+const fn default_web_search_timeout_secs() -> u64 {
     15
 }
 
-fn default_web_fetch_enabled() -> bool {
+const fn default_web_fetch_enabled() -> bool {
     true
 }
 
-fn default_web_fetch_max_chars() -> usize {
+const fn default_web_fetch_max_chars() -> usize {
     10_000
 }
 
@@ -1921,11 +1921,11 @@ impl Default for ProxyConfig {
 }
 
 impl ProxyConfig {
-    pub fn supported_service_keys() -> &'static [&'static str] {
+    pub const fn supported_service_keys() -> &'static [&'static str] {
         SUPPORTED_PROXY_SERVICE_KEYS
     }
 
-    pub fn supported_service_selectors() -> &'static [&'static str] {
+    pub const fn supported_service_selectors() -> &'static [&'static str] {
         SUPPORTED_PROXY_SERVICE_SELECTORS
     }
 
@@ -2477,37 +2477,37 @@ pub struct MemoryConfig {
 fn default_embedding_provider() -> String {
     "none".into()
 }
-fn default_hygiene_enabled() -> bool {
+const fn default_hygiene_enabled() -> bool {
     true
 }
-fn default_archive_after_days() -> u32 {
+const fn default_archive_after_days() -> u32 {
     7
 }
-fn default_purge_after_days() -> u32 {
+const fn default_purge_after_days() -> u32 {
     30
 }
-fn default_conversation_retention_days() -> u32 {
+const fn default_conversation_retention_days() -> u32 {
     3
 }
-fn default_daily_retention_days() -> u32 {
+const fn default_daily_retention_days() -> u32 {
     7
 }
 fn default_embedding_model() -> String {
     "text-embedding-3-small".into()
 }
-fn default_embedding_dims() -> usize {
+const fn default_embedding_dims() -> usize {
     1536
 }
-fn default_vector_weight() -> f64 {
+const fn default_vector_weight() -> f64 {
     0.7
 }
-fn default_keyword_weight() -> f64 {
+const fn default_keyword_weight() -> f64 {
     0.3
 }
-fn default_min_relevance_score() -> f64 {
+const fn default_min_relevance_score() -> f64 {
     0.4
 }
-fn default_cache_size() -> usize {
+const fn default_cache_size() -> usize {
     10_000
 }
 
@@ -2704,7 +2704,7 @@ fn default_auto_approve() -> Vec<String> {
     vec!["file_read".into(), "memory_recall".into()]
 }
 
-fn default_always_ask() -> Vec<String> {
+const fn default_always_ask() -> Vec<String> {
     vec![]
 }
 
@@ -2823,11 +2823,11 @@ fn default_docker_network() -> String {
     "none".into()
 }
 
-fn default_docker_memory_limit_mb() -> Option<u64> {
+const fn default_docker_memory_limit_mb() -> Option<u64> {
     Some(512)
 }
 
-fn default_docker_cpu_limit() -> Option<f64> {
+const fn default_docker_cpu_limit() -> Option<f64> {
     Some(1.0)
 }
 
@@ -2893,27 +2893,27 @@ pub struct ReliabilityConfig {
     pub scheduler_retries: u32,
 }
 
-fn default_provider_retries() -> u32 {
+const fn default_provider_retries() -> u32 {
     2
 }
 
-fn default_provider_backoff_ms() -> u64 {
+const fn default_provider_backoff_ms() -> u64 {
     500
 }
 
-fn default_channel_backoff_secs() -> u64 {
+const fn default_channel_backoff_secs() -> u64 {
     2
 }
 
-fn default_channel_backoff_max_secs() -> u64 {
+const fn default_channel_backoff_max_secs() -> u64 {
     60
 }
 
-fn default_scheduler_poll_secs() -> u64 {
+const fn default_scheduler_poll_secs() -> u64 {
     15
 }
 
-fn default_scheduler_retries() -> u32 {
+const fn default_scheduler_retries() -> u32 {
     2
 }
 
@@ -2949,15 +2949,15 @@ pub struct SchedulerConfig {
     pub max_concurrent: usize,
 }
 
-fn default_scheduler_enabled() -> bool {
+const fn default_scheduler_enabled() -> bool {
     true
 }
 
-fn default_scheduler_max_tasks() -> usize {
+const fn default_scheduler_max_tasks() -> usize {
     64
 }
 
-fn default_scheduler_max_concurrent() -> usize {
+const fn default_scheduler_max_concurrent() -> usize {
     4
 }
 
@@ -3189,7 +3189,7 @@ pub struct CronConfig {
     pub max_run_history: u32,
 }
 
-fn default_max_run_history() -> u32 {
+const fn default_max_run_history() -> u32 {
     50
 }
 
@@ -3329,7 +3329,7 @@ pub struct ChannelsConfig {
     pub message_timeout_secs: u64,
 }
 
-fn default_channel_message_timeout_secs() -> u64 {
+const fn default_channel_message_timeout_secs() -> u64 {
     300
 }
 
@@ -3370,7 +3370,7 @@ pub enum StreamMode {
     Partial,
 }
 
-fn default_draft_update_interval_ms() -> u64 {
+const fn default_draft_update_interval_ms() -> u64 {
     1000
 }
 
@@ -3516,23 +3516,23 @@ pub struct SignalStormProtectionConfig {
     pub breaker_duration_secs: u64,
 }
 
-fn default_signal_storm_dedupe_ttl_secs() -> u64 {
+const fn default_signal_storm_dedupe_ttl_secs() -> u64 {
     60
 }
 
-fn default_signal_storm_min_reply_interval_secs() -> u64 {
+const fn default_signal_storm_min_reply_interval_secs() -> u64 {
     2
 }
 
-fn default_signal_storm_abnormal_threshold() -> usize {
+const fn default_signal_storm_abnormal_threshold() -> usize {
     10
 }
 
-fn default_signal_storm_abnormal_window_secs() -> u64 {
+const fn default_signal_storm_abnormal_window_secs() -> u64 {
     60
 }
 
-fn default_signal_storm_breaker_duration_secs() -> u64 {
+const fn default_signal_storm_breaker_duration_secs() -> u64 {
     300
 }
 
@@ -3612,7 +3612,7 @@ fn default_signal_http_url() -> String {
     "http://localhost:8080".to_string()
 }
 
-fn default_signal_startup_timeout_ms() -> u64 {
+const fn default_signal_startup_timeout_ms() -> u64 {
     30_000
 }
 
@@ -3749,7 +3749,7 @@ pub struct NextcloudTalkConfig {
 impl WhatsAppConfig {
     /// Detect which backend to use based on config fields.
     /// Returns "cloud" if phone_number_id is set, "web" if session_path is set.
-    pub fn backend_type(&self) -> &'static str {
+    pub const fn backend_type(&self) -> &'static str {
         if self.phone_number_id.is_some() {
             "cloud"
         } else if self.session_path.is_some() {
@@ -3761,19 +3761,19 @@ impl WhatsAppConfig {
     }
 
     /// Check if this is a valid Cloud API config
-    pub fn is_cloud_config(&self) -> bool {
+    pub const fn is_cloud_config(&self) -> bool {
         self.phone_number_id.is_some() && self.access_token.is_some() && self.verify_token.is_some()
     }
 
     /// Check if this is a valid Web config
-    pub fn is_web_config(&self) -> bool {
+    pub const fn is_web_config(&self) -> bool {
         self.session_path.is_some()
     }
 
     /// Returns true when both Cloud and Web selectors are present.
     ///
     /// Runtime currently prefers Cloud mode in this case for backward compatibility.
-    pub fn is_ambiguous_config(&self) -> bool {
+    pub const fn is_ambiguous_config(&self) -> bool {
         self.phone_number_id.is_some() && self.session_path.is_some()
     }
 }
@@ -3822,7 +3822,7 @@ fn default_wacli_host() -> String {
     "127.0.0.1".to_string()
 }
 
-fn default_wacli_port() -> u16 {
+const fn default_wacli_port() -> u16 {
     16867
 }
 
@@ -3875,7 +3875,7 @@ pub struct IrcConfig {
     pub verify_tls: Option<bool>,
 }
 
-fn default_irc_port() -> u16 {
+const fn default_irc_port() -> u16 {
     6697
 }
 
@@ -3883,7 +3883,7 @@ fn default_irc_port() -> u16 {
 ///
 /// - `websocket` (default) — persistent WSS long-connection; no public URL required.
 /// - `webhook`             — HTTP callback server; requires a public HTTPS endpoint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LarkReceiveMode {
     #[default]
@@ -4065,19 +4065,19 @@ pub struct ResourceLimitsConfig {
     pub memory_monitoring: bool,
 }
 
-fn default_max_memory_mb() -> u32 {
+const fn default_max_memory_mb() -> u32 {
     512
 }
 
-fn default_max_cpu_time_seconds() -> u64 {
+const fn default_max_cpu_time_seconds() -> u64 {
     60
 }
 
-fn default_max_subprocesses() -> u32 {
+const fn default_max_subprocesses() -> u32 {
     10
 }
 
-fn default_memory_monitoring_enabled() -> bool {
+const fn default_memory_monitoring_enabled() -> bool {
     true
 }
 
@@ -4112,7 +4112,7 @@ pub struct AuditConfig {
     pub sign_events: bool,
 }
 
-fn default_audit_enabled() -> bool {
+const fn default_audit_enabled() -> bool {
     true
 }
 
@@ -4120,7 +4120,7 @@ fn default_audit_log_path() -> String {
     "audit.log".to_string()
 }
 
-fn default_audit_max_size_mb() -> u32 {
+const fn default_audit_max_size_mb() -> u32 {
     100
 }
 
@@ -4521,7 +4521,7 @@ fn decrypt_config_secrets(config: &mut Config, openprx_dir: &Path) -> Result<()>
 impl Config {
     pub(crate) fn load_from_path(config_path: &Path, workspace_dir: PathBuf) -> Result<Self> {
         let merged = read_merged_toml(config_path)?;
-        let mut config: Config = merged.try_into().context("Failed to deserialize merged config")?;
+        let mut config: Self = merged.try_into().context("Failed to deserialize merged config")?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
 
@@ -4577,7 +4577,7 @@ impl Config {
             );
             Ok(config)
         } else {
-            let mut config = Config::default();
+            let mut config = Self::default();
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
             config.save().await?;

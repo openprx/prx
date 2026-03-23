@@ -12,7 +12,7 @@ pub struct GitOperationsTool {
 }
 
 impl GitOperationsTool {
-    pub fn new(security: Arc<SecurityPolicy>, workspace_dir: std::path::PathBuf) -> Self {
+    pub const fn new(security: Arc<SecurityPolicy>, workspace_dir: std::path::PathBuf) -> Self {
         Self {
             security,
             workspace_dir,

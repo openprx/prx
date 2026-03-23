@@ -69,11 +69,16 @@ impl EvolutionMemoryRetriever {
         let useful_ratio = useful_ratio_score(entry.useful_count, entry.access_count);
         let source_confidence = entry.source_confidence.unwrap_or(0.5).clamp(0.0, 1.0);
 
-        weights.recency * recency
-            + weights.access_freq * access_freq
-            + weights.category_weight * category_weight
-            + weights.useful_ratio * useful_ratio
-            + weights.source_confidence * source_confidence
+        weights.source_confidence.mul_add(
+            source_confidence,
+            weights.useful_ratio.mul_add(
+                useful_ratio,
+                weights.category_weight.mul_add(
+                    category_weight,
+                    weights.recency.mul_add(recency, weights.access_freq * access_freq),
+                ),
+            ),
+        )
     }
 
     async fn write_access_logs(&self, query: &str, selected: &[MemoryEntry], token_budget: usize) -> Result<()> {
@@ -148,7 +153,7 @@ impl EvolutionAwareRetrieval for EvolutionMemoryRetriever {
     }
 }
 
-fn is_active(entry: &MemoryEntry) -> bool {
+const fn is_active(entry: &MemoryEntry) -> bool {
     match entry.lifecycle_state {
         Some(LifecycleState::Active) | None => true,
         Some(LifecycleState::Archived | LifecycleState::Tombstoned) => false,
@@ -202,7 +207,7 @@ fn useful_ratio_score(useful_count: Option<u32>, access_count: Option<u32>) -> f
     (f64::from(useful) / f64::from(access)).clamp(0.0, 1.0)
 }
 
-fn category_weight_score(category: &MemoryCategory) -> f64 {
+const fn category_weight_score(category: &MemoryCategory) -> f64 {
     match category {
         MemoryCategory::Core => 1.0,
         MemoryCategory::Conversation => 0.9,

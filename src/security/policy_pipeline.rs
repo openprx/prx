@@ -27,11 +27,11 @@ pub enum PolicyLayer {
 impl std::fmt::Display for PolicyLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PolicyLayer::Global => write!(f, "global"),
-            PolicyLayer::Profile => write!(f, "profile"),
-            PolicyLayer::Agent => write!(f, "agent"),
-            PolicyLayer::Group => write!(f, "group"),
-            PolicyLayer::Tool => write!(f, "tool"),
+            Self::Global => write!(f, "global"),
+            Self::Profile => write!(f, "profile"),
+            Self::Agent => write!(f, "agent"),
+            Self::Group => write!(f, "group"),
+            Self::Tool => write!(f, "tool"),
         }
     }
 }
@@ -135,7 +135,7 @@ pub struct PolicyPipeline {
 
 impl PolicyPipeline {
     /// Create a new pipeline from the `[security.tool_policy]` config section.
-    pub fn new(config: ToolPolicyConfig) -> Self {
+    pub const fn new(config: ToolPolicyConfig) -> Self {
         Self { config }
     }
 

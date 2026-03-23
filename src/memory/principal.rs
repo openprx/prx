@@ -409,7 +409,7 @@ fn compile_patterns(patterns: Vec<String>) -> Vec<Regex> {
         .collect()
 }
 
-fn anonymous_principal(
+const fn anonymous_principal(
     user_id: String,
     current_channel: String,
     current_chat_id: String,
@@ -432,7 +432,7 @@ const ACL_ENFORCE_ANONYMOUS: bool = true;
 const ACL_ENFORCE_GUEST: bool = true;
 const ACL_ENFORCE_MEMBER: bool = true;
 
-fn is_acl_enforced_for_role(role: &Role) -> bool {
+const fn is_acl_enforced_for_role(role: &Role) -> bool {
     match role {
         Role::Owner => false,
         Role::Anonymous => ACL_ENFORCE_ANONYMOUS,

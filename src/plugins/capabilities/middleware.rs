@@ -24,7 +24,7 @@ pub enum MiddlewareStage {
 }
 
 impl MiddlewareStage {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Inbound => "inbound",
             Self::Outbound => "outbound",
@@ -160,7 +160,7 @@ impl WasmMiddleware {
         &self.plugin_name
     }
 
-    pub fn priority(&self) -> i32 {
+    pub const fn priority(&self) -> i32 {
         self.priority
     }
 
@@ -177,7 +177,7 @@ pub struct MiddlewareChain {
 
 impl MiddlewareChain {
     /// Create a new empty middleware chain.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             middlewares: Vec::new(),
         }
@@ -209,12 +209,12 @@ impl MiddlewareChain {
     }
 
     /// Returns true if the chain has no middlewares.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.middlewares.is_empty()
     }
 
     /// Number of middlewares in the chain.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.middlewares.len()
     }
 }

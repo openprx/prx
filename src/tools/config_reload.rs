@@ -32,7 +32,7 @@ pub struct ConfigReloadTool {
 
 impl ConfigReloadTool {
     /// Create a new `ConfigReloadTool` backed by the shared config state.
-    pub fn new(config: SharedConfig) -> Self {
+    pub const fn new(config: SharedConfig) -> Self {
         Self { config }
     }
 }

@@ -11,7 +11,7 @@ pub enum AnthropicAuthKind {
 }
 
 impl AnthropicAuthKind {
-    pub fn as_metadata_value(self) -> &'static str {
+    pub const fn as_metadata_value(self) -> &'static str {
         match self {
             Self::ApiKey => "api-key",
             Self::Authorization => "authorization",

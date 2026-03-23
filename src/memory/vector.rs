@@ -114,7 +114,7 @@ pub fn hybrid_merge(
         .map(|mut r| {
             let vs = r.vector_score.unwrap_or(0.0);
             let ks = r.keyword_score.unwrap_or(0.0);
-            r.final_score = vector_weight * vs + keyword_weight * ks;
+            r.final_score = vector_weight.mul_add(vs, keyword_weight * ks);
             r
         })
         .collect();

@@ -14,7 +14,7 @@ pub struct FileReadTool {
 }
 
 impl FileReadTool {
-    pub fn new(security: Arc<SecurityPolicy>, acl_enabled: bool) -> Self {
+    pub const fn new(security: Arc<SecurityPolicy>, acl_enabled: bool) -> Self {
         Self { security, acl_enabled }
     }
 

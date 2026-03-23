@@ -264,7 +264,7 @@ async fn persist_job_result(
     success
 }
 
-fn is_one_shot_auto_delete(job: &CronJob) -> bool {
+const fn is_one_shot_auto_delete(job: &CronJob) -> bool {
     job.delete_after_run && matches!(job.schedule, Schedule::At { .. })
 }
 

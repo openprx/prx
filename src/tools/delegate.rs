@@ -165,13 +165,13 @@ impl DelegateTool {
     }
 
     /// Attach multimodal configuration for sub-agent tool loops.
-    pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
+    pub const fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
         self
     }
 
     /// Attach compaction configuration for agentic sub-agent loops.
-    pub fn with_compaction_config(mut self, config: crate::config::AgentCompactionConfig) -> Self {
+    pub const fn with_compaction_config(mut self, config: crate::config::AgentCompactionConfig) -> Self {
         self.compaction_config = config;
         self
     }

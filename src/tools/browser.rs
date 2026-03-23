@@ -104,7 +104,7 @@ impl BrowserBackendKind {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::AgentBrowser => "agent_browser",
             Self::RustNative => "rust_native",
@@ -260,7 +260,7 @@ impl BrowserTool {
         BrowserBackendKind::parse(&self.backend)
     }
 
-    fn rust_native_compiled() -> bool {
+    const fn rust_native_compiled() -> bool {
         cfg!(feature = "browser-native")
     }
 
@@ -1867,7 +1867,7 @@ fn is_computer_use_only_action(action: &str) -> bool {
     )
 }
 
-fn backend_name(backend: ResolvedBackend) -> &'static str {
+const fn backend_name(backend: ResolvedBackend) -> &'static str {
     match backend {
         ResolvedBackend::AgentBrowser => "agent_browser",
         ResolvedBackend::RustNative => "rust_native",

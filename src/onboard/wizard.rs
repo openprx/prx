@@ -57,7 +57,7 @@ const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
-fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
+const fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
     let ChannelsConfig {
         cli: _,     // `cli` is always available and does not require channel server startup
         webhook: _, // webhook traffic is handled by gateway, not `prx channel start`

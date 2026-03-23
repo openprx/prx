@@ -15,7 +15,7 @@ pub struct ScheduleTool {
 }
 
 impl ScheduleTool {
-    pub fn new(security: Arc<SecurityPolicy>, config: SharedConfig) -> Self {
+    pub const fn new(security: Arc<SecurityPolicy>, config: SharedConfig) -> Self {
         Self { security, config }
     }
 }

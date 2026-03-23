@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 pub struct NativeRuntime;
 
 impl NativeRuntime {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

@@ -372,7 +372,7 @@ fn build_log(experiment_id: &str, layer: EvolutionLayer, candidate: &EvolutionCa
     }
 }
 
-fn candidate_priority_rank(candidate: &EvolutionCandidate) -> u8 {
+const fn candidate_priority_rank(candidate: &EvolutionCandidate) -> u8 {
     match candidate.priority {
         CandidatePriority::High => 0,
         CandidatePriority::Medium => 1,
@@ -380,7 +380,7 @@ fn candidate_priority_rank(candidate: &EvolutionCandidate) -> u8 {
     }
 }
 
-fn metrics_for_candidate(candidate: &EvolutionCandidate) -> GateMetrics {
+const fn metrics_for_candidate(candidate: &EvolutionCandidate) -> GateMetrics {
     let average_improvement = match candidate.priority {
         CandidatePriority::High => 0.08,
         CandidatePriority::Medium => 0.05,

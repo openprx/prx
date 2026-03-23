@@ -38,7 +38,7 @@ struct HookActionEntry {
     stdin_json: bool,
 }
 
-fn default_stdin_json() -> bool {
+const fn default_stdin_json() -> bool {
     true
 }
 

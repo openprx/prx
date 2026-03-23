@@ -10,14 +10,14 @@ pub enum JobType {
 }
 
 impl JobType {
-    pub(crate) fn as_str(&self) -> &'static str {
+    pub(crate) const fn as_str(&self) -> &'static str {
         match self {
             Self::Shell => "shell",
             Self::Agent => "agent",
         }
     }
 
-    pub(crate) fn parse(raw: &str) -> Self {
+    pub(crate) const fn parse(raw: &str) -> Self {
         if raw.eq_ignore_ascii_case("agent") {
             Self::Agent
         } else {
@@ -35,14 +35,14 @@ pub enum SessionTarget {
 }
 
 impl SessionTarget {
-    pub(crate) fn as_str(&self) -> &'static str {
+    pub(crate) const fn as_str(&self) -> &'static str {
         match self {
             Self::Isolated => "isolated",
             Self::Main => "main",
         }
     }
 
-    pub(crate) fn parse(raw: &str) -> Self {
+    pub(crate) const fn parse(raw: &str) -> Self {
         if raw.eq_ignore_ascii_case("main") {
             Self::Main
         } else {
@@ -90,7 +90,7 @@ impl Default for DeliveryConfig {
     }
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 

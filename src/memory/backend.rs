@@ -76,11 +76,11 @@ const CUSTOM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
 const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 4] =
     [SQLITE_PROFILE, LUCID_PROFILE, MARKDOWN_PROFILE, NONE_PROFILE];
 
-pub fn selectable_memory_backends() -> &'static [MemoryBackendProfile] {
+pub const fn selectable_memory_backends() -> &'static [MemoryBackendProfile] {
     &SELECTABLE_MEMORY_BACKENDS
 }
 
-pub fn default_memory_backend_key() -> &'static str {
+pub const fn default_memory_backend_key() -> &'static str {
     SQLITE_PROFILE.key
 }
 

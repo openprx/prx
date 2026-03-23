@@ -12,7 +12,7 @@ pub struct CronRunsTool {
 }
 
 impl CronRunsTool {
-    pub fn new(config: SharedConfig) -> Self {
+    pub const fn new(config: SharedConfig) -> Self {
         Self { config }
     }
 }

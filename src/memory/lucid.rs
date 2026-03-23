@@ -125,7 +125,7 @@ impl LucidMemory {
         *guard = None;
     }
 
-    fn to_lucid_type(category: &MemoryCategory) -> &'static str {
+    const fn to_lucid_type(category: &MemoryCategory) -> &'static str {
         match category {
             MemoryCategory::Core => "decision",
             MemoryCategory::Daily => "context",
@@ -214,7 +214,7 @@ impl LucidMemory {
                 category: Self::to_memory_category(label.trim()),
                 timestamp: now.clone(),
                 session_id: None,
-                score: Some((1.0 - rank as f64 * 0.05).max(0.1)),
+                score: Some((rank as f64).mul_add(-0.05, 1.0).max(0.1)),
                 tags: None,
                 access_count: None,
                 useful_count: None,

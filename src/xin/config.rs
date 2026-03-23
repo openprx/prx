@@ -3,19 +3,19 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-fn default_interval_minutes() -> u32 {
+const fn default_interval_minutes() -> u32 {
     5
 }
-fn default_max_concurrent() -> usize {
+const fn default_max_concurrent() -> usize {
     4
 }
-fn default_max_tasks() -> usize {
+const fn default_max_tasks() -> usize {
     128
 }
-fn default_stale_timeout_minutes() -> u32 {
+const fn default_stale_timeout_minutes() -> u32 {
     60
 }
-fn default_builtin_tasks() -> bool {
+const fn default_builtin_tasks() -> bool {
     true
 }
 

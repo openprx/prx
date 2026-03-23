@@ -149,7 +149,7 @@ pub struct WasmCronManager {
 }
 
 impl WasmCronManager {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { jobs: Vec::new() }
     }
 
@@ -164,7 +164,7 @@ impl WasmCronManager {
     }
 
     /// Returns true if no cron jobs are registered.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.jobs.is_empty()
     }
 

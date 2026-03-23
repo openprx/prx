@@ -9,7 +9,7 @@ use uuid::Uuid;
 pub struct CliChannel;
 
 impl CliChannel {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

@@ -48,7 +48,7 @@ impl GatewayTool {
         }
     }
 
-    pub fn with_tools_count(mut self, tools_count: usize) -> Self {
+    pub const fn with_tools_count(mut self, tools_count: usize) -> Self {
         self.tools_count = tools_count;
         self
     }

@@ -103,7 +103,7 @@ pub enum CleaningStrategy {
 
 impl CleaningStrategy {
     /// Get the list of unsupported keywords for this strategy.
-    pub fn unsupported_keywords(self) -> &'static [&'static str] {
+    pub const fn unsupported_keywords(self) -> &'static [&'static str] {
         match self {
             Self::Gemini => GEMINI_UNSUPPORTED_KEYWORDS,
             Self::Anthropic => &["$ref", "$defs", "definitions"], // Anthropic doesn't resolve refs
@@ -400,7 +400,7 @@ impl SchemaCleanr {
     fn is_null_schema(value: &Value) -> bool {
         if let Some(obj) = value.as_object() {
             // { const: null }
-            if let Some(Value::Null) = obj.get("const") {
+            if matches!(obj.get("const"), Some(Value::Null)) {
                 return true;
             }
             // { enum: [null] }

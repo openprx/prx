@@ -17,7 +17,7 @@ pub struct SessionsListTool {
 }
 
 impl SessionsListTool {
-    pub fn new(active_runs: Arc<RwLock<Vec<SubAgentRun>>>) -> Self {
+    pub const fn new(active_runs: Arc<RwLock<Vec<SubAgentRun>>>) -> Self {
         Self { active_runs }
     }
 }

@@ -211,7 +211,7 @@ fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
     None
 }
 
-fn failure_reason(rate_limited: bool, non_retryable: bool) -> &'static str {
+const fn failure_reason(rate_limited: bool, non_retryable: bool) -> &'static str {
     if rate_limited && non_retryable {
         "rate_limited_non_retryable"
     } else if rate_limited {

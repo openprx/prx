@@ -24,7 +24,7 @@ pub enum HookEvent {
 }
 
 impl HookEvent {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::AgentStart => "agent_start",
             Self::AgentEnd => "agent_end",
@@ -53,7 +53,7 @@ struct HookAction {
     stdin_json: bool,
 }
 
-fn default_stdin_json() -> bool {
+const fn default_stdin_json() -> bool {
     true
 }
 

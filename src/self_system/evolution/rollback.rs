@@ -223,7 +223,7 @@ impl CircuitBreaker {
         self.state.clone()
     }
 
-    pub fn record_failure(&mut self, now: DateTime<Utc>) {
+    pub const fn record_failure(&mut self, now: DateTime<Utc>) {
         self.failures = self.failures.saturating_add(1);
         if self.failures >= self.threshold {
             self.state = CircuitBreakerState::Open;
@@ -231,7 +231,7 @@ impl CircuitBreaker {
         }
     }
 
-    pub fn record_success(&mut self) {
+    pub const fn record_success(&mut self) {
         self.failures = 0;
         self.state = CircuitBreakerState::Closed;
         self.opened_at = None;
@@ -263,11 +263,11 @@ impl CircuitBreaker {
     }
 
     /// Mark one layer as being evaluated, effectively freezing others.
-    pub fn begin_layer_evaluation(&mut self, layer: EvolutionLayer) {
+    pub const fn begin_layer_evaluation(&mut self, layer: EvolutionLayer) {
         self.evaluating_layer = Some(layer);
     }
 
-    pub fn end_layer_evaluation(&mut self) {
+    pub const fn end_layer_evaluation(&mut self) {
         self.evaluating_layer = None;
     }
 

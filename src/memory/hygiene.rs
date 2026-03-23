@@ -23,7 +23,7 @@ struct HygieneReport {
 }
 
 impl HygieneReport {
-    fn total_actions(&self) -> u64 {
+    const fn total_actions(&self) -> u64 {
         self.archived_memory_files
             + self.archived_session_files
             + self.purged_memory_archives

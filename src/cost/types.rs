@@ -51,7 +51,7 @@ impl TokenUsage {
     }
 
     /// Get the total cost.
-    pub fn cost(&self) -> f64 {
+    pub const fn cost(&self) -> f64 {
         self.cost_usd
     }
 }

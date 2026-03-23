@@ -69,19 +69,19 @@ pub struct EmailConfig {
     pub allowed_senders: Vec<String>,
 }
 
-fn default_imap_port() -> u16 {
+const fn default_imap_port() -> u16 {
     993
 }
-fn default_smtp_port() -> u16 {
+const fn default_smtp_port() -> u16 {
     465
 }
 fn default_imap_folder() -> String {
     "INBOX".into()
 }
-fn default_idle_timeout() -> u64 {
+const fn default_idle_timeout() -> u64 {
     1740 // 29 minutes per RFC 2177
 }
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 

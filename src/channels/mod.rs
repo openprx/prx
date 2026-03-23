@@ -3117,7 +3117,7 @@ enum ChannelHealthState {
     Timeout,
 }
 
-fn classify_health_result(result: &std::result::Result<bool, tokio::time::error::Elapsed>) -> ChannelHealthState {
+const fn classify_health_result(result: &std::result::Result<bool, tokio::time::error::Elapsed>) -> ChannelHealthState {
     match result {
         Ok(true) => ChannelHealthState::Healthy,
         Ok(false) => ChannelHealthState::Unhealthy,
@@ -3890,7 +3890,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         // session_status: runtime status card (OpenClaw alignment)
         let channel_names: Vec<String> = channels.iter().map(|c| c.name().to_string()).collect();
         tools_list.push(Box::new(tools::SessionStatusTool::new(
-            active_runs.clone(),
+            active_runs,
             &provider_name,
             &model,
             channel_names.clone(),

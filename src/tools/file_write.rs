@@ -13,7 +13,7 @@ pub struct FileWriteTool {
 }
 
 impl FileWriteTool {
-    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+    pub const fn new(security: Arc<SecurityPolicy>) -> Self {
         Self { security }
     }
 }

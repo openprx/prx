@@ -24,7 +24,7 @@ pub struct EmbeddingSimilarityDetector {
 }
 
 impl EmbeddingSimilarityDetector {
-    pub fn new(threshold: f64) -> Self {
+    pub const fn new(threshold: f64) -> Self {
         Self {
             threshold: threshold.clamp(0.8, 0.99),
         }
@@ -91,7 +91,7 @@ pub struct MemoryCompressor<D: SimilarityDetector> {
 }
 
 impl<D: SimilarityDetector> MemoryCompressor<D> {
-    pub fn new(detector: D) -> Self {
+    pub const fn new(detector: D) -> Self {
         Self { detector }
     }
 

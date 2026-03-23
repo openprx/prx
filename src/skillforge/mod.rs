@@ -40,16 +40,16 @@ pub struct SkillForgeConfig {
     pub output_dir: String,
 }
 
-fn default_auto_integrate() -> bool {
+const fn default_auto_integrate() -> bool {
     true
 }
 fn default_sources() -> Vec<String> {
     vec!["github".into(), "clawhub".into()]
 }
-fn default_scan_interval() -> u64 {
+const fn default_scan_interval() -> u64 {
     24
 }
-fn default_min_score() -> f64 {
+const fn default_min_score() -> f64 {
     0.7
 }
 fn default_output_dir() -> String {

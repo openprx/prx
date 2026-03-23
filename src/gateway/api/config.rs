@@ -61,7 +61,7 @@ struct ConfigFilePayload {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct UpdateConfigFileRequest {
+pub struct UpdateConfigFileRequest {
     content: String,
 }
 

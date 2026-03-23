@@ -50,7 +50,7 @@ impl DiagItem {
         }
     }
 
-    fn icon(&self) -> &'static str {
+    const fn icon(&self) -> &'static str {
         match self.severity {
             Severity::Ok => "✅",
             Severity::Warn => "⚠️ ",

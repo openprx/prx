@@ -47,11 +47,11 @@ struct DeviceCodeResponse {
     expires_in: u64,
 }
 
-fn default_interval() -> u64 {
+const fn default_interval() -> u64 {
     5
 }
 
-fn default_expires_in() -> u64 {
+const fn default_expires_in() -> u64 {
     900
 }
 
