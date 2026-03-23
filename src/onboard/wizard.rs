@@ -186,6 +186,7 @@ pub async fn run_wizard() -> Result<Config> {
         nodes: crate::config::NodesConfig::default(),
         agents: std::collections::HashMap::new(),
         media: crate::config::MediaConfig::default(),
+        causal_tree: crate::causal_tree::CausalTreeConfig::default(),
         security: crate::config::SecurityConfig::default(),
     };
 
@@ -427,6 +428,7 @@ async fn run_quick_setup_with_home(
         nodes: crate::config::NodesConfig::default(),
         agents: std::collections::HashMap::new(),
         media: crate::config::MediaConfig::default(),
+        causal_tree: crate::causal_tree::CausalTreeConfig::default(),
         security: crate::config::SecurityConfig::default(),
     };
 
