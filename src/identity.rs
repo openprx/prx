@@ -1163,7 +1163,7 @@ mod tests {
     #[test]
     fn aieos_to_system_prompt_empty_identity() {
         let identity = AieosIdentity {
-            identity: Some(IdentitySection { ..Default::default() }),
+            identity: Some(Default::default()),
             ..Default::default()
         };
 

@@ -181,24 +181,27 @@ impl Channel for QQChannel {
 
         // Determine if this is a group or private message based on recipient format
         // Format: "user:{openid}" or "group:{group_openid}"
-        let (url, body) = if let Some(group_id) = message.recipient.strip_prefix("group:") {
-            (
-                format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
-                json!({
-                    "content": &message.content,
-                    "msg_type": 0,
-                }),
-            )
-        } else {
-            let user_id = message.recipient.strip_prefix("user:").unwrap_or(&message.recipient);
-            (
-                format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
-                json!({
-                    "content": &message.content,
-                    "msg_type": 0,
-                }),
-            )
-        };
+        let (url, body) = message.recipient.strip_prefix("group:").map_or_else(
+            || {
+                let user_id = message.recipient.strip_prefix("user:").unwrap_or(&message.recipient);
+                (
+                    format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
+                    json!({
+                        "content": &message.content,
+                        "msg_type": 0,
+                    }),
+                )
+            },
+            |group_id| {
+                (
+                    format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
+                    json!({
+                        "content": &message.content,
+                        "msg_type": 0,
+                    }),
+                )
+            },
+        );
 
         ensure_https(&url)?;
 
@@ -235,7 +238,10 @@ impl Channel for QQChannel {
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)
-        let hello = read.next().await.ok_or(anyhow::anyhow!("QQ: no hello frame"))??;
+        let hello = read
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("QQ: no hello frame"))??;
         let hello_data: serde_json::Value = serde_json::from_str(&hello.to_string())?;
         let heartbeat_interval = hello_data
             .get("d")

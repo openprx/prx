@@ -36,6 +36,7 @@ use tokio::time::{Duration, timeout};
 
 // ── JSON-RPC 2.0 types ──────────────────────────────────────────────────────
 
+#[allow(clippy::trait_duplication_in_bounds)]
 #[derive(Serialize)]
 struct RpcRequest<'a, P: Serialize> {
     jsonrpc: &'a str,
@@ -425,11 +426,10 @@ impl WacliChannel {
             String::new()
         };
         let prefix = if is_group {
-            if let Some(name) = group_name {
-                format!("[WhatsApp Group: {name}]{self_note} {sender_display}: ")
-            } else {
-                format!("[WhatsApp Group]{self_note} {sender_display}: ")
-            }
+            group_name.map_or_else(
+                || format!("[WhatsApp Group]{self_note} {sender_display}: "),
+                |name| format!("[WhatsApp Group: {name}]{self_note} {sender_display}: "),
+            )
         } else {
             format!("{sender_display}: ")
         };

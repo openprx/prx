@@ -414,8 +414,7 @@ fn normalize_mattermost_content(
         return None;
     }
 
-    let mut cleaned = text.to_string();
-    if !mention_spans.is_empty() {
+    let cleaned = if !mention_spans.is_empty() {
         let mut result = String::with_capacity(text.len());
         let mut cursor = 0;
         for (start, end) in mention_spans {
@@ -424,8 +423,10 @@ fn normalize_mattermost_content(
             cursor = end;
         }
         result.push_str(&text[cursor..]);
-        cleaned = result;
-    }
+        result
+    } else {
+        text.to_string()
+    };
 
     let cleaned = cleaned.trim().to_string();
     if cleaned.is_empty() {

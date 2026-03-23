@@ -993,7 +993,7 @@ impl Memory for SqliteMemory {
             };
 
             // Vector similarity search (if embeddings available)
-            let vector_results = if let Some(ref qe) = query_embedding {
+            let vector_results = query_embedding.as_ref().map_or_else(Vec::new, |qe| {
                 match Self::vector_search(&conn, qe, limit * 2, None, session_ref) {
                     Ok(results) => results,
                     Err(e) => {
@@ -1001,9 +1001,7 @@ impl Memory for SqliteMemory {
                         Vec::new()
                     }
                 }
-            } else {
-                Vec::new()
-            };
+            });
 
             // Hybrid merge
             let merged = if vector_results.is_empty() {

@@ -138,11 +138,9 @@ impl SchemaCleanr {
     /// Clean schema with specified strategy.
     pub fn clean(schema: Value, strategy: CleaningStrategy) -> Value {
         // Extract $defs for reference resolution
-        let defs = if let Some(obj) = schema.as_object() {
-            Self::extract_defs(obj)
-        } else {
-            HashMap::new()
-        };
+        let defs = schema
+            .as_object()
+            .map_or_else(HashMap::new, |obj| Self::extract_defs(obj));
 
         Self::clean_with_defs(schema, &defs, strategy, &mut HashSet::new())
     }
@@ -476,7 +474,10 @@ impl SchemaCleanr {
 
             match non_null.len() {
                 0 => Value::String("null".to_string()),
-                1 => non_null.into_iter().next().unwrap_or(Value::String("null".to_string())),
+                1 => non_null
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| Value::String("null".to_string())),
                 _ => Value::Array(non_null),
             }
         } else {
@@ -717,7 +718,7 @@ mod tests {
         assert_eq!(gemini["description"], "A string field");
 
         // OpenAI: Most permissive (keeps minLength)
-        let openai = SchemaCleanr::clean_for_openai(schema.clone());
+        let openai = SchemaCleanr::clean_for_openai(schema);
         assert_eq!(openai["minLength"], 1); // OpenAI allows validation keywords
         assert_eq!(openai["type"], "string");
     }

@@ -641,10 +641,11 @@ impl McpTool {
             return;
         }
 
-        let mut new_config = self.base_config.clone();
-        if let Ok(Some(from_file)) = self.load_effective_config_from_json() {
-            new_config = from_file;
-        }
+        let new_config = if let Ok(Some(from_file)) = self.load_effective_config_from_json() {
+            from_file
+        } else {
+            self.base_config.clone()
+        };
 
         let mut discovered = HashMap::new();
         for (server_name, server) in &new_config.servers {
@@ -670,10 +671,11 @@ impl McpTool {
             return;
         }
 
-        let mut new_config = self.base_config.clone();
-        if let Ok(Some(from_file)) = self.load_effective_config_from_json() {
-            new_config = from_file;
-        }
+        let new_config = if let Ok(Some(from_file)) = self.load_effective_config_from_json() {
+            from_file
+        } else {
+            self.base_config.clone()
+        };
 
         let mut state = self.state.write();
         state.effective_config = new_config;

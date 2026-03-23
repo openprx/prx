@@ -290,7 +290,7 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
     let writer_for_engine = writer.clone();
 
     let selected_layer = map_layer(layer);
-    let mut pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer, &config.workspace_dir);
+    let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer, &config.workspace_dir);
 
     let report = match selected_layer {
         EvolutionLayer::Memory => {
@@ -354,7 +354,7 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
     Ok(())
 }
 
-fn map_layer(layer: Option<EvolutionLayerArg>) -> EvolutionLayer {
+const fn map_layer(layer: Option<EvolutionLayerArg>) -> EvolutionLayer {
     match layer {
         Some(EvolutionLayerArg::L1) | None => EvolutionLayer::Memory,
         Some(EvolutionLayerArg::L2) => EvolutionLayer::Prompt,
@@ -362,7 +362,7 @@ fn map_layer(layer: Option<EvolutionLayerArg>) -> EvolutionLayer {
     }
 }
 
-fn retention_from_runtime(retention: &EvolutionRetentionConfig) -> JsonlRetentionPolicy {
+const fn retention_from_runtime(retention: &EvolutionRetentionConfig) -> JsonlRetentionPolicy {
     JsonlRetentionPolicy {
         hot_days: retention.hot_days,
         warm_days: retention.warm_days,
@@ -487,7 +487,7 @@ where
     Ok(out)
 }
 
-fn bool_flag(v: bool) -> &'static str {
+const fn bool_flag(v: bool) -> &'static str {
     if v { "yes" } else { "no" }
 }
 

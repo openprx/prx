@@ -571,27 +571,28 @@ fn strip_channel_metadata(content: &str) -> String {
             }
             // Strip inline group prefixes like "[Signal Group: name] sender: "
             // These contain group names that could false-positive on bot name matching.
-            let cleaned = if let Some(rest) = trimmed.strip_prefix('[') {
-                if let Some(bracket_end) = rest.find(']') {
-                    let tag = &rest[..bracket_end];
-                    if tag.contains("Group") || tag.contains("group") {
-                        // Skip past the "] sender: " part
-                        let after_bracket = &rest[bracket_end + 1..];
-                        // Skip "sender_id: " prefix after the bracket
-                        if let Some(colon_pos) = after_bracket.find(": ") {
-                            after_bracket[colon_pos + 2..].to_string()
-                        } else {
-                            after_bracket.trim_start().to_string()
-                        }
-                    } else {
-                        line.to_string()
-                    }
-                } else {
-                    line.to_string()
-                }
-            } else {
-                line.to_string()
-            };
+            let cleaned = trimmed.strip_prefix('[').map_or_else(
+                || line.to_string(),
+                |rest| {
+                    rest.find(']').map_or_else(
+                        || line.to_string(),
+                        |bracket_end| {
+                            let tag = &rest[..bracket_end];
+                            if tag.contains("Group") || tag.contains("group") {
+                                // Skip past the "] sender: " part
+                                let after_bracket = &rest[bracket_end + 1..];
+                                // Skip "sender_id: " prefix after the bracket
+                                after_bracket.find(": ").map_or_else(
+                                    || after_bracket.trim_start().to_string(),
+                                    |colon_pos| after_bracket[colon_pos + 2..].to_string(),
+                                )
+                            } else {
+                                line.to_string()
+                            }
+                        },
+                    )
+                },
+            );
             Some(cleaned)
         })
         .collect::<Vec<_>>()
@@ -651,15 +652,16 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
 }
 
 fn build_channel_system_prompt(base_prompt: &str, channel_name: &str) -> String {
-    if let Some(instructions) = channel_delivery_instructions(channel_name) {
-        if base_prompt.is_empty() {
-            instructions.to_string()
-        } else {
-            format!("{base_prompt}\n\n{instructions}")
-        }
-    } else {
-        base_prompt.to_string()
-    }
+    channel_delivery_instructions(channel_name).map_or_else(
+        || base_prompt.to_string(),
+        |instructions| {
+            if base_prompt.is_empty() {
+                instructions.to_string()
+            } else {
+                format!("{base_prompt}\n\n{instructions}")
+            }
+        },
+    )
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -718,13 +720,11 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
-        "/models" => {
-            if let Some(provider) = parts.next() {
+        "/models" => parts
+            .next()
+            .map_or(Some(ChannelRuntimeCommand::ShowProviders), |provider| {
                 Some(ChannelRuntimeCommand::SetProvider(provider.trim().to_string()))
-            } else {
-                Some(ChannelRuntimeCommand::ShowProviders)
-            }
-        }
+            }),
         "/model" => {
             let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
             if model.is_empty() {
@@ -1227,10 +1227,10 @@ async fn build_memory_context(mem: &dyn Memory, user_msg: &str, min_relevance_sc
         let mut included = 0usize;
         let mut used_chars = 0usize;
 
-        for entry in entries.iter().filter(|e| match e.score {
-            Some(score) => score >= min_relevance_score,
-            None => true, // keep entries without a score (e.g. non-vector backends)
-        }) {
+        for entry in entries
+            .iter()
+            .filter(|e| e.score.map_or(true, |score| score >= min_relevance_score))
+        {
             if included >= MEMORY_CONTEXT_MAX_ENTRIES {
                 break;
             }
@@ -1562,23 +1562,26 @@ fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<St
         return false;
     };
 
-    let (name, has_args) = if let Some(function) = object.get("function").and_then(|f| f.as_object()) {
-        (
-            function
-                .get("name")
-                .and_then(|v| v.as_str())
-                .or_else(|| object.get("name").and_then(|v| v.as_str())),
-            function.contains_key("arguments")
-                || function.contains_key("parameters")
-                || object.contains_key("arguments")
-                || object.contains_key("parameters"),
-        )
-    } else {
-        (
-            object.get("name").and_then(|v| v.as_str()),
-            object.contains_key("arguments") || object.contains_key("parameters"),
-        )
-    };
+    let (name, has_args) = object.get("function").and_then(|f| f.as_object()).map_or_else(
+        || {
+            (
+                object.get("name").and_then(|v| v.as_str()),
+                object.contains_key("arguments") || object.contains_key("parameters"),
+            )
+        },
+        |function| {
+            (
+                function
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| object.get("name").and_then(|v| v.as_str())),
+                function.contains_key("arguments")
+                    || function.contains_key("parameters")
+                    || object.contains_key("arguments")
+                    || object.contains_key("parameters"),
+            )
+        },
+    );
 
     let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
         return false;

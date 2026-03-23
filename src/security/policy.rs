@@ -663,15 +663,15 @@ impl SecurityPolicy {
         }
 
         // Expand tilde for comparison
-        let expanded = if let Some(stripped) = path.strip_prefix("~/") {
-            if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
-                home.join(stripped).to_string_lossy().to_string()
-            } else {
-                path.to_string()
-            }
-        } else {
-            path.to_string()
-        };
+        let expanded = path.strip_prefix("~/").map_or_else(
+            || path.to_string(),
+            |stripped| {
+                std::env::var("HOME").ok().map(PathBuf::from).map_or_else(
+                    || path.to_string(),
+                    |home| home.join(stripped).to_string_lossy().to_string(),
+                )
+            },
+        );
 
         // Block absolute paths when workspace_only is set
         if self.workspace_only && Path::new(&expanded).is_absolute() {
@@ -681,15 +681,15 @@ impl SecurityPolicy {
         // Block forbidden paths using path-component-aware matching
         let expanded_path = Path::new(&expanded);
         for forbidden in &self.forbidden_paths {
-            let forbidden_expanded = if let Some(stripped) = forbidden.strip_prefix("~/") {
-                if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
-                    home.join(stripped).to_string_lossy().to_string()
-                } else {
-                    forbidden.clone()
-                }
-            } else {
-                forbidden.clone()
-            };
+            let forbidden_expanded = forbidden.strip_prefix("~/").map_or_else(
+                || forbidden.clone(),
+                |stripped| {
+                    std::env::var("HOME").ok().map(PathBuf::from).map_or_else(
+                        || forbidden.clone(),
+                        |home| home.join(stripped).to_string_lossy().to_string(),
+                    )
+                },
+            );
             let forbidden_path = Path::new(&forbidden_expanded);
             if expanded_path.starts_with(forbidden_path) {
                 return false;
@@ -1879,7 +1879,7 @@ mod tests {
         symlink(&outside, &link_path).unwrap();
 
         let policy = SecurityPolicy {
-            workspace_dir: workspace.clone(),
+            workspace_dir: workspace,
             ..SecurityPolicy::default()
         };
 

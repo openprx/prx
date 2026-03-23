@@ -333,7 +333,8 @@ impl Channel for WhatsAppWebChannel {
         }
 
         *self.client.lock() = None;
-        if let Some(handle) = self.bot_handle.lock().take() {
+        let value = self.bot_handle.lock().take();
+        if let Some(handle) = value {
             handle.abort();
         }
 

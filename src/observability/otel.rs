@@ -231,7 +231,7 @@ impl Observer for OtelObserver {
                 self.llm_duration.record(secs, &attrs);
 
                 // Create a completed span for visibility in trace backends.
-                let start_time = SystemTime::now().checked_sub(*duration).unwrap_or(SystemTime::now());
+                let start_time = SystemTime::now().checked_sub(*duration).unwrap_or_else(SystemTime::now);
                 let mut span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("llm.call")
                         .with_kind(SpanKind::Internal)
@@ -258,7 +258,7 @@ impl Observer for OtelObserver {
                 cost_usd,
             } => {
                 let secs = duration.as_secs_f64();
-                let start_time = SystemTime::now().checked_sub(*duration).unwrap_or(SystemTime::now());
+                let start_time = SystemTime::now().checked_sub(*duration).unwrap_or_else(SystemTime::now);
 
                 // Create a completed span with correct timing
                 let mut span = tracer.build(
@@ -295,7 +295,7 @@ impl Observer for OtelObserver {
                 success,
             } => {
                 let secs = duration.as_secs_f64();
-                let start_time = SystemTime::now().checked_sub(*duration).unwrap_or(SystemTime::now());
+                let start_time = SystemTime::now().checked_sub(*duration).unwrap_or_else(SystemTime::now);
 
                 let status = if *success { Status::Ok } else { Status::error("") };
 

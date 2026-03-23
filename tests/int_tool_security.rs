@@ -1,9 +1,9 @@
 //! P0 Integration Tests: Tool Security
 //!
 //! These tests validate cross-cutting security properties that emerge from the
-//! interaction of tools (ShellTool, FileReadTool, HttpRequestTool) with the
-//! SecurityPolicy and its subsystems (autonomy levels, risk classification,
-//! rate limiting via ActionTracker, ACL memory protection, SSRF defences,
+//! interaction of tools (`ShellTool`, `FileReadTool`, `HttpRequestTool`) with the
+//! `SecurityPolicy` and its subsystems (autonomy levels, risk classification,
+//! rate limiting via `ActionTracker`, ACL memory protection, SSRF defences,
 //! and environment variable sanitization).
 
 use openprx::runtime::NativeRuntime;
@@ -745,7 +745,7 @@ fn int_ts_03_rate_limit_boundary() {
 // INT-TS-06: FileRead tool blocks protected memory markdown
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// FileReadTool with ACL enabled blocks reads of MEMORY.md and memory/* paths.
+/// `FileReadTool` with ACL enabled blocks reads of MEMORY.md and memory/* paths.
 #[tokio::test]
 async fn int_ts_06_file_read_blocks_memory_markdown_with_acl() {
     let tmp = tempfile::tempdir().expect("test: should create temp dir");
@@ -793,7 +793,7 @@ async fn int_ts_06_file_read_blocks_memory_markdown_with_acl() {
     );
 }
 
-/// FileReadTool with ACL disabled allows reads of memory files.
+/// `FileReadTool` with ACL disabled allows reads of memory files.
 #[tokio::test]
 async fn int_ts_06_file_read_allows_memory_without_acl() {
     let tmp = tempfile::tempdir().expect("test: should create temp dir");
@@ -825,7 +825,7 @@ async fn int_ts_06_file_read_allows_memory_without_acl() {
 // INT-TS-09: WebFetchTool domain allowlist
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// WebFetchTool with empty allowed_domains still blocks private/local hosts.
+/// `WebFetchTool` with empty `allowed_domains` still blocks private/local hosts.
 /// `validate_url` propagates as `Err(anyhow)` rather than `Ok(ToolResult{success:false})`.
 #[tokio::test]
 async fn int_ts_09_web_fetch_blocks_private_with_empty_allowlist() {
@@ -856,7 +856,7 @@ async fn int_ts_09_web_fetch_blocks_private_with_empty_allowlist() {
     );
 }
 
-/// WebFetchTool rejects hosts not in allowed_domains.
+/// `WebFetchTool` rejects hosts not in `allowed_domains`.
 /// `validate_url` propagates as `Err(anyhow)` rather than `Ok(ToolResult{success:false})`.
 #[tokio::test]
 async fn int_ts_09_web_fetch_rejects_unlisted_domain() {

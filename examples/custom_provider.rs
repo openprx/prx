@@ -1,4 +1,4 @@
-//! Example: Implementing a custom Provider for ZeroClaw
+//! Example: Implementing a custom Provider for `ZeroClaw`
 //!
 //! This shows how to add a new LLM backend in ~30 lines of code.
 //! Copy this file, modify the API call, and register in `src/providers/mod.rs`.
@@ -53,7 +53,7 @@ impl Provider for OllamaProvider {
 
         resp["response"]
             .as_str()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .ok_or_else(|| anyhow::anyhow!("No response field in Ollama reply"))
     }
 }

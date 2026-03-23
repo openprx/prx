@@ -550,12 +550,10 @@ async fn terminal_input_loop(tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         let history_path = directories::ProjectDirs::from("dev", "openprx", "prx")
             .map(|dirs| dirs.data_dir().join("chat_history"))
             .unwrap_or_else(|| std::path::PathBuf::from(".prx_chat_history"));
-        let editor_builder = if let Ok(history) = FileBackedHistory::with_file(1000, history_path) {
-            Reedline::create().with_history(Box::new(history))
-        } else {
-            Reedline::create()
-        };
-        let mut editor = editor_builder;
+        let mut editor = FileBackedHistory::with_file(1000, history_path).map_or_else(
+            |_| Reedline::create(),
+            |history| Reedline::create().with_history(Box::new(history)),
+        );
         let prompt = DefaultPrompt::new(
             DefaultPromptSegment::Basic("prx".to_string()),
             DefaultPromptSegment::Empty,

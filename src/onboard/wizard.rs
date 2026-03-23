@@ -1272,10 +1272,7 @@ fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
 
     let raw = fs::read_to_string(&path).with_context(|| format!("failed to read model cache at {}", path.display()))?;
 
-    match serde_json::from_str::<ModelCacheState>(&raw) {
-        Ok(state) => Ok(state),
-        Err(_) => Ok(ModelCacheState::default()),
-    }
+    serde_json::from_str::<ModelCacheState>(&raw).map_or_else(|_| Ok(ModelCacheState::default()), Ok)
 }
 
 fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Result<()> {
@@ -2886,10 +2883,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         return Ok::<_, reqwest::Error>((false, None, None));
                     }
 
-                    let payload: Value = match resp.json() {
-                        Ok(payload) => payload,
-                        Err(_) => Value::Null,
-                    };
+                    let payload: Value = resp.json().map_or(Value::Null, |payload| payload);
                     let user_id = payload
                         .get("user_id")
                         .and_then(|value| value.as_str())
@@ -3215,13 +3209,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .default("6697".into())
                     .interact_text()?;
 
-                let port: u16 = match port_str.trim().parse() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        println!("  {} Invalid port, using 6697", style("→").dim());
-                        6697
-                    }
-                };
+                let port: u16 = port_str.trim().parse().unwrap_or_else(|_| {
+                    println!("  {} Invalid port, using 6697", style("→").dim());
+                    6697
+                });
 
                 let nickname: String = Input::new().with_prompt("  Bot nickname").interact_text()?;
 

@@ -7,9 +7,10 @@ use anyhow::Context;
 use async_trait::async_trait;
 use directories::UserDirs;
 use parking_lot::Mutex;
+use parking_lot::RwLock;
 use reqwest::multipart::{Form, Part};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 
@@ -41,20 +42,17 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
             let search_area = &remaining[..hard_split];
 
             // Prefer splitting at newline
-            if let Some(pos) = search_area.rfind('\n') {
-                // Don't split if the newline is too close to the start
-                if search_area[..pos].chars().count() >= TELEGRAM_MAX_MESSAGE_LENGTH / 2 {
-                    pos + 1
-                } else {
-                    // Try space as fallback
-                    search_area.rfind(' ').unwrap_or(hard_split) + 1
-                }
-            } else if let Some(pos) = search_area.rfind(' ') {
-                pos + 1
-            } else {
-                // Hard split at character boundary
-                hard_split
-            }
+            search_area.rfind('\n').map_or_else(
+                || search_area.rfind(' ').map_or(hard_split, |pos| pos + 1),
+                |pos| {
+                    if search_area[..pos].chars().count() >= TELEGRAM_MAX_MESSAGE_LENGTH / 2 {
+                        pos + 1
+                    } else {
+                        // Try space as fallback
+                        search_area.rfind(' ').unwrap_or(hard_split) + 1
+                    }
+                },
+            )
         };
 
         chunks.push(remaining[..chunk_end].to_string());
@@ -428,7 +426,8 @@ impl TelegramChannel {
         if normalized.is_empty() {
             return;
         }
-        if let Ok(mut users) = self.allowed_users.write() {
+        {
+            let mut users = self.allowed_users.write();
             if !users.iter().any(|u| u == &normalized) {
                 users.push(normalized);
             }
@@ -573,10 +572,7 @@ impl TelegramChannel {
 
     fn is_user_allowed(&self, username: &str) -> bool {
         let identity = Self::normalize_identity(username);
-        self.allowed_users
-            .read()
-            .map(|users| users.iter().any(|u| u == "*" || u == &identity))
-            .unwrap_or(false)
+        self.allowed_users.read().iter().any(|u| u == "*" || u == &identity)
     }
 
     fn is_any_user_allowed<'a, I>(&self, identities: I) -> bool
@@ -799,11 +795,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .map(|id| id.to_string());
 
         // reply_target: chat_id or chat_id:thread_id format
-        let reply_target = if let Some(tid) = thread_id {
-            format!("{}:{}", chat_id, tid)
-        } else {
-            chat_id.clone()
-        };
+        let reply_target = thread_id.map_or_else(|| chat_id.clone(), |tid| format!("{}:{}", chat_id, tid));
 
         let content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();

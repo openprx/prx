@@ -353,12 +353,7 @@ impl ReliableProvider {
 
     /// Compute backoff duration, respecting Retry-After if present.
     fn compute_backoff(&self, base: u64, err: &anyhow::Error) -> u64 {
-        if let Some(retry_after) = parse_retry_after_ms(err) {
-            // Use Retry-After but cap at 30s to avoid indefinite waits
-            retry_after.min(30_000).max(base)
-        } else {
-            base
-        }
+        parse_retry_after_ms(err).map_or(base, |retry_after| retry_after.min(30_000).max(base))
     }
 }
 
@@ -876,10 +871,10 @@ impl Provider for ReliableProvider {
             let provider_clone = provider_name.clone();
 
             // Try the first model in the chain for streaming
-            let current_model = match self.model_chain(model).first() {
-                Some(m) => m.to_string(),
-                None => model.to_string(),
-            };
+            let current_model = self
+                .model_chain(model)
+                .first()
+                .map_or_else(|| model.to_string(), |m| m.to_string());
 
             // For streaming, we attempt once and propagate errors
             // The caller can retry the entire request if needed

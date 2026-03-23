@@ -32,11 +32,9 @@ pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {
 
     for (heading, body) in sections {
         let heading: Option<Rc<str>> = heading.map(Rc::from);
-        let full = if let Some(ref h) = heading {
-            format!("{h}\n{body}")
-        } else {
-            body.clone()
-        };
+        let full = heading
+            .as_ref()
+            .map_or_else(|| body.clone(), |h| format!("{h}\n{body}"));
 
         if full.len() <= max_chars {
             chunks.push(Chunk {

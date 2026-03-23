@@ -92,17 +92,17 @@ impl TuiState {
     }
 
     /// Scroll to the bottom of the conversation.
-    pub fn scroll_to_bottom(&mut self) {
+    pub const fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
 
     /// Scroll up by n lines.
-    pub fn scroll_up(&mut self, n: usize) {
+    pub const fn scroll_up(&mut self, n: usize) {
         self.scroll_offset = self.scroll_offset.saturating_add(n);
     }
 
     /// Scroll down by n lines.
-    pub fn scroll_down(&mut self, n: usize) {
+    pub const fn scroll_down(&mut self, n: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
@@ -168,7 +168,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.render_widget(status, area);
 }
 
-fn render_output(frame: &mut Frame, area: Rect, state: &mut TuiState) {
+fn render_output(frame: &mut Frame, area: Rect, state: &TuiState) {
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     for conv_line in &state.conversation_lines {

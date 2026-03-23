@@ -133,8 +133,8 @@ fn scrub_credentials(input: &str) -> String {
             let key = &caps[1];
             let val = caps
                 .get(2)
-                .or(caps.get(3))
-                .or(caps.get(4))
+                .or_else(|| caps.get(3))
+                .or_else(|| caps.get(4))
                 .map(|m| m.as_str())
                 .unwrap_or("");
 
@@ -631,10 +631,7 @@ pub(crate) async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevanc
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
         let relevant: Vec<_> = entries
             .iter()
-            .filter(|e| match e.score {
-                Some(score) => score >= min_relevance_score,
-                None => true,
-            })
+            .filter(|e| e.score.map_or(true, |score| score >= min_relevance_score))
             .collect();
 
         if !relevant.is_empty() {
@@ -1015,11 +1012,10 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
                                 };
                                 serde_json::json!({"command": command})
                             } else if value.starts_with("http://") || value.starts_with("https://") {
-                                if let Some(command) = build_curl_command(value) {
-                                    serde_json::json!({"command": command})
-                                } else {
-                                    serde_json::json!({"command": value})
-                                }
+                                build_curl_command(value).map_or_else(
+                                    || serde_json::json!({"command": value}),
+                                    |command| serde_json::json!({"command": command}),
+                                )
                             } else {
                                 serde_json::json!({"command": value})
                             }
@@ -1065,11 +1061,7 @@ fn strip_markdown_fence_block(input: &str) -> String {
         return trimmed.to_string();
     };
     let content = &trimmed[first_newline + 1..];
-    let content = if let Some(end) = content.rfind("```") {
-        &content[..end]
-    } else {
-        content
-    };
+    let content = content.rfind("```").map_or(content, |end| &content[..end]);
     content.trim().to_string()
 }
 
@@ -1528,22 +1520,22 @@ async fn acquire_tool_barrier(key: &'static str, tool_name: &str) -> Option<toki
             .clone()
     };
 
-    match tokio::time::timeout(
+    (tokio::time::timeout(
         std::time::Duration::from_secs(TOOL_BARRIER_TIMEOUT_SECS),
         barrier.lock_owned(),
     )
-    .await
-    {
-        Ok(guard) => Some(guard),
-        Err(_) => {
-            tracing::warn!(
-                tool = %tool_name,
-                barrier_key = key,
-                "Tool barrier lock timed out after {TOOL_BARRIER_TIMEOUT_SECS}s, proceeding without barrier",
-            );
-            None
-        }
-    }
+    .await)
+        .map_or_else(
+            |_| {
+                tracing::warn!(
+                    tool = %tool_name,
+                    barrier_key = key,
+                    "Tool barrier lock timed out after {TOOL_BARRIER_TIMEOUT_SECS}s, proceeding without barrier",
+                );
+                None
+            },
+            |guard| Some(guard),
+        )
 }
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
@@ -1750,11 +1742,10 @@ fn rollout_effective_sample_percent(stage: &str, configured_percent: u8) -> u8 {
 }
 
 fn rollout_sampling_key(channel_name: &str, scope_ctx: Option<&ScopeContext<'_>>) -> String {
-    if let Some(scope) = scope_ctx {
-        format!("{}:{}:{}:{}", channel_name, scope.channel, scope.sender, scope.chat_id)
-    } else {
-        channel_name.to_string()
-    }
+    scope_ctx.map_or_else(
+        || channel_name.to_string(),
+        |scope| format!("{}:{}:{}:{}", channel_name, scope.channel, scope.sender, scope.chat_id),
+    )
 }
 
 fn rollout_sample_selected(key: &str, sample_percent: u8) -> bool {

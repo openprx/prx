@@ -2,9 +2,9 @@
 //! constant-time comparison, reserved memory namespace, and concurrent memory safety.
 //!
 //! These tests exercise security-critical paths that span multiple modules:
-//! SecurityPolicy scope rules, PairingGuard brute-force protection,
-//! scope-injection stripping in Agent::execute_tool_call, reserved memory
-//! namespace enforcement, and concurrent SQLite memory safety.
+//! `SecurityPolicy` scope rules, `PairingGuard` brute-force protection,
+//! scope-injection stripping in `Agent::execute_tool_call`, reserved memory
+//! namespace enforcement, and concurrent `SQLite` memory safety.
 #![allow(clippy::indexing_slicing)]
 
 use openprx::config::ScopeRule;
@@ -77,8 +77,8 @@ async fn scope_policy_shell_deny_trusted_user_unaffected() {
     );
 }
 
-/// Multiple scope rules: deny shell for untrusted_user, but allow memory_recall only for
-/// a restricted_user via whitelist. Verify layered evaluation.
+/// Multiple scope rules: deny shell for `untrusted_user`, but allow `memory_recall` only for
+/// a `restricted_user` via whitelist. Verify layered evaluation.
 #[tokio::test]
 async fn scope_policy_multi_rule_layered_evaluation() {
     let policy = SecurityPolicy {
@@ -133,8 +133,8 @@ async fn scope_policy_multi_rule_layered_evaluation() {
 // INT-CS-04: Scope forgery via _prx_scope_trusted injection
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// The execute_one_tool function in loop_.rs strips forged _zc_scope and sets
-/// _zc_scope_trusted=false when no trusted scope context is provided.
+/// The `execute_one_tool` function in loop_.rs strips forged _`zc_scope` and sets
+/// _`zc_scope_trusted=false` when no trusted scope context is provided.
 /// This test simulates what the runtime does and validates that the stripping
 /// logic works as documented.
 #[tokio::test]
@@ -178,7 +178,7 @@ async fn scope_forgery_zc_scope_stripped_when_no_context() {
     );
 }
 
-/// Agent::execute_tool_call strips _prx_scope and forces _prx_scope_trusted=false.
+/// `Agent::execute_tool_call` strips _`prx_scope` and forces _`prx_scope_trusted=false`.
 /// This tests the sanitization path in agent.rs (lines 496-502).
 #[tokio::test]
 async fn scope_forgery_prx_scope_stripped_in_agent() {
@@ -259,8 +259,8 @@ async fn scope_forgery_both_naming_conventions_stripped() {
 // INT-CS-05: PairingGuard brute-force lockout
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// After 5 failed pairing attempts (MAX_PAIR_ATTEMPTS=5), the 6th attempt
-/// returns Err(remaining_lockout_secs). Even a valid code is rejected during lockout.
+/// After 5 failed pairing attempts (`MAX_PAIR_ATTEMPTS=5`), the 6th attempt
+/// returns `Err(remaining_lockout_secs)`. Even a valid code is rejected during lockout.
 #[tokio::test]
 async fn pairing_guard_brute_force_lockout_after_max_attempts() {
     let guard = PairingGuard::new(true, &[]);
@@ -370,7 +370,7 @@ async fn pairing_guard_constant_time_eq_correctness() {
     );
 }
 
-/// Statistical timing test: constant_time_eq should not exhibit a measurable
+/// Statistical timing test: `constant_time_eq` should not exhibit a measurable
 /// timing difference between early-mismatch and late-mismatch inputs.
 ///
 /// We compare two scenarios on same-length strings:
@@ -499,7 +499,7 @@ async fn reserved_namespace_router_prefix_rejected_for_normal_session() {
     );
 }
 
-/// The self_system session ID is allowed to write to reserved namespaces.
+/// The `self_system` session ID is allowed to write to reserved namespaces.
 #[tokio::test]
 async fn reserved_namespace_self_system_session_allowed() {
     let self_system_id = openprx::self_system::SELF_SYSTEM_SESSION_ID;
@@ -549,7 +549,7 @@ async fn reserved_namespace_normal_keys_always_allowed() {
 }
 
 /// No session provided — writing to reserved namespace should be rejected
-/// (None is not the self_system session).
+/// (None is not the `self_system` session).
 #[tokio::test]
 async fn reserved_namespace_no_session_rejected() {
     let result = validate_memory_write_target("self/core_values", None);
@@ -569,7 +569,7 @@ async fn reserved_namespace_no_session_rejected() {
 // INT-AM-05: Concurrent agent sessions share memory safely
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// 10 parallel sessions store to the same SQLite backend.
+/// 10 parallel sessions store to the same `SQLite` backend.
 /// All stores succeed with no data loss.
 #[tokio::test]
 async fn concurrent_sessions_store_no_data_loss() {
@@ -600,7 +600,7 @@ async fn concurrent_sessions_store_no_data_loss() {
     );
 }
 
-/// 10 parallel sessions store and then recall from the same SQLite backend.
+/// 10 parallel sessions store and then recall from the same `SQLite` backend.
 /// Each session's data is retrievable after concurrent writes.
 #[tokio::test]
 async fn concurrent_sessions_store_then_recall() {

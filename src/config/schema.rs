@@ -4,6 +4,7 @@ use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
 use directories::UserDirs;
+use parking_lot::RwLock;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,7 +13,7 @@ use std::fs::Permissions;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 #[cfg(unix)]
 use tokio::fs::File;
 use tokio::fs::{self, OpenOptions};
@@ -2222,14 +2223,7 @@ fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, reqwest::Clie
 }
 
 fn clear_runtime_proxy_client_cache() {
-    match runtime_proxy_client_cache().write() {
-        Ok(mut guard) => {
-            guard.clear();
-        }
-        Err(poisoned) => {
-            poisoned.into_inner().clear();
-        }
-    }
+    runtime_proxy_client_cache().write().clear();
 }
 
 fn runtime_proxy_cache_key(service_key: &str, timeout_secs: Option<u64>, connect_timeout_secs: Option<u64>) -> String {
@@ -2246,41 +2240,20 @@ fn runtime_proxy_cache_key(service_key: &str, timeout_secs: Option<u64>, connect
 }
 
 fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
-    match runtime_proxy_client_cache().read() {
-        Ok(guard) => guard.get(cache_key).cloned(),
-        Err(poisoned) => poisoned.into_inner().get(cache_key).cloned(),
-    }
+    runtime_proxy_client_cache().read().get(cache_key).cloned()
 }
 
 fn set_runtime_proxy_cached_client(cache_key: String, client: reqwest::Client) {
-    match runtime_proxy_client_cache().write() {
-        Ok(mut guard) => {
-            guard.insert(cache_key, client);
-        }
-        Err(poisoned) => {
-            poisoned.into_inner().insert(cache_key, client);
-        }
-    }
+    runtime_proxy_client_cache().write().insert(cache_key, client);
 }
 
 pub fn set_runtime_proxy_config(config: ProxyConfig) {
-    match runtime_proxy_state().write() {
-        Ok(mut guard) => {
-            *guard = config;
-        }
-        Err(poisoned) => {
-            *poisoned.into_inner() = config;
-        }
-    }
-
+    *runtime_proxy_state().write() = config;
     clear_runtime_proxy_client_cache();
 }
 
 pub fn runtime_proxy_config() -> ProxyConfig {
-    match runtime_proxy_state().read() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
+    runtime_proxy_state().read().clone()
 }
 
 pub fn apply_runtime_proxy_to_builder(builder: reqwest::ClientBuilder, service_key: &str) -> reqwest::ClientBuilder {
@@ -4978,19 +4951,27 @@ impl Config {
         }
 
         // Proxy URLs: OPENPRX_* wins, then generic *PROXY vars.
-        let mut proxy_url_overridden = false;
-        if let Ok(proxy_url) = env_openprx("HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY")) {
+        let http_overridden = if let Ok(proxy_url) = env_openprx("HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
+        {
             self.proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
-            proxy_url_overridden = true;
-        }
-        if let Ok(proxy_url) = env_openprx("HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY")) {
-            self.proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
-            proxy_url_overridden = true;
-        }
-        if let Ok(proxy_url) = env_openprx("ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY")) {
+            true
+        } else {
+            false
+        };
+        let https_overridden =
+            if let Ok(proxy_url) = env_openprx("HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY")) {
+                self.proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
+                true
+            } else {
+                false
+            };
+        let all_overridden = if let Ok(proxy_url) = env_openprx("ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY")) {
             self.proxy.all_proxy = normalize_proxy_url_option(Some(&proxy_url));
-            proxy_url_overridden = true;
-        }
+            true
+        } else {
+            false
+        };
+        let proxy_url_overridden = http_overridden || https_overridden || all_overridden;
         if let Ok(no_proxy) = env_openprx("NO_PROXY").or_else(|_| std::env::var("NO_PROXY")) {
             self.proxy.no_proxy = normalize_no_proxy_list(vec![no_proxy]);
         }
@@ -7655,10 +7636,7 @@ default_model = "legacy-model"
     }
 
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
-        match runtime_proxy_client_cache().read() {
-            Ok(guard) => guard.contains_key(cache_key),
-            Err(poisoned) => poisoned.into_inner().contains_key(cache_key),
-        }
+        runtime_proxy_client_cache().read().contains_key(cache_key)
     }
 
     /// Serialise tests that mutate the global `RUNTIME_PROXY_CLIENT_CACHE` so

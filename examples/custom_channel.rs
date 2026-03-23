@@ -1,6 +1,6 @@
-//! Example: Implementing a custom Channel for ZeroClaw
+//! Example: Implementing a custom Channel for `ZeroClaw`
 //!
-//! Channels let ZeroClaw communicate through any messaging platform.
+//! Channels let `ZeroClaw` communicate through any messaging platform.
 //! Implement the Channel trait, register it, and the agent works everywhere.
 
 use anyhow::Result;
@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
-    /// Channel-specific reply address (e.g. Telegram chat_id, Discord channel_id).
+    /// Channel-specific reply address (e.g. Telegram `chat_id`, Discord `channel_id`).
     pub reply_target: String,
     pub content: String,
     pub channel: String,
@@ -50,7 +50,7 @@ impl TelegramChannel {
 
 #[async_trait]
 impl Channel for TelegramChannel {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "telegram"
     }
 

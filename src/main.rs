@@ -77,7 +77,12 @@
     clippy::unnecessary_literal_bound,
     clippy::unnecessary_map_or,
     clippy::unnecessary_wraps,
-    dead_code
+    dead_code,
+    clippy::excessive_nesting,
+    clippy::single_option_map,
+    clippy::trait_duplication_in_bounds,
+    clippy::large_stack_frames,
+    clippy::too_long_first_doc_paragraph
 )]
 
 use anyhow::{Result, bail};
@@ -1125,11 +1130,11 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
     let bin_name = cmd.get_name().to_string();
 
     match shell {
-        CompletionShell::Bash => generate(shells::Bash, &mut cmd, bin_name.clone(), writer),
-        CompletionShell::Fish => generate(shells::Fish, &mut cmd, bin_name.clone(), writer),
-        CompletionShell::Zsh => generate(shells::Zsh, &mut cmd, bin_name.clone(), writer),
+        CompletionShell::Bash => generate(shells::Bash, &mut cmd, bin_name, writer),
+        CompletionShell::Fish => generate(shells::Fish, &mut cmd, bin_name, writer),
+        CompletionShell::Zsh => generate(shells::Zsh, &mut cmd, bin_name, writer),
         CompletionShell::PowerShell => {
-            generate(shells::PowerShell, &mut cmd, bin_name.clone(), writer);
+            generate(shells::PowerShell, &mut cmd, bin_name, writer);
         }
         CompletionShell::Elvish => generate(shells::Elvish, &mut cmd, bin_name, writer),
     }
@@ -1264,18 +1269,22 @@ fn extract_openai_account_id_for_profile(access_token: &str) -> Option<String> {
 }
 
 fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
-    match profile.token_set.as_ref().and_then(|token_set| token_set.expires_at) {
-        Some(ts) => {
-            let now = chrono::Utc::now();
-            if ts <= now {
-                format!("expired at {}", ts.to_rfc3339())
-            } else {
-                let mins = (ts - now).num_minutes();
-                format!("expires in {mins}m ({})", ts.to_rfc3339())
-            }
-        }
-        None => "n/a".to_string(),
-    }
+    profile
+        .token_set
+        .as_ref()
+        .and_then(|token_set| token_set.expires_at)
+        .map_or_else(
+            || "n/a".to_string(),
+            |ts| {
+                let now = chrono::Utc::now();
+                if ts <= now {
+                    format!("expired at {}", ts.to_rfc3339())
+                } else {
+                    let mins = (ts - now).num_minutes();
+                    format!("expires in {mins}m ({})", ts.to_rfc3339())
+                }
+            },
+        )
 }
 
 #[allow(clippy::too_many_lines)]

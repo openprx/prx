@@ -3,7 +3,7 @@
 //! Prevents: Pattern 2 — Config persistence & workspace discovery bugs (13% of user bugs).
 //! Issues: #547, #417, #621, #802
 //!
-//! Tests Config::load_or_init() with isolated temp directories, env var overrides,
+//! Tests `Config::load_or_init()` with isolated temp directories, env var overrides,
 //! and config file round-trips to verify workspace discovery and persistence.
 #![allow(clippy::field_reassign_with_default)]
 
@@ -200,9 +200,9 @@ fn config_file_write_read_roundtrip() {
 #[test]
 fn config_file_with_missing_optional_fields_uses_defaults() {
     // Simulate a minimal config TOML that omits optional sections
-    let minimal_toml = r#"
+    let minimal_toml = r"
 default_temperature = 0.7
-"#;
+";
     let parsed: Config = toml::from_str(minimal_toml).expect("minimal TOML should parse");
 
     // Agent config should use defaults
@@ -216,13 +216,13 @@ default_temperature = 0.7
 
 #[test]
 fn config_file_with_custom_agent_section() {
-    let toml_with_agent = r#"
+    let toml_with_agent = r"
 default_temperature = 0.7
 
 [agent]
 max_tool_iterations = 3
 compact_context = true
-"#;
+";
     let parsed: Config = toml::from_str(toml_with_agent).expect("TOML with agent section should parse");
 
     assert_eq!(parsed.agent.max_tool_iterations, 3);

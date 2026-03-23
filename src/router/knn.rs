@@ -299,7 +299,7 @@ mod tests {
             success: true,
             timestamp: 12345,
         };
-        let stored = StoredQueryRecord::from_record(original.clone());
+        let stored = StoredQueryRecord::from_record(original);
         let restored = stored.into_record().expect("test: roundtrip");
         assert_eq!(restored.query_id, "q42");
         assert_eq!(restored.chosen_model_id, "claude-3");

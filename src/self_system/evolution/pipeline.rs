@@ -81,7 +81,7 @@ impl EvolutionPipeline {
 
     /// Execute one pipeline pass for a specific layer and trigger source.
     pub async fn run_for_layer(
-        &mut self,
+        &self,
         trigger: EvolutionTrigger,
         layer: EvolutionLayer,
         engine: &mut dyn EvolutionEngine,
@@ -316,17 +316,14 @@ impl EvolutionPipeline {
     }
 
     async fn infer_backfill_result(&self, log: &EvolutionLog, now: DateTime<Utc>) -> Result<EvolutionResult> {
-        let since = match parse_rfc3339(&log.timestamp) {
-            Some(ts) => ts,
-            None => {
-                tracing::debug!(
-                    timestamp = %log.timestamp,
-                    experiment_id = %log.experiment_id,
-                    "failed to parse evolution timestamp; using fallback backfill window"
-                );
-                now - Duration::days(BACKFILL_DAYS)
-            }
-        };
+        let since = parse_rfc3339(&log.timestamp).unwrap_or_else(|| {
+            tracing::debug!(
+                timestamp = %log.timestamp,
+                experiment_id = %log.experiment_id,
+                "failed to parse evolution timestamp; using fallback backfill window"
+            );
+            now - Duration::days(BACKFILL_DAYS)
+        });
         let decisions = self.writer.read_decisions_since(since).await?;
         let mut success = 0u32;
         let mut failure = 0u32;
@@ -565,7 +562,7 @@ mod tests {
         cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
         let shared = new_shared_evolution_config(cfg);
 
-        let mut pipeline = EvolutionPipeline::new(shared, analyzer, writer.clone(), dir.path());
+        let pipeline = EvolutionPipeline::new(shared, analyzer, writer.clone(), dir.path());
         let mut engine = MockEngine;
         let now = Utc::now();
 

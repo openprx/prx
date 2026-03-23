@@ -404,7 +404,7 @@ impl OllamaProvider {
             || name.starts_with("tool_call<")
         {
             if let Some(nested_name) = args.get("name").and_then(|v| v.as_str()) {
-                let nested_args = args.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                let nested_args = args.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
                 tracing::debug!(
                     "Unwrapped nested tool call: {} -> {} with args {:?}",
                     name,

@@ -194,7 +194,7 @@ impl Tool for HttpRequestTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
 
         let method_str = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
-        let headers_val = args.get("headers").cloned().unwrap_or(json!({}));
+        let headers_val = args.get("headers").cloned().unwrap_or_else(|| json!({}));
         let body = args.get("body").and_then(|v| v.as_str());
 
         if !self.security.can_act() {

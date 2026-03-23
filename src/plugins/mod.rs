@@ -395,12 +395,7 @@ impl PluginManager {
         let mut chain = capabilities::middleware::MiddlewareChain::new();
 
         for info in &plugins {
-            let middleware_caps: Vec<_> = info
-                .capabilities
-                .iter()
-                .filter(|c| c.starts_with("middleware"))
-                .collect();
-            if middleware_caps.is_empty() {
+            if !info.capabilities.iter().any(|c| c.starts_with("middleware")) {
                 continue;
             }
 
@@ -470,8 +465,7 @@ impl PluginManager {
         let mut executor = capabilities::hook::WasmHookExecutor::new();
 
         for info in &plugins {
-            let hook_caps: Vec<_> = info.capabilities.iter().filter(|c| c.starts_with("hook")).collect();
-            if hook_caps.is_empty() {
+            if !info.capabilities.iter().any(|c| c.starts_with("hook")) {
                 continue;
             }
 
@@ -537,8 +531,7 @@ impl PluginManager {
         let mut manager = capabilities::cron::WasmCronManager::new();
 
         for info in &plugins {
-            let cron_caps: Vec<_> = info.capabilities.iter().filter(|c| c.starts_with("cron")).collect();
-            if cron_caps.is_empty() {
+            if !info.capabilities.iter().any(|c| c.starts_with("cron")) {
                 continue;
             }
 
@@ -612,8 +605,7 @@ impl PluginManager {
         let mut providers = Vec::new();
 
         for info in &plugins {
-            let provider_caps: Vec<_> = info.capabilities.iter().filter(|c| c.starts_with("provider")).collect();
-            if provider_caps.is_empty() {
+            if !info.capabilities.iter().any(|c| c.starts_with("provider")) {
                 continue;
             }
 
@@ -678,8 +670,7 @@ impl PluginManager {
         let mut storages = Vec::new();
 
         for info in &plugins {
-            let storage_caps: Vec<_> = info.capabilities.iter().filter(|c| c.starts_with("storage")).collect();
-            if storage_caps.is_empty() {
+            if !info.capabilities.iter().any(|c| c.starts_with("storage")) {
                 continue;
             }
 

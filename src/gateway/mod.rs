@@ -96,7 +96,7 @@ fn verify_webhook_hmac_signature(secret: &str, body: &[u8], signature_header: &s
     let signature_hex = signature_header
         .trim()
         .strip_prefix("sha256=")
-        .unwrap_or(signature_header.trim());
+        .unwrap_or_else(|| signature_header.trim());
     let Ok(provided) = hex::decode(signature_hex) else {
         return false;
     };
@@ -852,16 +852,19 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 
 /// GET /metrics — Prometheus text exposition format
 async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let body = if let Some(prom) = state
+    let body = state
         .observer
         .as_ref()
         .as_any()
         .downcast_ref::<crate::observability::PrometheusObserver>()
-    {
-        prom.encode()
-    } else {
-        String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
-    };
+        .map_or_else(
+            || {
+                String::from(
+                    "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n",
+                )
+            },
+            |prom| prom.encode(),
+        );
 
     (StatusCode::OK, [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)], body)
 }

@@ -35,9 +35,9 @@ const MUST_INCLUDE: &[&str] = &["Cargo.toml", "Cargo.lock", "src/"];
 fn parse_dockerignore(content: &str) -> Vec<String> {
     content
         .lines()
-        .map(|line| line.trim())
+        .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| line.to_string())
+        .map(std::string::ToString::to_string)
         .collect()
 }
 
@@ -64,7 +64,7 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
     }
 
     // Pattern is a prefix (directory match)
-    if path_normalized.starts_with(&format!("{}/", pattern_normalized)) {
+    if path_normalized.starts_with(&format!("{pattern_normalized}/")) {
         return true;
     }
 
@@ -119,10 +119,8 @@ async fn dockerignore_excludes_security_critical_paths() {
 
         assert!(
             is_excluded(&patterns, &test_path),
-            "Path '{}' (tested as '{}') MUST be excluded by .dockerignore but is not. \
-             This is a security/performance issue.",
-            must_exclude,
-            test_path
+            "Path '{must_exclude}' (tested as '{test_path}') MUST be excluded by .dockerignore but is not. \
+             This is a security/performance issue."
         );
     }
 }
@@ -138,8 +136,7 @@ async fn dockerignore_does_not_exclude_build_essentials() {
     for must_include in MUST_INCLUDE {
         assert!(
             !is_excluded(&patterns, must_include),
-            "Path '{}' MUST NOT be excluded by .dockerignore (required for build)",
-            must_include
+            "Path '{must_include}' MUST NOT be excluded by .dockerignore (required for build)"
         );
     }
 }

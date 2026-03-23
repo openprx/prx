@@ -5,7 +5,7 @@
 //! external service dependencies. They complement the unit tests in
 //! `src/agent/tests.rs` by running at the integration test boundary.
 //!
-//! Ref: https://github.com/openprx-labs/openprx/issues/618 (item 6)
+//! Ref: <https://github.com/openprx-labs/openprx/issues/618> (item 6)
 #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
 use anyhow::Result;
@@ -33,7 +33,7 @@ struct MockProvider {
 }
 
 impl MockProvider {
-    fn new(responses: Vec<ChatResponse>) -> Self {
+    const fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
         }
@@ -69,10 +69,10 @@ struct EchoTool;
 
 #[async_trait]
 impl Tool for EchoTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "echo"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Echoes the input message"
     }
     fn parameters_schema(&self) -> serde_json::Value {
@@ -111,10 +111,10 @@ impl CountingTool {
 
 #[async_trait]
 impl Tool for CountingTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "counter"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Counts invocations"
     }
     fn parameters_schema(&self) -> serde_json::Value {
@@ -219,7 +219,7 @@ fn text_response(text: &str) -> ChatResponse {
     }
 }
 
-fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
+const fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
         text: Some(String::new()),
         tool_calls: calls,
@@ -486,7 +486,7 @@ async fn e2e_multi_turn_history_fidelity() {
     assert!(matches!(&history[6], ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "response 3"));
 }
 
-/// Validates that a custom MemoryLoader injects RAG context into user
+/// Validates that a custom `MemoryLoader` injects RAG context into user
 /// messages before they reach the provider.
 #[tokio::test]
 async fn e2e_memory_enrichment_injects_context() {
@@ -602,7 +602,7 @@ async fn e2e_empty_memory_context_passthrough() {
 // Live integration test — real OpenAI Codex API (requires credentials)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Sends a real multi-turn conversation to OpenAI Codex and verifies
+/// Sends a real multi-turn conversation to `OpenAI` Codex and verifies
 /// the model retains context from earlier messages.
 ///
 /// Requires valid OAuth credentials in `~/.openprx/`.

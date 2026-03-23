@@ -34,7 +34,7 @@ impl RouterHistory {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_timeout(mut self, query_timeout: Duration) -> Self {
+    pub(crate) const fn with_timeout(mut self, query_timeout: Duration) -> Self {
         self.query_timeout = query_timeout;
         self
     }

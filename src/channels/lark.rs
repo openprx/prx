@@ -386,7 +386,7 @@ impl LarkChannel {
                         break;
                     }
                     // GC stale fragments > 5 min
-                    let cutoff = Instant::now().checked_sub(Duration::from_secs(300)).unwrap_or(Instant::now());
+                    let cutoff = Instant::now().checked_sub(Duration::from_secs(300)).unwrap_or_else(Instant::now);
                     frag_cache.retain(|_, (_, ts)| *ts > cutoff);
                 }
 

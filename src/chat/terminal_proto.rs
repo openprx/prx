@@ -97,7 +97,7 @@ pub struct ChatTheme {
 
 impl ChatTheme {
     /// Dark theme (default).
-    pub fn dark() -> Self {
+    pub const fn dark() -> Self {
         Self {
             user_color: "\x1b[32m",      // green
             assistant_color: "\x1b[36m", // cyan
@@ -109,7 +109,7 @@ impl ChatTheme {
     }
 
     /// Light theme.
-    pub fn light() -> Self {
+    pub const fn light() -> Self {
         Self {
             user_color: "\x1b[34m",      // blue
             assistant_color: "\x1b[35m", // magenta
@@ -121,7 +121,7 @@ impl ChatTheme {
     }
 
     /// Monokai-inspired theme.
-    pub fn monokai() -> Self {
+    pub const fn monokai() -> Self {
         Self {
             user_color: "\x1b[38;2;166;226;46m",       // monokai green
             assistant_color: "\x1b[38;2;102;217;239m", // monokai cyan
@@ -133,7 +133,7 @@ impl ChatTheme {
     }
 
     /// ANSI reset sequence.
-    pub fn reset() -> &'static str {
+    pub const fn reset() -> &'static str {
         "\x1b[0m"
     }
 

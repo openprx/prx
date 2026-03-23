@@ -1,6 +1,6 @@
-//! Phase 4: Cross-module integration — config hot-reload via SharedConfig.
+//! Phase 4: Cross-module integration — config hot-reload via `SharedConfig`.
 //!
-//! Validates that SharedConfig (ArcSwap) provides lock-free reads and
+//! Validates that `SharedConfig` (`ArcSwap`) provides lock-free reads and
 //! atomic swaps, simulating the hot-reload path without needing
 //! the actual file-watcher.
 
@@ -65,7 +65,7 @@ async fn concurrent_readers_during_swap() {
             for _ in 0..100 {
                 let snapshot = shared.load_full();
                 let _ = snapshot.default_temperature;
-                let _ = snapshot.default_model.as_ref().map(|m| m.len());
+                let _ = snapshot.default_model.as_ref().map(std::string::String::len);
             }
         }));
     }

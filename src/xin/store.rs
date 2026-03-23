@@ -335,8 +335,9 @@ pub fn ensure_system_task(config: &Config, new: &NewXinTask) -> Result<XinTask> 
         }
     })?;
 
-    match existing {
-        Some(id) => {
+    existing.map_or_else(
+        || add_task(config, new),
+        |id| {
             // Update payload and interval if changed
             let patch = XinTaskPatch {
                 payload: Some(new.payload.clone()),
@@ -345,9 +346,8 @@ pub fn ensure_system_task(config: &Config, new: &NewXinTask) -> Result<XinTask> 
                 ..XinTaskPatch::default()
             };
             update_task(config, &id, &patch)
-        }
-        None => add_task(config, new),
-    }
+        },
+    )
 }
 
 /// Record a completed run in the `xin_runs` history table.
