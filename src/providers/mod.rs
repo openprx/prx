@@ -1345,25 +1345,31 @@ fn create_provider_with_url_and_options(
     // Resolve credential and break static-analysis taint chain from the
     // `api_key` parameter so that downstream provider storage of the value
     // is not linked to the original sensitive-named source.
-    let resolved_credential = if let Some(context) = qwen_oauth_context.as_ref() {
-        context.credential.clone()
-    } else if let Some(context) = claude_code_context.as_ref() {
-        let fallback_override = if claude_code_placeholder_requested {
-            None
-        } else {
-            api_key
-        };
-        context.credential.clone().or_else(|| {
-            if is_claude_code_alias(name) {
-                resolve_provider_credential("anthropic", fallback_override)
-            } else {
-                resolve_provider_credential(name, fallback_override)
-            }
-        })
-    } else {
-        resolve_provider_credential(name, api_key)
-    }
-    .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
+    let resolved_credential = qwen_oauth_context
+        .as_ref()
+        .map_or_else(
+            || {
+                claude_code_context.as_ref().map_or_else(
+                    || resolve_provider_credential(name, api_key),
+                    |context| {
+                        let fallback_override = if claude_code_placeholder_requested {
+                            None
+                        } else {
+                            api_key
+                        };
+                        context.credential.clone().or_else(|| {
+                            if is_claude_code_alias(name) {
+                                resolve_provider_credential("anthropic", fallback_override)
+                            } else {
+                                resolve_provider_credential(name, fallback_override)
+                            }
+                        })
+                    },
+                )
+            },
+            |context| context.credential.clone(),
+        )
+        .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
     match name {

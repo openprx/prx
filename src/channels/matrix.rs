@@ -216,7 +216,8 @@ impl MatrixChannel {
             return Ok(self.room_id.clone());
         }
 
-        if let Some(cached) = self.resolved_room_id_cache.read().await.clone() {
+        let value = self.resolved_room_id_cache.read().await.clone();
+        if let Some(cached) = value {
             return Ok(cached);
         }
 
@@ -287,7 +288,7 @@ impl MatrixChannel {
 
                 let resolved_device_id = match (whoami.as_ref(), self.session_device_id_hint.as_ref()) {
                     (Some(whoami), Some(hinted)) => {
-                        if let Some(whoami_device_id) = whoami.device_id.as_ref() {
+                        whoami.device_id.as_ref().map_or_else(|| hinted.clone(), |whoami_device_id| {
                             if whoami_device_id != hinted {
                                 tracing::warn!(
                                     "Matrix configured device_id '{}' does not match whoami '{}'; using whoami.",
@@ -296,9 +297,7 @@ impl MatrixChannel {
                                 );
                             }
                             whoami_device_id.clone()
-                        } else {
-                            hinted.clone()
-                        }
+                        })
                     }
                     (Some(whoami), None) => whoami.device_id.clone().ok_or_else(|| {
                         anyhow::anyhow!(

@@ -107,8 +107,8 @@ mod tests {
         let fc2 = Arc::new(AtomicUsize::new(0));
 
         let m = MultiObserver::new(vec![
-            Box::new(CountingObserver::new(ec1.clone(), mc1.clone(), fc1.clone())),
-            Box::new(CountingObserver::new(ec2.clone(), mc2.clone(), fc2.clone())),
+            Box::new(CountingObserver::new(ec1.clone(), mc1, fc1)),
+            Box::new(CountingObserver::new(ec2.clone(), mc2, fc2)),
         ]);
 
         m.record_event(&ObserverEvent::HeartbeatTick);
@@ -129,8 +129,8 @@ mod tests {
         let fc2 = Arc::new(AtomicUsize::new(0));
 
         let m = MultiObserver::new(vec![
-            Box::new(CountingObserver::new(ec1.clone(), mc1.clone(), fc1.clone())),
-            Box::new(CountingObserver::new(ec2.clone(), mc2.clone(), fc2.clone())),
+            Box::new(CountingObserver::new(ec1, mc1.clone(), fc1)),
+            Box::new(CountingObserver::new(ec2, mc2.clone(), fc2)),
         ]);
 
         m.record_metric(&ObserverMetric::TokensUsed(100));
@@ -149,7 +149,7 @@ mod tests {
 
         let m = MultiObserver::new(vec![
             Box::new(CountingObserver::new(ec.clone(), mc.clone(), fc1.clone())),
-            Box::new(CountingObserver::new(ec.clone(), mc.clone(), fc2.clone())),
+            Box::new(CountingObserver::new(ec, mc, fc2.clone())),
         ]);
 
         m.flush();

@@ -493,11 +493,9 @@ impl Tool for MemorySearchTool {
         };
 
         let scope_ctx = parse_scope_ctx(&args);
-        let principal = if let Some(ref ctx) = scope_ctx {
+        let principal = scope_ctx.as_ref().map_or_else(anonymous_principal, |ctx| {
             resolve_principal(&conn, ctx).unwrap_or_else(|_| fallback_principal(ctx))
-        } else {
-            anonymous_principal()
-        };
+        });
         let (scope_sql, scope_params) = principal.build_sql_scope();
 
         if self.acl_enabled && principal.acl_enforced {
@@ -679,7 +677,7 @@ fn best_snippet(content: &str, terms: &[String]) -> String {
     });
     let line = first_match
         .or_else(|| content.lines().map(str::trim).find(|line| !line.is_empty()))
-        .unwrap_or(content.trim());
+        .unwrap_or_else(|| content.trim());
     if line.chars().count() <= MAX_SNIPPET_CHARS {
         return line.to_string();
     }

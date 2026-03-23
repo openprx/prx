@@ -198,11 +198,7 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
             continue;
         };
 
-        let is_old = if let Some(date) = date_prefix(filename) {
-            date < cutoff_date
-        } else {
-            is_older_than(&path, cutoff_time)
-        };
+        let is_old = date_prefix(filename).map_or_else(|| is_older_than(&path, cutoff_time), |date| date < cutoff_date);
 
         if is_old {
             move_to_archive(&path, &archive_dir)?;
@@ -279,11 +275,7 @@ fn purge_session_archives(workspace_dir: &Path, purge_after_days: u32) -> Result
             continue;
         };
 
-        let is_old = if let Some(date) = date_prefix(filename) {
-            date < cutoff_date
-        } else {
-            is_older_than(&path, cutoff_time)
-        };
+        let is_old = date_prefix(filename).map_or_else(|| is_older_than(&path, cutoff_time), |date| date < cutoff_date);
 
         if is_old {
             fs::remove_file(&path)?;

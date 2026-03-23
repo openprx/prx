@@ -221,17 +221,17 @@ impl AnthropicProvider {
         }
 
         // Check whether the token is expired or within the buffer.
-        let needs_refresh = match state.expires_at {
-            Some(expires_at) => {
+        let needs_refresh = state.expires_at.map_or_else(
+            || state.credential.is_none(),
+            |expires_at| {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .ok()
                     .and_then(|d| i64::try_from(d.as_millis()).ok())
                     .unwrap_or(i64::MAX);
                 expires_at <= now_ms.saturating_add(Self::REFRESH_BUFFER_MS)
-            }
-            None => state.credential.is_none(),
-        };
+            },
+        );
 
         if needs_refresh {
             let refresh_token = state
@@ -802,7 +802,7 @@ impl Provider for AnthropicProvider {
                     parameters: func
                         .get("parameters")
                         .cloned()
-                        .unwrap_or(serde_json::json!({"type": "object"})),
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"})),
                 })
             })
             .collect();

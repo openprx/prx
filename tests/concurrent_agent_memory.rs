@@ -1,7 +1,7 @@
 //! Phase 4: Cross-module integration tests — concurrent agent turns with shared memory.
 //!
 //! Validates that multiple parallel agent invocations can safely read/write
-//! to the same SQLite memory backend without data loss or corruption.
+//! to the same `SQLite` memory backend without data loss or corruption.
 
 use openprx::memory::sqlite::SqliteMemory;
 use openprx::memory::traits::{Memory, MemoryCategory};

@@ -90,20 +90,17 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
             let search_area = &remaining[..hard_split];
 
             // Prefer splitting at newline
-            if let Some(pos) = search_area.rfind('\n') {
-                // Don't split if the newline is too close to the end
-                if search_area[..pos].chars().count() >= DISCORD_MAX_MESSAGE_LENGTH / 2 {
-                    pos + 1
-                } else {
-                    // Try space as fallback
-                    search_area.rfind(' ').map_or(hard_split, |space| space + 1)
-                }
-            } else if let Some(pos) = search_area.rfind(' ') {
-                pos + 1
-            } else {
-                // Hard split at the limit
-                hard_split
-            }
+            search_area.rfind('\n').map_or_else(
+                || search_area.rfind(' ').map_or(hard_split, |pos| pos + 1),
+                |pos| {
+                    if search_area[..pos].chars().count() >= DISCORD_MAX_MESSAGE_LENGTH / 2 {
+                        pos + 1
+                    } else {
+                        // Try space as fallback
+                        search_area.rfind(' ').map_or(hard_split, |space| space + 1)
+                    }
+                },
+            )
         };
 
         chunks.push(remaining[..chunk_end].to_string());
@@ -255,7 +252,7 @@ impl Channel for DiscordChannel {
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)
-        let hello = read.next().await.ok_or(anyhow::anyhow!("No hello"))??;
+        let hello = read.next().await.ok_or_else(|| anyhow::anyhow!("No hello"))??;
         let hello_data: serde_json::Value = serde_json::from_str(&hello.to_string())?;
         let heartbeat_interval = hello_data
             .get("d")

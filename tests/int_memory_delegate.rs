@@ -489,10 +489,8 @@ async fn int_e2e_04_scope_denied_audit_log_error_response() {
     );
 
     // Step 4: Verify error response would be generated (shell never executes)
-    let error_message = format!(
-        "Tool '{}' denied by scope rules for sender '{}' on channel '{}'",
-        tool_name, sender, channel
-    );
+    let error_message =
+        format!("Tool '{tool_name}' denied by scope rules for sender '{sender}' on channel '{channel}'");
     assert!(
         error_message.contains("denied"),
         "error response should indicate denial"

@@ -74,7 +74,12 @@
     clippy::unused_self,
     clippy::cast_precision_loss,
     clippy::unnecessary_wraps,
-    clippy::assertions_on_constants
+    clippy::assertions_on_constants,
+    clippy::excessive_nesting,
+    clippy::single_option_map,
+    clippy::trait_duplication_in_bounds,
+    clippy::large_stack_frames,
+    clippy::too_long_first_doc_paragraph
 )]
 
 use clap::Subcommand;

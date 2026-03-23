@@ -290,7 +290,7 @@ impl SignalStormGuard {
         false
     }
 
-    fn is_duplicate(&mut self, fingerprint: &str, ttl: Duration, now: Instant) -> bool {
+    fn is_duplicate(&self, fingerprint: &str, ttl: Duration, now: Instant) -> bool {
         if ttl.is_zero() {
             return false;
         }
@@ -587,19 +587,23 @@ impl SignalChannel {
         let Some(ref expected) = self.group_id else {
             return true;
         };
-        match data_msg.group_info.as_ref().and_then(|g| g.group_id.as_deref()) {
-            Some(gid) => gid == expected.as_str(),
-            None => expected.eq_ignore_ascii_case("dm"),
-        }
+        data_msg
+            .group_info
+            .as_ref()
+            .and_then(|g| g.group_id.as_deref())
+            .map_or_else(|| expected.eq_ignore_ascii_case("dm"), |gid| gid == expected.as_str())
     }
 
     /// Determine the send target: group id or the sender's number.
     fn reply_target(&self, data_msg: &DataMessage, sender: &str) -> String {
-        if let Some(group_id) = data_msg.group_info.as_ref().and_then(|g| g.group_id.as_deref()) {
-            format!("{GROUP_TARGET_PREFIX}{group_id}")
-        } else {
-            sender.to_string()
-        }
+        data_msg
+            .group_info
+            .as_ref()
+            .and_then(|g| g.group_id.as_deref())
+            .map_or_else(
+                || sender.to_string(),
+                |group_id| format!("{GROUP_TARGET_PREFIX}{group_id}"),
+            )
     }
 
     fn parse_embedded_data_message(edit_message: &serde_json::Value) -> Option<DataMessage> {
@@ -1467,14 +1471,13 @@ impl SignalChannel {
             })
             .or(sync_group_id.as_deref());
         let content_prefix = if is_group_message {
-            if let Some(group_name) = group_info
+            group_info
                 .and_then(|g| g.group_name.as_deref())
                 .filter(|name| !name.trim().is_empty())
-            {
-                format!("[Signal Group: {group_name}] {sender}: ")
-            } else {
-                format!("[Signal Group] {sender}: ")
-            }
+                .map_or_else(
+                    || format!("[Signal Group] {sender}: "),
+                    |group_name| format!("[Signal Group: {group_name}] {sender}: "),
+                )
         } else {
             String::new()
         };

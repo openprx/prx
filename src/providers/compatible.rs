@@ -972,10 +972,7 @@ impl Provider for OpenAiCompatibleProvider {
         let mut messages = Vec::new();
 
         if self.merge_system_into_user {
-            let content = match system_prompt {
-                Some(sys) => format!("{sys}\n\n{message}"),
-                None => message.to_string(),
-            };
+            let content = system_prompt.map_or_else(|| message.to_string(), |sys| format!("{sys}\n\n{message}"));
             messages.push(Message {
                 role: "user".to_string(),
                 content,
@@ -1464,10 +1461,7 @@ impl Provider for OpenAiCompatibleProvider {
             // Check status
             if !response.status().is_success() {
                 let status = response.status();
-                let error = match response.text().await {
-                    Ok(e) => e,
-                    Err(_) => format!("HTTP error: {}", status),
-                };
+                let error = (response.text().await).unwrap_or_else(|_| format!("HTTP error: {}", status));
                 let _ = tx
                     .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
                     .await;

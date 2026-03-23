@@ -3,9 +3,9 @@
 //! Prevents: Pattern 3 — Channel message routing & identity bugs (17% of user bugs).
 //! Issues: #496, #483, #620, #415, #503
 //!
-//! Tests that ChannelMessage fields are used consistently and that the
-//! SendMessage → Channel trait contract preserves correct identity semantics.
-//! Verifies sender/reply_target field contracts to prevent field swaps.
+//! Tests that `ChannelMessage` fields are used consistently and that the
+//! `SendMessage` → Channel trait contract preserves correct identity semantics.
+//! Verifies `sender/reply_target` field contracts to prevent field swaps.
 #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
 use async_trait::async_trait;
@@ -157,7 +157,7 @@ struct CapturingChannel {
 }
 
 impl CapturingChannel {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             sent: std::sync::Mutex::new(Vec::new()),
         }
@@ -170,7 +170,7 @@ impl CapturingChannel {
 
 #[async_trait]
 impl Channel for CapturingChannel {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "capturing"
     }
 

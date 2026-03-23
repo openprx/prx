@@ -5,7 +5,7 @@
 //!
 //! Tests agent behavior with malformed tool calls, empty responses,
 //! max iteration limits, and cascading tool failures using mock providers.
-//! Complements inline parse_tool_calls tests in `src/agent/loop_.rs`.
+//! Complements inline `parse_tool_calls` tests in `src/agent/loop_.rs`.
 #![allow(clippy::unwrap_used)]
 
 use anyhow::Result;
@@ -30,7 +30,7 @@ struct MockProvider {
 }
 
 impl MockProvider {
-    fn new(responses: Vec<ChatResponse>) -> Self {
+    const fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
         }
@@ -65,10 +65,10 @@ struct EchoTool;
 
 #[async_trait]
 impl Tool for EchoTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "echo"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Echoes the input message"
     }
     fn parameters_schema(&self) -> serde_json::Value {
@@ -98,10 +98,10 @@ struct FailingTool;
 
 #[async_trait]
 impl Tool for FailingTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "failing_tool"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Always fails"
     }
     fn parameters_schema(&self) -> serde_json::Value {
@@ -130,10 +130,10 @@ impl CountingTool {
 
 #[async_trait]
 impl Tool for CountingTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "counter"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Counts invocations"
     }
     fn parameters_schema(&self) -> serde_json::Value {
@@ -173,7 +173,7 @@ fn text_response(text: &str) -> ChatResponse {
     }
 }
 
-fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
+const fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
         text: Some(String::new()),
         tool_calls: calls,
@@ -297,7 +297,7 @@ async fn agent_handles_mixed_tool_success_and_failure() {
 // TG4.3: Iteration limit enforcement (#777)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent should not exceed max_tool_iterations (default=50) even with
+/// Agent should not exceed `max_tool_iterations` (default=50) even with
 /// a provider that keeps returning tool calls
 #[tokio::test]
 async fn agent_respects_max_tool_iterations() {

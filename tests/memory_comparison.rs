@@ -1,6 +1,6 @@
-//! Head-to-head comparison: SQLite vs Markdown memory backends
+//! Head-to-head comparison: `SQLite` vs Markdown memory backends
 //!
-//! Run with: cargo test --test memory_comparison -- --nocapture
+//! Run with: cargo test --test `memory_comparison` -- --nocapture
 #![allow(clippy::print_stdout, clippy::expect_used)]
 
 use std::time::Instant;
@@ -60,8 +60,8 @@ async fn compare_store_speed() {
 
     println!("\n============================================================");
     println!("STORE {n} entries:");
-    println!("  SQLite:   {:?}", sq_dur);
-    println!("  Markdown: {:?}", md_dur);
+    println!("  SQLite:   {sq_dur:?}");
+    println!("  Markdown: {md_dur:?}");
 
     // Both should succeed
     assert_eq!(sq.count().await.unwrap(), n);

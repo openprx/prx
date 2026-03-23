@@ -1,9 +1,9 @@
-//! Example: Implementing a custom Memory backend for ZeroClaw
+//! Example: Implementing a custom Memory backend for `ZeroClaw`
 //!
 //! This demonstrates how to create a Redis-backed memory backend.
 //! The Memory trait is async and pluggable — implement it for any storage.
 //!
-//! Run: cargo run --example custom_memory
+//! Run: cargo run --example `custom_memory`
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,7 @@ pub trait Memory: Send + Sync {
 
 // ── Your custom implementation ─────────────────────────────────────
 
-/// In-memory HashMap backend (great for testing or ephemeral sessions)
+/// In-memory `HashMap` backend (great for testing or ephemeral sessions)
 pub struct InMemoryBackend {
     store: Mutex<HashMap<String, MemoryEntry>>,
 }
@@ -63,7 +63,7 @@ impl InMemoryBackend {
 
 #[async_trait]
 impl Memory for InMemoryBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "in-memory"
     }
 

@@ -142,14 +142,13 @@ impl LinqChannel {
                 let part_type = part.get("type").and_then(|t| t.as_str())?;
                 match part_type {
                     "text" => part.get("value").and_then(|v| v.as_str()).map(ToString::to_string),
-                    "media" | "image" => {
-                        if let Some(marker) = Self::media_part_to_image_marker(part) {
-                            Some(marker)
-                        } else {
+                    "media" | "image" => Self::media_part_to_image_marker(part).map_or_else(
+                        || {
                             tracing::debug!("Linq: skipping unsupported {part_type} part");
                             None
-                        }
-                    }
+                        },
+                        |marker| Some(marker),
+                    ),
                     _ => {
                         tracing::debug!("Linq: skipping {part_type} part");
                         None

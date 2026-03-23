@@ -304,7 +304,7 @@ fn verify_webhook_hmac_signature(secret: &str, body: &[u8], signature_header: &s
     let signature_hex = signature_header
         .trim()
         .strip_prefix("sha256=")
-        .unwrap_or(signature_header.trim());
+        .unwrap_or_else(|| signature_header.trim());
     let Ok(provided) = hex::decode(signature_hex) else {
         return false;
     };

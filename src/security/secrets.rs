@@ -90,13 +90,14 @@ impl SecretStore {
     /// **Warning**: Legacy `enc:` values are insecure. Use `decrypt_and_migrate` to
     /// automatically upgrade them to the secure `enc2:` format.
     pub fn decrypt(&self, value: &str) -> Result<String> {
-        if let Some(hex_str) = value.strip_prefix("enc2:") {
-            self.decrypt_chacha20(hex_str)
-        } else if let Some(hex_str) = value.strip_prefix("enc:") {
-            self.decrypt_legacy_xor(hex_str)
-        } else {
-            Ok(value.to_string())
-        }
+        value.strip_prefix("enc2:").map_or_else(
+            || {
+                value
+                    .strip_prefix("enc:")
+                    .map_or_else(|| Ok(value.to_string()), |hex_str| self.decrypt_legacy_xor(hex_str))
+            },
+            |hex_str| self.decrypt_chacha20(hex_str),
+        )
     }
 
     /// Decrypt a secret and return a migrated `enc2:` value if the input used legacy `enc:` format.

@@ -174,10 +174,9 @@ impl WasmStorage {
             .get_func(store.as_context_mut(), &func_idx)
             .ok_or_else(|| PluginError::Runtime("store-memory is not a function".to_string()))?;
 
-        let session_val = match session_id {
-            Some(s) => wasmtime::component::Val::Option(Some(Box::new(wasmtime::component::Val::String(s.into())))),
-            None => wasmtime::component::Val::Option(None),
-        };
+        let session_val = session_id.map_or(wasmtime::component::Val::Option(None), |s| {
+            wasmtime::component::Val::Option(Some(Box::new(wasmtime::component::Val::String(s.into()))))
+        });
 
         let params = [
             wasmtime::component::Val::String(key.into()),
@@ -244,10 +243,9 @@ impl WasmStorage {
             .get_func(store.as_context_mut(), &func_idx)
             .ok_or_else(|| PluginError::Runtime("recall-memory is not a function".to_string()))?;
 
-        let session_val = match session_id {
-            Some(s) => wasmtime::component::Val::Option(Some(Box::new(wasmtime::component::Val::String(s.into())))),
-            None => wasmtime::component::Val::Option(None),
-        };
+        let session_val = session_id.map_or(wasmtime::component::Val::Option(None), |s| {
+            wasmtime::component::Val::Option(Some(Box::new(wasmtime::component::Val::String(s.into()))))
+        });
 
         let params = [
             wasmtime::component::Val::String(query.into()),

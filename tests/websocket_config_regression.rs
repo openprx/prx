@@ -1,8 +1,8 @@
-//! Regression guard: all WebSocket channels must use connect_async_with_config
-//! (with explicit message size limits) instead of bare connect_async.
+//! Regression guard: all WebSocket channels must use `connect_async_with_config`
+//! (with explicit message size limits) instead of bare `connect_async`.
 //!
-//! Bare connect_async accepts messages up to 64 MB by default, which enables
-//! trivial memory-exhaustion DoS via oversized WebSocket frames.
+//! Bare `connect_async` accepts messages up to 64 MB by default, which enables
+//! trivial memory-exhaustion `DoS` via oversized WebSocket frames.
 
 const WS_CHANNEL_FILES: &[(&str, &str)] = &[
     ("discord", include_str!("../src/channels/discord.rs")),

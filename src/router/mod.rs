@@ -116,7 +116,7 @@ impl RouterEngine {
             } else {
                 filter_models_by_providers(config.models.clone(), &reachable_providers)
             },
-            ..config.clone()
+            ..config
         };
         let models =
             futures::executor::block_on(ModelCapabilityEntry::load_all(&filtered_config.models, memory.as_ref()));

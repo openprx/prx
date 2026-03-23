@@ -689,7 +689,7 @@ impl Tool for ComposioTool {
                     .ok_or_else(|| anyhow::anyhow!("Missing 'action_name' (or 'tool_slug') for execute"))?;
 
                 let app = args.get("app").and_then(|v| v.as_str());
-                let params = args.get("params").cloned().unwrap_or(json!({}));
+                let params = args.get("params").cloned().unwrap_or_else(|| json!({}));
                 let acct_ref = args.get("connected_account_id").and_then(|v| v.as_str());
 
                 match self
@@ -733,7 +733,7 @@ impl Tool for ComposioTool {
 
                 match self.get_connection_url(app, auth_config_id, entity_id).await {
                     Ok(link) => {
-                        let target = app.unwrap_or(auth_config_id.unwrap_or("provided auth config"));
+                        let target = app.unwrap_or_else(|| auth_config_id.unwrap_or("provided auth config"));
                         let mut output = format!("Open this URL to connect {target}:\n{}", link.redirect_url);
                         if let Some(connected_account_id) = link.connected_account_id.as_deref() {
                             if let Some(app_name) = app {
@@ -829,24 +829,20 @@ fn build_connected_account_hint(
         return String::new();
     };
 
-    if let Some(app) = app_hint {
-        format!(
+    app_hint.map_or_else(|| format!(" Hint: use action='list_accounts' with entity_id='{entity}' to retrieve connected_account_id."), |app| format!(
             " Hint: use action='list_accounts' with app='{app}' and entity_id='{entity}' to retrieve connected_account_id."
-        )
-    } else {
-        format!(" Hint: use action='list_accounts' with entity_id='{entity}' to retrieve connected_account_id.")
-    }
+        ))
 }
 
 fn map_v3_tools_to_actions(items: Vec<ComposioV3Tool>) -> Vec<ComposioAction> {
     items
         .into_iter()
         .filter_map(|item| {
-            let name = item.slug.or(item.name.clone())?;
+            let name = item.slug.or_else(|| item.name.clone())?;
             let app_name = item
                 .toolkit
                 .as_ref()
-                .and_then(|toolkit| toolkit.slug.clone().or(toolkit.name.clone()))
+                .and_then(|toolkit| toolkit.slug.clone().or_else(|| toolkit.name.clone()))
                 .or(item.app_name);
             let description = item.description.or(item.name);
             Some(ComposioAction {

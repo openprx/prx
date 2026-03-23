@@ -188,14 +188,14 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
 
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
     let mut job = get_job(config, job_id)?;
-    let mut schedule_changed = false;
-
-    if let Some(schedule) = patch.schedule {
+    let schedule_changed = if let Some(schedule) = patch.schedule {
         validate_schedule(&schedule, Utc::now())?;
         job.schedule = schedule;
         job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
-        schedule_changed = true;
-    }
+        true
+    } else {
+        false
+    };
     if let Some(command) = patch.command {
         job.command = command;
     }

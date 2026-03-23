@@ -100,7 +100,7 @@ impl ChatSession {
     }
 
     /// Number of turns in this session.
-    pub fn turn_count(&self) -> usize {
+    pub const fn turn_count(&self) -> usize {
         self.turns.len()
     }
 
@@ -135,11 +135,10 @@ fn truncate_title(content: &str) -> String {
         end = i;
     }
     // Try to break at a space
-    if let Some(space_pos) = trimmed[..end].rfind(' ') {
-        format!("{}...", &trimmed[..space_pos])
-    } else {
-        format!("{}...", &trimmed[..end])
-    }
+    trimmed[..end].rfind(' ').map_or_else(
+        || format!("{}...", &trimmed[..end]),
+        |space_pos| format!("{}...", &trimmed[..space_pos]),
+    )
 }
 
 #[allow(clippy::indexing_slicing)]

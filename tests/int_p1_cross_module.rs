@@ -165,8 +165,8 @@ async fn int_cr_01_hot_reload_concurrent_readers_see_consistent_config() {
     );
 }
 
-/// Config change propagates to SecurityPolicy construction.
-/// INT-CR-03: Verify that changes to autonomy config produce different SecurityPolicy.
+/// Config change propagates to `SecurityPolicy` construction.
+/// INT-CR-03: Verify that changes to autonomy config produce different `SecurityPolicy`.
 #[tokio::test]
 async fn int_cr_03_config_change_propagates_to_security_policy() {
     let shared = new_shared(Config::default());
@@ -258,7 +258,7 @@ async fn int_sme_04_circuit_breaker_opens_after_threshold_failures() {
 // INT-SME-05: Rollback manager restores previous state on failure
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// RollbackManager can backup, modify, then restore the previous version.
+/// `RollbackManager` can backup, modify, then restore the previous version.
 #[tokio::test]
 async fn int_sme_05_rollback_manager_backup_and_restore() {
     let dir = tempfile::tempdir().expect("test: create temp dir");
@@ -302,7 +302,7 @@ async fn int_sme_05_rollback_manager_backup_and_restore() {
     );
 }
 
-/// Rollback manager prunes old versions beyond max_versions.
+/// Rollback manager prunes old versions beyond `max_versions`.
 #[tokio::test]
 async fn int_sme_05_rollback_manager_prunes_old_versions() {
     let dir = tempfile::tempdir().expect("test: create temp dir");
@@ -334,7 +334,7 @@ async fn int_sme_05_rollback_manager_prunes_old_versions() {
 // INT-SME-06: Trace context propagates through full evolution pipeline
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// with_trace() propagates TraceContext so that current_trace() returns it inside the span.
+/// `with_trace()` propagates `TraceContext` so that `current_trace()` returns it inside the span.
 #[tokio::test]
 async fn int_sme_06_trace_context_propagation() {
     let ctx = TraceContext::new();
@@ -357,7 +357,7 @@ async fn int_sme_06_trace_context_propagation() {
     );
 }
 
-/// Nested operations within with_trace() share the same trace context.
+/// Nested operations within `with_trace()` share the same trace context.
 #[tokio::test]
 async fn int_sme_06_trace_context_shared_across_nested_operations() {
     let ctx = TraceContext::new();
@@ -384,7 +384,7 @@ async fn int_sme_06_trace_context_shared_across_nested_operations() {
     );
 }
 
-/// Outside of with_trace(), current_trace() returns None.
+/// Outside of `with_trace()`, `current_trace()` returns None.
 #[tokio::test]
 async fn int_sme_06_trace_context_absent_outside_scope() {
     let result = current_trace();
@@ -398,7 +398,7 @@ async fn int_sme_06_trace_context_absent_outside_scope() {
 // INT-MM-02: LucidMemory delegates to SQLite local
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// LucidMemory wraps SqliteMemory and delegates store/get/recall/count operations.
+/// `LucidMemory` wraps `SqliteMemory` and delegates store/get/recall/count operations.
 #[tokio::test]
 async fn int_mm_02_lucid_delegates_to_sqlite() {
     use openprx::memory::lucid::LucidMemory;
@@ -452,7 +452,7 @@ async fn int_mm_02_lucid_delegates_to_sqlite() {
 // INT-MM-03: MarkdownMemory concurrent access
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// 5 concurrent tasks write to the same MarkdownMemory without file corruption.
+/// 5 concurrent tasks write to the same `MarkdownMemory` without file corruption.
 #[tokio::test]
 async fn int_mm_03_markdown_concurrent_writes_no_corruption() {
     let tmp = tempfile::TempDir::new().expect("test: create temp dir");
@@ -529,7 +529,7 @@ async fn int_mm_04_memory_backend_fallback_on_unknown() {
 // header processing.)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// IdempotencyStore correctly limits the maximum number of tracked keys.
+/// `IdempotencyStore` correctly limits the maximum number of tracked keys.
 /// We verify this indirectly by ensuring the store can be created with bounded config.
 #[tokio::test]
 async fn int_gs_06_idempotency_store_creation_bounded() {
@@ -550,7 +550,7 @@ async fn int_gs_06_idempotency_store_creation_bounded() {
 // INT-GS-07: Public bind detection warns on insecure pairing
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// is_public_bind correctly identifies public vs private addresses.
+/// `is_public_bind` correctly identifies public vs private addresses.
 #[tokio::test]
 async fn int_gs_07_public_bind_detection() {
     // Public addresses — should return true
@@ -578,7 +578,7 @@ async fn int_gs_07_public_bind_detection() {
 // INT-GCW-02: Webhook group message auto-save filtering
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// should_autosave_content filters noise patterns even when the message is long enough.
+/// `should_autosave_content` filters noise patterns even when the message is long enough.
 #[tokio::test]
 async fn int_gcw_02_webhook_group_filtering_noise() {
     // Group message with heartbeat pattern (should NOT be auto-saved)

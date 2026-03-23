@@ -285,7 +285,7 @@ mod tests {
             mentioned_uuids: vec![],
         };
 
-        let cloned = message.clone();
+        let cloned = message;
         assert_eq!(cloned.id, "42");
         assert_eq!(cloned.sender, "alice");
         assert_eq!(cloned.reply_target, "alice");

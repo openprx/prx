@@ -598,15 +598,14 @@ fn ensure_openclaw_skills_repo(
     // Check enabled flag (env var takes priority over config)
     let enabled = {
         let env_override = std::env::var("ZEROCLAW_OPENCLAW_SKILLS_ENABLED").ok();
-        if let Some(raw) = env_override.as_deref() {
-            match raw.trim().to_ascii_lowercase().as_str() {
+        env_override.as_deref().map_or_else(
+            || config_openclaw_skills_enabled.unwrap_or(false),
+            |raw| match raw.trim().to_ascii_lowercase().as_str() {
                 "1" | "true" | "yes" | "on" => true,
                 "0" | "false" | "no" | "off" => false,
                 _ => config_openclaw_skills_enabled.unwrap_or(false),
-            }
-        } else {
-            config_openclaw_skills_enabled.unwrap_or(false)
-        }
+            },
+        )
     };
 
     if !enabled {

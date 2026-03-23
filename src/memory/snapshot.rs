@@ -396,13 +396,12 @@ fn has_markdown_memory_files(workspace_dir: &Path) -> bool {
         return false;
     }
 
-    match fs::read_dir(memory_dir) {
-        Ok(entries) => entries.filter_map(std::result::Result::ok).any(|entry| {
+    fs::read_dir(memory_dir).map_or(false, |entries| {
+        entries.filter_map(std::result::Result::ok).any(|entry| {
             let path = entry.path();
             path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("md")
-        }),
-        Err(_) => false,
-    }
+        })
+    })
 }
 
 /// NOTE: All `.exists()` checks below are TOCTOU safe — read-only probes for

@@ -75,11 +75,9 @@ impl IrcMessage {
         };
 
         // Split at trailing (first `:` after command/params)
-        let (params_part, trailing) = if let Some(colon_pos) = rest.find(" :") {
+        let (params_part, trailing) = rest.find(" :").map_or((rest, None), |colon_pos| {
             (&rest[..colon_pos], Some(&rest[colon_pos + 2..]))
-        } else {
-            (rest, None)
-        };
+        });
 
         let mut parts: Vec<&str> = params_part.split_whitespace().collect();
         if parts.is_empty() {

@@ -3,7 +3,7 @@
 //! Prevents: Pattern 5 — Memory & state persistence bugs (10% of user bugs).
 //! Issues: #430, #693, #802
 //!
-//! Tests SqliteMemory deduplication on restart, session scoping, concurrent
+//! Tests `SqliteMemory` deduplication on restart, session scoping, concurrent
 //! message ordering, and recall behavior after re-initialization.
 #![allow(clippy::indexing_slicing)]
 

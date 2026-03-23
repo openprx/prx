@@ -483,17 +483,21 @@ impl Channel for EmailChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         // Use explicit subject if provided, otherwise fall back to legacy parsing or default
-        let (subject, body) = if let Some(ref subj) = message.subject {
-            (subj.as_str(), message.content.as_str())
-        } else if message.content.starts_with("Subject: ") {
-            if let Some(pos) = message.content.find('\n') {
-                (&message.content[9..pos], message.content[pos + 1..].trim())
-            } else {
-                ("OpenPRX Message", message.content.as_str())
-            }
-        } else {
-            ("OpenPRX Message", message.content.as_str())
-        };
+        let (subject, body) = message.subject.as_ref().map_or_else(
+            || {
+                if message.content.starts_with("Subject: ") {
+                    message
+                        .content
+                        .find('\n')
+                        .map_or(("OpenPRX Message", message.content.as_str()), |pos| {
+                            (&message.content[9..pos], message.content[pos + 1..].trim())
+                        })
+                } else {
+                    ("OpenPRX Message", message.content.as_str())
+                }
+            },
+            |subj| (subj.as_str(), message.content.as_str()),
+        );
 
         let email = Message::builder()
             .from(self.config.from_address.parse()?)

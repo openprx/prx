@@ -315,11 +315,9 @@ impl Tool for MemoryGetTool {
                 }
             };
             let scope_ctx = parse_scope_ctx(&args);
-            let principal = if let Some(ref ctx) = scope_ctx {
+            let principal = scope_ctx.as_ref().map_or_else(anonymous_principal, |ctx| {
                 resolve_principal(&conn, ctx).unwrap_or_else(|_| fallback_principal(ctx))
-            } else {
-                anonymous_principal()
-            };
+            });
             let (scope_sql, scope_params) = principal.build_sql_scope();
 
             if self.acl_enabled && principal.acl_enforced {

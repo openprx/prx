@@ -622,14 +622,12 @@ impl Agent {
 
         // Prefer structured run_id from JSON output; fall back to text parsing
         // only if the tool does not return a machine-readable envelope.
-        let run_id: Option<String> = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&result.output) {
+        let run_id: Option<String> = serde_json::from_str::<serde_json::Value>(&result.output).map_or(None, |json| {
             json.get("run_id")
                 .or_else(|| json.get("id"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
-        } else {
-            None
-        };
+        });
 
         let run_id = run_id.or_else(|| {
             // Legacy text parsing — emit a warning so future regressions surface.

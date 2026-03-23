@@ -43,7 +43,7 @@ struct MockProvider {
 }
 
 impl MockProvider {
-    fn new(responses: Vec<ChatResponse>) -> Self {
+    const fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: std::sync::Mutex::new(responses),
         }
@@ -82,7 +82,7 @@ struct HangingProvider {
 }
 
 impl HangingProvider {
-    fn new(responses: Vec<ChatResponse>, hang_on_call: usize) -> Self {
+    const fn new(responses: Vec<ChatResponse>, hang_on_call: usize) -> Self {
         Self {
             responses: std::sync::Mutex::new(responses),
             hang_on_call,
@@ -143,10 +143,10 @@ struct EchoTool;
 
 #[async_trait]
 impl Tool for EchoTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "echo"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Echoes the input message"
     }
     fn parameters_schema(&self) -> serde_json::Value {
@@ -185,10 +185,10 @@ impl CountingTool {
 
 #[async_trait]
 impl Tool for CountingTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "counter"
     }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Counts invocations"
     }
     fn parameters_schema(&self) -> serde_json::Value {
@@ -211,7 +211,7 @@ struct MockMemory;
 
 #[async_trait]
 impl Memory for MockMemory {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "mock"
     }
 
@@ -273,7 +273,7 @@ fn text_response(text: &str) -> ChatResponse {
     }
 }
 
-fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
+const fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
         text: Some(String::new()),
         tool_calls: calls,
@@ -395,7 +395,7 @@ async fn test_health_handler() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
 
-/// Minimal auth middleware that checks bearer token against PairingGuard.
+/// Minimal auth middleware that checks bearer token against `PairingGuard`.
 async fn test_auth_middleware(
     axum::extract::State(state): axum::extract::State<AppState>,
     request: axum::extract::Request,
@@ -406,8 +406,7 @@ async fn test_auth_middleware(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|auth| auth.strip_prefix("Bearer "))
-        .map(str::trim)
-        .unwrap_or("");
+        .map_or("", str::trim);
 
     if state.pairing.require_pairing() && !state.pairing.is_authenticated(token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
@@ -490,7 +489,7 @@ fn compute_hmac_signature(secret: &str, body: &[u8]) -> String {
     format!("sha256={}", hex::encode(result.into_bytes()))
 }
 
-/// Start an axum test server on a random port and return (addr, join_handle).
+/// Start an axum test server on a random port and return (addr, `join_handle`).
 async fn spawn_test_server(router: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -513,7 +512,7 @@ async fn spawn_test_server(router: Router) -> (SocketAddr, tokio::task::JoinHand
 // INT-AP-01: Provider returns tool calls, agent dispatches correctly
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Validates that when a provider returns tool_calls, the agent dispatches
+/// Validates that when a provider returns `tool_calls`, the agent dispatches
 /// to the correct tool, collects the result, and feeds it back to the provider,
 /// ultimately returning a final text response.
 #[tokio::test]
@@ -727,7 +726,7 @@ async fn int_agent_gateway_gs01_rejects_unauthenticated_api_request() {
 // INT-GS-04: Gateway body size limit prevents OOM
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Validates that sending a body larger than MAX_BODY_SIZE (64KB) to a
+/// Validates that sending a body larger than `MAX_BODY_SIZE` (64KB) to a
 /// body-limited route returns 413 Payload Too Large.
 #[tokio::test]
 async fn int_agent_gateway_gs04_body_size_limit_prevents_oom() {
@@ -919,7 +918,7 @@ async fn int_agent_gateway_ap04_empty_provider_response() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Validates that when the provider requests a tool that is not registered,
-/// the agent returns an error ToolResult and feeds it back to the provider.
+/// the agent returns an error `ToolResult` and feeds it back to the provider.
 #[tokio::test]
 async fn int_agent_gateway_at03_unknown_tool_name() {
     let provider = Box::new(MockProvider::new(vec![
@@ -987,7 +986,7 @@ fn int_agent_gateway_gs02_rate_limiter_enforcement() {
 // INT-GS-03: Rate limiter memory does not grow unbounded
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Rate limiter with bounded max_keys evicts entries when capacity is exceeded.
+/// Rate limiter with bounded `max_keys` evicts entries when capacity is exceeded.
 #[test]
 fn int_agent_gateway_gs03_rate_limiter_bounded_memory() {
     // max_keys=3 — only 3 distinct keys can be tracked

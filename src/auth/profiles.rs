@@ -39,13 +39,10 @@ pub struct TokenSet {
 
 impl TokenSet {
     pub fn is_expiring_within(&self, skew: Duration) -> bool {
-        match self.expires_at {
-            Some(expires_at) => {
-                let now_plus_skew = Utc::now() + chrono::Duration::from_std(skew).unwrap_or_default();
-                expires_at <= now_plus_skew
-            }
-            None => false,
-        }
+        self.expires_at.map_or(false, |expires_at| {
+            let now_plus_skew = Utc::now() + chrono::Duration::from_std(skew).unwrap_or_default();
+            expires_at <= now_plus_skew
+        })
     }
 }
 

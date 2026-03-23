@@ -274,15 +274,29 @@ undocumented_unsafe_blocks = "deny"
 inefficient_to_string = "deny"
 large_futures = "warn"
 
+# Nursery lints that require deep refactoring — allow for now
+significant_drop_tightening = "allow"
+future_not_send = "allow"
+redundant_pub_crate = "allow"
+
+# Pedantic style lints — allow non-critical ones
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+too_many_lines = "allow"
+cognitive_complexity = "allow"
+excessive_nesting = "allow"
+pub_with_shorthand = "allow"
+single_option_map = "allow"
+trait_duplication_in_bounds = "allow"
+large_stack_frames = "allow"
+too_long_first_doc_paragraph = "allow"
+
 cast_possible_truncation = "warn"
 cast_sign_loss = "warn"
 cast_precision_loss = "warn"
 cast_lossless = "warn"
-too_many_lines = "allow"
 
 [lints]
 workspace = true

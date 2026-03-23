@@ -429,7 +429,7 @@ impl Provider for OpenRouterProvider {
                                 .and_then(|d| d.as_str())
                                 .unwrap_or("")
                                 .to_string(),
-                            parameters: func.get("parameters").cloned().unwrap_or(serde_json::json!({})),
+                            parameters: func.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({})),
                         },
                     })
                 })

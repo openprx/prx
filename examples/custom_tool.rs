@@ -1,4 +1,4 @@
-//! Example: Implementing a custom Tool for ZeroClaw
+//! Example: Implementing a custom Tool for `ZeroClaw`
 //!
 //! This shows how to add a new tool the agent can use.
 //! Tools are the agent's hands — they let it interact with the world.
@@ -28,11 +28,11 @@ pub struct HttpGetTool;
 
 #[async_trait]
 impl Tool for HttpGetTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "http_get"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Fetch a URL and return the HTTP status code and content length"
     }
 

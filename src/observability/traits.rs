@@ -202,8 +202,8 @@ mod tests {
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 
-        let cloned_event = event.clone();
-        let cloned_metric = metric.clone();
+        let cloned_event = event;
+        let cloned_metric = metric;
 
         assert!(matches!(cloned_event, ObserverEvent::ToolCall { .. }));
         assert!(matches!(cloned_metric, ObserverMetric::RequestLatency(_)));

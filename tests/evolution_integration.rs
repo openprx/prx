@@ -99,7 +99,7 @@ async fn trace_id_end_to_end_pipeline_to_evolution_log() -> Result<()> {
     seed_three_day_digests(analyzer.as_ref(), now).await;
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
-    let mut pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
+    let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
     let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer))?;
 
     let report = pipeline
@@ -149,7 +149,7 @@ async fn record_analyze_evolve_closed_loop_produces_candidate() -> Result<()> {
     seed_three_day_digests(analyzer.as_ref(), Utc::now()).await;
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
-    let mut pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
+    let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
     let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer))?;
 
     let report = pipeline
@@ -198,7 +198,7 @@ async fn shadow_mode_generates_recommendation_without_applying_change() -> Resul
     seed_three_day_digests(analyzer.as_ref(), Utc::now()).await;
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
-    let mut pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
+    let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer.clone(), dir.path());
     let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer))?;
 
     let report = pipeline
@@ -372,7 +372,7 @@ async fn rollback_triggers_when_judge_score_below_threshold() -> Result<()> {
     seed_three_day_digests(analyzer.as_ref(), Utc::now()).await;
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
-    let mut pipeline = EvolutionPipeline::new(shared, analyzer, writer, dir.path());
+    let pipeline = EvolutionPipeline::new(shared, analyzer, writer, dir.path());
     let mut engine = RollbackTriggerEngine {
         target_path: target.clone(),
     };

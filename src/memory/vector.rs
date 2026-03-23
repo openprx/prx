@@ -228,7 +228,9 @@ mod tests {
 
     #[test]
     fn hybrid_merge_respects_limit() {
-        let vec_results: Vec<(String, f32)> = (0..20).map(|i| (format!("item_{i}"), 1.0 - i as f32 * 0.05)).collect();
+        let vec_results: Vec<(String, f32)> = (0..20)
+            .map(|i| (format!("item_{i}"), (i as f32).mul_add(-0.05, 1.0)))
+            .collect();
         let merged = hybrid_merge(&vec_results, &[], 1.0, 0.0, 5);
         assert_eq!(merged.len(), 5);
     }
@@ -279,7 +281,7 @@ mod tests {
     #[test]
     fn cosine_high_dimensional() {
         let a: Vec<f32> = (0..1536).map(|i| (f64::from(i) * 0.001) as f32).collect();
-        let b: Vec<f32> = (0..1536).map(|i| (f64::from(i) * 0.001 + 0.0001) as f32).collect();
+        let b: Vec<f32> = (0..1536).map(|i| f64::from(i).mul_add(0.001, 0.0001) as f32).collect();
         let sim = cosine_similarity(&a, &b);
         assert!(sim > 0.99, "High-dim similar vectors should be close: {sim}");
     }

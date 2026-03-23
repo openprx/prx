@@ -1182,7 +1182,7 @@ mod native_backend {
                         let cwd = std::env::current_dir().context("Failed to determine current working directory")?;
                         // Resolve parent so we can canonicalize even when the
                         // target file does not yet exist.
-                        let parent = requested.parent().unwrap_or(std::path::Path::new("."));
+                        let parent = requested.parent().unwrap_or_else(|| std::path::Path::new("."));
                         let canonical_parent = tokio::fs::canonicalize(parent).await.with_context(|| {
                             format!("Screenshot parent directory does not exist: {}", parent.display())
                         })?;
