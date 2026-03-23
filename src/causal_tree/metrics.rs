@@ -207,8 +207,7 @@ mod tests {
             no_qualified: false,
         });
         let json = serde_json::to_string(&m).expect("test: serialize");
-        let restored: CausalTreeMetrics =
-            serde_json::from_str(&json).expect("test: deserialize");
+        let restored: CausalTreeMetrics = serde_json::from_str(&json).expect("test: deserialize");
         assert_eq!(restored.total_runs, 1);
         assert_eq!(restored.hits_at_1, 1);
     }

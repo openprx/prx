@@ -136,18 +136,14 @@ impl CircuitBreakerState {
         }
         // If open, check whether the cooldown has elapsed.
         match self.open_since {
-            Some(opened_at) => {
-                opened_at.elapsed().as_secs() < policy.circuit_breaker_cooldown_secs
-            }
+            Some(opened_at) => opened_at.elapsed().as_secs() < policy.circuit_breaker_cooldown_secs,
             None => true,
         }
     }
 
     /// Transition to the open state if the threshold has been reached.
     pub fn maybe_open(&mut self, policy: &CausalPolicy) {
-        if self.consecutive_failures >= policy.circuit_breaker_threshold
-            && self.open_since.is_none()
-        {
+        if self.consecutive_failures >= policy.circuit_breaker_threshold && self.open_since.is_none() {
             self.open_since = Some(std::time::Instant::now());
         }
     }
@@ -205,8 +201,7 @@ mod tests {
     fn test_config_serde_roundtrip() {
         let cfg = CausalTreeConfig::default();
         let json = serde_json::to_string(&cfg).expect("test: serialize");
-        let restored: CausalTreeConfig =
-            serde_json::from_str(&json).expect("test: deserialize");
+        let restored: CausalTreeConfig = serde_json::from_str(&json).expect("test: deserialize");
         assert!(!restored.enabled);
         assert_eq!(restored.policy.max_branches, 3);
     }

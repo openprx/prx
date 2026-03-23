@@ -96,10 +96,7 @@ impl CausalTreeEngine {
     ///   pipeline timeout, no branch qualified, etc.).
     ///
     /// On failure the circuit breaker is updated. On success it resets.
-    pub async fn run(
-        &self,
-        state: &CausalState,
-    ) -> Result<(PathCommitDecision, CausalBranch), CausalTreeError> {
+    pub async fn run(&self, state: &CausalState) -> Result<(PathCommitDecision, CausalBranch), CausalTreeError> {
         let pipeline_start = Instant::now();
         let policy = &self.config.policy;
 
@@ -125,16 +122,11 @@ impl CausalTreeEngine {
                 commit_succeeded: false,
                 circuit_breaker_tripped: true,
             });
-            self.observer
-                .record_metric(&ObserverMetric::CteExtraLatency(elapsed));
-            return Err(CausalTreeError::CircuitBreakerOpen {
-                consecutive_failures,
-            });
+            self.observer.record_metric(&ObserverMetric::CteExtraLatency(elapsed));
+            return Err(CausalTreeError::CircuitBreakerOpen { consecutive_failures });
         }
 
-        let result = self
-            .run_pipeline(state, policy, pipeline_start)
-            .await;
+        let result = self.run_pipeline(state, policy, pipeline_start).await;
 
         // Update circuit breaker and metrics based on outcome.
         match &result {
@@ -154,9 +146,7 @@ impl CausalTreeEngine {
         match &result {
             Ok((decision, branch)) => {
                 self.observer.record_event(&ObserverEvent::CteRun {
-                    branch_count: decision.fallback_branch_ids.len()
-                        + decision.rejected_branch_ids.len()
-                        + 1,
+                    branch_count: decision.fallback_branch_ids.len() + decision.rejected_branch_ids.len() + 1,
                     chosen_branch: decision.chosen_branch_id.clone(),
                     chosen_label: branch.label.as_str().to_string(),
                     extra_latency_ms: elapsed_ms,
@@ -175,8 +165,7 @@ impl CausalTreeEngine {
                 });
             }
         }
-        self.observer
-            .record_metric(&ObserverMetric::CteExtraLatency(elapsed));
+        self.observer.record_metric(&ObserverMetric::CteExtraLatency(elapsed));
 
         result
     }
@@ -224,12 +213,7 @@ impl CausalTreeEngine {
             .into_iter()
             .zip(artifacts.into_iter())
             .filter_map(|(branch, artifact)| {
-                let score = self.scorer.score(
-                    state,
-                    &branch,
-                    artifact.as_ref(),
-                    &self.config,
-                )?;
+                let score = self.scorer.score(state, &branch, artifact.as_ref(), &self.config)?;
                 Some((branch, score, artifact))
             })
             .collect();
@@ -255,13 +239,8 @@ impl CausalTreeEngine {
             })?;
 
         // --- 5. Feedback ---
-        let all_branches: Vec<CausalBranch> =
-            sorted.iter().map(|(b, _, _)| b.clone()).collect();
-        if let Err(e) = self
-            .feedback
-            .write_decision(state, &decision, &all_branches)
-            .await
-        {
+        let all_branches: Vec<CausalBranch> = sorted.iter().map(|(b, _, _)| b.clone()).collect();
+        if let Err(e) = self.feedback.write_decision(state, &decision, &all_branches).await {
             tracing::warn!(error = %e, "feedback write failed (non-fatal)");
         }
 
@@ -287,11 +266,7 @@ impl CausalTreeEngine {
     }
 
     /// Check whether the pipeline has exceeded its total time budget.
-    fn check_timeout(
-        &self,
-        policy: &CausalPolicy,
-        start: Instant,
-    ) -> Result<(), CausalTreeError> {
+    fn check_timeout(&self, policy: &CausalPolicy, start: Instant) -> Result<(), CausalTreeError> {
         let elapsed_ms = start.elapsed().as_millis() as u64;
         if elapsed_ms > policy.extra_latency_budget_ms {
             return Err(CausalTreeError::PipelineTimeout {

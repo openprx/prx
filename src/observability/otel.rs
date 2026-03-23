@@ -408,10 +408,7 @@ impl Observer for OtelObserver {
                             KeyValue::new("cte.chosen_label", chosen_label.clone()),
                             KeyValue::new("cte.extra_latency_ms", *extra_latency_ms as i64),
                             KeyValue::new("cte.commit_succeeded", *commit_succeeded),
-                            KeyValue::new(
-                                "cte.circuit_breaker_tripped",
-                                *circuit_breaker_tripped,
-                            ),
+                            KeyValue::new("cte.circuit_breaker_tripped", *circuit_breaker_tripped),
                         ]),
                 );
                 if *commit_succeeded {

@@ -160,9 +160,10 @@ impl DefaultBranchScorer {
 /// Currently detects write inputs by string prefix. This should be replaced
 /// with a typed capability type in a future iteration.
 fn branch_requires_write(branch: &CausalBranch) -> bool {
-    branch.required_inputs.iter().any(|input| {
-        input.starts_with("write:") || input.starts_with("tool:write")
-    })
+    branch
+        .required_inputs
+        .iter()
+        .any(|input| input.starts_with("write:") || input.starts_with("tool:write"))
 }
 
 /// Normalise a ratio to `[0.0, 1.0]`, handling the zero-denominator edge
@@ -173,11 +174,7 @@ fn branch_requires_write(branch: &CausalBranch) -> bool {
 ///   relative to an exhausted budget).
 fn safe_norm(numerator: u64, denominator: u64) -> f32 {
     if denominator == 0 {
-        if numerator == 0 {
-            0.0_f32
-        } else {
-            1.0_f32
-        }
+        if numerator == 0 { 0.0_f32 } else { 1.0_f32 }
     } else {
         (numerator as f32 / denominator as f32).clamp(0.0, 1.0)
     }
@@ -226,9 +223,7 @@ impl BranchScorer for DefaultBranchScorer {
         // because there is no mechanism to obtain user approval.
         // Note: this is distinct from gate 1 — a branch may require approval
         // for non-write reasons (e.g. irreversible read side-effects).
-        if branch.commit_policy == CommitPolicy::RequireApproval
-            && state.side_effect_mode == SideEffectMode::ReadOnly
-        {
+        if branch.commit_policy == CommitPolicy::RequireApproval && state.side_effect_mode == SideEffectMode::ReadOnly {
             return None;
         }
 
@@ -244,16 +239,13 @@ impl BranchScorer for DefaultBranchScorer {
         let norm_cost = safe_norm(branch.estimated_cost.estimated_tokens, remaining_tokens);
 
         // Latency normalised against remaining latency budget.
-        let norm_latency =
-            safe_norm(u64::from(branch.estimated_latency_ms), remaining_latency_ms);
+        let norm_latency = safe_norm(u64::from(branch.estimated_latency_ms), remaining_latency_ms);
 
         // Rehearsal bonus: a positive score_delta means the rehearsal
         // produced better-than-expected results. The 0.1 multiplier keeps
         // the bonus bounded well below the primary weight (0.25 minimum).
         // TODO: expose as `config.w_rehearsal` in a future iteration.
-        let rehearsal_bonus = artifact
-            .map(|a| a.score_delta.clamp(-1.0, 1.0) * 0.1)
-            .unwrap_or(0.0);
+        let rehearsal_bonus = artifact.map(|a| a.score_delta.clamp(-1.0, 1.0) * 0.1).unwrap_or(0.0);
 
         let raw_score = config.w_confidence.mul_add(
             norm_confidence,
@@ -458,10 +450,7 @@ mod tests {
         let score = scorer
             .score(&state, &branch, None, &default_config())
             .expect("test: branch should not be gated");
-        assert!(
-            (0.0..=1.0).contains(&score),
-            "score {score} must be in [0.0, 1.0]"
-        );
+        assert!((0.0..=1.0).contains(&score), "score {score} must be in [0.0, 1.0]");
     }
 
     /// Higher confidence produces a higher score (all else equal).
@@ -553,27 +542,15 @@ mod tests {
             ..base_branch("b-gated")
         };
 
-        let pairs: Vec<(&CausalBranch, Option<&RehearsalArtifact>)> = vec![
-            (&b_low, None),
-            (&b_gated, None),
-            (&b_high, None),
-        ];
+        let pairs: Vec<(&CausalBranch, Option<&RehearsalArtifact>)> =
+            vec![(&b_low, None), (&b_gated, None), (&b_high, None)];
 
         let ranked = scorer.rank_branches(&state, &pairs, &config);
 
         assert_eq!(ranked.len(), 2, "gated branch must be excluded");
-        assert_eq!(
-            ranked[0].branch.branch_id, "b-high",
-            "highest score must be first"
-        );
-        assert_eq!(
-            ranked[1].branch.branch_id, "b-low",
-            "lowest score must be last"
-        );
-        assert!(
-            ranked[0].score >= ranked[1].score,
-            "scores must be non-increasing"
-        );
+        assert_eq!(ranked[0].branch.branch_id, "b-high", "highest score must be first");
+        assert_eq!(ranked[1].branch.branch_id, "b-low", "lowest score must be last");
+        assert!(ranked[0].score >= ranked[1].score, "scores must be non-increasing");
     }
 
     /// rank_branches is stable for equal scores (tie-breaks on branch_id).
@@ -588,10 +565,7 @@ mod tests {
         let b1 = base_branch("b-alpha");
         let b2 = base_branch("b-beta");
 
-        let pairs: Vec<(&CausalBranch, Option<&RehearsalArtifact>)> = vec![
-            (&b2, None),
-            (&b1, None),
-        ];
+        let pairs: Vec<(&CausalBranch, Option<&RehearsalArtifact>)> = vec![(&b2, None), (&b1, None)];
 
         let ranked = scorer.rank_branches(&state, &pairs, &config);
         assert_eq!(ranked.len(), 2);
@@ -633,10 +607,7 @@ mod tests {
             "zero-cost branch must not be blocked when remaining tokens = 0"
         );
         let score = score.expect("test: confirmed some above");
-        assert!(
-            (0.0..=1.0).contains(&score),
-            "score {score} must be in [0.0, 1.0]"
-        );
+        assert!((0.0..=1.0).contains(&score), "score {score} must be in [0.0, 1.0]");
     }
 
     /// Negative rehearsal delta does not push score below 0.0.
@@ -705,7 +676,7 @@ mod tests {
         let state = CausalState {
             budget: BudgetState {
                 extra_token_limit: 1000,
-                tokens_used: 900,  // 100 remaining — branch below uses 100
+                tokens_used: 900, // 100 remaining — branch below uses 100
                 extra_latency_budget_ms: 500,
                 latency_used_ms: 500, // 0 remaining
             },
@@ -745,10 +716,7 @@ mod tests {
             let score = scorer
                 .score(&state, &branch, None, &default_config())
                 .expect("test: boundary branch should not be gated");
-            assert!(
-                !score.is_nan(),
-                "score must not be NaN for confidence={confidence}"
-            );
+            assert!(!score.is_nan(), "score must not be NaN for confidence={confidence}");
         }
     }
 }

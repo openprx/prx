@@ -5,13 +5,13 @@ use crate::agent::dispatcher::{
 };
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+#[cfg(feature = "llm-router")]
+use crate::causal_tree::CausalTreeEngine;
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
-#[cfg(feature = "llm-router")]
-use crate::causal_tree::CausalTreeEngine;
 #[cfg(feature = "llm-router")]
 use crate::router::RouterEngine;
 #[cfg(feature = "llm-router")]
@@ -844,19 +844,13 @@ impl Agent {
                 crate::causal_tree::BranchLabel::AskApproval => {
                     // High-risk action detected — request user confirmation.
                     let preview: String = user_message.chars().take(200).collect();
-                    let ellipsis = if user_message.chars().count() > 200 {
-                        "..."
-                    } else {
-                        ""
-                    };
+                    let ellipsis = if user_message.chars().count() > 200 { "..." } else { "" };
                     let approval_msg = format!(
                         "This request may involve high-risk actions. \
                          Please confirm you'd like to proceed, or rephrase your request.\n\n> {preview}{ellipsis}"
                     );
                     self.history
-                        .push(ConversationMessage::Chat(ChatMessage::assistant(
-                            approval_msg.clone(),
-                        )));
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(approval_msg.clone())));
                     self.trim_history();
                     self.hooks
                         .emit(

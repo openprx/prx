@@ -162,11 +162,7 @@ impl DefaultRehearsalEngine {
     ///
     /// Simulates a memory prefetch and computes a label-dependent score delta.
     /// Any unresolved risks in `state` are surfaced as structured warnings.
-    fn build_dry_run_artifact(
-        &self,
-        state: &CausalState,
-        branch: &CausalBranch,
-    ) -> RehearsalArtifact {
+    fn build_dry_run_artifact(&self, state: &CausalState, branch: &CausalBranch) -> RehearsalArtifact {
         // ----------------------------------------------------------------
         // Simulated memory prefetch keys (slugified to prevent injection)
         // ----------------------------------------------------------------
@@ -421,10 +417,7 @@ mod tests {
             w0.contains("UNWRAP_IN_PROD"),
             "first warning must contain risk code: got {w0}"
         );
-        assert!(
-            w0.contains("High"),
-            "first warning must contain severity: got {w0}"
-        );
+        assert!(w0.contains("High"), "first warning must contain severity: got {w0}");
 
         let w1 = &artifact.warnings[1];
         assert!(
@@ -482,11 +475,7 @@ mod tests {
     async fn test_timeout_fires_on_zero_ms_budget() {
         let engine = DefaultRehearsalEngine::new();
         let state = base_state("test timeout");
-        let branch = make_branch(
-            "b-timeout",
-            BranchLabel::DirectAnswer,
-            RehearsalLevel::DryRunReadonly,
-        );
+        let branch = make_branch("b-timeout", BranchLabel::DirectAnswer, RehearsalLevel::DryRunReadonly);
         let policy = CausalPolicy {
             rehearsal_timeout_ms: 0,
             ..CausalPolicy::default()

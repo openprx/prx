@@ -38,21 +38,16 @@ fn intent_contains_any(intent: &str, keywords: &[&str]) -> bool {
             return false;
         }
 
-        text_bytes
-            .windows(klen)
-            .enumerate()
-            .any(|(i, window)| {
-                if window != kw_bytes {
-                    return false;
-                }
-                // Check left boundary: start of string or non-alphanumeric.
-                let left_ok = i == 0
-                    || !text_bytes[i - 1].is_ascii_alphanumeric();
-                // Check right boundary: end of string or non-alphanumeric.
-                let right_ok = i + klen == text_bytes.len()
-                    || !text_bytes[i + klen].is_ascii_alphanumeric();
-                left_ok && right_ok
-            })
+        text_bytes.windows(klen).enumerate().any(|(i, window)| {
+            if window != kw_bytes {
+                return false;
+            }
+            // Check left boundary: start of string or non-alphanumeric.
+            let left_ok = i == 0 || !text_bytes[i - 1].is_ascii_alphanumeric();
+            // Check right boundary: end of string or non-alphanumeric.
+            let right_ok = i + klen == text_bytes.len() || !text_bytes[i + klen].is_ascii_alphanumeric();
+            left_ok && right_ok
+        })
     })
 }
 
@@ -71,11 +66,7 @@ pub trait TreeExpander: Send + Sync {
     ///
     /// Returns [`CausalTreeError::ExpansionEmpty`] when no viable branch can be
     /// constructed, or [`CausalTreeError::ExpansionFailed`] on internal errors.
-    async fn expand(
-        &self,
-        state: &CausalState,
-        policy: &CausalPolicy,
-    ) -> Result<Vec<CausalBranch>, CausalTreeError>;
+    async fn expand(&self, state: &CausalState, policy: &CausalPolicy) -> Result<Vec<CausalBranch>, CausalTreeError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -115,8 +106,7 @@ impl DefaultTreeExpander {
     /// within a single request is sufficient; no cross-thread synchronisation
     /// of the counter value is required).
     fn next_seq(&self) -> u64 {
-        self.seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Build a branch ID from a label and the current sequence value.
@@ -125,17 +115,8 @@ impl DefaultTreeExpander {
     }
 
     /// Construct a [`CausalBranch`] for a direct answer.
-    fn direct_answer_branch(
-        &self,
-        state: &CausalState,
-        confidence: f32,
-        explanation: Vec<String>,
-    ) -> CausalBranch {
-        let parent_ids = state
-            .completed_steps
-            .iter()
-            .map(|s| s.step_id.clone())
-            .collect();
+    fn direct_answer_branch(&self, state: &CausalState, confidence: f32, explanation: Vec<String>) -> CausalBranch {
+        let parent_ids = state.completed_steps.iter().map(|s| s.step_id.clone()).collect();
 
         CausalBranch {
             branch_id: self.make_branch_id(BranchLabel::DirectAnswer),
@@ -162,11 +143,7 @@ impl DefaultTreeExpander {
         confidence: f32,
         explanation: Vec<String>,
     ) -> CausalBranch {
-        let parent_ids = state
-            .completed_steps
-            .iter()
-            .map(|s| s.step_id.clone())
-            .collect();
+        let parent_ids = state.completed_steps.iter().map(|s| s.step_id.clone()).collect();
 
         CausalBranch {
             branch_id: self.make_branch_id(BranchLabel::RetrieveThenAnswer),
@@ -187,17 +164,8 @@ impl DefaultTreeExpander {
     }
 
     /// Construct a [`CausalBranch`] for ask-approval.
-    fn ask_approval_branch(
-        &self,
-        state: &CausalState,
-        confidence: f32,
-        explanation: Vec<String>,
-    ) -> CausalBranch {
-        let parent_ids = state
-            .completed_steps
-            .iter()
-            .map(|s| s.step_id.clone())
-            .collect();
+    fn ask_approval_branch(&self, state: &CausalState, confidence: f32, explanation: Vec<String>) -> CausalBranch {
+        let parent_ids = state.completed_steps.iter().map(|s| s.step_id.clone()).collect();
 
         CausalBranch {
             branch_id: self.make_branch_id(BranchLabel::AskApproval),
@@ -232,11 +200,7 @@ impl DefaultTreeExpander {
 
 #[async_trait]
 impl TreeExpander for DefaultTreeExpander {
-    async fn expand(
-        &self,
-        state: &CausalState,
-        policy: &CausalPolicy,
-    ) -> Result<Vec<CausalBranch>, CausalTreeError> {
+    async fn expand(&self, state: &CausalState, policy: &CausalPolicy) -> Result<Vec<CausalBranch>, CausalTreeError> {
         let intent = state.user_intent.as_str();
         let mut branches: Vec<CausalBranch> = Vec::with_capacity(policy.max_branches);
 
@@ -311,24 +275,20 @@ impl TreeExpander for DefaultTreeExpander {
             let da_branch = self.direct_answer_branch(
                 state,
                 0.60,
-                vec![
-                    format!(
-                        "No specific intent pattern detected for '{}'; \
+                vec![format!(
+                    "No specific intent pattern detected for '{}'; \
                          DirectAnswer included as low-cost baseline.",
-                        intent
-                    ),
-                ],
+                    intent
+                )],
             );
             let rta_branch = self.retrieve_then_answer_branch(
                 state,
                 0.70,
-                vec![
-                    format!(
-                        "No specific intent pattern detected for '{}'; \
+                vec![format!(
+                    "No specific intent pattern detected for '{}'; \
                          RetrieveThenAnswer included for higher-quality fallback.",
-                        intent
-                    ),
-                ],
+                    intent
+                )],
             );
             // Push higher-confidence branch first so truncation favours it.
             branches.push(rta_branch);
@@ -430,7 +390,13 @@ mod tests {
         let expander = DefaultTreeExpander::new();
         let policy = CausalPolicy::default();
 
-        for intent in &["audit the repo", "review this PR", "analyze logs", "search for bugs", "find issues"] {
+        for intent in &[
+            "audit the repo",
+            "review this PR",
+            "analyze logs",
+            "search for bugs",
+            "find issues",
+        ] {
             let state = base_state(intent, SideEffectMode::ReadOnly);
             let branches = expander
                 .expand(&state, &policy)
@@ -460,11 +426,7 @@ mod tests {
         let expander = DefaultTreeExpander::new();
         let policy = CausalPolicy::default(); // max_branches = 3
 
-        let state = state_with_risk(
-            "deploy service",
-            SideEffectMode::GuardedWrite,
-            RiskLevel::High,
-        );
+        let state = state_with_risk("deploy service", SideEffectMode::GuardedWrite, RiskLevel::High);
         let branches = expander
             .expand(&state, &policy)
             .await
@@ -597,14 +559,8 @@ mod tests {
         let policy = CausalPolicy::default();
         let state = base_state("write a poem", SideEffectMode::ReadOnly);
 
-        let first = expander
-            .expand(&state, &policy)
-            .await
-            .expect("test: first expand");
-        let second = expander
-            .expand(&state, &policy)
-            .await
-            .expect("test: second expand");
+        let first = expander.expand(&state, &policy).await.expect("test: first expand");
+        let second = expander.expand(&state, &policy).await.expect("test: second expand");
 
         let ids_first: Vec<&str> = first.iter().map(|b| b.branch_id.as_str()).collect();
         let ids_second: Vec<&str> = second.iter().map(|b| b.branch_id.as_str()).collect();
@@ -633,18 +589,12 @@ mod tests {
 
         for branch in &branches {
             let id = &branch.branch_id;
-            assert!(
-                id.starts_with("b-"),
-                "branch_id '{}' must start with 'b-'",
-                id
-            );
+            assert!(id.starts_with("b-"), "branch_id '{}' must start with 'b-'", id);
             // Format: b-<label>-<seq>  — at least two '-' separators
             let parts: Vec<&str> = id.splitn(3, '-').collect();
             assert_eq!(parts.len(), 3, "branch_id '{}' must have format b-label-seq", id);
             // Last segment must be a valid integer
-            parts[2]
-                .parse::<u64>()
-                .expect("test: seq segment must be a number");
+            parts[2].parse::<u64>().expect("test: seq segment must be a number");
         }
     }
 
@@ -687,11 +637,7 @@ mod tests {
 
         // "hello" would normally trigger DirectAnswer, but the approval gate
         // must take precedence when the session is non-readonly with High risk.
-        let state = state_with_risk(
-            "hello deploy service",
-            SideEffectMode::GuardedWrite,
-            RiskLevel::High,
-        );
+        let state = state_with_risk("hello deploy service", SideEffectMode::GuardedWrite, RiskLevel::High);
         let branches = expander
             .expand(&state, &policy)
             .await
@@ -718,11 +664,7 @@ mod tests {
 
         // "audit" would normally trigger RetrieveThenAnswer, but high-risk
         // non-readonly must still require approval first.
-        let state = state_with_risk(
-            "audit and deploy",
-            SideEffectMode::GuardedWrite,
-            RiskLevel::Critical,
-        );
+        let state = state_with_risk("audit and deploy", SideEffectMode::GuardedWrite, RiskLevel::Critical);
         let branches = expander
             .expand(&state, &policy)
             .await
@@ -766,19 +708,15 @@ mod tests {
             .expand(&this_state, &policy)
             .await
             .expect("test: expand should succeed");
-        let this_labels: Vec<BranchLabel> =
-            this_branches.iter().map(|b| b.label).collect();
+        let this_labels: Vec<BranchLabel> = this_branches.iter().map(|b| b.label).collect();
         // "explain this concept" has no matching keyword → default path
         assert!(
-            this_labels.contains(&BranchLabel::RetrieveThenAnswer)
-                || this_labels.contains(&BranchLabel::DirectAnswer),
+            this_labels.contains(&BranchLabel::RetrieveThenAnswer) || this_labels.contains(&BranchLabel::DirectAnswer),
             "'this' substring must not trigger simple-keyword DirectAnswer(0.85)"
         );
         // Confidence must NOT be 0.85 (that value is only for simple-keyword matches).
         assert!(
-            this_branches
-                .iter()
-                .all(|b| (b.confidence - 0.85).abs() > f32::EPSILON),
+            this_branches.iter().all(|b| (b.confidence - 0.85).abs() > f32::EPSILON),
             "'this' must not produce confidence=0.85 (simple-keyword path)"
         );
     }
@@ -794,11 +732,7 @@ mod tests {
             ..CausalPolicy::default()
         };
 
-        let state = state_with_risk(
-            "deploy now",
-            SideEffectMode::GuardedWrite,
-            RiskLevel::High,
-        );
+        let state = state_with_risk("deploy now", SideEffectMode::GuardedWrite, RiskLevel::High);
         let branches = expander
             .expand(&state, &policy)
             .await
