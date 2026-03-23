@@ -10,9 +10,7 @@ use uuid::Uuid;
 /// happens in the gateway when Meta sends webhook events.
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
-        anyhow::bail!(
-            "Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https"
-        );
+        anyhow::bail!("Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https");
     }
     Ok(())
 }
@@ -30,12 +28,7 @@ pub struct WhatsAppChannel {
 }
 
 impl WhatsAppChannel {
-    pub fn new(
-        access_token: String,
-        endpoint_id: String,
-        verify_token: String,
-        allowed_numbers: Vec<String>,
-    ) -> Self {
+    pub fn new(access_token: String, endpoint_id: String, verify_token: String, allowed_numbers: Vec<String>) -> Self {
         Self {
             access_token,
             endpoint_id,
@@ -112,11 +105,7 @@ impl WhatsAppChannel {
 
                     // Extract text content (support text messages only for now)
                     let content = if let Some(text_obj) = msg.get("text") {
-                        text_obj
-                            .get("body")
-                            .and_then(|b| b.as_str())
-                            .unwrap_or("")
-                            .to_string()
+                        text_obj.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string()
                     } else {
                         // Could be image, audio, etc. — skip for now
                         tracing::debug!("WhatsApp: skipping non-text message from {from}");
@@ -165,16 +154,10 @@ impl Channel for WhatsAppChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // WhatsApp Cloud API: POST to /v18.0/{phone_number_id}/messages
-        let url = format!(
-            "https://graph.facebook.com/v18.0/{}/messages",
-            self.endpoint_id
-        );
+        let url = format!("https://graph.facebook.com/v18.0/{}/messages", self.endpoint_id);
 
         // Normalize recipient (remove leading + if present for API)
-        let to = message
-            .recipient
-            .strip_prefix('+')
-            .unwrap_or(&message.recipient);
+        let to = message.recipient.strip_prefix('+').unwrap_or(&message.recipient);
 
         let body = serde_json::json!({
             "messaging_product": "whatsapp",
@@ -400,12 +383,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_normalizes_phone_with_plus() {
-        let ch = WhatsAppChannel::new(
-            "tok".into(),
-            "123".into(),
-            "ver".into(),
-            vec!["+1234567890".into()],
-        );
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["+1234567890".into()]);
         // API sends without +, but we normalize to +
         let payload = serde_json::json!({
             "entry": [{
@@ -577,10 +555,7 @@ mod tests {
             }]
         });
         let msgs = ch.parse_webhook_payload(&payload);
-        assert!(
-            msgs.is_empty(),
-            "Messages with empty text object should be skipped"
-        );
+        assert!(msgs.is_empty(), "Messages with empty text object should be skipped");
     }
 
     #[test]
@@ -890,12 +865,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_mixed_authorized_unauthorized() {
-        let ch = WhatsAppChannel::new(
-            "tok".into(),
-            "123".into(),
-            "ver".into(),
-            vec!["+1111111111".into()],
-        );
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["+1111111111".into()]);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -989,11 +959,7 @@ mod tests {
             "tok".into(),
             "123".into(),
             "ver".into(),
-            vec![
-                "+1111111111".into(),
-                "+2222222222".into(),
-                "+3333333333".into(),
-            ],
+            vec!["+1111111111".into(), "+2222222222".into(), "+3333333333".into()],
         );
         assert!(ch.is_number_allowed("+1111111111"));
         assert!(ch.is_number_allowed("+2222222222"));
@@ -1004,12 +970,7 @@ mod tests {
     #[test]
     fn whatsapp_number_allowed_case_sensitive() {
         // Phone numbers should be exact match
-        let ch = WhatsAppChannel::new(
-            "tok".into(),
-            "123".into(),
-            "ver".into(),
-            vec!["+1234567890".into()],
-        );
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["+1234567890".into()]);
         assert!(ch.is_number_allowed("+1234567890"));
         // Different number should not match
         assert!(!ch.is_number_allowed("+1234567891"));
@@ -1017,12 +978,7 @@ mod tests {
 
     #[test]
     fn whatsapp_parse_phone_already_has_plus() {
-        let ch = WhatsAppChannel::new(
-            "tok".into(),
-            "123".into(),
-            "ver".into(),
-            vec!["+1234567890".into()],
-        );
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["+1234567890".into()]);
         // If API sends with +, we should still handle it
         let payload = serde_json::json!({
             "entry": [{

@@ -35,9 +35,7 @@ impl DockerRuntime {
         }
 
         let allowed = self.config.allowed_workspace_roots.iter().any(|root| {
-            let root_path = Path::new(root)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(root));
+            let root_path = Path::new(root).canonicalize().unwrap_or_else(|_| PathBuf::from(root));
             resolved.starts_with(root_path)
         });
 
@@ -83,17 +81,9 @@ impl RuntimeAdapter for DockerRuntime {
             .map_or(0, |mb| mb.saturating_mul(1024 * 1024))
     }
 
-    fn build_shell_command(
-        &self,
-        command: &str,
-        workspace_dir: &Path,
-    ) -> anyhow::Result<tokio::process::Command> {
+    fn build_shell_command(&self, command: &str, workspace_dir: &Path) -> anyhow::Result<tokio::process::Command> {
         let mut process = tokio::process::Command::new("docker");
-        process
-            .arg("run")
-            .arg("--rm")
-            .arg("--init")
-            .arg("--interactive");
+        process.arg("run").arg("--rm").arg("--init").arg("--interactive");
 
         let network = self.config.network.trim();
         if !network.is_empty() {
@@ -113,12 +103,9 @@ impl RuntimeAdapter for DockerRuntime {
         }
 
         if self.config.mount_workspace {
-            let host_workspace = self.workspace_mount_path(workspace_dir).with_context(|| {
-                format!(
-                    "Failed to validate workspace mount path {}",
-                    workspace_dir.display()
-                )
-            })?;
+            let host_workspace = self
+                .workspace_mount_path(workspace_dir)
+                .with_context(|| format!("Failed to validate workspace mount path {}", workspace_dir.display()))?;
 
             process
                 .arg("--volume")
@@ -127,11 +114,7 @@ impl RuntimeAdapter for DockerRuntime {
                 .arg("/workspace");
         }
 
-        process
-            .arg(self.config.image.trim())
-            .arg("sh")
-            .arg("-c")
-            .arg(command);
+        process.arg(self.config.image.trim()).arg("sh").arg("-c").arg(command);
 
         Ok(process)
     }
@@ -169,9 +152,7 @@ mod tests {
         let runtime = DockerRuntime::new(cfg);
 
         let workspace = std::env::temp_dir();
-        let command = runtime
-            .build_shell_command("echo hello", &workspace)
-            .unwrap();
+        let command = runtime.build_shell_command("echo hello", &workspace).unwrap();
         let debug = format!("{command:?}");
 
         assert!(debug.contains("docker"));
@@ -207,9 +188,7 @@ mod tests {
         };
         let runtime = DockerRuntime::new(cfg);
         let workspace = std::env::temp_dir();
-        let cmd = runtime
-            .build_shell_command("echo hello", &workspace)
-            .unwrap();
+        let cmd = runtime.build_shell_command("echo hello", &workspace).unwrap();
         let debug = format!("{cmd:?}");
         assert!(
             debug.contains("--network") && debug.contains("none"),
@@ -225,9 +204,7 @@ mod tests {
         };
         let runtime = DockerRuntime::new(cfg);
         let workspace = std::env::temp_dir();
-        let cmd = runtime
-            .build_shell_command("echo hello", &workspace)
-            .unwrap();
+        let cmd = runtime.build_shell_command("echo hello", &workspace).unwrap();
         let debug = format!("{cmd:?}");
         assert!(
             debug.contains("--read-only"),
@@ -244,10 +221,7 @@ mod tests {
         };
         let runtime = DockerRuntime::new(cfg);
         let result = runtime.build_shell_command("echo test", Path::new("/"));
-        assert!(
-            result.is_err(),
-            "mounting filesystem root (/) must be refused"
-        );
+        assert!(result.is_err(), "mounting filesystem root (/) must be refused");
         let error_chain = format!("{:#}", result.unwrap_err());
         assert!(
             error_chain.contains("root"),
@@ -263,9 +237,7 @@ mod tests {
         };
         let runtime = DockerRuntime::new(cfg);
         let workspace = std::env::temp_dir();
-        let cmd = runtime
-            .build_shell_command("echo hello", &workspace)
-            .unwrap();
+        let cmd = runtime.build_shell_command("echo hello", &workspace).unwrap();
         let debug = format!("{cmd:?}");
         assert!(
             !debug.contains("--memory"),

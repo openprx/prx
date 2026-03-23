@@ -57,9 +57,7 @@ impl CronTool {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
+                error: Some(format!("Security policy: read-only mode, cannot perform '{action}'")),
             });
         }
         if self.security.is_rate_limited() {
@@ -207,9 +205,7 @@ impl Tool for CronTool {
                                 (false, true) => " [one-shot]",
                                 (false, false) => "",
                             };
-                            let last_run = job
-                                .last_run
-                                .map_or_else(|| "never".to_string(), |v| v.to_rfc3339());
+                            let last_run = job.last_run.map_or_else(|| "never".to_string(), |v| v.to_rfc3339());
                             let last_status = job.last_status.as_deref().unwrap_or("n/a");
                             lines.push(format!(
                                 "- {} | {} | next={} | last={} ({}){} | cmd: {}",
@@ -224,11 +220,7 @@ impl Tool for CronTool {
                         }
                         Ok(ToolResult {
                             success: true,
-                            output: format!(
-                                "Scheduled jobs ({}):\n{}",
-                                jobs.len(),
-                                lines.join("\n")
-                            ),
+                            output: format!("Scheduled jobs ({}):\n{}", jobs.len(), lines.join("\n")),
                             error: None,
                         })
                     }
@@ -331,9 +323,7 @@ impl Tool for CronTool {
                                 started_at: run.started_at,
                                 finished_at: run.finished_at,
                                 status: run.status,
-                                output: run
-                                    .output
-                                    .map(|out| truncate_str(&out, MAX_RUN_OUTPUT_CHARS)),
+                                output: run.output.map(|out| truncate_str(&out, MAX_RUN_OUTPUT_CHARS)),
                                 duration_ms: run.duration_ms,
                             })
                             .collect();
@@ -362,9 +352,7 @@ impl Tool for CronTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(
-                                "Missing 'expression' parameter for add action".to_string(),
-                            ),
+                            error: Some("Missing 'expression' parameter for add action".to_string()),
                         });
                     }
                 };
@@ -378,10 +366,7 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                let approved = args
-                    .get("approved")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
                 if let Err(reason) = self.security.validate_command_execution(command, approved) {
                     return Ok(ToolResult {
                         success: false,
@@ -423,10 +408,7 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                let approved = args
-                    .get("approved")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
                 if let Err(reason) = self.security.validate_command_execution(command, approved) {
                     return Ok(ToolResult {
                         success: false,
@@ -488,9 +470,7 @@ impl Tool for CronTool {
                     _ => Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(
-                            "'once' requires exactly one of 'delay' or 'run_at'".to_string(),
-                        ),
+                        error: Some("'once' requires exactly one of 'delay' or 'run_at'".to_string()),
                     }),
                 }
             }
@@ -557,13 +537,9 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                let approved = args
-                    .get("approved")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
                 if let Some(command) = &patch.command {
-                    if let Err(reason) = self.security.validate_command_execution(command, approved)
-                    {
+                    if let Err(reason) = self.security.validate_command_execution(command, approved) {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
@@ -600,26 +576,19 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                let approved = args
-                    .get("approved")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
                 if !self.security.can_act() {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(
-                            "Security policy: read-only mode, cannot perform 'cron run'".into(),
-                        ),
+                        error: Some("Security policy: read-only mode, cannot perform 'cron run'".into()),
                     });
                 }
                 if self.security.is_rate_limited() {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(
-                            "Rate limit exceeded: too many actions in the last hour".into(),
-                        ),
+                        error: Some("Rate limit exceeded: too many actions in the last hour".into()),
                     });
                 }
                 let job = match cron::get_job(&cfg, job_id) {
@@ -633,10 +602,7 @@ impl Tool for CronTool {
                     }
                 };
                 if matches!(job.job_type, JobType::Shell) {
-                    if let Err(reason) = self
-                        .security
-                        .validate_command_execution(&job.command, approved)
-                    {
+                    if let Err(reason) = self.security.validate_command_execution(&job.command, approved) {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
@@ -762,17 +728,12 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         new_shared(config)
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ))
+        Arc::new(SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir))
     }
 
     #[tokio::test]
@@ -823,10 +784,7 @@ mod tests {
         let cfg_snap = cfg.load_full();
         let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo get-test").unwrap();
         let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
-        let result = tool
-            .execute(json!({"action": "get", "job_id": job.id}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "get", "job_id": job.id})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("echo get-test"));
     }
@@ -876,12 +834,7 @@ mod tests {
         let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("cron is disabled")
-        );
+        assert!(result.error.unwrap_or_default().contains("cron is disabled"));
     }
 
     #[tokio::test]

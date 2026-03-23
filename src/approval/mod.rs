@@ -323,12 +323,7 @@ mod tests {
     #[test]
     fn yes_response_does_not_add_to_allowlist() {
         let mgr = ApprovalManager::from_config(&supervised_config());
-        mgr.record_decision(
-            "file_write",
-            &serde_json::json!({}),
-            ApprovalResponse::Yes,
-            "cli",
-        );
+        mgr.record_decision("file_write", &serde_json::json!({}), ApprovalResponse::Yes, "cli");
         assert!(mgr.needs_approval("file_write"));
     }
 

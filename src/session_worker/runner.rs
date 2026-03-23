@@ -23,18 +23,13 @@ Focus only on the assigned task; do not ask clarifying questions.";
 fn write_worker_result(result: &WorkerResult) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     let json = serde_json::to_string(result).context("serialize worker result")?;
-    stdout
-        .write_all(json.as_bytes())
-        .context("write worker result")?;
+    stdout.write_all(json.as_bytes()).context("write worker result")?;
     stdout.write_all(b"\n").context("write worker newline")?;
     stdout.flush().context("flush worker stdout")?;
     Ok(())
 }
 
-fn select_tools_for_worker(
-    source: Vec<Box<dyn Tool>>,
-    allowed_tools: &[String],
-) -> Result<Vec<Box<dyn Tool>>> {
+fn select_tools_for_worker(source: Vec<Box<dyn Tool>>, allowed_tools: &[String]) -> Result<Vec<Box<dyn Tool>>> {
     if allowed_tools.is_empty() {
         return Ok(source);
     }
@@ -104,26 +99,21 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
 
-    let provider: Arc<dyn Provider> =
-        Arc::from(crate::providers::create_resilient_provider_with_options(
-            &manifest.provider_name,
-            manifest.api_key.as_deref().or(config.api_key.as_deref()),
-            config.api_url.as_deref(),
-            &config.reliability,
-            &provider_runtime_options,
-        )?);
+    let provider: Arc<dyn Provider> = Arc::from(crate::providers::create_resilient_provider_with_options(
+        &manifest.provider_name,
+        manifest.api_key.as_deref().or(config.api_key.as_deref()),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &provider_runtime_options,
+    )?);
 
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new_with_path_and_acl(
         manifest.memory_db_path.clone(),
         config.memory.acl_enabled,
     )?);
 
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &manifest.workspace_dir,
-    ));
-    let runtime: Arc<dyn runtime::RuntimeAdapter> =
-        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &manifest.workspace_dir));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -167,10 +157,7 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
             manifest.scope_chat_id.as_deref(),
         ) {
             (Some(sender), Some(channel), Some(chat_type), Some(chat_id))
-                if !sender.is_empty()
-                    && !channel.is_empty()
-                    && !chat_type.is_empty()
-                    && !chat_id.is_empty() =>
+                if !sender.is_empty() && !channel.is_empty() && !chat_type.is_empty() && !chat_id.is_empty() =>
             {
                 Some(ScopeContext {
                     policy: &security,
@@ -208,15 +195,9 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
                 rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
                 rollout_channels: config.agent.concurrency_rollout_channels.clone(),
                 auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-                rollback_timeout_rate_threshold: config
-                    .agent
-                    .concurrency_rollback_timeout_rate_threshold,
-                rollback_cancel_rate_threshold: config
-                    .agent
-                    .concurrency_rollback_cancel_rate_threshold,
-                rollback_error_rate_threshold: config
-                    .agent
-                    .concurrency_rollback_error_rate_threshold,
+                rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
+                rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
+                rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
             },
             manifest.compaction_config.as_ref(),
             None,
@@ -233,21 +214,13 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
         // No timeout — run until natural completion (rely on callback)
         run_future.await
     } else {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(manifest.timeout_seconds),
-            run_future,
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_secs(manifest.timeout_seconds), run_future).await {
             Ok(r) => r,
             Err(_) => {
                 return Ok(WorkerResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Sub-agent timed out after {}s",
-                        manifest.timeout_seconds
-                    )),
+                    error: Some(format!("Sub-agent timed out after {}s", manifest.timeout_seconds)),
                 });
             }
         }
@@ -354,11 +327,7 @@ mod tests {
     #[test]
     fn parse_tools_override_rejects_invalid_json_shape() {
         let error = parse_tools_override(r#"{"tool":"shell"}"#).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("parse --tools JSON as string array")
-        );
+        assert!(error.to_string().contains("parse --tools JSON as string array"));
     }
 
     #[tokio::test]
@@ -393,11 +362,7 @@ mod tests {
         .await;
         assert_eq!(
             snapshot,
-            Some((
-                "run-child".to_string(),
-                "signal:group:test".to_string(),
-                1usize
-            ))
+            Some(("run-child".to_string(), "signal:group:test".to_string(), 1usize))
         );
     }
 }

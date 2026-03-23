@@ -165,12 +165,7 @@ fn skip_env_assignments(s: &str) -> &str {
             return rest;
         };
         // Environment assignment: contains '=' and starts with a letter or underscore
-        if word.contains('=')
-            && word
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        {
+        if word.contains('=') && word.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
             // Advance past this word
             rest = rest[word.len()..].trim_start();
         } else {
@@ -404,11 +399,7 @@ impl SecurityPolicy {
                 continue;
             };
 
-            let base = base_raw
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let base = base_raw.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
 
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
@@ -480,12 +471,9 @@ impl SecurityPolicy {
                         "install" | "add" | "remove" | "uninstall" | "update" | "publish"
                     )
                 }),
-                "cargo" => args.first().is_some_and(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "add" | "remove" | "install" | "clean" | "publish"
-                    )
-                }),
+                "cargo" => args
+                    .first()
+                    .is_some_and(|verb| matches!(verb.as_str(), "add" | "remove" | "install" | "clean" | "publish")),
                 "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
                 _ => false,
             };
@@ -510,11 +498,7 @@ impl SecurityPolicy {
     // before any risk or autonomy logic runs.
 
     /// Validate full command execution policy (allowlist + risk gate).
-    pub fn validate_command_execution(
-        &self,
-        command: &str,
-        approved: bool,
-    ) -> Result<CommandRiskLevel, String> {
+    pub fn validate_command_execution(&self, command: &str, approved: bool) -> Result<CommandRiskLevel, String> {
         if !self.is_command_allowed(command) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -526,10 +510,7 @@ impl SecurityPolicy {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
-                return Err(
-                    "Command requires explicit approval (approved=true): high-risk operation"
-                        .into(),
-                );
+                return Err("Command requires explicit approval (approved=true): high-risk operation".into());
             }
         }
 
@@ -538,9 +519,7 @@ impl SecurityPolicy {
             && self.require_approval_for_medium_risk
             && !approved
         {
-            return Err(
-                "Command requires explicit approval (approved=true): medium-risk operation".into(),
-            );
+            return Err("Command requires explicit approval (approved=true): medium-risk operation".into());
         }
 
         Ok(risk)
@@ -588,10 +567,7 @@ impl SecurityPolicy {
         if self.autonomy != AutonomyLevel::Full {
             // Block `tee` — it can write to arbitrary files, bypassing the
             // redirect check above (e.g. `echo secret | tee /etc/crontab`)
-            if command
-                .split_whitespace()
-                .any(|w| w == "tee" || w.ends_with("/tee"))
-            {
+            if command.split_whitespace().any(|w| w == "tee" || w.ends_with("/tee")) {
                 return false;
             }
 
@@ -617,14 +593,8 @@ impl SecurityPolicy {
             }
 
             // Empty list or ["*"] means all commands are allowed
-            let all_allowed =
-                self.allowed_commands.is_empty() || self.allowed_commands.iter().any(|c| c == "*");
-            if !all_allowed
-                && !self
-                    .allowed_commands
-                    .iter()
-                    .any(|allowed| allowed == base_cmd)
-            {
+            let all_allowed = self.allowed_commands.is_empty() || self.allowed_commands.iter().any(|c| c == "*");
+            if !all_allowed && !self.allowed_commands.iter().any(|allowed| allowed == base_cmd) {
                 return false;
             }
 
@@ -756,11 +726,7 @@ impl SecurityPolicy {
     ///
     /// Read operations are always allowed by autonomy/rate gates.
     /// Act operations require non-readonly autonomy and available action budget.
-    pub fn enforce_tool_operation(
-        &self,
-        operation: ToolOperation,
-        operation_name: &str,
-    ) -> Result<(), String> {
+    pub fn enforce_tool_operation(&self, operation: ToolOperation, operation_name: &str) -> Result<(), String> {
         match operation {
             ToolOperation::Read => Ok(()),
             ToolOperation::Act => {
@@ -792,10 +758,7 @@ impl SecurityPolicy {
     }
 
     /// Build from config sections
-    pub fn from_config(
-        autonomy_config: &crate::config::AutonomyConfig,
-        workspace_dir: &Path,
-    ) -> Self {
+    pub fn from_config(autonomy_config: &crate::config::AutonomyConfig, workspace_dir: &Path) -> Self {
         Self {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
@@ -822,13 +785,7 @@ impl SecurityPolicy {
     ///
     /// A rule matches when ALL specified criteria match the provided context.
     /// A criterion is skipped (treated as matching) when not specified in the rule.
-    pub fn is_tool_allowed(
-        &self,
-        tool_name: &str,
-        sender: &str,
-        channel: &str,
-        chat_type: &str,
-    ) -> bool {
+    pub fn is_tool_allowed(&self, tool_name: &str, sender: &str, channel: &str, chat_type: &str) -> bool {
         // ReadOnly blocks all tools unconditionally via can_act(); scope check is layered on top.
         // We don't double-block here — let can_act() handle ReadOnly separately.
 
@@ -855,12 +812,7 @@ impl SecurityPolicy {
 
 /// Check whether a scope rule's criteria match the given request context.
 /// A criterion is skipped (matches anything) when not specified (`None`).
-fn rule_matches(
-    rule: &crate::config::ScopeRule,
-    sender: &str,
-    channel: &str,
-    chat_type: &str,
-) -> bool {
+fn rule_matches(rule: &crate::config::ScopeRule, sender: &str, channel: &str, chat_type: &str) -> bool {
     if let Some(ref user_pattern) = rule.user {
         if user_pattern != "*" && user_pattern != sender {
             return false;
@@ -936,10 +888,7 @@ mod tests {
     #[test]
     fn enforce_tool_operation_read_allowed_in_readonly_mode() {
         let p = readonly_policy();
-        assert!(
-            p.enforce_tool_operation(ToolOperation::Read, "memory_recall")
-                .is_ok()
-        );
+        assert!(p.enforce_tool_operation(ToolOperation::Read, "memory_recall").is_ok());
     }
 
     #[test]
@@ -1068,10 +1017,7 @@ mod tests {
             p.command_risk_level("git reset --hard HEAD~1"),
             CommandRiskLevel::Medium
         );
-        assert_eq!(
-            p.command_risk_level("touch file.txt"),
-            CommandRiskLevel::Medium
-        );
+        assert_eq!(p.command_risk_level("touch file.txt"), CommandRiskLevel::Medium);
     }
 
     #[test]
@@ -1080,10 +1026,7 @@ mod tests {
             allowed_commands: vec!["rm".into()],
             ..SecurityPolicy::default()
         };
-        assert_eq!(
-            p.command_risk_level("rm -rf /tmp/test"),
-            CommandRiskLevel::High
-        );
+        assert_eq!(p.command_risk_level("rm -rf /tmp/test"), CommandRiskLevel::High);
     }
 
     #[test]
@@ -1587,10 +1530,7 @@ mod tests {
 
     // ── is_tool_allowed / scope rules ────────────────────────
 
-    fn make_scope_policy(
-        rules: Vec<crate::config::ScopeRule>,
-        default_allow: bool,
-    ) -> SecurityPolicy {
+    fn make_scope_policy(rules: Vec<crate::config::ScopeRule>, default_allow: bool) -> SecurityPolicy {
         SecurityPolicy {
             scope_rules: rules,
             scope_default_allow: default_allow,
@@ -1784,13 +1724,10 @@ mod tests {
             ..SecurityPolicy::default()
         };
         for dir in [
-            "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev",
-            "/proc", "/sys", "/var", "/tmp",
+            "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev", "/proc", "/sys",
+            "/var", "/tmp",
         ] {
-            assert!(
-                !p.is_path_allowed(dir),
-                "System dir should be blocked: {dir}"
-            );
+            assert!(!p.is_path_allowed(dir), "System dir should be blocked: {dir}");
             assert!(
                 !p.is_path_allowed(&format!("{dir}/subpath")),
                 "Subpath of system dir should be blocked: {dir}/subpath"
@@ -1810,10 +1747,7 @@ mod tests {
             "~/.aws/credentials",
             "~/.config/secrets",
         ] {
-            assert!(
-                !p.is_path_allowed(path),
-                "Sensitive dotfile should be blocked: {path}"
-            );
+            assert!(!p.is_path_allowed(path), "Sensitive dotfile should be blocked: {path}");
         }
     }
 
@@ -1853,10 +1787,7 @@ mod tests {
     #[test]
     fn checklist_default_policy_is_workspace_only() {
         let p = SecurityPolicy::default();
-        assert!(
-            p.workspace_only,
-            "Default policy must be workspace_only=true"
-        );
+        assert!(p.workspace_only, "Default policy must be workspace_only=true");
     }
 
     #[test]
@@ -1886,9 +1817,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&workspace);
 
         // Use the canonicalized workspace so starts_with checks match
-        let canonical_workspace = workspace
-            .canonicalize()
-            .unwrap_or_else(|_| workspace.clone());
+        let canonical_workspace = workspace.canonicalize().unwrap_or_else(|_| workspace.clone());
 
         let policy = SecurityPolicy {
             workspace_dir: canonical_workspace.clone(),

@@ -180,10 +180,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn classification_config(
-        mut self,
-        classification_config: crate::config::QueryClassificationConfig,
-    ) -> Self {
+    pub fn classification_config(mut self, classification_config: crate::config::QueryClassificationConfig) -> Self {
         self.classification_config = Some(classification_config);
         self
     }
@@ -199,10 +196,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn task_routing_config(
-        mut self,
-        task_routing_config: crate::config::TaskRoutingConfig,
-    ) -> Self {
+    pub fn task_routing_config(mut self, task_routing_config: crate::config::TaskRoutingConfig) -> Self {
         self.task_routing_config = Some(task_routing_config);
         self
     }
@@ -214,31 +208,19 @@ impl AgentBuilder {
     }
 
     pub fn build(self) -> Result<Agent> {
-        let tools = self
-            .tools
-            .ok_or_else(|| anyhow::anyhow!("tools are required"))?;
-        let workspace_dir = self
-            .workspace_dir
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let tools = self.tools.ok_or_else(|| anyhow::anyhow!("tools are required"))?;
+        let workspace_dir = self.workspace_dir.unwrap_or_else(|| std::path::PathBuf::from("."));
         let hooks = self
             .hooks
             .unwrap_or_else(|| Arc::new(HookManager::new(workspace_dir.clone())));
 
         Ok(Agent {
-            provider: self
-                .provider
-                .ok_or_else(|| anyhow::anyhow!("provider is required"))?,
+            provider: self.provider.ok_or_else(|| anyhow::anyhow!("provider is required"))?,
             tools,
-            memory: self
-                .memory
-                .ok_or_else(|| anyhow::anyhow!("memory is required"))?,
-            observer: self
-                .observer
-                .ok_or_else(|| anyhow::anyhow!("observer is required"))?,
+            memory: self.memory.ok_or_else(|| anyhow::anyhow!("memory is required"))?,
+            observer: self.observer.ok_or_else(|| anyhow::anyhow!("observer is required"))?,
             hooks,
-            prompt_builder: self
-                .prompt_builder
-                .unwrap_or_else(SystemPromptBuilder::with_defaults),
+            prompt_builder: self.prompt_builder.unwrap_or_else(SystemPromptBuilder::with_defaults),
             tool_dispatcher: self
                 .tool_dispatcher
                 .ok_or_else(|| anyhow::anyhow!("tool_dispatcher is required"))?,
@@ -280,25 +262,19 @@ impl Agent {
     }
 
     pub fn from_config(config: &Config) -> Result<Self> {
-        let observer: Arc<dyn Observer> =
-            Arc::from(observability::create_observer(&config.observability));
-        let runtime: Arc<dyn runtime::RuntimeAdapter> =
-            Arc::from(runtime::create_runtime(&config.runtime)?);
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
-            &config.workspace_dir,
-        ));
+        let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
+        let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
 
-        let memory: Arc<dyn Memory> =
-            Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
-                &config.memory,
-                &config.embedding_routes,
-                Some(&config.storage.provider.config),
-                &config.workspace_dir,
-                config.api_key.as_deref(),
-                &config.identity_bindings,
-                &config.user_policies,
-            )?);
+        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
+            &config.memory,
+            &config.embedding_routes,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+            &config.identity_bindings,
+            &config.user_policies,
+        )?);
 
         let composio_key = if config.composio.enabled {
             config.composio.api_key.as_deref()
@@ -351,8 +327,7 @@ impl Agent {
             _ => Box::new(XmlToolDispatcher),
         };
 
-        let available_hints: Vec<String> =
-            config.model_routes.iter().map(|r| r.hint.clone()).collect();
+        let available_hints: Vec<String> = config.model_routes.iter().map(|r| r.hint.clone()).collect();
 
         #[cfg(feature = "llm-router")]
         if config.router.enabled {
@@ -367,10 +342,7 @@ impl Agent {
             .observer(observer)
             .hooks(Arc::new(HookManager::new(config.workspace_dir.clone())))
             .tool_dispatcher(tool_dispatcher)
-            .memory_loader(Box::new(DefaultMemoryLoader::new(
-                5,
-                config.memory.min_relevance_score,
-            )))
+            .memory_loader(Box::new(DefaultMemoryLoader::new(5, config.memory.min_relevance_score)))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
@@ -381,10 +353,7 @@ impl Agent {
             .available_hints(available_hints.clone())
             .model_routes(config.model_routes.clone())
             .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills_with_config(
-                &config.workspace_dir,
-                config,
-            ))
+            .skills(crate::skills::load_skills_with_config(&config.workspace_dir, config))
             .auto_save(config.memory.auto_save);
 
         #[cfg(not(feature = "llm-router"))]
@@ -395,10 +364,7 @@ impl Agent {
             .observer(observer)
             .hooks(Arc::new(HookManager::new(config.workspace_dir.clone())))
             .tool_dispatcher(tool_dispatcher)
-            .memory_loader(Box::new(DefaultMemoryLoader::new(
-                5,
-                config.memory.min_relevance_score,
-            )))
+            .memory_loader(Box::new(DefaultMemoryLoader::new(5, config.memory.min_relevance_score)))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
@@ -408,16 +374,12 @@ impl Agent {
             .task_routing_config(config.task_routing.clone())
             .available_hints(available_hints)
             .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills_with_config(
-                &config.workspace_dir,
-                config,
-            ))
+            .skills(crate::skills::load_skills_with_config(&config.workspace_dir, config))
             .auto_save(config.memory.auto_save);
 
         #[cfg(feature = "llm-router")]
         if config.router.enabled {
-            let router_embedder =
-                memory::create_embedder_from_config(config, config.api_key.as_deref());
+            let router_embedder = memory::create_embedder_from_config(config, config.api_key.as_deref());
             let router = futures::executor::block_on(RouterEngine::new(
                 config.router.clone(),
                 provider_name.to_string(),
@@ -425,9 +387,7 @@ impl Agent {
                 builder
                     .memory
                     .as_ref()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("memory backend must be set before enabling router")
-                    })?
+                    .ok_or_else(|| anyhow::anyhow!("memory backend must be set before enabling router"))?
                     .clone(),
                 Some(router_embedder),
             ))?;
@@ -495,15 +455,10 @@ impl Agent {
         let mut sanitized_args = call.arguments.clone();
         if let Some(obj) = sanitized_args.as_object_mut() {
             obj.remove("_prx_scope");
-            obj.insert(
-                "_prx_scope_trusted".to_string(),
-                serde_json::Value::Bool(false),
-            );
+            obj.insert("_prx_scope_trusted".to_string(), serde_json::Value::Bool(false));
         }
 
-        let (result, success) = if let Some(tool) =
-            self.tools.iter().find(|t| t.supports_name(&call.name))
-        {
+        let (result, success) = if let Some(tool) = self.tools.iter().find(|t| t.supports_name(&call.name)) {
             match tool.execute_named(&call.name, sanitized_args).await {
                 Ok(r) => {
                     self.hooks
@@ -533,9 +488,7 @@ impl Agent {
                 }
                 Err(e) => {
                     let message = format!("Error executing {}: {e}", call.name);
-                    self.hooks
-                        .emit(HookEvent::Error, payload_error("tool", &message))
-                        .await;
+                    self.hooks.emit(HookEvent::Error, payload_error("tool", &message)).await;
                     self.observer.record_event(&ObserverEvent::ToolCall {
                         tool: call.name.clone(),
                         duration: start.elapsed(),
@@ -546,9 +499,7 @@ impl Agent {
             }
         } else {
             let message = format!("Unknown tool: {}", call.name);
-            self.hooks
-                .emit(HookEvent::Error, payload_error("tool", &message))
-                .await;
+            self.hooks.emit(HookEvent::Error, payload_error("tool", &message)).await;
             (message, false)
         };
 
@@ -569,10 +520,7 @@ impl Agent {
             return results;
         }
 
-        let futs: Vec<_> = calls
-            .iter()
-            .map(|call| self.execute_tool_call(call))
-            .collect();
+        let futs: Vec<_> = calls.iter().map(|call| self.execute_tool_call(call)).collect();
         futures::future::join_all(futs).await
     }
 
@@ -641,11 +589,7 @@ impl Agent {
         }
     }
 
-    async fn spawn_delegate_task(
-        &self,
-        user_message: &str,
-        sub_agent_model: Option<&str>,
-    ) -> Result<String> {
+    async fn spawn_delegate_task(&self, user_message: &str, sub_agent_model: Option<&str>) -> Result<String> {
         let tool = self
             .tools
             .iter()
@@ -658,10 +602,7 @@ impl Agent {
             "mode": "process",
         });
 
-        if let Some(model) = sub_agent_model
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
+        if let Some(model) = sub_agent_model.map(str::trim).filter(|value| !value.is_empty()) {
             args["model"] = serde_json::Value::String(model.to_string());
         }
 
@@ -677,15 +618,14 @@ impl Agent {
 
         // Prefer structured run_id from JSON output; fall back to text parsing
         // only if the tool does not return a machine-readable envelope.
-        let run_id: Option<String> =
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&result.output) {
-                json.get("run_id")
-                    .or_else(|| json.get("id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            } else {
-                None
-            };
+        let run_id: Option<String> = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&result.output) {
+            json.get("run_id")
+                .or_else(|| json.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        } else {
+            None
+        };
 
         let run_id = run_id.or_else(|| {
             // Legacy text parsing — emit a warning so future regressions surface.
@@ -724,9 +664,7 @@ impl Agent {
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
-                .push(ConversationMessage::Chat(ChatMessage::system(
-                    system_prompt,
-                )));
+                .push(ConversationMessage::Chat(ChatMessage::system(system_prompt)));
         }
 
         if self.auto_save && memory::should_autosave_content(user_message) {
@@ -748,8 +686,7 @@ impl Agent {
             format!("{context}{user_message}")
         };
 
-        let classify_result =
-            super::classifier::classify_intent(&self.task_routing_config, user_message);
+        let classify_result = super::classifier::classify_intent(&self.task_routing_config, user_message);
         tracing::info!(
             intent = ?classify_result.intent,
             reason = classify_result.reason.as_str(),
@@ -760,18 +697,14 @@ impl Agent {
             // Record user message in history before delegating so follow-up
             // turns can see that delegation happened.
             self.history
-                .push(ConversationMessage::Chat(ChatMessage::user(
-                    enriched.clone(),
-                )));
+                .push(ConversationMessage::Chat(ChatMessage::user(enriched.clone())));
             let task_id = self
                 .spawn_delegate_task(user_message, classify_result.model_hint.as_deref())
                 .await?;
             let ack = format!("已收到，正在后台处理（任务 {task_id}），完成后会回传结果。");
             // Record acknowledgment in history as well.
             self.history
-                .push(ConversationMessage::Chat(ChatMessage::assistant(
-                    ack.clone(),
-                )));
+                .push(ConversationMessage::Chat(ChatMessage::assistant(ack.clone())));
             return Ok(ack);
         }
 
@@ -784,13 +717,10 @@ impl Agent {
             {
                 if let Some(router) = &self.router {
                     if classify_result.model_hint.is_none() {
-                        let result = router
-                            .select_model(user_message, &classify_result.intent)
-                            .await;
-                        if let (Some(provider), Some(model)) = (
-                            result.chosen_provider.as_deref(),
-                            result.chosen_model.as_deref(),
-                        ) {
+                        let result = router.select_model(user_message, &classify_result.intent).await;
+                        if let (Some(provider), Some(model)) =
+                            (result.chosen_provider.as_deref(), result.chosen_model.as_deref())
+                        {
                             tracing::info!(
                                 chosen = model,
                                 provider = provider,
@@ -848,11 +778,7 @@ impl Agent {
                     }),
                 )
                 .await;
-            let dynamic_tool_specs = self
-                .tools
-                .iter()
-                .flat_map(|tool| tool.specs())
-                .collect::<Vec<_>>();
+            let dynamic_tool_specs = self.tools.iter().flat_map(|tool| tool.specs()).collect::<Vec<_>>();
             #[allow(unused_mut)]
             let mut response = match self
                 .provider
@@ -874,8 +800,7 @@ impl Agent {
                 Err(err) => {
                     #[cfg(feature = "llm-router")]
                     if let Some(router) = &self.router {
-                        cost_event.primary_prompt_tokens +=
-                            Self::estimate_text_tokens(user_message);
+                        cost_event.primary_prompt_tokens += Self::estimate_text_tokens(user_message);
                         let success = false;
                         let latency = turn_start.elapsed().as_millis() as u64;
                         if let Err(record_err) = router
@@ -887,9 +812,7 @@ impl Agent {
                         cost_event.primary_model = effective_model.clone();
                         cost_event.total_cost_usd = router
                             .model_cost_per_million_tokens(&effective_model)
-                            .map(|rate| {
-                                rate * cost_event.primary_prompt_tokens as f32 / 1_000_000.0
-                            })
+                            .map(|rate| rate * cost_event.primary_prompt_tokens as f32 / 1_000_000.0)
                             .unwrap_or(0.0);
                         self.append_router_cost_event(&cost_event).await;
                     }
@@ -922,22 +845,18 @@ impl Agent {
                             parsed.0.clone()
                         };
                         cost_event.primary_model = effective_model.clone();
-                        cost_event.primary_prompt_tokens +=
-                            Self::estimate_text_tokens(user_message);
-                        cost_event.primary_completion_tokens +=
-                            Self::estimate_text_tokens(&initial_text);
+                        cost_event.primary_prompt_tokens += Self::estimate_text_tokens(user_message);
+                        cost_event.primary_completion_tokens += Self::estimate_text_tokens(&initial_text);
 
                         if automix.enabled
                             && !automix.premium_model_id.trim().is_empty()
                             && is_cheap_model_target(&effective_model, &automix.cheap_model_tiers)
                         {
-                            let confidence =
-                                ConfidenceChecker::check_rules(&initial_text, user_message);
+                            let confidence = ConfidenceChecker::check_rules(&initial_text, user_message);
                             cost_event.confidence = confidence;
 
                             if should_escalate(confidence, automix.confidence_threshold) {
-                                let premium_model =
-                                    self.resolve_model_target(&automix.premium_model_id);
+                                let premium_model = self.resolve_model_target(&automix.premium_model_id);
                                 tracing::info!(
                                     confidence,
                                     escalate_to = premium_model.as_str(),
@@ -948,8 +867,7 @@ impl Agent {
                                     .chat(
                                         ChatRequest {
                                             messages: &messages,
-                                            tools: if self.tool_dispatcher.should_send_tool_specs()
-                                            {
+                                            tools: if self.tool_dispatcher.should_send_tool_specs() {
                                                 Some(&dynamic_tool_specs)
                                             } else {
                                                 None
@@ -963,8 +881,7 @@ impl Agent {
                                     Ok(resp) => {
                                         cost_event.escalated = true;
                                         cost_event.escalation_model = Some(premium_model.clone());
-                                        cost_event.escalation_prompt_tokens +=
-                                            Self::estimate_text_tokens(user_message);
+                                        cost_event.escalation_prompt_tokens += Self::estimate_text_tokens(user_message);
                                         let premium_text = resp.text.clone().unwrap_or_default();
                                         cost_event.escalation_completion_tokens +=
                                             Self::estimate_text_tokens(&premium_text);
@@ -1004,9 +921,7 @@ impl Agent {
                 };
 
                 self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        final_text.clone(),
-                    )));
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(final_text.clone())));
                 self.trim_history();
 
                 // Note: assistant responses are intentionally NOT auto-saved here.
@@ -1034,17 +949,14 @@ impl Agent {
                     cost_event.total_cost_usd = router
                         .model_cost_per_million_tokens(&cost_event.primary_model)
                         .map(|rate| {
-                            rate * (cost_event.primary_prompt_tokens
-                                + cost_event.primary_completion_tokens)
-                                as f32
+                            rate * (cost_event.primary_prompt_tokens + cost_event.primary_completion_tokens) as f32
                                 / 1_000_000.0
                         })
                         .unwrap_or(0.0);
                     if let Some(model) = &cost_event.escalation_model {
                         if let Some(rate) = router.model_cost_per_million_tokens(model) {
                             cost_event.total_cost_usd += rate
-                                * (cost_event.escalation_prompt_tokens
-                                    + cost_event.escalation_completion_tokens)
+                                * (cost_event.escalation_prompt_tokens + cost_event.escalation_completion_tokens)
                                     as f32
                                 / 1_000_000.0;
                         }
@@ -1057,9 +969,7 @@ impl Agent {
 
             if !text.is_empty() {
                 self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        text.clone(),
-                    )));
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(text.clone())));
                 print!("{text}");
                 let _ = std::io::stdout().flush();
             }
@@ -1087,10 +997,7 @@ impl Agent {
             }
             self.append_router_cost_event(&cost_event).await;
         }
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            max_tool_iterations
-        )
+        anyhow::bail!("Agent exceeded maximum tool iterations ({})", max_tool_iterations)
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
@@ -1676,10 +1583,7 @@ mod tests {
         assert_eq!(response, "This is the premium answer.");
         assert_eq!(
             models.lock().clone(),
-            vec![
-                "openai/model-mini".to_string(),
-                "openai/model-premium".to_string()
-            ]
+            vec!["openai/model-mini".to_string(), "openai/model-premium".to_string()]
         );
     }
 
@@ -1767,10 +1671,7 @@ mod tests {
         assert_eq!(response, "I'm not sure, maybe this is the answer.");
         assert_eq!(
             models.lock().clone(),
-            vec![
-                "openai/model-mini".to_string(),
-                "openai/model-premium".to_string()
-            ]
+            vec!["openai/model-mini".to_string(), "openai/model-premium".to_string()]
         );
 
         let prefix = format!("router/cost/{}/", chrono::Utc::now().format("%Y-%m-%d"));
@@ -1793,21 +1694,14 @@ mod tests {
     #[cfg(feature = "llm-router")]
     #[tokio::test]
     async fn test_automix_failure_records_elo_on_cheap_model() {
-        let (mut agent, memory, models) = build_named_automix_agent(
-            "I'm not sure, maybe this is the answer.",
-            "This should fail.",
-            true,
-        )
-        .await;
+        let (mut agent, memory, models) =
+            build_named_automix_agent("I'm not sure, maybe this is the answer.", "This should fail.", true).await;
 
         let response = agent.turn("hello").await.unwrap();
         assert_eq!(response, "I'm not sure, maybe this is the answer.");
         assert_eq!(
             models.lock().clone(),
-            vec![
-                "openai/model-cheap".to_string(),
-                "openai/model-premium".to_string()
-            ]
+            vec!["openai/model-cheap".to_string(), "openai/model-premium".to_string()]
         );
 
         let cheap_elo = memory
@@ -1818,13 +1712,7 @@ mod tests {
         let cheap_snapshot: serde_json::Value = serde_json::from_str(&cheap_elo.content).unwrap();
         assert!(cheap_snapshot["dynamic_elo"].as_f64().unwrap() > 1_000.0);
 
-        assert!(
-            memory
-                .get("router/elo/model-premium")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(memory.get("router/elo/model-premium").await.unwrap().is_none());
 
         let router_entries = memory
             .list(
@@ -1867,8 +1755,7 @@ mod tests {
             .into_iter()
             .filter(|entry| entry.key.starts_with(&prefix))
             .collect();
-        let unique_keys: std::collections::HashSet<_> =
-            entries.iter().map(|entry| entry.key.clone()).collect();
+        let unique_keys: std::collections::HashSet<_> = entries.iter().map(|entry| entry.key.clone()).collect();
 
         assert_eq!(entries.len(), 5);
         assert_eq!(unique_keys.len(), 5);

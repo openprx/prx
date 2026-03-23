@@ -28,8 +28,7 @@ impl Integrator {
     pub fn integrate(&self, candidate: &ScoutResult) -> Result<PathBuf> {
         let safe_name = sanitize_path_component(&candidate.name)?;
         let skill_dir = self.output_dir.join(&safe_name);
-        fs::create_dir_all(&skill_dir)
-            .with_context(|| format!("Failed to create dir: {}", skill_dir.display()))?;
+        fs::create_dir_all(&skill_dir).with_context(|| format!("Failed to create dir: {}", skill_dir.display()))?;
 
         let toml_path = skill_dir.join("SKILL.toml");
         let md_path = skill_dir.join("SKILL.md");
@@ -37,10 +36,8 @@ impl Integrator {
         let toml_content = self.generate_toml(candidate);
         let md_content = self.generate_md(candidate);
 
-        fs::write(&toml_path, &toml_content)
-            .with_context(|| format!("Failed to write {}", toml_path.display()))?;
-        fs::write(&md_path, &md_content)
-            .with_context(|| format!("Failed to write {}", md_path.display()))?;
+        fs::write(&toml_path, &toml_content).with_context(|| format!("Failed to write {}", toml_path.display()))?;
+        fs::write(&md_path, &md_content).with_context(|| format!("Failed to write {}", md_path.display()))?;
 
         info!(
             skill = candidate.name.as_str(),
@@ -203,15 +200,11 @@ mod tests {
         assert!(path.join("SKILL.toml").exists());
         assert!(path.join("SKILL.md").exists());
 
-        let toml = tokio::fs::read_to_string(path.join("SKILL.toml"))
-            .await
-            .unwrap();
+        let toml = tokio::fs::read_to_string(path.join("SKILL.toml")).await.unwrap();
         assert!(toml.contains("name = \"test-skill\""));
         assert!(toml.contains("stars = 42"));
 
-        let md = tokio::fs::read_to_string(path.join("SKILL.md"))
-            .await
-            .unwrap();
+        let md = tokio::fs::read_to_string(path.join("SKILL.md")).await.unwrap();
         assert!(md.contains("# test-skill"));
         assert!(md.contains("A test skill for unit tests"));
 

@@ -55,11 +55,7 @@ mod tests {
     }
 
     impl CountingObserver {
-        fn new(
-            event_count: Arc<AtomicUsize>,
-            metric_count: Arc<AtomicUsize>,
-            flush_count: Arc<AtomicUsize>,
-        ) -> Self {
+        fn new(event_count: Arc<AtomicUsize>, metric_count: Arc<AtomicUsize>, flush_count: Arc<AtomicUsize>) -> Self {
             Self {
                 event_count,
                 metric_count,

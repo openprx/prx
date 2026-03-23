@@ -29,10 +29,7 @@ pub async fn run(config: Config) -> Result<()> {
     let mut interval = time::interval(Duration::from_secs(interval_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
     let registry = Arc::new(BuiltinRegistry::new());
 
     // Register built-in system tasks if configured
@@ -213,11 +210,7 @@ async fn execute_single_task(
 
 // ── Execution modes ─────────────────────────────────────────────────────
 
-async fn run_internal(
-    config: &Config,
-    registry: &BuiltinRegistry,
-    task: &XinTask,
-) -> (bool, String) {
+async fn run_internal(config: &Config, registry: &BuiltinRegistry, task: &XinTask) -> (bool, String) {
     match registry.execute(&task.payload, config.clone()).await {
         Ok(output) => (true, output),
         Err(e) => (false, format!("internal handler error: {e}")),
@@ -226,31 +219,21 @@ async fn run_internal(
 
 async fn run_agent(config: &Config, security: &SecurityPolicy, task: &XinTask) -> (bool, String) {
     if !security.can_act() {
-        return (
-            false,
-            "blocked by security policy: autonomy is read-only".into(),
-        );
+        return (false, "blocked by security policy: autonomy is read-only".into());
     }
 
     if security.is_rate_limited() {
-        return (
-            false,
-            "blocked by security policy: rate limit exceeded".into(),
-        );
+        return (false, "blocked by security policy: rate limit exceeded".into());
     }
 
     if !security.record_action() {
-        return (
-            false,
-            "blocked by security policy: action budget exhausted".into(),
-        );
+        return (false, "blocked by security policy: action budget exhausted".into());
     }
 
     let prompt = format!("[xin:task:{}] {}", task.id, task.payload);
 
     let mut agent_config = config.clone();
-    if agent_config.agent.max_tool_iterations == 0
-        || agent_config.agent.max_tool_iterations > AGENT_MAX_TOOL_ITERATIONS
+    if agent_config.agent.max_tool_iterations == 0 || agent_config.agent.max_tool_iterations > AGENT_MAX_TOOL_ITERATIONS
     {
         agent_config.agent.max_tool_iterations = AGENT_MAX_TOOL_ITERATIONS;
     }
@@ -278,34 +261,22 @@ async fn run_agent(config: &Config, security: &SecurityPolicy, task: &XinTask) -
 
 async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -> (bool, String) {
     if !security.can_act() {
-        return (
-            false,
-            "blocked by security policy: autonomy is read-only".into(),
-        );
+        return (false, "blocked by security policy: autonomy is read-only".into());
     }
 
     if security.is_rate_limited() {
-        return (
-            false,
-            "blocked by security policy: rate limit exceeded".into(),
-        );
+        return (false, "blocked by security policy: rate limit exceeded".into());
     }
 
     if !security.is_command_allowed(&task.payload) {
         return (
             false,
-            format!(
-                "blocked by security policy: command not allowed: {}",
-                task.payload
-            ),
+            format!("blocked by security policy: command not allowed: {}", task.payload),
         );
     }
 
     if !security.record_action() {
-        return (
-            false,
-            "blocked by security policy: action budget exhausted".into(),
-        );
+        return (false, "blocked by security policy: action budget exhausted".into());
     }
 
     let child = match Command::new("sh")
@@ -322,12 +293,7 @@ async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -
         Err(e) => return (false, format!("spawn error: {e}")),
     };
 
-    match time::timeout(
-        Duration::from_secs(SHELL_TIMEOUT_SECS),
-        child.wait_with_output(),
-    )
-    .await
-    {
+    match time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), child.wait_with_output()).await {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);

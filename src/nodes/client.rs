@@ -1,8 +1,7 @@
 use crate::config::RemoteNodeConfig;
 use crate::nodes::protocol::{
-    AsyncTaskAccepted, CancelParams, ExecShellParams, ExecShellResult, MetricsResult, PingResult,
-    ReadFileParams, ReadFileResult, TaskListResult, TaskStatusParams, TaskStatusResult,
-    WriteFileParams, WriteFileResult,
+    AsyncTaskAccepted, CancelParams, ExecShellParams, ExecShellResult, MetricsResult, PingResult, ReadFileParams,
+    ReadFileResult, TaskListResult, TaskStatusParams, TaskStatusResult, WriteFileParams, WriteFileResult,
 };
 use crate::nodes::transport::{NodeTransport, TransportRequest};
 use anyhow::{Context, Result, anyhow, bail};
@@ -75,11 +74,7 @@ impl RemoteNodeClient {
         guard.allow_request().map(|_| true).unwrap_or(false)
     }
 
-    async fn call_rpc<T: serde::de::DeserializeOwned>(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<T> {
+    async fn call_rpc<T: serde::de::DeserializeOwned>(&self, method: &str, params: serde_json::Value) -> Result<T> {
         {
             let guard = self.circuit_breaker.lock().await;
             guard.allow_request()?;
@@ -117,12 +112,7 @@ impl RemoteNodeClient {
         Ok(start.elapsed())
     }
 
-    pub async fn exec_shell(
-        &self,
-        cmd: &str,
-        timeout_ms: Option<u64>,
-        cwd: Option<&str>,
-    ) -> Result<ExecShellResult> {
+    pub async fn exec_shell(&self, cmd: &str, timeout_ms: Option<u64>, cwd: Option<&str>) -> Result<ExecShellResult> {
         if cmd.trim().is_empty() {
             bail!("command cannot be empty")
         }
@@ -167,12 +157,7 @@ impl RemoteNodeClient {
         .await
     }
 
-    pub async fn read_file(
-        &self,
-        path: &str,
-        offset: Option<u64>,
-        limit: Option<u64>,
-    ) -> Result<ReadFileResult> {
+    pub async fn read_file(&self, path: &str, offset: Option<u64>, limit: Option<u64>) -> Result<ReadFileResult> {
         self.call_rpc(
             "node.read_file",
             serde_json::to_value(ReadFileParams {
@@ -184,12 +169,7 @@ impl RemoteNodeClient {
         .await
     }
 
-    pub async fn write_file(
-        &self,
-        path: &str,
-        content: &str,
-        create_dirs: bool,
-    ) -> Result<WriteFileResult> {
+    pub async fn write_file(&self, path: &str, content: &str, create_dirs: bool) -> Result<WriteFileResult> {
         self.call_rpc(
             "node.write_file",
             serde_json::to_value(WriteFileParams {
@@ -275,12 +255,7 @@ mod tests {
     impl EchoTransport {
         fn new() -> (Arc<Self>, Arc<ParkingMutex<Vec<String>>>) {
             let calls = Arc::new(ParkingMutex::new(Vec::new()));
-            (
-                Arc::new(Self {
-                    calls: calls.clone(),
-                }),
-                calls,
-            )
+            (Arc::new(Self { calls: calls.clone() }), calls)
         }
     }
 
@@ -368,12 +343,7 @@ mod tests {
         }
         let blocked = client.ping().await;
         assert!(blocked.is_err());
-        assert!(
-            blocked
-                .unwrap_err()
-                .to_string()
-                .contains("temporarily unhealthy")
-        );
+        assert!(blocked.unwrap_err().to_string().contains("temporarily unhealthy"));
     }
 
     #[tokio::test]

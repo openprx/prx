@@ -222,10 +222,7 @@ async fn int_sme_04_circuit_breaker_opens_after_threshold_failures() {
         CircuitBreakerState::Closed,
         "test: breaker should remain Closed after 4 failures (threshold=5)"
     );
-    assert!(
-        breaker.can_execute(now),
-        "test: Closed breaker should allow execution"
-    );
+    assert!(breaker.can_execute(now), "test: Closed breaker should allow execution");
 
     // 5th failure trips the breaker
     breaker.record_failure(now);
@@ -234,10 +231,7 @@ async fn int_sme_04_circuit_breaker_opens_after_threshold_failures() {
         CircuitBreakerState::Open,
         "test: breaker should Open after 5 failures"
     );
-    assert!(
-        !breaker.can_execute(now),
-        "test: Open breaker should block execution"
-    );
+    assert!(!breaker.can_execute(now), "test: Open breaker should block execution");
 
     // After cooldown (1 hour), should transition to HalfOpen
     let after_cooldown = now + chrono::Duration::hours(1);
@@ -276,8 +270,7 @@ async fn int_sme_05_rollback_manager_backup_and_restore() {
         .await
         .expect("test: write initial prompt");
 
-    let manager = RollbackManager::new(dir.path(), &target, &versions, 5)
-        .expect("test: create rollback manager");
+    let manager = RollbackManager::new(dir.path(), &target, &versions, 5).expect("test: create rollback manager");
 
     // Backup current version
     let snapshot = manager
@@ -292,9 +285,7 @@ async fn int_sme_05_rollback_manager_backup_and_restore() {
         .expect("test: write mutated prompt");
 
     // Verify mutation took effect
-    let mutated = tokio::fs::read_to_string(&target)
-        .await
-        .expect("test: read mutated");
+    let mutated = tokio::fs::read_to_string(&target).await.expect("test: read mutated");
     assert_eq!(mutated, "You are an evil assistant.");
 
     // Rollback to the backup
@@ -304,9 +295,7 @@ async fn int_sme_05_rollback_manager_backup_and_restore() {
         .expect("test: rollback should succeed");
 
     // Verify restoration
-    let restored = tokio::fs::read_to_string(&target)
-        .await
-        .expect("test: read restored");
+    let restored = tokio::fs::read_to_string(&target).await.expect("test: read restored");
     assert_eq!(
         restored, "You are a helpful assistant.",
         "test: content should be restored to original after rollback"
@@ -320,8 +309,7 @@ async fn int_sme_05_rollback_manager_prunes_old_versions() {
     let target = dir.path().join("config.toml");
     let versions = dir.path().join(".evolution/rollback/versions");
 
-    let manager = RollbackManager::new(dir.path(), &target, &versions, 3)
-        .expect("test: create rollback manager");
+    let manager = RollbackManager::new(dir.path(), &target, &versions, 3).expect("test: create rollback manager");
 
     // Create 5 backups (only 3 should be retained)
     for i in 0..5 {
@@ -376,14 +364,10 @@ async fn int_sme_06_trace_context_shared_across_nested_operations() {
     let expected_trace_id = ctx.trace_id.clone();
 
     let (id_from_op1, id_from_op2) = with_trace(ctx, || async {
-        let op1_trace = current_trace()
-            .expect("test: trace context in op1")
-            .trace_id;
+        let op1_trace = current_trace().expect("test: trace context in op1").trace_id;
 
         // Simulate a second operation in the same trace span
-        let op2_trace = current_trace()
-            .expect("test: trace context in op2")
-            .trace_id;
+        let op2_trace = current_trace().expect("test: trace context in op2").trace_id;
 
         (op1_trace, op2_trace)
     })
@@ -393,10 +377,7 @@ async fn int_sme_06_trace_context_shared_across_nested_operations() {
         id_from_op1, expected_trace_id,
         "test: op1 should see the correct trace_id"
     );
-    assert_eq!(
-        id_from_op2, expected_trace_id,
-        "test: op2 should see the same trace_id"
-    );
+    assert_eq!(id_from_op2, expected_trace_id, "test: op2 should see the same trace_id");
     assert_eq!(
         id_from_op1, id_from_op2,
         "test: both operations should share the same trace context"
@@ -428,22 +409,12 @@ async fn int_mm_02_lucid_delegates_to_sqlite() {
 
     // Store through LucidMemory
     lucid
-        .store(
-            "lucid-key-1",
-            "lucid content one",
-            MemoryCategory::Core,
-            None,
-        )
+        .store("lucid-key-1", "lucid content one", MemoryCategory::Core, None)
         .await
         .expect("test: lucid store should succeed");
 
     lucid
-        .store(
-            "lucid-key-2",
-            "lucid content two",
-            MemoryCategory::Core,
-            None,
-        )
+        .store("lucid-key-2", "lucid content two", MemoryCategory::Core, None)
         .await
         .expect("test: lucid store 2 should succeed");
 
@@ -456,10 +427,7 @@ async fn int_mm_02_lucid_delegates_to_sqlite() {
     assert_eq!(entry.content, "lucid content one");
 
     // Count through LucidMemory
-    let count = lucid
-        .count()
-        .await
-        .expect("test: lucid count should succeed");
+    let count = lucid.count().await.expect("test: lucid count should succeed");
     assert_eq!(count, 2, "test: lucid should have 2 entries");
 
     // Recall through LucidMemory
@@ -467,20 +435,14 @@ async fn int_mm_02_lucid_delegates_to_sqlite() {
         .recall("lucid content", 10, None)
         .await
         .expect("test: lucid recall should succeed");
-    assert!(
-        !results.is_empty(),
-        "test: lucid recall should find matching entries"
-    );
+    assert!(!results.is_empty(), "test: lucid recall should find matching entries");
 
     // Forget through LucidMemory
     let forgotten = lucid
         .forget("lucid-key-1")
         .await
         .expect("test: lucid forget should succeed");
-    assert!(
-        forgotten,
-        "test: forget should return true for existing key"
-    );
+    assert!(forgotten, "test: forget should return true for existing key");
 
     let count_after = lucid.count().await.expect("test: count after forget");
     assert_eq!(count_after, 1, "test: count should decrease after forget");
@@ -517,10 +479,7 @@ async fn int_mm_03_markdown_concurrent_writes_no_corruption() {
 
     // Verify all 5 entries are retrievable
     let count = mem.count().await.expect("test: count should succeed");
-    assert_eq!(
-        count, 5,
-        "test: all 5 concurrent writes should be present, got {count}"
-    );
+    assert_eq!(count, 5, "test: all 5 concurrent writes should be present, got {count}");
 
     // Spot-check that content is not corrupted
     for i in 0..5 {
@@ -559,10 +518,7 @@ async fn int_mm_04_memory_backend_fallback_on_unknown() {
 
     // Known backends should classify correctly
     assert_eq!(classify_memory_backend("sqlite"), MemoryBackendKind::Sqlite);
-    assert_eq!(
-        classify_memory_backend("markdown"),
-        MemoryBackendKind::Markdown
-    );
+    assert_eq!(classify_memory_backend("markdown"), MemoryBackendKind::Markdown);
     assert_eq!(classify_memory_backend("none"), MemoryBackendKind::None);
 }
 
@@ -598,18 +554,12 @@ async fn int_gs_06_idempotency_store_creation_bounded() {
 #[tokio::test]
 async fn int_gs_07_public_bind_detection() {
     // Public addresses — should return true
-    assert!(
-        is_public_bind("0.0.0.0"),
-        "test: 0.0.0.0 is a public bind address"
-    );
+    assert!(is_public_bind("0.0.0.0"), "test: 0.0.0.0 is a public bind address");
     assert!(
         is_public_bind("192.168.1.1"),
         "test: 192.168.1.1 is a public bind address"
     );
-    assert!(
-        is_public_bind("10.0.0.1"),
-        "test: 10.0.0.1 is a public bind address"
-    );
+    assert!(is_public_bind("10.0.0.1"), "test: 10.0.0.1 is a public bind address");
 
     // Private/localhost addresses — should return false
     assert!(
@@ -620,14 +570,8 @@ async fn int_gs_07_public_bind_detection() {
         !is_public_bind("localhost"),
         "test: localhost is NOT a public bind address"
     );
-    assert!(
-        !is_public_bind("::1"),
-        "test: ::1 is NOT a public bind address"
-    );
-    assert!(
-        !is_public_bind("[::1]"),
-        "test: [::1] is NOT a public bind address"
-    );
+    assert!(!is_public_bind("::1"), "test: ::1 is NOT a public bind address");
+    assert!(!is_public_bind("[::1]"), "test: [::1] is NOT a public bind address");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -677,10 +621,7 @@ async fn int_tr_05_sandbox_selection_cascade_fallback() {
         "none",
         "test: disabled sandbox should return NoopSandbox"
     );
-    assert!(
-        sandbox.is_available(),
-        "test: NoopSandbox should always be available"
-    );
+    assert!(sandbox.is_available(), "test: NoopSandbox should always be available");
 
     // Auto-detection should return some sandbox (at least NoopSandbox)
     let auto_config = SecurityConfig {
@@ -749,10 +690,7 @@ async fn int_cs_03_policy_pipeline_layer_precedence() {
 
     // shell: no group, no tool -> global allow
     let decision3 = pipeline.evaluate("shell", &EvalContext::default());
-    assert!(
-        decision3.allowed,
-        "test: shell should be ALLOWED (global default)"
-    );
+    assert!(decision3.allowed, "test: shell should be ALLOWED (global default)");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

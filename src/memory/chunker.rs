@@ -47,9 +47,7 @@ pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {
         } else {
             // Split on paragraphs (blank lines)
             let paragraphs = split_on_blank_lines(&body);
-            let mut current = heading
-                .as_deref()
-                .map_or_else(String::new, |h| format!("{h}\n"));
+            let mut current = heading.as_deref().map_or_else(String::new, |h| format!("{h}\n"));
 
             for para in paragraphs {
                 if current.len() + para.len() > max_chars && !current.trim().is_empty() {
@@ -58,9 +56,7 @@ pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {
                         content: current.trim().to_string(),
                         heading: heading.clone(),
                     });
-                    current = heading
-                        .as_deref()
-                        .map_or_else(String::new, |h| format!("{h}\n"));
+                    current = heading.as_deref().map_or_else(String::new, |h| format!("{h}\n"));
                 }
 
                 if para.len() > max_chars {
@@ -71,9 +67,7 @@ pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {
                             content: current.trim().to_string(),
                             heading: heading.clone(),
                         });
-                        current = heading
-                            .as_deref()
-                            .map_or_else(String::new, |h| format!("{h}\n"));
+                        current = heading.as_deref().map_or_else(String::new, |h| format!("{h}\n"));
                     }
                     for line_chunk in split_on_lines(&para, max_chars) {
                         chunks.push(Chunk {
@@ -208,18 +202,11 @@ mod tests {
         // Build multi-line text (one sentence per line) to exercise line-level splitting
         let long_text: String = (0..200).fold(String::new(), |mut s, i| {
             use std::fmt::Write;
-            let _ = writeln!(
-                s,
-                "This is sentence number {i} with some extra words to fill it up."
-            );
+            let _ = writeln!(s, "This is sentence number {i} with some extra words to fill it up.");
             s
         });
         let chunks = chunk_markdown(&long_text, 50); // 50 tokens ≈ 200 chars
-        assert!(
-            chunks.len() > 1,
-            "Expected multiple chunks, got {}",
-            chunks.len()
-        );
+        assert!(chunks.len() > 1, "Expected multiple chunks, got {}", chunks.len());
         for chunk in &chunks {
             // Allow some slack (heading re-insertion etc.)
             assert!(

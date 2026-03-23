@@ -14,12 +14,7 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
-    pub fn new(
-        provider: String,
-        brave_api_key: Option<String>,
-        max_results: usize,
-        timeout_secs: u64,
-    ) -> Self {
+    pub fn new(provider: String, brave_api_key: Option<String>, max_results: usize, timeout_secs: u64) -> Self {
         Self {
             provider: provider.trim().to_lowercase(),
             brave_api_key,
@@ -40,10 +35,7 @@ impl WebSearchTool {
         let response = client.get(&search_url).send().await?;
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "DuckDuckGo search failed with status: {}",
-                response.status()
-            );
+            anyhow::bail!("DuckDuckGo search failed with status: {}", response.status());
         }
 
         let html = response.text().await?;
@@ -52,22 +44,14 @@ impl WebSearchTool {
 
     fn parse_duckduckgo_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
         // Extract result links: <a class="result__a" href="...">Title</a>
-        let link_regex = Regex::new(
-            r#"<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#,
-        )?;
+        let link_regex = Regex::new(r#"<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#)?;
 
         // Extract snippets: <a class="result__snippet">...</a>
         let snippet_regex = Regex::new(r#"<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)</a>"#)?;
 
-        let link_matches: Vec<_> = link_regex
-            .captures_iter(html)
-            .take(self.max_results + 2)
-            .collect();
+        let link_matches: Vec<_> = link_regex.captures_iter(html).take(self.max_results + 2).collect();
 
-        let snippet_matches: Vec<_> = snippet_regex
-            .captures_iter(html)
-            .take(self.max_results + 2)
-            .collect();
+        let snippet_matches: Vec<_> = snippet_regex.captures_iter(html).take(self.max_results + 2).collect();
 
         if link_matches.is_empty() {
             return Ok(format!("No results found for: {}", query));
@@ -143,15 +127,9 @@ impl WebSearchTool {
         let mut lines = vec![format!("Search results for: {} (via Brave)", query)];
 
         for (i, result) in results.iter().take(self.max_results).enumerate() {
-            let title = result
-                .get("title")
-                .and_then(|t| t.as_str())
-                .unwrap_or("No title");
+            let title = result.get("title").and_then(|t| t.as_str()).unwrap_or("No title");
             let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
-            let description = result
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or("");
+            let description = result.get("description").and_then(|d| d.as_str()).unwrap_or("");
 
             lines.push(format!("{}. {}", i + 1, title));
             lines.push(format!("   {}", url));

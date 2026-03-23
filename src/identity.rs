@@ -157,10 +157,7 @@ pub struct InterestsSection {
 ///
 /// Checks `aieos_path` first, then `aieos_inline`. Returns `Ok(None)` if
 /// neither is configured.
-pub fn load_aieos_identity(
-    config: &IdentityConfig,
-    workspace_dir: &Path,
-) -> Result<Option<AieosIdentity>> {
+pub fn load_aieos_identity(config: &IdentityConfig, workspace_dir: &Path) -> Result<Option<AieosIdentity>> {
     // Only load AIEOS if format is explicitly set to "aieos"
     if config.format != "aieos" {
         return Ok(None);
@@ -264,11 +261,7 @@ fn normalize_names(value: Option<&Value>) -> Option<Names> {
         }
     }
 
-    if names.first.is_none()
-        && names.last.is_none()
-        && names.nickname.is_none()
-        && names.full.is_none()
-    {
+    if names.first.is_none() && names.last.is_none() && names.nickname.is_none() && names.full.is_none() {
         return None;
     }
 
@@ -333,10 +326,7 @@ fn normalize_moral_compass(value: &Value) -> Vec<String> {
         if let Some(core_values) = map.get("core_values") {
             values.extend(list_from_value(core_values));
         }
-        if let Some(conflict_style) = map
-            .get("conflict_resolution_style")
-            .and_then(scalar_to_string)
-        {
+        if let Some(conflict_style) = map.get("conflict_resolution_style").and_then(scalar_to_string) {
             values.push(format!("Conflict Style: {conflict_style}"));
         }
         if values.is_empty() {
@@ -354,10 +344,7 @@ fn normalize_linguistics_section(section: Option<&Value>) -> Option<LinguisticsS
 
     let style = value_at_path(section, &["style"])
         .and_then(value_to_text)
-        .or_else(|| {
-            non_empty_list_at(section, &["text_style", "style_descriptors"])
-                .map(|list| list.join(", "))
-        });
+        .or_else(|| non_empty_list_at(section, &["text_style", "style_descriptors"]).map(|list| list.join(", ")));
 
     let formality = value_at_path(section, &["formality"])
         .and_then(value_to_text)
@@ -375,8 +362,7 @@ fn normalize_linguistics_section(section: Option<&Value>) -> Option<LinguisticsS
     let forbidden_words = non_empty_list_at(section, &["forbidden_words"])
         .or_else(|| non_empty_list_at(section, &["idiolect", "forbidden_words"]));
 
-    if style.is_none() && formality.is_none() && catchphrases.is_none() && forbidden_words.is_none()
-    {
+    if style.is_none() && formality.is_none() && catchphrases.is_none() && forbidden_words.is_none() {
         return None;
     }
 
@@ -399,8 +385,7 @@ fn normalize_motivations_section(section: Option<&Value>) -> Option<MotivationsS
 
     let fears = value_at_path(section, &["fears"]).and_then(|fears| {
         let values = if fears.is_object() {
-            let mut combined =
-                non_empty_list_at(section, &["fears", "rational"]).unwrap_or_default();
+            let mut combined = non_empty_list_at(section, &["fears", "rational"]).unwrap_or_default();
             if let Some(mut irrational) = non_empty_list_at(section, &["fears", "irrational"]) {
                 combined.append(&mut irrational);
             }
@@ -414,18 +399,10 @@ fn normalize_motivations_section(section: Option<&Value>) -> Option<MotivationsS
         };
 
         let deduped = dedupe_non_empty(values);
-        if deduped.is_empty() {
-            None
-        } else {
-            Some(deduped)
-        }
+        if deduped.is_empty() { None } else { Some(deduped) }
     });
 
-    if core_drive.is_none()
-        && short_term_goals.is_none()
-        && long_term_goals.is_none()
-        && fears.is_none()
-    {
+    if core_drive.is_none() && short_term_goals.is_none() && long_term_goals.is_none() && fears.is_none() {
         return None;
     }
 
@@ -457,9 +434,7 @@ fn normalize_physicality_section(section: Option<&Value>) -> Option<PhysicalityS
         .and_then(value_to_text)
         .or_else(|| {
             let mut descriptors = Vec::new();
-            if let Some(face_shape) =
-                value_at_path(section, &["face", "shape"]).and_then(scalar_to_string)
-            {
+            if let Some(face_shape) = value_at_path(section, &["face", "shape"]).and_then(scalar_to_string) {
                 descriptors.push(format!("Face shape: {face_shape}"));
             }
             if let Some(build_description) =
@@ -572,11 +547,7 @@ fn value_to_text(value: &Value) -> Option<String> {
 fn summarize_object(map: &Map<String, Value>) -> Option<String> {
     let mut parts = Vec::new();
     summarize_object_into_parts("", map, &mut parts);
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("; "))
-    }
+    if parts.is_empty() { None } else { Some(parts.join("; ")) }
 }
 
 fn summarize_object_into_parts(prefix: &str, map: &Map<String, Value>, parts: &mut Vec<String>) {
@@ -695,20 +666,12 @@ fn favorites_map(value: &Value) -> Option<HashMap<String, String>> {
         }
     }
 
-    if favorites.is_empty() {
-        None
-    } else {
-        Some(favorites)
-    }
+    if favorites.is_empty() { None } else { Some(favorites) }
 }
 
 fn non_empty_list_at(value: &Value, path: &[&str]) -> Option<Vec<String>> {
     let values = value_at_path(value, path).map(list_from_value)?;
-    if values.is_empty() {
-        None
-    } else {
-        Some(values)
-    }
+    if values.is_empty() { None } else { Some(values) }
 }
 
 /// Convert AIEOS identity to a system prompt string.
@@ -993,10 +956,7 @@ mod tests {
         let json = r#"{"identity":{"names":{"first":"Nova"}}}"#;
         let identity: AieosIdentity = serde_json::from_str(json).unwrap();
         assert!(identity.identity.is_some());
-        assert_eq!(
-            identity.identity.unwrap().names.unwrap().first.unwrap(),
-            "Nova"
-        );
+        assert_eq!(identity.identity.unwrap().names.unwrap().first.unwrap(), "Nova");
     }
 
     #[test]
@@ -1203,9 +1163,7 @@ mod tests {
     #[test]
     fn aieos_to_system_prompt_empty_identity() {
         let identity = AieosIdentity {
-            identity: Some(IdentitySection {
-                ..Default::default()
-            }),
+            identity: Some(IdentitySection { ..Default::default() }),
             ..Default::default()
         };
 
@@ -1409,12 +1367,7 @@ mod tests {
         );
 
         let capabilities = identity.capabilities.clone().unwrap();
-        assert!(
-            capabilities
-                .skills
-                .unwrap()
-                .contains(&"Gardening".to_string())
-        );
+        assert!(capabilities.skills.unwrap().contains(&"Gardening".to_string()));
 
         let prompt = aieos_to_system_prompt(&identity);
         assert!(prompt.contains("## Identity"));
@@ -1449,10 +1402,7 @@ mod tests {
         };
 
         let identity = load_aieos_identity(&config, temp.path()).unwrap().unwrap();
-        assert_eq!(
-            identity.identity.unwrap().names.unwrap().first.as_deref(),
-            Some("Nova")
-        );
+        assert_eq!(identity.identity.unwrap().names.unwrap().first.as_deref(), Some("Nova"));
         assert_eq!(identity.psychology.unwrap().mbti.as_deref(), Some("ENTP"));
     }
 

@@ -41,10 +41,7 @@ impl Sandbox for FirejailSandbox {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
         // Prepend firejail to the command
         let program = cmd.get_program().to_string_lossy().to_string();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
 
         // Build firejail wrapper with security flags
         let mut firejail_cmd = Command::new("firejail");
@@ -104,10 +101,7 @@ mod tests {
         let result = FirejailSandbox::new();
         match result {
             Ok(_) => println!("Firejail is installed"),
-            Err(e) => assert!(
-                e.kind() == std::io::ErrorKind::NotFound
-                    || e.kind() == std::io::ErrorKind::Unsupported
-            ),
+            Err(e) => assert!(e.kind() == std::io::ErrorKind::NotFound || e.kind() == std::io::ErrorKind::Unsupported),
         }
     }
 
@@ -142,10 +136,7 @@ mod tests {
             "wrapped command should use firejail as program"
         );
 
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
 
         let expected_flags = [
             "--private",
@@ -161,10 +152,7 @@ mod tests {
         ];
 
         for flag in &expected_flags {
-            assert!(
-                args.contains(&flag.to_string()),
-                "must include security flag: {flag}"
-            );
+            assert!(args.contains(&flag.to_string()), "must include security flag: {flag}");
         }
     }
 
@@ -176,19 +164,13 @@ mod tests {
         cmd.arg("/workspace");
         sandbox.wrap_command(&mut cmd).unwrap();
 
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
 
         assert!(
             args.contains(&"ls".to_string()),
             "original program must be passed as argument"
         );
-        assert!(
-            args.contains(&"-la".to_string()),
-            "original args must be preserved"
-        );
+        assert!(args.contains(&"-la".to_string()), "original args must be preserved");
         assert!(
             args.contains(&"/workspace".to_string()),
             "original args must be preserved"

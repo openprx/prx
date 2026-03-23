@@ -21,11 +21,7 @@ pub struct CustomTunnel {
 }
 
 impl CustomTunnel {
-    pub fn new(
-        start_command: String,
-        health_url: Option<String>,
-        url_pattern: Option<String>,
-    ) -> Self {
+    pub fn new(start_command: String, health_url: Option<String>, url_pattern: Option<String>) -> Self {
         Self {
             start_command,
             health_url,
@@ -68,33 +64,22 @@ impl Tunnel for CustomTunnel {
                 let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
 
                 while tokio::time::Instant::now() < deadline {
-                    let line = tokio::time::timeout(
-                        tokio::time::Duration::from_secs(3),
-                        reader.next_line(),
-                    )
-                    .await;
+                    let line = tokio::time::timeout(tokio::time::Duration::from_secs(3), reader.next_line()).await;
 
                     match line {
                         Ok(Ok(Some(l))) => {
                             tracing::debug!("custom-tunnel: {l}");
                             // Simple substring match on the pattern
-                            if l.contains(pattern)
-                                || l.contains("https://")
-                                || l.contains("http://")
-                            {
+                            if l.contains(pattern) || l.contains("https://") || l.contains("http://") {
                                 // Extract URL from the line
                                 if let Some(idx) = l.find("https://") {
                                     let url_part = &l[idx..];
-                                    let end = url_part
-                                        .find(|c: char| c.is_whitespace())
-                                        .unwrap_or(url_part.len());
+                                    let end = url_part.find(|c: char| c.is_whitespace()).unwrap_or(url_part.len());
                                     public_url = url_part[..end].to_string();
                                     break;
                                 } else if let Some(idx) = l.find("http://") {
                                     let url_part = &l[idx..];
-                                    let end = url_part
-                                        .find(|c: char| c.is_whitespace())
-                                        .unwrap_or(url_part.len());
+                                    let end = url_part.find(|c: char| c.is_whitespace()).unwrap_or(url_part.len());
                                     public_url = url_part[..end].to_string();
                                     break;
                                 }
@@ -160,12 +145,7 @@ mod tests {
         let result = tunnel.start("127.0.0.1", 8080).await;
 
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("start_command is empty")
-        );
+        assert!(result.unwrap_err().to_string().contains("start_command is empty"));
     }
 
     #[tokio::test]
@@ -174,10 +154,7 @@ mod tests {
 
         let url = tunnel.start("127.0.0.1", 4455).await.unwrap();
         assert_eq!(url, "http://127.0.0.1:4455");
-        assert_eq!(
-            tunnel.public_url().as_deref(),
-            Some("http://127.0.0.1:4455")
-        );
+        assert_eq!(tunnel.public_url().as_deref(), Some("http://127.0.0.1:4455"));
 
         tunnel.stop().await.unwrap();
     }
@@ -193,21 +170,14 @@ mod tests {
         let url = tunnel.start("localhost", 9999).await.unwrap();
 
         assert_eq!(url, "https://public.example");
-        assert_eq!(
-            tunnel.public_url().as_deref(),
-            Some("https://public.example")
-        );
+        assert_eq!(tunnel.public_url().as_deref(), Some("https://public.example"));
 
         tunnel.stop().await.unwrap();
     }
 
     #[tokio::test]
     async fn start_replaces_host_and_port_placeholders() {
-        let tunnel = CustomTunnel::new(
-            "echo http://{host}:{port}".into(),
-            None,
-            Some("http://".into()),
-        );
+        let tunnel = CustomTunnel::new("echo http://{host}:{port}".into(), None, Some("http://".into()));
 
         let url = tunnel.start("10.1.2.3", 4321).await.unwrap();
 
@@ -217,11 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_check_with_unreachable_health_url_returns_false() {
-        let tunnel = CustomTunnel::new(
-            "sleep 1".into(),
-            Some("http://127.0.0.1:9/healthz".into()),
-            None,
-        );
+        let tunnel = CustomTunnel::new("sleep 1".into(), Some("http://127.0.0.1:9/healthz".into()), None);
 
         assert!(!tunnel.health_check().await);
     }

@@ -13,10 +13,7 @@ pub struct MemoryRecallTool {
 
 impl MemoryRecallTool {
     pub fn new(memory: Arc<dyn Memory>, acl_enabled: bool) -> Self {
-        Self {
-            memory,
-            acl_enabled,
-        }
+        Self { memory, acl_enabled }
     }
 }
 
@@ -71,9 +68,7 @@ impl Tool for MemoryRecallTool {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if query.starts_with("router/")
-            && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
-        {
+        if query.starts_with("router/") && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -96,14 +91,8 @@ impl Tool for MemoryRecallTool {
             Ok(entries) => {
                 let mut output = format!("Found {} memories:\n", entries.len());
                 for entry in &entries {
-                    let score = entry
-                        .score
-                        .map_or_else(String::new, |s| format!(" [{s:.0}%]"));
-                    let _ = writeln!(
-                        output,
-                        "- [{}] {}: {}{score}",
-                        entry.category, entry.key, entry.content
-                    );
+                    let score = entry.score.map_or_else(String::new, |s| format!(" [{s:.0}%]"));
+                    let _ = writeln!(output, "- [{}] {}: {}{score}", entry.category, entry.key, entry.content);
                 }
                 Ok(ToolResult {
                     success: true,
@@ -162,21 +151,13 @@ mod tests {
     async fn recall_respects_limit() {
         let (_tmp, mem) = seeded_mem();
         for i in 0..10 {
-            mem.store(
-                &format!("k{i}"),
-                &format!("Rust fact {i}"),
-                MemoryCategory::Core,
-                None,
-            )
-            .await
-            .unwrap();
+            mem.store(&format!("k{i}"), &format!("Rust fact {i}"), MemoryCategory::Core, None)
+                .await
+                .unwrap();
         }
 
         let tool = MemoryRecallTool::new(mem, false);
-        let result = tool
-            .execute(json!({"query": "Rust", "limit": 3}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"query": "Rust", "limit": 3})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("Found 3"));
     }
@@ -216,10 +197,7 @@ mod tests {
     async fn recall_rejects_reserved_router_query_without_self_system_session() {
         let (_tmp, mem) = seeded_mem();
         let tool = MemoryRecallTool::new(mem, false);
-        let result = tool
-            .execute(json!({"query": "router/elo/test"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"query": "router/elo/test"})).await.unwrap();
         assert!(!result.success);
         assert!(
             result

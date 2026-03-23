@@ -106,9 +106,7 @@ impl Tool for TtsTool {
             }
         };
 
-        let voice = args["voice"]
-            .as_str()
-            .unwrap_or("zh-CN-YunxiNeural");
+        let voice = args["voice"].as_str().unwrap_or("zh-CN-YunxiNeural");
 
         // Validate voice name: only allow alphanumeric, hyphens, underscores, spaces,
         // and dots (e.g. "zh-CN-YunxiNeural", "en-US-AriaNeural").
@@ -139,9 +137,7 @@ impl Tool for TtsTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(
-                        "Missing 'target': no recipient specified and no default conversation sender.".into(),
-                    ),
+                    error: Some("Missing 'target': no recipient specified and no default conversation sender.".into()),
                 });
             }
         };
@@ -230,10 +226,7 @@ mod tests {
             self.sent.lock().push(message.content.clone());
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -249,11 +242,7 @@ mod tests {
         })
     }
 
-    fn make_tts(
-        channel: Arc<dyn Channel>,
-        recipient: Option<&str>,
-        level: AutonomyLevel,
-    ) -> TtsTool {
+    fn make_tts(channel: Arc<dyn Channel>, recipient: Option<&str>, level: AutonomyLevel) -> TtsTool {
         let default_recipient = Arc::new(tokio::sync::RwLock::new(recipient.map(String::from)));
         TtsTool::new(channel, default_recipient, test_security(level, 1000))
     }
@@ -349,10 +338,7 @@ mod tests {
     #[tokio::test]
     async fn empty_target_and_no_default_fails() {
         let tool = make_tts(MockChannel::ok(), None, AutonomyLevel::Full);
-        let result = tool
-            .execute(json!({"text": "hello", "target": ""}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"text": "hello", "target": ""})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("target"));
     }
@@ -367,13 +353,7 @@ mod tests {
         let result = tool.execute(json!({"text": "test speech"})).await.unwrap();
         // auto_generate_voice fails → graceful error, not panic
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("TTS generation failed")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("TTS generation failed"));
     }
 
     #[tokio::test]

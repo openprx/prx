@@ -22,9 +22,7 @@ async fn parallel_stores_no_data_loss() {
         handles.push(tokio::spawn(async move {
             let key = format!("agent-{i}");
             let content = format!("result from agent {i}");
-            mem.store(&key, &content, MemoryCategory::Core, None)
-                .await
-                .unwrap();
+            mem.store(&key, &content, MemoryCategory::Core, None).await.unwrap();
         }));
     }
     for h in handles {
@@ -59,10 +57,7 @@ async fn parallel_stores_then_recall_all() {
     }
 
     let results = mem.recall("Rust concurrency", 10, None).await.unwrap();
-    assert!(
-        !results.is_empty(),
-        "recall should find concurrently-stored entries"
-    );
+    assert!(!results.is_empty(), "recall should find concurrently-stored entries");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,25 +105,11 @@ async fn session_scoped_parallel_stores_isolated() {
     assert_eq!(total, 10, "both sessions should have stored 5 entries each");
 
     // Session-scoped list should show only that session's entries
-    let a_entries = mem
-        .list(Some(&MemoryCategory::Core), Some("session-a"))
-        .await
-        .unwrap();
-    assert_eq!(
-        a_entries.len(),
-        5,
-        "session-a should have exactly 5 entries"
-    );
+    let a_entries = mem.list(Some(&MemoryCategory::Core), Some("session-a")).await.unwrap();
+    assert_eq!(a_entries.len(), 5, "session-a should have exactly 5 entries");
 
-    let b_entries = mem
-        .list(Some(&MemoryCategory::Core), Some("session-b"))
-        .await
-        .unwrap();
-    assert_eq!(
-        b_entries.len(),
-        5,
-        "session-b should have exactly 5 entries"
-    );
+    let b_entries = mem.list(Some(&MemoryCategory::Core), Some("session-b")).await.unwrap();
+    assert_eq!(b_entries.len(), 5, "session-b should have exactly 5 entries");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,14 +125,9 @@ async fn concurrent_upserts_on_same_key_converge() {
     for i in 0..10 {
         let mem = mem.clone();
         handles.push(tokio::spawn(async move {
-            mem.store(
-                "shared-key",
-                &format!("value-{i}"),
-                MemoryCategory::Core,
-                None,
-            )
-            .await
-            .unwrap();
+            mem.store("shared-key", &format!("value-{i}"), MemoryCategory::Core, None)
+                .await
+                .unwrap();
         }));
     }
     for h in handles {
@@ -160,10 +136,7 @@ async fn concurrent_upserts_on_same_key_converge() {
 
     // Should still be exactly 1 entry (upsert semantics)
     let count = mem.count().await.unwrap();
-    assert_eq!(
-        count, 1,
-        "concurrent upserts on same key should deduplicate"
-    );
+    assert_eq!(count, 1, "concurrent upserts on same key should deduplicate");
 
     // Content should be one of the values (last writer wins)
     let entry = mem.get("shared-key").await.unwrap().unwrap();
@@ -265,14 +238,9 @@ async fn cross_category_isolation() {
     mem.store("note-1", "meeting at 3pm", MemoryCategory::Daily, None)
         .await
         .unwrap();
-    mem.store(
-        "chat-1",
-        "user said hello",
-        MemoryCategory::Conversation,
-        None,
-    )
-    .await
-    .unwrap();
+    mem.store("chat-1", "user said hello", MemoryCategory::Conversation, None)
+        .await
+        .unwrap();
 
     let core = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
     assert_eq!(core.len(), 1);
@@ -280,10 +248,7 @@ async fn cross_category_isolation() {
     let daily = mem.list(Some(&MemoryCategory::Daily), None).await.unwrap();
     assert_eq!(daily.len(), 1);
 
-    let convo = mem
-        .list(Some(&MemoryCategory::Conversation), None)
-        .await
-        .unwrap();
+    let convo = mem.list(Some(&MemoryCategory::Conversation), None).await.unwrap();
     assert_eq!(convo.len(), 1);
 
     // Total should be 3

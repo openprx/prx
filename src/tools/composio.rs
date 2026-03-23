@@ -24,9 +24,7 @@ const COMPOSIO_TOOL_VERSION_LATEST: &str = "latest";
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
-        anyhow::bail!(
-            "Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https"
-        );
+        anyhow::bail!("Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https");
     }
     Ok(())
 }
@@ -40,11 +38,7 @@ pub struct ComposioTool {
 }
 
 impl ComposioTool {
-    pub fn new(
-        api_key: &str,
-        default_entity_id: Option<&str>,
-        security: Arc<SecurityPolicy>,
-    ) -> Self {
+    pub fn new(api_key: &str, default_entity_id: Option<&str>, security: Arc<SecurityPolicy>) -> Self {
         Self {
             api_key: api_key.to_string(),
             default_entity_id: normalize_entity_id(default_entity_id.unwrap_or("default")),
@@ -65,19 +59,16 @@ impl ComposioTool {
     /// List available Composio apps/actions for the authenticated user.
     ///
     /// Uses v3 endpoint first and falls back to v2 for compatibility.
-    pub async fn list_actions(
-        &self,
-        app_name: Option<&str>,
-    ) -> anyhow::Result<Vec<ComposioAction>> {
+    pub async fn list_actions(&self, app_name: Option<&str>) -> anyhow::Result<Vec<ComposioAction>> {
         match self.list_actions_v3(app_name).await {
             Ok(items) => Ok(items),
             Err(v3_err) => {
                 let v2 = self.list_actions_v2(app_name).await;
                 match v2 {
                     Ok(items) => Ok(items),
-                    Err(v2_err) => anyhow::bail!(
-                        "Composio action listing failed on v3 ({v3_err}) and v2 fallback ({v2_err})"
-                    ),
+                    Err(v2_err) => {
+                        anyhow::bail!("Composio action listing failed on v3 ({v3_err}) and v2 fallback ({v2_err})")
+                    }
                 }
             }
         }
@@ -147,10 +138,7 @@ impl ComposioTool {
             ("statuses", "INITIATED"),
         ]);
 
-        if let Some(app) = app_name
-            .map(normalize_app_slug)
-            .filter(|app| !app.is_empty())
-        {
+        if let Some(app) = app_name.map(normalize_app_slug).filter(|app| !app.is_empty()) {
             req = req.query(&[("toolkit_slugs", app.as_str())]);
         }
 
@@ -188,9 +176,7 @@ impl ComposioTool {
         app_name: Option<&str>,
         entity_id: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
-        let app = app_name
-            .map(normalize_app_slug)
-            .filter(|app| !app.is_empty());
+        let app = app_name.map(normalize_app_slug).filter(|app| !app.is_empty());
         let entity = entity_id.map(normalize_entity_id);
         let (Some(app), Some(entity)) = (app, entity) else {
             return Ok(None);
@@ -200,9 +186,7 @@ impl ComposioTool {
             return Ok(Some(cached));
         }
 
-        let accounts = self
-            .list_connected_accounts(Some(&app), Some(&entity))
-            .await?;
+        let accounts = self.list_connected_accounts(Some(&app), Some(&entity)).await?;
         // The API returns accounts ordered by updated_at DESC, so the first
         // usable account is the most recently active one.  We always pick it
         // rather than giving up when multiple accounts exist — giving up was
@@ -245,12 +229,7 @@ impl ComposioTool {
         };
 
         match self
-            .execute_action_v3(
-                &tool_slug,
-                params.clone(),
-                entity_id,
-                resolved_account_ref.as_deref(),
-            )
+            .execute_action_v3(&tool_slug, params.clone(), entity_id, resolved_account_ref.as_deref())
             .await
         {
             Ok(result) => Ok(result),
@@ -263,10 +242,7 @@ impl ComposioTool {
 
                 let mut v2_errors = Vec::new();
                 for candidate in v2_candidates {
-                    match self
-                        .execute_action_v2(&candidate, params.clone(), entity_id)
-                        .await
-                    {
+                    match self.execute_action_v2(&candidate, params.clone(), entity_id).await {
                         Ok(result) => return Ok(result),
                         Err(v2_err) => v2_errors.push(format!("{candidate}: {v2_err}")),
                     }
@@ -288,10 +264,7 @@ impl ComposioTool {
     fn build_list_actions_v3_query(app_name: Option<&str>) -> Vec<(String, String)> {
         let mut query = vec![
             ("limit".to_string(), "200".to_string()),
-            (
-                "toolkit_versions".to_string(),
-                COMPOSIO_TOOL_VERSION_LATEST.to_string(),
-            ),
+            ("toolkit_versions".to_string(), COMPOSIO_TOOL_VERSION_LATEST.to_string()),
         ];
 
         if let Some(app) = app_name.map(str::trim).filter(|app| !app.is_empty()) {
@@ -336,12 +309,7 @@ impl ComposioTool {
         entity_id: Option<&str>,
         connected_account_ref: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
-        let (url, body) = Self::build_execute_action_v3_request(
-            tool_slug,
-            params,
-            entity_id,
-            connected_account_ref,
-        );
+        let (url, body) = Self::build_execute_action_v3_request(tool_slug, params, entity_id, connected_account_ref);
 
         ensure_https(&url)?;
 
@@ -410,22 +378,16 @@ impl ComposioTool {
         auth_config_id: Option<&str>,
         entity_id: &str,
     ) -> anyhow::Result<ComposioConnectionLink> {
-        let v3 = self
-            .get_connection_url_v3(app_name, auth_config_id, entity_id)
-            .await;
+        let v3 = self.get_connection_url_v3(app_name, auth_config_id, entity_id).await;
         match v3 {
             Ok(url) => Ok(url),
             Err(v3_err) => {
                 let app = app_name.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Composio v3 connect failed ({v3_err}) and v2 fallback requires 'app'"
-                    )
+                    anyhow::anyhow!("Composio v3 connect failed ({v3_err}) and v2 fallback requires 'app'")
                 })?;
                 match self.get_connection_url_v2(app, entity_id).await {
                     Ok(url) => Ok(url),
-                    Err(v2_err) => anyhow::bail!(
-                        "Composio connect failed on v3 ({v3_err}) and v2 fallback ({v2_err})"
-                    ),
+                    Err(v2_err) => anyhow::bail!("Composio connect failed on v3 ({v3_err}) and v2 fallback ({v2_err})"),
                 }
             }
         }
@@ -440,9 +402,8 @@ impl ComposioTool {
         let auth_config_id = match auth_config_id {
             Some(id) => id.to_string(),
             None => {
-                let app = app_name.ok_or_else(|| {
-                    anyhow::anyhow!("Missing 'app' or 'auth_config_id' for v3 connect")
-                })?;
+                let app =
+                    app_name.ok_or_else(|| anyhow::anyhow!("Missing 'app' or 'auth_config_id' for v3 connect"))?;
                 self.resolve_auth_config_id(app).await?
             }
         };
@@ -470,19 +431,15 @@ impl ComposioTool {
             .json()
             .await
             .context("Failed to decode Composio v3 connect response")?;
-        let redirect_url = extract_redirect_url(&result)
-            .ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v3 response"))?;
+        let redirect_url =
+            extract_redirect_url(&result).ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v3 response"))?;
         Ok(ComposioConnectionLink {
             redirect_url,
             connected_account_id: extract_connected_account_id(&result),
         })
     }
 
-    async fn get_connection_url_v2(
-        &self,
-        app_name: &str,
-        entity_id: &str,
-    ) -> anyhow::Result<ComposioConnectionLink> {
+    async fn get_connection_url_v2(&self, app_name: &str, entity_id: &str) -> anyhow::Result<ComposioConnectionLink> {
         let url = format!("{COMPOSIO_API_BASE_V2}/connectedAccounts");
 
         let body = json!({
@@ -507,8 +464,8 @@ impl ComposioTool {
             .json()
             .await
             .context("Failed to decode Composio v2 connect response")?;
-        let redirect_url = extract_redirect_url(&result)
-            .ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v2 response"))?;
+        let redirect_url =
+            extract_redirect_url(&result).ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v2 response"))?;
         Ok(ComposioConnectionLink {
             redirect_url,
             connected_account_id: extract_connected_account_id(&result),
@@ -522,11 +479,7 @@ impl ComposioTool {
             .client()
             .get(&url)
             .header("x-api-key", &self.api_key)
-            .query(&[
-                ("toolkit_slug", app_name),
-                ("show_disabled", "true"),
-                ("limit", "25"),
-            ])
+            .query(&[("toolkit_slug", app_name), ("show_disabled", "true"), ("limit", "25")])
             .send()
             .await?;
 
@@ -541,9 +494,7 @@ impl ComposioTool {
             .context("Failed to decode Composio v3 auth configs response")?;
 
         if body.items.is_empty() {
-            anyhow::bail!(
-                "No auth config found for toolkit '{app_name}'. Create one in Composio first."
-            );
+            anyhow::bail!("No auth config found for toolkit '{app_name}'. Create one in Composio first.");
         }
 
         let preferred = body
@@ -671,9 +622,7 @@ impl Tool for ComposioTool {
                 match self.list_connected_accounts(app, Some(entity_id)).await {
                     Ok(accounts) => {
                         if accounts.is_empty() {
-                            let app_hint = app
-                                .map(|value| format!(" for app '{value}'"))
-                                .unwrap_or_default();
+                            let app_hint = app.map(|value| format!(" for app '{value}'")).unwrap_or_default();
                             return Ok(ToolResult {
                                 success: true,
                                 output: format!(
@@ -731,9 +680,7 @@ impl Tool for ComposioTool {
                     .get("tool_slug")
                     .or_else(|| args.get("action_name"))
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Missing 'action_name' (or 'tool_slug') for execute")
-                    })?;
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'action_name' (or 'tool_slug') for execute"))?;
 
                 let app = args.get("app").and_then(|v| v.as_str());
                 let params = args.get("params").cloned().unwrap_or(json!({}));
@@ -744,8 +691,7 @@ impl Tool for ComposioTool {
                     .await
                 {
                     Ok(result) => {
-                        let output = serde_json::to_string_pretty(&result)
-                            .unwrap_or_else(|_| format!("{result:?}"));
+                        let output = serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}"));
                         Ok(ToolResult {
                             success: true,
                             output,
@@ -779,26 +725,15 @@ impl Tool for ComposioTool {
                     anyhow::bail!("Missing 'app' or 'auth_config_id' for connect");
                 }
 
-                match self
-                    .get_connection_url(app, auth_config_id, entity_id)
-                    .await
-                {
+                match self.get_connection_url(app, auth_config_id, entity_id).await {
                     Ok(link) => {
-                        let target =
-                            app.unwrap_or(auth_config_id.unwrap_or("provided auth config"));
-                        let mut output =
-                            format!("Open this URL to connect {target}:\n{}", link.redirect_url);
+                        let target = app.unwrap_or(auth_config_id.unwrap_or("provided auth config"));
+                        let mut output = format!("Open this URL to connect {target}:\n{}", link.redirect_url);
                         if let Some(connected_account_id) = link.connected_account_id.as_deref() {
                             if let Some(app_name) = app {
-                                self.cache_connected_account(
-                                    app_name,
-                                    entity_id,
-                                    connected_account_id,
-                                );
+                                self.cache_connected_account(app_name, entity_id, connected_account_id);
                             }
-                            output.push_str(&format!(
-                                "\nConnected account ID: {connected_account_id}"
-                            ));
+                            output.push_str(&format!("\nConnected account ID: {connected_account_id}"));
                         }
                         Ok(ToolResult {
                             success: true,
@@ -872,11 +807,7 @@ fn infer_app_slug_from_action_name(action_name: &str) -> Option<String> {
 }
 
 fn connected_account_cache_key(app_name: &str, entity_id: &str) -> String {
-    format!(
-        "{}:{}",
-        normalize_entity_id(entity_id),
-        normalize_app_slug(app_name)
-    )
+    format!("{}:{}", normalize_entity_id(entity_id), normalize_app_slug(app_name))
 }
 
 fn build_connected_account_hint(
@@ -897,9 +828,7 @@ fn build_connected_account_hint(
             " Hint: use action='list_accounts' with app='{app}' and entity_id='{entity}' to retrieve connected_account_id."
         )
     } else {
-        format!(
-            " Hint: use action='list_accounts' with entity_id='{entity}' to retrieve connected_account_id."
-        )
+        format!(" Hint: use action='list_accounts' with entity_id='{entity}' to retrieve connected_account_id.")
     }
 }
 
@@ -966,11 +895,7 @@ async fn response_error(resp: reqwest::Response) -> String {
     }
 
     if let Some(api_error) = extract_api_error_message(&body) {
-        return format!(
-            "HTTP {}: {}",
-            status.as_u16(),
-            sanitize_error_message(&api_error)
-        );
+        return format!("HTTP {}: {}", status.as_u16(), sanitize_error_message(&api_error));
     }
 
     format!("HTTP {}", status.as_u16())
@@ -1008,12 +933,7 @@ fn extract_api_error_message(body: &str) -> Option<String> {
         .and_then(|v| v.get("message"))
         .and_then(|v| v.as_str())
         .map(ToString::to_string)
-        .or_else(|| {
-            parsed
-                .get("message")
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string)
-        })
+        .or_else(|| parsed.get("message").and_then(|v| v.as_str()).map(ToString::to_string))
 }
 
 // ── API response types ──────────────────────────────────────────
@@ -1053,9 +973,7 @@ impl ComposioConnectedAccount {
     }
 
     fn toolkit_slug(&self) -> Option<&str> {
-        self.toolkit
-            .as_ref()
-            .and_then(|toolkit| toolkit.slug.as_deref())
+        self.toolkit.as_ref().and_then(|toolkit| toolkit.slug.as_deref())
     }
 }
 
@@ -1222,13 +1140,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("read-only mode")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only mode"));
     }
 
     #[tokio::test]
@@ -1246,20 +1158,15 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Rate limit exceeded")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit exceeded"));
     }
 
     // ── API response parsing ──────────────────────────────────
 
     #[test]
     fn composio_action_deserializes() {
-        let json_str = r#"{"name": "GMAIL_FETCH_EMAILS", "appName": "gmail", "description": "Fetch emails", "enabled": true}"#;
+        let json_str =
+            r#"{"name": "GMAIL_FETCH_EMAILS", "appName": "gmail", "description": "Fetch emails", "enabled": true}"#;
         let action: ComposioAction = serde_json::from_str(json_str).unwrap();
         assert_eq!(action.name, "GMAIL_FETCH_EMAILS");
         assert_eq!(action.app_name.as_deref(), Some("gmail"));
@@ -1268,7 +1175,8 @@ mod tests {
 
     #[test]
     fn composio_actions_response_deserializes() {
-        let json_str = r#"{"items": [{"name": "TEST_ACTION", "appName": "test", "description": "A test", "enabled": true}]}"#;
+        let json_str =
+            r#"{"items": [{"name": "TEST_ACTION", "appName": "test", "description": "A test", "enabled": true}]}"#;
         let resp: ComposioActionsResponse = serde_json::from_str(json_str).unwrap();
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].name, "TEST_ACTION");
@@ -1305,10 +1213,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].name, "gmail-fetch-emails");
         assert_eq!(actions[0].app_name.as_deref(), Some("gmail"));
-        assert_eq!(
-            actions[0].description.as_deref(),
-            Some("Fetch inbox emails")
-        );
+        assert_eq!(actions[0].description.as_deref(), Some("Fetch inbox emails"));
     }
 
     #[test]
@@ -1319,26 +1224,14 @@ mod tests {
 
     #[test]
     fn normalize_tool_slug_supports_legacy_action_name() {
-        assert_eq!(
-            normalize_tool_slug("GMAIL_FETCH_EMAILS"),
-            "gmail-fetch-emails"
-        );
-        assert_eq!(
-            normalize_tool_slug(" github-list-repos "),
-            "github-list-repos"
-        );
+        assert_eq!(normalize_tool_slug("GMAIL_FETCH_EMAILS"), "gmail-fetch-emails");
+        assert_eq!(normalize_tool_slug(" github-list-repos "), "github-list-repos");
     }
 
     #[test]
     fn normalize_legacy_action_name_supports_v3_slug_input() {
-        assert_eq!(
-            normalize_legacy_action_name("gmail-fetch-emails"),
-            "GMAIL_FETCH_EMAILS"
-        );
-        assert_eq!(
-            normalize_legacy_action_name(" GITHUB_LIST_REPOS "),
-            "GITHUB_LIST_REPOS"
-        );
+        assert_eq!(normalize_legacy_action_name("gmail-fetch-emails"), "GMAIL_FETCH_EMAILS");
+        assert_eq!(normalize_legacy_action_name(" GITHUB_LIST_REPOS "), "GITHUB_LIST_REPOS");
     }
 
     #[test]
@@ -1362,10 +1255,7 @@ mod tests {
 
     #[test]
     fn connected_account_cache_key_is_stable() {
-        assert_eq!(
-            connected_account_cache_key("GMAIL", " default "),
-            "default:gmail"
-        );
+        assert_eq!(connected_account_cache_key("GMAIL", " default "), "default:gmail");
     }
 
     #[test]
@@ -1402,18 +1292,9 @@ mod tests {
         let camel = json!({"connectedAccountId": "ca_camel"});
         let nested = json!({"data": {"connected_account_id": "ca_nested"}});
 
-        assert_eq!(
-            extract_connected_account_id(&root).as_deref(),
-            Some("ca_root")
-        );
-        assert_eq!(
-            extract_connected_account_id(&camel).as_deref(),
-            Some("ca_camel")
-        );
-        assert_eq!(
-            extract_connected_account_id(&nested).as_deref(),
-            Some("ca_nested")
-        );
+        assert_eq!(extract_connected_account_id(&root).as_deref(), Some("ca_root"));
+        assert_eq!(extract_connected_account_id(&camel).as_deref(), Some("ca_camel"));
+        assert_eq!(extract_connected_account_id(&nested).as_deref(), Some("ca_nested"));
     }
 
     #[test]
@@ -1458,21 +1339,14 @@ mod tests {
         let nested = r#"{"error":{"message":"tool not found"}}"#;
         let flat = r#"{"message":"invalid api key"}"#;
 
-        assert_eq!(
-            extract_api_error_message(nested).as_deref(),
-            Some("tool not found")
-        );
-        assert_eq!(
-            extract_api_error_message(flat).as_deref(),
-            Some("invalid api key")
-        );
+        assert_eq!(extract_api_error_message(nested).as_deref(), Some("tool not found"));
+        assert_eq!(extract_api_error_message(flat).as_deref(), Some("invalid api key"));
         assert_eq!(extract_api_error_message("not-json"), None);
     }
 
     #[test]
     fn composio_action_with_null_fields() {
-        let json_str =
-            r#"{"name": "TEST_ACTION", "appName": null, "description": null, "enabled": false}"#;
+        let json_str = r#"{"name": "TEST_ACTION", "appName": null, "description": null, "enabled": false}"#;
         let action: ComposioAction = serde_json::from_str(json_str).unwrap();
         assert_eq!(action.name, "TEST_ACTION");
         assert!(action.app_name.is_none());
@@ -1644,14 +1518,8 @@ mod tests {
         // Both spellings should reach the same handler and return the same
         // shape of error (network failure in test, not a dispatch error).
         let tool = ComposioTool::new("test-key", None, test_security());
-        let r1 = tool
-            .execute(json!({"action": "list_accounts"}))
-            .await
-            .unwrap();
-        let r2 = tool
-            .execute(json!({"action": "connected_accounts"}))
-            .await
-            .unwrap();
+        let r1 = tool.execute(json!({"action": "list_accounts"})).await.unwrap();
+        let r2 = tool.execute(json!({"action": "connected_accounts"})).await.unwrap();
         // Both fail the same way (network) — neither is a dispatch error.
         assert!(!r1.success);
         assert!(!r2.success);
@@ -1683,12 +1551,8 @@ mod tests {
 
     #[test]
     fn build_execute_action_v3_request_drops_blank_optional_fields() {
-        let (url, body) = ComposioTool::build_execute_action_v3_request(
-            "github-list-repos",
-            json!({}),
-            None,
-            Some("   "),
-        );
+        let (url, body) =
+            ComposioTool::build_execute_action_v3_request("github-list-repos", json!({}), None, Some("   "));
 
         assert_eq!(
             url,

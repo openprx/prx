@@ -15,11 +15,7 @@ pub struct HeartbeatEngine {
 }
 
 impl HeartbeatEngine {
-    pub fn new(
-        config: HeartbeatConfig,
-        workspace_dir: std::path::PathBuf,
-        observer: Arc<dyn Observer>,
-    ) -> Self {
+    pub fn new(config: HeartbeatConfig, workspace_dir: std::path::PathBuf, observer: Arc<dyn Observer>) -> Self {
         Self {
             config,
             workspace_dir,
@@ -202,7 +198,8 @@ mod tests {
 
     #[test]
     fn parse_tasks_mixed_markdown() {
-        let content = "# Periodic Tasks\n\n## Quick\n- Task A\n\n## Long\n- Task B\n\n* Not a dash bullet\n1. Not numbered";
+        let content =
+            "# Periodic Tasks\n\n## Quick\n- Task A\n\n## Long\n- Task B\n\n* Not a dash bullet\n1. Not numbered";
         let tasks = HeartbeatEngine::parse_tasks(content);
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0], "Task A");

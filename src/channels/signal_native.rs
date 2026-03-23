@@ -118,10 +118,7 @@ impl SignalNativeChannel {
                 .send()
                 .await;
             if result.is_ok() {
-                tracing::info!(
-                    "Signal native: daemon ready after {}ms",
-                    (attempt + 1) * poll_ms
-                );
+                tracing::info!("Signal native: daemon ready after {}ms", (attempt + 1) * poll_ms);
                 return Ok(());
             }
         }
@@ -227,18 +224,9 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
-        assert!(
-            args.contains(&"+15551234567".to_string()),
-            "should have account"
-        );
-        assert!(
-            args.contains(&"127.0.0.1:19876".to_string()),
-            "should have host:port"
-        );
-        assert!(
-            args.contains(&"daemon".to_string()),
-            "should have daemon subcommand"
-        );
+        assert!(args.contains(&"+15551234567".to_string()), "should have account");
+        assert!(args.contains(&"127.0.0.1:19876".to_string()), "should have host:port");
+        assert!(args.contains(&"daemon".to_string()), "should have daemon subcommand");
         assert!(args.contains(&"--no-receive-stdout".to_string()));
     }
 
@@ -300,15 +288,12 @@ impl Channel for SignalNativeChannel {
     /// the inner SSE listener.  The daemon process is automatically killed when
     /// this function returns (because the `Child` guard goes out of scope).
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
-        tracing::info!(
-            "Signal native: spawning signal-cli daemon on port {}",
-            self.http_port
-        );
+        tracing::info!("Signal native: spawning signal-cli daemon on port {}", self.http_port);
 
         let mut cmd = self.build_command();
-        let _child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("Failed to spawn signal-cli at '{}': {e}", self.cli_path)
-        })?;
+        let _child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn signal-cli at '{}': {e}", self.cli_path))?;
 
         self.wait_for_ready().await?;
         tracing::info!(
@@ -366,14 +351,7 @@ impl Channel for SignalNativeChannel {
     }
 
     /// Send a thread reply (degrades to quote reply in Signal) via the inner channel.
-    async fn send_thread_reply(
-        &self,
-        channel_id: &str,
-        thread_id: &str,
-        message: &str,
-    ) -> Result<()> {
-        self.inner
-            .send_thread_reply(channel_id, thread_id, message)
-            .await
+    async fn send_thread_reply(&self, channel_id: &str, thread_id: &str, message: &str) -> Result<()> {
+        self.inner.send_thread_reply(channel_id, thread_id, message).await
     }
 }

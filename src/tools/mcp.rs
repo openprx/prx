@@ -23,8 +23,8 @@ const MCP_ROOT_NAME: &str = "mcp_call";
 /// the global `config.toml`. These are common MCP server launchers.
 static ALLOWED_MCP_COMMANDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     HashSet::from([
-        "npx", "node", "python", "python3", "uvx", "uv", "deno", "bun",
-        "docker", "cargo", "go", "ruby", "php", "dotnet", "java",
+        "npx", "node", "python", "python3", "uvx", "uv", "deno", "bun", "docker", "cargo", "go", "ruby", "php",
+        "dotnet", "java",
     ])
 });
 
@@ -123,11 +123,7 @@ pub struct McpTool {
 }
 
 impl McpTool {
-    pub fn new(
-        security: Arc<SecurityPolicy>,
-        base_config: McpConfig,
-        workspace_dir: PathBuf,
-    ) -> Self {
+    pub fn new(security: Arc<SecurityPolicy>, base_config: McpConfig, workspace_dir: PathBuf) -> Self {
         let state = RuntimeState {
             effective_config: base_config.clone(),
             mcp_json_mtime: None,
@@ -185,9 +181,7 @@ impl McpTool {
     fn validate_http_url(url: &str) -> anyhow::Result<()> {
         let host = super::http_request::extract_host(url)?;
         if super::http_request::is_private_or_local_host(&host) {
-            bail!(
-                "SSRF blocked: MCP HTTP URL resolves to a private/local address (host: {host})"
-            );
+            bail!("SSRF blocked: MCP HTTP URL resolves to a private/local address (host: {host})");
         }
         Ok(())
     }
@@ -435,11 +429,7 @@ impl McpTool {
             })
             .unwrap_or_default();
 
-        let output = if content.is_empty() {
-            value.to_string()
-        } else {
-            content
-        };
+        let output = if content.is_empty() { value.to_string() } else { content };
 
         (!is_error, output)
     }
@@ -453,9 +443,7 @@ impl McpTool {
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("MCP server '{server_name}' uses stdio but command is missing")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("MCP server '{server_name}' uses stdio but command is missing"))?;
 
         let mut cmd = Command::new(command);
         cmd.args(&server.args);
@@ -467,12 +455,7 @@ impl McpTool {
         let transport = TokioChildProcess::new(cmd)?;
         let client = tokio::time::timeout(startup_timeout, ().serve(transport))
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "MCP startup timed out after {} ms",
-                    server.startup_timeout_ms
-                )
-            })??;
+            .map_err(|_| anyhow::anyhow!("MCP startup timed out after {} ms", server.startup_timeout_ms))??;
 
         let list = client.peer().list_all_tools().await?;
         let _ = client.cancel().await;
@@ -500,9 +483,7 @@ impl McpTool {
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("MCP server '{server_name}' uses http but url is missing")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("MCP server '{server_name}' uses http but url is missing"))?;
 
         // ── SSRF protection: block private/local addresses ──
         Self::validate_http_url(url)?;
@@ -511,12 +492,7 @@ impl McpTool {
         let transport = StreamableHttpClientTransport::from_uri(url);
         let client = tokio::time::timeout(startup_timeout, ().serve(transport))
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "MCP startup timed out after {} ms",
-                    server.startup_timeout_ms
-                )
-            })??;
+            .map_err(|_| anyhow::anyhow!("MCP startup timed out after {} ms", server.startup_timeout_ms))??;
 
         let list = client.peer().list_all_tools().await?;
         let _ = client.cancel().await;
@@ -556,16 +532,12 @@ impl McpTool {
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("MCP server '{server_name}' uses stdio but command is missing")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("MCP server '{server_name}' uses stdio but command is missing"))?;
 
         {
-            let redacted_args = arguments.as_ref().map(|a| {
-                crate::agent::loop_::redact_sensitive_json_keys(&serde_json::Value::Object(
-                    a.clone(),
-                ))
-            });
+            let redacted_args = arguments
+                .as_ref()
+                .map(|a| crate::agent::loop_::redact_sensitive_json_keys(&serde_json::Value::Object(a.clone())));
             tracing::debug!(
                 server = server_name,
                 tool = tool_name,
@@ -585,12 +557,7 @@ impl McpTool {
         let transport = TokioChildProcess::new(cmd)?;
         let client = tokio::time::timeout(startup_timeout, ().serve(transport))
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "MCP startup timed out after {} ms",
-                    server.startup_timeout_ms
-                )
-            })??;
+            .map_err(|_| anyhow::anyhow!("MCP startup timed out after {} ms", server.startup_timeout_ms))??;
 
         let result = tokio::time::timeout(
             request_timeout,
@@ -602,9 +569,7 @@ impl McpTool {
             }),
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("MCP call timed out after {} ms", server.request_timeout_ms)
-        })?;
+        .map_err(|_| anyhow::anyhow!("MCP call timed out after {} ms", server.request_timeout_ms))?;
 
         let _ = client.cancel().await;
 
@@ -632,9 +597,7 @@ impl McpTool {
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("MCP server '{server_name}' uses http but url is missing")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("MCP server '{server_name}' uses http but url is missing"))?;
 
         // ── SSRF protection: block private/local addresses ──
         Self::validate_http_url(url)?;
@@ -644,12 +607,7 @@ impl McpTool {
         let transport = StreamableHttpClientTransport::from_uri(url);
         let client = tokio::time::timeout(startup_timeout, ().serve(transport))
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "MCP startup timed out after {} ms",
-                    server.startup_timeout_ms
-                )
-            })??;
+            .map_err(|_| anyhow::anyhow!("MCP startup timed out after {} ms", server.startup_timeout_ms))??;
 
         let result = tokio::time::timeout(
             request_timeout,
@@ -661,9 +619,7 @@ impl McpTool {
             }),
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("MCP call timed out after {} ms", server.request_timeout_ms)
-        })??;
+        .map_err(|_| anyhow::anyhow!("MCP call timed out after {} ms", server.request_timeout_ms))??;
 
         let _ = client.cancel().await;
         let value = serde_json::to_value(result)?;
@@ -735,40 +691,24 @@ impl McpTool {
             let state = self.state.read();
             (
                 state.effective_config.clone(),
-                state
-                    .discovered_tools
-                    .get(&server_name)
-                    .cloned()
-                    .unwrap_or_default(),
+                state.discovered_tools.get(&server_name).cloned().unwrap_or_default(),
             )
         };
 
         let server = Self::resolve_server(&effective_config, &server_name)?;
 
         if !Self::tool_allowed(server, &tool_name) {
-            bail!(
-                "Tool '{tool_name}' is blocked by allow/deny rules for MCP server '{server_name}'"
-            );
+            bail!("Tool '{tool_name}' is blocked by allow/deny rules for MCP server '{server_name}'");
         }
 
         if !discovered_for_server.is_empty() && !discovered_for_server.contains_key(&tool_name) {
-            let available = discovered_for_server
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "Tool '{tool_name}' not found on MCP server '{server_name}'. Available: [{available}]"
-            );
+            let available = discovered_for_server.keys().cloned().collect::<Vec<_>>().join(", ");
+            bail!("Tool '{tool_name}' not found on MCP server '{server_name}'. Available: [{available}]");
         }
 
         match server.transport {
-            McpTransport::Stdio => {
-                Self::call_stdio(&server_name, server, &tool_name, arguments).await
-            }
-            McpTransport::Http => {
-                Self::call_http(&server_name, server, &tool_name, arguments).await
-            }
+            McpTransport::Stdio => Self::call_stdio(&server_name, server, &tool_name, arguments).await,
+            McpTransport::Http => Self::call_http(&server_name, server, &tool_name, arguments).await,
         }
     }
 }
@@ -849,9 +789,10 @@ impl Tool for McpTool {
                 let alias = Self::alias_name(&server_cfg.tool_name_prefix, server_name, tool_name);
                 specs.push(ToolSpec {
                     name: alias,
-                    description: meta.description.clone().unwrap_or_else(|| {
-                        format!("MCP tool '{}' from server '{}'", tool_name, server_name)
-                    }),
+                    description: meta
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| format!("MCP tool '{}' from server '{}'", tool_name, server_name)),
                     parameters: meta
                         .input_schema
                         .clone()
@@ -881,11 +822,7 @@ impl Tool for McpTool {
         self.execute_named(MCP_ROOT_NAME, args).await
     }
 
-    async fn execute_named(
-        &self,
-        name: &str,
-        args: serde_json::Value,
-    ) -> anyhow::Result<ToolResult> {
+    async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
@@ -915,10 +852,7 @@ impl Tool for McpTool {
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("Missing 'tool' parameter"))?
                 .to_string();
-            let arguments = args
-                .get("arguments")
-                .and_then(serde_json::Value::as_object)
-                .cloned();
+            let arguments = args.get("arguments").and_then(serde_json::Value::as_object).cloned();
             (server_name, tool_name, arguments)
         } else {
             let state = self.state.read();
@@ -926,15 +860,14 @@ impl Tool for McpTool {
                 .ok_or_else(|| anyhow::anyhow!("Unknown MCP alias tool '{name}'"))?;
             drop(state);
 
-            let arguments = args.as_object().cloned().ok_or_else(|| {
-                anyhow::anyhow!("MCP alias tool '{name}' expects object arguments")
-            })?;
+            let arguments = args
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("MCP alias tool '{name}' expects object arguments"))?;
             (server_name, tool_name, Some(arguments))
         };
 
-        let call_result = self
-            .validate_and_call(server_name, tool_name, arguments)
-            .await;
+        let call_result = self.validate_and_call(server_name, tool_name, arguments).await;
 
         match call_result {
             Ok((success, output)) => Ok(ToolResult {
@@ -985,10 +918,7 @@ mod tests {
             deny_tools: vec!["tool1".into()],
             ..McpServerConfig::default()
         };
-        assert!(
-            !McpTool::tool_allowed(&cfg, "tool1"),
-            "deny should override allow"
-        );
+        assert!(!McpTool::tool_allowed(&cfg, "tool1"), "deny should override allow");
     }
 
     // ── convert_json_server ─────────────────────────────────────
@@ -1097,10 +1027,7 @@ mod tests {
 
     #[test]
     fn alias_name_format() {
-        assert_eq!(
-            McpTool::alias_name("mcp", "server1", "search"),
-            "mcp__server1__search"
-        );
+        assert_eq!(McpTool::alias_name("mcp", "server1", "search"), "mcp__server1__search");
     }
 
     // ── extract_call_success_and_output ──────────────────────────
@@ -1216,10 +1143,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let tool = McpTool::new(security, McpConfig::default(), std::env::temp_dir());
-        let result = tool
-            .execute(json!({"server": "s", "tool": "t"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"server": "s", "tool": "t"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
     }
@@ -1230,15 +1154,8 @@ mod tests {
     async fn mcp_disabled_returns_error() {
         let mut cfg = McpConfig::default();
         cfg.enabled = false;
-        let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
-            cfg,
-            std::env::temp_dir(),
-        );
-        let result = tool
-            .execute(json!({"server": "s", "tool": "t"}))
-            .await
-            .unwrap();
+        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), cfg, std::env::temp_dir());
+        let result = tool.execute(json!({"server": "s", "tool": "t"})).await.unwrap();
         assert!(!result.success);
         assert!(
             result
@@ -1314,11 +1231,7 @@ mod tests {
                 ..McpServerConfig::default()
             },
         );
-        let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
-            base,
-            std::env::temp_dir(),
-        );
+        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), base, std::env::temp_dir());
         // Same server name AND same command => allowed
         assert!(tool.is_command_allowed("trusted-server", "my-custom-binary"));
         // Same server name but DIFFERENT command => blocked (prevents override attack)
@@ -1399,25 +1312,15 @@ mod tests {
         )
         .expect("test: write mcp.json");
 
-        let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
-            McpConfig::default(),
-            dir.clone(),
-        );
+        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), McpConfig::default(), dir.clone());
 
         let result = tool.load_effective_config_from_json();
         let cfg = result.expect("test: load config").expect("test: some config");
 
         // "evil" server should be blocked
-        assert!(
-            !cfg.servers.contains_key("evil"),
-            "malicious server should be rejected"
-        );
+        assert!(!cfg.servers.contains_key("evil"), "malicious server should be rejected");
         // "legit" server should be kept
-        assert!(
-            cfg.servers.contains_key("legit"),
-            "legitimate server should be kept"
-        );
+        assert!(cfg.servers.contains_key("legit"), "legitimate server should be kept");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1445,11 +1348,7 @@ mod tests {
         )
         .expect("test: write mcp.json");
 
-        let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
-            McpConfig::default(),
-            dir.clone(),
-        );
+        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), McpConfig::default(), dir.clone());
 
         let cfg = tool
             .load_effective_config_from_json()
@@ -1459,10 +1358,7 @@ mod tests {
         let server = cfg.servers.get("myserver").expect("test: server present");
         assert!(!server.env.contains_key("LD_PRELOAD"));
         assert!(!server.env.contains_key("NODE_OPTIONS"));
-        assert_eq!(
-            server.env.get("API_KEY").map(String::as_str),
-            Some("safe-value")
-        );
+        assert_eq!(server.env.get("API_KEY").map(String::as_str), Some("safe-value"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1532,11 +1428,7 @@ mod tests {
         )
         .expect("test: write mcp.json");
 
-        let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
-            McpConfig::default(),
-            dir.clone(),
-        );
+        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), McpConfig::default(), dir.clone());
 
         let cfg = tool
             .load_effective_config_from_json()
@@ -1549,10 +1441,7 @@ mod tests {
             "SSRF: private IP HTTP server should be rejected"
         );
         // "public" server should be kept
-        assert!(
-            cfg.servers.contains_key("public"),
-            "public HTTP server should be kept"
-        );
+        assert!(cfg.servers.contains_key("public"), "public HTTP server should be kept");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1593,21 +1482,14 @@ mod tests {
             },
         );
 
-        let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
-            base,
-            dir.clone(),
-        );
+        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), base, dir.clone());
 
         let cfg = tool
             .load_effective_config_from_json()
             .expect("test: load config")
             .expect("test: some config");
 
-        let server = cfg
-            .servers
-            .get("my-mcp")
-            .expect("test: server should exist");
+        let server = cfg.servers.get("my-mcp").expect("test: server should exist");
         // Command must be pinned to base_config value
         assert_eq!(
             server.command.as_deref(),
@@ -1650,21 +1532,14 @@ mod tests {
             },
         );
 
-        let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
-            base,
-            dir.clone(),
-        );
+        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), base, dir.clone());
 
         let cfg = tool
             .load_effective_config_from_json()
             .expect("test: load config")
             .expect("test: some config");
 
-        let server = cfg
-            .servers
-            .get("my-mcp")
-            .expect("test: server should exist");
+        let server = cfg.servers.get("my-mcp").expect("test: server should exist");
         assert_eq!(server.command.as_deref(), Some("node"));
         assert_eq!(server.args, vec!["--custom-arg"]);
 
@@ -1737,11 +1612,7 @@ mod tests {
             },
         );
 
-        let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
-            base,
-            std::env::temp_dir(),
-        );
+        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), base, std::env::temp_dir());
 
         // Exact match with base_config command → allowed
         assert!(tool.is_command_allowed("custom-server", "/opt/custom/my-tool"));

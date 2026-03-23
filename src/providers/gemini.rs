@@ -141,8 +141,7 @@ impl GenerateContentResponse {
     fn into_effective_response(self) -> Self {
         match self {
             Self {
-                response: Some(inner),
-                ..
+                response: Some(inner), ..
             } => *inner,
             other => other,
         }
@@ -183,9 +182,7 @@ impl GeminiProvider {
             .or_else(|| Self::load_non_empty_env("GOOGLE_API_KEY").map(GeminiAuth::EnvGoogleKey))
             .or_else(|| Self::try_load_gemini_cli_token().map(GeminiAuth::OAuthToken));
 
-        Self {
-            auth: resolved_auth,
-        }
+        Self { auth: resolved_auth }
     }
 
     fn normalize_non_empty(value: &str) -> Option<String> {
@@ -226,9 +223,7 @@ impl GeminiProvider {
             }
         }
 
-        creds
-            .access_token
-            .and_then(|token| Self::normalize_non_empty(&token))
+        creds.access_token.and_then(|token| Self::normalize_non_empty(&token))
     }
 
     /// Get the Gemini CLI config directory (~/.gemini)
@@ -332,10 +327,7 @@ impl GeminiProvider {
                         generation_config: request.generation_config.clone(),
                     },
                 };
-                self.http_client()
-                    .post(url)
-                    .json(&internal_request)
-                    .bearer_auth(token)
+                self.http_client().post(url).json(&internal_request).bearer_auth(token)
             }
             _ => req,
         }
@@ -418,9 +410,7 @@ impl Provider for GeminiProvider {
     ) -> anyhow::Result<String> {
         let system_instruction = system_prompt.map(|sys| Content {
             role: None,
-            parts: vec![Part {
-                text: sys.to_string(),
-            }],
+            parts: vec![Part { text: sys.to_string() }],
         });
 
         let contents = vec![Content {
@@ -501,11 +491,7 @@ impl Provider for GeminiProvider {
                 "https://generativelanguage.googleapis.com/v1beta/models".to_string()
             };
 
-            self.http_client()
-                .get(&url)
-                .send()
-                .await?
-                .error_for_status()?;
+            self.http_client().get(&url).send().await?.error_for_status()?;
         }
         Ok(())
     }
@@ -518,10 +504,7 @@ mod tests {
 
     #[test]
     fn normalize_non_empty_trims_and_filters() {
-        assert_eq!(
-            GeminiProvider::normalize_non_empty(" value "),
-            Some("value".into())
-        );
+        assert_eq!(GeminiProvider::normalize_non_empty(" value "), Some("value".into()));
         assert_eq!(GeminiProvider::normalize_non_empty(""), None);
         assert_eq!(GeminiProvider::normalize_non_empty(" \t\n"), None);
     }
@@ -635,9 +618,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part {
-                    text: "hello".into(),
-                }],
+                parts: vec![Part { text: "hello".into() }],
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
@@ -652,10 +633,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            request
-                .headers()
-                .get(AUTHORIZATION)
-                .and_then(|h| h.to_str().ok()),
+            request.headers().get(AUTHORIZATION).and_then(|h| h.to_str().ok()),
             Some("Bearer ya29.mock-token")
         );
     }
@@ -670,9 +648,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part {
-                    text: "hello".into(),
-                }],
+                parts: vec![Part { text: "hello".into() }],
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
@@ -708,9 +684,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part {
-                    text: "hello".into(),
-                }],
+                parts: vec![Part { text: "hello".into() }],
             }],
             system_instruction: None,
             generation_config: GenerationConfig {

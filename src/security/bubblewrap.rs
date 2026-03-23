@@ -35,10 +35,7 @@ impl BubblewrapSandbox {
 impl Sandbox for BubblewrapSandbox {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
         let program = cmd.get_program().to_string_lossy().to_string();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
 
         let mut bwrap_cmd = Command::new("bwrap");
         bwrap_cmd.args([
@@ -111,10 +108,7 @@ mod tests {
             "wrapped command should use bwrap as program"
         );
 
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
 
         assert!(
             args.contains(&"--unshare-all".to_string()),
@@ -138,23 +132,14 @@ mod tests {
         cmd.arg("/tmp");
         sandbox.wrap_command(&mut cmd).unwrap();
 
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
 
         assert!(
             args.contains(&"ls".to_string()),
             "original program must be passed as argument"
         );
-        assert!(
-            args.contains(&"-la".to_string()),
-            "original args must be preserved"
-        );
-        assert!(
-            args.contains(&"/tmp".to_string()),
-            "original args must be preserved"
-        );
+        assert!(args.contains(&"-la".to_string()), "original args must be preserved");
+        assert!(args.contains(&"/tmp".to_string()), "original args must be preserved");
     }
 
     #[test]
@@ -163,22 +148,13 @@ mod tests {
         let mut cmd = Command::new("echo");
         sandbox.wrap_command(&mut cmd).unwrap();
 
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
 
         assert!(
             args.contains(&"--ro-bind".to_string()),
             "must include read-only bind for /usr"
         );
-        assert!(
-            args.contains(&"--dev".to_string()),
-            "must include /dev mount"
-        );
-        assert!(
-            args.contains(&"--proc".to_string()),
-            "must include /proc mount"
-        );
+        assert!(args.contains(&"--dev".to_string()), "must include /dev mount");
+        assert!(args.contains(&"--proc".to_string()), "must include /proc mount");
     }
 }

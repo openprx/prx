@@ -21,9 +21,7 @@ impl CronRemoveTool {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
+                error: Some(format!("Security policy: read-only mode, cannot perform '{action}'")),
             });
         }
 
@@ -120,17 +118,12 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         new_shared(config)
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ))
+        Arc::new(SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir))
     }
 
     #[tokio::test]
@@ -155,12 +148,7 @@ mod tests {
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("Missing 'job_id'")
-        );
+        assert!(result.error.unwrap_or_default().contains("Missing 'job_id'"));
     }
 
     #[tokio::test]

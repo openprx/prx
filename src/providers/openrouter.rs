@@ -1,6 +1,6 @@
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
+    ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -143,9 +143,7 @@ impl OpenRouterProvider {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
                         if let Some(tool_calls_value) = value.get("tool_calls") {
                             if let Ok(parsed_calls) =
-                                serde_json::from_value::<Vec<ProviderToolCall>>(
-                                    tool_calls_value.clone(),
-                                )
+                                serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
                             {
                                 let tool_calls = parsed_calls
                                     .into_iter()
@@ -261,9 +259,7 @@ impl Provider for OpenRouterProvider {
         temperature: f64,
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var."
-            )
+            anyhow::anyhow!("OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var.")
         })?;
 
         let mut messages = Vec::new();
@@ -317,9 +313,7 @@ impl Provider for OpenRouterProvider {
         temperature: f64,
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var."
-            )
+            anyhow::anyhow!("OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var.")
         })?;
 
         let api_messages: Vec<Message> = messages
@@ -367,9 +361,7 @@ impl Provider for OpenRouterProvider {
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var."
-            )
+            anyhow::anyhow!("OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var.")
         })?;
 
         let tools = Self::convert_tools(request.tools);
@@ -417,9 +409,7 @@ impl Provider for OpenRouterProvider {
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var."
-            )
+            anyhow::anyhow!("OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var.")
         })?;
 
         // Convert tool JSON values to NativeToolSpec
@@ -439,10 +429,7 @@ impl Provider for OpenRouterProvider {
                                 .and_then(|d| d.as_str())
                                 .unwrap_or("")
                                 .to_string(),
-                            parameters: func
-                                .get("parameters")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({})),
+                            parameters: func.get("parameters").cloned().unwrap_or(serde_json::json!({})),
                         },
                     })
                 })
@@ -495,10 +482,7 @@ mod tests {
     #[test]
     fn creates_with_key() {
         let provider = OpenRouterProvider::new(Some("openrouter-test-credential"));
-        assert_eq!(
-            provider.credential.as_deref(),
-            Some("openrouter-test-credential")
-        );
+        assert_eq!(provider.credential.as_deref(), Some("openrouter-test-credential"));
     }
 
     #[test]

@@ -86,9 +86,7 @@ impl WasmMiddleware {
         let instance = linker
             .instantiate_async(&mut store, component)
             .await
-            .map_err(|e| {
-                PluginError::Instantiation(format!("failed to instantiate middleware: {e}"))
-            })?;
+            .map_err(|e| PluginError::Instantiation(format!("failed to instantiate middleware: {e}")))?;
 
         Ok(Self {
             plugin_name: manifest.plugin.name.clone(),
@@ -105,22 +103,14 @@ impl WasmMiddleware {
 
         // Navigate to the exported interface: prx:plugin/middleware-exports@0.1.0
         let iface_idx = instance
-            .get_export_index(
-                store.as_context_mut(),
-                None,
-                "prx:plugin/middleware-exports@0.1.0",
-            )
+            .get_export_index(store.as_context_mut(), None, "prx:plugin/middleware-exports@0.1.0")
             .ok_or_else(|| {
-                PluginError::Runtime(
-                    "plugin does not export prx:plugin/middleware-exports@0.1.0".to_string(),
-                )
+                PluginError::Runtime("plugin does not export prx:plugin/middleware-exports@0.1.0".to_string())
             })?;
 
         let func_idx = instance
             .get_export_index(store.as_context_mut(), Some(&iface_idx), "process")
-            .ok_or_else(|| {
-                PluginError::Runtime("process not found in middleware-exports".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Runtime("process not found in middleware-exports".to_string()))?;
 
         let func = instance
             .get_func(store.as_context_mut(), &func_idx)
@@ -175,9 +165,7 @@ impl WasmMiddleware {
     }
 
     /// Register host functions for middleware plugins.
-    fn register_host_functions(
-        linker: &mut wasmtime::component::Linker<HostState>,
-    ) -> PluginResult<()> {
+    fn register_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
         super::common::register_common_host_functions(linker)
     }
 }

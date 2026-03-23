@@ -118,10 +118,7 @@ pub(crate) fn is_glm_alias(name: &str) -> bool {
 }
 
 pub(crate) fn is_moonshot_intl_alias(name: &str) -> bool {
-    matches!(
-        name,
-        "moonshot-intl" | "moonshot-global" | "kimi-intl" | "kimi-global"
-    )
+    matches!(name, "moonshot-intl" | "moonshot-global" | "kimi-intl" | "kimi-global")
 }
 
 pub(crate) fn is_moonshot_cn_alias(name: &str) -> bool {
@@ -244,14 +241,8 @@ struct QwenOauthCredentials {
 impl std::fmt::Debug for QwenOauthCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QwenOauthCredentials")
-            .field(
-                "access_token",
-                &self.access_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("access_token", &self.access_token.as_ref().map(|_| "[REDACTED]"))
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
             .field("resource_url", &self.resource_url)
             .field("expiry_date", &self.expiry_date)
             .finish()
@@ -289,14 +280,8 @@ pub(crate) struct ClaudeCodeCredentials {
 impl std::fmt::Debug for ClaudeCodeCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClaudeCodeCredentials")
-            .field(
-                "access_token",
-                &self.access_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("access_token", &self.access_token.as_ref().map(|_| "[REDACTED]"))
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
             .field("expires_at", &self.expires_at)
             .field("subscription_type", &self.subscription_type)
             .finish()
@@ -333,14 +318,8 @@ struct ClaudeCodeProviderContext {
 impl std::fmt::Debug for ClaudeCodeProviderContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClaudeCodeProviderContext")
-            .field(
-                "credential",
-                &self.credential.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("credential", &self.credential.as_ref().map(|_| "[REDACTED]"))
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
             .field("expires_at", &self.expires_at)
             .finish()
     }
@@ -355,10 +334,7 @@ struct QwenOauthProviderContext {
 impl std::fmt::Debug for QwenOauthProviderContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QwenOauthProviderContext")
-            .field(
-                "credential",
-                &self.credential.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("credential", &self.credential.as_ref().map(|_| "[REDACTED]"))
             .field("base_url", &self.base_url)
             .finish()
     }
@@ -372,8 +348,7 @@ fn read_non_empty_env(name: &str) -> Option<String> {
 }
 
 fn is_minimax_oauth_placeholder(value: &str) -> bool {
-    value.eq_ignore_ascii_case(MINIMAX_OAUTH_PLACEHOLDER)
-        || value.eq_ignore_ascii_case(MINIMAX_OAUTH_CN_PLACEHOLDER)
+    value.eq_ignore_ascii_case(MINIMAX_OAUTH_PLACEHOLDER) || value.eq_ignore_ascii_case(MINIMAX_OAUTH_CN_PLACEHOLDER)
 }
 
 fn minimax_oauth_region(name: &str) -> MinimaxOauthRegion {
@@ -395,13 +370,11 @@ fn minimax_oauth_region(name: &str) -> MinimaxOauthRegion {
 }
 
 fn minimax_oauth_client_id() -> String {
-    read_non_empty_env(MINIMAX_OAUTH_CLIENT_ID_ENV)
-        .unwrap_or_else(|| MINIMAX_OAUTH_DEFAULT_CLIENT_ID.to_string())
+    read_non_empty_env(MINIMAX_OAUTH_CLIENT_ID_ENV).unwrap_or_else(|| MINIMAX_OAUTH_DEFAULT_CLIENT_ID.to_string())
 }
 
 fn qwen_oauth_client_id() -> String {
-    read_non_empty_env(QWEN_OAUTH_CLIENT_ID_ENV)
-        .unwrap_or_else(|| QWEN_OAUTH_DEFAULT_CLIENT_ID.to_string())
+    read_non_empty_env(QWEN_OAUTH_CLIENT_ID_ENV).unwrap_or_else(|| QWEN_OAUTH_DEFAULT_CLIENT_ID.to_string())
 }
 
 fn qwen_oauth_credentials_file_path() -> Option<PathBuf> {
@@ -460,14 +433,10 @@ fn normalize_qwen_oauth_base_url(raw: &str) -> Option<String> {
 
 /// Check whether a hostname or IP literal is a private or loopback address.
 fn is_private_or_loopback_host(host: &str) -> bool {
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
     let lower = bare.to_lowercase();
 
-    if lower == "localhost" || lower.ends_with(".localhost") || lower == "::1" || lower == "0.0.0.0"
-    {
+    if lower == "localhost" || lower.ends_with(".localhost") || lower == "::1" || lower == "0.0.0.0" {
         return true;
     }
 
@@ -524,9 +493,7 @@ fn read_claude_code_cached_credentials() -> Option<ClaudeCodeCredentials> {
     parsed.claude_ai_oauth
 }
 
-pub(crate) fn write_claude_code_cached_credentials(
-    credentials: &ClaudeCodeCredentials,
-) -> anyhow::Result<()> {
+pub(crate) fn write_claude_code_cached_credentials(credentials: &ClaudeCodeCredentials) -> anyhow::Result<()> {
     let Some(path) = claude_code_credentials_file_path() else {
         return Ok(());
     };
@@ -543,10 +510,7 @@ pub(crate) fn write_claude_code_cached_credentials(
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("Claude credentials root must be an object"))?;
 
-    if !root_obj
-        .get("claudeAiOauth")
-        .is_some_and(serde_json::Value::is_object)
-    {
+    if !root_obj.get("claudeAiOauth").is_some_and(serde_json::Value::is_object) {
         root_obj.insert("claudeAiOauth".to_string(), serde_json::json!({}));
     }
     let oauth_obj = root_obj
@@ -579,10 +543,7 @@ pub(crate) fn write_claude_code_cached_credentials(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        oauth_obj.insert(
-            "subscriptionType".to_string(),
-            serde_json::json!(subscription_type),
-        );
+        oauth_obj.insert("subscriptionType".to_string(), serde_json::json!(subscription_type));
     }
 
     let serialized = serde_json::to_string(&root)?;
@@ -664,14 +625,9 @@ fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOa
         anyhow::bail!("Qwen OAuth refresh failed (HTTP {status}): {detail}");
     }
 
-    let payload =
-        parsed.ok_or_else(|| anyhow::anyhow!("Qwen OAuth refresh response is not JSON"))?;
+    let payload = parsed.ok_or_else(|| anyhow::anyhow!("Qwen OAuth refresh response is not JSON"))?;
 
-    if let Some(error_code) = payload
-        .error
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
+    if let Some(error_code) = payload.error.as_deref().filter(|value| !value.trim().is_empty()) {
         let detail = payload.error_description.as_deref().unwrap_or(error_code);
         anyhow::bail!("Qwen OAuth refresh failed: {detail}");
     }
@@ -712,9 +668,7 @@ fn refresh_qwen_oauth_access_token(refresh_token: &str) -> anyhow::Result<QwenOa
     })
 }
 
-pub(crate) fn refresh_claude_code_access_token(
-    refresh_token: &str,
-) -> anyhow::Result<ClaudeCodeCredentials> {
+pub(crate) fn refresh_claude_code_access_token(refresh_token: &str) -> anyhow::Result<ClaudeCodeCredentials> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -750,8 +704,7 @@ pub(crate) fn refresh_claude_code_access_token(
         anyhow::bail!("Claude Code OAuth refresh failed (HTTP {status}): {detail}");
     }
 
-    let payload =
-        parsed.ok_or_else(|| anyhow::anyhow!("Claude Code OAuth refresh response is not JSON"))?;
+    let payload = parsed.ok_or_else(|| anyhow::anyhow!("Claude Code OAuth refresh response is not JSON"))?;
 
     if let Some(error_code) = payload
         .error
@@ -795,9 +748,7 @@ pub(crate) fn refresh_claude_code_access_token(
 }
 
 fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthProviderContext {
-    let override_value = credential_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    let override_value = credential_override.map(str::trim).filter(|value| !value.is_empty());
     let placeholder_requested = override_value
         .map(|value| value.eq_ignore_ascii_case(QWEN_OAUTH_PLACEHOLDER))
         .unwrap_or(false);
@@ -844,11 +795,7 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
         }
     }
 
-    let mut credential = env_token.or_else(|| {
-        cached
-            .as_ref()
-            .and_then(|credentials| credentials.access_token.clone())
-    });
+    let mut credential = env_token.or_else(|| cached.as_ref().and_then(|credentials| credentials.access_token.clone()));
     credential = credential
         .as_deref()
         .map(str::trim)
@@ -869,10 +816,7 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
                 .and_then(normalize_qwen_oauth_base_url)
         });
 
-    QwenOauthProviderContext {
-        credential,
-        base_url,
-    }
+    QwenOauthProviderContext { credential, base_url }
 }
 
 fn is_claude_code_oauth_placeholder(value: &str) -> bool {
@@ -880,12 +824,8 @@ fn is_claude_code_oauth_placeholder(value: &str) -> bool {
 }
 
 fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeProviderContext {
-    let override_value = credential_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let placeholder_requested = override_value
-        .map(is_claude_code_oauth_placeholder)
-        .unwrap_or(false);
+    let override_value = credential_override.map(str::trim).filter(|value| !value.is_empty());
+    let placeholder_requested = override_value.map(is_claude_code_oauth_placeholder).unwrap_or(false);
 
     if let Some(explicit) = override_value {
         if !placeholder_requested {
@@ -943,11 +883,7 @@ fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeP
     }
 
     let credential = env_access_token
-        .or_else(|| {
-            cached
-                .as_ref()
-                .and_then(|credentials| credentials.access_token.clone())
-        })
+        .or_else(|| cached.as_ref().and_then(|credentials| credentials.access_token.clone()))
         .as_deref()
         .map(str::trim)
         .filter(|token| !token.is_empty())
@@ -958,9 +894,7 @@ fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeP
             .as_ref()
             .and_then(|credentials| credentials.refresh_token.clone())
     });
-    let expires_at = cached
-        .as_ref()
-        .and_then(|credentials| credentials.expires_at);
+    let expires_at = cached.as_ref().and_then(|credentials| credentials.expires_at);
 
     ClaudeCodeProviderContext {
         credential: if placeholder_requested {
@@ -1177,15 +1111,7 @@ fn token_end(input: &str, from: usize) -> usize {
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
 /// `ghu_`, and `github_pat_`.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 7] = [
-        "sk-",
-        "xoxb-",
-        "xoxp-",
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "github_pat_",
-    ];
+    const PREFIXES: [&str; 7] = ["sk-", "xoxb-", "xoxp-", "ghp_", "gho_", "ghu_", "github_pat_"];
 
     let mut scrubbed = input.to_string();
 
@@ -1352,26 +1278,19 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
     None
 }
 
-fn parse_custom_provider_url(
-    raw_url: &str,
-    provider_label: &str,
-    format_hint: &str,
-) -> anyhow::Result<String> {
+fn parse_custom_provider_url(raw_url: &str, provider_label: &str, format_hint: &str) -> anyhow::Result<String> {
     let base_url = raw_url.trim();
 
     if base_url.is_empty() {
         anyhow::bail!("{provider_label} requires a URL. Format: {format_hint}");
     }
 
-    let parsed = reqwest::Url::parse(base_url).map_err(|_| {
-        anyhow::anyhow!("{provider_label} requires a valid URL. Format: {format_hint}")
-    })?;
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|_| anyhow::anyhow!("{provider_label} requires a valid URL. Format: {format_hint}"))?;
 
     match parsed.scheme() {
         "http" | "https" => Ok(base_url.to_string()),
-        _ => anyhow::bail!(
-            "{provider_label} requires an http:// or https:// URL. Format: {format_hint}"
-        ),
+        _ => anyhow::bail!("{provider_label} requires an http:// or https:// URL. Format: {format_hint}"),
     }
 }
 
@@ -1387,9 +1306,7 @@ pub fn create_provider_with_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     match name {
-        "openai-codex" | "openai_codex" | "codex" => {
-            Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options)))
-        }
+        "openai-codex" | "openai_codex" | "codex" => Ok(Box::new(openai_codex::OpenAiCodexProvider::new(options))),
         _ => create_provider_with_url_and_options(name, api_key, None, options),
     }
 }
@@ -1412,9 +1329,7 @@ fn create_provider_with_url_and_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let qwen_oauth_context = is_qwen_oauth_alias(name).then(|| resolve_qwen_oauth_context(api_key));
-    let claude_code_placeholder_requested = api_key
-        .map(str::trim)
-        .is_some_and(is_claude_code_oauth_placeholder);
+    let claude_code_placeholder_requested = api_key.map(str::trim).is_some_and(is_claude_code_oauth_placeholder);
     let claude_code_context = if is_claude_code_alias(name) {
         Some(resolve_claude_code_context(api_key))
     } else if name == "anthropic" {
@@ -1478,9 +1393,7 @@ fn create_provider_with_url_and_options(
             }
             Ok(Box::new(anthropic::AnthropicProvider::new(key)))
         }
-        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
-            api_url, key,
-        ))),
+        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
             api_url,
@@ -1509,8 +1422,7 @@ fn create_provider_with_url_and_options(
             AuthStyle::Bearer,
         ))),
         name if moonshot_base_url(name).is_some() => {
-            let url = moonshot_base_url(name)
-                .ok_or_else(|| anyhow::anyhow!("moonshot URL resolved to None"))?;
+            let url = moonshot_base_url(name).ok_or_else(|| anyhow::anyhow!("moonshot URL resolved to None"))?;
             Ok(Box::new(OpenAiCompatibleProvider::new(
                 "Moonshot",
                 url,
@@ -1518,15 +1430,13 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
             )))
         }
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
-            Ok(Box::new(OpenAiCompatibleProvider::new_with_user_agent(
-                "Kimi Code",
-                "https://api.kimi.com/coding/v1",
-                key,
-                AuthStyle::Bearer,
-                "KimiCLI/0.77",
-            )))
-        }
+        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(OpenAiCompatibleProvider::new_with_user_agent(
+            "Kimi Code",
+            "https://api.kimi.com/coding/v1",
+            key,
+            AuthStyle::Bearer,
+            "KimiCLI/0.77",
+        ))),
         "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Synthetic",
             "https://api.synthetic.com",
@@ -1540,8 +1450,7 @@ fn create_provider_with_url_and_options(
             AuthStyle::Bearer,
         ))),
         name if zai_base_url(name).is_some() => {
-            let url =
-                zai_base_url(name).ok_or_else(|| anyhow::anyhow!("Z.AI URL resolved to None"))?;
+            let url = zai_base_url(name).ok_or_else(|| anyhow::anyhow!("Z.AI URL resolved to None"))?;
             Ok(Box::new(OpenAiCompatibleProvider::new(
                 "Z.AI",
                 url,
@@ -1550,28 +1459,22 @@ fn create_provider_with_url_and_options(
             )))
         }
         name if glm_base_url(name).is_some() => {
-            let url =
-                glm_base_url(name).ok_or_else(|| anyhow::anyhow!("GLM URL resolved to None"))?;
-            Ok(Box::new(
-                OpenAiCompatibleProvider::new_no_responses_fallback(
-                    "GLM",
-                    url,
-                    key,
-                    AuthStyle::Bearer,
-                ),
-            ))
+            let url = glm_base_url(name).ok_or_else(|| anyhow::anyhow!("GLM URL resolved to None"))?;
+            Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
+                "GLM",
+                url,
+                key,
+                AuthStyle::Bearer,
+            )))
         }
         name if minimax_base_url(name).is_some() => {
-            let url = minimax_base_url(name)
-                .ok_or_else(|| anyhow::anyhow!("MiniMax URL resolved to None"))?;
-            Ok(Box::new(
-                OpenAiCompatibleProvider::new_merge_system_into_user(
-                    "MiniMax",
-                    url,
-                    key,
-                    AuthStyle::Bearer,
-                ),
-            ))
+            let url = minimax_base_url(name).ok_or_else(|| anyhow::anyhow!("MiniMax URL resolved to None"))?;
+            Ok(Box::new(OpenAiCompatibleProvider::new_merge_system_into_user(
+                "MiniMax",
+                url,
+                key,
+                AuthStyle::Bearer,
+            )))
         }
         "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
         name if is_qwen_oauth_alias(name) => {
@@ -1579,11 +1482,7 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
-                .or_else(|| {
-                    qwen_oauth_context
-                        .as_ref()
-                        .and_then(|context| context.base_url.clone())
-                })
+                .or_else(|| qwen_oauth_context.as_ref().and_then(|context| context.base_url.clone()))
                 .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
 
             Ok(Box::new(OpenAiCompatibleProvider::new_with_user_agent(
@@ -1601,8 +1500,7 @@ fn create_provider_with_url_and_options(
             AuthStyle::Bearer,
         ))),
         name if qwen_coding_base_url(name).is_some() => {
-            let url = qwen_coding_base_url(name)
-                .ok_or_else(|| anyhow::anyhow!("Qwen Coding URL resolved to None"))?;
+            let url = qwen_coding_base_url(name).ok_or_else(|| anyhow::anyhow!("Qwen Coding URL resolved to None"))?;
             Ok(Box::new(OpenAiCompatibleProvider::new(
                 "Qwen Coding Plan Pro",
                 url,
@@ -1611,8 +1509,7 @@ fn create_provider_with_url_and_options(
             )))
         }
         name if qwen_base_url(name).is_some() => {
-            let url =
-                qwen_base_url(name).ok_or_else(|| anyhow::anyhow!("Qwen URL resolved to None"))?;
+            let url = qwen_base_url(name).ok_or_else(|| anyhow::anyhow!("Qwen URL resolved to None"))?;
             Ok(Box::new(OpenAiCompatibleProvider::new(
                 "Qwen",
                 url,
@@ -1729,14 +1626,12 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => {
-            Ok(Box::new(OpenAiCompatibleProvider::new(
-                "NVIDIA NIM",
-                "https://integrate.api.nvidia.com/v1",
-                key,
-                AuthStyle::Bearer,
-            )))
-        }
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "NVIDIA NIM",
+            "https://integrate.api.nvidia.com/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
 
         // ── AI inference routers ─────────────────────────────
         "astrai" => Ok(Box::new(OpenAiCompatibleProvider::new(
@@ -1825,12 +1720,7 @@ pub fn create_resilient_provider_with_options(
                 "openai-codex" | "openai_codex" | "codex" => {
                     create_provider_with_options(provider_name, explicit_key, options)
                 }
-                _ => create_provider_with_url_and_options(
-                    provider_name,
-                    explicit_key,
-                    api_url,
-                    options,
-                ),
+                _ => create_provider_with_url_and_options(provider_name, explicit_key, api_url, options),
             }
         } else {
             create_provider_with_options(provider_name, None, options)
@@ -1843,10 +1733,7 @@ pub fn create_resilient_provider_with_options(
                 if provider_name == primary_name {
                     anyhow::bail!("Primary provider \"{provider_name}\" unavailable: {reason}");
                 }
-                tracing::warn!(
-                    provider = provider_name,
-                    "Ignoring unavailable fallback provider"
-                );
+                tracing::warn!(provider = provider_name, "Ignoring unavailable fallback provider");
                 unavailable.push((provider_name.clone(), reason));
             }
         }
@@ -1856,14 +1743,10 @@ pub fn create_resilient_provider_with_options(
         anyhow::bail!("No available providers after credential/initialization checks");
     }
 
-    let reliable = ReliableProvider::new(
-        providers,
-        reliability.provider_retries,
-        reliability.provider_backoff_ms,
-    )
-    .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(reliability.model_fallbacks.clone())
-    .with_unavailable_providers(unavailable);
+    let reliable = ReliableProvider::new(providers, reliability.provider_retries, reliability.provider_backoff_ms)
+        .with_api_keys(reliability.api_keys.clone())
+        .with_model_fallbacks(reliability.model_fallbacks.clone())
+        .with_unavailable_providers(unavailable);
 
     Ok(Box::new(reliable))
 }
@@ -1901,13 +1784,7 @@ pub fn create_routed_provider_with_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     if model_routes.is_empty() {
-        return create_resilient_provider_with_options(
-            primary_name,
-            api_key,
-            api_url,
-            reliability,
-            options,
-        );
+        return create_resilient_provider_with_options(primary_name, api_key, api_url, reliability, options);
     }
 
     // Collect unique provider names needed
@@ -1921,15 +1798,12 @@ pub fn create_routed_provider_with_options(
     // Create each provider (with its own resilience wrapper)
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
     for name in &needed {
-        let routed_credential = model_routes
-            .iter()
-            .find(|r| &r.provider == name)
-            .and_then(|r| {
-                r.api_key.as_ref().and_then(|raw_key| {
-                    let trimmed_key = raw_key.trim();
-                    (!trimmed_key.is_empty()).then_some(trimmed_key)
-                })
-            });
+        let routed_credential = model_routes.iter().find(|r| &r.provider == name).and_then(|r| {
+            r.api_key.as_ref().and_then(|raw_key| {
+                let trimmed_key = raw_key.trim();
+                (!trimmed_key.is_empty()).then_some(trimmed_key)
+            })
+        });
         let key = routed_credential.or(api_key);
         // Only use api_url for the primary provider
         let url = if name == primary_name { api_url } else { None };
@@ -2022,10 +1896,7 @@ fn default_openprx_state_dir() -> PathBuf {
         }
     }
 
-    directories::UserDirs::new().map_or_else(
-        || PathBuf::from(".openprx"),
-        |dirs| dirs.home_dir().join(".openprx"),
-    )
+    directories::UserDirs::new().map_or_else(|| PathBuf::from(".openprx"), |dirs| dirs.home_dir().join(".openprx"))
 }
 
 fn openai_codex_auth_profile_available_for_state_dir(state_dir: &std::path::Path) -> bool {
@@ -2074,10 +1945,7 @@ pub fn provider_matches_model_prefix(provider_name: &str, model: &str) -> bool {
                 .any(|alias| alias.eq_ignore_ascii_case(&provider_name))
         {
             if info.name.eq_ignore_ascii_case(&prefix)
-                || info
-                    .aliases
-                    .iter()
-                    .any(|alias| alias.eq_ignore_ascii_case(&prefix))
+                || info.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(&prefix))
             {
                 return true;
             }
@@ -2112,19 +1980,12 @@ pub fn summarize_provider_availability(
             if openai_codex_auth_profile_available() {
                 available.push(provider.clone());
             } else {
-                unavailable.push((
-                    provider.clone(),
-                    "missing OpenAI Codex auth profile/token".to_string(),
-                ));
+                unavailable.push((provider.clone(), "missing OpenAI Codex auth profile/token".to_string()));
             }
             continue;
         }
 
-        let explicit_for_provider = if provider == primary_name {
-            api_key
-        } else {
-            None
-        };
+        let explicit_for_provider = if provider == primary_name { api_key } else { None };
         if provider_requires_explicit_credential(provider)
             && resolve_provider_credential(provider, explicit_for_provider).is_none()
         {
@@ -2425,9 +2286,7 @@ mod tests {
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
+        LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned")
     }
 
     #[test]
@@ -2523,10 +2382,7 @@ mod tests {
         let fake_home = format!("/tmp/openprx-qwen-oauth-home-{}", std::process::id());
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
         let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, Some("oauth-token"));
-        let _resource_guard = EnvGuard::set(
-            QWEN_OAUTH_RESOURCE_URL_ENV,
-            Some("coding-intl.dashscope.aliyuncs.com"),
-        );
+        let _resource_guard = EnvGuard::set(QWEN_OAUTH_RESOURCE_URL_ENV, Some("coding-intl.dashscope.aliyuncs.com"));
 
         let context = resolve_qwen_oauth_context(Some("  explicit-qwen-token  "));
 
@@ -2541,10 +2397,7 @@ mod tests {
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
         let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, Some("oauth-token"));
         let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
-        let _resource_guard = EnvGuard::set(
-            QWEN_OAUTH_RESOURCE_URL_ENV,
-            Some("coding-intl.dashscope.aliyuncs.com"),
-        );
+        let _resource_guard = EnvGuard::set(QWEN_OAUTH_RESOURCE_URL_ENV, Some("coding-intl.dashscope.aliyuncs.com"));
         let _dashscope_guard = EnvGuard::set("DASHSCOPE_API_KEY", Some("dashscope-fallback"));
 
         let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
@@ -2578,19 +2431,13 @@ mod tests {
         let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
 
         assert_eq!(context.credential.as_deref(), Some("cached-token"));
-        assert_eq!(
-            context.base_url.as_deref(),
-            Some("https://resource.example.com/v1")
-        );
+        assert_eq!(context.base_url.as_deref(), Some("https://resource.example.com/v1"));
     }
 
     #[test]
     fn resolve_qwen_oauth_context_placeholder_does_not_use_dashscope_fallback() {
         let _env_lock = env_lock();
-        let fake_home = format!(
-            "/tmp/openprx-qwen-oauth-home-{}-placeholder",
-            std::process::id()
-        );
+        let fake_home = format!("/tmp/openprx-qwen-oauth-home-{}-placeholder", std::process::id());
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
         let _token_guard = EnvGuard::set(QWEN_OAUTH_TOKEN_ENV, None);
         let _refresh_guard = EnvGuard::set(QWEN_OAUTH_REFRESH_TOKEN_ENV, None);
@@ -2609,8 +2456,7 @@ mod tests {
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
         let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, Some("oauth-token"));
         let _refresh_guard = EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, Some("oauth-refresh"));
-        let _anthropic_oauth_guard =
-            EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
+        let _anthropic_oauth_guard = EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
 
         let context = resolve_claude_code_context(Some("  explicit-claude-token  "));
 
@@ -2623,10 +2469,8 @@ mod tests {
         let fake_home = format!("/tmp/openprx-claude-oauth-home-{}-env", std::process::id());
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
         let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, Some("env-access-token"));
-        let _refresh_guard =
-            EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, Some("env-refresh-token"));
-        let _anthropic_oauth_guard =
-            EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
+        let _refresh_guard = EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, Some("env-refresh-token"));
+        let _anthropic_oauth_guard = EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
 
         let context = resolve_claude_code_context(Some("claude-code"));
 
@@ -2659,15 +2503,11 @@ mod tests {
     #[test]
     fn resolve_claude_code_context_placeholder_does_not_use_anthropic_oauth_fallback() {
         let _env_lock = env_lock();
-        let fake_home = format!(
-            "/tmp/openprx-claude-oauth-home-{}-placeholder",
-            std::process::id()
-        );
+        let fake_home = format!("/tmp/openprx-claude-oauth-home-{}-placeholder", std::process::id());
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
         let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, None);
         let _refresh_guard = EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, None);
-        let _anthropic_oauth_guard =
-            EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
+        let _anthropic_oauth_guard = EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
         let _anthropic_api_guard = EnvGuard::set("ANTHROPIC_API_KEY", Some("anthropic-api-key"));
 
         let context = resolve_claude_code_context(Some("claude-code"));
@@ -2740,10 +2580,7 @@ mod tests {
     #[test]
     fn regional_endpoint_aliases_map_to_expected_urls() {
         assert_eq!(minimax_base_url("minimax"), Some(MINIMAX_INTL_BASE_URL));
-        assert_eq!(
-            minimax_base_url("minimax-intl"),
-            Some(MINIMAX_INTL_BASE_URL)
-        );
+        assert_eq!(minimax_base_url("minimax-intl"), Some(MINIMAX_INTL_BASE_URL));
         assert_eq!(minimax_base_url("minimax-cn"), Some(MINIMAX_CN_BASE_URL));
 
         assert_eq!(glm_base_url("glm"), Some(GLM_GLOBAL_BASE_URL));
@@ -2751,24 +2588,15 @@ mod tests {
         assert_eq!(glm_base_url("bigmodel"), Some(GLM_CN_BASE_URL));
 
         assert_eq!(moonshot_base_url("moonshot"), Some(MOONSHOT_CN_BASE_URL));
-        assert_eq!(
-            moonshot_base_url("moonshot-intl"),
-            Some(MOONSHOT_INTL_BASE_URL)
-        );
+        assert_eq!(moonshot_base_url("moonshot-intl"), Some(MOONSHOT_INTL_BASE_URL));
 
         assert_eq!(qwen_base_url("qwen"), Some(QWEN_CN_BASE_URL));
         assert_eq!(qwen_base_url("qwen-cn"), Some(QWEN_CN_BASE_URL));
         assert_eq!(qwen_base_url("qwen-intl"), Some(QWEN_INTL_BASE_URL));
         assert_eq!(qwen_base_url("qwen-us"), Some(QWEN_US_BASE_URL));
         assert_eq!(qwen_base_url("qwen-code"), Some(QWEN_CN_BASE_URL));
-        assert_eq!(
-            qwen_coding_base_url("dashscope-coding"),
-            Some(QWEN_CODING_CN_BASE_URL)
-        );
-        assert_eq!(
-            qwen_coding_base_url("qwen-coding"),
-            Some(QWEN_CODING_CN_BASE_URL)
-        );
+        assert_eq!(qwen_coding_base_url("dashscope-coding"), Some(QWEN_CODING_CN_BASE_URL));
+        assert_eq!(qwen_coding_base_url("qwen-coding"), Some(QWEN_CODING_CN_BASE_URL));
         assert_eq!(
             qwen_coding_base_url("dashscope-coding-intl"),
             Some(QWEN_CODING_INTL_BASE_URL)
@@ -2962,9 +2790,7 @@ mod tests {
         assert!(create_provider("litellm", Some("key")).is_ok());
         assert!(create_provider("lite-llm", Some("key")).is_ok());
         assert!(create_provider("litellm", None).is_ok());
-        assert!(
-            create_provider_with_url("litellm", Some("key"), Some("http://127.0.0.1:4001")).is_ok()
-        );
+        assert!(create_provider_with_url("litellm", Some("key"), Some("http://127.0.0.1:4001")).is_ok());
     }
 
     #[test]
@@ -2972,9 +2798,7 @@ mod tests {
         assert!(create_provider("vllm", Some("key")).is_ok());
         assert!(create_provider("v-llm", Some("key")).is_ok());
         assert!(create_provider("vllm", None).is_ok());
-        assert!(
-            create_provider_with_url("vllm", Some("key"), Some("http://127.0.0.1:9000/v1")).is_ok()
-        );
+        assert!(create_provider_with_url("vllm", Some("key"), Some("http://127.0.0.1:9000/v1")).is_ok());
     }
 
     #[test]
@@ -3196,24 +3020,15 @@ mod tests {
             scheduler_retries: 2,
         };
 
-        let provider = create_resilient_provider(
-            "openrouter",
-            Some("provider-test-credential"),
-            None,
-            &reliability,
-        );
+        let provider = create_resilient_provider("openrouter", Some("provider-test-credential"), None, &reliability);
         assert!(provider.is_ok());
     }
 
     #[test]
     fn resilient_provider_errors_for_invalid_primary() {
         let reliability = crate::config::ReliabilityConfig::default();
-        let provider = create_resilient_provider(
-            "totally-invalid",
-            Some("provider-test-credential"),
-            None,
-            &reliability,
-        );
+        let provider =
+            create_resilient_provider("totally-invalid", Some("provider-test-credential"), None, &reliability);
         assert!(provider.is_err());
     }
 
@@ -3404,8 +3219,7 @@ mod tests {
             scheduler_retries: 2,
         };
 
-        let provider =
-            create_resilient_provider("openai", Some("openai-test-key"), None, &reliability);
+        let provider = create_resilient_provider("openai", Some("openai-test-key"), None, &reliability);
         assert!(provider.is_ok());
     }
 
@@ -3442,8 +3256,7 @@ mod tests {
 
     #[test]
     fn ollama_cloud_with_custom_url() {
-        let provider =
-            create_provider_with_url("ollama", Some("ollama-key"), Some("https://ollama.com"));
+        let provider = create_provider_with_url("ollama", Some("ollama-key"), Some("https://ollama.com"));
         assert!(provider.is_ok());
     }
 

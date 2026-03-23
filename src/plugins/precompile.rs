@@ -32,8 +32,7 @@ impl CacheMetrics {
 
     pub fn record_miss(&self, compile_ms: u64) {
         self.misses.fetch_add(1, Ordering::Relaxed);
-        self.total_compile_ms
-            .fetch_add(compile_ms, Ordering::Relaxed);
+        self.total_compile_ms.fetch_add(compile_ms, Ordering::Relaxed);
     }
 
     pub fn hits(&self) -> u64 {
@@ -252,8 +251,7 @@ mod tests {
 
     #[test]
     fn metrics_shared_via_arc() {
-        let cache =
-            PrecompileCache::new(std::env::temp_dir().join("prx_metrics_arc_test")).unwrap();
+        let cache = PrecompileCache::new(std::env::temp_dir().join("prx_metrics_arc_test")).unwrap();
         let metrics_ref = Arc::clone(&cache.metrics);
         metrics_ref.record_hit();
         assert_eq!(cache.metrics.hits(), 1);
@@ -268,10 +266,7 @@ mod tests {
         let data2 = b"hello WASM world"; // uppercase 'W'
         let h1 = PrecompileCache::hash_bytes(data1);
         let h2 = PrecompileCache::hash_bytes(data2);
-        assert_ne!(
-            h1, h2,
-            "single-byte change must produce different cache key"
-        );
+        assert_ne!(h1, h2, "single-byte change must produce different cache key");
     }
 
     #[test]

@@ -56,11 +56,7 @@ pub async fn start_experiment(
 ///
 /// Status is marked `succeeded` if `outcome_fitness >= baseline_fitness`,
 /// otherwise `failed`.
-pub async fn complete_experiment(
-    memory: &dyn Memory,
-    id: &str,
-    outcome_fitness: f64,
-) -> Result<ExperimentRecord> {
+pub async fn complete_experiment(memory: &dyn Memory, id: &str, outcome_fitness: f64) -> Result<ExperimentRecord> {
     let mut record = load_experiment(memory, id).await?;
     if record.status != ExperimentStatus::Running {
         bail!("experiment {id} is not running");
@@ -79,11 +75,7 @@ pub async fn complete_experiment(
 }
 
 /// Roll back a running experiment with a reason and persist it.
-pub async fn rollback_experiment(
-    memory: &dyn Memory,
-    id: &str,
-    reason: &str,
-) -> Result<ExperimentRecord> {
+pub async fn rollback_experiment(memory: &dyn Memory, id: &str, reason: &str) -> Result<ExperimentRecord> {
     let mut record = load_experiment(memory, id).await?;
     if record.status != ExperimentStatus::Running {
         bail!("experiment {id} is not running");
@@ -182,12 +174,7 @@ mod tests {
             Ok(())
         }
 
-        async fn recall(
-            &self,
-            _query: &str,
-            _limit: usize,
-            _session_id: Option<&str>,
-        ) -> Result<Vec<MemoryEntry>> {
+        async fn recall(&self, _query: &str, _limit: usize, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
 
@@ -196,11 +183,7 @@ mod tests {
             Ok(entries.get(key).cloned())
         }
 
-        async fn list(
-            &self,
-            category: Option<&MemoryCategory>,
-            _session_id: Option<&str>,
-        ) -> Result<Vec<MemoryEntry>> {
+        async fn list(&self, category: Option<&MemoryCategory>, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
             let entries = self.entries.lock().await;
             Ok(entries
                 .values()
@@ -247,9 +230,7 @@ mod tests {
             .await
             .unwrap();
 
-        let completed = complete_experiment(&memory, &record.id, 0.75)
-            .await
-            .unwrap();
+        let completed = complete_experiment(&memory, &record.id, 0.75).await.unwrap();
         assert_eq!(completed.status, ExperimentStatus::Failed);
         assert_eq!(completed.outcome_fitness, Some(0.75));
         assert!(completed.ended_at.is_some());
@@ -266,10 +247,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rolled_back.status, ExperimentStatus::RolledBack);
-        assert_eq!(
-            rolled_back.rollback_reason.as_deref(),
-            Some("latency regression")
-        );
+        assert_eq!(rolled_back.rollback_reason.as_deref(), Some("latency regression"));
         assert!(rolled_back.ended_at.is_some());
     }
 }

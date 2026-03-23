@@ -110,10 +110,7 @@ impl Channel for MattermostChannel {
 
         if let Some(root) = root_id {
             if let Some(obj) = body_map.as_object_mut() {
-                obj.insert(
-                    "root_id".to_string(),
-                    serde_json::Value::String(root.to_string()),
-                );
+                obj.insert("root_id".to_string(), serde_json::Value::String(root.to_string()));
             }
         }
 
@@ -157,10 +154,7 @@ impl Channel for MattermostChannel {
 
             let resp = match self
                 .http_client()
-                .get(format!(
-                    "{}/api/v4/channels/{}/posts",
-                    self.base_url, channel_id
-                ))
+                .get(format!("{}/api/v4/channels/{}/posts", self.base_url, channel_id))
                 .bearer_auth(&self.bot_token)
                 .query(&[("since", last_create_at.to_string())])
                 .send()
@@ -187,17 +181,9 @@ impl Channel for MattermostChannel {
                 post_list.sort_by_key(|p| p.get("create_at").and_then(|c| c.as_i64()).unwrap_or(0));
 
                 for post in post_list {
-                    let msg = self.parse_mattermost_post(
-                        post,
-                        &bot_user_id,
-                        &bot_username,
-                        last_create_at,
-                        &channel_id,
-                    );
-                    let create_at = post
-                        .get("create_at")
-                        .and_then(|c| c.as_i64())
-                        .unwrap_or(last_create_at);
+                    let msg =
+                        self.parse_mattermost_post(post, &bot_user_id, &bot_username, last_create_at, &channel_id);
+                    let create_at = post.get("create_at").and_then(|c| c.as_i64()).unwrap_or(last_create_at);
                     last_create_at = last_create_at.max(create_at);
 
                     if let Some(channel_msg) = msg {
@@ -244,13 +230,7 @@ impl Channel for MattermostChannel {
                     }
                 }
 
-                if let Ok(r) = client
-                    .post(&url)
-                    .bearer_auth(&token)
-                    .json(&body)
-                    .send()
-                    .await
-                {
+                if let Ok(r) = client.post(&url).bearer_auth(&token).json(&body).send().await {
                     if !r.status().is_success() {
                         tracing::debug!(status = %r.status(), "Mattermost typing indicator failed");
                     }
@@ -340,12 +320,7 @@ impl MattermostChannel {
 /// Checks two sources:
 /// 1. Text-based: looks for `@bot_username` in the message body (case-insensitive).
 /// 2. Metadata-based: checks the post's `metadata.mentions` array for the bot user ID.
-fn contains_bot_mention_mm(
-    text: &str,
-    bot_user_id: &str,
-    bot_username: &str,
-    post: &serde_json::Value,
-) -> bool {
+fn contains_bot_mention_mm(text: &str, bot_user_id: &str, bot_username: &str, post: &serde_json::Value) -> bool {
     // 1. Text-based: @username (case-insensitive, word-boundary aware)
     if !find_bot_mention_spans(text, bot_username).is_empty() {
         return true;
@@ -464,26 +439,12 @@ mod tests {
 
     // Helper: create a channel with mention_only=false (legacy behavior).
     fn make_channel(allowed: Vec<String>, thread_replies: bool) -> MattermostChannel {
-        MattermostChannel::new(
-            "url".into(),
-            "token".into(),
-            None,
-            allowed,
-            thread_replies,
-            false,
-        )
+        MattermostChannel::new("url".into(), "token".into(), None, allowed, thread_replies, false)
     }
 
     // Helper: create a channel with mention_only=true.
     fn make_mention_only_channel() -> MattermostChannel {
-        MattermostChannel::new(
-            "url".into(),
-            "token".into(),
-            None,
-            vec!["*".into()],
-            true,
-            true,
-        )
+        MattermostChannel::new("url".into(), "token".into(), None, vec!["*".into()], true, true)
     }
 
     #[test]
@@ -568,8 +529,7 @@ mod tests {
             "create_at": 1_600_000_000_000_i64
         });
 
-        let msg =
-            ch.parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789");
+        let msg = ch.parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789");
         assert!(msg.is_none());
     }
 
@@ -583,8 +543,7 @@ mod tests {
             "create_at": 1_400_000_000_000_i64
         });
 
-        let msg =
-            ch.parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789");
+        let msg = ch.parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789");
         assert!(msg.is_none());
     }
 
@@ -636,8 +595,7 @@ mod tests {
             "root_id": ""
         });
 
-        let msg =
-            ch.parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1");
+        let msg = ch.parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1");
         assert!(msg.is_none());
     }
 
@@ -686,8 +644,7 @@ mod tests {
             "root_id": ""
         });
 
-        let msg =
-            ch.parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1");
+        let msg = ch.parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1");
         assert!(msg.is_none());
     }
 
@@ -742,8 +699,7 @@ mod tests {
             "root_id": ""
         });
 
-        let msg =
-            ch.parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1");
+        let msg = ch.parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1");
         assert!(msg.is_none());
     }
 
@@ -787,23 +743,13 @@ mod tests {
     #[test]
     fn contains_mention_text_at_end() {
         let post = json!({});
-        assert!(contains_bot_mention_mm(
-            "hello @mybot",
-            "bot123",
-            "mybot",
-            &post
-        ));
+        assert!(contains_bot_mention_mm("hello @mybot", "bot123", "mybot", &post));
     }
 
     #[test]
     fn contains_mention_text_at_start() {
         let post = json!({});
-        assert!(contains_bot_mention_mm(
-            "@mybot hello",
-            "bot123",
-            "mybot",
-            &post
-        ));
+        assert!(contains_bot_mention_mm("@mybot hello", "bot123", "mybot", &post));
     }
 
     #[test]
@@ -815,24 +761,14 @@ mod tests {
     #[test]
     fn no_mention_different_username() {
         let post = json!({});
-        assert!(!contains_bot_mention_mm(
-            "@otherbot hello",
-            "bot123",
-            "mybot",
-            &post
-        ));
+        assert!(!contains_bot_mention_mm("@otherbot hello", "bot123", "mybot", &post));
     }
 
     #[test]
     fn no_mention_partial_username() {
         let post = json!({});
         // "mybot" is a prefix of "mybotx" — should NOT match
-        assert!(!contains_bot_mention_mm(
-            "@mybotx hello",
-            "bot123",
-            "mybot",
-            &post
-        ));
+        assert!(!contains_bot_mention_mm("@mybotx hello", "bot123", "mybot", &post));
     }
 
     #[test]
@@ -850,12 +786,7 @@ mod tests {
     fn mention_followed_by_punctuation() {
         let post = json!({});
         // "@mybot," — comma is not alphanumeric/underscore/dash/dot, so it's a boundary
-        assert!(contains_bot_mention_mm(
-            "@mybot, hello",
-            "bot123",
-            "mybot",
-            &post
-        ));
+        assert!(contains_bot_mention_mm("@mybot, hello", "bot123", "mybot", &post));
     }
 
     #[test]
@@ -863,12 +794,7 @@ mod tests {
         let post = json!({
             "metadata": { "mentions": ["bot123"] }
         });
-        assert!(contains_bot_mention_mm(
-            "no at mention",
-            "bot123",
-            "mybot",
-            &post
-        ));
+        assert!(contains_bot_mention_mm("no at mention", "bot123", "mybot", &post));
     }
 
     #[test]
@@ -912,16 +838,14 @@ mod tests {
     #[test]
     fn normalize_strips_multiple_mentions() {
         let post = json!({});
-        let result =
-            normalize_mattermost_content("@mybot hello @mybot world", "bot123", "mybot", &post);
+        let result = normalize_mattermost_content("@mybot hello @mybot world", "bot123", "mybot", &post);
         assert_eq!(result.as_deref(), Some("hello   world"));
     }
 
     #[test]
     fn normalize_keeps_partial_username_mentions() {
         let post = json!({});
-        let result =
-            normalize_mattermost_content("@mybot hello @mybotx world", "bot123", "mybot", &post);
+        let result = normalize_mattermost_content("@mybot hello @mybotx world", "bot123", "mybot", &post);
         assert_eq!(result.as_deref(), Some("hello @mybotx world"));
     }
 }

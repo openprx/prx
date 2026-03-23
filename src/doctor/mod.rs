@@ -80,14 +80,8 @@ pub fn run(config: &Config) -> Result<()> {
         println!("    {} {}", item.icon(), item.message);
     }
 
-    let errors = items
-        .iter()
-        .filter(|i| i.severity == Severity::Error)
-        .count();
-    let warns = items
-        .iter()
-        .filter(|i| i.severity == Severity::Warn)
-        .count();
+    let errors = items.iter().filter(|i| i.severity == Severity::Error).count();
+    let warns = items.iter().filter(|i| i.severity == Severity::Warn).count();
     let oks = items.iter().filter(|i| i.severity == Severity::Ok).count();
 
     println!();
@@ -158,11 +152,7 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
     println!("  Providers to probe: {}", targets.len());
     println!(
         "  Mode: {}",
-        if use_cache {
-            "cache-first"
-        } else {
-            "force live refresh"
-        }
+        if use_cache { "cache-first" } else { "force live refresh" }
     );
     println!();
 
@@ -188,10 +178,7 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
                     }
                     ModelProbeOutcome::AuthOrAccess => {
                         auth_count += 1;
-                        println!(
-                            "    ⚠️  auth/access: {}",
-                            truncate_for_display(&error_text, 160)
-                        );
+                        println!("    ⚠️  auth/access: {}", truncate_for_display(&error_text, 160));
                     }
                     ModelProbeOutcome::Error => {
                         error_count += 1;
@@ -210,9 +197,7 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
     );
 
     if auth_count > 0 {
-        println!(
-            "  💡 Some providers need valid API keys/plan access before `/models` can be fetched."
-        );
+        println!("  💡 Some providers need valid API keys/plan access before `/models` can be fetched.");
     }
 
     if provider_override.is_some() && ok_count == 0 {
@@ -248,10 +233,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 format!("default provider \"{provider}\" is invalid: {reason}"),
             ));
         } else {
-            items.push(DiagItem::ok(
-                cat,
-                format!("provider \"{provider}\" is valid"),
-            ));
+            items.push(DiagItem::ok(cat, format!("provider \"{provider}\" is valid")));
         }
     } else {
         items.push(DiagItem::error(cat, "no default_provider configured"));
@@ -273,10 +255,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     if config.default_model.is_some() {
         items.push(DiagItem::ok(
             cat,
-            format!(
-                "default model: {}",
-                config.default_model.as_deref().unwrap_or("?")
-            ),
+            format!("default model: {}", config.default_model.as_deref().unwrap_or("?")),
         ));
     } else {
         items.push(DiagItem::warn(cat, "no default_model configured"));
@@ -286,10 +265,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     if config.default_temperature >= 0.0 && config.default_temperature <= 2.0 {
         items.push(DiagItem::ok(
             cat,
-            format!(
-                "temperature {:.1} (valid range 0.0–2.0)",
-                config.default_temperature
-            ),
+            format!("temperature {:.1} (valid range 0.0–2.0)", config.default_temperature),
         ));
     } else {
         items.push(DiagItem::error(
@@ -436,10 +412,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.dimensions.is_some_and(|value| value == 0) {
             items.push(DiagItem::warn(
                 cat,
-                format!(
-                    "embedding route \"{}\" has invalid dimensions=0",
-                    route.hint
-                ),
+                format!("embedding route \"{}\" has invalid dimensions=0", route.hint),
             ));
         }
     }
@@ -451,11 +424,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if !config
-            .embedding_routes
-            .iter()
-            .any(|route| route.hint.trim() == hint)
-        {
+        if !config.embedding_routes.iter().any(|route| route.hint.trim() == hint) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -510,13 +479,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 fn provider_validation_error(name: &str) -> Option<String> {
     match crate::providers::create_provider(name, None) {
         Ok(_) => None,
-        Err(err) => Some(
-            err.to_string()
-                .lines()
-                .next()
-                .unwrap_or("invalid provider")
-                .into(),
-        ),
+        Err(err) => Some(err.to_string().lines().next().unwrap_or("invalid provider").into()),
     }
 }
 
@@ -572,52 +535,33 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
     let ws = &config.workspace_dir;
 
     if ws.exists() {
-        items.push(DiagItem::ok(
-            cat,
-            format!("directory exists: {}", ws.display()),
-        ));
+        items.push(DiagItem::ok(cat, format!("directory exists: {}", ws.display())));
     } else {
-        items.push(DiagItem::error(
-            cat,
-            format!("directory missing: {}", ws.display()),
-        ));
+        items.push(DiagItem::error(cat, format!("directory missing: {}", ws.display())));
         return;
     }
 
     // Writable check
     let probe = workspace_probe_path(ws);
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-    {
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
         Ok(mut probe_file) => {
             let write_result = probe_file.write_all(b"probe");
             drop(probe_file);
             let _ = std::fs::remove_file(&probe);
             match write_result {
                 Ok(()) => items.push(DiagItem::ok(cat, "directory is writable")),
-                Err(e) => items.push(DiagItem::error(
-                    cat,
-                    format!("directory write probe failed: {e}"),
-                )),
+                Err(e) => items.push(DiagItem::error(cat, format!("directory write probe failed: {e}"))),
             }
         }
         Err(e) => {
-            items.push(DiagItem::error(
-                cat,
-                format!("directory is not writable: {e}"),
-            ));
+            items.push(DiagItem::error(cat, format!("directory is not writable: {e}")));
         }
     }
 
     // Disk space (best-effort via `df`)
     if let Some(avail_mb) = disk_available_mb(ws) {
         if avail_mb >= 100 {
-            items.push(DiagItem::ok(
-                cat,
-                format!("disk space: {avail_mb} MB available"),
-            ));
+            items.push(DiagItem::ok(cat, format!("disk space: {avail_mb} MB available")));
         } else {
             items.push(DiagItem::warn(
                 cat,
@@ -631,13 +575,7 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
     check_file_exists(ws, "AGENTS.md", false, cat, items);
 }
 
-fn check_file_exists(
-    base: &Path,
-    name: &str,
-    required: bool,
-    cat: &'static str,
-    items: &mut Vec<DiagItem>,
-) {
+fn check_file_exists(base: &Path, name: &str, required: bool, cat: &'static str, items: &mut Vec<DiagItem>) {
     let path = base.join(name);
     if path.is_file() {
         items.push(DiagItem::ok(cat, format!("{name} present")));
@@ -649,11 +587,7 @@ fn check_file_exists(
 }
 
 fn disk_available_mb(path: &Path) -> Option<u64> {
-    let output = std::process::Command::new("df")
-        .arg("-m")
-        .arg(path)
-        .output()
-        .ok()?;
+    let output = std::process::Command::new("df").arg("-m").arg(path).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -671,11 +605,7 @@ fn workspace_probe_path(workspace_dir: &Path) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
-    workspace_dir.join(format!(
-        ".openprx_doctor_probe_{}_{}",
-        std::process::id(),
-        nanos
-    ))
+    workspace_dir.join(format!(".openprx_doctor_probe_{}_{}", std::process::id(), nanos))
 }
 
 // ── Daemon state (original logic, preserved) ─────────────────────
@@ -718,29 +648,18 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
         .unwrap_or("");
 
     if let Ok(ts) = DateTime::parse_from_rfc3339(updated_at) {
-        let age = Utc::now()
-            .signed_duration_since(ts.with_timezone(&Utc))
-            .num_seconds();
+        let age = Utc::now().signed_duration_since(ts.with_timezone(&Utc)).num_seconds();
         if age <= DAEMON_STALE_SECONDS {
             items.push(DiagItem::ok(cat, format!("heartbeat fresh ({age}s ago)")));
         } else {
-            items.push(DiagItem::error(
-                cat,
-                format!("heartbeat stale ({age}s ago)"),
-            ));
+            items.push(DiagItem::error(cat, format!("heartbeat stale ({age}s ago)")));
         }
     } else {
-        items.push(DiagItem::error(
-            cat,
-            format!("invalid daemon timestamp: {updated_at}"),
-        ));
+        items.push(DiagItem::error(cat, format!("invalid daemon timestamp: {updated_at}")));
     }
 
     // Components
-    if let Some(components) = snapshot
-        .get("components")
-        .and_then(serde_json::Value::as_object)
-    {
+    if let Some(components) = snapshot.get("components").and_then(serde_json::Value::as_object) {
         // Scheduler
         if let Some(scheduler) = components.get("scheduler") {
             let scheduler_ok = scheduler
@@ -751,9 +670,7 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                 .get("last_ok")
                 .and_then(serde_json::Value::as_str)
                 .and_then(parse_rfc3339)
-                .map_or(i64::MAX, |dt| {
-                    Utc::now().signed_duration_since(dt).num_seconds()
-                });
+                .map_or(i64::MAX, |dt| Utc::now().signed_duration_since(dt).num_seconds());
 
             if scheduler_ok && scheduler_age <= SCHEDULER_STALE_SECONDS {
                 items.push(DiagItem::ok(
@@ -786,9 +703,7 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                 .get("last_ok")
                 .and_then(serde_json::Value::as_str)
                 .and_then(parse_rfc3339)
-                .map_or(i64::MAX, |dt| {
-                    Utc::now().signed_duration_since(dt).num_seconds()
-                });
+                .map_or(i64::MAX, |dt| Utc::now().signed_duration_since(dt).num_seconds());
 
             if status_ok && age <= CHANNEL_STALE_SECONDS {
                 items.push(DiagItem::ok(cat, format!("{name} fresh ({age}s ago)")));
@@ -804,10 +719,7 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
         if channel_count == 0 {
             items.push(DiagItem::warn(cat, "no channel components tracked yet"));
         } else if stale > 0 {
-            items.push(DiagItem::warn(
-                cat,
-                format!("{channel_count} channels, {stale} stale"),
-            ));
+            items.push(DiagItem::warn(cat, format!("{channel_count} channels, {stale} stale")));
         }
     }
 }
@@ -832,10 +744,7 @@ fn check_environment(items: &mut Vec<DiagItem>) {
     if std::env::var("HOME").is_ok() || std::env::var("USERPROFILE").is_ok() {
         items.push(DiagItem::ok(cat, "home directory env set"));
     } else {
-        items.push(DiagItem::error(
-            cat,
-            "neither $HOME nor $USERPROFILE is set",
-        ));
+        items.push(DiagItem::error(cat, "neither $HOME nor $USERPROFILE is set"));
     }
 
     // Optional tools
@@ -856,10 +765,7 @@ fn check_command_available(cmd: &str, args: &[&str], cat: &'static str, items: &
             items.push(DiagItem::ok(cat, format!("{cmd}: {display}")));
         }
         Ok(_) => {
-            items.push(DiagItem::warn(
-                cat,
-                format!("{cmd} found but returned non-zero"),
-            ));
+            items.push(DiagItem::warn(cat, format!("{cmd} found but returned non-zero")));
         }
         Err(_) => {
             items.push(DiagItem::warn(cat, format!("{cmd} not found in PATH")));
@@ -896,9 +802,7 @@ fn truncate_for_display(input: &str, max_chars: usize) -> String {
 // ── Helpers ──────────────────────────────────────────────────────
 
 fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(raw).ok().map(|dt| dt.with_timezone(&Utc))
 }
 
 #[cfg(test)]
@@ -928,9 +832,7 @@ mod tests {
 
     #[test]
     fn classify_model_probe_error_marks_unsupported_as_skipped() {
-        let outcome = classify_model_probe_error(
-            "Provider 'copilot' does not support live model discovery yet",
-        );
+        let outcome = classify_model_probe_error("Provider 'copilot' does not support live model discovery yet");
         assert_eq!(outcome, ModelProbeOutcome::Skipped);
     }
 
@@ -939,9 +841,7 @@ mod tests {
         let auth_outcome = classify_model_probe_error("OpenAI API error (401): unauthorized");
         assert_eq!(auth_outcome, ModelProbeOutcome::AuthOrAccess);
 
-        let plan_outcome = classify_model_probe_error(
-            "Z.AI API error (429): plan does not include requested model",
-        );
+        let plan_outcome = classify_model_probe_error("Z.AI API error (429): plan does not include requested model");
         assert_eq!(plan_outcome, ModelProbeOutcome::AuthOrAccess);
     }
 
@@ -983,9 +883,7 @@ mod tests {
         config.default_provider = Some("totally-fake".into());
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
-        let prov_item = items
-            .iter()
-            .find(|i| i.message.contains("default provider"));
+        let prov_item = items.iter().find(|i| i.message.contains("default provider"));
         assert!(prov_item.is_some());
         assert_eq!(prov_item.unwrap().severity, Severity::Error);
     }
@@ -997,10 +895,9 @@ mod tests {
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
 
-        let prov_item = items.iter().find(|item| {
-            item.message
-                .contains("default provider \"custom:\" is invalid")
-        });
+        let prov_item = items
+            .iter()
+            .find(|item| item.message.contains("default provider \"custom:\" is invalid"));
         assert!(prov_item.is_some());
         assert_eq!(prov_item.unwrap().severity, Severity::Error);
     }
@@ -1022,9 +919,7 @@ mod tests {
         config.reliability.fallback_providers = vec!["fake-provider".into()];
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
-        let fb_item = items
-            .iter()
-            .find(|i| i.message.contains("fallback provider"));
+        let fb_item = items.iter().find(|i| i.message.contains("fallback provider"));
         assert!(fb_item.is_some());
         assert_eq!(fb_item.unwrap().severity, Severity::Warn);
     }
@@ -1036,10 +931,9 @@ mod tests {
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
 
-        let fb_item = items.iter().find(|item| {
-            item.message
-                .contains("fallback provider \"custom:\" is invalid")
-        });
+        let fb_item = items
+            .iter()
+            .find(|item| item.message.contains("fallback provider \"custom:\" is invalid"));
         assert!(fb_item.is_some());
         assert_eq!(fb_item.unwrap().severity, Severity::Warn);
     }
@@ -1110,10 +1004,9 @@ mod tests {
 
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
-        let route_item = items.iter().find(|item| {
-            item.message
-                .contains("embedding route \"semantic\" has empty model")
-        });
+        let route_item = items
+            .iter()
+            .find(|item| item.message.contains("embedding route \"semantic\" has empty model"));
         assert!(route_item.is_some());
         assert_eq!(route_item.unwrap().severity, Severity::Warn);
     }
@@ -1145,10 +1038,9 @@ mod tests {
 
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
-        let route_item = items.iter().find(|item| {
-            item.message
-                .contains("no matching [[embedding_routes]] entry exists")
-        });
+        let route_item = items
+            .iter()
+            .find(|item| item.message.contains("no matching [[embedding_routes]] entry exists"));
         assert!(route_item.is_some());
         assert_eq!(route_item.unwrap().severity, Severity::Warn);
     }
@@ -1165,8 +1057,7 @@ mod tests {
 
     #[test]
     fn parse_df_available_mb_uses_last_data_line() {
-        let stdout =
-            "Filesystem 1M-blocks Used Available Use% Mounted on\n/dev/sda1 1000 500 500 50% /\n";
+        let stdout = "Filesystem 1M-blocks Used Available Use% Mounted on\n/dev/sda1 1000 500 500 50% /\n";
         assert_eq!(parse_df_available_mb(stdout), Some(500));
     }
 

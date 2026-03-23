@@ -103,9 +103,7 @@ impl MemorySafetyFilter {
         }
 
         let lower = content.to_ascii_lowercase();
-        let matched_injection = injection_markers()
-            .iter()
-            .find(|marker| lower.contains(*marker));
+        let matched_injection = injection_markers().iter().find(|marker| lower.contains(*marker));
         if let Some(marker) = matched_injection {
             issues.push(SafetyIssue {
                 kind: SafetyIssueKind::PromptInjection,
@@ -166,34 +164,27 @@ fn pii_phone_regex() -> &'static Regex {
 
 fn pii_email_regex() -> &'static Regex {
     static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-            .expect("BUG: invalid hardcoded email regex")
+        Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").expect("BUG: invalid hardcoded email regex")
     });
     &EMAIL
 }
 
 fn pii_id_regex() -> &'static Regex {
     static ID: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\b\d{17}[\dXx]\b|\b\d{15}\b|\b\d{3}-\d{2}-\d{4}\b")
-            .expect("BUG: invalid hardcoded ID regex")
+        Regex::new(r"\b\d{17}[\dXx]\b|\b\d{15}\b|\b\d{3}-\d{2}-\d{4}\b").expect("BUG: invalid hardcoded ID regex")
     });
     &ID
 }
 
 fn credit_card_candidate_regex() -> &'static Regex {
-    static CARD: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\b(?:\d[ -]?){13,19}\b").expect("BUG: invalid hardcoded credit card regex")
-    });
+    static CARD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b(?:\d[ -]?){13,19}\b").expect("BUG: invalid hardcoded credit card regex"));
     &CARD
 }
 
 fn contains_credit_card_number(content: &str) -> bool {
     for candidate in credit_card_candidate_regex().find_iter(content) {
-        let digits: String = candidate
-            .as_str()
-            .chars()
-            .filter(|ch| ch.is_ascii_digit())
-            .collect();
+        let digits: String = candidate.as_str().chars().filter(|ch| ch.is_ascii_digit()).collect();
         if (13..=19).contains(&digits.len()) && passes_luhn(&digits) {
             return true;
         }
@@ -247,12 +238,7 @@ mod tests {
         let result = filter.check(content, &source).await;
         assert!(!result.passed);
         assert!(result.issues.iter().any(|i| i.kind == SafetyIssueKind::Pii));
-        assert!(
-            result
-                .issues
-                .iter()
-                .any(|i| i.kind == SafetyIssueKind::PromptInjection)
-        );
+        assert!(result.issues.iter().any(|i| i.kind == SafetyIssueKind::PromptInjection));
     }
 
     #[test]
@@ -269,11 +255,7 @@ mod tests {
 
     #[test]
     fn credit_card_detection_uses_luhn_validation() {
-        assert!(contains_credit_card_number(
-            "payment card 4111 1111 1111 1111"
-        ));
-        assert!(!contains_credit_card_number(
-            "random digits 1234 5678 9012 3456"
-        ));
+        assert!(contains_credit_card_number("payment card 4111 1111 1111 1111"));
+        assert!(!contains_credit_card_number("random digits 1234 5678 9012 3456"));
     }
 }

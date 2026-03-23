@@ -6,10 +6,7 @@ use std::io::{self, Write};
 
 /// Detect if the terminal supports kitty graphics protocol.
 pub fn supports_kitty_graphics() -> bool {
-    std::env::var("TERM_PROGRAM")
-        .map(|v| v == "kitty")
-        .unwrap_or(false)
-        || std::env::var("KITTY_PID").is_ok()
+    std::env::var("TERM_PROGRAM").map(|v| v == "kitty").unwrap_or(false) || std::env::var("KITTY_PID").is_ok()
 }
 
 /// Detect if the terminal supports iTerm2 inline image protocol.

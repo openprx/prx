@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::cron::{
-    CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
-    next_run_for_schedule, schedule_cron_expression, validate_schedule,
+    CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget, next_run_for_schedule,
+    schedule_cron_expression, validate_schedule,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -19,12 +19,7 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
     add_shell_job(config, None, schedule, command)
 }
 
-pub fn add_shell_job(
-    config: &Config,
-    name: Option<String>,
-    schedule: Schedule,
-    command: &str,
-) -> Result<CronJob> {
+pub fn add_shell_job(config: &Config, name: Option<String>, schedule: Schedule, command: &str) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
@@ -168,8 +163,7 @@ pub fn claim_job(config: &Config, job_id: &str) -> Result<bool> {
 }
 
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
-    let lim = i64::try_from(config.scheduler.max_tasks.max(1))
-        .context("Scheduler max_tasks overflows i64")?;
+    let lim = i64::try_from(config.scheduler.max_tasks.max(1)).context("Scheduler max_tasks overflows i64")?;
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
@@ -230,29 +224,30 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     }
 
     with_connection(config, |conn| {
-        let changed = conn.execute(
-            "UPDATE cron_jobs
+        let changed = conn
+            .execute(
+                "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                  session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
                  next_run = ?12
              WHERE id = ?13",
-            params![
-                job.expression,
-                job.command,
-                serde_json::to_string(&job.schedule)?,
-                job.job_type.as_str(),
-                job.prompt,
-                job.name,
-                job.session_target.as_str(),
-                job.model,
-                if job.enabled { 1 } else { 0 },
-                serde_json::to_string(&job.delivery)?,
-                if job.delete_after_run { 1 } else { 0 },
-                job.next_run.to_rfc3339(),
-                job.id,
-            ],
-        )
-        .context("Failed to update cron job")?;
+                params![
+                    job.expression,
+                    job.command,
+                    serde_json::to_string(&job.schedule)?,
+                    job.job_type.as_str(),
+                    job.prompt,
+                    job.name,
+                    job.session_target.as_str(),
+                    job.model,
+                    if job.enabled { 1 } else { 0 },
+                    serde_json::to_string(&job.delivery)?,
+                    if job.delete_after_run { 1 } else { 0 },
+                    job.next_run.to_rfc3339(),
+                    job.id,
+                ],
+            )
+            .context("Failed to update cron job")?;
         if changed == 0 {
             anyhow::bail!("cron job '{}' was deleted or modified concurrently", job.id);
         }
@@ -283,12 +278,7 @@ pub fn record_last_run(
     })
 }
 
-pub fn reschedule_after_run(
-    config: &Config,
-    job: &CronJob,
-    success: bool,
-    output: &str,
-) -> Result<()> {
+pub fn reschedule_after_run(config: &Config, job: &CronJob, success: bool, output: &str) -> Result<()> {
     let now = Utc::now();
     let next_run = next_run_for_schedule(&job.schedule, now)?;
     let status = if success { "ok" } else { "error" };
@@ -299,13 +289,7 @@ pub fn reschedule_after_run(
             "UPDATE cron_jobs
              SET next_run = ?1, last_run = ?2, last_status = ?3, last_output = ?4
              WHERE id = ?5",
-            params![
-                next_run.to_rfc3339(),
-                now.to_rfc3339(),
-                status,
-                bounded_output,
-                job.id
-            ],
+            params![next_run.to_rfc3339(), now.to_rfc3339(), status, bounded_output, job.id],
         )
         .context("Failed to update cron job run state")?;
         Ok(())
@@ -356,8 +340,7 @@ pub fn record_run(
         )
         .context("Failed to prune cron run history")?;
 
-        tx.commit()
-            .context("Failed to commit cron run transaction")?;
+        tx.commit().context("Failed to commit cron run transaction")?;
         Ok(())
     })
 }
@@ -396,10 +379,8 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
             Ok(CronRun {
                 id: row.get(0)?,
                 job_id: row.get(1)?,
-                started_at: parse_rfc3339(&row.get::<_, String>(2)?)
-                    .map_err(sql_conversion_error)?,
-                finished_at: parse_rfc3339(&row.get::<_, String>(3)?)
-                    .map_err(sql_conversion_error)?,
+                started_at: parse_rfc3339(&row.get::<_, String>(2)?).map_err(sql_conversion_error)?,
+                finished_at: parse_rfc3339(&row.get::<_, String>(3)?).map_err(sql_conversion_error)?,
                 status: row.get(4)?,
                 output: row.get(5)?,
                 duration_ms: row.get(6)?,
@@ -415,8 +396,8 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
 }
 
 fn parse_rfc3339(raw: &str) -> Result<DateTime<Utc>> {
-    let parsed = DateTime::parse_from_rfc3339(raw)
-        .with_context(|| format!("Invalid RFC3339 timestamp in cron DB: {raw}"))?;
+    let parsed =
+        DateTime::parse_from_rfc3339(raw).with_context(|| format!("Invalid RFC3339 timestamp in cron DB: {raw}"))?;
     Ok(parsed.with_timezone(&Utc))
 }
 
@@ -427,8 +408,7 @@ fn sql_conversion_error(err: anyhow::Error) -> rusqlite::Error {
 fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let expression: String = row.get(1)?;
     let schedule_raw: Option<String> = row.get(3)?;
-    let schedule =
-        decode_schedule(schedule_raw.as_deref(), &expression).map_err(sql_conversion_error)?;
+    let schedule = decode_schedule(schedule_raw.as_deref(), &expression).map_err(sql_conversion_error)?;
 
     let delivery_raw: Option<String> = row.get(10)?;
     let delivery = decode_delivery(delivery_raw.as_deref()).map_err(sql_conversion_error)?;
@@ -506,14 +486,9 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
 
     // Tolerate "duplicate column name" errors to handle the race where
     // another process adds the column between our PRAGMA check and ALTER.
-    match conn.execute(
-        &format!("ALTER TABLE cron_jobs ADD COLUMN {name} {sql_type}"),
-        [],
-    ) {
+    match conn.execute(&format!("ALTER TABLE cron_jobs ADD COLUMN {name} {sql_type}"), []) {
         Ok(_) => Ok(()),
-        Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
-            if msg.contains("duplicate column name") =>
-        {
+        Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
             tracing::debug!("Column cron_jobs.{name} already exists (concurrent migration): {err}");
             Ok(())
         }
@@ -528,8 +503,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             .with_context(|| format!("Failed to create cron directory: {}", parent.display()))?;
     }
 
-    let conn = Connection::open(&db_path)
-        .with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
+    let conn = Connection::open(&db_path).with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
 
     // Avoid SQLITE_BUSY under concurrent scheduler + CLI access
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -702,10 +676,7 @@ mod tests {
                     (Utc::now() + ChronoDuration::minutes(5)).to_rfc3339(),
                 ],
             )?;
-            conn.execute(
-                "UPDATE cron_jobs SET schedule = NULL WHERE id = 'legacy-id'",
-                [],
-            )?;
+            conn.execute("UPDATE cron_jobs SET schedule = NULL WHERE id = 'legacy-id'", [])?;
             Ok(())
         })
         .unwrap();
@@ -761,16 +732,7 @@ mod tests {
         let job = add_job(&config, "*/5 * * * *", "echo trunc").unwrap();
         let output = "x".repeat(MAX_CRON_OUTPUT_BYTES + 512);
 
-        record_run(
-            &config,
-            &job.id,
-            Utc::now(),
-            Utc::now(),
-            "ok",
-            Some(&output),
-            1,
-        )
-        .unwrap();
+        record_run(&config, &job.id, Utc::now(), Utc::now(), "ok", Some(&output), 1).unwrap();
 
         let runs = list_runs(&config, &job.id, 1).unwrap();
         let stored = runs[0].output.as_deref().unwrap_or_default();

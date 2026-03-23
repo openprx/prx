@@ -17,10 +17,7 @@ pub(super) struct StatusResponse {
 
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     let config = state.config.lock().clone();
-    let model = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| state.model.clone());
+    let model = config.default_model.clone().unwrap_or_else(|| state.model.clone());
 
     let availability = crate::providers::summarize_provider_availability(
         config.default_provider.as_deref().unwrap_or("openrouter"),

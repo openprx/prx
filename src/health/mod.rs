@@ -46,15 +46,13 @@ where
 {
     let mut map = registry().components.lock();
     let now = now_rfc3339();
-    let entry = map
-        .entry(component.to_string())
-        .or_insert_with(|| ComponentHealth {
-            status: "starting".into(),
-            updated_at: now.clone(),
-            last_ok: None,
-            last_error: None,
-            restart_count: 0,
-        });
+    let entry = map.entry(component.to_string()).or_insert_with(|| ComponentHealth {
+        status: "starting".into(),
+        updated_at: now.clone(),
+        last_ok: None,
+        last_error: None,
+        restart_count: 0,
+    });
     update(entry);
     entry.updated_at = now;
 }

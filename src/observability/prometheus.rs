@@ -1,7 +1,5 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
-use prometheus::{
-    Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder,
-};
+use prometheus::{Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder};
 
 /// Prometheus-backed observer — exposes metrics for scraping via `/metrics`.
 pub struct PrometheusObserver {
@@ -78,8 +76,7 @@ impl PrometheusObserver {
         .expect("valid metric");
 
         let heartbeat_ticks =
-            prometheus::IntCounter::new("prx_heartbeat_ticks_total", "Total heartbeat ticks")
-                .expect("valid metric");
+            prometheus::IntCounter::new("prx_heartbeat_ticks_total", "Total heartbeat ticks").expect("valid metric");
 
         let errors = IntCounterVec::new(
             prometheus::Opts::new("prx_errors_total", "Total errors by component"),
@@ -88,21 +85,15 @@ impl PrometheusObserver {
         .expect("valid metric");
 
         let agent_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "prx_agent_duration_seconds",
-                "Agent invocation duration in seconds",
-            )
-            .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+            HistogramOpts::new("prx_agent_duration_seconds", "Agent invocation duration in seconds")
+                .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
             &["provider", "model"],
         )
         .expect("valid metric");
 
         let tool_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "prx_tool_duration_seconds",
-                "Tool execution duration in seconds",
-            )
-            .buckets(vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]),
+            HistogramOpts::new("prx_tool_duration_seconds", "Tool execution duration in seconds")
+                .buckets(vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]),
             &["tool"],
         )
         .expect("valid metric");
@@ -114,8 +105,7 @@ impl PrometheusObserver {
         .expect("valid metric");
 
         let tokens_used =
-            prometheus::IntGauge::new("prx_tokens_used_last", "Tokens used in the last request")
-                .expect("valid metric");
+            prometheus::IntGauge::new("prx_tokens_used_last", "Tokens used in the last request").expect("valid metric");
 
         let active_sessions = GaugeVec::new(
             prometheus::Opts::new("prx_active_sessions", "Number of active sessions"),
@@ -123,11 +113,8 @@ impl PrometheusObserver {
         )
         .expect("valid metric");
 
-        let queue_depth = GaugeVec::new(
-            prometheus::Opts::new("prx_queue_depth", "Message queue depth"),
-            &[],
-        )
-        .expect("valid metric");
+        let queue_depth =
+            GaugeVec::new(prometheus::Opts::new("prx_queue_depth", "Message queue depth"), &[]).expect("valid metric");
 
         // Register all metrics
         registry.register(Box::new(agent_starts.clone())).ok();
@@ -182,9 +169,7 @@ impl Observer for PrometheusObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
             ObserverEvent::AgentStart { provider, model } => {
-                self.agent_starts
-                    .with_label_values(&[provider, model])
-                    .inc();
+                self.agent_starts.with_label_values(&[provider, model]).inc();
             }
             ObserverEvent::AgentEnd {
                 provider,
@@ -211,9 +196,7 @@ impl Observer for PrometheusObserver {
                 success,
             } => {
                 let success_str = if *success { "true" } else { "false" };
-                self.tool_calls
-                    .with_label_values(&[tool.as_str(), success_str])
-                    .inc();
+                self.tool_calls.with_label_values(&[tool.as_str(), success_str]).inc();
                 self.tool_duration
                     .with_label_values(&[tool.as_str()])
                     .observe(duration.as_secs_f64());
@@ -226,9 +209,7 @@ impl Observer for PrometheusObserver {
                 rollback,
                 ..
             } => {
-                self.tool_batches
-                    .with_label_values(&[rollout_stage.as_str()])
-                    .inc();
+                self.tool_batches.with_label_values(&[rollout_stage.as_str()]).inc();
                 self.tool_timeouts
                     .with_label_values(&[rollout_stage.as_str()])
                     .inc_by(u64::try_from(*timeout_count).unwrap_or(u64::MAX));
@@ -236,28 +217,19 @@ impl Observer for PrometheusObserver {
                     .with_label_values(&[rollout_stage.as_str()])
                     .inc_by(u64::try_from(*cancel_count).unwrap_or(u64::MAX));
                 if *degraded {
-                    self.tool_degrades
-                        .with_label_values(&[rollout_stage.as_str()])
-                        .inc();
+                    self.tool_degrades.with_label_values(&[rollout_stage.as_str()]).inc();
                 }
                 if *rollback {
-                    self.tool_rollbacks
-                        .with_label_values(&[rollout_stage.as_str()])
-                        .inc();
+                    self.tool_rollbacks.with_label_values(&[rollout_stage.as_str()]).inc();
                 }
             }
             ObserverEvent::ChannelMessage { channel, direction } => {
-                self.channel_messages
-                    .with_label_values(&[channel, direction])
-                    .inc();
+                self.channel_messages.with_label_values(&[channel, direction]).inc();
             }
             ObserverEvent::HeartbeatTick => {
                 self.heartbeat_ticks.inc();
             }
-            ObserverEvent::Error {
-                component,
-                message: _,
-            } => {
+            ObserverEvent::Error { component, message: _ } => {
                 self.errors.with_label_values(&[component]).inc();
             }
         }
@@ -272,14 +244,10 @@ impl Observer for PrometheusObserver {
                 self.tokens_used.set(i64::try_from(*t).unwrap_or(i64::MAX));
             }
             ObserverMetric::ActiveSessions(s) => {
-                self.active_sessions
-                    .with_label_values(&[] as &[&str])
-                    .set(*s as f64);
+                self.active_sessions.with_label_values(&[] as &[&str]).set(*s as f64);
             }
             ObserverMetric::QueueDepth(d) => {
-                self.queue_depth
-                    .with_label_values(&[] as &[&str])
-                    .set(*d as f64);
+                self.queue_depth.with_label_values(&[] as &[&str]).set(*d as f64);
             }
         }
     }

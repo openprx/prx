@@ -73,38 +73,32 @@ impl PolicyDecision {
 ///
 /// Map a tool name to the group(s) it belongs to. A tool may belong to at most one group
 /// for policy purposes.
-static TOOL_GROUPS: std::sync::LazyLock<HashMap<&'static str, &'static str>> =
-    std::sync::LazyLock::new(|| {
-        let mut m = HashMap::new();
-        // group:sessions
-        for tool in [
-            "sessions_list",
-            "sessions_send",
-            "sessions_history",
-            "sessions_spawn",
-        ] {
-            m.insert(tool, "sessions");
-        }
-        // group:automation
-        for tool in ["cron", "schedule", "gateway"] {
-            m.insert(tool, "automation");
-        }
-        // group:ui
-        for tool in ["canvas", "browser", "browser_open"] {
-            m.insert(tool, "ui");
-        }
-        // group:hardware
-        for tool in [
-            "nodes",
-            "hardware_read",
-            "hardware_write",
-            "hardware_gpio",
-            "hardware_serial",
-        ] {
-            m.insert(tool, "hardware");
-        }
-        m
-    });
+static TOOL_GROUPS: std::sync::LazyLock<HashMap<&'static str, &'static str>> = std::sync::LazyLock::new(|| {
+    let mut m = HashMap::new();
+    // group:sessions
+    for tool in ["sessions_list", "sessions_send", "sessions_history", "sessions_spawn"] {
+        m.insert(tool, "sessions");
+    }
+    // group:automation
+    for tool in ["cron", "schedule", "gateway"] {
+        m.insert(tool, "automation");
+    }
+    // group:ui
+    for tool in ["canvas", "browser", "browser_open"] {
+        m.insert(tool, "ui");
+    }
+    // group:hardware
+    for tool in [
+        "nodes",
+        "hardware_read",
+        "hardware_write",
+        "hardware_gpio",
+        "hardware_serial",
+    ] {
+        m.insert(tool, "hardware");
+    }
+    m
+});
 
 /// Look up which group a tool belongs to (if any).
 pub fn tool_group(tool_name: &str) -> Option<&'static str> {
@@ -161,10 +155,7 @@ impl PolicyPipeline {
     pub fn evaluate(&self, tool_name: &str, _ctx: &EvalContext) -> PolicyDecision {
         let mut layers = Vec::new();
         let mut current_allowed = self.config.default_allow();
-        let mut reason = format!(
-            "global default: {}",
-            if current_allowed { "allow" } else { "deny" }
-        );
+        let mut reason = format!("global default: {}", if current_allowed { "allow" } else { "deny" });
         layers.push(PolicyLayer::Global);
 
         // Profile layer (future: check per-user/channel overrides)
@@ -226,11 +217,7 @@ mod tests {
     use crate::config::schema::ToolPolicyConfig;
     use std::collections::HashMap;
 
-    fn make_pipeline(
-        default: &str,
-        groups: HashMap<String, String>,
-        tools: HashMap<String, String>,
-    ) -> PolicyPipeline {
+    fn make_pipeline(default: &str, groups: HashMap<String, String>, tools: HashMap<String, String>) -> PolicyPipeline {
         PolicyPipeline::new(ToolPolicyConfig {
             default: default.to_string(),
             groups,

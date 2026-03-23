@@ -15,9 +15,7 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Embed a single text
     async fn embed_one(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         let mut results = self.embed(&[text]).await?;
-        results
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("Empty embedding result"))
+        results.pop().ok_or_else(|| anyhow::anyhow!("Empty embedding result"))
     }
 }
 
@@ -147,10 +145,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
                 .ok_or_else(|| anyhow::anyhow!("Invalid embedding item"))?;
 
             #[allow(clippy::cast_possible_truncation)]
-            let vec: Vec<f32> = embedding
-                .iter()
-                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                .collect();
+            let vec: Vec<f32> = embedding.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
 
             embeddings.push(vec);
         }
@@ -170,21 +165,11 @@ pub fn create_embedding_provider(
     match provider {
         "openai" => {
             let key = api_key.unwrap_or("");
-            Box::new(OpenAiEmbedding::new(
-                "https://api.openai.com",
-                key,
-                model,
-                dims,
-            ))
+            Box::new(OpenAiEmbedding::new("https://api.openai.com", key, model, dims))
         }
         "openrouter" => {
             let key = api_key.unwrap_or("");
-            Box::new(OpenAiEmbedding::new(
-                "https://openrouter.ai/api/v1",
-                key,
-                model,
-                dims,
-            ))
+            Box::new(OpenAiEmbedding::new("https://openrouter.ai/api/v1", key, model, dims))
         }
         name if name.starts_with("custom:") => {
             let base_url = name.strip_prefix("custom:").unwrap_or("");
@@ -228,12 +213,7 @@ mod tests {
 
     #[test]
     fn factory_openrouter() {
-        let p = create_embedding_provider(
-            "openrouter",
-            Some("sk-or-test"),
-            "openai/text-embedding-3-small",
-            1536,
-        );
+        let p = create_embedding_provider("openrouter", Some("sk-or-test"), "openai/text-embedding-3-small", 1536);
         assert_eq!(p.name(), "openai"); // uses OpenAiEmbedding internally
         assert_eq!(p.dimensions(), 1536);
     }
@@ -315,10 +295,7 @@ mod tests {
             "openai/text-embedding-3-small",
             1536,
         );
-        assert_eq!(
-            p.embeddings_url(),
-            "https://openrouter.ai/api/v1/embeddings"
-        );
+        assert_eq!(p.embeddings_url(), "https://openrouter.ai/api/v1/embeddings");
     }
 
     #[test]
@@ -335,29 +312,13 @@ mod tests {
 
     #[test]
     fn embeddings_url_non_v1_api_path_uses_raw_suffix() {
-        let p = OpenAiEmbedding::new(
-            "https://api.example.com/api/coding/v3",
-            "key",
-            "model",
-            1536,
-        );
-        assert_eq!(
-            p.embeddings_url(),
-            "https://api.example.com/api/coding/v3/embeddings"
-        );
+        let p = OpenAiEmbedding::new("https://api.example.com/api/coding/v3", "key", "model", 1536);
+        assert_eq!(p.embeddings_url(), "https://api.example.com/api/coding/v3/embeddings");
     }
 
     #[test]
     fn embeddings_url_custom_full_endpoint() {
-        let p = OpenAiEmbedding::new(
-            "https://my-api.example.com/api/v2/embeddings",
-            "key",
-            "model",
-            1536,
-        );
-        assert_eq!(
-            p.embeddings_url(),
-            "https://my-api.example.com/api/v2/embeddings"
-        );
+        let p = OpenAiEmbedding::new("https://my-api.example.com/api/v2/embeddings", "key", "model", 1536);
+        assert_eq!(p.embeddings_url(), "https://my-api.example.com/api/v2/embeddings");
     }
 }

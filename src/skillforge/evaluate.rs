@@ -61,23 +61,14 @@ pub struct Evaluator {
 }
 
 /// Known-bad patterns in repo names / descriptions (matched as whole words).
-const BAD_PATTERNS: &[&str] = &[
-    "malware",
-    "exploit",
-    "hack",
-    "crack",
-    "keygen",
-    "ransomware",
-    "trojan",
-];
+const BAD_PATTERNS: &[&str] = &["malware", "exploit", "hack", "crack", "keygen", "ransomware", "trojan"];
 
 /// Check if `haystack` contains `word` as a whole word (bounded by non-alphanumeric chars).
 fn contains_word(haystack: &str, word: &str) -> bool {
     for (i, _) in haystack.match_indices(word) {
         let before_ok = i == 0 || !haystack.as_bytes()[i - 1].is_ascii_alphanumeric();
         let after = i + word.len();
-        let after_ok =
-            after >= haystack.len() || !haystack.as_bytes()[after].is_ascii_alphanumeric();
+        let after_ok = after >= haystack.len() || !haystack.as_bytes()[after].is_ascii_alphanumeric();
         if before_ok && after_ok {
             return true;
         }
@@ -216,11 +207,7 @@ mod tests {
         c.name = "malware-skill".into();
         let res = eval.evaluate(c);
         // 0.5 base + 0.3 license - 0.5 bad_pattern + 0.2 recency = 0.5
-        assert!(
-            res.scores.security <= 0.5,
-            "security: {}",
-            res.scores.security
-        );
+        assert!(res.scores.security <= 0.5, "security: {}", res.scores.security);
     }
 
     #[test]
@@ -248,11 +235,7 @@ mod tests {
         c.description = "Tools for hackathons and lifehacks".into();
         let res = eval.evaluate(c);
         // "hack" should NOT match "hackathon" or "lifehacks"
-        assert!(
-            res.scores.security >= 0.5,
-            "security: {}",
-            res.scores.security
-        );
+        assert!(res.scores.security >= 0.5, "security: {}", res.scores.security);
     }
 
     #[test]
@@ -263,10 +246,6 @@ mod tests {
         c.updated_at = None;
         let res = eval.evaluate(c);
         // 0.5 base + 0.0 license - 0.5 bad_pattern + 0.0 recency = 0.0
-        assert!(
-            res.scores.security < 0.5,
-            "security: {}",
-            res.scores.security
-        );
+        assert!(res.scores.security < 0.5, "security: {}", res.scores.security);
     }
 }

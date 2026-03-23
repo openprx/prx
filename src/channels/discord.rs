@@ -122,11 +122,7 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
-fn normalize_incoming_content(
-    content: &str,
-    mention_only: bool,
-    bot_user_id: &str,
-) -> Option<String> {
+fn normalize_incoming_content(content: &str, mention_only: bool, bot_user_id: &str) -> Option<String> {
     if content.is_empty() {
         return None;
     }
@@ -198,10 +194,7 @@ impl Channel for DiscordChannel {
         let chunks = split_message_for_discord(&message.content);
 
         for (i, chunk) in chunks.iter().enumerate() {
-            let url = format!(
-                "https://discord.com/api/v10/channels/{}/messages",
-                message.recipient
-            );
+            let url = format!("https://discord.com/api/v10/channels/{}/messages", message.recipient);
 
             let body = json!({ "content": chunk });
 
@@ -256,8 +249,7 @@ impl Channel for DiscordChannel {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(2 * 1024 * 1024); // 2 MB — chat messages are small
         ws_config.max_frame_size = Some(1024 * 1024); // 1 MB per frame
-        let (ws_stream, _) =
-            tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_config), false).await?;
+        let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_config), false).await?;
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)
@@ -282,9 +274,7 @@ impl Channel for DiscordChannel {
                 }
             }
         });
-        write
-            .send(Message::Text(identify.to_string().into()))
-            .await?;
+        write.send(Message::Text(identify.to_string().into())).await?;
 
         tracing::info!("Discord: connected and identified");
 
@@ -539,13 +529,7 @@ mod tests {
 
     #[test]
     fn specific_allowlist_filters() {
-        let ch = DiscordChannel::new(
-            "fake".into(),
-            None,
-            vec!["111".into(), "222".into()],
-            false,
-            false,
-        );
+        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into(), "222".into()], false, false);
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("222"));
         assert!(!ch.is_user_allowed("333"));
@@ -568,13 +552,7 @@ mod tests {
 
     #[test]
     fn allowlist_with_wildcard_and_specific() {
-        let ch = DiscordChannel::new(
-            "fake".into(),
-            None,
-            vec!["111".into(), "*".into()],
-            false,
-            false,
-        );
+        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into(), "*".into()], false, false);
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("anyone_else"));
     }
@@ -896,10 +874,7 @@ mod tests {
         msg.push_str(&"x".repeat(1990));
         msg.push_str("\n```\nMore text after code block");
         let parts = split_message_for_discord(&msg);
-        assert!(
-            parts.len() >= 2,
-            "code block spanning boundary should split"
-        );
+        assert!(parts.len() >= 2, "code block spanning boundary should split");
         for part in &parts {
             assert!(
                 part.len() <= DISCORD_MAX_MESSAGE_LENGTH,

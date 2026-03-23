@@ -15,15 +15,14 @@ pub mod renderer;
 pub mod tui;
 
 use crate::agent::loop_::{
-    ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig, build_context,
-    build_runtime_system_prompt, increment_recalled_useful_counts, is_tool_loop_cancelled,
-    run_tool_call_loop, select_prompt_skills,
+    ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig, build_context, build_runtime_system_prompt,
+    increment_recalled_useful_counts, is_tool_loop_cancelled, run_tool_call_loop, select_prompt_skills,
 };
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
 use crate::channels::{
-    Channel, SendMessage, TerminalChannel, extract_tool_context_summary,
-    is_context_window_overflow_error, sanitize_channel_response,
+    Channel, SendMessage, TerminalChannel, extract_tool_context_summary, is_context_window_overflow_error,
+    sanitize_channel_response,
 };
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
@@ -161,12 +160,8 @@ pub async fn run(
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
     let hooks = HookManager::new(config.workspace_dir.clone());
-    let runtime: Arc<dyn runtime::RuntimeAdapter> =
-        Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
 
     // ── Memory ───────────────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
@@ -348,8 +343,7 @@ pub async fn run(
     // Tracks the timestamp (ms) of the last Ctrl+C press for double-press detection.
     let last_ctrlc_ms = Arc::new(AtomicU64::new(0));
     // The active cancellation token for the current generation turn (if any).
-    let active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>> =
-        Arc::new(parking_lot::Mutex::new(None));
+    let active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>> = Arc::new(parking_lot::Mutex::new(None));
 
     // Persistent Ctrl+C handler: runs for the entire chat session.
     // - If a generation is active: cancel it (first press) or exit (double press).
@@ -384,8 +378,7 @@ pub async fn run(
     // SIGTERM handler: signal graceful shutdown.
     #[cfg(unix)]
     {
-        let sigterm_result =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        let sigterm_result = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
         match sigterm_result {
             Ok(mut sigterm) => {
                 let shutdown_signal = shutdown.clone();
@@ -463,8 +456,7 @@ pub async fn run(
         }
 
         // Inject memory context
-        let mem_context =
-            build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+        let mem_context = build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
         let context = mem_context.preamble.clone();
         let enriched = if context.is_empty() {
             user_input.clone()
@@ -473,8 +465,7 @@ pub async fn run(
         };
 
         // Build system prompt with skill selection
-        let selected_skills =
-            select_prompt_skills(&user_input, &skills, &config, skill_embedder.as_ref()).await;
+        let selected_skills = select_prompt_skills(&user_input, &skills, &config, skill_embedder.as_ref()).await;
         let system_prompt = build_runtime_system_prompt(
             &config,
             model_name,
@@ -493,8 +484,7 @@ pub async fn run(
         // ── Set active recipient/channel on tools (for proactive messaging) ──
         for tool in &tools_registry {
             tool.set_active_recipient("user").await;
-            tool.set_active_channel(Arc::clone(&terminal) as Arc<dyn Channel>)
-                .await;
+            tool.set_active_channel(Arc::clone(&terminal) as Arc<dyn Channel>).await;
         }
 
         // ── Streaming pipeline setup ─────────────────────────────
@@ -521,10 +511,7 @@ pub async fn run(
                 let mut accumulated = String::new();
                 while let Some(delta) = rx.recv().await {
                     accumulated.push_str(&delta);
-                    if let Err(e) = channel
-                        .update_draft(&reply_target, &draft_id_owned, &accumulated)
-                        .await
-                    {
+                    if let Err(e) = channel.update_draft(&reply_target, &draft_id_owned, &accumulated).await {
                         tracing::debug!("Draft update failed: {e}");
                     }
                 }
@@ -532,30 +519,23 @@ pub async fn run(
         } else {
             // No draft — consume delta_rx so the sender doesn't block
             let mut rx = delta_rx;
-            Some(tokio::spawn(
-                async move { while rx.recv().await.is_some() {} },
-            ))
+            Some(tokio::spawn(async move { while rx.recv().await.is_some() {} }))
         };
 
         // Register this turn's cancellation token so the Ctrl+C handler can cancel it.
         *active_cancel.lock() = Some(cancellation.clone());
 
         // ── Tool event forwarding (visual feedback in terminal) ──
-        let (tool_event_tx, mut tool_event_rx) =
-            mpsc::channel::<ToolCallNotification>(TOOL_EVENT_CHANNEL_CAPACITY);
+        let (tool_event_tx, mut tool_event_rx) = mpsc::channel::<ToolCallNotification>(TOOL_EVENT_CHANNEL_CAPACITY);
         let terminal_for_tools = Arc::clone(&terminal);
         let tool_event_forwarder = tokio::spawn(async move {
             while let Some(notif) = tool_event_rx.recv().await {
                 match notif {
                     ToolCallNotification::Started { name, args_summary } => {
-                        terminal_for_tools
-                            .notify_tool_started(&name, &args_summary)
-                            .await;
+                        terminal_for_tools.notify_tool_started(&name, &args_summary).await;
                     }
                     ToolCallNotification::Finished { name, success } => {
-                        terminal_for_tools
-                            .notify_tool_finished(&name, success)
-                            .await;
+                        terminal_for_tools.notify_tool_finished(&name, success).await;
                     }
                 }
             }
@@ -574,12 +554,8 @@ pub async fn run(
 
         // ── Timeout budget ───────────────────────────────────────
         let timeout_budget = {
-            let base = config
-                .channels_config
-                .message_timeout_secs
-                .max(TIMEOUT_MIN_BASE_SECS);
-            let scale =
-                (config.agent.max_tool_iterations.max(1) as u64).min(TIMEOUT_MAX_SCALE_FACTOR);
+            let base = config.channels_config.message_timeout_secs.max(TIMEOUT_MIN_BASE_SECS);
+            let scale = (config.agent.max_tool_iterations.max(1) as u64).min(TIMEOUT_MAX_SCALE_FACTOR);
             Duration::from_secs(base.saturating_mul(scale))
         };
 
@@ -627,15 +603,9 @@ pub async fn run(
                         rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
                         rollout_channels: config.agent.concurrency_rollout_channels.clone(),
                         auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-                        rollback_timeout_rate_threshold: config
-                            .agent
-                            .concurrency_rollback_timeout_rate_threshold,
-                        rollback_cancel_rate_threshold: config
-                            .agent
-                            .concurrency_rollback_cancel_rate_threshold,
-                        rollback_error_rate_threshold: config
-                            .agent
-                            .concurrency_rollback_error_rate_threshold,
+                        rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
+                        rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
+                        rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
                     },
                     Some(&config.agent.compaction),
                     Some(cancellation.clone()),
@@ -678,8 +648,7 @@ pub async fn run(
                 // ── Context window overflow → compact + retry ─────
                 Ok(Err(ref e)) if is_context_window_overflow_error(e) => {
                     compact_chat_history(&mut history);
-                    let compacted_chars: usize =
-                        history.iter().map(|m| m.content.chars().count()).sum();
+                    let compacted_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
                     tracing::warn!(
                         retries = context_overflow_retries,
                         compacted_chars,
@@ -775,10 +744,7 @@ pub async fn run(
 
         // Finalize the streaming draft with the full response
         if let Some(ref d_id) = draft_id {
-            if let Err(e) = terminal
-                .finalize_draft("user", d_id, display_response)
-                .await
-            {
+            if let Err(e) = terminal.finalize_draft("user", d_id, display_response).await {
                 tracing::warn!("Failed to finalize draft: {e}");
                 let rendered = render_response(display_response);
                 let _ = terminal.send(&SendMessage::new(rendered, "user")).await;
@@ -835,10 +801,7 @@ pub async fn run(
 fn render_response(response: &str) -> String {
     #[cfg(feature = "terminal-tui")]
     {
-        format!(
-            "\n{}\n",
-            renderer::render_markdown_with_highlighting(response)
-        )
+        format!("\n{}\n", renderer::render_markdown_with_highlighting(response))
     }
     #[cfg(not(feature = "terminal-tui"))]
     {
@@ -850,17 +813,10 @@ fn render_response(response: &str) -> String {
 
 /// Save a session to the Memory backend.
 async fn save_session(mem: &dyn Memory, session: &session::ChatSession) -> Result<()> {
-    let json = session
-        .to_json()
-        .map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-    mem.store(
-        &session.memory_key(),
-        &json,
-        MemoryCategory::Conversation,
-        None,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("store: {e}"))?;
+    let json = session.to_json().map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+    mem.store(&session.memory_key(), &json, MemoryCategory::Conversation, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("store: {e}"))?;
     Ok(())
 }
 
@@ -873,10 +829,7 @@ async fn load_session_by_id(mem: &dyn Memory, id: &str) -> Option<session::ChatS
 
 /// Load the most recent session.
 async fn load_latest_session(mem: &dyn Memory) -> Option<session::ChatSession> {
-    let entries = mem
-        .list(Some(&MemoryCategory::Conversation), None)
-        .await
-        .ok()?;
+    let entries = mem.list(Some(&MemoryCategory::Conversation), None).await.ok()?;
     // Find entries with the session prefix, parse and sort by updated_at
     let mut sessions: Vec<session::ChatSession> = entries
         .iter()
@@ -907,11 +860,7 @@ async fn list_saved_sessions(mem: &dyn Memory) -> Result<()> {
 
     println!("Saved sessions:\n");
     for s in &sessions {
-        let title = if s.title.is_empty() {
-            "(untitled)"
-        } else {
-            &s.title
-        };
+        let title = if s.title.is_empty() { "(untitled)" } else { &s.title };
         println!(
             "  {} | {} | {} turns | {}",
             &s.id[..8.min(s.id.len())],

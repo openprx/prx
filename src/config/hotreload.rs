@@ -71,11 +71,7 @@ impl HotReloadManager {
 
 // ── watcher implementation ────────────────────────────────────────────────────
 
-fn run_watcher(
-    config_path: PathBuf,
-    shared: SharedConfig,
-    reload_version: Arc<AtomicU64>,
-) -> anyhow::Result<()> {
+fn run_watcher(config_path: PathBuf, shared: SharedConfig, reload_version: Arc<AtomicU64>) -> anyhow::Result<()> {
     use notify::RecursiveMode;
     use notify_debouncer_mini::{DebounceEventResult, new_debouncer};
 
@@ -87,9 +83,7 @@ fn run_watcher(
         .unwrap_or_else(|| PathBuf::from("."));
 
     let mut debouncer = new_debouncer(debounce_ms, tx)?;
-    debouncer
-        .watcher()
-        .watch(&watch_root, RecursiveMode::Recursive)?;
+    debouncer.watcher().watch(&watch_root, RecursiveMode::Recursive)?;
 
     let mut last_content_hash = files::compute_config_fingerprint(&config_path).ok();
 
@@ -122,10 +116,7 @@ fn run_watcher(
                     }
                 };
 
-                if last_content_hash
-                    .as_ref()
-                    .is_some_and(|h| h == &content_hash)
-                {
+                if last_content_hash.as_ref().is_some_and(|h| h == &content_hash) {
                     tracing::debug!(
                         path = %config_path.display(),
                         "Config watcher event ignored (content unchanged)"
@@ -184,10 +175,7 @@ fn try_reload(config_path: &std::path::Path, shared: &SharedConfig) -> anyhow::R
     Ok(())
 }
 
-fn load_stable_config_snapshot(
-    config_path: &std::path::Path,
-    workspace_dir: PathBuf,
-) -> anyhow::Result<Config> {
+fn load_stable_config_snapshot(config_path: &std::path::Path, workspace_dir: PathBuf) -> anyhow::Result<Config> {
     const MAX_ATTEMPTS: usize = 3;
 
     for attempt in 1..=MAX_ATTEMPTS {
@@ -206,10 +194,7 @@ fn load_stable_config_snapshot(
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    anyhow::bail!(
-        "Config changed repeatedly while reloading: {}",
-        config_path.display()
-    );
+    anyhow::bail!("Config changed repeatedly while reloading: {}", config_path.display());
 }
 
 fn log_diff(old: &Config, fresh: &Config) {
@@ -233,12 +218,10 @@ fn log_diff(old: &Config, fresh: &Config) {
             old.agent.max_history_messages, fresh.agent.max_history_messages
         ));
     }
-    if old.agent.read_only_tool_concurrency_window != fresh.agent.read_only_tool_concurrency_window
-    {
+    if old.agent.read_only_tool_concurrency_window != fresh.agent.read_only_tool_concurrency_window {
         changes.push(format!(
             "agent.read_only_tool_concurrency_window: {} → {}",
-            old.agent.read_only_tool_concurrency_window,
-            fresh.agent.read_only_tool_concurrency_window
+            old.agent.read_only_tool_concurrency_window, fresh.agent.read_only_tool_concurrency_window
         ));
     }
     if old.agent.read_only_tool_timeout_secs != fresh.agent.read_only_tool_timeout_secs {
@@ -259,13 +242,10 @@ fn log_diff(old: &Config, fresh: &Config) {
             old.agent.low_priority_tools, fresh.agent.low_priority_tools
         ));
     }
-    if old.agent.concurrency_kill_switch_force_serial
-        != fresh.agent.concurrency_kill_switch_force_serial
-    {
+    if old.agent.concurrency_kill_switch_force_serial != fresh.agent.concurrency_kill_switch_force_serial {
         changes.push(format!(
             "agent.concurrency_kill_switch_force_serial: {} → {}",
-            old.agent.concurrency_kill_switch_force_serial,
-            fresh.agent.concurrency_kill_switch_force_serial
+            old.agent.concurrency_kill_switch_force_serial, fresh.agent.concurrency_kill_switch_force_serial
         ));
     }
     if old.agent.concurrency_rollout_stage != fresh.agent.concurrency_rollout_stage {
@@ -274,13 +254,10 @@ fn log_diff(old: &Config, fresh: &Config) {
             old.agent.concurrency_rollout_stage, fresh.agent.concurrency_rollout_stage
         ));
     }
-    if old.agent.concurrency_rollout_sample_percent
-        != fresh.agent.concurrency_rollout_sample_percent
-    {
+    if old.agent.concurrency_rollout_sample_percent != fresh.agent.concurrency_rollout_sample_percent {
         changes.push(format!(
             "agent.concurrency_rollout_sample_percent: {} → {}",
-            old.agent.concurrency_rollout_sample_percent,
-            fresh.agent.concurrency_rollout_sample_percent
+            old.agent.concurrency_rollout_sample_percent, fresh.agent.concurrency_rollout_sample_percent
         ));
     }
     if old.agent.concurrency_rollout_channels != fresh.agent.concurrency_rollout_channels {
@@ -289,16 +266,13 @@ fn log_diff(old: &Config, fresh: &Config) {
             old.agent.concurrency_rollout_channels, fresh.agent.concurrency_rollout_channels
         ));
     }
-    if old.agent.concurrency_auto_rollback_enabled != fresh.agent.concurrency_auto_rollback_enabled
-    {
+    if old.agent.concurrency_auto_rollback_enabled != fresh.agent.concurrency_auto_rollback_enabled {
         changes.push(format!(
             "agent.concurrency_auto_rollback_enabled: {} → {}",
-            old.agent.concurrency_auto_rollback_enabled,
-            fresh.agent.concurrency_auto_rollback_enabled
+            old.agent.concurrency_auto_rollback_enabled, fresh.agent.concurrency_auto_rollback_enabled
         ));
     }
-    if (old.agent.concurrency_rollback_timeout_rate_threshold
-        - fresh.agent.concurrency_rollback_timeout_rate_threshold)
+    if (old.agent.concurrency_rollback_timeout_rate_threshold - fresh.agent.concurrency_rollback_timeout_rate_threshold)
         .abs()
         > f64::EPSILON
     {
@@ -308,8 +282,7 @@ fn log_diff(old: &Config, fresh: &Config) {
             fresh.agent.concurrency_rollback_timeout_rate_threshold
         ));
     }
-    if (old.agent.concurrency_rollback_cancel_rate_threshold
-        - fresh.agent.concurrency_rollback_cancel_rate_threshold)
+    if (old.agent.concurrency_rollback_cancel_rate_threshold - fresh.agent.concurrency_rollback_cancel_rate_threshold)
         .abs()
         > f64::EPSILON
     {
@@ -319,15 +292,13 @@ fn log_diff(old: &Config, fresh: &Config) {
             fresh.agent.concurrency_rollback_cancel_rate_threshold
         ));
     }
-    if (old.agent.concurrency_rollback_error_rate_threshold
-        - fresh.agent.concurrency_rollback_error_rate_threshold)
+    if (old.agent.concurrency_rollback_error_rate_threshold - fresh.agent.concurrency_rollback_error_rate_threshold)
         .abs()
         > f64::EPSILON
     {
         changes.push(format!(
             "agent.concurrency_rollback_error_rate_threshold: {:.3} → {:.3}",
-            old.agent.concurrency_rollback_error_rate_threshold,
-            fresh.agent.concurrency_rollback_error_rate_threshold
+            old.agent.concurrency_rollback_error_rate_threshold, fresh.agent.concurrency_rollback_error_rate_threshold
         ));
     }
     if old.heartbeat.enabled != fresh.heartbeat.enabled {
@@ -337,10 +308,7 @@ fn log_diff(old: &Config, fresh: &Config) {
         ));
     }
     if old.cron.enabled != fresh.cron.enabled {
-        changes.push(format!(
-            "cron.enabled: {} → {}",
-            old.cron.enabled, fresh.cron.enabled
-        ));
+        changes.push(format!("cron.enabled: {} → {}", old.cron.enabled, fresh.cron.enabled));
     }
     if old.web_search.enabled != fresh.web_search.enabled {
         changes.push(format!(

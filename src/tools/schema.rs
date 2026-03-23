@@ -274,9 +274,7 @@ impl SchemaCleanr {
                 // Keep all other keys, cleaning nested objects/arrays recursively.
                 _ => {
                     let cleaned_value = match value {
-                        Value::Object(_) | Value::Array(_) => {
-                            Self::clean_with_defs(value, defs, strategy, ref_stack)
-                        }
+                        Value::Object(_) | Value::Array(_) => Self::clean_with_defs(value, defs, strategy, ref_stack),
                         other => other,
                     };
                     cleaned.insert(key, cleaned_value);
@@ -468,17 +466,11 @@ impl SchemaCleanr {
     /// Clean type array, removing null.
     fn clean_type_array(value: Value) -> Value {
         if let Value::Array(types) = value {
-            let non_null: Vec<Value> = types
-                .into_iter()
-                .filter(|v| v.as_str() != Some("null"))
-                .collect();
+            let non_null: Vec<Value> = types.into_iter().filter(|v| v.as_str() != Some("null")).collect();
 
             match non_null.len() {
                 0 => Value::String("null".to_string()),
-                1 => non_null
-                    .into_iter()
-                    .next()
-                    .unwrap_or(Value::String("null".to_string())),
+                1 => non_null.into_iter().next().unwrap_or(Value::String("null".to_string())),
                 _ => Value::Array(non_null),
             }
         } else {
@@ -748,11 +740,7 @@ mod tests {
                 .get("minLength")
                 .is_none()
         );
-        assert!(
-            cleaned["properties"]["user"]
-                .get("additionalProperties")
-                .is_none()
-        );
+        assert!(cleaned["properties"]["user"].get("additionalProperties").is_none());
     }
 
     #[test]

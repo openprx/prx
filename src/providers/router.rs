@@ -79,10 +79,7 @@ impl RouterProvider {
             if let Some((idx, resolved_model)) = self.routes.get(hint) {
                 return (*idx, resolved_model.clone());
             }
-            tracing::warn!(
-                hint = hint,
-                "Unknown route hint, falling back to default provider"
-            );
+            tracing::warn!(hint = hint, "Unknown route hint, falling back to default provider");
         }
 
         // Not a hint or hint not found — use default provider with the model as-is
@@ -121,17 +118,10 @@ impl Provider for RouterProvider {
     ) -> anyhow::Result<String> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
-        provider
-            .chat_with_history(messages, &resolved_model, temperature)
-            .await
+        provider.chat_with_history(messages, &resolved_model, temperature).await
     }
 
-    async fn chat(
-        &self,
-        request: ChatRequest<'_>,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
+    async fn chat(&self, request: ChatRequest<'_>, model: &str, temperature: f64) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
         provider.chat(request, &resolved_model, temperature).await
@@ -158,9 +148,7 @@ impl Provider for RouterProvider {
     }
 
     fn supports_vision(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+        self.providers.iter().any(|(_, provider)| provider.supports_vision())
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -252,12 +240,7 @@ mod tests {
         let provider_list: Vec<(String, Box<dyn Provider>)> = providers
             .iter()
             .zip(mocks.iter())
-            .map(|((name, _), mock)| {
-                (
-                    name.to_string(),
-                    Box::new(Arc::clone(mock)) as Box<dyn Provider>,
-                )
-            })
+            .map(|((name, _), mock)| (name.to_string(), Box::new(Arc::clone(mock)) as Box<dyn Provider>))
             .collect();
 
         let route_list: Vec<(String, Route)> = routes
@@ -298,16 +281,10 @@ mod tests {
     async fn routes_hint_to_correct_provider() {
         let (router, mocks) = make_router(
             vec![("fast", "fast-response"), ("smart", "smart-response")],
-            vec![
-                ("fast", "fast", "llama-3-70b"),
-                ("reasoning", "smart", "claude-opus"),
-            ],
+            vec![("fast", "fast", "llama-3-70b"), ("reasoning", "smart", "claude-opus")],
         );
 
-        let result = router
-            .simple_chat("hello", "hint:reasoning", 0.5)
-            .await
-            .unwrap();
+        let result = router.simple_chat("hello", "hint:reasoning", 0.5).await.unwrap();
         assert_eq!(result, "smart-response");
         assert_eq!(mocks[1].call_count(), 1);
         assert_eq!(mocks[1].last_model(), "claude-opus");
@@ -334,10 +311,7 @@ mod tests {
             vec![],
         );
 
-        let result = router
-            .simple_chat("hello", "hint:nonexistent", 0.5)
-            .await
-            .unwrap();
+        let result = router.simple_chat("hello", "hint:nonexistent", 0.5).await.unwrap();
         assert_eq!(result, "default-response");
         assert_eq!(mocks[0].call_count(), 1);
         // Falls back to default with the hint as model name
@@ -347,10 +321,7 @@ mod tests {
     #[tokio::test]
     async fn non_hint_model_uses_default_provider() {
         let (router, mocks) = make_router(
-            vec![
-                ("primary", "primary-response"),
-                ("secondary", "secondary-response"),
-            ],
+            vec![("primary", "primary-response"), ("secondary", "secondary-response")],
             vec![("code", "secondary", "codellama")],
         );
 
@@ -386,10 +357,7 @@ mod tests {
 
     #[test]
     fn skips_routes_with_unknown_provider() {
-        let (router, _) = make_router(
-            vec![("default", "ok")],
-            vec![("broken", "nonexistent", "model")],
-        );
+        let (router, _) = make_router(vec![("default", "ok")], vec![("broken", "nonexistent", "model")]);
 
         // Route should not exist
         assert!(!router.routes.contains_key("broken"));
@@ -407,10 +375,7 @@ mod tests {
     async fn chat_with_system_passes_system_prompt() {
         let mock = Arc::new(MockProvider::new("response"));
         let router = RouterProvider::new(
-            vec![(
-                "default".into(),
-                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
-            )],
+            vec![("default".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
             vec![],
             "model".into(),
         );
@@ -427,10 +392,7 @@ mod tests {
     async fn chat_with_tools_delegates_to_resolved_provider() {
         let mock = Arc::new(MockProvider::new("tool-response"));
         let router = RouterProvider::new(
-            vec![(
-                "default".into(),
-                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
-            )],
+            vec![("default".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
             vec![],
             "model".into(),
         );
@@ -450,10 +412,7 @@ mod tests {
 
         // chat_with_tools should delegate through the router to the mock.
         // MockProvider's default chat_with_tools calls chat_with_history -> chat_with_system.
-        let result = router
-            .chat_with_tools(&messages, &tools, "model", 0.7)
-            .await
-            .unwrap();
+        let result = router.chat_with_tools(&messages, &tools, "model", 0.7).await.unwrap();
         assert_eq!(result.text.as_deref(), Some("tool-response"));
         assert_eq!(mock.call_count(), 1);
         assert_eq!(mock.last_model(), "model");
@@ -488,9 +447,7 @@ mod tests {
             vec![
                 (
                     "default".into(),
-                    Box::new(NativeCapabilityMock {
-                        native_tools: false,
-                    }) as Box<dyn Provider>,
+                    Box::new(NativeCapabilityMock { native_tools: false }) as Box<dyn Provider>,
                 ),
                 (
                     "alternate".into(),

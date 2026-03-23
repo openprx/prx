@@ -1,8 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::memory::Memory;
 use crate::memory::principal::{
-    ChatType, MemoryWriteContext, Principal, Role, Visibility, log_access, post_filter,
-    resolve_principal,
+    ChatType, MemoryWriteContext, Principal, Role, Visibility, log_access, post_filter, resolve_principal,
 };
 use crate::memory::topic;
 use async_trait::async_trait;
@@ -51,11 +50,10 @@ impl MemorySearchTool {
 
         let memory_dir = workspace.join("memory");
         if memory_dir.exists() && memory_dir.is_dir() {
-            for entry in std::fs::read_dir(memory_dir)
-                .map_err(|e| anyhow::anyhow!("Failed to read memory directory: {e}"))?
+            for entry in
+                std::fs::read_dir(memory_dir).map_err(|e| anyhow::anyhow!("Failed to read memory directory: {e}"))?
             {
-                let entry =
-                    entry.map_err(|e| anyhow::anyhow!("Failed to read memory entry: {e}"))?;
+                let entry = entry.map_err(|e| anyhow::anyhow!("Failed to read memory entry: {e}"))?;
                 let path = entry.path();
 
                 if !path.is_file() {
@@ -71,9 +69,8 @@ impl MemorySearchTool {
                     None => continue,
                 };
 
-                let resolved = std::fs::canonicalize(&path).map_err(|e| {
-                    anyhow::anyhow!("Failed to resolve memory file '{}': {e}", path.display())
-                })?;
+                let resolved = std::fs::canonicalize(&path)
+                    .map_err(|e| anyhow::anyhow!("Failed to resolve memory file '{}': {e}", path.display()))?;
 
                 if !resolved.starts_with(&workspace) {
                     continue;
@@ -119,10 +116,7 @@ fn compute_score(line: &str, terms: &[String]) -> f64 {
     }
 
     let haystack = line.to_lowercase();
-    let matched = terms
-        .iter()
-        .filter(|term| haystack.contains(term.as_str()))
-        .count();
+    let matched = terms.iter().filter(|term| haystack.contains(term.as_str())).count();
 
     if matched == 0 {
         0.0
@@ -155,9 +149,7 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
         return None;
     }
 
-    let scope = args
-        .get("_zc_scope")
-        .and_then(serde_json::Value::as_object)?;
+    let scope = args.get("_zc_scope").and_then(serde_json::Value::as_object)?;
 
     let channel = scope
         .get("channel")
@@ -194,11 +186,7 @@ fn fallback_principal(ctx: &MemoryWriteContext) -> Principal {
         blocked_patterns: Vec::new(),
         current_channel: ctx.channel.clone().unwrap_or_default(),
         current_chat_id: ctx.chat_id.clone().unwrap_or_default(),
-        current_chat_type: ctx
-            .chat_type
-            .as_deref()
-            .map(ChatType::from_str)
-            .unwrap_or(ChatType::Dm),
+        current_chat_type: ctx.chat_type.as_deref().map(ChatType::from_str).unwrap_or(ChatType::Dm),
         acl_enforced: true,
     }
 }
@@ -377,15 +365,8 @@ fn search_rows_with_scope(
 ) -> anyhow::Result<Vec<MatchRow>> {
     let terms = tokenize_query(query);
     let fts_rows = fetch_fts_with_scope(conn, query, max_results, scope_sql, scope_params)?;
-    let semantic_rows =
-        fetch_semantic_like_with_scope(conn, query, max_results, scope_sql, scope_params)?;
-    Ok(merge_results(
-        fts_rows,
-        semantic_rows,
-        &terms,
-        min_score,
-        max_results,
-    ))
+    let semantic_rows = fetch_semantic_like_with_scope(conn, query, max_results, scope_sql, scope_params)?;
+    Ok(merge_results(fts_rows, semantic_rows, &terms, min_score, max_results))
 }
 
 fn search_topic_rows_with_scope(
@@ -499,9 +480,7 @@ impl Tool for MemorySearchTool {
             Ok(conn) => conn,
             Err(error) => {
                 if self.acl_enabled {
-                    tracing::warn!(
-                        "memory_search sqlite open failed while acl is enabled: {error}"
-                    );
+                    tracing::warn!("memory_search sqlite open failed while acl is enabled: {error}");
                     return Ok(ToolResult {
                         success: true,
                         output: format!("No matches found for query: '{trimmed_query}'"),
@@ -522,16 +501,9 @@ impl Tool for MemorySearchTool {
         let (scope_sql, scope_params) = principal.build_sql_scope();
 
         if self.acl_enabled && principal.acl_enforced {
-            let scoped = search_rows_with_scope(
-                &conn,
-                trimmed_query,
-                max_results,
-                min_score,
-                &scope_sql,
-                &scope_params,
-            )?;
-            let scoped_topic =
-                search_topic_rows_with_scope(&conn, trimmed_query, &principal, max_results)?;
+            let scoped =
+                search_rows_with_scope(&conn, trimmed_query, max_results, min_score, &scope_sql, &scope_params)?;
+            let scoped_topic = search_topic_rows_with_scope(&conn, trimmed_query, &principal, max_results)?;
             let terms = tokenize_query(trimmed_query);
             let merged = merge_results(scoped, scoped_topic, &terms, min_score, max_results);
             let filtered = post_filter(merged, &principal, |row| row.content.as_str());
@@ -542,33 +514,19 @@ impl Tool for MemorySearchTool {
                 Some(trimmed_query),
                 None,
                 Some("acl_enforced"),
-                if filtered.is_empty() {
-                    "no_results"
-                } else {
-                    "allowed"
-                },
+                if filtered.is_empty() { "no_results" } else { "allowed" },
             );
             return Ok(render_search_result(trimmed_query, filtered));
         }
 
         // Observe mode: run ACL path for audit only, but return unfiltered results.
-        let scoped = search_rows_with_scope(
-            &conn,
-            trimmed_query,
-            max_results,
-            min_score,
-            &scope_sql,
-            &scope_params,
-        )?;
-        let scoped_topic =
-            search_topic_rows_with_scope(&conn, trimmed_query, &principal, max_results)?;
+        let scoped = search_rows_with_scope(&conn, trimmed_query, max_results, min_score, &scope_sql, &scope_params)?;
+        let scoped_topic = search_topic_rows_with_scope(&conn, trimmed_query, &principal, max_results)?;
         let terms = tokenize_query(trimmed_query);
         let scoped_all = merge_results(scoped, scoped_topic, &terms, min_score, max_results);
         let filtered = post_filter(scoped_all.clone(), &principal, |row| row.content.as_str());
-        let all_rows_base =
-            search_rows_with_scope(&conn, trimmed_query, max_results, min_score, "1=1", &[])?;
-        let all_topic =
-            search_topic_rows_with_scope(&conn, trimmed_query, &owner_principal(), max_results)?;
+        let all_rows_base = search_rows_with_scope(&conn, trimmed_query, max_results, min_score, "1=1", &[])?;
+        let all_topic = search_topic_rows_with_scope(&conn, trimmed_query, &owner_principal(), max_results)?;
         let all_rows = merge_results(all_rows_base, all_topic, &terms, min_score, max_results);
 
         let denied_by_scope = all_rows
@@ -621,9 +579,8 @@ impl MemorySearchTool {
 
         let mut matches: Vec<FallbackMatchRow> = Vec::new();
         for (relative_path, full_path) in files {
-            let contents = std::fs::read_to_string(&full_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read memory file '{}': {e}", full_path.display())
-            })?;
+            let contents = std::fs::read_to_string(&full_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read memory file '{}': {e}", full_path.display()))?;
             for (idx, line) in contents.lines().enumerate() {
                 let line_no = idx + 1;
                 let score = compute_score(line, &terms);
@@ -761,12 +718,7 @@ mod tests {
             .await
             .unwrap();
         memory
-            .store(
-                "daily_note",
-                "Daily note mentions tests",
-                MemoryCategory::Daily,
-                None,
-            )
+            .store("daily_note", "Daily note mentions tests", MemoryCategory::Daily, None)
             .await
             .unwrap();
 
@@ -1103,12 +1055,7 @@ mod tests {
             .await
             .unwrap();
         memory
-            .store(
-                "blocked_k",
-                "entry secret token",
-                MemoryCategory::Core,
-                None,
-            )
+            .store("blocked_k", "entry secret token", MemoryCategory::Core, None)
             .await
             .unwrap();
 

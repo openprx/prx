@@ -1,10 +1,9 @@
 use crate::config::Config;
 use crate::self_system::evolution::{
-    AsyncJsonlWriter, CircuitBreakerState, EvolutionAnalyzer, EvolutionConfig, EvolutionLayer,
-    EvolutionLog, EvolutionMode, EvolutionPipeline, EvolutionResult, EvolutionRetentionConfig,
-    EvolutionRuntimeConfig, EvolutionTrigger, JsonlRetentionPolicy, JsonlStoragePaths,
-    MemoryAccessLog, MemoryEvolutionEngine, PromptEvolutionEngine, StrategyEvolutionEngine,
-    new_shared_evolution_config,
+    AsyncJsonlWriter, CircuitBreakerState, EvolutionAnalyzer, EvolutionConfig, EvolutionLayer, EvolutionLog,
+    EvolutionMode, EvolutionPipeline, EvolutionResult, EvolutionRetentionConfig, EvolutionRuntimeConfig,
+    EvolutionTrigger, JsonlRetentionPolicy, JsonlStoragePaths, MemoryAccessLog, MemoryEvolutionEngine,
+    PromptEvolutionEngine, StrategyEvolutionEngine, new_shared_evolution_config,
 };
 use crate::{EvolutionCommands, EvolutionLayerArg};
 use anyhow::{Context, Result};
@@ -75,11 +74,7 @@ struct TriggerOutput {
     report: crate::self_system::evolution::PipelineRunReport,
 }
 
-pub async fn handle_command(
-    command: EvolutionCommands,
-    as_json: bool,
-    config: &Config,
-) -> Result<()> {
+pub async fn handle_command(command: EvolutionCommands, as_json: bool, config: &Config) -> Result<()> {
     match command {
         EvolutionCommands::Status => handle_status(as_json, config).await,
         EvolutionCommands::History { limit } => handle_history(as_json, config, limit).await,
@@ -93,10 +88,8 @@ async fn handle_status(as_json: bool, config: &Config) -> Result<()> {
     let (cfg, _path, _exists) = load_evolution_config(config).await?;
     let storage_root = resolve_storage_root(config, &cfg.runtime);
 
-    let decisions = read_all_jsonl::<crate::self_system::evolution::DecisionLog>(
-        &storage_root.join("decisions"),
-    )
-    .await?;
+    let decisions =
+        read_all_jsonl::<crate::self_system::evolution::DecisionLog>(&storage_root.join("decisions")).await?;
     let memory = read_all_jsonl::<MemoryAccessLog>(&storage_root.join("memory_access")).await?;
     let mut evolution = read_all_jsonl::<EvolutionLog>(&storage_root.join("evolution")).await?;
 
@@ -156,15 +149,9 @@ async fn handle_status(as_json: bool, config: &Config) -> Result<()> {
     if payload.recent_cycles.is_empty() {
         println!("(no evolution cycle logs found)");
     } else {
-        println!(
-            "{:<26} {:<10} {:<12} Result",
-            "Timestamp", "Layer", "Change"
-        );
+        println!("{:<26} {:<10} {:<12} Result", "Timestamp", "Layer", "Change");
         for row in &payload.recent_cycles {
-            let result = row
-                .result
-                .as_ref()
-                .map_or_else(|| "unknown".to_string(), debug_value);
+            let result = row.result.as_ref().map_or_else(|| "unknown".to_string(), debug_value);
             println!(
                 "{:<26} {:<10} {:<12} {}",
                 row.timestamp,
@@ -211,10 +198,7 @@ async fn handle_history(as_json: bool, config: &Config, limit: usize) -> Result<
         "Timestamp", "Layer", "Change", "Result"
     );
     for item in &payload.items {
-        let result = item
-            .result
-            .as_ref()
-            .map_or_else(|| "unknown".to_string(), debug_value);
+        let result = item.result.as_ref().map_or_else(|| "unknown".to_string(), debug_value);
         println!(
             "{:<26} {:<10} {:<10} {:<10} {}",
             item.timestamp,
@@ -285,11 +269,7 @@ async fn handle_config(as_json: bool, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn handle_trigger(
-    as_json: bool,
-    config: &Config,
-    layer: Option<EvolutionLayerArg>,
-) -> Result<()> {
+async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionLayerArg>) -> Result<()> {
     let (cfg, cfg_path, _exists) = load_evolution_config(config).await?;
     let shared = new_shared_evolution_config(cfg.clone());
 
@@ -303,20 +283,15 @@ async fn handle_trigger(
         .await?,
     );
 
-    let analyzer = Arc::new(EvolutionAnalyzer::new(
-        writer.clone(),
-        storage_root.join("analysis"),
-    ));
+    let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
     let writer_for_engine = writer.clone();
 
     let selected_layer = map_layer(layer);
-    let mut pipeline =
-        EvolutionPipeline::new(shared.clone(), analyzer, writer, &config.workspace_dir);
+    let mut pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer, &config.workspace_dir);
 
     let report = match selected_layer {
         EvolutionLayer::Memory => {
-            let mut engine =
-                MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer_for_engine.clone()))?;
+            let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer_for_engine.clone()))?;
             pipeline
                 .run_for_layer(
                     EvolutionTrigger::Manual,
@@ -327,11 +302,7 @@ async fn handle_trigger(
                 .await?
         }
         EvolutionLayer::Prompt => {
-            let mut engine = PromptEvolutionEngine::new(
-                shared,
-                &config.workspace_dir,
-                Some(writer_for_engine.clone()),
-            );
+            let mut engine = PromptEvolutionEngine::new(shared, &config.workspace_dir, Some(writer_for_engine.clone()));
             pipeline
                 .run_for_layer(
                     EvolutionTrigger::Manual,
@@ -342,8 +313,7 @@ async fn handle_trigger(
                 .await?
         }
         EvolutionLayer::Policy => {
-            let mut engine =
-                StrategyEvolutionEngine::new(shared, &config.workspace_dir, writer_for_engine)?;
+            let mut engine = StrategyEvolutionEngine::new(shared, &config.workspace_dir, writer_for_engine)?;
             pipeline
                 .run_for_layer(
                     EvolutionTrigger::Manual,
@@ -409,9 +379,7 @@ async fn load_evolution_config(config: &Config) -> Result<(EvolutionConfig, Path
 }
 
 fn discover_evolution_config_path(config: &Config) -> PathBuf {
-    if let Ok(raw) = std::env::var("OPENPRX_EVOLUTION_CONFIG")
-        .or_else(|_| std::env::var("ZEROCLAW_EVOLUTION_CONFIG"))
-    {
+    if let Ok(raw) = std::env::var("OPENPRX_EVOLUTION_CONFIG").or_else(|_| std::env::var("ZEROCLAW_EVOLUTION_CONFIG")) {
         let p = PathBuf::from(raw);
         if !p.as_os_str().is_empty() {
             return p;

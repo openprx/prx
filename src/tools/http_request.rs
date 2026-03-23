@@ -139,10 +139,7 @@ impl HttpRequestTool {
 
     fn truncate_response(&self, text: &str) -> String {
         if text.len() > self.max_response_size {
-            let mut truncated = text
-                .chars()
-                .take(self.max_response_size)
-                .collect::<String>();
+            let mut truncated = text.chars().take(self.max_response_size).collect::<String>();
             truncated.push_str("\n\n... [Response truncated due to size limit] ...");
             truncated
         } else {
@@ -239,10 +236,7 @@ impl Tool for HttpRequestTool {
 
         let request_headers = self.parse_headers(&headers_val);
 
-        match self
-            .execute_request(&url, method, request_headers, body)
-            .await
-        {
+        match self.execute_request(&url, method, request_headers, body).await {
             Ok(response) => {
                 let status = response.status();
                 let status_code = status.as_u16();
@@ -374,25 +368,16 @@ pub(crate) fn extract_host(url: &str) -> anyhow::Result<String> {
 }
 
 fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
+    allowed_domains
+        .iter()
+        .any(|domain| host == domain || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.')))
 }
 
 pub(crate) fn is_private_or_local_host(host: &str) -> bool {
     // Strip brackets from IPv6 addresses like [::1]
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
 
-    let has_local_tld = bare
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
+    let has_local_tld = bare.rsplit('.').next().is_some_and(|label| label == "local");
 
     if bare == "localhost" || bare.ends_with(".localhost") || has_local_tld {
         return true;
@@ -518,30 +503,21 @@ mod tests {
     #[test]
     fn validate_rejects_allowlist_miss() {
         let tool = test_tool(vec!["example.com"]);
-        let err = tool
-            .validate_url("https://google.com")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("https://google.com").unwrap_err().to_string();
         assert!(err.contains("allowed_domains"));
     }
 
     #[test]
     fn validate_rejects_localhost() {
         let tool = test_tool(vec!["localhost"]);
-        let err = tool
-            .validate_url("https://localhost:8080")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("https://localhost:8080").unwrap_err().to_string();
         assert!(err.contains("local/private"));
     }
 
     #[test]
     fn validate_rejects_private_ipv4() {
         let tool = test_tool(vec!["192.168.1.5"]);
-        let err = tool
-            .validate_url("https://192.168.1.5")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("https://192.168.1.5").unwrap_err().to_string();
         assert!(err.contains("local/private"));
     }
 
@@ -558,10 +534,7 @@ mod tests {
     #[test]
     fn validate_rejects_userinfo() {
         let tool = test_tool(vec!["example.com"]);
-        let err = tool
-            .validate_url("https://user@example.com")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("https://user@example.com").unwrap_err().to_string();
         assert!(err.contains("userinfo"));
     }
 
@@ -569,10 +542,7 @@ mod tests {
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
         let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30);
-        let err = tool
-            .validate_url("https://example.com")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("https://example.com").unwrap_err().to_string();
         assert!(err.contains("allowed_domains"));
     }
 
@@ -685,10 +655,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
-        let result = tool
-            .execute(json!({"url": "https://example.com"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"url": "https://example.com"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));
     }
@@ -700,10 +667,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
-        let result = tool
-            .execute(json!({"url": "https://example.com"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"url": "https://example.com"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("rate limit"));
     }
@@ -717,12 +681,7 @@ mod tests {
 
     #[test]
     fn truncate_response_over_limit() {
-        let tool = HttpRequestTool::new(
-            Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
-            10,
-            30,
-        );
+        let tool = HttpRequestTool::new(Arc::new(SecurityPolicy::default()), vec!["example.com".into()], 10, 30);
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
         assert!(truncated.len() <= 10 + 60); // limit + message
@@ -739,16 +698,8 @@ mod tests {
         });
         let parsed = tool.parse_headers(&headers);
         assert_eq!(parsed.len(), 3);
-        assert!(
-            parsed
-                .iter()
-                .any(|(k, v)| k == "Authorization" && v == "Bearer secret")
-        );
-        assert!(
-            parsed
-                .iter()
-                .any(|(k, v)| k == "X-API-Key" && v == "my-key")
-        );
+        assert!(parsed.iter().any(|(k, v)| k == "Authorization" && v == "Bearer secret"));
+        assert!(parsed.iter().any(|(k, v)| k == "X-API-Key" && v == "my-key"));
         assert!(
             parsed
                 .iter()
@@ -771,11 +722,7 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "Authorization" && v == "***REDACTED***")
         );
-        assert!(
-            redacted
-                .iter()
-                .any(|(k, v)| k == "X-API-Key" && v == "***REDACTED***")
-        );
+        assert!(redacted.iter().any(|(k, v)| k == "X-API-Key" && v == "***REDACTED***"));
         assert!(
             redacted
                 .iter()
@@ -898,10 +845,7 @@ mod tests {
     #[test]
     fn validate_rejects_ftp_scheme() {
         let tool = test_tool(vec!["example.com"]);
-        let err = tool
-            .validate_url("ftp://example.com")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("ftp://example.com").unwrap_err().to_string();
         assert!(err.contains("http://") || err.contains("https://"));
     }
 
@@ -915,10 +859,7 @@ mod tests {
     #[test]
     fn validate_rejects_ipv6_host() {
         let tool = test_tool(vec!["example.com"]);
-        let err = tool
-            .validate_url("http://[::1]:8080/path")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("http://[::1]:8080/path").unwrap_err().to_string();
         assert!(err.contains("IPv6"));
     }
 }

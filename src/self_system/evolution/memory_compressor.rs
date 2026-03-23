@@ -113,11 +113,7 @@ impl<D: SimilarityDetector> MemoryCompressor<D> {
     }
 
     /// Verify critical fact retention. Reject when loss rate exceeds 10%.
-    pub fn verify_fidelity(
-        &self,
-        originals: &[MemoryEntry],
-        compressed_content: &str,
-    ) -> FidelityReport {
+    pub fn verify_fidelity(&self, originals: &[MemoryEntry], compressed_content: &str) -> FidelityReport {
         let original_facts = extract_key_facts(originals);
         if original_facts.is_empty() {
             return FidelityReport {
@@ -169,11 +165,7 @@ impl<D: SimilarityDetector> MemoryCompressor<D> {
     }
 
     /// Validate compression output and enforce fidelity threshold.
-    pub fn finalize_compression(
-        &self,
-        originals: &[MemoryEntry],
-        candidate: MemoryEntry,
-    ) -> Result<CompressionResult> {
+    pub fn finalize_compression(&self, originals: &[MemoryEntry], candidate: MemoryEntry) -> Result<CompressionResult> {
         let report = self.verify_fidelity(originals, &candidate.content);
         if report.loss_rate > 0.10 {
             return Ok(CompressionResult {
@@ -302,9 +294,7 @@ fn should_keep_left(left: &MemoryEntry, right: &MemoryEntry) -> bool {
 }
 
 fn parse_ts(raw: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(raw).ok().map(|dt| dt.with_timezone(&Utc))
 }
 
 #[cfg(test)]
@@ -356,15 +346,9 @@ mod tests {
             entry("a", "Rust memory safety ownership"),
             entry("b", "Tokio async runtime scheduler"),
         ];
-        let candidate = compressor.build_compressed_entry(
-            "compressed",
-            "Rust summary only",
-            MemoryCategory::Core,
-            &originals,
-        );
-        let result = compressor
-            .finalize_compression(&originals, candidate)
-            .unwrap();
+        let candidate =
+            compressor.build_compressed_entry("compressed", "Rust summary only", MemoryCategory::Core, &originals);
+        let result = compressor.finalize_compression(&originals, candidate).unwrap();
         assert!(!result.accepted);
         assert!(result.report.loss_rate > 0.10);
     }
@@ -373,12 +357,8 @@ mod tests {
     fn build_compressed_entry_sets_audit_chain() {
         let compressor = MemoryCompressor::default();
         let originals = vec![entry("src-1", "alpha"), entry("src-2", "beta")];
-        let compressed = compressor.build_compressed_entry(
-            "compressed",
-            "alpha beta",
-            MemoryCategory::Core,
-            &originals,
-        );
+        let compressed =
+            compressor.build_compressed_entry("compressed", "alpha beta", MemoryCategory::Core, &originals);
         assert_eq!(
             compressed.compressed_from,
             Some(vec!["src-1".to_string(), "src-2".to_string()])

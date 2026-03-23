@@ -2,16 +2,15 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use openprx::self_system::evolution::{
-    Actor, AsyncJsonlWriter, CandidatePriority, ChangeType, CircuitBreaker, CircuitBreakerState,
-    DataBasis, DecisionLog, DecisionType, EngineCycleInput, EvolutionAnalyzer, EvolutionCandidate,
-    EvolutionConfig, EvolutionEngine, EvolutionLayer, EvolutionLog, EvolutionMode,
-    EvolutionPipeline, EvolutionResult, EvolutionTrigger, JsonlRetentionPolicy, JsonlStoragePaths,
-    MemoryAccessLog, MemoryAction, MemoryEvolutionEngine, Outcome, RollbackManager, TaskType,
-    with_trace,
+    Actor, AsyncJsonlWriter, CandidatePriority, ChangeType, CircuitBreaker, CircuitBreakerState, DataBasis,
+    DecisionLog, DecisionType, EngineCycleInput, EvolutionAnalyzer, EvolutionCandidate, EvolutionConfig,
+    EvolutionEngine, EvolutionLayer, EvolutionLog, EvolutionMode, EvolutionPipeline, EvolutionResult, EvolutionTrigger,
+    JsonlRetentionPolicy, JsonlStoragePaths, MemoryAccessLog, MemoryAction, MemoryEvolutionEngine, Outcome,
+    RollbackManager, TaskType, with_trace,
 };
 use openprx::self_system::evolution::{
-    ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
-    EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
+    ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
+    EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -43,12 +42,7 @@ fn sample_decision(trace_id: &str, experiment_id: &str, ts: &str, outcome: Outco
     }
 }
 
-fn sample_memory(
-    trace_id: &str,
-    experiment_id: &str,
-    ts: &str,
-    useful: Option<bool>,
-) -> MemoryAccessLog {
+fn sample_memory(trace_id: &str, experiment_id: &str, ts: &str, useful: Option<bool>) -> MemoryAccessLog {
     MemoryAccessLog {
         timestamp: ts.to_string(),
         experiment_id: experiment_id.to_string(),
@@ -66,12 +60,8 @@ fn sample_memory(
 }
 
 async fn seed_three_day_digests(analyzer: &EvolutionAnalyzer, now: chrono::DateTime<Utc>) {
-    let _ = analyzer
-        .generate_daily_digest(now - Duration::days(2))
-        .await;
-    let _ = analyzer
-        .generate_daily_digest(now - Duration::days(1))
-        .await;
+    let _ = analyzer.generate_daily_digest(now - Duration::days(2)).await;
+    let _ = analyzer.generate_daily_digest(now - Duration::days(1)).await;
 }
 
 #[tokio::test]
@@ -105,10 +95,7 @@ async fn trace_id_end_to_end_pipeline_to_evolution_log() -> Result<()> {
     })
     .await;
 
-    let analyzer = Arc::new(EvolutionAnalyzer::new(
-        writer.clone(),
-        storage_root.join("analysis"),
-    ));
+    let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
     seed_three_day_digests(analyzer.as_ref(), now).await;
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
@@ -116,20 +103,12 @@ async fn trace_id_end_to_end_pipeline_to_evolution_log() -> Result<()> {
     let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer))?;
 
     let report = pipeline
-        .run_for_layer(
-            EvolutionTrigger::Manual,
-            EvolutionLayer::Memory,
-            &mut engine,
-            now,
-        )
+        .run_for_layer(EvolutionTrigger::Manual, EvolutionLayer::Memory, &mut engine, now)
         .await?;
 
     assert!(report.selected_candidate.is_some());
     assert_eq!(
-        report
-            .evolution_log
-            .as_ref()
-            .map(|item| item.experiment_id.as_str()),
+        report.evolution_log.as_ref().map(|item| item.experiment_id.as_str()),
         Some(report.experiment_id.as_str())
     );
 
@@ -166,10 +145,7 @@ async fn record_analyze_evolve_closed_loop_produces_candidate() -> Result<()> {
         .await?;
     writer.flush().await?;
 
-    let analyzer = Arc::new(EvolutionAnalyzer::new(
-        writer.clone(),
-        storage_root.join("analysis"),
-    ));
+    let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
     seed_three_day_digests(analyzer.as_ref(), Utc::now()).await;
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
@@ -218,10 +194,7 @@ async fn shadow_mode_generates_recommendation_without_applying_change() -> Resul
         .await?;
     writer.flush().await?;
 
-    let analyzer = Arc::new(EvolutionAnalyzer::new(
-        writer.clone(),
-        storage_root.join("analysis"),
-    ));
+    let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
     seed_three_day_digests(analyzer.as_ref(), Utc::now()).await;
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);
@@ -296,10 +269,7 @@ impl EvolutionEngine for RollbackTriggerEngine {
         EvolutionLayer::Memory
     }
 
-    async fn run_cycle(
-        &mut self,
-        input: EngineCycleInput,
-    ) -> Result<openprx::self_system::evolution::CycleResult> {
+    async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<openprx::self_system::evolution::CycleResult> {
         let proposal = EvolutionProposal {
             id: "proposal-rb".to_string(),
             summary: "force rollback".to_string(),
@@ -391,22 +361,14 @@ async fn rollback_triggers_when_judge_score_below_threshold() -> Result<()> {
 
     let ts = Utc::now().to_rfc3339();
     writer
-        .append_decision(&sample_decision(
-            "trace-rb",
-            "exp-rb",
-            &ts,
-            Outcome::Failure,
-        ))
+        .append_decision(&sample_decision("trace-rb", "exp-rb", &ts, Outcome::Failure))
         .await?;
     writer
         .append_memory_access(&sample_memory("trace-rb", "exp-rb", &ts, Some(false)))
         .await?;
     writer.flush().await?;
 
-    let analyzer = Arc::new(EvolutionAnalyzer::new(
-        writer.clone(),
-        storage_root.join("analysis"),
-    ));
+    let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
     seed_three_day_digests(analyzer.as_ref(), Utc::now()).await;
 
     let shared = openprx::self_system::evolution::new_shared_evolution_config(cfg);

@@ -151,9 +151,7 @@ impl ScheduleTool {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
+                error: Some(format!("Security policy: read-only mode, cannot perform '{action}'")),
             });
         }
 
@@ -238,12 +236,7 @@ impl ScheduleTool {
         }
     }
 
-    fn handle_create_like(
-        &self,
-        action: &str,
-        args: &serde_json::Value,
-        approved: bool,
-    ) -> Result<ToolResult> {
+    fn handle_create_like(&self, action: &str, args: &serde_json::Value, approved: bool) -> Result<ToolResult> {
         let command = args
             .get("command")
             .and_then(|value| value.as_str())
@@ -297,10 +290,7 @@ impl ScheduleTool {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(
-                            "Exactly one of 'expression', 'delay', or 'run_at' must be provided"
-                                .into(),
-                        ),
+                        error: Some("Exactly one of 'expression', 'delay', or 'run_at' must be provided".into()),
                     });
                 }
             }
@@ -408,13 +398,8 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
-            &config.workspace_dir,
-        ));
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         (tmp, crate::config::new_shared(config), security)
     }
 
@@ -459,17 +444,11 @@ mod tests {
 
         let id = create.output.split_whitespace().nth(3).unwrap();
 
-        let get = tool
-            .execute(json!({"action": "get", "id": id}))
-            .await
-            .unwrap();
+        let get = tool.execute(json!({"action": "get", "id": id})).await.unwrap();
         assert!(get.success);
         assert!(get.output.contains("echo hello"));
 
-        let cancel = tool
-            .execute(json!({"action": "cancel", "id": id}))
-            .await
-            .unwrap();
+        let cancel = tool.execute(json!({"action": "cancel", "id": id})).await.unwrap();
         assert!(cancel.success);
     }
 
@@ -499,16 +478,10 @@ mod tests {
         assert!(add.success);
 
         let id = add.output.split_whitespace().nth(3).unwrap();
-        let pause = tool
-            .execute(json!({"action": "pause", "id": id}))
-            .await
-            .unwrap();
+        let pause = tool.execute(json!({"action": "pause", "id": id})).await.unwrap();
         assert!(pause.success);
 
-        let resume = tool
-            .execute(json!({"action": "resume", "id": id}))
-            .await
-            .unwrap();
+        let resume = tool.execute(json!({"action": "resume", "id": id})).await.unwrap();
         assert!(resume.success);
     }
 
@@ -524,13 +497,8 @@ mod tests {
             },
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
-            &config.workspace_dir,
-        ));
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
 
         let tool = ScheduleTool::new(security, crate::config::new_shared(config));
 
@@ -569,10 +537,7 @@ mod tests {
         };
         config.cron.enabled = false;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
-            &config.workspace_dir,
-        ));
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         let tool = ScheduleTool::new(security, crate::config::new_shared(config));
 
         let create = tool
@@ -585,13 +550,7 @@ mod tests {
             .unwrap();
 
         assert!(!create.success);
-        assert!(
-            create
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("cron is disabled")
-        );
+        assert!(create.error.as_deref().unwrap_or_default().contains("cron is disabled"));
     }
 
     #[tokio::test]
@@ -605,10 +564,7 @@ mod tests {
         config.autonomy.level = AutonomyLevel::Supervised;
         config.autonomy.allowed_commands = vec!["echo".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
-            &config.workspace_dir,
-        ));
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         let tool = ScheduleTool::new(security, crate::config::new_shared(config));
 
         let result = tool
@@ -621,13 +577,7 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("not allowed")
-        );
+        assert!(result.error.as_deref().unwrap_or_default().contains("not allowed"));
     }
 
     #[tokio::test]
@@ -641,10 +591,7 @@ mod tests {
         config.autonomy.level = AutonomyLevel::Supervised;
         config.autonomy.allowed_commands = vec!["touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
-            &config.workspace_dir,
-        ));
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         let tool = ScheduleTool::new(security, crate::config::new_shared(config));
 
         let denied = tool

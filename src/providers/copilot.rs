@@ -12,8 +12,8 @@
 //! third-party integrations simultaneously.
 
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
+    ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -187,9 +187,7 @@ impl CopilotProvider {
             {
                 use std::os::unix::fs::PermissionsExt;
 
-                if let Err(err) =
-                    std::fs::set_permissions(&token_dir, std::fs::Permissions::from_mode(0o700))
-                {
+                if let Err(err) = std::fs::set_permissions(&token_dir, std::fs::Permissions::from_mode(0o700)) {
                     warn!(
                         "Failed to set Copilot token directory permissions on {:?}: {err}",
                         token_dir
@@ -199,9 +197,7 @@ impl CopilotProvider {
         }
 
         Self {
-            github_token: github_token
-                .filter(|token| !token.is_empty())
-                .map(String::from),
+            github_token: github_token.filter(|token| !token.is_empty()).map(String::from),
             refresh_lock: Arc::new(Mutex::new(None)),
             token_dir,
         }
@@ -357,9 +353,7 @@ impl CopilotProvider {
             .unwrap_or_default()
             .into_iter()
             .map(|tool_call| ProviderToolCall {
-                id: tool_call
-                    .id
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                id: tool_call.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 name: tool_call.function.name,
                 arguments: tool_call.function.arguments,
             })
@@ -617,9 +611,7 @@ impl Provider for CopilotProvider {
             tool_calls: None,
         });
 
-        let response = self
-            .send_chat_request(messages, None, model, temperature)
-            .await?;
+        let response = self.send_chat_request(messages, None, model, temperature).await?;
         Ok(response.text.unwrap_or_default())
     }
 
@@ -692,16 +684,8 @@ mod tests {
     #[test]
     fn copilot_headers_include_required_fields() {
         let headers = CopilotProvider::COPILOT_HEADERS;
-        assert!(
-            headers
-                .iter()
-                .any(|(header, _)| *header == "Editor-Version")
-        );
-        assert!(
-            headers
-                .iter()
-                .any(|(header, _)| *header == "Editor-Plugin-Version")
-        );
+        assert!(headers.iter().any(|(header, _)| *header == "Editor-Version"));
+        assert!(headers.iter().any(|(header, _)| *header == "Editor-Plugin-Version"));
         assert!(headers.iter().any(|(header, _)| *header == "User-Agent"));
     }
 

@@ -22,18 +22,10 @@ impl BuiltinRegistry {
     pub fn new() -> Self {
         let mut handlers: HashMap<&'static str, HandlerFn> = HashMap::new();
         handlers.insert("xin:health_check", |cfg| Box::pin(handle_health_check(cfg)));
-        handlers.insert("xin:stale_cleanup", |cfg| {
-            Box::pin(handle_stale_cleanup(cfg))
-        });
-        handlers.insert("xin:memory_evolution", |cfg| {
-            Box::pin(handle_memory_evolution(cfg))
-        });
-        handlers.insert("xin:fitness_report", |_cfg| {
-            Box::pin(handle_fitness_report())
-        });
-        handlers.insert("xin:memory_hygiene", |cfg| {
-            Box::pin(handle_memory_hygiene(cfg))
-        });
+        handlers.insert("xin:stale_cleanup", |cfg| Box::pin(handle_stale_cleanup(cfg)));
+        handlers.insert("xin:memory_evolution", |cfg| Box::pin(handle_memory_evolution(cfg)));
+        handlers.insert("xin:fitness_report", |_cfg| Box::pin(handle_fitness_report()));
+        handlers.insert("xin:memory_hygiene", |cfg| Box::pin(handle_memory_hygiene(cfg)));
         Self { handlers }
     }
 
@@ -118,8 +110,8 @@ pub fn builtin_task_definitions() -> Vec<NewXinTask> {
 #[allow(clippy::unused_async)]
 async fn handle_health_check(_config: Config) -> Result<String> {
     let snapshot = crate::health::snapshot_json();
-    let summary = serde_json::to_string_pretty(&snapshot)
-        .unwrap_or_else(|_| "failed to serialize health snapshot".into());
+    let summary =
+        serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "failed to serialize health snapshot".into());
     Ok(format!("health check completed\n{summary}"))
 }
 
@@ -147,9 +139,7 @@ async fn handle_memory_evolution(config: Config) -> Result<String> {
 
     const XIN_MAX_TOOL_ITERATIONS: usize = 15;
     let mut evo_config = config.clone();
-    if evo_config.agent.max_tool_iterations == 0
-        || evo_config.agent.max_tool_iterations > XIN_MAX_TOOL_ITERATIONS
-    {
+    if evo_config.agent.max_tool_iterations == 0 || evo_config.agent.max_tool_iterations > XIN_MAX_TOOL_ITERATIONS {
         evo_config.agent.max_tool_iterations = XIN_MAX_TOOL_ITERATIONS;
     }
 

@@ -51,19 +51,13 @@ impl GitOperationsTool {
 
     /// Check if an operation requires write access
     fn requires_write_access(&self, operation: &str) -> bool {
-        matches!(
-            operation,
-            "commit" | "add" | "checkout" | "stash" | "reset" | "revert"
-        )
+        matches!(operation, "commit" | "add" | "checkout" | "stash" | "reset" | "revert")
     }
 
     /// Check if an operation is read-only
     #[cfg(test)]
     fn is_read_only(&self, operation: &str) -> bool {
-        matches!(
-            operation,
-            "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
-        )
+        matches!(operation, "status" | "diff" | "log" | "show" | "branch" | "rev-parse")
     }
 
     async fn run_git_command(&self, args: &[&str]) -> anyhow::Result<String> {
@@ -82,9 +76,7 @@ impl GitOperationsTool {
     }
 
     async fn git_status(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let output = self
-            .run_git_command(&["status", "--porcelain=2", "--branch"])
-            .await?;
+        let output = self.run_git_command(&["status", "--porcelain=2", "--branch"]).await?;
 
         // Parse git status output into structured format
         let mut result = serde_json::Map::new();
@@ -134,10 +126,7 @@ impl GitOperationsTool {
 
     async fn git_diff(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let files = args.get("files").and_then(|v| v.as_str()).unwrap_or(".");
-        let cached = args
-            .get("cached")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let cached = args.get("cached").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Validate files argument against injection patterns
         self.sanitize_git_args(files)?;
@@ -242,8 +231,7 @@ impl GitOperationsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&json!({ "commits": commits }))
-                .unwrap_or_default(),
+            output: serde_json::to_string_pretty(&json!({ "commits": commits })).unwrap_or_default(),
             error: None,
         })
     }
@@ -387,22 +375,16 @@ impl GitOperationsTool {
     }
 
     async fn git_stash(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("push");
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("push");
 
         let output = match action {
-            "push" | "save" => {
-                self.run_git_command(&["stash", "push", "-m", "auto-stash"])
-                    .await
-            }
+            "push" | "save" => self.run_git_command(&["stash", "push", "-m", "auto-stash"]).await,
             "pop" => self.run_git_command(&["stash", "pop"]).await,
             "list" => self.run_git_command(&["stash", "list"]).await,
             "drop" => {
                 let index_raw = args.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                let index = i32::try_from(index_raw)
-                    .map_err(|_| anyhow::anyhow!("stash index too large: {index_raw}"))?;
+                let index =
+                    i32::try_from(index_raw).map_err(|_| anyhow::anyhow!("stash index too large: {index_raw}"))?;
                 self.run_git_command(&["stash", "drop", &format!("stash@{{{index}}}")])
                     .await
             }
@@ -521,9 +503,7 @@ impl Tool for GitOperationsTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(
-                        "Action blocked: git write operations require higher autonomy level".into(),
-                    ),
+                    error: Some("Action blocked: git write operations require higher autonomy level".into()),
                 });
             }
 
@@ -713,13 +693,7 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         // can_act() returns false for ReadOnly, so we get the "higher autonomy level" message
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("higher autonomy")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("higher autonomy"));
     }
 
     #[tokio::test]
@@ -761,10 +735,7 @@ mod tests {
         // The error should be about git (not about autonomy/read-only mode)
         assert!(!result.success, "Expected failure due to missing git repo");
         let error_msg = result.error.as_deref().unwrap_or("");
-        assert!(
-            !error_msg.is_empty(),
-            "Expected a git-related error message"
-        );
+        assert!(!error_msg.is_empty(), "Expected a git-related error message");
         assert!(
             !error_msg.contains("read-only") && !error_msg.contains("autonomy"),
             "Error should be about git, not about autonomy restrictions: {error_msg}"
@@ -778,13 +749,7 @@ mod tests {
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Missing 'operation'")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("Missing 'operation'"));
     }
 
     #[tokio::test]
@@ -801,13 +766,7 @@ mod tests {
 
         let result = tool.execute(json!({"operation": "push"})).await.unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Unknown operation")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("Unknown operation"));
     }
 
     #[test]

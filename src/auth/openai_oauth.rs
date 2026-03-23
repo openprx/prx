@@ -102,11 +102,7 @@ pub fn build_authorize_url(pkce: &PkceState) -> String {
     format!("{OPENAI_OAUTH_AUTHORIZE_URL}?{}", encoded.join("&"))
 }
 
-pub async fn exchange_code_for_tokens(
-    client: &Client,
-    code: &str,
-    pkce: &PkceState,
-) -> Result<TokenSet> {
+pub async fn exchange_code_for_tokens(client: &Client, code: &str, pkce: &PkceState) -> Result<TokenSet> {
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -177,10 +173,7 @@ pub async fn start_device_code_flow(client: &Client) -> Result<DeviceCodeStart> 
     })
 }
 
-pub async fn poll_device_code_tokens(
-    client: &Client,
-    device: &DeviceCodeStart,
-) -> Result<TokenSet> {
+pub async fn poll_device_code_tokens(client: &Client, device: &DeviceCodeStart) -> Result<TokenSet> {
     let started = Instant::now();
     let mut interval_secs = device.interval.max(1);
 
@@ -269,8 +262,7 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
 
     let code = parse_code_from_redirect(path, Some(expected_state))?;
 
-    let body =
-        "<html><body><h2>OpenPRX login complete</h2><p>You can close this tab.</p></body></html>";
+    let body = "<html><body><h2>OpenPRX login complete</h2><p>You can close this tab.</p></body></html>";
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
@@ -358,9 +350,7 @@ pub fn extract_expiry_from_jwt(token: &str) -> Option<chrono::DateTime<Utc>> {
 
 fn decode_jwt_claims(token: &str) -> Option<serde_json::Value> {
     let payload = token.split('.').nth(1)?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
     serde_json::from_slice(&decoded).ok()
 }
 
@@ -371,10 +361,7 @@ async fn parse_token_response(response: reqwest::Response) -> Result<TokenSet> {
         anyhow::bail!("OpenAI OAuth token request failed ({status}): {body}");
     }
 
-    let token: TokenResponse = response
-        .json()
-        .await
-        .context("Failed to parse OpenAI token response")?;
+    let token: TokenResponse = response.json().await.context("Failed to parse OpenAI token response")?;
 
     let expires_at = token.expires_in.and_then(|seconds| {
         if seconds <= 0 {
@@ -421,9 +408,7 @@ fn url_encode(input: &str) -> String {
     input
         .bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
             _ => format!("%{b:02X}"),
         })
         .collect::<String>()
@@ -477,11 +462,8 @@ mod tests {
 
     #[test]
     fn parse_redirect_url_extracts_code() {
-        let code = parse_code_from_redirect(
-            "http://127.0.0.1:1455/auth/callback?code=abc123&state=xyz",
-            Some("xyz"),
-        )
-        .unwrap();
+        let code =
+            parse_code_from_redirect("http://127.0.0.1:1455/auth/callback?code=abc123&state=xyz", Some("xyz")).unwrap();
         assert_eq!(code, "abc123");
     }
 
@@ -504,17 +486,13 @@ mod tests {
             Some("xyz"),
         )
         .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("OpenAI OAuth error: access_denied")
-        );
+        assert!(err.to_string().contains("OpenAI OAuth error: access_denied"));
     }
 
     #[test]
     fn extract_account_id_from_jwt_payload() {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode("{\"account_id\":\"acct_123\"}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{\"account_id\":\"acct_123\"}");
         let token = format!("{header}.{payload}.sig");
 
         let account = extract_account_id_from_jwt(&token);
@@ -524,8 +502,7 @@ mod tests {
     #[test]
     fn extract_expiry_from_jwt_payload() {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
-        let payload =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{\"exp\":1900000000}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{\"exp\":1900000000}");
         let token = format!("{header}.{payload}.sig");
 
         let expiry = extract_expiry_from_jwt(&token);

@@ -20,8 +20,7 @@ use wasmtime::component::ResourceTable;
 #[cfg(feature = "wasm-plugins")]
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
 
-pub(crate) type WebSocketSessionMap =
-    Arc<Mutex<HashMap<u64, Arc<Mutex<Box<dyn WebSocketConnection>>>>>>;
+pub(crate) type WebSocketSessionMap = Arc<Mutex<HashMap<u64, Arc<Mutex<Box<dyn WebSocketConnection>>>>>>;
 
 #[async_trait]
 pub trait WebSocketConnection: Send + Sync {
@@ -38,9 +37,7 @@ pub trait WebSocketConnector: Send + Sync {
 struct TungsteniteConnector;
 
 struct TungsteniteConnection {
-    stream: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 }
 
 #[async_trait]
@@ -57,9 +54,7 @@ impl WebSocketConnector for TungsteniteConnector {
 impl WebSocketConnection for TungsteniteConnection {
     async fn send_text(&mut self, message: String) -> Result<(), String> {
         self.stream
-            .send(tokio_tungstenite::tungstenite::Message::Text(
-                message.into(),
-            ))
+            .send(tokio_tungstenite::tungstenite::Message::Text(message.into()))
             .await
             .map_err(|e| format!("websocket send failed: {e}"))
     }
@@ -409,11 +404,7 @@ pub async fn host_kv_delete(state: &HostState, key: &str) -> bool {
 /// Maps to `prx:host/kv.list-keys(prefix)`.
 pub async fn host_kv_list_keys(state: &HostState, prefix: &str) -> Vec<String> {
     let store = state.kv_store.read().await;
-    store
-        .keys()
-        .filter(|k| k.starts_with(prefix))
-        .cloned()
-        .collect()
+    store.keys().filter(|k| k.starts_with(prefix)).cloned().collect()
 }
 
 /// Open a websocket-outbound connection and return an opaque session id.
@@ -434,11 +425,7 @@ pub async fn host_websocket_connect(state: &HostState, url: &str) -> Result<u64,
 }
 
 /// Send a UTF-8 message on an open websocket session.
-pub async fn host_websocket_send(
-    state: &HostState,
-    session_id: u64,
-    message: String,
-) -> Result<(), String> {
+pub async fn host_websocket_send(state: &HostState, session_id: u64, message: String) -> Result<(), String> {
     state.check_permission("websocket-outbound")?;
     websocket_send_with(
         Arc::clone(&state.websocket_sessions),
@@ -452,23 +439,13 @@ pub async fn host_websocket_send(
 /// Receive a UTF-8 message from an open websocket session.
 pub async fn host_websocket_receive(state: &HostState, session_id: u64) -> Result<String, String> {
     state.check_permission("websocket-outbound")?;
-    websocket_receive_with(
-        Arc::clone(&state.websocket_sessions),
-        state.timeout_ms,
-        session_id,
-    )
-    .await
+    websocket_receive_with(Arc::clone(&state.websocket_sessions), state.timeout_ms, session_id).await
 }
 
 /// Close an open websocket session and release its host-side state.
 pub async fn host_websocket_close(state: &HostState, session_id: u64) -> Result<(), String> {
     state.check_permission("websocket-outbound")?;
-    websocket_close_with(
-        Arc::clone(&state.websocket_sessions),
-        state.timeout_ms,
-        session_id,
-    )
-    .await
+    websocket_close_with(Arc::clone(&state.websocket_sessions), state.timeout_ms, session_id).await
 }
 
 #[cfg(test)]
@@ -534,8 +511,7 @@ mod tests {
             }
             self.sent_messages.lock().await.push(message.clone());
             if self.receive_plan.is_empty() {
-                self.receive_plan
-                    .push_back(MockReceiveBehavior::Message(message));
+                self.receive_plan.push_back(MockReceiveBehavior::Message(message));
             }
             Ok(())
         }
@@ -562,10 +538,7 @@ mod tests {
     impl MockConnector {
         async fn push_plan(&self, url: &str, behavior: MockConnectBehavior) {
             let mut plans = self.plans.lock().await;
-            plans
-                .entry(url.to_string())
-                .or_default()
-                .push_back(behavior);
+            plans.entry(url.to_string()).or_default().push_back(behavior);
         }
     }
 
@@ -604,10 +577,7 @@ mod tests {
     fn host_state_creation() {
         let state = test_state();
         assert_eq!(state.plugin_name, "test-plugin");
-        assert_eq!(
-            host_config_get(&state, "api_key"),
-            Some("test-key".to_string())
-        );
+        assert_eq!(host_config_get(&state, "api_key"), Some("test-key".to_string()));
         assert_eq!(host_config_get(&state, "missing"), None);
     }
 
@@ -694,9 +664,7 @@ mod tests {
             .await;
         let state = test_state().with_websocket_connector(connector);
 
-        let session_id = host_websocket_connect(&state, "ws://mock.example/echo")
-            .await
-            .unwrap();
+        let session_id = host_websocket_connect(&state, "ws://mock.example/echo").await.unwrap();
         host_websocket_send(&state, session_id, "hello".to_string())
             .await
             .unwrap();
@@ -756,9 +724,7 @@ mod tests {
         connector
             .push_plan(
                 "ws://mock.example/retry",
-                MockConnectBehavior::Connect(Ok(mock_connection(vec![
-                    MockReceiveBehavior::Closed,
-                ]))),
+                MockConnectBehavior::Connect(Ok(mock_connection(vec![MockReceiveBehavior::Closed]))),
             )
             .await;
         connector
@@ -769,12 +735,8 @@ mod tests {
             .await;
         let state = test_state().with_websocket_connector(connector);
 
-        let first_session = host_websocket_connect(&state, "ws://mock.example/retry")
-            .await
-            .unwrap();
-        let first_error = host_websocket_receive(&state, first_session)
-            .await
-            .unwrap_err();
+        let first_session = host_websocket_connect(&state, "ws://mock.example/retry").await.unwrap();
+        let first_error = host_websocket_receive(&state, first_session).await.unwrap_err();
         assert!(first_error.contains("closed"));
         assert!(
             host_websocket_send(&state, first_session, "stale".to_string())
@@ -782,15 +744,11 @@ mod tests {
                 .is_err()
         );
 
-        let second_session = host_websocket_connect(&state, "ws://mock.example/retry")
-            .await
-            .unwrap();
+        let second_session = host_websocket_connect(&state, "ws://mock.example/retry").await.unwrap();
         host_websocket_send(&state, second_session, "retry-ok".to_string())
             .await
             .unwrap();
-        let message = host_websocket_receive(&state, second_session)
-            .await
-            .unwrap();
+        let message = host_websocket_receive(&state, second_session).await.unwrap();
         assert_eq!(message, "retry-ok");
     }
 }

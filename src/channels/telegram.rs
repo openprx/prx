@@ -113,8 +113,8 @@ fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentK
         "mp4" | "mov" | "mkv" | "avi" | "webm" => Some(TelegramAttachmentKind::Video),
         "mp3" | "m4a" | "wav" | "flac" => Some(TelegramAttachmentKind::Audio),
         "ogg" | "oga" | "opus" => Some(TelegramAttachmentKind::Voice),
-        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx" | "xls"
-        | "xlsx" | "ppt" | "pptx" => Some(TelegramAttachmentKind::Document),
+        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx" | "xls" | "xlsx" | "ppt"
+        | "pptx" => Some(TelegramAttachmentKind::Document),
         _ => None,
     }
 }
@@ -147,13 +147,7 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
 /// These tags are used internally but must not be sent to Telegram as raw markup,
 /// since Telegram's Markdown parser will reject them (causing status 400 errors).
 fn strip_tool_call_tags(message: &str) -> String {
-    const TOOL_CALL_OPEN_TAGS: [&str; 5] = [
-        "<tool_call>",
-        "<toolcall>",
-        "<tool-call>",
-        "<tool>",
-        "<invoke>",
-    ];
+    const TOOL_CALL_OPEN_TAGS: [&str; 5] = ["<tool_call>", "<toolcall>", "<tool-call>", "<tool>", "<invoke>"];
 
     fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
         tags.iter()
@@ -182,8 +176,7 @@ fn strip_tool_call_tags(message: &str) -> String {
             }
 
             let slice = &trimmed[byte_idx..];
-            let mut stream =
-                serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+            let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
             if let Some(Ok(_value)) = stream.next() {
                 let consumed = stream.byte_offset();
                 if consumed > 0 {
@@ -341,11 +334,7 @@ impl TelegramChannel {
     }
 
     /// Configure streaming mode for progressive draft updates.
-    pub fn with_streaming(
-        mut self,
-        stream_mode: StreamMode,
-        draft_update_interval_ms: u64,
-    ) -> Self {
+    pub fn with_streaming(mut self, stream_mode: StreamMode, draft_update_interval_ms: u64) -> Self {
         self.stream_mode = stream_mode;
         self.draft_update_interval_ms = draft_update_interval_ms;
         self
@@ -399,9 +388,8 @@ impl TelegramChannel {
         let contents = fs::read_to_string(&config_path)
             .await
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
-        let mut config: Config = toml::from_str(&contents).context(
-            "Failed to parse config.toml — check [channels.telegram] section for syntax errors",
-        )?;
+        let mut config: Config = toml::from_str(&contents)
+            .context("Failed to parse config.toml — check [channels.telegram] section for syntax errors")?;
         config.config_path = config_path;
         config.workspace_dir = openprx_dir.join("workspace");
         Ok(config)
@@ -456,10 +444,7 @@ impl TelegramChannel {
     }
 
     fn pairing_code_active(&self) -> bool {
-        self.pairing
-            .as_ref()
-            .and_then(PairingGuard::pairing_code)
-            .is_some()
+        self.pairing.as_ref().and_then(PairingGuard::pairing_code).is_some()
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -664,14 +649,10 @@ impl TelegramChannel {
                                             &chat_id,
                                         ))
                                         .await;
-                                    tracing::info!(
-                                        "Telegram: paired and allowlisted identity={identity}"
-                                    );
+                                    tracing::info!("Telegram: paired and allowlisted identity={identity}");
                                 }
                                 Err(e) => {
-                                    tracing::error!(
-                                        "Telegram: failed to persist allowlist after bind: {e}"
-                                    );
+                                    tracing::error!("Telegram: failed to persist allowlist after bind: {e}");
                                     let _ = self
                                         .send(&SendMessage::new(
                                             "⚠️ Bound for this runtime, but failed to persist config. Access may be lost after restart; check config file permissions.",
@@ -845,12 +826,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         })
     }
 
-    async fn send_text_chunks(
-        &self,
-        message: &str,
-        chat_id: &str,
-        thread_id: Option<&str>,
-    ) -> anyhow::Result<()> {
+    async fn send_text_chunks(&self, message: &str, chat_id: &str, thread_id: Option<&str>) -> anyhow::Result<()> {
         let chunks = split_message_for_telegram(message);
 
         for (index, chunk) in chunks.iter().enumerate() {
@@ -956,12 +932,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             body["caption"] = serde_json::Value::String(cap.to_string());
         }
 
-        let resp = self
-            .http_client()
-            .post(self.api_url(method))
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.http_client().post(self.api_url(method)).json(&body).send().await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
@@ -982,26 +953,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         if is_http_url(target) {
             return match attachment.kind {
-                TelegramAttachmentKind::Image => {
-                    self.send_photo_by_url(chat_id, thread_id, target, None)
-                        .await
-                }
-                TelegramAttachmentKind::Document => {
-                    self.send_document_by_url(chat_id, thread_id, target, None)
-                        .await
-                }
-                TelegramAttachmentKind::Video => {
-                    self.send_video_by_url(chat_id, thread_id, target, None)
-                        .await
-                }
-                TelegramAttachmentKind::Audio => {
-                    self.send_audio_by_url(chat_id, thread_id, target, None)
-                        .await
-                }
-                TelegramAttachmentKind::Voice => {
-                    self.send_voice_by_url(chat_id, thread_id, target, None)
-                        .await
-                }
+                TelegramAttachmentKind::Image => self.send_photo_by_url(chat_id, thread_id, target, None).await,
+                TelegramAttachmentKind::Document => self.send_document_by_url(chat_id, thread_id, target, None).await,
+                TelegramAttachmentKind::Video => self.send_video_by_url(chat_id, thread_id, target, None).await,
+                TelegramAttachmentKind::Audio => self.send_audio_by_url(chat_id, thread_id, target, None).await,
+                TelegramAttachmentKind::Voice => self.send_voice_by_url(chat_id, thread_id, target, None).await,
             };
         }
 
@@ -1012,9 +968,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         match attachment.kind {
             TelegramAttachmentKind::Image => self.send_photo(chat_id, thread_id, path, None).await,
-            TelegramAttachmentKind::Document => {
-                self.send_document(chat_id, thread_id, path, None).await
-            }
+            TelegramAttachmentKind::Document => self.send_document(chat_id, thread_id, path, None).await,
             TelegramAttachmentKind::Video => self.send_video(chat_id, thread_id, path, None).await,
             TelegramAttachmentKind::Audio => self.send_audio(chat_id, thread_id, path, None).await,
             TelegramAttachmentKind::Voice => self.send_voice(chat_id, thread_id, path, None).await,
@@ -1029,17 +983,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         file_path: &Path,
         caption: Option<&str>,
     ) -> anyhow::Result<()> {
-        let file_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
+        let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
 
         let file_bytes = tokio::fs::read(file_path).await?;
         let part = Part::bytes(file_bytes).file_name(file_name.to_string());
 
-        let mut form = Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("document", part);
+        let mut form = Form::new().text("chat_id", chat_id.to_string()).part("document", part);
 
         if let Some(tid) = thread_id {
             form = form.text("message_thread_id", tid.to_string());
@@ -1076,9 +1025,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> anyhow::Result<()> {
         let part = Part::bytes(file_bytes).file_name(file_name.to_string());
 
-        let mut form = Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("document", part);
+        let mut form = Form::new().text("chat_id", chat_id.to_string()).part("document", part);
 
         if let Some(tid) = thread_id {
             form = form.text("message_thread_id", tid.to_string());
@@ -1112,17 +1059,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         file_path: &Path,
         caption: Option<&str>,
     ) -> anyhow::Result<()> {
-        let file_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("photo.jpg");
+        let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("photo.jpg");
 
         let file_bytes = tokio::fs::read(file_path).await?;
         let part = Part::bytes(file_bytes).file_name(file_name.to_string());
 
-        let mut form = Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("photo", part);
+        let mut form = Form::new().text("chat_id", chat_id.to_string()).part("photo", part);
 
         if let Some(tid) = thread_id {
             form = form.text("message_thread_id", tid.to_string());
@@ -1159,9 +1101,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> anyhow::Result<()> {
         let part = Part::bytes(file_bytes).file_name(file_name.to_string());
 
-        let mut form = Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("photo", part);
+        let mut form = Form::new().text("chat_id", chat_id.to_string()).part("photo", part);
 
         if let Some(tid) = thread_id {
             form = form.text("message_thread_id", tid.to_string());
@@ -1195,17 +1135,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         file_path: &Path,
         caption: Option<&str>,
     ) -> anyhow::Result<()> {
-        let file_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("video.mp4");
+        let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("video.mp4");
 
         let file_bytes = tokio::fs::read(file_path).await?;
         let part = Part::bytes(file_bytes).file_name(file_name.to_string());
 
-        let mut form = Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("video", part);
+        let mut form = Form::new().text("chat_id", chat_id.to_string()).part("video", part);
 
         if let Some(tid) = thread_id {
             form = form.text("message_thread_id", tid.to_string());
@@ -1239,17 +1174,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         file_path: &Path,
         caption: Option<&str>,
     ) -> anyhow::Result<()> {
-        let file_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("audio.mp3");
+        let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("audio.mp3");
 
         let file_bytes = tokio::fs::read(file_path).await?;
         let part = Part::bytes(file_bytes).file_name(file_name.to_string());
 
-        let mut form = Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("audio", part);
+        let mut form = Form::new().text("chat_id", chat_id.to_string()).part("audio", part);
 
         if let Some(tid) = thread_id {
             form = form.text("message_thread_id", tid.to_string());
@@ -1283,17 +1213,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         file_path: &Path,
         caption: Option<&str>,
     ) -> anyhow::Result<()> {
-        let file_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("voice.ogg");
+        let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("voice.ogg");
 
         let file_bytes = tokio::fs::read(file_path).await?;
         let part = Part::bytes(file_bytes).file_name(file_name.to_string());
 
-        let mut form = Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("voice", part);
+        let mut form = Form::new().text("chat_id", chat_id.to_string()).part("voice", part);
 
         if let Some(tid) = thread_id {
             form = form.text("message_thread_id", tid.to_string());
@@ -1460,12 +1385,7 @@ impl Channel for TelegramChannel {
             body["message_thread_id"] = serde_json::Value::String(tid.to_string());
         }
 
-        let resp = self
-            .client
-            .post(self.api_url("sendMessage"))
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.client.post(self.api_url("sendMessage")).json(&body).send().await?;
 
         if !resp.status().is_success() {
             let err = resp.text().await.unwrap_or_default();
@@ -1486,12 +1406,7 @@ impl Channel for TelegramChannel {
         Ok(message_id)
     }
 
-    async fn update_draft(
-        &self,
-        recipient: &str,
-        message_id: &str,
-        text: &str,
-    ) -> anyhow::Result<()> {
+    async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> anyhow::Result<()> {
         let (chat_id, _) = Self::parse_reply_target(recipient);
 
         // Rate-limit edits per chat
@@ -1554,12 +1469,7 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
-    async fn finalize_draft(
-        &self,
-        recipient: &str,
-        message_id: &str,
-        text: &str,
-    ) -> anyhow::Result<()> {
+    async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> anyhow::Result<()> {
         let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
 
@@ -1572,9 +1482,7 @@ impl Channel for TelegramChannel {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
-                    return self
-                        .send_text_chunks(text, &chat_id, thread_id.as_deref())
-                        .await;
+                    return self.send_text_chunks(text, &chat_id, thread_id.as_deref()).await;
                 }
             };
 
@@ -1590,18 +1498,14 @@ impl Channel for TelegramChannel {
                 .await;
 
             // Fall back to chunked send
-            return self
-                .send_text_chunks(text, &chat_id, thread_id.as_deref())
-                .await;
+            return self.send_text_chunks(text, &chat_id, thread_id.as_deref()).await;
         }
 
         let msg_id = match message_id.parse::<i64>() {
             Ok(id) => id,
             Err(e) => {
                 tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
-                return self
-                    .send_text_chunks(text, &chat_id, thread_id.as_deref())
-                    .await;
+                return self.send_text_chunks(text, &chat_id, thread_id.as_deref()).await;
             }
         };
 
@@ -1644,8 +1548,7 @@ impl Channel for TelegramChannel {
 
         // Edit failed entirely — fall back to new message
         tracing::warn!("Telegram finalize_draft edit failed; falling back to sendMessage");
-        self.send_text_chunks(text, &chat_id, thread_id.as_deref())
-            .await
+        self.send_text_chunks(text, &chat_id, thread_id.as_deref()).await
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
@@ -1693,8 +1596,7 @@ impl Channel for TelegramChannel {
 
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
-                self.send_text_chunks(&text_without_markers, chat_id, thread_id)
-                    .await?;
+                self.send_text_chunks(&text_without_markers, chat_id, thread_id).await?;
             }
 
             for attachment in &attachments {
@@ -1705,8 +1607,7 @@ impl Channel for TelegramChannel {
         }
 
         if let Some(attachment) = parse_path_only_attachment(&content) {
-            self.send_attachment(chat_id, thread_id, &attachment)
-                .await?;
+            self.send_attachment(chat_id, thread_id, &attachment).await?;
             return Ok(());
         }
 
@@ -1755,10 +1656,7 @@ impl Channel for TelegramChannel {
                 }
             };
 
-            let ok = data
-                .get("ok")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true);
+            let ok = data.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(true);
             if !ok {
                 let error_code = data
                     .get("error_code")
@@ -1776,10 +1674,7 @@ Ensure only one `openprx` process is using this bot token."
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 } else {
-                    tracing::warn!(
-                        "Telegram getUpdates API error (code={}): {description}",
-                        error_code
-                    );
+                    tracing::warn!("Telegram getUpdates API error (code={}): {description}", error_code);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 continue;
@@ -1819,12 +1714,7 @@ Ensure only one `openprx` process is using this bot token."
     async fn health_check(&self) -> bool {
         let timeout_duration = Duration::from_secs(5);
 
-        match tokio::time::timeout(
-            timeout_duration,
-            self.http_client().get(self.api_url("getMe")).send(),
-        )
-        .await
-        {
+        match tokio::time::timeout(timeout_duration, self.http_client().get(self.api_url("getMe")).send()).await {
             Ok(Ok(resp)) => resp.status().is_success(),
             Ok(Err(e)) => {
                 tracing::debug!("Telegram health check failed: {e}");
@@ -1931,8 +1821,8 @@ mod tests {
         let off = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
         assert!(!off.supports_draft_updates());
 
-        let partial = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
-            .with_streaming(StreamMode::Partial, 750);
+        let partial =
+            TelegramChannel::new("fake-token".into(), vec!["*".into()], false).with_streaming(StreamMode::Partial, 750);
         assert!(partial.supports_draft_updates());
         assert_eq!(partial.draft_update_interval_ms, 750);
     }
@@ -1940,10 +1830,7 @@ mod tests {
     #[tokio::test]
     async fn send_draft_returns_none_when_stream_mode_off() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
-        let id = ch
-            .send_draft(&SendMessage::new("draft", "123"))
-            .await
-            .unwrap();
+        let id = ch.send_draft(&SendMessage::new("draft", "123")).await.unwrap();
         assert!(id.is_none());
     }
 
@@ -1961,22 +1848,20 @@ mod tests {
 
     #[tokio::test]
     async fn update_draft_utf8_truncation_is_safe_for_multibyte_text() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
-            .with_streaming(StreamMode::Partial, 0);
+        let ch =
+            TelegramChannel::new("fake-token".into(), vec!["*".into()], false).with_streaming(StreamMode::Partial, 0);
         let long_emoji_text = "😀".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 20);
 
         // Invalid message_id returns early after building display_text.
         // This asserts truncation never panics on UTF-8 boundaries.
-        let result = ch
-            .update_draft("123", "not-a-number", &long_emoji_text)
-            .await;
+        let result = ch.update_draft("123", "not-a-number", &long_emoji_text).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn finalize_draft_invalid_message_id_falls_back_to_chunk_send() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
-            .with_streaming(StreamMode::Partial, 0);
+        let ch =
+            TelegramChannel::new("fake-token".into(), vec!["*".into()], false).with_streaming(StreamMode::Partial, 0);
         let long_text = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 64);
 
         // For oversized text + invalid draft message_id, finalize_draft should
@@ -1988,10 +1873,7 @@ mod tests {
     #[test]
     fn telegram_api_url() {
         let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
-        assert_eq!(
-            ch.api_url("getMe"),
-            "https://api.telegram.org/bot123:ABC/getMe"
-        );
+        assert_eq!(ch.api_url("getMe"), "https://api.telegram.org/bot123:ABC/getMe");
     }
 
     #[test]
@@ -2075,10 +1957,7 @@ mod tests {
 
     #[test]
     fn telegram_extract_bind_code_plain_command() {
-        assert_eq!(
-            TelegramChannel::extract_bind_code("/bind 123456"),
-            Some("123456")
-        );
+        assert_eq!(TelegramChannel::extract_bind_code("/bind 123456"), Some("123456"));
     }
 
     #[test]
@@ -2123,8 +2002,7 @@ mod tests {
         let image_path = dir.path().join("snap.png");
         std::fs::write(&image_path, b"fake-png").unwrap();
 
-        let parsed = parse_path_only_attachment(image_path.to_string_lossy().as_ref())
-            .expect("expected attachment");
+        let parsed = parse_path_only_attachment(image_path.to_string_lossy().as_ref()).expect("expected attachment");
 
         assert_eq!(parsed.kind, TelegramAttachmentKind::Image);
         assert_eq!(parsed.target, image_path.to_string_lossy());
@@ -2161,9 +2039,7 @@ mod tests {
             }
         });
 
-        let msg = ch
-            .parse_update_message(&update)
-            .expect("message should parse");
+        let msg = ch.parse_update_message(&update).expect("message should parse");
 
         assert_eq!(msg.sender, "alice");
         assert_eq!(msg.reply_target, "-100200300");
@@ -2188,9 +2064,7 @@ mod tests {
             }
         });
 
-        let msg = ch
-            .parse_update_message(&update)
-            .expect("numeric allowlist should pass");
+        let msg = ch.parse_update_message(&update).expect("numeric allowlist should pass");
 
         assert_eq!(msg.sender, "555");
         assert_eq!(msg.reply_target, "12345");
@@ -2239,37 +2113,25 @@ mod tests {
     #[test]
     fn telegram_api_url_send_photo() {
         let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
-        assert_eq!(
-            ch.api_url("sendPhoto"),
-            "https://api.telegram.org/bot123:ABC/sendPhoto"
-        );
+        assert_eq!(ch.api_url("sendPhoto"), "https://api.telegram.org/bot123:ABC/sendPhoto");
     }
 
     #[test]
     fn telegram_api_url_send_video() {
         let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
-        assert_eq!(
-            ch.api_url("sendVideo"),
-            "https://api.telegram.org/bot123:ABC/sendVideo"
-        );
+        assert_eq!(ch.api_url("sendVideo"), "https://api.telegram.org/bot123:ABC/sendVideo");
     }
 
     #[test]
     fn telegram_api_url_send_audio() {
         let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
-        assert_eq!(
-            ch.api_url("sendAudio"),
-            "https://api.telegram.org/bot123:ABC/sendAudio"
-        );
+        assert_eq!(ch.api_url("sendAudio"), "https://api.telegram.org/bot123:ABC/sendAudio");
     }
 
     #[test]
     fn telegram_api_url_send_voice() {
         let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
-        assert_eq!(
-            ch.api_url("sendVoice"),
-            "https://api.telegram.org/bot123:ABC/sendVoice"
-        );
+        assert_eq!(ch.api_url("sendVoice"), "https://api.telegram.org/bot123:ABC/sendVoice");
     }
 
     // ── File sending integration tests (with mock server) ──────────
@@ -2302,9 +2164,7 @@ mod tests {
         // Minimal valid PNG header bytes
         let file_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
-        let result = ch
-            .send_photo_bytes("123456", None, file_bytes, "test.png", None)
-            .await;
+        let result = ch.send_photo_bytes("123456", None, file_bytes, "test.png", None).await;
 
         assert!(result.is_err());
     }
@@ -2314,12 +2174,7 @@ mod tests {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
 
         let result = ch
-            .send_document_by_url(
-                "123456",
-                None,
-                "https://example.com/file.pdf",
-                Some("PDF doc"),
-            )
+            .send_document_by_url("123456", None, "https://example.com/file.pdf", Some("PDF doc"))
             .await;
 
         assert!(result.is_err());
@@ -2423,10 +2278,7 @@ mod tests {
 
     #[test]
     fn telegram_split_at_word_boundary() {
-        let msg = format!(
-            "{} more text here",
-            "word ".repeat(TELEGRAM_MAX_MESSAGE_LENGTH / 5)
-        );
+        let msg = format!("{} more text here", "word ".repeat(TELEGRAM_MAX_MESSAGE_LENGTH / 5));
         let chunks = split_message_for_telegram(&msg);
         assert!(chunks.len() >= 2);
         // First chunk should end with a complete word (space at the end)
@@ -2479,13 +2331,7 @@ mod tests {
 
         // With caption
         let result = ch
-            .send_document_bytes(
-                "123456",
-                None,
-                file_bytes.clone(),
-                "test.txt",
-                Some("My caption"),
-            )
+            .send_document_bytes("123456", None, file_bytes.clone(), "test.txt", Some("My caption"))
             .await;
         assert!(result.is_err()); // Network error expected
 
@@ -2503,20 +2349,12 @@ mod tests {
 
         // With caption
         let result = ch
-            .send_photo_bytes(
-                "123456",
-                None,
-                file_bytes.clone(),
-                "test.png",
-                Some("Photo caption"),
-            )
+            .send_photo_bytes("123456", None, file_bytes.clone(), "test.png", Some("Photo caption"))
             .await;
         assert!(result.is_err());
 
         // Without caption
-        let result = ch
-            .send_photo_bytes("123456", None, file_bytes, "test.png", None)
-            .await;
+        let result = ch.send_photo_bytes("123456", None, file_bytes, "test.png", None).await;
         assert!(result.is_err());
     }
 
@@ -2540,9 +2378,7 @@ mod tests {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
         let file_bytes = b"content".to_vec();
 
-        let result = ch
-            .send_document_bytes("123456", None, file_bytes, "", None)
-            .await;
+        let result = ch.send_document_bytes("123456", None, file_bytes, "", None).await;
 
         // Should not panic
         assert!(result.is_err());
@@ -2553,9 +2389,7 @@ mod tests {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
         let file_bytes = b"content".to_vec();
 
-        let result = ch
-            .send_document_bytes("", None, file_bytes, "test.txt", None)
-            .await;
+        let result = ch.send_document_bytes("", None, file_bytes, "test.txt", None).await;
 
         // Should not panic
         assert!(result.is_err());
@@ -2623,8 +2457,7 @@ mod tests {
 
     #[test]
     fn strip_tool_call_tags_removes_standard_tags() {
-        let input =
-            "Hello <tool>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool> world";
+        let input = "Hello <tool>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool> world";
         let result = strip_tool_call_tags(input);
         assert_eq!(result, "Hello  world");
     }
@@ -2687,16 +2520,14 @@ mod tests {
 
     #[test]
     fn strip_tool_call_tags_handles_unclosed_tool_call_with_json() {
-        let input =
-            "Status:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"uptime\"}}";
+        let input = "Status:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"uptime\"}}";
         let result = strip_tool_call_tags(input);
         assert_eq!(result, "Status:");
     }
 
     #[test]
     fn strip_tool_call_tags_handles_mismatched_close_tag() {
-        let input =
-            "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"uptime\"}}</arg_value>";
+        let input = "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"uptime\"}}</arg_value>";
         let result = strip_tool_call_tags(input);
         assert_eq!(result, "");
     }
@@ -2724,14 +2555,8 @@ mod tests {
 
     #[test]
     fn telegram_contains_bot_mention_finds_mention() {
-        assert!(TelegramChannel::contains_bot_mention(
-            "Hello @mybot",
-            "mybot"
-        ));
-        assert!(TelegramChannel::contains_bot_mention(
-            "@mybot help",
-            "mybot"
-        ));
+        assert!(TelegramChannel::contains_bot_mention("Hello @mybot", "mybot"));
+        assert!(TelegramChannel::contains_bot_mention("@mybot help", "mybot"));
         assert!(TelegramChannel::contains_bot_mention(
             "Hey @mybot how are you?",
             "mybot"
@@ -2744,18 +2569,9 @@ mod tests {
 
     #[test]
     fn telegram_contains_bot_mention_no_false_positives() {
-        assert!(!TelegramChannel::contains_bot_mention(
-            "Hello @otherbot",
-            "mybot"
-        ));
-        assert!(!TelegramChannel::contains_bot_mention(
-            "Hello mybot",
-            "mybot"
-        ));
-        assert!(!TelegramChannel::contains_bot_mention(
-            "Hello @mybot2",
-            "mybot"
-        ));
+        assert!(!TelegramChannel::contains_bot_mention("Hello @otherbot", "mybot"));
+        assert!(!TelegramChannel::contains_bot_mention("Hello mybot", "mybot"));
+        assert!(!TelegramChannel::contains_bot_mention("Hello @mybot2", "mybot"));
         assert!(!TelegramChannel::contains_bot_mention("", "mybot"));
     }
 
@@ -2828,9 +2644,7 @@ mod tests {
             }
         });
 
-        let parsed = ch
-            .parse_update_message(&update)
-            .expect("mention should parse");
+        let parsed = ch.parse_update_message(&update).expect("mention should parse");
         assert_eq!(parsed.content, "Hi status please");
 
         let empty_update = serde_json::json!({
@@ -2891,10 +2705,7 @@ mod tests {
         msg.push_str(&"x".repeat(4085));
         msg.push_str("\n```\nMore text after code block");
         let parts = split_message_for_telegram(&msg);
-        assert!(
-            parts.len() >= 2,
-            "code block spanning boundary should split"
-        );
+        assert!(parts.len() >= 2, "code block spanning boundary should split");
         for part in &parts {
             assert!(
                 part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,

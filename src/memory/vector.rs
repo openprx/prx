@@ -93,10 +93,7 @@ pub fn hybrid_merge(
     }
 
     // Normalize keyword scores (BM25 can be any positive number)
-    let max_kw = keyword_results
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(0.0_f32, f32::max);
+    let max_kw = keyword_results.iter().map(|(_, s)| *s).fold(0.0_f32, f32::max);
     let max_kw = if max_kw < f32::EPSILON { 1.0 } else { max_kw };
 
     for (id, score) in keyword_results {
@@ -230,9 +227,7 @@ mod tests {
 
     #[test]
     fn hybrid_merge_respects_limit() {
-        let vec_results: Vec<(String, f32)> = (0..20)
-            .map(|i| (format!("item_{i}"), 1.0 - i as f32 * 0.05))
-            .collect();
+        let vec_results: Vec<(String, f32)> = (0..20).map(|i| (format!("item_{i}"), 1.0 - i as f32 * 0.05)).collect();
         let merged = hybrid_merge(&vec_results, &[], 1.0, 0.0, 5);
         assert_eq!(merged.len(), 5);
     }
@@ -283,14 +278,9 @@ mod tests {
     #[test]
     fn cosine_high_dimensional() {
         let a: Vec<f32> = (0..1536).map(|i| (f64::from(i) * 0.001) as f32).collect();
-        let b: Vec<f32> = (0..1536)
-            .map(|i| (f64::from(i) * 0.001 + 0.0001) as f32)
-            .collect();
+        let b: Vec<f32> = (0..1536).map(|i| (f64::from(i) * 0.001 + 0.0001) as f32).collect();
         let sim = cosine_similarity(&a, &b);
-        assert!(
-            sim > 0.99,
-            "High-dim similar vectors should be close: {sim}"
-        );
+        assert!(sim > 0.99, "High-dim similar vectors should be close: {sim}");
     }
 
     #[test]

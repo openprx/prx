@@ -201,11 +201,7 @@ pub async fn put_config_file(
     let target_path = match resolve_config_file_path(&current.config_path, &filename) {
         Ok(path) => path,
         Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": error})),
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": error}))).into_response();
         }
     };
 
@@ -255,9 +251,7 @@ pub async fn put_config_file(
         }
     }
 
-    if let Err(error) =
-        crate::config::schema::write_toml_string_atomic(&target_path, &payload.content).await
-    {
+    if let Err(error) = crate::config::schema::write_toml_string_atomic(&target_path, &payload.content).await {
         warn!("Failed to save config file: {error}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -266,18 +260,17 @@ pub async fn put_config_file(
             .into_response();
     }
 
-    let refreshed = match crate::config::Config::load_from_path(
-        &current.config_path,
-        current.workspace_dir,
-    ) {
+    let refreshed = match crate::config::Config::load_from_path(&current.config_path, current.workspace_dir) {
         Ok(config) => config,
         Err(error) => {
             warn!("Saved file but merged config is invalid: {error}");
             return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "Saved file but merged configuration is invalid — check TOML syntax"})),
-                )
-                    .into_response();
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"error": "Saved file but merged configuration is invalid — check TOML syntax"}),
+                ),
+            )
+                .into_response();
         }
     };
 
@@ -300,10 +293,7 @@ pub async fn get_config_schema() -> Response {
 }
 
 fn collect_config_files(config_path: &std::path::Path) -> anyhow::Result<Vec<ConfigFilePayload>> {
-    let mut files = vec![read_config_file(
-        config_path.to_path_buf(),
-        ConfigFileSource::Main,
-    )?];
+    let mut files = vec![read_config_file(config_path.to_path_buf(), ConfigFileSource::Main)?];
     for path in crate::config::files::list_config_fragment_paths(config_path)? {
         files.push(read_config_file(path, ConfigFileSource::Fragment)?);
     }
@@ -331,10 +321,7 @@ fn read_config_file(path: PathBuf, source: ConfigFileSource) -> anyhow::Result<C
     })
 }
 
-fn resolve_config_file_path(
-    config_path: &std::path::Path,
-    filename: &str,
-) -> Result<PathBuf, String> {
+fn resolve_config_file_path(config_path: &std::path::Path, filename: &str) -> Result<PathBuf, String> {
     if filename == "config.toml" {
         return Ok(config_path.to_path_buf());
     }
@@ -376,9 +363,7 @@ fn redact_config_value(key: Option<&str>, value: &mut Value) {
 fn redact_sensitive_value(value: &mut Value) {
     match value {
         Value::Null => {}
-        Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-            *value = Value::String(REDACTION_MASK.to_string())
-        }
+        Value::Bool(_) | Value::Number(_) | Value::String(_) => *value = Value::String(REDACTION_MASK.to_string()),
         Value::Array(items) => {
             for item in items {
                 redact_sensitive_value(item);

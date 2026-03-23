@@ -45,11 +45,7 @@ impl XmlToolDispatcher {
                 let inner = &remaining[start + 11..start + end];
                 match serde_json::from_str::<Value>(inner.trim()) {
                     Ok(parsed) => {
-                        let name = parsed
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
+                        let name = parsed.get("name").and_then(Value::as_str).unwrap_or("").to_string();
                         if name.is_empty() {
                             remaining = &remaining[start + end + 12..];
                             continue;
@@ -108,8 +104,7 @@ impl ToolDispatcher for XmlToolDispatcher {
     fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String {
         let mut instructions = String::new();
         instructions.push_str("## Tool Use Protocol\n\n");
-        instructions
-            .push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
+        instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
         instructions.push_str(
             "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n",
         );
@@ -184,10 +179,7 @@ impl ToolDispatcher for NativeToolDispatcher {
         let messages = results
             .iter()
             .map(|result| ToolResultMessage {
-                tool_call_id: result
-                    .tool_call_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
+                tool_call_id: result.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string()),
                 content: result.output.clone(),
             })
             .collect();
@@ -239,8 +231,7 @@ mod tests {
     fn xml_dispatcher_parses_tool_calls() {
         let response = ChatResponse {
             text: Some(
-                "Checking\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>"
-                    .into(),
+                "Checking\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>".into(),
             ),
             tool_calls: vec![],
         };

@@ -135,12 +135,7 @@ impl Channel for DingTalkChannel {
             }
         });
 
-        let resp = self
-            .http_client()
-            .post(webhook_url)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.http_client().post(webhook_url).json(&body).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -161,8 +156,7 @@ impl Channel for DingTalkChannel {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(2 * 1024 * 1024);
         ws_config.max_frame_size = Some(1024 * 1024);
-        let (ws_stream, _) =
-            tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_config), false).await?;
+        let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_config), false).await?;
         let (mut write, mut read) = ws_stream.split();
 
         tracing::info!("DingTalk: connected and listening for messages...");
@@ -231,15 +225,10 @@ impl Channel for DingTalkChannel {
                         continue;
                     }
 
-                    let sender_id = data
-                        .get("senderStaffId")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("unknown");
+                    let sender_id = data.get("senderStaffId").and_then(|s| s.as_str()).unwrap_or("unknown");
 
                     if !self.is_user_allowed(sender_id) {
-                        tracing::warn!(
-                            "DingTalk: ignoring message from unauthorized user: {sender_id}"
-                        );
+                        tracing::warn!("DingTalk: ignoring message from unauthorized user: {sender_id}");
                         continue;
                     }
 

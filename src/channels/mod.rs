@@ -64,9 +64,7 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{
-    ScopeContext, ToolConcurrencyGovernanceConfig, build_tool_instructions, run_tool_call_loop,
-};
+use crate::agent::loop_::{ScopeContext, ToolConcurrencyGovernanceConfig, build_tool_instructions, run_tool_call_loop};
 use crate::config::Config;
 use crate::hooks::HookManager;
 use crate::identity;
@@ -132,10 +130,7 @@ fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
 }
 
-fn channel_message_timeout_budget_secs(
-    message_timeout_secs: u64,
-    max_tool_iterations: usize,
-) -> u64 {
+fn channel_message_timeout_budget_secs(message_timeout_secs: u64, max_tool_iterations: usize) -> u64 {
     let iterations = max_tool_iterations.max(1) as u64;
     let scale = iterations.min(CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP);
     message_timeout_secs.saturating_mul(scale)
@@ -309,10 +304,7 @@ fn normalize_allowlist(values: &[String]) -> HashSet<String> {
 }
 
 fn infer_chat_type_from_message(msg: &traits::ChannelMessage) -> &'static str {
-    if msg.reply_target.starts_with("group:")
-        || msg.reply_target.ends_with("@g.us")
-        || msg.sender.ends_with("@g.us")
-    {
+    if msg.reply_target.starts_with("group:") || msg.reply_target.ends_with("@g.us") || msg.sender.ends_with("@g.us") {
         "group"
     } else {
         "direct"
@@ -336,10 +328,7 @@ fn allowlist_matches(allowlist: &HashSet<String>, value: &str) -> bool {
     allowlist.contains("*") || allowlist.contains(value)
 }
 
-fn normalize_dm_policy(
-    channel_name: &str,
-    dm_policy: crate::config::DmPolicy,
-) -> crate::config::DmPolicy {
+fn normalize_dm_policy(channel_name: &str, dm_policy: crate::config::DmPolicy) -> crate::config::DmPolicy {
     match dm_policy {
         crate::config::DmPolicy::Pairing => {
             tracing::warn!(
@@ -404,10 +393,7 @@ fn evaluate_inbound_policy(policy: &InboundPolicyConfig, msg: &traits::ChannelMe
     }
 }
 
-fn should_process_inbound_message(
-    ctx: &ChannelRuntimeContext,
-    msg: &traits::ChannelMessage,
-) -> bool {
+fn should_process_inbound_message(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage) -> bool {
     let policy = match msg.channel.as_str() {
         "signal" => ctx.signal_inbound_policy.as_ref(),
         "whatsapp" => ctx.whatsapp_inbound_policy.as_ref(),
@@ -423,9 +409,7 @@ fn should_process_inbound_message(
 fn collect_bot_names(config: &Config) -> Vec<String> {
     let mut names: Vec<String> = vec!["prx".to_string()];
 
-    if let Ok(Some(aieos_identity)) =
-        identity::load_aieos_identity(&config.identity, &config.workspace_dir)
-    {
+    if let Ok(Some(aieos_identity)) = identity::load_aieos_identity(&config.identity, &config.workspace_dir) {
         if let Some(identity) = aieos_identity.identity {
             if let Some(agent_names) = identity.names {
                 if let Some(first) = agent_names.first {
@@ -503,10 +487,7 @@ fn collect_mention_only_by_channel(config: &Config) -> HashMap<String, bool> {
         mention_only.insert("slack".to_string(), slack.mention_only);
     }
     if let Some(mattermost) = config.channels_config.mattermost.as_ref() {
-        mention_only.insert(
-            "mattermost".to_string(),
-            mattermost.mention_only.unwrap_or(false),
-        );
+        mention_only.insert("mattermost".to_string(), mattermost.mention_only.unwrap_or(false));
     }
     if let Some(imessage) = config.channels_config.imessage.as_ref() {
         mention_only.insert("imessage".to_string(), imessage.mention_only);
@@ -546,17 +527,10 @@ fn collect_mention_only_by_channel(config: &Config) -> HashMap<String, bool> {
 }
 
 fn is_mention_only_enabled(ctx: &ChannelRuntimeContext, channel_name: &str) -> bool {
-    ctx.mention_only_by_channel
-        .get(channel_name)
-        .copied()
-        .unwrap_or(false)
+    ctx.mention_only_by_channel.get(channel_name).copied().unwrap_or(false)
 }
 
-fn is_bot_mentioned(
-    ctx: &ChannelRuntimeContext,
-    msg: &traits::ChannelMessage,
-    content: &str,
-) -> bool {
+fn is_bot_mentioned(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage, content: &str) -> bool {
     // Check UUID-based mentions first (Signal @mentions)
     for uuid in &ctx.bot_uuids {
         if msg.mentioned_uuids.contains(uuid) {
@@ -744,9 +718,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     match base_command.as_str() {
         "/models" => {
             if let Some(provider) = parts.next() {
-                Some(ChannelRuntimeCommand::SetProvider(
-                    provider.trim().to_string(),
-                ))
+                Some(ChannelRuntimeCommand::SetProvider(provider.trim().to_string()))
             } else {
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
@@ -836,18 +808,13 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
 
 async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     let path = path.to_path_buf();
-    let fingerprint = tokio::task::spawn_blocking(move || {
-        crate::config::files::compute_config_fingerprint(&path).ok()
-    })
-    .await
-    .ok()??;
+    let fingerprint = tokio::task::spawn_blocking(move || crate::config::files::compute_config_fingerprint(&path).ok())
+        .await
+        .ok()??;
     Some(ConfigFileStamp { fingerprint })
 }
 
-fn load_runtime_defaults_from_config_file(
-    path: &Path,
-    workspace_dir: &Path,
-) -> Result<ChannelRuntimeDefaults> {
+fn load_runtime_defaults_from_config_file(path: &Path, workspace_dir: &Path) -> Result<ChannelRuntimeDefaults> {
     let parsed = Config::load_from_path(path, workspace_dir.to_path_buf())?;
     Ok(runtime_defaults_from_config(&parsed))
 }
@@ -870,8 +837,7 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let next_defaults =
-        load_runtime_defaults_from_config_file(&config_path, ctx.workspace_dir.as_path())?;
+    let next_defaults = load_runtime_defaults_from_config_file(&config_path, ctx.workspace_dir.as_path())?;
     let next_default_provider = providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
@@ -960,24 +926,17 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
         return false;
     }
 
-    let keep_from = turns
-        .len()
-        .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+    let keep_from = turns.len().saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
     let mut compacted = normalize_cached_channel_turns(turns[keep_from..].to_vec());
 
     for turn in &mut compacted {
         if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
-            turn.content =
-                truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
+            turn.content = truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
         }
     }
 
     // Enforce a hard total character budget to avoid repeated context overflow.
-    while compacted
-        .iter()
-        .map(|turn| turn.content.chars().count())
-        .sum::<usize>()
-        > CHANNEL_HISTORY_COMPACT_TOTAL_CHARS
+    while compacted.iter().map(|turn| turn.content.chars().count()).sum::<usize>() > CHANNEL_HISTORY_COMPACT_TOTAL_CHARS
         && compacted.len() > 1
     {
         compacted.remove(0);
@@ -1014,9 +973,7 @@ async fn append_sender_turn(
 
     if let Err(error) = ctx
         .memory
-        .append_conversation_turn(
-            sender_key, channel, sender, &role, &content, timestamp, message_id,
-        )
+        .append_conversation_turn(sender_key, channel, sender, &role, &content, timestamp, message_id)
         .await
     {
         tracing::warn!(
@@ -1107,10 +1064,7 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
         .unwrap_or_default()
 }
 
-async fn get_or_create_provider(
-    ctx: &ChannelRuntimeContext,
-    provider_name: &str,
-) -> anyhow::Result<Arc<dyn Provider>> {
+async fn get_or_create_provider(ctx: &ChannelRuntimeContext, provider_name: &str) -> anyhow::Result<Arc<dyn Provider>> {
     if let Some(existing) = ctx.provider_cache.lock().get(provider_name).cloned() {
         return Ok(existing);
     }
@@ -1163,11 +1117,7 @@ fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &P
             current.provider, current.provider
         );
     } else {
-        let _ = writeln!(
-            response,
-            "\nCached model IDs (top {}):",
-            cached_models.len()
-        );
+        let _ = writeln!(response, "\nCached model IDs (top {}):", cached_models.len());
         for model in cached_models {
             let _ = writeln!(response, "- `{model}`");
         }
@@ -1219,36 +1169,28 @@ async fn handle_runtime_command_if_needed(
 
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
-        ChannelRuntimeCommand::SetProvider(raw_provider) => {
-            match resolve_provider_alias(&raw_provider) {
-                Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
-                    Ok(_) => {
-                        if provider_name != current.provider {
-                            current.provider = provider_name.clone();
-                            set_route_selection(ctx, &sender_key, current.clone());
-                            clear_sender_history(ctx, &sender_key);
-                        }
+        ChannelRuntimeCommand::SetProvider(raw_provider) => match resolve_provider_alias(&raw_provider) {
+            Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
+                Ok(_) => {
+                    if provider_name != current.provider {
+                        current.provider = provider_name.clone();
+                        set_route_selection(ctx, &sender_key, current.clone());
+                        clear_sender_history(ctx, &sender_key);
+                    }
 
-                        format!(
-                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
-                            current.model
-                        )
-                    }
-                    Err(err) => {
-                        let safe_err = providers::sanitize_api_error(&err.to_string());
-                        format!(
-                            "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
-                        )
-                    }
-                },
-                None => format!(
-                    "Unknown provider `{raw_provider}`. Use `/models` to list valid providers."
-                ),
-            }
-        }
-        ChannelRuntimeCommand::ShowModel => {
-            build_models_help_response(&current, ctx.workspace_dir.as_path())
-        }
+                    format!(
+                        "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                        current.model
+                    )
+                }
+                Err(err) => {
+                    let safe_err = providers::sanitize_api_error(&err.to_string());
+                    format!("Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}")
+                }
+            },
+            None => format!("Unknown provider `{raw_provider}`. Use `/models` to list valid providers."),
+        },
+        ChannelRuntimeCommand::ShowModel => build_models_help_response(&current, ctx.workspace_dir.as_path()),
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
@@ -1270,20 +1212,13 @@ async fn handle_runtime_command_if_needed(
         .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
         .await
     {
-        tracing::warn!(
-            "Failed to send runtime command response on {}: {err}",
-            channel.name()
-        );
+        tracing::warn!("Failed to send runtime command response on {}: {err}", channel.name());
     }
 
     true
 }
 
-async fn build_memory_context(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-) -> String {
+async fn build_memory_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
     let mut context = String::new();
 
     if let Ok(entries) = mem.recall(user_msg, 5, None).await {
@@ -1426,10 +1361,7 @@ pub(crate) fn extract_tool_context_summary(history: &[ChatMessage], start_index:
 }
 
 pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
-    let known_tool_names: HashSet<String> = tools
-        .iter()
-        .map(|tool| tool.name().to_ascii_lowercase())
-        .collect();
+    let known_tool_names: HashSet<String> = tools.iter().map(|tool| tool.name().to_ascii_lowercase()).collect();
     let cleaned_tags = strip_isolated_tool_tag_artifacts(response, &known_tool_names);
     strip_isolated_tool_json_artifacts(&cleaned_tags, &known_tool_names)
 }
@@ -1477,9 +1409,7 @@ fn is_signal_image_message(msg: &traits::ChannelMessage) -> bool {
         return false;
     }
 
-    let has_image_markers = !crate::multimodal::parse_image_markers(&msg.content)
-        .1
-        .is_empty();
+    let has_image_markers = !crate::multimodal::parse_image_markers(&msg.content).1.is_empty();
     let has_signal_image_meta =
         msg.content.contains("vision_required=true") || msg.content.contains("image_attachments=");
     has_image_markers || has_signal_image_meta
@@ -1527,17 +1457,13 @@ async fn run_signal_vision_preflight(
     }
 
     if !provider.supports_vision() {
-        tracing::warn!(
-            "Signal image guard: provider does not support vision, forcing uncertainty fallback"
-        );
+        tracing::warn!("Signal image guard: provider does not support vision, forcing uncertainty fallback");
         return SignalVisionPreflightOutcome::Fallback;
     }
 
     let (cleaned_text, image_refs) = crate::multimodal::parse_image_markers(&msg.content);
     if image_refs.is_empty() {
-        tracing::warn!(
-            "Signal image guard: image attachment metadata exists but no usable image markers"
-        );
+        tracing::warn!("Signal image guard: image attachment metadata exists but no usable image markers");
         return SignalVisionPreflightOutcome::Fallback;
     }
 
@@ -1566,25 +1492,17 @@ Never guess brand, dosage, specification, or product identity.",
         ChatMessage::user(user_prompt),
     ];
 
-    let prepared = match crate::multimodal::prepare_messages_for_provider(
-        &preflight_messages,
-        multimodal_config,
-    )
-    .await
+    let prepared = match crate::multimodal::prepare_messages_for_provider(&preflight_messages, multimodal_config).await
     {
         Ok(prepared) => prepared,
         Err(error) => {
-            tracing::warn!(
-                "Signal image guard: multimodal preflight normalization failed: {error}"
-            );
+            tracing::warn!("Signal image guard: multimodal preflight normalization failed: {error}");
             return SignalVisionPreflightOutcome::Fallback;
         }
     };
 
     if !prepared.contains_images {
-        tracing::warn!(
-            "Signal image guard: preflight request did not retain image payloads after normalization"
-        );
+        tracing::warn!("Signal image guard: preflight request did not retain image payloads after normalization");
         return SignalVisionPreflightOutcome::Fallback;
     }
 
@@ -1614,26 +1532,18 @@ Never guess brand, dosage, specification, or product identity.",
 
     let raw_report = preflight_response.text_or_empty().trim();
     let Some(report) = parse_signal_vision_preflight_report(raw_report) else {
-        tracing::warn!(
-            "Signal image guard: preflight returned unparsable payload, forcing fallback"
-        );
+        tracing::warn!("Signal image guard: preflight returned unparsable payload, forcing fallback");
         return SignalVisionPreflightOutcome::Fallback;
     };
 
     let confidence = report.confidence.unwrap_or_default();
-    let summary = report
-        .summary_text()
-        .map(|value| value.to_string())
-        .unwrap_or_default();
+    let summary = report.summary_text().map(|value| value.to_string()).unwrap_or_default();
     let status = report.status.trim().to_ascii_lowercase();
     let status_uncertain = matches!(
         status.as_str(),
         "uncertain" | "unknown" | "unclear" | "insufficient" | "low_confidence"
     );
-    if status_uncertain
-        || summary.is_empty()
-        || confidence < SIGNAL_VISION_PREFLIGHT_CONFIDENCE_THRESHOLD
-    {
+    if status_uncertain || summary.is_empty() || confidence < SIGNAL_VISION_PREFLIGHT_CONFIDENCE_THRESHOLD {
         tracing::warn!(
             "Signal image guard: preflight confidence too low (status={status}, confidence={confidence:.2})"
         );
@@ -1641,9 +1551,7 @@ Never guess brand, dosage, specification, or product identity.",
     }
 
     SignalVisionPreflightOutcome::Ready {
-        context: format!(
-            "[signal-vision-preflight confidence={confidence:.2}]\n{summary}\n[/signal-vision-preflight]"
-        ),
+        context: format!("[signal-vision-preflight confidence={confidence:.2}]\n{summary}\n[/signal-vision-preflight]"),
     }
 }
 
@@ -1652,24 +1560,23 @@ fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<St
         return false;
     };
 
-    let (name, has_args) =
-        if let Some(function) = object.get("function").and_then(|f| f.as_object()) {
-            (
-                function
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| object.get("name").and_then(|v| v.as_str())),
-                function.contains_key("arguments")
-                    || function.contains_key("parameters")
-                    || object.contains_key("arguments")
-                    || object.contains_key("parameters"),
-            )
-        } else {
-            (
-                object.get("name").and_then(|v| v.as_str()),
-                object.contains_key("arguments") || object.contains_key("parameters"),
-            )
-        };
+    let (name, has_args) = if let Some(function) = object.get("function").and_then(|f| f.as_object()) {
+        (
+            function
+                .get("name")
+                .and_then(|v| v.as_str())
+                .or_else(|| object.get("name").and_then(|v| v.as_str())),
+            function.contains_key("arguments")
+                || function.contains_key("parameters")
+                || object.contains_key("arguments")
+                || object.contains_key("parameters"),
+        )
+    } else {
+        (
+            object.get("name").and_then(|v| v.as_str()),
+            object.contains_key("arguments") || object.contains_key("parameters"),
+        )
+    };
 
     let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
         return false;
@@ -1678,20 +1585,14 @@ fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<St
     has_args && known_tool_names.contains(&name.to_ascii_lowercase())
 }
 
-fn is_tool_result_payload(
-    object: &serde_json::Map<String, serde_json::Value>,
-    saw_tool_call_payload: bool,
-) -> bool {
+fn is_tool_result_payload(object: &serde_json::Map<String, serde_json::Value>, saw_tool_call_payload: bool) -> bool {
     if !saw_tool_call_payload || !object.contains_key("result") {
         return false;
     }
 
-    object.keys().all(|key| {
-        matches!(
-            key.as_str(),
-            "result" | "id" | "tool_call_id" | "name" | "tool"
-        )
-    })
+    object
+        .keys()
+        .all(|key| matches!(key.as_str(), "result" | "id" | "tool_call_id" | "name" | "tool"))
 }
 
 fn sanitize_tool_json_value(
@@ -1704,11 +1605,7 @@ fn sanitize_tool_json_value(
     }
 
     if let Some(array) = value.as_array() {
-        if !array.is_empty()
-            && array
-                .iter()
-                .all(|item| is_tool_call_payload(item, known_tool_names))
-        {
+        if !array.is_empty() && array.iter().all(|item| is_tool_call_payload(item, known_tool_names)) {
             return Some((String::new(), true));
         }
         return None;
@@ -1743,9 +1640,7 @@ fn sanitize_tool_json_value(
 
 fn is_line_isolated_json_segment(message: &str, start: usize, end: usize) -> bool {
     let line_start = message[..start].rfind('\n').map_or(0, |idx| idx + 1);
-    let line_end = message[end..]
-        .find('\n')
-        .map_or(message.len(), |idx| end + idx);
+    let line_end = message[end..].find('\n').map_or(message.len(), |idx| end + idx);
 
     message[line_start..start].trim().is_empty() && message[end..line_end].trim().is_empty()
 }
@@ -1765,8 +1660,7 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
         cleaned.push_str(&message[cursor..start]);
 
         let candidate = &message[start..];
-        let mut stream =
-            serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+        let mut stream = serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
 
         if let Some(Ok(value)) = stream.next() {
             let consumed = stream.byte_offset();
@@ -1880,9 +1774,7 @@ fn strip_isolated_tool_tag_artifacts(message: &str, known_tool_names: &HashSet<S
     let mut cursor = 0usize;
 
     while cursor < message.len() {
-        let Some((start_rel, open_end_rel, close_tag)) =
-            find_first_tool_call_open_tag(&message[cursor..])
-        else {
+        let Some((start_rel, open_end_rel, close_tag)) = find_first_tool_call_open_tag(&message[cursor..]) else {
             cleaned.push_str(&message[cursor..]);
             break;
         };
@@ -2002,10 +1894,7 @@ fn spawn_supervised_listener_with_health_interval(
 fn compute_max_in_flight_messages(channel_count: usize) -> usize {
     channel_count
         .saturating_mul(CHANNEL_PARALLELISM_PER_CHANNEL)
-        .clamp(
-            CHANNEL_MIN_IN_FLIGHT_MESSAGES,
-            CHANNEL_MAX_IN_FLIGHT_MESSAGES,
-        )
+        .clamp(CHANNEL_MIN_IN_FLIGHT_MESSAGES, CHANNEL_MAX_IN_FLIGHT_MESSAGES)
 }
 
 fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
@@ -2082,10 +1971,7 @@ async fn process_channel_message(
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
-                    .send(
-                        &SendMessage::new(message, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
+                    .send(&SendMessage::new(message, &msg.reply_target).in_thread(msg.thread_ts.clone()))
                     .await;
             }
             return;
@@ -2205,10 +2091,7 @@ async fn process_channel_message(
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Err(e) = channel
-                    .send(
-                        &SendMessage::new(fallback, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
+                    .send(&SendMessage::new(fallback, &msg.reply_target).in_thread(msg.thread_ts.clone()))
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
@@ -2287,9 +2170,7 @@ async fn process_channel_message(
     };
 
     let mut history = rebuild_history();
-    let use_streaming = target_channel
-        .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates());
+    let use_streaming = target_channel.as_ref().is_some_and(|ch| ch.supports_draft_updates());
 
     let (delta_tx, delta_rx) = if use_streaming {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -2301,9 +2182,7 @@ async fn process_channel_message(
     let draft_message_id = if use_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
-                .send_draft(
-                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
-                )
+                .send_draft(&SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()))
                 .await
             {
                 Ok(id) => id,
@@ -2319,11 +2198,9 @@ async fn process_channel_message(
         None
     };
 
-    let draft_updater = if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) = (
-        delta_rx,
-        draft_message_id.as_deref(),
-        target_channel.as_ref(),
-    ) {
+    let draft_updater = if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) =
+        (delta_rx, draft_message_id.as_deref(), target_channel.as_ref())
+    {
         let channel = Arc::clone(channel_ref);
         let reply_target = msg.reply_target.clone();
         let draft_id = draft_id_ref.to_string();
@@ -2331,10 +2208,7 @@ async fn process_channel_message(
             let mut accumulated = String::new();
             while let Some(delta) = rx.recv().await {
                 accumulated.push_str(&delta);
-                if let Err(e) = channel
-                    .update_draft(&reply_target, &draft_id, &accumulated)
-                    .await
-                {
+                if let Err(e) = channel.update_draft(&reply_target, &draft_id, &accumulated).await {
                     tracing::debug!("Draft update failed: {e}");
                 }
             }
@@ -2401,8 +2275,7 @@ async fn process_channel_message(
 
     const MAX_CONTEXT_OVERFLOW_RETRIES: usize = 2;
 
-    let timeout_budget_secs =
-        channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let timeout_budget_secs = channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
 
     // Derive chat_type from reply_target: "group" if the reply target is a group, else "direct".
     let chat_type = infer_chat_type_from_message(&msg);
@@ -2462,9 +2335,7 @@ async fn process_channel_message(
                 };
             }
             LlmExecutionResult::Completed(Ok(Err(e))) => {
-                if crate::agent::loop_::is_tool_loop_cancelled(&e)
-                    || cancellation_token.is_cancelled()
-                {
+                if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled() {
                     break LlmFinalOutcome::Cancelled;
                 }
 
@@ -2474,12 +2345,7 @@ async fn process_channel_message(
                         .conversation_histories
                         .lock()
                         .get(&history_key)
-                        .map(|turns| {
-                            turns
-                                .iter()
-                                .map(|t| t.content.chars().count())
-                                .sum::<usize>()
-                        })
+                        .map(|turns| turns.iter().map(|t| t.content.chars().count()).sum::<usize>())
                         .unwrap_or(0);
                     eprintln!(
                         "  ⚠️ Context window exceeded after {}ms; sender history compacted={} (chars={})",
@@ -2537,9 +2403,7 @@ async fn process_channel_message(
                 sender = %msg.sender,
                 "Cancelled in-flight channel request due to newer message"
             );
-            if let (Some(channel), Some(draft_id)) =
-                (target_channel.as_ref(), draft_message_id.as_deref())
-            {
+            if let (Some(channel), Some(draft_id)) = (target_channel.as_ref(), draft_message_id.as_deref()) {
                 if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
                     tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
                 }
@@ -2549,11 +2413,10 @@ async fn process_channel_message(
             response,
             history_len_before_tools,
         } => {
-            let sanitized_response =
-                sanitize_channel_response(&response, ctx.tools_registry.as_ref());
-            let delivered_response = if sanitized_response.is_empty() && !response.trim().is_empty()
-            {
-                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+            let sanitized_response = sanitize_channel_response(&response, ctx.tools_registry.as_ref());
+            let delivered_response = if sanitized_response.is_empty() && !response.trim().is_empty() {
+                "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
+                    .to_string()
             } else {
                 sanitized_response
             };
@@ -2598,10 +2461,7 @@ async fn process_channel_message(
                             .await;
                     }
                 } else if let Err(e) = channel
-                    .send(
-                        &SendMessage::new(delivered_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
+                    .send(&SendMessage::new(delivered_response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
@@ -2609,10 +2469,7 @@ async fn process_channel_message(
             }
         }
         LlmFinalOutcome::Error(e) => {
-            eprintln!(
-                "  ❌ LLM error after {}ms: {e}",
-                started_at.elapsed().as_millis()
-            );
+            eprintln!("  ❌ LLM error after {}ms: {e}", started_at.elapsed().as_millis());
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
@@ -2625,11 +2482,8 @@ async fn process_channel_message(
                 } else {
                     let _ = channel
                         .send(
-                            &SendMessage::new(
-                                "⚠️ Something went wrong. Please try again later.",
-                                &msg.reply_target,
-                            )
-                            .in_thread(msg.thread_ts.clone()),
+                            &SendMessage::new("⚠️ Something went wrong. Please try again later.", &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
                         )
                         .await;
                 }
@@ -2640,41 +2494,26 @@ async fn process_channel_message(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
                 timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
             );
-            eprintln!(
-                "  ❌ {} (elapsed: {}ms)",
-                timeout_msg,
-                started_at.elapsed().as_millis()
-            );
+            eprintln!("  ❌ {} (elapsed: {}ms)", timeout_msg, started_at.elapsed().as_millis());
             if let Some(channel) = target_channel.as_ref() {
                 let error_text = "⚠️ Request timed out. Please try again shortly.";
                 if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
-                        .await;
+                    let _ = channel.finalize_draft(&msg.reply_target, draft_id, error_text).await;
                 } else {
                     let _ = channel
-                        .send(
-                            &SendMessage::new(error_text, &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
+                        .send(&SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
                         .await;
                 }
             }
         }
         LlmFinalOutcome::ContextOverflowExhausted => {
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "Session context was too long and has been reset. Please resend your message.";
+                let error_text = "Session context was too long and has been reset. Please resend your message.";
                 if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
-                        .await;
+                    let _ = channel.finalize_draft(&msg.reply_target, draft_id, error_text).await;
                 } else {
                     let _ = channel
-                        .send(
-                            &SendMessage::new(error_text, &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
+                        .send(&SendMessage::new(error_text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
                         .await;
                 }
             }
@@ -2702,10 +2541,9 @@ async fn run_message_dispatch_loop(
     let system_semaphore = Arc::new(tokio::sync::Semaphore::new(system_capacity));
 
     let mut workers = tokio::task::JoinSet::new();
-    let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
-        String,
-        InFlightSenderTaskState,
-    >::new()));
+    let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(
+        HashMap::<String, InFlightSenderTaskState>::new(),
+    ));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
@@ -2724,8 +2562,7 @@ async fn run_message_dispatch_loop(
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
             let _permit = permit;
-            let interrupt_enabled =
-                worker_ctx.interrupt_on_new_message && msg.channel == "telegram";
+            let interrupt_enabled = worker_ctx.interrupt_on_new_message && msg.channel == "telegram";
             let sender_scope_key = interruption_scope_key(&msg);
             let cancellation_token = CancellationToken::new();
             let completion = Arc::new(InFlightTaskCompletion::new());
@@ -2781,19 +2618,12 @@ async fn run_message_dispatch_loop(
 }
 
 /// Load OpenClaw format bootstrap files into the prompt.
-fn load_openclaw_bootstrap_files(
-    prompt: &mut String,
-    workspace_dir: &std::path::Path,
-    max_chars_per_file: usize,
-) {
+fn load_openclaw_bootstrap_files(prompt: &mut String, workspace_dir: &std::path::Path, max_chars_per_file: usize) {
     prompt.push_str(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
     );
 
-    prompt.push_str(&build_identity_prompt_with_limit(
-        workspace_dir,
-        max_chars_per_file,
-    ));
+    prompt.push_str(&build_identity_prompt_with_limit(workspace_dir, max_chars_per_file));
 
     // BOOTSTRAP.md — only if it exists (first-run ritual)
     let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
@@ -2999,9 +2829,7 @@ pub fn build_system_prompt_with_mode(
                 }
                 Err(e) => {
                     // Log error but don't fail - fall back to OpenClaw
-                    eprintln!(
-                        "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
-                    );
+                    eprintln!("Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format.");
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
                     load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
                 }
@@ -3023,8 +2851,7 @@ pub fn build_system_prompt_with_mode(
     let _ = writeln!(prompt, "## Current Date & Time\n\nTimezone: {tz}\n");
 
     // ── 7. Runtime ──────────────────────────────────────────────
-    let host =
-        hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
+    let host = hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
     let _ = writeln!(
         prompt,
         "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
@@ -3033,26 +2860,24 @@ pub fn build_system_prompt_with_mode(
 
     // ── 8. Channel Capabilities ─────────────────────────────────────
     prompt.push_str("## Channel Capabilities\n\n");
-    prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
+    prompt.push_str(
+        "- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n",
+    );
     prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
     prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
-    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
+    prompt.push_str(
+        "- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n",
+    );
 
     if prompt.is_empty() {
-        "You are OpenPRX, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
-            .to_string()
+        "You are OpenPRX, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.".to_string()
     } else {
         prompt
     }
 }
 
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
-fn inject_workspace_file(
-    prompt: &mut String,
-    workspace_dir: &std::path::Path,
-    filename: &str,
-    max_chars: usize,
-) {
+fn inject_workspace_file(prompt: &mut String, workspace_dir: &std::path::Path, filename: &str, max_chars: usize) {
     use std::fmt::Write;
 
     let path = workspace_dir.join(filename);
@@ -3103,15 +2928,11 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
 
     let mut updated = config.clone();
     let Some(telegram) = updated.channels_config.telegram.as_mut() else {
-        anyhow::bail!(
-            "Telegram channel is not configured. Run `prx onboard --channels-only` first"
-        );
+        anyhow::bail!("Telegram channel is not configured. Run `prx onboard --channels-only` first");
     };
 
     if telegram.allowed_users.iter().any(|u| u == "*") {
-        println!(
-            "⚠️ Telegram allowlist is currently wildcard (`*`) — binding is unnecessary until you remove '*'."
-        );
+        println!("⚠️ Telegram allowlist is currently wildcard (`*`) — binding is unnecessary until you remove '*'.");
     }
 
     if telegram
@@ -3152,10 +2973,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
         let home = directories::UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
             .context("Could not find home directory")?;
-        let plist = home
-            .join("Library")
-            .join("LaunchAgents")
-            .join("com.prx.daemon.plist");
+        let plist = home.join("Library").join("LaunchAgents").join("com.prx.daemon.plist");
         if !plist.exists() {
             return Ok(false);
         }
@@ -3169,9 +2987,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
             return Ok(false);
         }
 
-        let _ = Command::new("launchctl")
-            .args(["stop", "com.prx.daemon"])
-            .output();
+        let _ = Command::new("launchctl").args(["stop", "com.prx.daemon"]).output();
         let start_output = Command::new("launchctl")
             .args(["start", "com.prx.daemon"])
             .output()
@@ -3188,8 +3004,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
         // OpenRC (system-wide) takes precedence over systemd (user-level)
         let openrc_init_script = PathBuf::from("/etc/init.d/prx");
         if openrc_init_script.exists() {
-            if let Ok(status_output) = Command::new("rc-service").args(OPENRC_STATUS_ARGS).output()
-            {
+            if let Ok(status_output) = Command::new("rc-service").args(OPENRC_STATUS_ARGS).output() {
                 // rc-service exits 0 if running, non-zero otherwise
                 if status_output.status.success() {
                     let restart_output = Command::new("rc-service")
@@ -3209,11 +3024,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
         let home = directories::UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
             .context("Could not find home directory")?;
-        let unit_path: PathBuf = home
-            .join(".config")
-            .join("systemd")
-            .join("user")
-            .join("prx.service");
+        let unit_path: PathBuf = home.join(".config").join("systemd").join("user").join("prx.service");
         if !unit_path.exists() {
             return Ok(false);
         }
@@ -3267,10 +3078,7 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                 ("Signal", config.channels_config.signal.is_some()),
                 ("WhatsApp", config.channels_config.whatsapp.is_some()),
                 ("Linq", config.channels_config.linq.is_some()),
-                (
-                    "Nextcloud Talk",
-                    config.channels_config.nextcloud_talk.is_some(),
-                ),
+                ("Nextcloud Talk", config.channels_config.nextcloud_talk.is_some()),
                 ("Email", config.channels_config.email.is_some()),
                 ("IRC", config.channels_config.irc.is_some()),
                 ("Lark", config.channels_config.lark.is_some()),
@@ -3280,9 +3088,7 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
             if !cfg!(feature = "channel-matrix") {
-                println!(
-                    "  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`)."
-                );
+                println!("  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`).");
             }
             println!("\nTo start channels: prx channel start");
             println!("To check health:    prx channel doctor");
@@ -3293,16 +3099,12 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             channel_type,
             config: _,
         } => {
-            anyhow::bail!(
-                "Channel type '{channel_type}' — use `prx onboard` to configure channels"
-            );
+            anyhow::bail!("Channel type '{channel_type}' — use `prx onboard` to configure channels");
         }
         crate::ChannelCommands::Remove { name } => {
             anyhow::bail!("Remove channel '{name}' — edit ~/.openprx/config.toml directly");
         }
-        crate::ChannelCommands::BindTelegram { identity } => {
-            bind_telegram_identity(config, &identity).await
-        }
+        crate::ChannelCommands::BindTelegram { identity } => bind_telegram_identity(config, &identity).await,
     }
 }
 
@@ -3313,9 +3115,7 @@ enum ChannelHealthState {
     Timeout,
 }
 
-fn classify_health_result(
-    result: &std::result::Result<bool, tokio::time::error::Elapsed>,
-) -> ChannelHealthState {
+fn classify_health_result(result: &std::result::Result<bool, tokio::time::error::Elapsed>) -> ChannelHealthState {
     match result {
         Ok(true) => ChannelHealthState::Healthy,
         Ok(false) => ChannelHealthState::Unhealthy,
@@ -3331,12 +3131,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         channels.push((
             "Telegram",
             Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
-                    tg.mention_only,
-                )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+                TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone(), tg.mention_only)
+                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
             ),
         ));
     }
@@ -3366,10 +3162,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref im) = config.channels_config.imessage {
-        channels.push((
-            "iMessage",
-            Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
-        ));
+        channels.push(("iMessage", Arc::new(IMessageChannel::new(im.allowed_contacts.clone()))));
     }
 
     #[cfg(feature = "channel-matrix")]
@@ -3397,9 +3190,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref sig) = config.channels_config.signal {
         let signal_channel: Arc<dyn Channel + Send + Sync> = if sig.is_native_mode() {
             Arc::new(SignalNativeChannel::new(
-                sig.cli_path
-                    .clone()
-                    .unwrap_or_else(|| "signal-cli".to_string()),
+                sig.cli_path.clone().unwrap_or_else(|| "signal-cli".to_string()),
                 sig.account.clone(),
                 sig.data_dir.clone(),
                 sig.daemon_http_port.unwrap_or(16866),
@@ -3632,15 +3423,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         );
     }
 
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+    let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
     let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
-    let runtime: Arc<dyn runtime::RuntimeAdapter> =
-        Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
@@ -3677,8 +3463,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config,
     );
 
-    let skill_embedder =
-        crate::memory::create_embedder_from_config(&config, config.api_key.as_deref());
+    let skill_embedder = crate::memory::create_embedder_from_config(&config, config.api_key.as_deref());
     let mut skills = crate::skills::load_skills_with_config(&workspace, &config);
     if config.skill_rag.enabled {
         crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
@@ -3765,11 +3550,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "Manage sub-agent runs spawned by sessions_spawn. Actions: list active/recent runs, kill a running run, or steer a running run with a new instruction.",
     ));
 
-    let bootstrap_max_chars = if config.agent.compact_context {
-        Some(6000)
-    } else {
-        None
-    };
+    let bootstrap_max_chars = if config.agent.compact_context { Some(6000) } else { None };
     let native_tools = provider.supports_native_tools();
     let mut system_prompt = build_system_prompt_with_mode(
         &workspace,
@@ -3787,11 +3568,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     if !skills.is_empty() {
         println!(
             "  🧩 Skills:   {}",
-            skills
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
         );
     }
 
@@ -3819,12 +3596,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     if let Some(ref tg) = config.channels_config.telegram {
         channels.push(Arc::new(
-            TelegramChannel::new(
-                tg.bot_token.clone(),
-                tg.allowed_users.clone(),
-                tg.mention_only,
-            )
-            .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+            TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone(), tg.mention_only)
+                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
         ));
     }
 
@@ -3887,9 +3660,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 sig.daemon_http_port.unwrap_or(16866)
             );
             Arc::new(SignalNativeChannel::new(
-                sig.cli_path
-                    .clone()
-                    .unwrap_or_else(|| "signal-cli".to_string()),
+                sig.cli_path.clone().unwrap_or_else(|| "signal-cli".to_string()),
                 sig.account.clone(),
                 sig.data_dir.clone(),
                 sig.daemon_http_port.unwrap_or(16866),
@@ -3983,9 +3754,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 wc.allowed_from.clone(),
             )));
         } else {
-            tracing::debug!(
-                "wacli channel configured but not enabled (set enabled = true to activate)"
-            );
+            tracing::debug!("wacli channel configured but not enabled (set enabled = true to activate)");
         }
     }
 
@@ -4115,9 +3884,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         // subagents: OpenClaw-compatible subagent management interface
         tools_list.push(Box::new(tools::SubagentsTool::new(active_runs.clone())));
         // sessions_history: conversation log viewer (OpenClaw alignment)
-        tools_list.push(Box::new(tools::SessionsHistoryTool::new(
-            active_runs.clone(),
-        )));
+        tools_list.push(Box::new(tools::SessionsHistoryTool::new(active_runs.clone())));
         // session_status: runtime status card (OpenClaw alignment)
         let channel_names: Vec<String> = channels.iter().map(|c| c.name().to_string()).collect();
         tools_list.push(Box::new(tools::SessionStatusTool::new(
@@ -4152,9 +3919,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Register config_reload tool (allows AI to manually trigger hot-reload).
     {
         let shared_config_for_reload = Arc::new(arc_swap::ArcSwap::from_pointee(config.clone()));
-        tools_list.push(Box::new(tools::ConfigReloadTool::new(
-            shared_config_for_reload,
-        )));
+        tools_list.push(Box::new(tools::ConfigReloadTool::new(shared_config_for_reload)));
     }
 
     // ── Register WASM plugin tools (channel path) ──
@@ -4167,10 +3932,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         if let Some(ref pm) = pm {
             // Tool adapters
             let wasm_tools = pm
-                .create_tool_adapters_with_memory(
-                    Some(Arc::clone(&mem)),
-                    Some(Arc::clone(&wasm_bus)),
-                )
+                .create_tool_adapters_with_memory(Some(Arc::clone(&mem)), Some(Arc::clone(&wasm_bus)))
                 .await;
             if !wasm_tools.is_empty() {
                 tracing::info!(
@@ -4180,14 +3942,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 tools_list.extend(wasm_tools);
             }
             // Middleware chain (log only; channel path does not use it yet)
-            let mw_chain = pm
-                .create_middleware_chain(Some(Arc::clone(&wasm_bus)))
-                .await;
+            let mw_chain = pm.create_middleware_chain(Some(Arc::clone(&wasm_bus))).await;
             if !mw_chain.is_empty() {
-                tracing::info!(
-                    count = mw_chain.len(),
-                    "WASM middleware chain ready (channel path)"
-                );
+                tracing::info!(count = mw_chain.len(), "WASM middleware chain ready (channel path)");
             }
             // Hook executor (log only; channel path does not use it yet)
             let hook_exec = pm.create_hook_executor(Some(Arc::clone(&wasm_bus))).await;
@@ -4197,10 +3954,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             // Cron manager (log only; channel path does not use it yet)
             let cron_mgr = pm.create_cron_manager(Some(Arc::clone(&wasm_bus))).await;
             if !cron_mgr.is_empty() {
-                tracing::info!(
-                    count = cron_mgr.jobs().len(),
-                    "WASM cron manager ready (channel path)"
-                );
+                tracing::info!(count = cron_mgr.jobs().len(), "WASM cron manager ready (channel path)");
             }
         }
         tracing::debug!("WASM event bus ready (channel path)");
@@ -4216,10 +3970,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     println!("🦀 OpenPRX Channel Server");
     println!("  🤖 Model:    {model}");
-    let effective_backend = memory::effective_memory_backend_name(
-        &config.memory.backend,
-        Some(&config.storage.provider.config),
-    );
+    let effective_backend =
+        memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
     println!(
         "  🧠 Memory:   {} (auto-save: {})",
         effective_backend,
@@ -4227,11 +3979,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     );
     println!(
         "  📡 Channels: {}",
-        channels
-            .iter()
-            .map(|c| c.name())
-            .collect::<Vec<_>>()
-            .join(", ")
+        channels.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")
     );
     println!();
     println!("  Listening for messages... (Ctrl+C to stop)");
@@ -4275,8 +4023,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
-    let message_timeout_secs =
-        effective_channel_message_timeout_secs(config.channels_config.message_timeout_secs);
+    let message_timeout_secs = effective_channel_message_timeout_secs(config.channels_config.message_timeout_secs);
     let signal_inbound_policy = config.channels_config.signal.as_ref().map(|signal| {
         let allowed_from = normalize_allowlist(&signal.allowed_from);
         let group_allow_from = normalize_allowlist(&signal.group_allow_from);
@@ -4390,17 +4137,9 @@ mod tests {
         std::fs::write(tmp.path().join("SOUL.md"), "# Soul\nBe helpful.").unwrap();
         std::fs::write(tmp.path().join("IDENTITY.md"), "# Identity\nName: OpenPRX").unwrap();
         std::fs::write(tmp.path().join("USER.md"), "# User\nName: Test User").unwrap();
-        std::fs::write(
-            tmp.path().join("AGENTS.md"),
-            "# Agents\nFollow instructions.",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "# Agents\nFollow instructions.").unwrap();
         std::fs::write(tmp.path().join("TOOLS.md"), "# Tools\nUse shell carefully.").unwrap();
-        std::fs::write(
-            tmp.path().join("HEARTBEAT.md"),
-            "# Heartbeat\nCheck status.",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("HEARTBEAT.md"), "# Heartbeat\nCheck status.").unwrap();
         std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
         tmp
     }
@@ -4438,13 +4177,11 @@ mod tests {
 
     #[test]
     fn context_window_overflow_error_detector_matches_known_messages() {
-        let overflow_err = anyhow::anyhow!(
-            "OpenAI Codex stream error: Your input exceeds the context window of this model."
-        );
+        let overflow_err =
+            anyhow::anyhow!("OpenAI Codex stream error: Your input exceeds the context window of this model.");
         assert!(is_context_window_overflow_error(&overflow_err));
 
-        let other_err =
-            anyhow::anyhow!("OpenAI Codex API error (502 Bad Gateway): error code: 502");
+        let other_err = anyhow::anyhow!("OpenAI Codex API error (502 Bad Gateway): error code: 502");
         assert!(!is_context_window_overflow_error(&other_err));
     }
 
@@ -4556,16 +4293,13 @@ mod tests {
         assert!(compact_sender_history(&ctx, &sender));
 
         let histories = ctx.conversation_histories.lock();
-        let kept = histories
-            .get(&sender)
-            .expect("sender history should remain");
+        let kept = histories.get(&sender).expect("sender history should remain");
         assert!(!kept.is_empty());
         assert!(kept.len() <= CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
         assert!(kept.iter().all(|turn| {
             let len = turn.content.chars().count();
             len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS
-                || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
-                    && turn.content.ends_with("..."))
+                || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3 && turn.content.ends_with("..."))
         }));
         let total_chars: usize = kept.iter().map(|turn| turn.content.chars().count()).sum();
         assert!(
@@ -4740,10 +4474,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -4770,10 +4501,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -5009,9 +4737,7 @@ BTC is currently around $65,000 based on latest tool output."#
         ) -> anyhow::Result<String> {
             let completed_iterations = Self::completed_tool_iterations(messages);
             if completed_iterations >= self.required_tool_iterations {
-                Ok(format!(
-                    "Completed after {completed_iterations} tool iterations."
-                ))
+                Ok(format!("Completed after {completed_iterations} tool iterations."))
             } else {
                 Ok(tool_call_payload())
             }
@@ -5381,8 +5107,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_signal_image_without_vision_result_uses_uncertainty_fallback()
-    {
+    async fn process_channel_message_signal_image_without_vision_result_uses_uncertainty_fallback() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -5908,21 +5633,12 @@ BTC is currently around $65,000 based on latest tool output."#
         let config_dir = temp.path().join("config.d");
         std::fs::create_dir_all(&config_dir).expect("create config.d");
 
-        std::fs::write(&config_path, "default_provider = \"openrouter\"\n")
-            .expect("write config.toml");
-        std::fs::write(
-            config_dir.join("memory.toml"),
-            "[memory]\nbackend = \"sqlite\"\n",
-        )
-        .expect("write fragment");
+        std::fs::write(&config_path, "default_provider = \"openrouter\"\n").expect("write config.toml");
+        std::fs::write(config_dir.join("memory.toml"), "[memory]\nbackend = \"sqlite\"\n").expect("write fragment");
 
         let before = config_file_stamp(&config_path).await.expect("stamp before");
 
-        std::fs::write(
-            config_dir.join("memory.toml"),
-            "[memory]\nbackend = \"markdown\"\n",
-        )
-        .expect("rewrite fragment");
+        std::fs::write(config_dir.join("memory.toml"), "[memory]\nbackend = \"markdown\"\n").expect("rewrite fragment");
 
         let after = config_file_stamp(&config_path).await.expect("stamp after");
         assert_ne!(before, after);
@@ -5946,8 +5662,7 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .expect("write fragment");
 
-        let defaults = load_runtime_defaults_from_config_file(&config_path, temp.path())
-            .expect("load merged defaults");
+        let defaults = load_runtime_defaults_from_config_file(&config_path, temp.path()).expect("load merged defaults");
         assert_eq!(defaults.default_provider, "openrouter");
         assert_eq!(defaults.model, "fragment-model");
         assert!((defaults.temperature - 0.42).abs() < f64::EPSILON);
@@ -6601,24 +6316,15 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("## Tools"), "missing Tools section");
         assert!(prompt.contains("## Safety"), "missing Safety section");
         assert!(prompt.contains("## Workspace"), "missing Workspace section");
-        assert!(
-            prompt.contains("## Project Context"),
-            "missing Project Context"
-        );
-        assert!(
-            prompt.contains("## Current Date & Time"),
-            "missing Date/Time"
-        );
+        assert!(prompt.contains("## Project Context"), "missing Project Context");
+        assert!(prompt.contains("## Current Date & Time"), "missing Date/Time");
         assert!(prompt.contains("## Runtime"), "missing Runtime section");
     }
 
     #[test]
     fn prompt_injects_tools() {
         let ws = make_workspace();
-        let tools = vec![
-            ("shell", "Run commands"),
-            ("memory_recall", "Search memory"),
-        ];
+        let tools = vec![("shell", "Run commands"), ("memory_recall", "Search memory")];
         let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
 
         assert!(prompt.contains("**shell**"));
@@ -6731,11 +6437,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let memory_dir = ws.path().join("memory");
         std::fs::create_dir_all(&memory_dir).unwrap();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        std::fs::write(
-            memory_dir.join(format!("{today}.md")),
-            "# Daily\nSome note.",
-        )
-        .unwrap();
+        std::fs::write(memory_dir.join(format!("{today}.md")), "# Daily\nSome note.").unwrap();
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
@@ -6744,10 +6446,7 @@ BTC is currently around $65,000 based on latest tool output."#
             !prompt.contains("Daily Notes"),
             "daily notes should not be auto-injected"
         );
-        assert!(
-            !prompt.contains("Some note"),
-            "daily content should not be in prompt"
-        );
+        assert!(!prompt.contains("Some note"), "daily content should not be in prompt");
     }
 
     #[test]
@@ -6788,11 +6487,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<description>Review code for bugs</description>"));
         assert!(prompt.contains("SKILL.md</location>"));
         assert!(prompt.contains("<instructions>"));
-        assert!(
-            prompt.contains(
-                "<instruction>Always run cargo test before final response.</instruction>"
-            )
-        );
+        assert!(prompt.contains("<instruction>Always run cargo test before final response.</instruction>"));
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains("<name>lint</name>"));
         assert!(prompt.contains("<kind>shell</kind>"));
@@ -6823,15 +6518,13 @@ BTC is currently around $65,000 based on latest tool output."#
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
 
         assert!(prompt.contains("<name>code&lt;review&gt;&amp;</name>"));
-        assert!(prompt.contains(
-            "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
-        ));
+        assert!(prompt.contains("<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"));
         assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
         assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
         assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
-        ));
+        assert!(
+            prompt.contains("<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>")
+        );
     }
 
     #[test]
@@ -6843,14 +6536,8 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
-        assert!(
-            prompt.contains("truncated at"),
-            "large files should be truncated"
-        );
-        assert!(
-            !prompt.contains(&big_content),
-            "full content should not appear"
-        );
+        assert!(prompt.contains("truncated at"), "large files should be truncated");
+        assert!(!prompt.contains(&big_content), "full content should not appear");
     }
 
     #[test]
@@ -6861,10 +6548,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         // Empty file should not produce a header
-        assert!(
-            !prompt.contains("### TOOLS.md"),
-            "empty files should be skipped"
-        );
+        assert!(!prompt.contains("### TOOLS.md"), "empty files should be skipped");
     }
 
     #[test]
@@ -6873,10 +6557,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         // Reproduces the production crash path where channel logs truncate at 80 chars.
         let result = std::panic::catch_unwind(|| crate::util::truncate_with_ellipsis(msg, 80));
-        assert!(
-            result.is_ok(),
-            "truncate_with_ellipsis should never panic on UTF-8"
-        );
+        assert!(result.is_ok(), "truncate_with_ellipsis should never panic on UTF-8");
 
         let truncated = result.unwrap();
         assert!(!truncated.is_empty());
@@ -6892,10 +6573,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("## Channel Capabilities"),
             "missing Channel Capabilities section"
         );
-        assert!(
-            prompt.contains("running as a messaging bot"),
-            "missing channel context"
-        );
+        assert!(prompt.contains("running as a messaging bot"), "missing channel context");
         assert!(
             prompt.contains("NEVER repeat, describe, or echo credentials"),
             "missing security instruction"
@@ -6949,10 +6627,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mentioned_uuids: vec![],
         };
 
-        assert_ne!(
-            conversation_memory_key(&msg1),
-            conversation_memory_key(&msg2)
-        );
+        assert_ne!(conversation_memory_key(&msg1), conversation_memory_key(&msg2));
     }
 
     #[tokio::test]
@@ -7281,10 +6956,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 4);
 
-        let roles = calls[0]
-            .iter()
-            .map(|(role, _)| role.as_str())
-            .collect::<Vec<_>>();
+        let roles = calls[0].iter().map(|(role, _)| role.as_str()).collect::<Vec<_>>();
         assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
         assert!(
             calls[0][0]
@@ -7483,14 +7155,7 @@ After"#;
             aieos_inline: Some(r#"{"identity":{"names":{"first":"Claw"}}}"#.into()),
         };
 
-        let prompt = build_system_prompt(
-            std::env::temp_dir().as_path(),
-            "model",
-            &[],
-            &[],
-            Some(&config),
-            None,
-        );
+        let prompt = build_system_prompt(std::env::temp_dir().as_path(), "model", &[], &[], Some(&config), None);
 
         assert!(prompt.contains("**Name:** Claw"));
         assert!(prompt.contains("## Identity"));
@@ -7606,10 +7271,7 @@ After"#;
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("listen boom")
         }
@@ -7625,10 +7287,7 @@ After"#;
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tx.closed().await;
             Ok(())
@@ -7655,12 +7314,7 @@ After"#;
         let component = &snapshot["components"]["channel:test-supervised-fail"];
         assert_eq!(component["status"], "error");
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
-        assert!(
-            component["last_error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("listen boom")
-        );
+        assert!(component["last_error"].as_str().unwrap_or("").contains("listen boom"));
         assert!(calls.load(Ordering::SeqCst) >= 1);
     }
 
@@ -7675,32 +7329,22 @@ After"#;
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
-        let handle = spawn_supervised_listener_with_health_interval(
-            channel,
-            tx,
-            1,
-            1,
-            Duration::from_millis(20),
-        );
+        let handle = spawn_supervised_listener_with_health_interval(channel, tx, 1, 1, Duration::from_millis(20));
 
         tokio::time::sleep(Duration::from_millis(35)).await;
-        let first_last_ok =
-            crate::health::snapshot_json()["components"][&component_name]["last_ok"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+        let first_last_ok = crate::health::snapshot_json()["components"][&component_name]["last_ok"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         assert!(!first_last_ok.is_empty());
 
         tokio::time::sleep(Duration::from_millis(70)).await;
-        let second_last_ok =
-            crate::health::snapshot_json()["components"][&component_name]["last_ok"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-        let first = chrono::DateTime::parse_from_rfc3339(&first_last_ok)
-            .expect("last_ok should be valid RFC3339");
-        let second = chrono::DateTime::parse_from_rfc3339(&second_last_ok)
-            .expect("last_ok should be valid RFC3339");
+        let second_last_ok = crate::health::snapshot_json()["components"][&component_name]["last_ok"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let first = chrono::DateTime::parse_from_rfc3339(&first_last_ok).expect("last_ok should be valid RFC3339");
+        let second = chrono::DateTime::parse_from_rfc3339(&second_last_ok).expect("last_ok should be valid RFC3339");
         assert!(second > first, "expected periodic health heartbeat refresh");
 
         drop(rx);

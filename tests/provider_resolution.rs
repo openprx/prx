@@ -170,12 +170,7 @@ fn compatible_provider_custom_auth_header() {
 #[test]
 fn compatible_provider_no_credential() {
     // Construction without credential should succeed (for local providers)
-    let _provider = OpenAiCompatibleProvider::new(
-        "TestLocal",
-        "http://localhost:11434",
-        None,
-        AuthStyle::Bearer,
-    );
+    let _provider = OpenAiCompatibleProvider::new("TestLocal", "http://localhost:11434", None, AuthStyle::Bearer);
 }
 
 #[test]

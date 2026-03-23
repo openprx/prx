@@ -49,10 +49,7 @@ fn parse_pin_aliases(content: &str) -> PinAliases {
     }
 
     let rest = &content[section_start..];
-    let section_end = rest
-        .find("\n## ")
-        .map(|i| section_start + i)
-        .unwrap_or(content.len());
+    let section_end = rest.find("\n## ").map(|i| section_start + i).unwrap_or(content.len());
     let section = &content[section_start..section_end];
 
     // Parse "alias: pin" or "alias = pin" lines
@@ -186,11 +183,7 @@ impl HardwareRag {
             }
 
             let board = infer_board_from_path(&path, &base);
-            let source = path
-                .strip_prefix(workspace_dir)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
+            let source = path.strip_prefix(workspace_dir).unwrap_or(&path).display().to_string();
 
             // Parse pin aliases from full content
             let aliases = parse_pin_aliases(&content);
@@ -209,10 +202,7 @@ impl HardwareRag {
             }
         }
 
-        Ok(Self {
-            chunks,
-            pin_aliases,
-        })
+        Ok(Self { chunks, pin_aliases })
     }
 
     /// Get pin aliases for a board (e.g. "red_led" -> 13).
@@ -223,10 +213,7 @@ impl HardwareRag {
     /// Build pin-alias context for query. When user says "red led", inject "red_led: 13" for matching boards.
     pub fn pin_alias_context(&self, query: &str, boards: &[String]) -> String {
         let query_lower = query.to_lowercase();
-        let query_words: Vec<&str> = query_lower
-            .split_whitespace()
-            .filter(|w| w.len() > 1)
-            .collect();
+        let query_words: Vec<&str> = query_lower.split_whitespace().filter(|w| w.len() > 1).collect();
 
         let mut lines = Vec::new();
         for board in boards {
@@ -255,10 +242,7 @@ impl HardwareRag {
         }
 
         let query_lower = query.to_lowercase();
-        let query_terms: Vec<&str> = query_lower
-            .split_whitespace()
-            .filter(|w| w.len() > 2)
-            .collect();
+        let query_terms: Vec<&str> = query_lower.split_whitespace().filter(|w| w.len() > 2).collect();
 
         let mut scored: Vec<(&DatasheetChunk, f32)> = Vec::new();
         for chunk in &self.chunks {
@@ -349,10 +333,7 @@ user_led: 5"#;
     fn infer_board_from_path_nucleo() {
         let base = std::path::Path::new("/base");
         let path = std::path::Path::new("/base/nucleo-f401re.md");
-        assert_eq!(
-            infer_board_from_path(path, base),
-            Some("nucleo-f401re".into())
-        );
+        assert_eq!(infer_board_from_path(path, base), Some("nucleo-f401re".into()));
     }
 
     #[test]

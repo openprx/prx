@@ -53,9 +53,7 @@ impl ModelCapabilityEntry {
             let stats = load_success_rate_snapshot(memory, &model.model_id).await;
             let latency = load_latency_snapshot(memory, &model.model_id).await;
 
-            let dynamic_elo = metrics
-                .as_ref()
-                .map_or(model.elo_rating, |metrics| metrics.dynamic_elo);
+            let dynamic_elo = metrics.as_ref().map_or(model.elo_rating, |metrics| metrics.dynamic_elo);
 
             entries.push(Self {
                 config: model.clone(),
@@ -110,10 +108,7 @@ impl ModelCapabilityEntry {
     }
 }
 
-pub fn reachable_provider_names(
-    default_provider: &str,
-    model_routes: &[ModelRouteConfig],
-) -> HashSet<String> {
+pub fn reachable_provider_names(default_provider: &str, model_routes: &[ModelRouteConfig]) -> HashSet<String> {
     let mut providers = HashSet::from([default_provider.to_string()]);
     for route in model_routes {
         providers.insert(route.provider.clone());
@@ -148,11 +143,7 @@ pub fn is_model_reachable(
             .any(|route| route_matches_model(route, provider, model_id))
 }
 
-pub async fn append_success_event(
-    memory: &dyn Memory,
-    model_id: &str,
-    success: bool,
-) -> Result<()> {
+pub async fn append_success_event(memory: &dyn Memory, model_id: &str, success: bool) -> Result<()> {
     static SUCCESS_EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
     let timestamp = Utc::now().timestamp_millis();
@@ -206,10 +197,7 @@ pub async fn load_recent_successes(memory: &dyn Memory, model_id: &str) -> VecDe
     }
 }
 
-async fn load_metrics_snapshot(
-    memory: &dyn Memory,
-    model_id: &str,
-) -> Option<RouterMetricsSnapshot> {
+async fn load_metrics_snapshot(memory: &dyn Memory, model_id: &str) -> Option<RouterMetricsSnapshot> {
     let key = format!("router/elo/{model_id}");
     memory
         .get(&key)
@@ -219,17 +207,18 @@ async fn load_metrics_snapshot(
         .and_then(|entry| serde_json::from_str::<RouterMetricsSnapshot>(&entry.content).ok())
 }
 
-pub async fn load_success_rate_snapshot(
-    memory: &dyn Memory,
-    model_id: &str,
-) -> Option<RouterSuccessRateSnapshot> {
+pub async fn load_success_rate_snapshot(memory: &dyn Memory, model_id: &str) -> Option<RouterSuccessRateSnapshot> {
     for key in [
         format!("router/success_rate/{model_id}"),
         format!("router/stats/{model_id}"),
     ] {
-        if let Some(snapshot) = memory.get(&key).await.ok().flatten().and_then(|entry| {
-            serde_json::from_str::<RouterSuccessRateSnapshot>(&entry.content).ok()
-        }) {
+        if let Some(snapshot) = memory
+            .get(&key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|entry| serde_json::from_str::<RouterSuccessRateSnapshot>(&entry.content).ok())
+        {
             return Some(snapshot);
         }
     }
@@ -237,10 +226,7 @@ pub async fn load_success_rate_snapshot(
     None
 }
 
-async fn load_latency_snapshot(
-    memory: &dyn Memory,
-    model_id: &str,
-) -> Option<RouterLatencySnapshot> {
+async fn load_latency_snapshot(memory: &dyn Memory, model_id: &str) -> Option<RouterLatencySnapshot> {
     let key = format!("router/latency/{model_id}");
     memory
         .get(&key)
@@ -312,10 +298,7 @@ mod tests {
             model("claude-3", "anthropic", 1100.0, 300),
             model("ds-v3", "deepseek", 1000.0, 200),
         ];
-        let allowed: HashSet<String> = ["openai", "deepseek"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let allowed: HashSet<String> = ["openai", "deepseek"].iter().map(|s| s.to_string()).collect();
         let filtered = filter_models_by_providers(models, &allowed);
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().all(|m| m.provider != "anthropic"));
@@ -359,12 +342,7 @@ mod tests {
     #[test]
     fn reachable_via_route() {
         let routes = vec![route("anthropic", "claude-3")];
-        assert!(is_model_reachable(
-            "openai",
-            &routes,
-            "anthropic",
-            "claude-3"
-        ));
+        assert!(is_model_reachable("openai", &routes, "anthropic", "claude-3"));
     }
 
     #[test]
@@ -411,8 +389,7 @@ mod tests {
     #[test]
     fn success_rate_snapshot_serde_default() {
         // When deserialized from empty JSON, serde applies default_success_rate() = 1.0
-        let snapshot: RouterSuccessRateSnapshot =
-            serde_json::from_str("{}").expect("test: parse empty JSON");
+        let snapshot: RouterSuccessRateSnapshot = serde_json::from_str("{}").expect("test: parse empty JSON");
         assert!((snapshot.success_rate - 1.0).abs() < f32::EPSILON);
     }
 

@@ -41,10 +41,7 @@ pub async fn list_plugins(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /api/plugins/{name}/reload — reload a specific plugin.
-pub async fn reload_plugin(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
+pub async fn reload_plugin(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
     #[cfg(feature = "wasm-plugins")]
     {
         if let Some(ref pm) = state.plugin_manager {

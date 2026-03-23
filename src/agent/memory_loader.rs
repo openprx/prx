@@ -4,8 +4,7 @@ use std::fmt::Write;
 
 #[async_trait]
 pub trait MemoryLoader: Send + Sync {
-    async fn load_context(&self, memory: &dyn Memory, user_message: &str)
-    -> anyhow::Result<String>;
+    async fn load_context(&self, memory: &dyn Memory, user_message: &str) -> anyhow::Result<String>;
 }
 
 pub struct DefaultMemoryLoader {
@@ -33,11 +32,7 @@ impl DefaultMemoryLoader {
 
 #[async_trait]
 impl MemoryLoader for DefaultMemoryLoader {
-    async fn load_context(
-        &self,
-        memory: &dyn Memory,
-        user_message: &str,
-    ) -> anyhow::Result<String> {
+    async fn load_context(&self, memory: &dyn Memory, user_message: &str) -> anyhow::Result<String> {
         let entries = memory.recall(user_message, self.limit, None).await?;
         if entries.is_empty() {
             return Ok(String::new());

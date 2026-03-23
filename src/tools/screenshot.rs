@@ -69,9 +69,7 @@ impl ScreenshotTool {
         );
 
         // Reject filenames with shell-breaking characters to prevent injection in sh -c
-        const SHELL_UNSAFE: &[char] = &[
-            '\'', '"', '`', '$', '\\', ';', '|', '&', '\n', '\0', '(', ')',
-        ];
+        const SHELL_UNSAFE: &[char] = &['\'', '"', '`', '$', '\\', ';', '|', '&', '\n', '\0', '(', ')'];
         if safe_name.contains(SHELL_UNSAFE) {
             return Ok(ToolResult {
                 success: false,
@@ -105,9 +103,7 @@ impl ScreenshotTool {
         let program = cmd_args.remove(0);
         let result = tokio::time::timeout(
             Duration::from_secs(SCREENSHOT_TIMEOUT_SECS),
-            tokio::process::Command::new(&program)
-                .args(&cmd_args)
-                .output(),
+            tokio::process::Command::new(&program).args(&cmd_args).output(),
         )
         .await;
 
@@ -120,8 +116,7 @@ impl ScreenshotTool {
                             success: false,
                             output: String::new(),
                             error: Some(
-                                "No screenshot tool found. Install gnome-screenshot, scrot, or ImageMagick."
-                                    .into(),
+                                "No screenshot tool found. Install gnome-screenshot, scrot, or ImageMagick.".into(),
                             ),
                         });
                     }
@@ -142,9 +137,7 @@ impl ScreenshotTool {
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Screenshot timed out after {SCREENSHOT_TIMEOUT_SECS}s"
-                )),
+                error: Some(format!("Screenshot timed out after {SCREENSHOT_TIMEOUT_SECS}s")),
             }),
         }
     }
@@ -303,10 +296,7 @@ mod tests {
     #[tokio::test]
     async fn screenshot_rejects_shell_injection_filename() {
         let tool = ScreenshotTool::new(test_security());
-        let result = tool
-            .execute(json!({"filename": "test'injection.png"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"filename": "test'injection.png"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("unsafe for shell execution"));
     }

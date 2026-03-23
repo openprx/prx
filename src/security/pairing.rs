@@ -54,13 +54,7 @@ impl PairingGuard {
     pub fn new(require_pairing: bool, existing_tokens: &[String]) -> Self {
         let tokens: HashSet<String> = existing_tokens
             .iter()
-            .map(|t| {
-                if is_token_hash(t) {
-                    t.clone()
-                } else {
-                    hash_token(t)
-                }
-            })
+            .map(|t| if is_token_hash(t) { t.clone() } else { hash_token(t) })
             .collect();
         let code = if require_pairing && tokens.is_empty() {
             Some(generate_code())
@@ -271,10 +265,7 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 
 /// Check if a host string represents a non-localhost bind address.
 pub fn is_public_bind(host: &str) -> bool {
-    !matches!(
-        host,
-        "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0:0:0:0:0:0:0:1"
-    )
+    !matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0:0:0:0:0:0:0:1")
 }
 
 #[cfg(test)]
@@ -473,9 +464,7 @@ mod tests {
 
         assert_eq!(payload.len(), 64, "Token payload should be 32 bytes in hex");
         assert!(
-            payload
-                .chars()
-                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
+            payload.chars().all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
             "Token payload should be lowercase hex"
         );
     }
@@ -499,10 +488,7 @@ mod tests {
         );
         let lockout_secs = result.unwrap_err();
         assert!(lockout_secs > 0, "Lockout should have remaining seconds");
-        assert!(
-            lockout_secs <= PAIR_LOCKOUT_SECS,
-            "Lockout should not exceed max"
-        );
+        assert!(lockout_secs <= PAIR_LOCKOUT_SECS, "Lockout should not exceed max");
     }
 
     #[test]
@@ -549,9 +535,6 @@ mod tests {
 
         // Legitimate client is NOT locked out
         let result = guard.try_pair("wrong", legitimate).await;
-        assert!(
-            result.is_ok(),
-            "Legitimate client should not be locked out by attacker"
-        );
+        assert!(result.is_ok(), "Legitimate client should not be locked out by attacker");
     }
 }

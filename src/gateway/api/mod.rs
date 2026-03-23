@@ -136,14 +136,11 @@ fn header_matches_host_origin(headers: &HeaderMap, header_name: axum::http::Head
         .next()
         .unwrap_or("");
 
-    authority.eq_ignore_ascii_case(host)
-        || forwarded_host.is_some_and(|value| authority.eq_ignore_ascii_case(value))
+    authority.eq_ignore_ascii_case(host) || forwarded_host.is_some_and(|value| authority.eq_ignore_ascii_case(value))
 }
 
 fn cookie_auth_allowed(headers: &HeaderMap) -> bool {
-    if header_matches_host_origin(headers, header::ORIGIN)
-        || header_matches_host_origin(headers, header::REFERER)
-    {
+    if header_matches_host_origin(headers, header::ORIGIN) || header_matches_host_origin(headers, header::REFERER) {
         return true;
     }
 
@@ -182,11 +179,7 @@ async fn auth_middleware(State(state): State<AppState>, request: Request, next: 
     next.run(request).await
 }
 
-async fn api_rate_limit_middleware(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn api_rate_limit_middleware(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let token = extract_resource_auth_token(request.headers());
     let peer_addr = request
         .extensions()
@@ -277,13 +270,7 @@ pub(super) fn resolve_memory_backend(config: &Config) -> String {
         return backend;
     }
 
-    let storage_provider = config
-        .storage
-        .provider
-        .config
-        .provider
-        .trim()
-        .to_ascii_lowercase();
+    let storage_provider = config.storage.provider.config.provider.trim().to_ascii_lowercase();
     if storage_provider == "sqlite" || storage_provider == "postgres" {
         return storage_provider;
     }

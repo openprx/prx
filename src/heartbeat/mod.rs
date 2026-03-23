@@ -24,9 +24,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path();
 
-        HeartbeatEngine::ensure_heartbeat_file(workspace)
-            .await
-            .unwrap();
+        HeartbeatEngine::ensure_heartbeat_file(workspace).await.unwrap();
 
         let heartbeat_path = workspace.join("HEARTBEAT.md");
         assert!(heartbeat_path.exists());

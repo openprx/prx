@@ -49,9 +49,7 @@ pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Resu
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("npm not found: {e}"))?;
-    let node_modules = String::from_utf8_lossy(&npm_root_out.stdout)
-        .trim()
-        .to_string();
+    let node_modules = String::from_utf8_lossy(&npm_root_out.stdout).trim().to_string();
 
     let tts_out = tokio::process::Command::new("node")
         .args(["-e", &tts_script])
@@ -67,9 +65,7 @@ pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Resu
 
     // 2. Convert MP3 → M4A (AAC) — Signal displays M4A as a playable voice note.
     let ffmpeg_out = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-y", "-i", &mp3_path, "-c:a", "aac", "-b:a", "64k", &m4a_path,
-        ])
+        .args(["-y", "-i", &mp3_path, "-c:a", "aac", "-b:a", "64k", &m4a_path])
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("ffmpeg not found: {e}"))?;
@@ -302,9 +298,7 @@ impl Tool for MessageSendTool {
                             tokio::spawn(async move {
                                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                                 if let Err(e) = tokio::fs::remove_file(&tts_path).await {
-                                    tracing::debug!(
-                                        "auto-tts cleanup: could not remove {tts_path}: {e}"
-                                    );
+                                    tracing::debug!("auto-tts cleanup: could not remove {tts_path}: {e}");
                                 }
                             });
                         }
@@ -329,9 +323,7 @@ impl Tool for MessageSendTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(
-                                "Missing 'target': provide a recipient for the reaction.".into(),
-                            ),
+                            error: Some("Missing 'target': provide a recipient for the reaction.".into()),
                         });
                     }
                 };
@@ -342,9 +334,7 @@ impl Tool for MessageSendTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(
-                                "Missing required 'emoji' parameter for react action.".into(),
-                            ),
+                            error: Some("Missing required 'emoji' parameter for react action.".into()),
                         });
                     }
                 };
@@ -355,26 +345,21 @@ impl Tool for MessageSendTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(
-                                "Missing required 'target_author' parameter for react action."
-                                    .into(),
-                            ),
+                            error: Some("Missing required 'target_author' parameter for react action.".into()),
                         });
                     }
                 };
 
-                let target_timestamp =
-                    match args["target_timestamp"].as_u64() {
-                        Some(ts) => ts,
-                        None => return Ok(ToolResult {
+                let target_timestamp = match args["target_timestamp"].as_u64() {
+                    Some(ts) => ts,
+                    None => {
+                        return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(
-                                "Missing required 'target_timestamp' parameter for react action."
-                                    .into(),
-                            ),
-                        }),
-                    };
+                            error: Some("Missing required 'target_timestamp' parameter for react action.".into()),
+                        });
+                    }
+                };
 
                 match &self.signal {
                     Some(signal) => {
@@ -400,9 +385,7 @@ impl Tool for MessageSendTool {
                     None => Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(
-                            "Reactions are not supported on this channel (Signal required).".into(),
-                        ),
+                        error: Some("Reactions are not supported on this channel (Signal required).".into()),
                     }),
                 }
             }
@@ -430,10 +413,7 @@ impl Tool for MessageSendTool {
                     }
                 };
                 let new_text = args["message"].as_str().unwrap_or("");
-                match channel
-                    .edit_message(&recipient, &message_id, new_text)
-                    .await
-                {
+                match channel.edit_message(&recipient, &message_id, new_text).await {
                     Ok(()) => Ok(ToolResult {
                         success: true,
                         output: format!("Message {message_id} edited."),
@@ -506,10 +486,7 @@ impl Tool for MessageSendTool {
                     }
                 };
                 let message = args["message"].as_str().unwrap_or("");
-                match channel
-                    .send_thread_reply(&recipient, &thread_id, message)
-                    .await
-                {
+                match channel.send_thread_reply(&recipient, &thread_id, message).await {
                     Ok(()) => Ok(ToolResult {
                         success: true,
                         output: format!("Thread reply sent to thread {thread_id}."),
@@ -563,10 +540,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -622,8 +596,7 @@ mod tests {
     async fn send_uses_default_recipient_when_target_omitted() {
         let (ch, sent) = DummyChannel::new();
         let tool = MessageSendTool::new(ch, test_security(AutonomyLevel::Full));
-        tool.set_default_recipient(Some("+19998887777".to_string()))
-            .await;
+        tool.set_default_recipient(Some("+19998887777".to_string())).await;
 
         let result = tool
             .execute(json!({
@@ -793,11 +766,7 @@ mod tests {
             .execute(json!({ "action": "send", "message": "second" }))
             .await
             .unwrap();
-        assert!(
-            result.success,
-            "Expected success on second send: {:?}",
-            result.error
-        );
+        assert!(result.success, "Expected success on second send: {:?}", result.error);
         assert_eq!(
             original_sent.lock().await.len(),
             1,

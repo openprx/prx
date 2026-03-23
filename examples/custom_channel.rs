@@ -83,10 +83,7 @@ impl Channel for TelegramChannel {
             if let Some(updates) = resp["result"].as_array() {
                 for update in updates {
                     if let Some(msg) = update.get("message") {
-                        let sender = msg["from"]["username"]
-                            .as_str()
-                            .unwrap_or("unknown")
-                            .to_string();
+                        let sender = msg["from"]["username"].as_str().unwrap_or("unknown").to_string();
 
                         if !self.allowed_users.is_empty() && !self.allowed_users.contains(&sender) {
                             continue;

@@ -15,11 +15,7 @@ use base64::Engine as _;
 ///
 /// Returns `None` if the media type is unsupported or processing fails.
 /// The caller should fall back to a raw `<media:…>` marker in that case.
-pub async fn process_media_attachment(
-    path: &str,
-    content_type: &str,
-    config: &MediaConfig,
-) -> Option<String> {
+pub async fn process_media_attachment(path: &str, content_type: &str, config: &MediaConfig) -> Option<String> {
     if content_type.starts_with("audio/") {
         process_audio(path, config).await
     } else if content_type.starts_with("video/") {
@@ -82,10 +78,7 @@ async fn transcribe_ollama(path: &str, config: &MediaConfig) -> Option<String> {
         .ok()?;
 
     if !resp.status().is_success() {
-        tracing::warn!(
-            "media: Ollama audio transcription failed: {}",
-            resp.status()
-        );
+        tracing::warn!("media: Ollama audio transcription failed: {}", resp.status());
         return None;
     }
 
@@ -140,11 +133,7 @@ async fn transcribe_cli(path: &str) -> Option<String> {
     let _ = std::fs::remove_file(&wav_path);
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        None
-    } else {
-        Some(stdout)
-    }
+    if stdout.is_empty() { None } else { Some(stdout) }
 }
 
 // ── Video ──────────────────────────────────────────────────────────
@@ -182,10 +171,7 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
             .output()
             .await
             .ok()?;
-        String::from_utf8_lossy(&probe.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(10.0)
+        String::from_utf8_lossy(&probe.stdout).trim().parse().unwrap_or(10.0)
     } else {
         10.0 // fallback: assume 10 seconds
     };

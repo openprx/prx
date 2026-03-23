@@ -25,17 +25,11 @@ struct MigrationStats {
 
 pub async fn handle_command(command: crate::MigrateCommands, config: &Config) -> Result<()> {
     match command {
-        crate::MigrateCommands::Openclaw { source, dry_run } => {
-            migrate_openclaw_memory(config, source, dry_run).await
-        }
+        crate::MigrateCommands::Openclaw { source, dry_run } => migrate_openclaw_memory(config, source, dry_run).await,
     }
 }
 
-async fn migrate_openclaw_memory(
-    config: &Config,
-    source_workspace: Option<PathBuf>,
-    dry_run: bool,
-) -> Result<()> {
+async fn migrate_openclaw_memory(config: &Config, source_workspace: Option<PathBuf>, dry_run: bool) -> Result<()> {
     let source_workspace = resolve_openclaw_workspace(source_workspace)?;
     if !source_workspace.exists() {
         bail!(
@@ -52,10 +46,7 @@ async fn migrate_openclaw_memory(
     let entries = collect_source_entries(&source_workspace, &mut stats)?;
 
     if entries.is_empty() {
-        println!(
-            "No importable memory found in {}",
-            source_workspace.display()
-        );
+        println!("No importable memory found in {}", source_workspace.display());
         println!("Checked for: memory/brain.db, MEMORY.md, memory/*.md");
         return Ok(());
     }
@@ -95,9 +86,7 @@ async fn migrate_openclaw_memory(
             stats.renamed_conflicts += 1;
         }
 
-        memory
-            .store(&key, &entry.content, entry.category, None)
-            .await?;
+        memory.store(&key, &entry.content, entry.category, None).await?;
         stats.imported += 1;
     }
 
@@ -117,10 +106,7 @@ fn target_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
     memory::create_memory_for_migration(&config.memory.backend, &config.workspace_dir)
 }
 
-fn collect_source_entries(
-    source_workspace: &Path,
-    stats: &mut MigrationStats,
-) -> Result<Vec<SourceEntry>> {
+fn collect_source_entries(source_workspace: &Path, stats: &mut MigrationStats) -> Result<Vec<SourceEntry>> {
     let mut entries = Vec::new();
 
     let sqlite_path = source_workspace.join("memory").join("brain.db");
@@ -164,16 +150,12 @@ fn read_openclaw_sqlite_entries(db_path: &Path) -> Result<Vec<SourceEntry>> {
 
     let columns = table_columns(&conn, "memories")?;
     let key_expr = pick_column_expr(&columns, &["key", "id", "name"], "CAST(rowid AS TEXT)");
-    let Some(content_expr) =
-        pick_optional_column_expr(&columns, &["content", "value", "text", "memory"])
-    else {
+    let Some(content_expr) = pick_optional_column_expr(&columns, &["content", "value", "text", "memory"]) else {
         bail!("OpenClaw memories table found but no content-like column was detected");
     };
     let category_expr = pick_column_expr(&columns, &["category", "kind", "type"], "'core'");
 
-    let sql = format!(
-        "SELECT {key_expr} AS key, {content_expr} AS content, {category_expr} AS category FROM memories"
-    );
+    let sql = format!("SELECT {key_expr} AS key, {content_expr} AS content, {category_expr} AS category FROM memories");
 
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
@@ -182,9 +164,7 @@ fn read_openclaw_sqlite_entries(db_path: &Path) -> Result<Vec<SourceEntry>> {
     let mut idx = 0_usize;
 
     while let Some(row) = rows.next()? {
-        let key: String = row
-            .get(0)
-            .unwrap_or_else(|_| format!("openclaw_sqlite_{idx}"));
+        let key: String = row.get(0).unwrap_or_else(|_| format!("openclaw_sqlite_{idx}"));
         let content: String = row.get(1).unwrap_or_default();
         let category_raw: String = row.get(2).unwrap_or_else(|_| "core".to_string());
 
@@ -227,16 +207,8 @@ fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<Vec<SourceE
                 continue;
             }
             let content = fs::read_to_string(&path)?;
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("openclaw_daily");
-            all.extend(parse_markdown_file(
-                &path,
-                &content,
-                MemoryCategory::Daily,
-                stem,
-            ));
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("openclaw_daily");
+            all.extend(parse_markdown_file(&path, &content, MemoryCategory::Daily, stem));
         }
     }
 
@@ -244,12 +216,7 @@ fn read_openclaw_markdown_entries(source_workspace: &Path) -> Result<Vec<SourceE
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn parse_markdown_file(
-    _path: &Path,
-    content: &str,
-    default_category: MemoryCategory,
-    stem: &str,
-) -> Vec<SourceEntry> {
+fn parse_markdown_file(_path: &Path, content: &str, default_category: MemoryCategory, stem: &str) -> Vec<SourceEntry> {
     let mut entries = Vec::new();
 
     for (idx, raw_line) in content.lines().enumerate() {
@@ -261,10 +228,7 @@ fn parse_markdown_file(
         let line = trimmed.strip_prefix("- ").unwrap_or(trimmed);
         let (key, text) = match parse_structured_memory_line(line) {
             Some((k, v)) => (normalize_key(k, idx), v.trim().to_string()),
-            None => (
-                format!("openclaw_{stem}_{}", idx + 1),
-                line.trim().to_string(),
-            ),
+            None => (format!("openclaw_{stem}_{}", idx + 1), line.trim().to_string()),
         };
 
         if text.is_empty() {
@@ -621,11 +585,7 @@ mod tests {
         .unwrap();
 
         let rows = read_openclaw_sqlite_entries(&db_path).unwrap();
-        assert_eq!(
-            rows.len(),
-            0,
-            "entries with empty/whitespace content must be skipped"
-        );
+        assert_eq!(rows.len(), 0, "entries with empty/whitespace content must be skipped");
     }
 
     #[test]
@@ -639,10 +599,7 @@ mod tests {
         std::fs::write(&db_path, "fake db content").unwrap();
 
         let result = backup_target_memory(tmp.path()).unwrap();
-        assert!(
-            result.is_some(),
-            "backup should be created when files exist"
-        );
+        assert!(result.is_some(), "backup should be created when files exist");
 
         let backup_dir = result.unwrap();
         assert!(backup_dir.exists());
@@ -656,9 +613,6 @@ mod tests {
     fn backup_returns_none_when_no_files() {
         let tmp = TempDir::new().unwrap();
         let result = backup_target_memory(tmp.path()).unwrap();
-        assert!(
-            result.is_none(),
-            "backup should return None when no files to backup"
-        );
+        assert!(result.is_none(), "backup should return None when no files to backup");
     }
 }

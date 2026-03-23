@@ -20,16 +20,10 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         "log" => Box::new(LogObserver::new()),
         "prometheus" => Box::new(PrometheusObserver::new()),
         "otel" | "opentelemetry" | "otlp" => {
-            match OtelObserver::new(
-                config.otel_endpoint.as_deref(),
-                config.otel_service_name.as_deref(),
-            ) {
+            match OtelObserver::new(config.otel_endpoint.as_deref(), config.otel_service_name.as_deref()) {
                 Ok(obs) => {
                     tracing::info!(
-                        endpoint = config
-                            .otel_endpoint
-                            .as_deref()
-                            .unwrap_or("http://localhost:4318"),
+                        endpoint = config.otel_endpoint.as_deref().unwrap_or("http://localhost:4318"),
                         "OpenTelemetry observer initialized"
                     );
                     Box::new(obs)

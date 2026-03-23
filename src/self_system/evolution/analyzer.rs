@@ -182,21 +182,14 @@ impl EvolutionAnalyzer {
             .collect::<Vec<MemoryAccessLog>>();
 
         let total_tasks = decisions.len() as u32;
-        let successful_tasks = decisions
-            .iter()
-            .filter(|item| item.outcome == Outcome::Success)
-            .count() as u32;
+        let successful_tasks = decisions.iter().filter(|item| item.outcome == Outcome::Success).count() as u32;
         let failed_tasks = decisions
             .iter()
             .filter(|item| matches!(item.outcome, Outcome::Failure | Outcome::RolledBack))
             .count() as u32;
         let corrected_tasks = decisions
             .iter()
-            .filter(|item| {
-                item.user_correction
-                    .as_ref()
-                    .is_some_and(|v| !v.trim().is_empty())
-            })
+            .filter(|item| item.user_correction.as_ref().is_some_and(|v| !v.trim().is_empty()))
             .count() as u32;
 
         let avg_tokens_consumed = average_u32(decisions.iter().map(|item| item.tokens_used));
@@ -212,10 +205,7 @@ impl EvolutionAnalyzer {
             .count() as f64;
         let memory_hit_rate = ratio(memory_hit_matches, memory.len() as f64);
 
-        let unknown_annotations = memory
-            .iter()
-            .filter(|item| item.was_useful.is_none())
-            .count() as f64;
+        let unknown_annotations = memory.iter().filter(|item| item.was_useful.is_none()).count() as f64;
         let unknown_annotation_ratio = ratio(unknown_annotations, memory.len() as f64);
 
         let task_type_distribution = build_task_type_distribution(&decisions);
@@ -245,12 +235,8 @@ impl EvolutionAnalyzer {
             ));
         }
 
-        if let Some(previous) = self
-            .load_daily_digest(now.date_naive() - Duration::days(1))
-            .await?
-        {
-            digest.significant_changes =
-                compare_daily_digest(&previous, &digest, self.shift_threshold);
+        if let Some(previous) = self.load_daily_digest(now.date_naive() - Duration::days(1)).await? {
+            digest.significant_changes = compare_daily_digest(&previous, &digest, self.shift_threshold);
         }
 
         self.persist_daily_digest(&digest).await?;
@@ -259,11 +245,7 @@ impl EvolutionAnalyzer {
 
     /// Aggregate the latest three daily digests and generate trend analysis.
     pub async fn generate_three_day_trend(&self, end_date: NaiveDate) -> Result<TrendAnalysis> {
-        let dates = [
-            end_date - Duration::days(2),
-            end_date - Duration::days(1),
-            end_date,
-        ];
+        let dates = [end_date - Duration::days(2), end_date - Duration::days(1), end_date];
 
         let mut digests = Vec::with_capacity(3);
         for day in dates {
@@ -274,12 +256,9 @@ impl EvolutionAnalyzer {
             digests.push(digest);
         }
 
-        let range_start =
-            DateTime::<Utc>::from_naive_utc_and_offset(dates[0].and_time(NaiveTime::MIN), Utc);
-        let range_end = DateTime::<Utc>::from_naive_utc_and_offset(
-            (end_date + Duration::days(1)).and_time(NaiveTime::MIN),
-            Utc,
-        );
+        let range_start = DateTime::<Utc>::from_naive_utc_and_offset(dates[0].and_time(NaiveTime::MIN), Utc);
+        let range_end =
+            DateTime::<Utc>::from_naive_utc_and_offset((end_date + Duration::days(1)).and_time(NaiveTime::MIN), Utc);
 
         let decisions = self
             .read_decisions_since(range_start)
@@ -328,10 +307,7 @@ impl EvolutionAnalyzer {
 
         if let Some(item) = lowest_efficiency_config.as_ref() {
             let mut target = BTreeMap::new();
-            target.insert(
-                "config_snapshot_hash".to_string(),
-                item.config_snapshot_hash.clone(),
-            );
+            target.insert("config_snapshot_hash".to_string(), item.config_snapshot_hash.clone());
             candidates.push(EvolutionCandidate {
                 target,
                 current_value: format!("token_per_success={:.2}", item.token_per_success),
@@ -388,14 +364,12 @@ impl EvolutionAnalyzer {
     }
 
     fn daily_digest_path(&self, date: NaiveDate) -> PathBuf {
-        self.analysis_root
-            .join("daily")
-            .join(format!("{date}.json"))
+        self.analysis_root.join("daily").join(format!("{date}.json"))
     }
 
     fn daily_digest_path_from_str(&self, date: &str) -> Result<PathBuf> {
-        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
-            .with_context(|| format!("invalid digest date: {date}"))?;
+        let date =
+            NaiveDate::parse_from_str(date, "%Y-%m-%d").with_context(|| format!("invalid digest date: {date}"))?;
         Ok(self.daily_digest_path(date))
     }
 
@@ -419,30 +393,20 @@ impl EvolutionAnalyzer {
 fn build_task_type_distribution(decisions: &[DecisionLog]) -> BTreeMap<String, TaskTypeDigest> {
     let mut grouped: HashMap<String, Vec<&DecisionLog>> = HashMap::new();
     for item in decisions {
-        grouped
-            .entry(task_type_name(&item.task_type))
-            .or_default()
-            .push(item);
+        grouped.entry(task_type_name(&item.task_type)).or_default().push(item);
     }
 
     let mut out = BTreeMap::new();
     for (task_type, rows) in grouped {
         let total = rows.len() as u32;
-        let success = rows
-            .iter()
-            .filter(|item| item.outcome == Outcome::Success)
-            .count() as u32;
+        let success = rows.iter().filter(|item| item.outcome == Outcome::Success).count() as u32;
         let failure = rows
             .iter()
             .filter(|item| matches!(item.outcome, Outcome::Failure | Outcome::RolledBack))
             .count() as u32;
         let corrected = rows
             .iter()
-            .filter(|item| {
-                item.user_correction
-                    .as_ref()
-                    .is_some_and(|v| !v.trim().is_empty())
-            })
+            .filter(|item| item.user_correction.as_ref().is_some_and(|v| !v.trim().is_empty()))
             .count() as u32;
         let avg_tokens = average_u32(rows.iter().map(|item| item.tokens_used));
 
@@ -463,11 +427,7 @@ fn build_task_type_distribution(decisions: &[DecisionLog]) -> BTreeMap<String, T
     out
 }
 
-fn compare_daily_digest(
-    previous: &DailyDigest,
-    current: &DailyDigest,
-    threshold: f64,
-) -> Vec<MetricShift> {
+fn compare_daily_digest(previous: &DailyDigest, current: &DailyDigest, threshold: f64) -> Vec<MetricShift> {
     let mut shifts = Vec::new();
     push_shift(
         &mut shifts,
@@ -479,10 +439,7 @@ fn compare_daily_digest(
     push_shift(
         &mut shifts,
         "success_rate",
-        ratio(
-            previous.successful_tasks as f64,
-            previous.total_tasks as f64,
-        ),
+        ratio(previous.successful_tasks as f64, previous.total_tasks as f64),
         ratio(current.successful_tasks as f64, current.total_tasks as f64),
         threshold,
     );
@@ -517,19 +474,9 @@ fn compare_daily_digest(
     shifts
 }
 
-fn push_shift(
-    shifts: &mut Vec<MetricShift>,
-    metric: &str,
-    previous: f64,
-    current: f64,
-    threshold: f64,
-) {
+fn push_shift(shifts: &mut Vec<MetricShift>, metric: &str, previous: f64, current: f64, threshold: f64) {
     let delta = (current - previous).abs();
-    let denominator = if previous.abs() < 1e-9 {
-        1.0
-    } else {
-        previous.abs()
-    };
+    let denominator = if previous.abs() < 1e-9 { 1.0 } else { previous.abs() };
     let delta_ratio = delta / denominator;
     if delta_ratio > threshold {
         shifts.push(MetricShift {
@@ -557,13 +504,11 @@ fn extract_noise_memories(memory: &[MemoryAccessLog]) -> Vec<NoiseMemoryPattern>
     let mut result = grouped
         .into_iter()
         .filter(|(_, (loaded, false_count, _))| *loaded >= 2 && *false_count == *loaded)
-        .map(
-            |(memory_id, (load_count, _, evidence_ids))| NoiseMemoryPattern {
-                memory_id,
-                load_count,
-                evidence_ids,
-            },
-        )
+        .map(|(memory_id, (load_count, _, evidence_ids))| NoiseMemoryPattern {
+            memory_id,
+            load_count,
+            evidence_ids,
+        })
         .collect::<Vec<_>>();
     result.sort_by(|a, b| b.load_count.cmp(&a.load_count));
     result
@@ -670,11 +615,7 @@ where
         total = total.saturating_add(item as u64);
         count = count.saturating_add(1);
     }
-    if count == 0 {
-        0.0
-    } else {
-        total as f64 / count as f64
-    }
+    if count == 0 { 0.0 } else { total as f64 / count as f64 }
 }
 
 fn parse_ts(raw: &str) -> Option<DateTime<Utc>> {
@@ -701,9 +642,7 @@ fn task_type_name(task_type: &TaskType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::self_system::evolution::record::{
-        Actor, AnnotationSource, DecisionType, MemoryAction,
-    };
+    use crate::self_system::evolution::record::{Actor, AnnotationSource, DecisionType, MemoryAction};
     use crate::self_system::evolution::storage::{JsonlRetentionPolicy, JsonlStoragePaths};
     use tempfile::tempdir;
 
@@ -798,8 +737,8 @@ mod tests {
 
         writer.flush().await.unwrap();
 
-        let analyzer = EvolutionAnalyzer::new(writer, dir.path().join("data/analysis"))
-            .with_thresholds(0.7, 0.15, 0.30);
+        let analyzer =
+            EvolutionAnalyzer::new(writer, dir.path().join("data/analysis")).with_thresholds(0.7, 0.15, 0.30);
         let now = DateTime::parse_from_rfc3339("2026-02-24T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -835,16 +774,10 @@ mod tests {
 
         let analyzer = EvolutionAnalyzer::new(writer.clone(), dir.path().join("data/analysis"));
 
-        let days = [
-            "2026-02-22T12:00:00Z",
-            "2026-02-23T12:00:00Z",
-            "2026-02-24T12:00:00Z",
-        ];
+        let days = ["2026-02-22T12:00:00Z", "2026-02-23T12:00:00Z", "2026-02-24T12:00:00Z"];
 
         for now in days {
-            let now = DateTime::parse_from_rfc3339(now)
-                .unwrap()
-                .with_timezone(&Utc);
+            let now = DateTime::parse_from_rfc3339(now).unwrap().with_timezone(&Utc);
             writer
                 .append_decision(&DecisionLog {
                     timestamp: now.to_rfc3339(),
@@ -932,11 +865,7 @@ mod tests {
 
         let shifts = compare_daily_digest(&previous, &current, 0.15);
         assert!(shifts.iter().any(|item| item.metric == "total_tasks"));
-        assert!(
-            shifts
-                .iter()
-                .any(|item| item.metric == "avg_tokens_consumed")
-        );
+        assert!(shifts.iter().any(|item| item.metric == "avg_tokens_consumed"));
     }
 
     #[test]

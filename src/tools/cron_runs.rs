@@ -128,9 +128,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         new_shared(config)
     }
 
@@ -155,10 +153,7 @@ mod tests {
         .unwrap();
 
         let tool = CronRunsTool::new(Arc::clone(&cfg));
-        let result = tool
-            .execute(json!({ "job_id": job.id, "limit": 5 }))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({ "job_id": job.id, "limit": 5 })).await.unwrap();
 
         assert!(result.success);
         assert!(result.output.contains("..."));
@@ -171,11 +166,6 @@ mod tests {
         let tool = CronRunsTool::new(cfg);
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("Missing 'job_id'")
-        );
+        assert!(result.error.unwrap_or_default().contains("Missing 'job_id'"));
     }
 }

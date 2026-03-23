@@ -121,10 +121,7 @@ impl Tool for ImageTool {
 
         // Security check for local paths (skip for HTTP(S) URLs and data URIs)
         for ref_str in &image_refs {
-            if ref_str.starts_with("http://")
-                || ref_str.starts_with("https://")
-                || ref_str.starts_with("data:")
-            {
+            if ref_str.starts_with("http://") || ref_str.starts_with("https://") || ref_str.starts_with("data:") {
                 continue;
             }
 
@@ -132,9 +129,7 @@ impl Tool for ImageTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Path not allowed: {ref_str} (must be within workspace)"
-                    )),
+                    error: Some(format!("Path not allowed: {ref_str} (must be within workspace)")),
                 });
             }
 
@@ -146,9 +141,7 @@ impl Tool for ImageTool {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!(
-                            "Failed to resolve image path: {ref_str} ({e})"
-                        )),
+                        error: Some(format!("Failed to resolve image path: {ref_str} ({e})")),
                     });
                 }
             };
@@ -157,10 +150,7 @@ impl Tool for ImageTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Resolved path escapes workspace: {}",
-                        resolved.display()
-                    )),
+                    error: Some(format!("Resolved path escapes workspace: {}", resolved.display())),
                 });
             }
         }
@@ -196,10 +186,9 @@ impl Tool for ImageTool {
         let messages = vec![ChatMessage::user(content)];
 
         // Normalize image references (local → base64 data URI, remote → validated data URI)
-        let prepared =
-            multimodal::prepare_messages_for_provider(&messages, &self.multimodal_config)
-                .await
-                .map_err(|e| anyhow::anyhow!("Image preparation failed: {e}"))?;
+        let prepared = multimodal::prepare_messages_for_provider(&messages, &self.multimodal_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("Image preparation failed: {e}"))?;
 
         if !prepared.contains_images {
             return Ok(ToolResult {

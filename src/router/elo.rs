@@ -71,10 +71,7 @@ mod tests {
         let (w2, _) = update_elo(1_000.0, 1_500.0); // weak beats strong
         let gain_strong = w1 - 1_500.0;
         let gain_weak = w2 - 1_000.0;
-        assert!(
-            gain_weak > gain_strong,
-            "upset should yield larger ELO gain"
-        );
+        assert!(gain_weak > gain_strong, "upset should yield larger ELO gain");
     }
 
     #[test]

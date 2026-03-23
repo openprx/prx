@@ -1,8 +1,8 @@
 use crate::config::NodeServerConfig;
 use crate::nodes::protocol::{
-    AsyncTaskAccepted, CancelParams, ExecShellParams, ExecShellResult, JsonRpcRequest,
-    JsonRpcResponse, MetricsResult, PingResult, ReadFileParams, ReadFileResult, TaskListItem,
-    TaskListResult, TaskStatusParams, TaskStatusResult, WriteFileParams, WriteFileResult,
+    AsyncTaskAccepted, CancelParams, ExecShellParams, ExecShellResult, JsonRpcRequest, JsonRpcResponse, MetricsResult,
+    PingResult, ReadFileParams, ReadFileResult, TaskListItem, TaskListResult, TaskStatusParams, TaskStatusResult,
+    WriteFileParams, WriteFileResult,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{ConnectInfo, State};
@@ -170,15 +170,12 @@ pub async fn run_node_server(config: NodeServerConfig) -> Result<()> {
         config.sandbox_root
     );
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await
-    .context("node server exited with error")
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .context("node server exited with error")
 }
 
 async fn handle_health() -> impl IntoResponse {
@@ -194,22 +191,14 @@ async fn handle_rpc(
     if let Err(error) = validate_auth(&headers, &state.config) {
         return (
             StatusCode::UNAUTHORIZED,
-            Json(JsonRpcResponse::failure(
-                "0".into(),
-                -32001,
-                error.to_string(),
-            )),
+            Json(JsonRpcResponse::failure("0".into(), -32001, error.to_string())),
         );
     }
 
     if let Err(error) = validate_hmac(&headers, &body, &state.config) {
         return (
             StatusCode::UNAUTHORIZED,
-            Json(JsonRpcResponse::failure(
-                "0".into(),
-                -32002,
-                error.to_string(),
-            )),
+            Json(JsonRpcResponse::failure("0".into(), -32002, error.to_string())),
         );
     }
 
@@ -280,11 +269,7 @@ async fn dispatch_rpc(state: &AppState, request: JsonRpcRequest, source_ip: &str
     }
 }
 
-async fn handle_exec_shell(
-    state: &AppState,
-    params: ExecShellParams,
-    source_ip: &str,
-) -> Result<Value> {
+async fn handle_exec_shell(state: &AppState, params: ExecShellParams, source_ip: &str) -> Result<Value> {
     cleanup_expired_task_results(state).await;
 
     let command_text = params.cmd.trim();
@@ -360,16 +345,7 @@ async fn handle_exec_shell(
         return Ok(serde_json::to_value(accepted)?);
     }
 
-    let result = execute_shell_command(
-        state,
-        &parsed_command,
-        cwd,
-        params.env,
-        timeout,
-        &task_id,
-        cancellation,
-    )
-    .await;
+    let result = execute_shell_command(state, &parsed_command, cwd, params.env, timeout, &task_id, cancellation).await;
 
     let callback_payload = finalize_task(state.clone(), &result).await;
     log_exec_shell_event(&parsed_command, &result, source_ip);
@@ -479,12 +455,7 @@ fn log_exec_shell_event(command: &ParsedCommand, result: &ExecShellResult, sourc
     );
 }
 
-async fn register_task(
-    state: &AppState,
-    task_id: &str,
-    cancellation: CancellationToken,
-    async_exec: bool,
-) {
+async fn register_task(state: &AppState, task_id: &str, cancellation: CancellationToken, async_exec: bool) {
     {
         let mut running_tasks = state.running_tasks.write().await;
         running_tasks.insert(task_id.to_string(), cancellation);
@@ -539,10 +510,7 @@ async fn count_running_async_tasks(state: &AppState) -> usize {
         .count()
 }
 
-async fn handle_task_status(
-    state: &AppState,
-    params: TaskStatusParams,
-) -> Result<TaskStatusResult> {
+async fn handle_task_status(state: &AppState, params: TaskStatusParams) -> Result<TaskStatusResult> {
     cleanup_expired_task_results(state).await;
     let task_results = state.task_results.read().await;
     let now = Instant::now();
@@ -686,9 +654,7 @@ fn validate_hmac(headers: &HeaderMap, body: &str, config: &NodeServerConfig) -> 
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| anyhow!("missing X-OpenPRX-Timestamp"))?;
 
-    let timestamp = timestamp_raw
-        .parse::<i64>()
-        .context("invalid X-OpenPRX-Timestamp")?;
+    let timestamp = timestamp_raw.parse::<i64>().context("invalid X-OpenPRX-Timestamp")?;
 
     let now = Utc::now().timestamp();
     if (now - timestamp).abs() > 300 {
@@ -701,8 +667,7 @@ fn validate_hmac(headers: &HeaderMap, body: &str, config: &NodeServerConfig) -> 
         .ok_or_else(|| anyhow!("missing X-OpenPRX-Signature"))?;
 
     let payload = format!("{timestamp}.{body}");
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|_| anyhow!("invalid hmac key length"))?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| anyhow!("invalid hmac key length"))?;
     mac.update(payload.as_bytes());
     let expected = hex::encode(mac.finalize().into_bytes());
 
@@ -828,11 +793,7 @@ fn elapsed_ms_u64(duration: Duration) -> u64 {
 
 fn cap_output(stdout: &[u8], stderr: &[u8], max_bytes: usize) -> (String, String, bool) {
     if max_bytes == 0 {
-        return (
-            String::new(),
-            String::new(),
-            !(stdout.is_empty() && stderr.is_empty()),
-        );
+        return (String::new(), String::new(), !(stdout.is_empty() && stderr.is_empty()));
     }
 
     let stdout_take = stdout.len().min(max_bytes);
@@ -892,8 +853,7 @@ fn validate_tls_requirements(config: &NodeServerConfig) -> Result<()> {
 
 fn prepare_sandbox_root(path: &str) -> Result<PathBuf> {
     let root = PathBuf::from(path);
-    std::fs::create_dir_all(&root)
-        .with_context(|| format!("failed to create sandbox root {}", root.display()))?;
+    std::fs::create_dir_all(&root).with_context(|| format!("failed to create sandbox root {}", root.display()))?;
 
     root.canonicalize()
         .with_context(|| format!("failed to canonicalize sandbox root {}", root.display()))

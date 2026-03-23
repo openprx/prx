@@ -45,11 +45,7 @@ impl SendMessage {
     }
 
     /// Create a new message with content, recipient, and subject
-    pub fn with_subject(
-        content: impl Into<String>,
-        recipient: impl Into<String>,
-        subject: impl Into<String>,
-    ) -> Self {
+    pub fn with_subject(content: impl Into<String>, recipient: impl Into<String>, subject: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             recipient: recipient.into(),
@@ -106,22 +102,12 @@ pub trait Channel: Send + Sync {
     }
 
     /// Update a previously sent draft message with new accumulated content.
-    async fn update_draft(
-        &self,
-        _recipient: &str,
-        _message_id: &str,
-        _text: &str,
-    ) -> anyhow::Result<()> {
+    async fn update_draft(&self, _recipient: &str, _message_id: &str, _text: &str) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
-    async fn finalize_draft(
-        &self,
-        _recipient: &str,
-        _message_id: &str,
-        _text: &str,
-    ) -> anyhow::Result<()> {
+    async fn finalize_draft(&self, _recipient: &str, _message_id: &str, _text: &str) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -145,12 +131,7 @@ pub trait Channel: Send + Sync {
     /// `new_text` is the replacement text.
     ///
     /// Returns `Err` if the platform does not support editing or if the edit fails.
-    async fn edit_message(
-        &self,
-        _channel_id: &str,
-        _message_id: &str,
-        _new_text: &str,
-    ) -> anyhow::Result<()> {
+    async fn edit_message(&self, _channel_id: &str, _message_id: &str, _new_text: &str) -> anyhow::Result<()> {
         Err(anyhow::anyhow!("edit not supported on this channel"))
     }
 
@@ -172,15 +153,8 @@ pub trait Channel: Send + Sync {
     ///
     /// Channels that do not have a native thread concept should degrade gracefully
     /// (e.g. Signal can fall back to a quote reply).
-    async fn send_thread_reply(
-        &self,
-        _channel_id: &str,
-        _thread_id: &str,
-        _message: &str,
-    ) -> anyhow::Result<()> {
-        Err(anyhow::anyhow!(
-            "thread reply not supported on this channel"
-        ))
+    async fn send_thread_reply(&self, _channel_id: &str, _thread_id: &str, _message: &str) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("thread reply not supported on this channel"))
     }
 }
 
@@ -277,10 +251,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
             tx.send(ChannelMessage {
                 id: "1".into(),
                 sender: "tester".into(),
@@ -325,12 +296,7 @@ mod tests {
         assert!(channel.health_check().await);
         assert!(channel.start_typing("bob").await.is_ok());
         assert!(channel.stop_typing("bob").await.is_ok());
-        assert!(
-            channel
-                .send(&SendMessage::new("hello", "bob"))
-                .await
-                .is_ok()
-        );
+        assert!(channel.send(&SendMessage::new("hello", "bob")).await.is_ok());
     }
 
     #[tokio::test]
@@ -346,12 +312,7 @@ mod tests {
                 .is_none()
         );
         assert!(channel.update_draft("bob", "msg_1", "text").await.is_ok());
-        assert!(
-            channel
-                .finalize_draft("bob", "msg_1", "final text")
-                .await
-                .is_ok()
-        );
+        assert!(channel.finalize_draft("bob", "msg_1", "final text").await.is_ok());
         assert!(channel.cancel_draft("bob", "msg_1").await.is_ok());
     }
 

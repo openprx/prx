@@ -2,9 +2,7 @@ use crate::cron::{Schedule, next_run_for_schedule};
 use crate::self_system::evolution::analyzer::{DailyDigest, EvolutionAnalyzer};
 use crate::self_system::evolution::config::{EvolutionMode, SharedEvolutionConfig};
 use crate::self_system::evolution::engine::EvolutionEngine;
-use crate::self_system::evolution::pipeline::{
-    EvolutionPipeline, EvolutionTrigger, PipelineRunReport,
-};
+use crate::self_system::evolution::pipeline::{EvolutionPipeline, EvolutionTrigger, PipelineRunReport};
 use crate::self_system::evolution::record::EvolutionLayer;
 use crate::self_system::evolution::rollback::CircuitBreaker;
 use crate::self_system::evolution::safety_utils::atomic_write;
@@ -106,11 +104,7 @@ impl EvolutionScheduler {
             state.next_cycle_at = Some(next_cycle(now)?.to_rfc3339());
 
             if self.circuit_breaker.can_execute(now) {
-                for layer in [
-                    EvolutionLayer::Memory,
-                    EvolutionLayer::Prompt,
-                    EvolutionLayer::Policy,
-                ] {
+                for layer in [EvolutionLayer::Memory, EvolutionLayer::Prompt, EvolutionLayer::Policy] {
                     self.enter_freeze_window(layer.clone());
 
                     let mode = self.shared_config.load_full().runtime.mode.clone();
@@ -139,17 +133,15 @@ impl EvolutionScheduler {
                                         .analyzer
                                         .generate_three_day_trend(now.date_naive())
                                         .await
-                                        .unwrap_or_else(|_| {
-                                            crate::self_system::evolution::TrendAnalysis {
-                                                start_date: now.date_naive().to_string(),
-                                                end_date: now.date_naive().to_string(),
-                                                digests: Vec::new(),
-                                                noise_memories: Vec::new(),
-                                                weakest_task_type: None,
-                                                lowest_efficiency_config: None,
-                                                user_correction_clusters: Vec::new(),
-                                                candidates: Vec::new(),
-                                            }
+                                        .unwrap_or_else(|_| crate::self_system::evolution::TrendAnalysis {
+                                            start_date: now.date_naive().to_string(),
+                                            end_date: now.date_naive().to_string(),
+                                            digests: Vec::new(),
+                                            noise_memories: Vec::new(),
+                                            weakest_task_type: None,
+                                            lowest_efficiency_config: None,
+                                            user_correction_clusters: Vec::new(),
+                                            candidates: Vec::new(),
                                         }),
                                     selected_candidate: None,
                                     gate_rejections: Vec::new(),
@@ -173,13 +165,8 @@ impl EvolutionScheduler {
     }
 
     fn enter_freeze_window(&mut self, active_layer: EvolutionLayer) {
-        self.circuit_breaker
-            .begin_layer_evaluation(active_layer.clone());
-        for layer in [
-            EvolutionLayer::Memory,
-            EvolutionLayer::Prompt,
-            EvolutionLayer::Policy,
-        ] {
+        self.circuit_breaker.begin_layer_evaluation(active_layer.clone());
+        for layer in [EvolutionLayer::Memory, EvolutionLayer::Prompt, EvolutionLayer::Policy] {
             if layer != active_layer {
                 self.circuit_breaker.freeze_layer(layer);
             }
@@ -187,11 +174,7 @@ impl EvolutionScheduler {
     }
 
     fn exit_freeze_window(&mut self, active_layer: EvolutionLayer) {
-        for layer in [
-            EvolutionLayer::Memory,
-            EvolutionLayer::Prompt,
-            EvolutionLayer::Policy,
-        ] {
+        for layer in [EvolutionLayer::Memory, EvolutionLayer::Prompt, EvolutionLayer::Policy] {
             if layer != active_layer {
                 self.circuit_breaker.unfreeze_layer(layer);
             }
@@ -199,40 +182,21 @@ impl EvolutionScheduler {
         self.circuit_breaker.end_layer_evaluation();
     }
 
-    async fn run_layer(
-        &mut self,
-        layer: EvolutionLayer,
-        now: DateTime<Utc>,
-    ) -> Result<PipelineRunReport> {
+    async fn run_layer(&mut self, layer: EvolutionLayer, now: DateTime<Utc>) -> Result<PipelineRunReport> {
         match layer {
             EvolutionLayer::Memory => {
                 self.pipeline
-                    .run_for_layer(
-                        EvolutionTrigger::CronTick,
-                        layer,
-                        self.memory_engine.as_mut(),
-                        now,
-                    )
+                    .run_for_layer(EvolutionTrigger::CronTick, layer, self.memory_engine.as_mut(), now)
                     .await
             }
             EvolutionLayer::Prompt => {
                 self.pipeline
-                    .run_for_layer(
-                        EvolutionTrigger::CronTick,
-                        layer,
-                        self.prompt_engine.as_mut(),
-                        now,
-                    )
+                    .run_for_layer(EvolutionTrigger::CronTick, layer, self.prompt_engine.as_mut(), now)
                     .await
             }
             EvolutionLayer::Policy => {
                 self.pipeline
-                    .run_for_layer(
-                        EvolutionTrigger::CronTick,
-                        layer,
-                        self.strategy_engine.as_mut(),
-                        now,
-                    )
+                    .run_for_layer(EvolutionTrigger::CronTick, layer, self.strategy_engine.as_mut(), now)
                     .await
             }
             _ => bail!("unsupported evolution layer for scheduler run: {:?}", layer),
@@ -324,20 +288,15 @@ fn parse_ts(raw: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::self_system::evolution::config::{
-        EvolutionConfig, EvolutionMode, new_shared_evolution_config,
-    };
+    use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode, new_shared_evolution_config};
     use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput};
     use crate::self_system::evolution::record::{
-        Actor, AnnotationSource, ChangeType, DataBasis, EvolutionLog, MemoryAction, Outcome,
-        TaskType,
+        Actor, AnnotationSource, ChangeType, DataBasis, EvolutionLog, MemoryAction, Outcome, TaskType,
     };
-    use crate::self_system::evolution::storage::{
-        AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths,
-    };
+    use crate::self_system::evolution::storage::{AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths};
     use crate::self_system::evolution::{
-        CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals, EvolutionValidation,
-        FitnessTrend, RiskLevel, ValidationStatus,
+        CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals, EvolutionValidation, FitnessTrend,
+        RiskLevel, ValidationStatus,
     };
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -426,13 +385,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let logs = dir.path().join("logs");
         let writer = Arc::new(
-            AsyncJsonlWriter::new(
-                JsonlStoragePaths::new(logs.clone()),
-                JsonlRetentionPolicy::default(),
-                1,
-            )
-            .await
-            .unwrap(),
+            AsyncJsonlWriter::new(JsonlStoragePaths::new(logs.clone()), JsonlRetentionPolicy::default(), 1)
+                .await
+                .unwrap(),
         );
 
         let now = Utc::now();
@@ -474,10 +429,7 @@ mod tests {
             .unwrap();
         writer.flush().await.unwrap();
 
-        let analyzer = Arc::new(EvolutionAnalyzer::new(
-            writer.clone(),
-            dir.path().join("analysis"),
-        ));
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.path().join("analysis")));
         let mut cfg = EvolutionConfig::default();
         cfg.runtime.mode = EvolutionMode::Auto;
         cfg.runtime.storage_dir = logs.to_string_lossy().to_string();
@@ -524,12 +476,8 @@ mod tests {
 
     #[test]
     fn scheduler_state_deserializes_with_partial_fields() {
-        let state: SchedulerState =
-            serde_json::from_str(r#"{"last_digest_at":"2026-02-24T00:00:00Z"}"#).unwrap();
-        assert_eq!(
-            state.last_digest_at.as_deref(),
-            Some("2026-02-24T00:00:00Z")
-        );
+        let state: SchedulerState = serde_json::from_str(r#"{"last_digest_at":"2026-02-24T00:00:00Z"}"#).unwrap();
+        assert_eq!(state.last_digest_at.as_deref(), Some("2026-02-24T00:00:00Z"));
         assert!(state.next_digest_at.is_none());
         assert!(state.last_cycle_at.is_none());
         assert!(state.next_cycle_at.is_none());

@@ -86,10 +86,7 @@ impl LinqChannel {
         let mut messages = Vec::new();
 
         // Only handle message.received events
-        let event_type = payload
-            .get("event_type")
-            .and_then(|e| e.as_str())
-            .unwrap_or("");
+        let event_type = payload.get("event_type").and_then(|e| e.as_str()).unwrap_or("");
         if event_type != "message.received" {
             tracing::debug!("Linq: skipping non-message event: {event_type}");
             return messages;
@@ -100,11 +97,7 @@ impl LinqChannel {
         };
 
         // Skip messages sent by the bot itself
-        if data
-            .get("is_from_me")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
+        if data.get("is_from_me").and_then(|v| v.as_bool()).unwrap_or(false) {
             tracing::debug!("Linq: skipping is_from_me message");
             return messages;
         }
@@ -132,11 +125,7 @@ impl LinqChannel {
         }
 
         // Get chat_id for reply routing
-        let chat_id = data
-            .get("chat_id")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
+        let chat_id = data.get("chat_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
         // Extract text from message parts
         let Some(message) = data.get("message") else {
@@ -152,10 +141,7 @@ impl LinqChannel {
             .filter_map(|part| {
                 let part_type = part.get("type").and_then(|t| t.as_str())?;
                 match part_type {
-                    "text" => part
-                        .get("value")
-                        .and_then(|v| v.as_str())
-                        .map(ToString::to_string),
+                    "text" => part.get("value").and_then(|v| v.as_str()).map(ToString::to_string),
                     "media" | "image" => {
                         if let Some(marker) = Self::media_part_to_image_marker(part) {
                             Some(marker)
@@ -324,12 +310,7 @@ impl Channel for LinqChannel {
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
         let url = format!("{LINQ_API_BASE}/chats/{recipient}/typing");
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_token)
-            .send()
-            .await?;
+        let resp = self.client.post(&url).bearer_auth(&self.api_token).send().await?;
 
         if !resp.status().is_success() {
             tracing::debug!("Linq start_typing failed: {}", resp.status());
@@ -341,12 +322,7 @@ impl Channel for LinqChannel {
     async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
         let url = format!("{LINQ_API_BASE}/chats/{recipient}/typing");
 
-        let resp = self
-            .client
-            .delete(&url)
-            .bearer_auth(&self.api_token)
-            .send()
-            .await?;
+        let resp = self.client.delete(&url).bearer_auth(&self.api_token).send().await?;
 
         if !resp.status().is_success() {
             tracing::debug!("Linq stop_typing failed: {}", resp.status());
@@ -383,10 +359,7 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
         return false;
     };
     mac.update(message.as_bytes());
-    let signature_hex = signature
-        .trim()
-        .strip_prefix("sha256=")
-        .unwrap_or(signature);
+    let signature_hex = signature.trim().strip_prefix("sha256=").unwrap_or(signature);
     let Ok(provided) = hex::decode(signature_hex.trim()) else {
         tracing::warn!("Linq: invalid webhook signature format");
         return false;
@@ -401,11 +374,7 @@ mod tests {
     use super::*;
 
     fn make_channel() -> LinqChannel {
-        LinqChannel::new(
-            "test-token".into(),
-            "+15551234567".into(),
-            vec!["+1234567890".into()],
-        )
+        LinqChannel::new("test-token".into(), "+15551234567".into(), vec!["+1234567890".into()])
     }
 
     #[test]
@@ -629,12 +598,7 @@ mod tests {
         let body = r#"{"event_type":"message.received"}"#;
         let now = chrono::Utc::now().timestamp().to_string();
 
-        assert!(!verify_linq_signature(
-            secret,
-            body,
-            &now,
-            "deadbeefdeadbeefdeadbeef"
-        ));
+        assert!(!verify_linq_signature(secret, body, &now, "deadbeefdeadbeefdeadbeef"));
     }
 
     #[test]
@@ -692,11 +656,7 @@ mod tests {
 
     #[test]
     fn linq_parse_normalizes_phone_with_plus() {
-        let ch = LinqChannel::new(
-            "tok".into(),
-            "+15551234567".into(),
-            vec!["+1234567890".into()],
-        );
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["+1234567890".into()]);
         // API sends without +, normalize to +
         let payload = serde_json::json!({
             "event_type": "message.received",

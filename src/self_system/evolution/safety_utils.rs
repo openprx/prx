@@ -15,27 +15,18 @@ pub fn validate_path_in_workspace(workspace_root: &Path, target: &Path) -> Resul
     if target.is_absolute() {
         bail!("absolute paths are not allowed: {}", target.display());
     }
-    if target
-        .components()
-        .any(|item| matches!(item, Component::ParentDir))
-    {
+    if target.components().any(|item| matches!(item, Component::ParentDir)) {
         bail!("parent traversal is not allowed: {}", target.display());
     }
 
-    let canonical_root = workspace_root.canonicalize().with_context(|| {
-        format!(
-            "failed to canonicalize workspace root: {}",
-            workspace_root.display()
-        )
-    })?;
+    let canonical_root = workspace_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize workspace root: {}", workspace_root.display()))?;
 
     let joined = canonical_root.join(target);
     let canonical_target = canonicalize_for_workspace_target(&joined)?;
     if !canonical_target.starts_with(&canonical_root) {
-        bail!(
-            "target path escapes workspace: {}",
-            canonical_target.display()
-        );
+        bail!("target path escapes workspace: {}", canonical_target.display());
     }
 
     Ok(canonical_target)
@@ -68,16 +59,10 @@ fn canonicalize_for_workspace_target(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn normalize_target_in_workspace(
-    workspace_root: &Path,
-    target: &Path,
-) -> Result<(PathBuf, PathBuf)> {
-    let canonical_root = workspace_root.canonicalize().with_context(|| {
-        format!(
-            "failed to canonicalize workspace root: {}",
-            workspace_root.display()
-        )
-    })?;
+fn normalize_target_in_workspace(workspace_root: &Path, target: &Path) -> Result<(PathBuf, PathBuf)> {
+    let canonical_root = workspace_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize workspace root: {}", workspace_root.display()))?;
     let relative = if target.is_absolute() {
         target.strip_prefix(&canonical_root).with_context(|| {
             format!(
@@ -96,12 +81,9 @@ fn normalize_target_in_workspace(
 async fn ensure_atomic_tmp_dir(canonical_root: &Path) -> Result<PathBuf> {
     let tmp_dir = validate_path_in_workspace(canonical_root, Path::new(".evolution/.atomic_tmp"))?;
     fs::create_dir_all(&tmp_dir).await?;
-    let canonical_tmp = tmp_dir.canonicalize().with_context(|| {
-        format!(
-            "failed to canonicalize atomic tmp dir: {}",
-            tmp_dir.display()
-        )
-    })?;
+    let canonical_tmp = tmp_dir
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize atomic tmp dir: {}", tmp_dir.display()))?;
     if canonical_tmp != tmp_dir {
         bail!(
             "atomic tmp dir resolved through symlink: expected={}, actual={}",
@@ -139,9 +121,7 @@ fn run_atomic_write_test_hook() {
 
 #[cfg(test)]
 fn set_atomic_write_test_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
-    *atomic_write_test_hook_cell()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = hook;
+    *atomic_write_test_hook_cell().lock().unwrap_or_else(|e| e.into_inner()) = hook;
 }
 
 #[cfg(not(test))]
@@ -149,8 +129,7 @@ fn run_atomic_write_test_hook() {}
 
 /// Atomically write content to target within workspace boundary.
 pub async fn atomic_write(workspace_root: &Path, path: &Path, content: &[u8]) -> Result<()> {
-    let (canonical_root, mut canonical_target) =
-        normalize_target_in_workspace(workspace_root, path)?;
+    let (canonical_root, mut canonical_target) = normalize_target_in_workspace(workspace_root, path)?;
     let parent = canonical_target
         .parent()
         .context("atomic_write target has no parent directory")?;
@@ -234,9 +213,7 @@ impl Drop for FileLockGuard {
 
 /// Acquire an exclusive lock-file beside `path` with bounded wait.
 pub async fn acquire_file_lock(path: &Path) -> Result<FileLockGuard> {
-    let parent = path
-        .parent()
-        .context("lock target has no parent directory")?;
+    let parent = path.parent().context("lock target has no parent directory")?;
     fs::create_dir_all(parent).await?;
     let lock_path = path.with_extension(format!(
         "{}.lock",
@@ -245,12 +222,7 @@ pub async fn acquire_file_lock(path: &Path) -> Result<FileLockGuard> {
 
     let start = Instant::now();
     loop {
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&lock_path)
-            .await
-        {
+        match OpenOptions::new().create_new(true).write(true).open(&lock_path).await {
             Ok(mut lock_file) => {
                 lock_file.write_all(b"lock").await?;
                 lock_file.flush().await?;
@@ -313,9 +285,7 @@ mod tests {
             symlink(&outside_link, &nested).unwrap();
         })));
 
-        let err = atomic_write(dir.path(), &target, b"nope")
-            .await
-            .unwrap_err();
+        let err = atomic_write(dir.path(), &target, b"nope").await.unwrap_err();
         set_atomic_write_test_hook(None);
         assert!(!err.to_string().is_empty());
         assert!(!outside.path().join("escaped").exists());
@@ -332,9 +302,7 @@ mod tests {
         symlink(outside.path(), &evolution_dir).unwrap();
 
         let target = dir.path().join("safe.txt");
-        let err = atomic_write(dir.path(), &target, b"payload")
-            .await
-            .unwrap_err();
+        let err = atomic_write(dir.path(), &target, b"payload").await.unwrap_err();
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("outside workspace")

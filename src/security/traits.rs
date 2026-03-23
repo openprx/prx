@@ -98,10 +98,7 @@ mod tests {
         let mut cmd = Command::new("echo");
         cmd.arg("test");
         let original_program = cmd.get_program().to_string_lossy().to_string();
-        let original_args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let original_args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
 
         let sandbox = NoopSandbox;
         assert!(sandbox.wrap_command(&mut cmd).is_ok());

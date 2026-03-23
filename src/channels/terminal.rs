@@ -95,36 +95,17 @@ fn sanitize_terminal_output(text: &str) -> String {
 #[derive(Debug)]
 enum UiEvent {
     // === Streaming events (with draft_id + seq for ordering) ===
-    DraftStarted {
-        draft_id: String,
-    },
-    TokenDelta {
-        draft_id: String,
-        seq: u64,
-        text: String,
-    },
-    DraftFinalized {
-        draft_id: String,
-        full_text: String,
-    },
-    DraftCancelled {
-        draft_id: String,
-    },
+    DraftStarted { draft_id: String },
+    TokenDelta { draft_id: String, seq: u64, text: String },
+    DraftFinalized { draft_id: String, full_text: String },
+    DraftCancelled { draft_id: String },
 
     // === Tool events ===
-    ToolCallStarted {
-        name: String,
-        args_summary: String,
-    },
-    ToolCallFinished {
-        name: String,
-        success: bool,
-    },
+    ToolCallStarted { name: String, args_summary: String },
+    ToolCallFinished { name: String, success: bool },
 
     // === Complete message (non-streaming fallback) ===
-    FinalMessage {
-        text: String,
-    },
+    FinalMessage { text: String },
 
     // === Typing indicator ===
     TypingStart,
@@ -210,11 +191,7 @@ impl UiActor {
                 }
             }
 
-            UiEvent::TokenDelta {
-                draft_id,
-                seq,
-                text,
-            } => {
+            UiEvent::TokenDelta { draft_id, seq, text } => {
                 // Ignore events for stale drafts or out-of-order events
                 if self.state != UiState::Streaming {
                     return;
@@ -230,24 +207,20 @@ impl UiActor {
                 // On first token, clear the "Thinking..." indicator
                 if self.draft_buffer.is_empty() {
                     print!("\r");
-                    let _ = execute!(
-                        io::stdout(),
-                        terminal::Clear(terminal::ClearType::CurrentLine)
-                    );
+                    let _ = execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine));
                 }
 
                 // Compute delta from accumulated text (safe char-boundary slicing)
-                let new_content = if text.len() > self.draft_buffer.len()
-                    && text.is_char_boundary(self.draft_buffer.len())
-                {
-                    &text[self.draft_buffer.len()..]
-                } else if text.len() > self.draft_buffer.len() {
-                    // Byte lengths diverged at a multi-byte char boundary —
-                    // fall back to printing full accumulated text next repaint
-                    &text
-                } else {
-                    &text
-                };
+                let new_content =
+                    if text.len() > self.draft_buffer.len() && text.is_char_boundary(self.draft_buffer.len()) {
+                        &text[self.draft_buffer.len()..]
+                    } else if text.len() > self.draft_buffer.len() {
+                        // Byte lengths diverged at a multi-byte char boundary —
+                        // fall back to printing full accumulated text next repaint
+                        &text
+                    } else {
+                        &text
+                    };
 
                 // Sanitize untrusted LLM output before printing
                 let safe_content = sanitize_terminal_output(new_content);
@@ -263,10 +236,7 @@ impl UiActor {
                 self.draft_buffer = text;
             }
 
-            UiEvent::DraftFinalized {
-                draft_id,
-                full_text,
-            } => {
+            UiEvent::DraftFinalized { draft_id, full_text } => {
                 if self.active_draft_id.as_deref() != Some(&draft_id) {
                     // Stale finalize — just print as a final message
                     if !full_text.is_empty() {
@@ -279,9 +249,7 @@ impl UiActor {
                 self.state = UiState::Finalizing;
 
                 // Flush any remaining un-rendered delta (safe char-boundary + sanitize)
-                if full_text.len() > self.draft_buffer.len()
-                    && full_text.is_char_boundary(self.draft_buffer.len())
-                {
+                if full_text.len() > self.draft_buffer.len() && full_text.is_char_boundary(self.draft_buffer.len()) {
                     let remaining = sanitize_terminal_output(&full_text[self.draft_buffer.len()..]);
                     print!("{remaining}");
                 }
@@ -298,10 +266,7 @@ impl UiActor {
                 if self.active_draft_id.as_deref() == Some(&draft_id) {
                     // Clear current line
                     print!("\r");
-                    let _ = execute!(
-                        io::stdout(),
-                        terminal::Clear(terminal::ClearType::CurrentLine)
-                    );
+                    let _ = execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine));
                     if !self.draft_buffer.is_empty() {
                         println!();
                         if !self.plain_mode {
@@ -373,10 +338,7 @@ impl UiActor {
 
             UiEvent::TypingStop => {
                 print!("\r");
-                let _ = execute!(
-                    io::stdout(),
-                    terminal::Clear(terminal::ClearType::CurrentLine)
-                );
+                let _ = execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine));
                 let _ = io::stdout().flush();
             }
 
@@ -695,28 +657,16 @@ mod tests {
     #[tokio::test]
     async fn update_and_finalize_draft() {
         let ch = TerminalChannel::new(true);
-        let draft_id = ch
-            .send_draft(&SendMessage::new("", "user"))
-            .await
-            .unwrap()
-            .unwrap();
+        let draft_id = ch.send_draft(&SendMessage::new("", "user")).await.unwrap().unwrap();
         ch.update_draft("user", &draft_id, "Hello").await.unwrap();
-        ch.update_draft("user", &draft_id, "Hello world")
-            .await
-            .unwrap();
-        ch.finalize_draft("user", &draft_id, "Hello world")
-            .await
-            .unwrap();
+        ch.update_draft("user", &draft_id, "Hello world").await.unwrap();
+        ch.finalize_draft("user", &draft_id, "Hello world").await.unwrap();
     }
 
     #[tokio::test]
     async fn cancel_draft_succeeds() {
         let ch = TerminalChannel::new(true);
-        let draft_id = ch
-            .send_draft(&SendMessage::new("", "user"))
-            .await
-            .unwrap()
-            .unwrap();
+        let draft_id = ch.send_draft(&SendMessage::new("", "user")).await.unwrap().unwrap();
         ch.update_draft("user", &draft_id, "partial").await.unwrap();
         ch.cancel_draft("user", &draft_id).await.unwrap();
     }
@@ -724,16 +674,10 @@ mod tests {
     #[tokio::test]
     async fn finalize_after_cancel_is_safe() {
         let ch = TerminalChannel::new(true);
-        let draft_id = ch
-            .send_draft(&SendMessage::new("", "user"))
-            .await
-            .unwrap()
-            .unwrap();
+        let draft_id = ch.send_draft(&SendMessage::new("", "user")).await.unwrap().unwrap();
         ch.cancel_draft("user", &draft_id).await.unwrap();
         // finalize on already-cancelled draft should not panic
-        ch.finalize_draft("user", &draft_id, "late text")
-            .await
-            .unwrap();
+        ch.finalize_draft("user", &draft_id, "late text").await.unwrap();
     }
 
     #[tokio::test]

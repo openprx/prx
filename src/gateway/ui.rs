@@ -67,14 +67,8 @@ fn serve_embedded(path: &str, cache_control: &'static str) -> Response {
 
     let mut response = Response::new(Body::from(file.data.into_owned()));
     let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type(path)),
-    );
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(cache_control),
-    );
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type(path)));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache_control));
     response
 }
 
@@ -85,11 +79,7 @@ fn not_found() -> Response {
 /// Check if a path is safe for embedded asset serving.
 /// Returns `false` for paths containing traversal, backslash, or empty segments.
 fn is_safe_asset_path(path: &str) -> bool {
-    !path.is_empty()
-        && !path.contains('\\')
-        && !path
-            .split('/')
-            .any(|segment| segment == ".." || segment.is_empty())
+    !path.is_empty() && !path.contains('\\') && !path.split('/').any(|segment| segment == ".." || segment.is_empty())
 }
 
 fn content_type(path: &str) -> &'static str {

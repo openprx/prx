@@ -35,8 +35,7 @@ impl StoredQueryRecord {
     fn from_record(record: QueryRecord) -> Self {
         Self {
             query_id: record.query_id,
-            embedding_b64: BASE64_STANDARD
-                .encode(crate::memory::vector::vec_to_bytes(&record.embedding)),
+            embedding_b64: BASE64_STANDARD.encode(crate::memory::vector::vec_to_bytes(&record.embedding)),
             chosen_model_id: record.chosen_model_id,
             success: record.success,
             timestamp: record.timestamp,
@@ -134,10 +133,7 @@ impl KnnStore {
             return None;
         }
 
-        Some((
-            winner.to_string(),
-            (winner_weight / total_weight).clamp(0.0, 1.0),
-        ))
+        Some((winner.to_string(), (winner_weight / total_weight).clamp(0.0, 1.0)))
     }
 
     pub async fn count(&self) -> Result<usize> {
@@ -212,10 +208,7 @@ mod tests {
             ("claude-3".to_string(), 1.0), // far → low weight
         ];
         let gpt_score = weighted_model_score(&neighbors, "gpt-4");
-        assert!(
-            gpt_score > 0.5,
-            "closer model should have higher score: {gpt_score}"
-        );
+        assert!(gpt_score > 0.5, "closer model should have higher score: {gpt_score}");
     }
 
     #[test]

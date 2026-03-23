@@ -53,17 +53,11 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
     }
 
     let report = HygieneReport {
-        archived_memory_files: archive_daily_memory_files(
-            workspace_dir,
-            config.archive_after_days,
-        )?,
+        archived_memory_files: archive_daily_memory_files(workspace_dir, config.archive_after_days)?,
         archived_session_files: archive_session_files(workspace_dir, config.archive_after_days)?,
         purged_memory_archives: purge_memory_archives(workspace_dir, config.purge_after_days)?,
         purged_session_archives: purge_session_archives(workspace_dir, config.purge_after_days)?,
-        pruned_conversation_rows: prune_conversation_rows(
-            workspace_dir,
-            config.conversation_retention_days,
-        )?,
+        pruned_conversation_rows: prune_conversation_rows(workspace_dir, config.conversation_retention_days)?,
         pruned_daily_rows: prune_daily_rows(workspace_dir, config.daily_retention_days)?,
         closed_stale_topics: close_stale_topics(workspace_dir)?,
     };
@@ -188,9 +182,7 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
 
     let cutoff_date = Local::now().date_naive() - Duration::days(i64::from(archive_after_days));
     let cutoff_time = SystemTime::now()
-        .checked_sub(StdDuration::from_secs(
-            u64::from(archive_after_days) * 24 * 60 * 60,
-        ))
+        .checked_sub(StdDuration::from_secs(u64::from(archive_after_days) * 24 * 60 * 60))
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
     let mut moved = 0_u64;
@@ -271,9 +263,7 @@ fn purge_session_archives(workspace_dir: &Path, purge_after_days: u32) -> Result
 
     let cutoff_date = Local::now().date_naive() - Duration::days(i64::from(purge_after_days));
     let cutoff_time = SystemTime::now()
-        .checked_sub(StdDuration::from_secs(
-            u64::from(purge_after_days) * 24 * 60 * 60,
-        ))
+        .checked_sub(StdDuration::from_secs(u64::from(purge_after_days) * 24 * 60 * 60))
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
     let mut removed = 0_u64;
@@ -489,11 +479,7 @@ mod tests {
 
         assert!(!old_file.exists(), "old session file should be archived");
         assert!(
-            workspace
-                .join("sessions")
-                .join("archive")
-                .join(&old_name)
-                .exists(),
+            workspace.join("sessions").join("archive").join(&old_name).exists(),
             "archived session file should exist"
         );
     }
@@ -521,10 +507,7 @@ mod tests {
 
         // Should skip because cadence gate prevents a second immediate run.
         run_if_due(&default_cfg(), workspace).unwrap();
-        assert!(
-            file_b.exists(),
-            "second file should remain because run is throttled"
-        );
+        assert!(file_b.exists(), "second file should remain because run is throttled");
     }
 
     #[test]
@@ -600,14 +583,9 @@ mod tests {
         let workspace = tmp.path();
 
         let mem = SqliteMemory::new(workspace).unwrap();
-        mem.store(
-            "conv_keep",
-            "high-signal context",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("conv_keep", "high-signal context", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
         drop(mem);
 
         let db_path = workspace.join("memory").join("brain.db");
@@ -684,14 +662,9 @@ mod tests {
         let workspace = tmp.path();
 
         let mem = SqliteMemory::new(workspace).unwrap();
-        mem.store(
-            "daily_keep",
-            "important summary",
-            MemoryCategory::Daily,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("daily_keep", "important summary", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
         drop(mem);
 
         let db_path = workspace.join("memory").join("brain.db");
@@ -748,32 +721,23 @@ mod tests {
 
         let conn = Connection::open(&db_path).unwrap();
         let stale_status: String = conn
-            .query_row(
-                "SELECT status FROM topics WHERE id = 'stale_open'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT status FROM topics WHERE id = 'stale_open'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         let stale_resolved_at: Option<String> = conn
-            .query_row(
-                "SELECT resolved_at FROM topics WHERE id = 'stale_open'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT resolved_at FROM topics WHERE id = 'stale_open'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         let fresh_status: String = conn
-            .query_row(
-                "SELECT status FROM topics WHERE id = 'fresh_open'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT status FROM topics WHERE id = 'fresh_open'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
 
         assert_eq!(stale_status, "closed");
-        assert!(
-            stale_resolved_at.is_some(),
-            "closed topic should be resolved"
-        );
+        assert!(stale_resolved_at.is_some(), "closed topic should be resolved");
         assert_eq!(fresh_status, "open");
     }
 }

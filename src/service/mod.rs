@@ -28,10 +28,7 @@ impl FromStr for InitSystem {
             "auto" => Ok(Self::Auto),
             "systemd" => Ok(Self::Systemd),
             "openrc" => Ok(Self::Openrc),
-            other => bail!(
-                "Unknown init system: '{}'. Supported: auto, systemd, openrc",
-                other
-            ),
+            other => bail!("Unknown init system: '{}'. Supported: auto, systemd, openrc", other),
         }
     }
 }
@@ -89,11 +86,7 @@ fn windows_task_name() -> &'static str {
     WINDOWS_TASK_NAME
 }
 
-pub fn handle_command(
-    command: &crate::ServiceCommands,
-    config: &Config,
-    init_system: InitSystem,
-) -> Result<()> {
+pub fn handle_command(command: &crate::ServiceCommands, config: &Config, init_system: InitSystem) -> Result<()> {
     match command {
         crate::ServiceCommands::Install => install(config, init_system),
         crate::ServiceCommands::Start => start(config, init_system),
@@ -157,12 +150,7 @@ fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "macos") {
         let plist = macos_service_file()?;
         let _ = run_checked(Command::new("launchctl").arg("stop").arg(SERVICE_LABEL));
-        let _ = run_checked(
-            Command::new("launchctl")
-                .arg("unload")
-                .arg("-w")
-                .arg(&plist),
-        );
+        let _ = run_checked(Command::new("launchctl").arg("unload").arg("-w").arg(&plist));
         println!("✅ Service stopped");
         Ok(())
     } else if cfg!(target_os = "linux") {
@@ -256,19 +244,11 @@ fn status(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "windows") {
         let _ = config;
         let task_name = windows_task_name();
-        let out =
-            run_capture(Command::new("schtasks").args(["/Query", "/TN", task_name, "/FO", "LIST"]));
+        let out = run_capture(Command::new("schtasks").args(["/Query", "/TN", task_name, "/FO", "LIST"]));
         match out {
             Ok(text) => {
                 let running = text.contains("Running");
-                println!(
-                    "Service: {}",
-                    if running {
-                        "✅ running"
-                    } else {
-                        "❌ not running"
-                    }
-                );
+                println!("Service: {}", if running { "✅ running" } else { "❌ not running" });
                 println!("Task: {}", task_name);
             }
             Err(_) => {
@@ -284,15 +264,14 @@ fn status(config: &Config, init_system: InitSystem) -> Result<()> {
 fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let out =
-                run_capture(Command::new("systemctl").args(["--user", "is-active", "prx.service"]))
-                    .unwrap_or_else(|_| "unknown".into());
+            let out = run_capture(Command::new("systemctl").args(["--user", "is-active", "prx.service"]))
+                .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
             println!("Unit: {}", linux_service_file(config)?.display());
         }
         InitSystem::Openrc => {
-            let out = run_capture(Command::new("rc-service").args(["prx", "status"]))
-                .unwrap_or_else(|_| "unknown".into());
+            let out =
+                run_capture(Command::new("rc-service").args(["prx", "status"])).unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
             println!("Unit: /etc/init.d/prx");
         }
@@ -307,8 +286,7 @@ fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "macos") {
         let file = macos_service_file()?;
         if file.exists() {
-            fs::remove_file(&file)
-                .with_context(|| format!("Failed to remove {}", file.display()))?;
+            fs::remove_file(&file).with_context(|| format!("Failed to remove {}", file.display()))?;
         }
         println!("✅ Service uninstalled ({})", file.display());
         return Ok(());
@@ -344,8 +322,7 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
         InitSystem::Systemd => {
             let file = linux_service_file(config)?;
             if file.exists() {
-                fs::remove_file(&file)
-                    .with_context(|| format!("Failed to remove {}", file.display()))?;
+                fs::remove_file(&file).with_context(|| format!("Failed to remove {}", file.display()))?;
             }
             let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
             println!("✅ Service uninstalled ({})", file.display());
@@ -353,15 +330,10 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
         InitSystem::Openrc => {
             let init_script = Path::new("/etc/init.d/prx");
             if init_script.exists() {
-                if let Err(err) =
-                    run_checked(Command::new("rc-update").args(["del", "prx", "default"]))
-                {
-                    eprintln!(
-                        "⚠️  Warning: Could not remove prx from OpenRC default runlevel: {err}"
-                    );
+                if let Err(err) = run_checked(Command::new("rc-update").args(["del", "prx", "default"])) {
+                    eprintln!("⚠️  Warning: Could not remove prx from OpenRC default runlevel: {err}");
                 }
-                fs::remove_file(init_script)
-                    .with_context(|| format!("Failed to remove {}", init_script.display()))?;
+                fs::remove_file(init_script).with_context(|| format!("Failed to remove {}", init_script.display()))?;
             }
             println!("✅ Service uninstalled (/etc/init.d/prx)");
         }
@@ -626,12 +598,9 @@ fn chown_recursive_to_openprx(_path: &Path) -> Result<()> {
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target)
-        .with_context(|| format!("Failed to create directory {}", target.display()))?;
+    fs::create_dir_all(target).with_context(|| format!("Failed to create directory {}", target.display()))?;
 
-    for entry in fs::read_dir(source)
-        .with_context(|| format!("Failed to read directory {}", source.display()))?
-    {
+    for entry in fs::read_dir(source).with_context(|| format!("Failed to read directory {}", source.display()))? {
         let entry = entry?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
@@ -697,10 +666,7 @@ fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
 fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
     let target_config = config_dir.join("config.toml");
     if target_config.exists() {
-        println!(
-            "✅ Reusing existing OpenRC config at {}",
-            target_config.display()
-        );
+        println!("✅ Reusing existing OpenRC config at {}", target_config.display());
         return Ok(());
     }
 
@@ -763,12 +729,7 @@ fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
     let output = Command::new(&program)
         .args(args.iter().map(String::as_str))
         .output()
-        .with_context(|| {
-            format!(
-                "Failed to verify OpenRC runtime write access for {}",
-                path.display()
-            )
-        })?;
+        .with_context(|| format!("Failed to verify OpenRC runtime write access for {}", path.display()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -788,11 +749,7 @@ fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn ensure_openrc_runtime_dirs_writable(
-    config_dir: &Path,
-    workspace_dir: &Path,
-    log_dir: &Path,
-) -> Result<()> {
+fn ensure_openrc_runtime_dirs_writable(config_dir: &Path, workspace_dir: &Path, log_dir: &Path) -> Result<()> {
     for path in [config_dir, workspace_dir, log_dir] {
         ensure_openrc_runtime_path_writable(path)?;
     }
@@ -800,11 +757,7 @@ fn ensure_openrc_runtime_dirs_writable(
 }
 
 #[cfg(not(unix))]
-fn ensure_openrc_runtime_dirs_writable(
-    _config_dir: &Path,
-    _workspace_dir: &Path,
-    _log_dir: &Path,
-) -> Result<()> {
+fn ensure_openrc_runtime_dirs_writable(_config_dir: &Path, _workspace_dir: &Path, _log_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -877,14 +830,12 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     let log_dir = Path::new("/var/log/prx");
 
     if !config_dir.exists() {
-        fs::create_dir_all(config_dir)
-            .with_context(|| format!("Failed to create {}", config_dir.display()))?;
+        fs::create_dir_all(config_dir).with_context(|| format!("Failed to create {}", config_dir.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(config_dir, fs::Permissions::from_mode(0o755)).with_context(
-                || format!("Failed to set permissions on {}", config_dir.display()),
-            )?;
+            fs::set_permissions(config_dir, fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("Failed to set permissions on {}", config_dir.display()))?;
         }
         println!("✅ Created directory: {}", config_dir.display());
     }
@@ -892,20 +843,15 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     migrate_openrc_runtime_state_if_needed(config_dir)?;
 
     if !workspace_dir.exists() {
-        fs::create_dir_all(&workspace_dir)
-            .with_context(|| format!("Failed to create {}", workspace_dir.display()))?;
+        fs::create_dir_all(&workspace_dir).with_context(|| format!("Failed to create {}", workspace_dir.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750)).with_context(
-                || format!("Failed to set permissions on {}", workspace_dir.display()),
-            )?;
+            fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750))
+                .with_context(|| format!("Failed to set permissions on {}", workspace_dir.display()))?;
         }
         chown_to_openprx(&workspace_dir)?;
-        println!(
-            "✅ Created directory: {} (owned by prx:prx)",
-            workspace_dir.display()
-        );
+        println!("✅ Created directory: {} (owned by prx:prx)", workspace_dir.display());
     }
 
     #[cfg(unix)]
@@ -922,15 +868,13 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
             .with_context(|| format!("Failed to set permissions on {}", config_dir.display()))?;
         let config_path = config_dir.join("config.toml");
         if config_path.exists() {
-            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).with_context(
-                || format!("Failed to set permissions on {}", config_path.display()),
-            )?;
+            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Failed to set permissions on {}", config_path.display()))?;
         }
         let secret_key_path = config_dir.join(".secret_key");
         if secret_key_path.exists() {
-            fs::set_permissions(&secret_key_path, fs::Permissions::from_mode(0o600)).with_context(
-                || format!("Failed to set permissions on {}", secret_key_path.display()),
-            )?;
+            fs::set_permissions(&secret_key_path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Failed to set permissions on {}", secret_key_path.display()))?;
         }
     }
 
@@ -938,8 +882,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
     let created_log_dir = !log_dir.exists();
     if created_log_dir {
-        fs::create_dir_all(log_dir)
-            .with_context(|| format!("Failed to create {}", log_dir.display()))?;
+        fs::create_dir_all(log_dir).with_context(|| format!("Failed to create {}", log_dir.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -953,16 +896,12 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     ensure_openrc_runtime_dirs_writable(config_dir, &workspace_dir, log_dir)?;
 
     if created_log_dir {
-        println!(
-            "✅ Created directory: {} (owned by prx:prx)",
-            log_dir.display()
-        );
+        println!("✅ Created directory: {} (owned by prx:prx)", log_dir.display());
     }
 
     let init_script = generate_openrc_script(&exe, config_dir);
     let init_path = Path::new("/etc/init.d/prx");
-    fs::write(init_path, init_script)
-        .with_context(|| format!("Failed to write {}", init_path.display()))?;
+    fs::write(init_path, init_script).with_context(|| format!("Failed to write {}", init_path.display()))?;
 
     #[cfg(unix)]
     {
@@ -1043,11 +982,7 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
     let _ = config;
-    Ok(home
-        .join(".config")
-        .join("systemd")
-        .join("user")
-        .join("prx.service"))
+    Ok(home.join(".config").join("systemd").join("user").join("prx.service"))
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
@@ -1089,24 +1024,22 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn run_capture_reads_stdout() {
-        let out = run_capture(Command::new("sh").args(["-lc", "echo hello"]))
-            .expect("stdout capture should succeed");
+        let out = run_capture(Command::new("sh").args(["-lc", "echo hello"])).expect("stdout capture should succeed");
         assert_eq!(out.trim(), "hello");
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn run_capture_falls_back_to_stderr() {
-        let out = run_capture(Command::new("sh").args(["-lc", "echo warn 1>&2"]))
-            .expect("stderr capture should succeed");
+        let out =
+            run_capture(Command::new("sh").args(["-lc", "echo warn 1>&2"])).expect("stderr capture should succeed");
         assert_eq!(out.trim(), "warn");
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn run_checked_errors_on_non_zero_status() {
-        let err = run_checked(Command::new("sh").args(["-lc", "exit 17"]))
-            .expect_err("non-zero exit should error");
+        let err = run_checked(Command::new("sh").args(["-lc", "exit 17"])).expect_err("non-zero exit should error");
         assert!(err.to_string().contains("Command failed"));
     }
 
@@ -1126,16 +1059,14 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn run_capture_reads_stdout_windows() {
-        let out = run_capture(Command::new("cmd").args(["/C", "echo hello"]))
-            .expect("stdout capture should succeed");
+        let out = run_capture(Command::new("cmd").args(["/C", "echo hello"])).expect("stdout capture should succeed");
         assert_eq!(out.trim(), "hello");
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn run_checked_errors_on_non_zero_status_windows() {
-        let err = run_checked(Command::new("cmd").args(["/C", "exit /b 17"]))
-            .expect_err("non-zero exit should error");
+        let err = run_checked(Command::new("cmd").args(["/C", "exit /b 17"])).expect_err("non-zero exit should error");
         assert!(err.to_string().contains("Command failed"));
     }
 
@@ -1143,23 +1074,15 @@ mod tests {
     fn init_system_from_str_parses_valid_values() {
         assert_eq!("auto".parse::<InitSystem>().unwrap(), InitSystem::Auto);
         assert_eq!("AUTO".parse::<InitSystem>().unwrap(), InitSystem::Auto);
-        assert_eq!(
-            "systemd".parse::<InitSystem>().unwrap(),
-            InitSystem::Systemd
-        );
-        assert_eq!(
-            "SYSTEMD".parse::<InitSystem>().unwrap(),
-            InitSystem::Systemd
-        );
+        assert_eq!("systemd".parse::<InitSystem>().unwrap(), InitSystem::Systemd);
+        assert_eq!("SYSTEMD".parse::<InitSystem>().unwrap(), InitSystem::Systemd);
         assert_eq!("openrc".parse::<InitSystem>().unwrap(), InitSystem::Openrc);
         assert_eq!("OPENRC".parse::<InitSystem>().unwrap(), InitSystem::Openrc);
     }
 
     #[test]
     fn init_system_from_str_rejects_unknown() {
-        let err = "unknown"
-            .parse::<InitSystem>()
-            .expect_err("should reject unknown");
+        let err = "unknown".parse::<InitSystem>().expect_err("should reject unknown");
         assert!(err.to_string().contains("Unknown init system"));
         assert!(err.to_string().contains("Supported: auto, systemd, openrc"));
     }
@@ -1221,10 +1144,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shell_single_quote_escapes_single_quotes() {
-        assert_eq!(
-            shell_single_quote("/tmp/weird'path"),
-            "'/tmp/weird'\"'\"'path'"
-        );
+        assert_eq!(shell_single_quote("/tmp/weird'path"), "'/tmp/weird'\"'\"'path'");
     }
 
     #[cfg(unix)]
@@ -1248,8 +1168,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn openrc_writability_probe_falls_back_to_su() {
-        let (program, args) =
-            build_openrc_writability_probe_command(Path::new("/etc/prx/workspace"), false);
+        let (program, args) = build_openrc_writability_probe_command(Path::new("/etc/prx/workspace"), false);
         assert_eq!(program, "su");
         assert_eq!(
             args,

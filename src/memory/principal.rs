@@ -156,8 +156,7 @@ impl Principal {
 
                 if ceiling_ord >= Visibility::Private.ordinal() {
                     conditions.push(
-                        "(visibility = 'private' AND chat_type = 'dm' AND channel = ? AND chat_id = ?)"
-                            .to_string(),
+                        "(visibility = 'private' AND chat_type = 'dm' AND channel = ? AND chat_id = ?)".to_string(),
                     );
                     params.push(Value::from(self.current_channel.clone()));
                     params.push(Value::from(self.current_chat_id.clone()));
@@ -170,18 +169,14 @@ impl Principal {
 
                 if ceiling_ord >= Visibility::Group.ordinal() {
                     conditions.push(
-                        "(visibility = 'group' AND chat_type = 'group' AND channel = ? AND chat_id = ?)"
-                            .to_string(),
+                        "(visibility = 'group' AND chat_type = 'group' AND channel = ? AND chat_id = ?)".to_string(),
                     );
                     params.push(Value::from(self.current_channel.clone()));
                     params.push(Value::from(self.current_chat_id.clone()));
                 }
 
                 if ceiling_ord >= Visibility::Project.ordinal() && !self.projects.is_empty() {
-                    let placeholders = (0..self.projects.len())
-                        .map(|_| "?")
-                        .collect::<Vec<_>>()
-                        .join(",");
+                    let placeholders = (0..self.projects.len()).map(|_| "?").collect::<Vec<_>>().join(",");
                     conditions.push(format!(
                         "(visibility = 'project' AND topic_id IN (\
                             SELECT t.id FROM topics t \
@@ -274,11 +269,7 @@ pub fn log_access(
 pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<Principal> {
     let current_channel = ctx.channel.clone().unwrap_or_default();
     let current_chat_id = ctx.chat_id.clone().unwrap_or_default();
-    let current_chat_type = ctx
-        .chat_type
-        .as_deref()
-        .map(ChatType::from_str)
-        .unwrap_or(ChatType::Dm);
+    let current_chat_type = ctx.chat_type.as_deref().map(ChatType::from_str).unwrap_or(ChatType::Dm);
 
     let Some(channel) = ctx.channel.as_deref() else {
         return Ok(anonymous_principal(
@@ -355,11 +346,7 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
     })
 }
 
-pub fn classify_memory(
-    ctx: &MemoryWriteContext,
-    content: &str,
-    principal: &Principal,
-) -> MemoryClassification {
+pub fn classify_memory(ctx: &MemoryWriteContext, content: &str, principal: &Principal) -> MemoryClassification {
     let mut risk_signals = Vec::new();
     if matches_sensitive_patterns(content) {
         risk_signals.push("sensitive_keyword_match".to_string());
@@ -368,11 +355,7 @@ pub fn classify_memory(
         risk_signals.push("pii_detected".to_string());
     }
 
-    let chat_type = ctx
-        .chat_type
-        .as_deref()
-        .map(ChatType::from_str)
-        .unwrap_or(ChatType::Dm);
+    let chat_type = ctx.chat_type.as_deref().map(ChatType::from_str).unwrap_or(ChatType::Dm);
 
     let base_visibility = match (&principal.role, &chat_type) {
         (Role::Owner, ChatType::Dm) => Visibility::Owner,
@@ -473,12 +456,10 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
-        .expect("compile regex: email address pattern")
+    Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b").expect("compile regex: email address pattern")
 });
-static IPV4_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").expect("compile regex: IPv4 address pattern")
-});
+static IPV4_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").expect("compile regex: IPv4 address pattern"));
 
 #[cfg(test)]
 mod tests {
@@ -743,10 +724,7 @@ mod tests {
             "hello".to_string(),
         ];
         let filtered = post_filter(inputs, &principal, |s| s.as_str());
-        assert_eq!(
-            filtered,
-            vec!["normal text".to_string(), "hello".to_string()]
-        );
+        assert_eq!(filtered, vec!["normal text".to_string(), "hello".to_string()]);
     }
 
     #[test]

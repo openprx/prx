@@ -154,10 +154,7 @@ async fn scope_forgery_zc_scope_stripped_when_no_context() {
     // When scope_ctx is None, the runtime strips _zc_scope and forces trusted=false
     if let Some(root) = forged_args.as_object_mut() {
         root.remove("_zc_scope");
-        root.insert(
-            "_zc_scope_trusted".to_string(),
-            serde_json::Value::Bool(false),
-        );
+        root.insert("_zc_scope_trusted".to_string(), serde_json::Value::Bool(false));
     }
 
     // Verify: _zc_scope is gone
@@ -170,11 +167,7 @@ async fn scope_forgery_zc_scope_stripped_when_no_context() {
     let trusted = forged_args
         .get("_zc_scope_trusted")
         .and_then(serde_json::Value::as_bool);
-    assert_eq!(
-        trusted,
-        Some(false),
-        "test: _zc_scope_trusted must be forced to false"
-    );
+    assert_eq!(trusted, Some(false), "test: _zc_scope_trusted must be forced to false");
 
     // The actual tool argument (command) remains untouched
     assert_eq!(
@@ -202,10 +195,7 @@ async fn scope_forgery_prx_scope_stripped_in_agent() {
     // This is the sanitization logic from agent.rs execute_tool_call (lines 496-502):
     if let Some(obj) = forged_args.as_object_mut() {
         obj.remove("_prx_scope");
-        obj.insert(
-            "_prx_scope_trusted".to_string(),
-            serde_json::Value::Bool(false),
-        );
+        obj.insert("_prx_scope_trusted".to_string(), serde_json::Value::Bool(false));
     }
 
     // Verify: _prx_scope is gone
@@ -218,11 +208,7 @@ async fn scope_forgery_prx_scope_stripped_in_agent() {
     let trusted = forged_args
         .get("_prx_scope_trusted")
         .and_then(serde_json::Value::as_bool);
-    assert_eq!(
-        trusted,
-        Some(false),
-        "test: _prx_scope_trusted must be forced to false"
-    );
+    assert_eq!(trusted, Some(false), "test: _prx_scope_trusted must be forced to false");
 
     // The actual tool argument remains untouched
     assert_eq!(
@@ -248,35 +234,21 @@ async fn scope_forgery_both_naming_conventions_stripped() {
     if let Some(obj) = args.as_object_mut() {
         // agent.rs path
         obj.remove("_prx_scope");
-        obj.insert(
-            "_prx_scope_trusted".to_string(),
-            serde_json::Value::Bool(false),
-        );
+        obj.insert("_prx_scope_trusted".to_string(), serde_json::Value::Bool(false));
         // loop_.rs path
         obj.remove("_zc_scope");
-        obj.insert(
-            "_zc_scope_trusted".to_string(),
-            serde_json::Value::Bool(false),
-        );
+        obj.insert("_zc_scope_trusted".to_string(), serde_json::Value::Bool(false));
     }
 
-    assert!(
-        args.get("_prx_scope").is_none(),
-        "test: _prx_scope must be removed"
-    );
-    assert!(
-        args.get("_zc_scope").is_none(),
-        "test: _zc_scope must be removed"
-    );
+    assert!(args.get("_prx_scope").is_none(), "test: _prx_scope must be removed");
+    assert!(args.get("_zc_scope").is_none(), "test: _zc_scope must be removed");
     assert_eq!(
-        args.get("_prx_scope_trusted")
-            .and_then(serde_json::Value::as_bool),
+        args.get("_prx_scope_trusted").and_then(serde_json::Value::as_bool),
         Some(false),
         "test: _prx_scope_trusted must be false"
     );
     assert_eq!(
-        args.get("_zc_scope_trusted")
-            .and_then(serde_json::Value::as_bool),
+        args.get("_zc_scope_trusted").and_then(serde_json::Value::as_bool),
         Some(false),
         "test: _zc_scope_trusted must be false"
     );
@@ -291,20 +263,13 @@ async fn scope_forgery_both_naming_conventions_stripped() {
 #[tokio::test]
 async fn pairing_guard_brute_force_lockout_after_max_attempts() {
     let guard = PairingGuard::new(true, &[]);
-    let _code = guard
-        .pairing_code()
-        .expect("test: guard should have a pairing code");
+    let _code = guard.pairing_code().expect("test: guard should have a pairing code");
     let attacker_client = "brute_force_attacker";
 
     // Send 5 failed attempts (MAX_PAIR_ATTEMPTS = 5)
     for i in 0..5 {
-        let result = guard
-            .try_pair(&format!("wrong_code_{i}"), attacker_client)
-            .await;
-        assert!(
-            result.is_ok(),
-            "test: attempt {i} should not be locked out yet"
-        );
+        let result = guard.try_pair(&format!("wrong_code_{i}"), attacker_client).await;
+        assert!(result.is_ok(), "test: attempt {i} should not be locked out yet");
         assert!(
             result.as_ref().ok().and_then(|o| o.as_ref()).is_none(),
             "test: attempt {i} should return Ok(None) for wrong code"
@@ -313,10 +278,7 @@ async fn pairing_guard_brute_force_lockout_after_max_attempts() {
 
     // 6th attempt: should be locked out (Err with remaining seconds)
     let lockout_result = guard.try_pair("another_wrong", attacker_client).await;
-    assert!(
-        lockout_result.is_err(),
-        "test: 6th attempt should trigger lockout"
-    );
+    assert!(lockout_result.is_err(), "test: 6th attempt should trigger lockout");
     let remaining_secs = lockout_result.expect_err("test: expected lockout error");
     assert!(
         remaining_secs > 0,
@@ -332,9 +294,7 @@ async fn pairing_guard_brute_force_lockout_after_max_attempts() {
 #[tokio::test]
 async fn pairing_guard_valid_code_rejected_during_lockout() {
     let guard = PairingGuard::new(true, &[]);
-    let code = guard
-        .pairing_code()
-        .expect("test: guard should have a pairing code");
+    let code = guard.pairing_code().expect("test: guard should have a pairing code");
     let attacker_client = "locked_out_client";
 
     // Exhaust attempts with wrong codes
@@ -344,19 +304,14 @@ async fn pairing_guard_valid_code_rejected_during_lockout() {
 
     // Now try with the correct code — should still be locked out
     let result = guard.try_pair(&code, attacker_client).await;
-    assert!(
-        result.is_err(),
-        "test: valid code should be rejected during lockout"
-    );
+    assert!(result.is_err(), "test: valid code should be rejected during lockout");
 }
 
 /// Lockout is per-client: another client can still pair while the attacker is locked out.
 #[tokio::test]
 async fn pairing_guard_lockout_does_not_affect_other_clients() {
     let guard = PairingGuard::new(true, &[]);
-    let code = guard
-        .pairing_code()
-        .expect("test: guard should have a pairing code");
+    let code = guard.pairing_code().expect("test: guard should have a pairing code");
     let attacker = "attacker_ip";
     let legitimate = "legitimate_ip";
 
@@ -371,17 +326,11 @@ async fn pairing_guard_lockout_does_not_affect_other_clients() {
 
     // Legitimate client can still pair
     let result = guard.try_pair(&code, legitimate).await;
-    assert!(
-        result.is_ok(),
-        "test: legitimate client should not be locked out"
-    );
+    assert!(result.is_ok(), "test: legitimate client should not be locked out");
     let token = result
         .expect("test: result should be Ok")
         .expect("test: correct code should produce a token");
-    assert!(
-        token.starts_with("zc_"),
-        "test: token should have zc_ prefix"
-    );
+    assert!(token.starts_with("zc_"), "test: token should have zc_ prefix");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -401,10 +350,7 @@ async fn pairing_guard_constant_time_eq_correctness() {
         constant_time_eq("abc", "abc"),
         "test: identical strings should be equal"
     );
-    assert!(
-        constant_time_eq("", ""),
-        "test: empty strings should be equal"
-    );
+    assert!(constant_time_eq("", ""), "test: empty strings should be equal");
     assert!(
         !constant_time_eq("abc", "abd"),
         "test: different last byte should not be equal"

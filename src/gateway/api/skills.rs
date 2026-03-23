@@ -29,10 +29,7 @@ pub async fn get_skills(State(state): State<AppState>) -> Json<SkillsResponse> {
         .map(|s| SkillInfo {
             name: s.name,
             description: s.description,
-            location: s
-                .location
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
+            location: s.location.map(|p| p.display().to_string()).unwrap_or_default(),
             enabled: true,
         })
         .collect();
@@ -207,9 +204,7 @@ pub async fn install_skill(
     if !is_allowed_skill_url(&req.url) {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::json!({"error": "Only GitHub and HuggingFace HTTPS URLs are supported"}),
-            ),
+            Json(serde_json::json!({"error": "Only GitHub and HuggingFace HTTPS URLs are supported"})),
         ));
     }
 
@@ -235,13 +230,7 @@ pub async fn install_skill(
 
     // Git clone
     let output = tokio::process::Command::new("git")
-        .args([
-            "clone",
-            "--depth",
-            "1",
-            &req.url,
-            &target_dir.display().to_string(),
-        ])
+        .args(["clone", "--depth", "1", &req.url, &target_dir.display().to_string()])
         .output()
         .await;
 
@@ -264,11 +253,7 @@ pub async fn install_skill(
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            warn!(
-                name = req.name.as_str(),
-                stderr = stderr.as_str(),
-                "git clone failed"
-            );
+            warn!(name = req.name.as_str(), stderr = stderr.as_str(), "git clone failed");
             // Clean up partial clone
             let _ = std::fs::remove_dir_all(&target_dir);
             Err((

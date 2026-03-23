@@ -30,12 +30,7 @@ impl Memory for NoneMemory {
         Ok(())
     }
 
-    async fn recall(
-        &self,
-        _query: &str,
-        _limit: usize,
-        _session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
+    async fn recall(&self, _query: &str, _limit: usize, _session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }
 
@@ -76,10 +71,7 @@ mod tests {
     async fn none_memory_is_noop() {
         let memory = NoneMemory::new();
 
-        memory
-            .store("k", "v", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        memory.store("k", "v", MemoryCategory::Core, None).await.unwrap();
 
         assert!(memory.get("k").await.unwrap().is_none());
         assert!(memory.recall("k", 10, None).await.unwrap().is_empty());

@@ -40,12 +40,9 @@ impl ConfidenceChecker {
         }
 
         let code_task_markers = [
-            "code", "rust", "python", "bug", "debug", "fix", "function", "函数", "代码", "调试",
-            "修复",
+            "code", "rust", "python", "bug", "debug", "fix", "function", "函数", "代码", "调试", "修复",
         ];
-        let is_code_task = code_task_markers
-            .iter()
-            .any(|marker| question_lower.contains(marker));
+        let is_code_task = code_task_markers.iter().any(|marker| question_lower.contains(marker));
         if is_code_task && answer.contains("```") {
             confidence += 0.2;
         }
@@ -58,13 +55,7 @@ impl ConfidenceChecker {
     }
 
     /// Placeholder for future sampling-based confidence checks.
-    pub fn check(
-        &self,
-        question: &str,
-        answer: &str,
-        _provider: &Arc<dyn Provider>,
-        _model: &str,
-    ) -> f32 {
+    pub fn check(&self, question: &str, answer: &str, _provider: &Arc<dyn Provider>, _model: &str) -> f32 {
         Self::check_rules(answer, question)
     }
 }
@@ -95,8 +86,7 @@ mod tests {
 
     #[test]
     fn test_confidence_low_triggers_escalation() {
-        let confidence =
-            ConfidenceChecker::check_rules("I'm not sure, maybe this is correct.", "answer this");
+        let confidence = ConfidenceChecker::check_rules("I'm not sure, maybe this is correct.", "answer this");
         assert!(should_escalate(confidence, 0.7));
     }
 
@@ -111,13 +101,7 @@ mod tests {
 
     #[test]
     fn cheap_model_target_matches_tier_marker() {
-        assert!(is_cheap_model_target(
-            "openai/gpt-4o-mini",
-            &[String::from("mini")]
-        ));
-        assert!(!is_cheap_model_target(
-            "openai/gpt-4o",
-            &[String::from("mini")]
-        ));
+        assert!(is_cheap_model_target("openai/gpt-4o-mini", &[String::from("mini")]));
+        assert!(!is_cheap_model_target("openai/gpt-4o", &[String::from("mini")]));
     }
 }

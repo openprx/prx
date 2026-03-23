@@ -290,10 +290,7 @@ mod tests {
     async fn get_component_returns_none_for_unregistered() {
         let registry = PluginRegistry::new();
         let component = registry.get_component("not-registered").await;
-        assert!(
-            component.is_none(),
-            "unregistered plugin should have no component"
-        );
+        assert!(component.is_none(), "unregistered plugin should have no component");
     }
 
     #[tokio::test]
@@ -326,10 +323,7 @@ mod tests {
         let plugin = LoadedPlugin::new(manifest, "/opt/plugins/info-test".into(), None);
         registry.register(plugin).await.unwrap();
 
-        let info = registry
-            .get_info("info-test")
-            .await
-            .expect("should find plugin");
+        let info = registry.get_info("info-test").await.expect("should find plugin");
         assert_eq!(info.name, "info-test");
         assert_eq!(info.version, "0.1.0");
         assert_eq!(info.description, "A test plugin");

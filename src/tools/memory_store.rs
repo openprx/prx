@@ -75,10 +75,7 @@ impl Tool for MemoryStoreTool {
             Some(other) => MemoryCategory::Custom(other.to_string()),
         };
 
-        if let Err(error) = self
-            .security
-            .enforce_tool_operation(ToolOperation::Act, "memory_store")
-        {
+        if let Err(error) = self.security.enforce_tool_operation(ToolOperation::Act, "memory_store") {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -160,9 +157,7 @@ mod tests {
         let (_tmp, mem) = test_mem();
         let tool = MemoryStoreTool::new(mem.clone(), test_security());
         let result = tool
-            .execute(
-                json!({"key": "proj_note", "content": "Uses async runtime", "category": "project"}),
-            )
+            .execute(json!({"key": "proj_note", "content": "Uses async runtime", "category": "project"}))
             .await
             .unwrap();
         assert!(result.success);
@@ -220,13 +215,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("read-only mode")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only mode"));
         assert!(mem.get("lang").await.unwrap().is_none());
     }
 
@@ -243,13 +232,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Rate limit exceeded")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit exceeded"));
         assert!(mem.get("lang").await.unwrap().is_none());
     }
 }

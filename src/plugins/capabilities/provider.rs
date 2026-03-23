@@ -77,9 +77,7 @@ impl WasmProvider {
         let instance = linker
             .instantiate_async(&mut store, component)
             .await
-            .map_err(|e| {
-                PluginError::Instantiation(format!("failed to instantiate provider: {e}"))
-            })?;
+            .map_err(|e| PluginError::Instantiation(format!("failed to instantiate provider: {e}")))?;
 
         // Cache the provider name at load time.
         let provider_name = Self::call_name(&instance, &mut store).await?;
@@ -105,9 +103,7 @@ impl WasmProvider {
     /// Register host functions needed by provider world plugins.
     ///
     /// Provider world imports: log, config, http-outbound, events.
-    fn register_host_functions(
-        linker: &mut wasmtime::component::Linker<HostState>,
-    ) -> PluginResult<()> {
+    fn register_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
         super::common::register_log_host_functions(linker)?;
         super::common::register_config_host_functions(linker)?;
         super::common::register_http_host_functions(linker)?;
@@ -122,22 +118,14 @@ impl WasmProvider {
         store: &mut wasmtime::Store<HostState>,
     ) -> PluginResult<String> {
         let iface_idx = instance
-            .get_export_index(
-                store.as_context_mut(),
-                None,
-                "prx:plugin/provider-exports@0.1.0",
-            )
+            .get_export_index(store.as_context_mut(), None, "prx:plugin/provider-exports@0.1.0")
             .ok_or_else(|| {
-                PluginError::Instantiation(
-                    "plugin does not export prx:plugin/provider-exports@0.1.0".to_string(),
-                )
+                PluginError::Instantiation("plugin does not export prx:plugin/provider-exports@0.1.0".to_string())
             })?;
 
         let func_idx = instance
             .get_export_index(store.as_context_mut(), Some(&iface_idx), "name")
-            .ok_or_else(|| {
-                PluginError::Instantiation("name not found in provider-exports".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Instantiation("name not found in provider-exports".to_string()))?;
 
         let name_fn = instance
             .get_func(store.as_context_mut(), &func_idx)
@@ -172,22 +160,14 @@ impl WasmProvider {
 
         // Navigate to prx:plugin/provider-exports@0.1.0 → chat
         let iface_idx = instance
-            .get_export_index(
-                store.as_context_mut(),
-                None,
-                "prx:plugin/provider-exports@0.1.0",
-            )
+            .get_export_index(store.as_context_mut(), None, "prx:plugin/provider-exports@0.1.0")
             .ok_or_else(|| {
-                PluginError::Runtime(
-                    "plugin does not export prx:plugin/provider-exports@0.1.0".to_string(),
-                )
+                PluginError::Runtime("plugin does not export prx:plugin/provider-exports@0.1.0".to_string())
             })?;
 
         let func_idx = instance
             .get_export_index(store.as_context_mut(), Some(&iface_idx), "chat")
-            .ok_or_else(|| {
-                PluginError::Runtime("chat not found in provider-exports".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Runtime("chat not found in provider-exports".to_string()))?;
 
         let chat_fn = instance
             .get_func(store.as_context_mut(), &func_idx)
@@ -198,10 +178,7 @@ impl WasmProvider {
             .iter()
             .map(|m| {
                 wasmtime::component::Val::Record(vec![
-                    (
-                        "role".to_string(),
-                        wasmtime::component::Val::String(m.role.clone()),
-                    ),
+                    ("role".to_string(), wasmtime::component::Val::String(m.role.clone())),
                     (
                         "content".to_string(),
                         wasmtime::component::Val::String(m.content.clone()),
@@ -256,9 +233,7 @@ impl WasmProvider {
         let fields = match val {
             wasmtime::component::Val::Record(f) => f,
             _ => {
-                return Err(PluginError::Runtime(
-                    "chat-response is not a record".to_string(),
-                ));
+                return Err(PluginError::Runtime("chat-response is not a record".to_string()));
             }
         };
 
@@ -281,8 +256,7 @@ impl WasmProvider {
             .find(|(k, _)| k == "tool-calls")
             .and_then(|(_, v)| match v {
                 wasmtime::component::Val::List(items) => {
-                    let calls: Vec<ToolCall> =
-                        items.iter().filter_map(Self::parse_tool_call).collect();
+                    let calls: Vec<ToolCall> = items.iter().filter_map(Self::parse_tool_call).collect();
                     Some(calls)
                 }
                 _ => None,
@@ -411,8 +385,7 @@ mod tests {
             ("name".to_string(), str_val("my_tool")),
             // id and arguments intentionally omitted — defaults to ""
         ]);
-        let tc = WasmProvider::parse_tool_call(&record)
-            .expect("should parse with default empty strings");
+        let tc = WasmProvider::parse_tool_call(&record).expect("should parse with default empty strings");
         assert_eq!(tc.name, "my_tool");
         assert_eq!(tc.id, "");
         assert_eq!(tc.arguments, "");
@@ -483,10 +456,7 @@ mod tests {
             ("arguments".to_string(), str_val("{}")),
         ]);
         let record = Val::Record(vec![
-            (
-                "text".to_string(),
-                Val::Option(Some(Box::new(str_val("also text")))),
-            ),
+            ("text".to_string(), Val::Option(Some(Box::new(str_val("also text"))))),
             ("tool-calls".to_string(), Val::List(vec![tc1, tc2])),
         ]);
         let resp = WasmProvider::parse_chat_response(&record).expect("should parse");
@@ -505,10 +475,7 @@ mod tests {
     #[test]
     fn parse_chat_response_missing_optional_fields() {
         // Only 'text' field — tool-calls field absent → defaults to empty vec
-        let record = Val::Record(vec![(
-            "text".to_string(),
-            Val::Option(Some(Box::new(str_val("hi")))),
-        )]);
+        let record = Val::Record(vec![("text".to_string(), Val::Option(Some(Box::new(str_val("hi")))))]);
         let resp = WasmProvider::parse_chat_response(&record).expect("should parse gracefully");
         assert_eq!(resp.text, Some("hi".to_string()));
         assert!(resp.tool_calls.is_empty());

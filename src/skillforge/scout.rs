@@ -125,14 +125,8 @@ impl GitHubScout {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let stars = item
-                    .get("stargazers_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let language = item
-                    .get("language")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+                let stars = item.get("stargazers_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let language = item.get("language").and_then(|v| v.as_str()).map(String::from);
                 let updated_at = item
                     .get("updated_at")
                     .and_then(|v| v.as_str())
@@ -241,31 +235,13 @@ mod tests {
 
     #[test]
     fn scout_source_from_str() {
-        assert_eq!(
-            "github".parse::<ScoutSource>().unwrap(),
-            ScoutSource::GitHub
-        );
-        assert_eq!(
-            "GitHub".parse::<ScoutSource>().unwrap(),
-            ScoutSource::GitHub
-        );
-        assert_eq!(
-            "clawhub".parse::<ScoutSource>().unwrap(),
-            ScoutSource::ClawHub
-        );
-        assert_eq!(
-            "huggingface".parse::<ScoutSource>().unwrap(),
-            ScoutSource::HuggingFace
-        );
-        assert_eq!(
-            "hf".parse::<ScoutSource>().unwrap(),
-            ScoutSource::HuggingFace
-        );
+        assert_eq!("github".parse::<ScoutSource>().unwrap(), ScoutSource::GitHub);
+        assert_eq!("GitHub".parse::<ScoutSource>().unwrap(), ScoutSource::GitHub);
+        assert_eq!("clawhub".parse::<ScoutSource>().unwrap(), ScoutSource::ClawHub);
+        assert_eq!("huggingface".parse::<ScoutSource>().unwrap(), ScoutSource::HuggingFace);
+        assert_eq!("hf".parse::<ScoutSource>().unwrap(), ScoutSource::HuggingFace);
         // unknown falls back to GitHub
-        assert_eq!(
-            "unknown".parse::<ScoutSource>().unwrap(),
-            ScoutSource::GitHub
-        );
+        assert_eq!("unknown".parse::<ScoutSource>().unwrap(), ScoutSource::GitHub);
     }
 
     #[test]

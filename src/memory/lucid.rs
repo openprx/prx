@@ -32,8 +32,7 @@ impl LucidMemory {
     const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
 
     pub fn new(workspace_dir: &Path, local: SqliteMemory) -> Self {
-        let lucid_cmd = std::env::var("ZEROCLAW_LUCID_CMD")
-            .unwrap_or_else(|_| Self::DEFAULT_LUCID_CMD.to_string());
+        let lucid_cmd = std::env::var("ZEROCLAW_LUCID_CMD").unwrap_or_else(|_| Self::DEFAULT_LUCID_CMD.to_string());
 
         let token_budget = std::env::var("ZEROCLAW_LUCID_BUDGET")
             .ok()
@@ -41,16 +40,10 @@ impl LucidMemory {
             .filter(|v| *v > 0)
             .unwrap_or(Self::DEFAULT_TOKEN_BUDGET);
 
-        let recall_timeout = Self::read_env_duration_ms(
-            "OPENPRX_LUCID_RECALL_TIMEOUT_MS",
-            Self::DEFAULT_RECALL_TIMEOUT_MS,
-            20,
-        );
-        let store_timeout = Self::read_env_duration_ms(
-            "OPENPRX_LUCID_STORE_TIMEOUT_MS",
-            Self::DEFAULT_STORE_TIMEOUT_MS,
-            50,
-        );
+        let recall_timeout =
+            Self::read_env_duration_ms("OPENPRX_LUCID_RECALL_TIMEOUT_MS", Self::DEFAULT_RECALL_TIMEOUT_MS, 20);
+        let store_timeout =
+            Self::read_env_duration_ms("OPENPRX_LUCID_STORE_TIMEOUT_MS", Self::DEFAULT_STORE_TIMEOUT_MS, 50);
         let local_hit_threshold = Self::read_env_usize(
             "OPENPRX_LUCID_LOCAL_HIT_THRESHOLD",
             Self::DEFAULT_LOCAL_HIT_THRESHOLD,
@@ -168,11 +161,7 @@ impl LucidMemory {
         let mut seen = HashSet::new();
 
         for entry in primary_results.into_iter().chain(secondary_results) {
-            let signature = format!(
-                "{}\u{0}{}",
-                entry.key.to_lowercase(),
-                entry.content.to_lowercase()
-            );
+            let signature = format!("{}\u{0}{}", entry.key.to_lowercase(), entry.content.to_lowercase());
 
             if seen.insert(signature) {
                 merged.push(entry);
@@ -248,12 +237,9 @@ impl LucidMemory {
         let mut cmd = Command::new(lucid_cmd);
         cmd.args(args);
 
-        let output = timeout(timeout_window, cmd.output()).await.map_err(|_| {
-            anyhow::anyhow!(
-                "lucid command timed out after {}ms",
-                timeout_window.as_millis()
-            )
-        })??;
+        let output = timeout(timeout_window, cmd.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("lucid command timed out after {}ms", timeout_window.as_millis()))??;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -263,11 +249,7 @@ impl LucidMemory {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    async fn run_lucid_command(
-        &self,
-        args: &[String],
-        timeout_window: Duration,
-    ) -> anyhow::Result<String> {
+    async fn run_lucid_command(&self, args: &[String], timeout_window: Duration) -> anyhow::Result<String> {
         Self::run_lucid_command_raw(&self.lucid_cmd, args, timeout_window).await
     }
 
@@ -321,24 +303,14 @@ impl Memory for LucidMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.local
-            .store(key, content, category.clone(), session_id)
-            .await?;
+        self.local.store(key, content, category.clone(), session_id).await?;
         self.sync_to_lucid_async(key, content, &category).await;
         Ok(())
     }
 
-    async fn recall(
-        &self,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
+    async fn recall(&self, query: &str, limit: usize, session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
         let local_results = self.local.recall(query, limit, session_id).await?;
-        if limit == 0
-            || local_results.len() >= limit
-            || local_results.len() >= self.local_hit_threshold
-        {
+        if limit == 0 || local_results.len() >= limit || local_results.len() >= self.local_hit_threshold {
             return Ok(local_results);
         }
 
@@ -612,12 +584,7 @@ exit 1
         );
 
         memory
-            .store(
-                "pref",
-                "Rust should stay local-first",
-                MemoryCategory::Core,
-                None,
-            )
+            .store("pref", "Rust should stay local-first", MemoryCategory::Core, None)
             .await
             .unwrap();
 

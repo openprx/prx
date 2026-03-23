@@ -136,25 +136,19 @@ impl SubagentsTool {
                     Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!(
-                            "Subagent `{run_id}` is running but cannot be steered."
-                        )),
+                        error: Some(format!("Subagent `{run_id}` is running but cannot be steered.")),
                     })
                 }
             }
             SubAgentStatus::Completed(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Subagent `{run_id}` already completed; cannot steer."
-                )),
+                error: Some(format!("Subagent `{run_id}` already completed; cannot steer.")),
             }),
             SubAgentStatus::Failed(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Subagent `{run_id}` already failed ({e}); cannot steer."
-                )),
+                error: Some(format!("Subagent `{run_id}` already failed ({e}); cannot steer.")),
             }),
         }
     }
@@ -208,19 +202,14 @@ impl Tool for SubagentsTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("list");
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
         match action {
             "list" => {
                 let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("all");
                 let limit = args
                     .get("limit")
                     .and_then(|v| v.as_u64())
-                    .map_or(DEFAULT_LIMIT, |v| {
-                        usize::try_from(v).unwrap_or(DEFAULT_LIMIT)
-                    });
+                    .map_or(DEFAULT_LIMIT, |v| usize::try_from(v).unwrap_or(DEFAULT_LIMIT));
                 self.execute_list(status, limit).await
             }
             "kill" => {
@@ -238,17 +227,13 @@ impl Tool for SubagentsTool {
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Missing 'run_id' parameter for steer action")
-                    })?;
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter for steer action"))?;
                 let message = args
                     .get("message")
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Missing 'message' parameter for steer action")
-                    })?;
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'message' parameter for steer action"))?;
                 self.execute_steer(run_id, message).await
             }
             _ => Ok(ToolResult {
@@ -303,10 +288,7 @@ mod tests {
         let runs = Arc::new(RwLock::new(vec![run]));
         let tool = SubagentsTool::new(runs.clone());
 
-        let result = tool
-            .execute(json!({"action":"kill","run_id":"run-1"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action":"kill","run_id":"run-1"})).await.unwrap();
         assert!(result.success);
 
         let guard = runs.read().await;
@@ -412,10 +394,7 @@ mod tests {
             make_run("r3", SubAgentStatus::Running),
         ];
         let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
-        let result = tool
-            .execute(json!({"action": "list", "limit": 2}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "list", "limit": 2})).await.unwrap();
         assert!(result.output.contains("2 shown"));
     }
 
@@ -446,10 +425,7 @@ mod tests {
     async fn kill_completed_fails() {
         let runs = vec![make_run("r1", SubAgentStatus::Completed("ok".into()))];
         let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
-        let result = tool
-            .execute(json!({"action": "kill", "run_id": "r1"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "kill", "run_id": "r1"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("completed"));
     }
@@ -458,10 +434,7 @@ mod tests {
     async fn kill_failed_fails() {
         let runs = vec![make_run("r1", SubAgentStatus::Failed("err".into()))];
         let tool = SubagentsTool::new(Arc::new(RwLock::new(runs)));
-        let result = tool
-            .execute(json!({"action": "kill", "run_id": "r1"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "kill", "run_id": "r1"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("failed"));
     }
@@ -507,13 +480,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("cannot be steered")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("cannot be steered"));
     }
 
     #[tokio::test]
@@ -543,13 +510,7 @@ mod tests {
         let tool = SubagentsTool::new(Arc::new(RwLock::new(Vec::new())));
         let result = tool.execute(json!({"action": "nuke"})).await.unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Unsupported")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("Unsupported"));
     }
 
     // ── Output formatting ───────────────────────────────────────

@@ -82,16 +82,8 @@ impl WasmCronJob {
 
         // Navigate to the exported interface: prx:plugin/cron-exports@0.1.0
         let iface_idx = instance
-            .get_export_index(
-                store.as_context_mut(),
-                None,
-                "prx:plugin/cron-exports@0.1.0",
-            )
-            .ok_or_else(|| {
-                PluginError::Runtime(
-                    "plugin does not export prx:plugin/cron-exports@0.1.0".to_string(),
-                )
-            })?;
+            .get_export_index(store.as_context_mut(), None, "prx:plugin/cron-exports@0.1.0")
+            .ok_or_else(|| PluginError::Runtime("plugin does not export prx:plugin/cron-exports@0.1.0".to_string()))?;
 
         let func_idx = instance
             .get_export_index(store.as_context_mut(), Some(&iface_idx), "run")
@@ -145,9 +137,7 @@ impl WasmCronJob {
     }
 
     /// Register host functions for cron plugins.
-    fn register_host_functions(
-        linker: &mut wasmtime::component::Linker<HostState>,
-    ) -> PluginResult<()> {
+    fn register_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
         super::common::register_common_host_functions(linker)
     }
 }

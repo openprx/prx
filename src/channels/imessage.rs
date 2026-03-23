@@ -26,9 +26,7 @@ impl IMessageChannel {
         if self.allowed_contacts.iter().any(|u| u == "*") {
             return true;
         }
-        self.allowed_contacts
-            .iter()
-            .any(|u| u.eq_ignore_ascii_case(sender))
+        self.allowed_contacts.iter().any(|u| u.eq_ignore_ascii_case(sender))
     }
 }
 
@@ -72,17 +70,12 @@ fn is_valid_imessage_target(target: &str) -> bool {
         let domain = &target[at_pos + 1..];
 
         // Local part: non-empty, alphanumeric + common email chars
-        let local_valid = !local.is_empty()
-            && local
-                .chars()
-                .all(|c| c.is_alphanumeric() || "._+-".contains(c));
+        let local_valid = !local.is_empty() && local.chars().all(|c| c.is_alphanumeric() || "._+-".contains(c));
 
         // Domain: non-empty, contains a dot, alphanumeric + dots/hyphens
         let domain_valid = !domain.is_empty()
             && domain.contains('.')
-            && domain
-                .chars()
-                .all(|c| c.is_alphanumeric() || ".-".contains(c));
+            && domain.chars().all(|c| c.is_alphanumeric() || ".-".contains(c));
 
         return local_valid && domain_valid;
     }
@@ -99,9 +92,7 @@ impl Channel for IMessageChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Defense-in-depth: validate target format before any interpolation
         if !is_valid_imessage_target(&message.recipient) {
-            anyhow::bail!(
-                "Invalid iMessage target: must be a phone number (+1234567890) or email (user@example.com)"
-            );
+            anyhow::bail!("Invalid iMessage target: must be a phone number (+1234567890) or email (user@example.com)");
         }
 
         // SECURITY: Escape both message AND target to prevent AppleScript injection
@@ -159,25 +150,23 @@ end tell"#
         .await??;
 
         // Track the last ROWID we've seen (shuttle conn in and out)
-        let (mut conn, initial_rowid) =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<(Connection, i64)> {
-                let rowid = {
-                    let mut stmt =
-                        conn.prepare("SELECT MAX(ROWID) FROM message WHERE is_from_me = 0")?;
-                    let rowid: Option<i64> = stmt.query_row([], |row| row.get(0))?;
-                    rowid.unwrap_or(0)
-                };
-                Ok((conn, rowid))
-            })
-            .await??;
+        let (mut conn, initial_rowid) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Connection, i64)> {
+            let rowid = {
+                let mut stmt = conn.prepare("SELECT MAX(ROWID) FROM message WHERE is_from_me = 0")?;
+                let rowid: Option<i64> = stmt.query_row([], |row| row.get(0))?;
+                rowid.unwrap_or(0)
+            };
+            Ok((conn, rowid))
+        })
+        .await??;
         let mut last_rowid = initial_rowid;
 
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(self.poll_interval_secs)).await;
 
             let since = last_rowid;
-            let (returned_conn, poll_result) = tokio::task::spawn_blocking(
-                move || -> (Connection, anyhow::Result<Vec<(i64, String, String)>>) {
+            let (returned_conn, poll_result) =
+                tokio::task::spawn_blocking(move || -> (Connection, anyhow::Result<Vec<(i64, String, String)>>) {
                     let result = (|| -> anyhow::Result<Vec<(i64, String, String)>> {
                         let mut stmt = conn.prepare(
                             "SELECT m.ROWID, h.id, m.text \
@@ -201,10 +190,9 @@ end tell"#
                     })();
 
                     (conn, result)
-                },
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("iMessage poll worker join error: {e}"))?;
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("iMessage poll worker join error: {e}"))?;
             conn = returned_conn;
 
             match poll_result {
@@ -283,19 +271,15 @@ async fn get_max_rowid(db_path: &Path) -> anyhow::Result<i64> {
 /// Uses rusqlite with parameterized queries for security (CWE-89 prevention).
 /// The `since_rowid` parameter is bound safely, preventing SQL injection.
 #[cfg(test)]
-async fn fetch_new_messages(
-    db_path: &Path,
-    since_rowid: i64,
-) -> anyhow::Result<Vec<(i64, String, String)>> {
+async fn fetch_new_messages(db_path: &Path, since_rowid: i64) -> anyhow::Result<Vec<(i64, String, String)>> {
     let path = db_path.to_path_buf();
-    let results =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(i64, String, String)>> {
-            let conn = Connection::open_with_flags(
-                &path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            let mut stmt = conn.prepare(
-                "SELECT m.ROWID, h.id, m.text \
+    let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(i64, String, String)>> {
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT m.ROWID, h.id, m.text \
              FROM message m \
              JOIN handle h ON m.handle_id = h.ROWID \
              WHERE m.ROWID > ?1 \
@@ -303,17 +287,17 @@ async fn fetch_new_messages(
              AND m.text IS NOT NULL \
              ORDER BY m.ROWID ASC \
              LIMIT 20",
-            )?;
-            let rows = stmt.query_map([since_rowid], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-        })
-        .await??;
+        )?;
+        let rows = stmt.query_map([since_rowid], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    })
+    .await??;
     Ok(results)
 }
 
@@ -405,10 +389,7 @@ mod tests {
 
     #[test]
     fn escape_applescript_mixed() {
-        assert_eq!(
-            escape_applescript(r#"say "hello\" world"#),
-            r#"say \"hello\\\" world"#
-        );
+        assert_eq!(escape_applescript(r#"say "hello\" world"#), r#"say \"hello\\\" world"#);
     }
 
     #[test]
@@ -424,10 +405,7 @@ mod tests {
         for (i, &c) in chars.iter().enumerate() {
             if c == '"' {
                 // Every quote must be preceded by a backslash
-                assert!(
-                    i > 0 && chars[i - 1] == '\\',
-                    "Found unescaped quote at position {i}"
-                );
+                assert!(i > 0 && chars[i - 1] == '\\', "Found unescaped quote at position {i}");
             }
         }
     }
@@ -637,24 +615,24 @@ mod tests {
         // Insert test data
         {
             let conn = Connection::open(&db_path).unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
             conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (100, 1, 'Hello', 0)",
                 [],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (100, 1, 'Hello', 0)",
-                []
-            ).unwrap();
-            conn.execute(
                 "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (200, 1, 'World', 0)",
-                []
-            ).unwrap();
+                [],
+            )
+            .unwrap();
             // This one is from_me=1, should be ignored
             conn.execute(
                 "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (300, 1, 'Sent', 1)",
-                []
-            ).unwrap();
+                [],
+            )
+            .unwrap();
         }
 
         let result = get_max_rowid(&db_path).await.unwrap();
@@ -684,39 +662,28 @@ mod tests {
         // Insert test data
         {
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (2, 'user@example.com')",
-                [],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (2, 'user@example.com')", [])
+                .unwrap();
             conn.execute(
                 "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'First message', 0)",
-                []
-            ).unwrap();
+                [],
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (20, 2, 'Second message', 0)",
-                []
-            ).unwrap();
+                [],
+            )
+            .unwrap();
         }
 
         let result = fetch_new_messages(&db_path, 0).await.unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(
-            result[0],
-            (10, "+1234567890".to_string(), "First message".to_string())
-        );
+        assert_eq!(result[0], (10, "+1234567890".to_string(), "First message".to_string()));
         assert_eq!(
             result[1],
-            (
-                20,
-                "user@example.com".to_string(),
-                "Second message".to_string()
-            )
+            (20, "user@example.com".to_string(), "Second message".to_string())
         );
     }
 
@@ -727,19 +694,18 @@ mod tests {
         // Insert test data
         {
             let conn = Connection::open(&db_path).unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
             conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Old message', 0)",
                 [],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Old message', 0)",
-                []
-            ).unwrap();
-            conn.execute(
                 "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (20, 1, 'New message', 0)",
-                []
-            ).unwrap();
+                [],
+            )
+            .unwrap();
         }
 
         // Fetch only messages after ROWID 15
@@ -756,19 +722,18 @@ mod tests {
         // Insert test data
         {
             let conn = Connection::open(&db_path).unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
             conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Received', 0)",
                 [],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Received', 0)",
-                []
-            ).unwrap();
-            conn.execute(
                 "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (20, 1, 'Sent by me', 1)",
-                []
-            ).unwrap();
+                [],
+            )
+            .unwrap();
         }
 
         let result = fetch_new_messages(&db_path, 0).await.unwrap();
@@ -783,15 +748,13 @@ mod tests {
         // Insert test data
         {
             let conn = Connection::open(&db_path).unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
             conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Has text', 0)",
                 [],
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Has text', 0)",
-                []
-            ).unwrap();
             conn.execute(
                 "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (20, 1, NULL, 0)",
                 [],
@@ -811,16 +774,16 @@ mod tests {
         // Insert 25 messages (limit is 20)
         {
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
-                [],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
             for i in 1..=25 {
                 conn.execute(
-                    &format!("INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES ({i}, 1, 'Message {i}', 0)"),
-                    []
-                ).unwrap();
+                    &format!(
+                        "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES ({i}, 1, 'Message {i}', 0)"
+                    ),
+                    [],
+                )
+                .unwrap();
             }
         }
 
@@ -837,23 +800,23 @@ mod tests {
         // Insert messages out of order
         {
             let conn = Connection::open(&db_path).unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
             conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (30, 1, 'Third', 0)",
                 [],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (30, 1, 'Third', 0)",
-                []
-            ).unwrap();
-            conn.execute(
                 "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'First', 0)",
-                []
-            ).unwrap();
+                [],
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (20, 1, 'Second', 0)",
-                []
-            ).unwrap();
+                [],
+            )
+            .unwrap();
         }
 
         let result = fetch_new_messages(&db_path, 0).await.unwrap();
@@ -877,11 +840,8 @@ mod tests {
         // Insert message with special characters (potential SQL injection patterns)
         {
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
-                [],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
             conn.execute(
                 "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Hello \"world'' OR 1=1; DROP TABLE message;--', 0)",
                 []
@@ -900,15 +860,13 @@ mod tests {
 
         {
             let conn = Connection::open(&db_path).unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
             conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Hello 🦀 世界 مرحبا', 0)",
                 [],
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Hello 🦀 世界 مرحبا', 0)",
-                []
-            ).unwrap();
         }
 
         let result = fetch_new_messages(&db_path, 0).await.unwrap();
@@ -922,11 +880,8 @@ mod tests {
 
         {
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
-                [],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
             conn.execute(
                 "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, '', 0)",
                 [],
@@ -946,15 +901,13 @@ mod tests {
 
         {
             let conn = Connection::open(&db_path).unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
             conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Test', 0)",
                 [],
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Test', 0)",
-                []
-            ).unwrap();
         }
 
         // Negative rowid should still work (fetch all messages with ROWID > -1)
@@ -968,15 +921,13 @@ mod tests {
 
         {
             let conn = Connection::open(&db_path).unwrap();
+            conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')", [])
+                .unwrap();
             conn.execute(
-                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Test', 0)",
                 [],
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Test', 0)",
-                []
-            ).unwrap();
         }
 
         // Very large rowid should return empty (no messages after this)

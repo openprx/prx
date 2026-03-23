@@ -69,8 +69,7 @@ impl LandlockSandbox {
         // Allow workspace directory (read/write)
         if let Some(ref workspace) = self.workspace_dir {
             if workspace.exists() {
-                let workspace_fd =
-                    PathFd::new(workspace).map_err(|e| std::io::Error::other(e.to_string()))?;
+                let workspace_fd = PathFd::new(workspace).map_err(|e| std::io::Error::other(e.to_string()))?;
                 ruleset = ruleset
                     .add_rule(PathBeneath::new(
                         workspace_fd,
@@ -81,32 +80,20 @@ impl LandlockSandbox {
         }
 
         // Allow /tmp for general operations
-        let tmp_fd =
-            PathFd::new(Path::new("/tmp")).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let tmp_fd = PathFd::new(Path::new("/tmp")).map_err(|e| std::io::Error::other(e.to_string()))?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(
-                tmp_fd,
-                AccessFs::ReadFile | AccessFs::WriteFile,
-            ))
+            .add_rule(PathBeneath::new(tmp_fd, AccessFs::ReadFile | AccessFs::WriteFile))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Allow /usr and /bin for executing commands
-        let usr_fd =
-            PathFd::new(Path::new("/usr")).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let usr_fd = PathFd::new(Path::new("/usr")).map_err(|e| std::io::Error::other(e.to_string()))?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(
-                usr_fd,
-                AccessFs::ReadFile | AccessFs::ReadDir,
-            ))
+            .add_rule(PathBeneath::new(usr_fd, AccessFs::ReadFile | AccessFs::ReadDir))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        let bin_fd =
-            PathFd::new(Path::new("/bin")).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let bin_fd = PathFd::new(Path::new("/bin")).map_err(|e| std::io::Error::other(e.to_string()))?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(
-                bin_fd,
-                AccessFs::ReadFile | AccessFs::ReadDir,
-            ))
+            .add_rule(PathBeneath::new(bin_fd, AccessFs::ReadFile | AccessFs::ReadDir))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Apply the ruleset
@@ -225,10 +212,7 @@ mod tests {
         // Result depends on platform and feature flag
         match result {
             Ok(sandbox) => assert!(sandbox.is_available()),
-            Err(_) => assert!(!cfg!(all(
-                feature = "sandbox-landlock",
-                target_os = "linux"
-            ))),
+            Err(_) => assert!(!cfg!(all(feature = "sandbox-landlock", target_os = "linux"))),
         }
     }
 

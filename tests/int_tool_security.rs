@@ -47,10 +47,7 @@ async fn int_ts_01_shell_readonly_denies_execution() {
         .await
         .expect("test: shell readonly should return ToolResult, not Err");
 
-    assert!(
-        !result.success,
-        "ReadOnly autonomy must deny shell execution"
-    );
+    assert!(!result.success, "ReadOnly autonomy must deny shell execution");
     let err = result.error.as_deref().unwrap_or("");
     assert!(
         err.contains("not allowed"),
@@ -71,10 +68,7 @@ async fn int_ts_01_shell_supervised_allows_low_risk() {
         .await
         .expect("test: supervised echo should succeed");
 
-    assert!(
-        result.success,
-        "Supervised autonomy should allow low-risk commands"
-    );
+    assert!(result.success, "Supervised autonomy should allow low-risk commands");
     assert!(result.output.contains("supervised_ok"));
 }
 
@@ -129,10 +123,7 @@ async fn int_ts_02_risk_classification_medium_needs_approval() {
         .execute(json!({"command": "touch newfile"}))
         .await
         .expect("test: unapproved medium-risk should return ToolResult");
-    assert!(
-        !denied.success,
-        "Medium-risk without approval must be denied"
-    );
+    assert!(!denied.success, "Medium-risk without approval must be denied");
     let err = denied.error.as_deref().unwrap_or("");
     assert!(
         err.contains("explicit approval"),
@@ -201,10 +192,7 @@ async fn int_ts_03_rate_limiting_blocks_after_budget() {
         .execute(json!({"command": "echo overflow"}))
         .await
         .expect("test: rate-limited command should return ToolResult");
-    assert!(
-        !result.success,
-        "11th command must be rate-limited (limit=10)"
-    );
+    assert!(!result.success, "11th command must be rate-limited (limit=10)");
     let err = result.error.as_deref().unwrap_or("");
     assert!(
         err.contains("Rate limit") || err.contains("budget exhausted"),
@@ -219,11 +207,7 @@ fn int_ts_03_action_tracker_sliding_window() {
     tracker.record();
     tracker.record();
     tracker.record();
-    assert_eq!(
-        tracker.count(),
-        3,
-        "test: tracker should count 3 after 3 records"
-    );
+    assert_eq!(tracker.count(), 3, "test: tracker should count 3 after 3 records");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -344,10 +328,7 @@ async fn int_ts_05_file_read_rejects_path_traversal() {
         .await
         .expect("test: traversal path should return ToolResult");
 
-    assert!(
-        !result.success,
-        "workspace_only=true must reject path traversal"
-    );
+    assert!(!result.success, "workspace_only=true must reject path traversal");
     let err = result.error.as_deref().unwrap_or("");
     assert!(
         err.contains("not allowed"),
@@ -374,8 +355,7 @@ async fn int_ts_05_file_read_rejects_symlink_escape() {
         .await
         .expect("test: write secret file");
 
-    symlink(outside.join("secret.txt"), workspace.join("escape.txt"))
-        .expect("test: create symlink");
+    symlink(outside.join("secret.txt"), workspace.join("escape.txt")).expect("test: create symlink");
 
     let security = make_security(|p| {
         p.workspace_dir = workspace.clone();
@@ -488,10 +468,7 @@ async fn int_ts_07_ssrf_blocks_ipv6_localhost() {
         .await
         .expect("test: IPv6 localhost block should return ToolResult");
 
-    assert!(
-        !result.success,
-        "SSRF: IPv6 localhost [::1] must be blocked"
-    );
+    assert!(!result.success, "SSRF: IPv6 localhost [::1] must be blocked");
     let err = result.error.as_deref().unwrap_or("");
     assert!(
         err.contains("IPv6") || err.contains("local/private") || err.contains("Blocked"),
@@ -524,10 +501,7 @@ async fn int_ts_07_ssrf_blocks_private_ip_ranges() {
             .await
             .expect("test: private IP should return ToolResult");
 
-        assert!(
-            !result.success,
-            "SSRF: private IP URL {url} must be blocked"
-        );
+        assert!(!result.success, "SSRF: private IP URL {url} must be blocked");
         let err = result.error.as_deref().unwrap_or("");
         assert!(
             err.contains("local/private") || err.contains("Blocked"),
@@ -549,10 +523,7 @@ async fn int_ts_07_http_request_readonly_blocked() {
         .await
         .expect("test: ReadOnly HTTP should return ToolResult");
 
-    assert!(
-        !result.success,
-        "ReadOnly autonomy must block HTTP requests"
-    );
+    assert!(!result.success, "ReadOnly autonomy must block HTTP requests");
     let err = result.error.as_deref().unwrap_or("");
     assert!(
         err.contains("read-only"),
@@ -650,11 +621,7 @@ async fn int_ts_10_env_preserves_safe_vars() {
         .await
         .expect("test: echo env vars should return ToolResult");
 
-    assert!(
-        result.success,
-        "test: echo should succeed, error: {:?}",
-        result.error
-    );
+    assert!(result.success, "test: echo should succeed, error: {:?}", result.error);
 
     // HOME should be set (not empty)
     assert!(
@@ -764,16 +731,10 @@ fn int_ts_03_rate_limit_boundary() {
     };
 
     for i in 0..10 {
-        assert!(
-            policy.record_action(),
-            "test: action {i} should be within limit"
-        );
+        assert!(policy.record_action(), "test: action {i} should be within limit");
     }
 
-    assert!(
-        !policy.record_action(),
-        "test: 11th action should be rate-limited"
-    );
+    assert!(!policy.record_action(), "test: 11th action should be rate-limited");
     assert!(
         policy.is_rate_limited(),
         "test: is_rate_limited should return true after exhaustion"

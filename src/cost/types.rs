@@ -19,11 +19,7 @@ pub struct TokenUsage {
 
 impl TokenUsage {
     fn sanitize_price(value: f64) -> f64 {
-        if value.is_finite() && value > 0.0 {
-            value
-        } else {
-            0.0
-        }
+        if value.is_finite() && value > 0.0 { value } else { 0.0 }
     }
 
     /// Create a new token usage record.

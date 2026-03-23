@@ -14,10 +14,7 @@ fn model(
         cost_per_million_tokens,
         max_context,
         latency_ms,
-        categories: categories
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect(),
+        categories: categories.iter().map(|value| (*value).to_string()).collect(),
         elo_rating: 1_000.0,
     }
 }
@@ -165,11 +162,7 @@ mod tests {
     fn builtin_models_all_have_categories() {
         let models = builtin_model_capabilities();
         for m in &models {
-            assert!(
-                !m.categories.is_empty(),
-                "model {} has no categories",
-                m.model_id
-            );
+            assert!(!m.categories.is_empty(), "model {} has no categories", m.model_id);
         }
     }
 

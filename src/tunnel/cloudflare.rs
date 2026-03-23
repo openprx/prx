@@ -56,8 +56,7 @@ impl Tunnel for CloudflareTunnel {
         // Wait up to 30s for the tunnel URL to appear
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
         while tokio::time::Instant::now() < deadline {
-            let line =
-                tokio::time::timeout(tokio::time::Duration::from_secs(5), reader.next_line()).await;
+            let line = tokio::time::timeout(tokio::time::Duration::from_secs(5), reader.next_line()).await;
 
             match line {
                 Ok(Ok(Some(l))) => {
@@ -65,9 +64,7 @@ impl Tunnel for CloudflareTunnel {
                     // Look for the URL pattern in cloudflared output
                     if let Some(idx) = l.find("https://") {
                         let url_part = &l[idx..];
-                        let end = url_part
-                            .find(|c: char| c.is_whitespace())
-                            .unwrap_or(url_part.len());
+                        let end = url_part.find(|c: char| c.is_whitespace()).unwrap_or(url_part.len());
                         public_url = url_part[..end].to_string();
                         break;
                     }

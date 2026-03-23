@@ -9,19 +9,13 @@ pub const SPLIT_FILE_LAYOUT: &[(&str, &[&str])] = &[
     ("memory.toml", &["memory", "storage"]),
     ("security.toml", &["security", "autonomy"]),
     ("agents.toml", &["agents", "sessions_spawn"]),
-    (
-        "identity.toml",
-        &["identity", "identity_bindings", "user_policies"],
-    ),
+    ("identity.toml", &["identity", "identity_bindings", "user_policies"]),
     ("network.toml", &["gateway", "tunnel", "proxy"]),
     ("scheduler.toml", &["scheduler", "cron", "heartbeat"]),
 ];
 
 pub fn config_dir_path(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("config.d")
+    config_path.parent().unwrap_or_else(|| Path::new(".")).join("config.d")
 }
 
 pub fn is_relevant_config_path(config_path: &Path, candidate: &Path) -> bool {
@@ -38,17 +32,10 @@ pub fn list_config_fragment_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
     if !config_dir.exists() {
         return Ok(Vec::new());
     }
-    let config_dir_meta = std::fs::symlink_metadata(&config_dir).with_context(|| {
-        format!(
-            "Failed to inspect config directory: {}",
-            config_dir.display()
-        )
-    })?;
+    let config_dir_meta = std::fs::symlink_metadata(&config_dir)
+        .with_context(|| format!("Failed to inspect config directory: {}", config_dir.display()))?;
     if config_dir_meta.file_type().is_symlink() {
-        bail!(
-            "config.d path must not be a symlink: {}",
-            config_dir.display()
-        );
+        bail!("config.d path must not be a symlink: {}", config_dir.display());
     }
     if !config_dir_meta.is_dir() {
         bail!("config.d path is not a directory: {}", config_dir.display());
@@ -58,8 +45,7 @@ pub fn list_config_fragment_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
     for entry in std::fs::read_dir(&config_dir)
         .with_context(|| format!("Failed to read config directory: {}", config_dir.display()))?
     {
-        let entry =
-            entry.with_context(|| format!("Failed to enumerate {}", config_dir.display()))?;
+        let entry = entry.with_context(|| format!("Failed to enumerate {}", config_dir.display()))?;
         let path = entry.path();
         let file_type = entry
             .file_type()
@@ -72,11 +58,7 @@ pub fn list_config_fragment_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
         }
     }
 
-    fragments.sort_by(|left, right| {
-        left.file_name()
-            .cmp(&right.file_name())
-            .then_with(|| left.cmp(right))
-    });
+    fragments.sort_by(|left, right| left.file_name().cmp(&right.file_name()).then_with(|| left.cmp(right)));
     Ok(fragments)
 }
 
@@ -116,8 +98,7 @@ pub fn compute_config_fingerprint(config_path: &Path) -> Result<Vec<u8>> {
     let mut hasher = Sha256::new();
     for path in config_layer_paths(config_path)? {
         hasher.update(path.to_string_lossy().as_bytes());
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("Failed to read config layer: {}", path.display()))?;
+        let bytes = std::fs::read(&path).with_context(|| format!("Failed to read config layer: {}", path.display()))?;
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     }
@@ -147,10 +128,7 @@ pub fn build_split_tables(root: &Value) -> Result<(Value, Vec<(String, Value)>)>
     Ok((Value::Table(main_table), split_tables))
 }
 
-pub async fn write_split_config(
-    config: &crate::config::schema::Config,
-    dry_run: bool,
-) -> Result<String> {
+pub async fn write_split_config(config: &crate::config::schema::Config, dry_run: bool) -> Result<String> {
     let (main_toml, fragment_tomls) = config.to_split_toml_strings()?;
     let config_dir = config_dir_path(&config.config_path);
     let preview = render_preview(&main_toml, &fragment_tomls);
@@ -164,10 +142,7 @@ pub async fn write_split_config(
         .await
         .with_context(|| format!("Failed to create {}", config_dir.display()))?;
 
-    let desired_names: Vec<&str> = fragment_tomls
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect();
+    let desired_names: Vec<&str> = fragment_tomls.iter().map(|(name, _)| name.as_str()).collect();
     remove_stale_managed_fragment_files(&config_dir, &desired_names).await?;
 
     for (name, contents) in &fragment_tomls {
@@ -235,10 +210,7 @@ fn config_layer_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(layers)
 }
 
-async fn remove_stale_managed_fragment_files(
-    config_dir: &Path,
-    desired_names: &[&str],
-) -> Result<()> {
+async fn remove_stale_managed_fragment_files(config_dir: &Path, desired_names: &[&str]) -> Result<()> {
     if !config_dir.exists() {
         return Ok(());
     }
@@ -275,10 +247,10 @@ fn render_preview(main_toml: &str, fragment_tomls: &[(String, String)]) -> Strin
 }
 
 fn read_toml_file(path: &Path) -> Result<Value> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-    let value: Value = toml::from_str(&contents)
-        .with_context(|| format!("Failed to parse TOML file: {}", path.display()))?;
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("Failed to read config file: {}", path.display()))?;
+    let value: Value =
+        toml::from_str(&contents).with_context(|| format!("Failed to parse TOML file: {}", path.display()))?;
     if !value.is_table() {
         bail!("Config layer must contain a TOML table: {}", path.display());
     }
@@ -319,19 +291,10 @@ enabled = true
         deep_merge_toml(&mut base, overlay);
 
         let memory = base.get("memory").and_then(Value::as_table).unwrap();
-        assert_eq!(
-            memory.get("paths").and_then(Value::as_array).unwrap().len(),
-            1
-        );
+        assert_eq!(memory.get("paths").and_then(Value::as_array).unwrap().len(), 1);
         let embeddings = memory.get("embeddings").and_then(Value::as_table).unwrap();
-        assert_eq!(
-            embeddings.get("provider").and_then(Value::as_str),
-            Some("old")
-        );
-        assert_eq!(
-            embeddings.get("enabled").and_then(Value::as_bool),
-            Some(true)
-        );
+        assert_eq!(embeddings.get("provider").and_then(Value::as_str), Some("old"));
+        assert_eq!(embeddings.get("enabled").and_then(Value::as_bool), Some(true));
     }
 
     #[test]

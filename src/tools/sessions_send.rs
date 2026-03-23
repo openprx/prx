@@ -82,9 +82,8 @@ impl Tool for SessionsSendTool {
         match &run.status {
             SubAgentStatus::Running => {
                 if let Some(ref tx) = run.steer_tx {
-                    tx.send(message.to_string()).map_err(|_| {
-                        anyhow::anyhow!("Session message channel closed unexpectedly")
-                    })?;
+                    tx.send(message.to_string())
+                        .map_err(|_| anyhow::anyhow!("Session message channel closed unexpectedly"))?;
                     Ok(ToolResult {
                         success: true,
                         output: format!(
@@ -107,16 +106,12 @@ impl Tool for SessionsSendTool {
             SubAgentStatus::Completed(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Session `{run_id}` already completed; cannot send message."
-                )),
+                error: Some(format!("Session `{run_id}` already completed; cannot send message.")),
             }),
             SubAgentStatus::Failed(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Session `{run_id}` already failed ({e}); cannot send message."
-                )),
+                error: Some(format!("Session `{run_id}` already failed ({e}); cannot send message.")),
             }),
         }
     }

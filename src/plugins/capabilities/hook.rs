@@ -102,9 +102,7 @@ impl WasmHook {
 
         let func_idx = instance
             .get_export_index(store.as_context_mut(), Some(&iface_idx), "on-event")
-            .ok_or_else(|| {
-                PluginError::Runtime("on-event not found in hook-exports".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Runtime("on-event not found in hook-exports".to_string()))?;
 
         let func = instance
             .get_func(store.as_context_mut(), &func_idx)
@@ -149,9 +147,7 @@ impl WasmHook {
     }
 
     /// Register host functions for hook plugins.
-    fn register_host_functions(
-        linker: &mut wasmtime::component::Linker<HostState>,
-    ) -> PluginResult<()> {
+    fn register_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
         super::common::register_common_host_functions(linker)
     }
 }

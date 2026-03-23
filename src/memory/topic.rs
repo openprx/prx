@@ -46,15 +46,7 @@ pub fn create_topic(
              VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)
              ON CONFLICT(project, external_id) DO UPDATE SET updated_at = excluded.updated_at
              RETURNING id",
-            params![
-                &topic_id,
-                title,
-                external_project,
-                external_id,
-                fingerprint,
-                &now,
-                &now
-            ],
+            params![&topic_id, title, external_project, external_id, fingerprint, &now, &now],
             |row| row.get(0),
         )?;
         return Ok(id);
@@ -65,15 +57,7 @@ pub fn create_topic(
          VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)
          ON CONFLICT(fingerprint) DO UPDATE SET updated_at = excluded.updated_at
          RETURNING id",
-        params![
-            &topic_id,
-            title,
-            project,
-            external_id,
-            fingerprint,
-            &now,
-            &now
-        ],
+        params![&topic_id, title, project, external_id, fingerprint, &now, &now],
         |row| row.get(0),
     )?;
     Ok(id)
@@ -256,11 +240,7 @@ pub fn query_topic_context(
     Ok(out)
 }
 
-pub fn resolve_topic(
-    conn: &Connection,
-    content: &str,
-    principal: &Principal,
-) -> Result<Option<String>> {
+pub fn resolve_topic(conn: &Connection, content: &str, principal: &Principal) -> Result<Option<String>> {
     if !needs_topic(content) {
         return Ok(None);
     }
@@ -269,8 +249,7 @@ pub fn resolve_topic(
     let external_id = extract_external_ref(content);
 
     if let Some(external_id) = external_id.as_deref() {
-        let maybe_topic =
-            find_topic_by_project_and_external(conn, project.as_deref(), external_id)?;
+        let maybe_topic = find_topic_by_project_and_external(conn, project.as_deref(), external_id)?;
 
         if let Some(topic) = maybe_topic {
             let real_id = resolve_alias(conn, &topic.id)?;
@@ -294,13 +273,7 @@ pub fn resolve_topic(
 
     let title = generate_topic_title(content);
     let fingerprint = topic_fingerprint(project.as_deref(), &title);
-    let topic_id = create_topic(
-        conn,
-        &title,
-        project.as_deref(),
-        external_id.as_deref(),
-        &fingerprint,
-    )?;
+    let topic_id = create_topic(conn, &title, project.as_deref(), external_id.as_deref(), &fingerprint)?;
     add_participant(conn, &topic_id, &principal.user_id, "participant")?;
     Ok(Some(topic_id))
 }
@@ -420,16 +393,13 @@ fn map_topic(row: &rusqlite::Row<'_>) -> rusqlite::Result<Topic> {
     })
 }
 
-static EXTERNAL_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"https?://[^\s]+/(pull|issues)/\d+").expect("external url regex must compile")
-});
+static EXTERNAL_URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"https?://[^\s]+/(pull|issues)/\d+").expect("external url regex must compile"));
 static EXTERNAL_TICKET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(openpr|pr|issue|mr|ticket)[#:\-\s]*\d+\b")
-        .expect("external id regex must compile")
+    Regex::new(r"(?i)\b(openpr|pr|issue|mr|ticket)[#:\-\s]*\d+\b").expect("external id regex must compile")
 });
 static TASK_WORDS: [&str; 12] = [
-    "bug", "修复", "部署", "实现", "开发", "问题", "需求", "fix", "deploy", "issue", "error",
-    "todo",
+    "bug", "修复", "部署", "实现", "开发", "问题", "需求", "fix", "deploy", "issue", "error", "todo",
 ];
 static GREETINGS: [&str; 11] = [
     "你好",
@@ -493,8 +463,7 @@ mod tests {
         )
         .unwrap();
 
-        let by_external =
-            find_topic_by_project_and_external(&conn, Some("openpr"), "openpr#42").unwrap();
+        let by_external = find_topic_by_project_and_external(&conn, Some("openpr"), "openpr#42").unwrap();
         assert_eq!(by_external.unwrap().id, id);
 
         let by_fp = find_topic_by_fingerprint(&conn, "fp-1").unwrap();
@@ -505,11 +474,9 @@ mod tests {
         update_topic_status(&conn, &id, "resolved").unwrap();
 
         let status: String = conn
-            .query_row(
-                "SELECT status FROM topics WHERE id = ?1",
-                params![&id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT status FROM topics WHERE id = ?1", params![&id], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(status, "resolved");
     }
@@ -574,16 +541,8 @@ mod tests {
     #[test]
     fn find_topic_by_project_and_external_prevents_cross_project_mixup() {
         let (_tmp, conn) = setup_conn();
-        let first = create_topic(
-            &conn,
-            "OpenPR issue",
-            Some("openpr"),
-            Some("issue#42"),
-            "fp-openpr",
-        )
-        .unwrap();
-        let second =
-            create_topic(&conn, "LC issue", Some("lc"), Some("issue#42"), "fp-lc").unwrap();
+        let first = create_topic(&conn, "OpenPR issue", Some("openpr"), Some("issue#42"), "fp-openpr").unwrap();
+        let second = create_topic(&conn, "LC issue", Some("lc"), Some("issue#42"), "fp-lc").unwrap();
         assert_ne!(first, second);
 
         let openpr = find_topic_by_project_and_external(&conn, Some("openpr"), "issue#42").unwrap();
@@ -595,22 +554,8 @@ mod tests {
     #[test]
     fn create_topic_with_null_project_external_id_is_idempotent_via_global_sentinel() {
         let (_tmp, conn) = setup_conn();
-        let first = create_topic(
-            &conn,
-            "Global issue",
-            None,
-            Some("issue#900"),
-            "fp-global-1",
-        )
-        .unwrap();
-        let second = create_topic(
-            &conn,
-            "Global issue duplicate",
-            None,
-            Some("issue#900"),
-            "fp-global-2",
-        )
-        .unwrap();
+        let first = create_topic(&conn, "Global issue", None, Some("issue#900"), "fp-global-1").unwrap();
+        let second = create_topic(&conn, "Global issue duplicate", None, Some("issue#900"), "fp-global-2").unwrap();
 
         assert_eq!(first, second);
 
@@ -630,16 +575,8 @@ mod tests {
     #[test]
     fn resolve_topic_prefers_project_scoped_external_id_match() {
         let (_tmp, conn) = setup_conn();
-        let openpr_id = create_topic(
-            &conn,
-            "OpenPR ticket",
-            Some("openpr"),
-            Some("issue#88"),
-            "fp-openpr-88",
-        )
-        .unwrap();
-        let _lc_id =
-            create_topic(&conn, "LC ticket", Some("lc"), Some("issue#88"), "fp-lc-88").unwrap();
+        let openpr_id = create_topic(&conn, "OpenPR ticket", Some("openpr"), Some("issue#88"), "fp-openpr-88").unwrap();
+        let _lc_id = create_topic(&conn, "LC ticket", Some("lc"), Some("issue#88"), "fp-lc-88").unwrap();
 
         let principal = base_principal("u-2");
         let resolved = resolve_topic(&conn, "openpr 处理 issue#88", &principal)
@@ -651,14 +588,7 @@ mod tests {
     #[test]
     fn resolve_topic_without_inferred_project_uses_global_sentinel_scope() {
         let (_tmp, conn) = setup_conn();
-        let global_id = create_topic(
-            &conn,
-            "Global ticket",
-            None,
-            Some("issue#101"),
-            "fp-global-101",
-        )
-        .unwrap();
+        let global_id = create_topic(&conn, "Global ticket", None, Some("issue#101"), "fp-global-101").unwrap();
         let _project_id = create_topic(
             &conn,
             "OpenPR ticket",

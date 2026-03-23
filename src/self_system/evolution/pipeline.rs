@@ -10,9 +10,7 @@ use crate::self_system::evolution::record::{
 };
 use crate::self_system::evolution::rollback::RollbackManager;
 use crate::self_system::evolution::run_engine_cycle;
-use crate::self_system::evolution::safety_utils::{
-    acquire_file_lock, atomic_write, validate_path_in_workspace,
-};
+use crate::self_system::evolution::safety_utils::{acquire_file_lock, atomic_write, validate_path_in_workspace};
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::trace::generate_experiment_id;
 use anyhow::Result;
@@ -93,11 +91,7 @@ impl EvolutionPipeline {
         let mut errors = Vec::new();
 
         let digest = self.analyzer.generate_daily_digest(now).await?;
-        let trend = match self
-            .analyzer
-            .generate_three_day_trend(now.date_naive())
-            .await
-        {
+        let trend = match self.analyzer.generate_three_day_trend(now.date_naive()).await {
             Ok(item) => item,
             Err(err) => {
                 errors.push(format!("three_day_trend_fallback: {err}"));
@@ -170,12 +164,7 @@ impl EvolutionPipeline {
                 errors,
             });
         };
-        let cycle_result = run_engine_cycle(
-            engine,
-            experiment_id.clone(),
-            vec![selected_candidate.clone()],
-        )
-        .await?;
+        let cycle_result = run_engine_cycle(engine, experiment_id.clone(), vec![selected_candidate.clone()]).await?;
 
         let mut evolution_log = cycle_result.evolution_log.clone().unwrap_or_else(|| {
             build_log(
@@ -202,10 +191,7 @@ impl EvolutionPipeline {
 
         let mut rolled_back = false;
         if should_rollback(&judge, &cycle_result) {
-            if let Err(err) = self
-                .rollback_cycle(layer.clone(), cycle_result.proposal.as_ref())
-                .await
-            {
+            if let Err(err) = self.rollback_cycle(layer.clone(), cycle_result.proposal.as_ref()).await {
                 errors.push(format!("rollback_failed: {err}"));
             } else {
                 rolled_back = true;
@@ -264,12 +250,7 @@ impl EvolutionPipeline {
 
         let rollback_dir = infer_rollback_dir(&self.workspace_root, &layer)?;
         let max_versions = self.shared_config.load_full().rollback.max_versions;
-        let manager = RollbackManager::new(
-            &self.workspace_root,
-            &target_path,
-            rollback_dir,
-            max_versions,
-        )?;
+        let manager = RollbackManager::new(&self.workspace_root, &target_path, rollback_dir, max_versions)?;
         manager.rollback_latest().await
     }
 
@@ -305,9 +286,7 @@ impl EvolutionPipeline {
                         }
                     };
 
-                    if parsed.result.is_none()
-                        && parse_rfc3339(&parsed.timestamp).is_some_and(|ts| ts <= cutoff)
-                    {
+                    if parsed.result.is_none() && parse_rfc3339(&parsed.timestamp).is_some_and(|ts| ts <= cutoff) {
                         parsed.result = Some(self.infer_backfill_result(&parsed, now).await?);
                         changed = true;
                         updated = updated.saturating_add(1);
@@ -336,11 +315,7 @@ impl EvolutionPipeline {
         Ok(updated)
     }
 
-    async fn infer_backfill_result(
-        &self,
-        log: &EvolutionLog,
-        now: DateTime<Utc>,
-    ) -> Result<EvolutionResult> {
+    async fn infer_backfill_result(&self, log: &EvolutionLog, now: DateTime<Utc>) -> Result<EvolutionResult> {
         let since = match parse_rfc3339(&log.timestamp) {
             Some(ts) => ts,
             None => {
@@ -355,10 +330,7 @@ impl EvolutionPipeline {
         let decisions = self.writer.read_decisions_since(since).await?;
         let mut success = 0u32;
         let mut failure = 0u32;
-        for row in decisions
-            .iter()
-            .filter(|item| item.experiment_id == log.experiment_id)
-        {
+        for row in decisions.iter().filter(|item| item.experiment_id == log.experiment_id) {
             match row.outcome {
                 Outcome::Success => success = success.saturating_add(1),
                 Outcome::Failure | Outcome::RolledBack => failure = failure.saturating_add(1),
@@ -377,21 +349,11 @@ impl EvolutionPipeline {
     }
 
     fn writer_root(&self) -> PathBuf {
-        self.shared_config
-            .load_full()
-            .runtime
-            .storage_dir
-            .to_string()
-            .into()
+        self.shared_config.load_full().runtime.storage_dir.to_string().into()
     }
 }
 
-fn build_log(
-    experiment_id: &str,
-    layer: EvolutionLayer,
-    candidate: &EvolutionCandidate,
-    reason: &str,
-) -> EvolutionLog {
+fn build_log(experiment_id: &str, layer: EvolutionLayer, candidate: &EvolutionCandidate, reason: &str) -> EvolutionLog {
     EvolutionLog {
         experiment_id: experiment_id.to_string(),
         timestamp: Utc::now().to_rfc3339(),
@@ -432,10 +394,7 @@ fn metrics_for_candidate(candidate: &EvolutionCandidate) -> GateMetrics {
     }
 }
 
-fn should_rollback(
-    judge: &JudgeResult,
-    cycle_result: &crate::self_system::evolution::engine::CycleResult,
-) -> bool {
+fn should_rollback(judge: &JudgeResult, cycle_result: &crate::self_system::evolution::engine::CycleResult) -> bool {
     judge.scores.overall() < JUDGE_PASS_THRESHOLD
         || matches!(
             cycle_result.cycle.outcome,
@@ -475,18 +434,14 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::self_system::evolution::config::{
-        EvolutionConfig, EvolutionMode, new_shared_evolution_config,
-    };
+    use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode, new_shared_evolution_config};
     use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput};
-    use crate::self_system::evolution::record::{
-        Actor, AnnotationSource, DecisionType, MemoryAction, TaskType,
-    };
+    use crate::self_system::evolution::record::{Actor, AnnotationSource, DecisionType, MemoryAction, TaskType};
     use crate::self_system::evolution::safety_utils::acquire_file_lock;
     use crate::self_system::evolution::storage::{JsonlRetentionPolicy, JsonlStoragePaths};
     use crate::self_system::evolution::{
-        CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals, EvolutionValidation,
-        FitnessTrend, RiskLevel, ValidationStatus,
+        CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals, EvolutionValidation, FitnessTrend,
+        RiskLevel, ValidationStatus,
     };
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -604,10 +559,7 @@ mod tests {
         writer.append_memory_access(&memory).await.unwrap();
         writer.flush().await.unwrap();
 
-        let analyzer = Arc::new(EvolutionAnalyzer::new(
-            writer.clone(),
-            dir.path().join("analysis"),
-        ));
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.path().join("analysis")));
         let mut cfg = EvolutionConfig::default();
         cfg.runtime.mode = EvolutionMode::Auto;
         cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
@@ -656,22 +608,14 @@ mod tests {
         drop(trend);
 
         let report = pipeline
-            .run_for_layer(
-                EvolutionTrigger::Manual,
-                EvolutionLayer::Memory,
-                &mut engine,
-                now,
-            )
+            .run_for_layer(EvolutionTrigger::Manual, EvolutionLayer::Memory, &mut engine, now)
             .await
             .unwrap();
 
         assert!(report.selected_candidate.is_some());
         assert_eq!(report.experiment_id.len(), 36);
         assert_eq!(
-            report
-                .evolution_log
-                .as_ref()
-                .map(|item| item.experiment_id.as_str()),
+            report.evolution_log.as_ref().map(|item| item.experiment_id.as_str()),
             Some(report.experiment_id.as_str())
         );
     }
@@ -689,10 +633,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let analyzer = Arc::new(EvolutionAnalyzer::new(
-            writer.clone(),
-            dir.path().join("analysis"),
-        ));
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.path().join("analysis")));
         let mut cfg = EvolutionConfig::default();
         cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
         let shared = new_shared_evolution_config(cfg);
@@ -730,10 +671,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let analyzer = Arc::new(EvolutionAnalyzer::new(
-            writer.clone(),
-            dir.path().join("analysis"),
-        ));
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.path().join("analysis")));
         let mut cfg = EvolutionConfig::default();
         cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
         let shared = new_shared_evolution_config(cfg);

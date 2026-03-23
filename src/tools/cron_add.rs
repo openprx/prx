@@ -21,9 +21,7 @@ impl CronAddTool {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
+                error: Some(format!("Security policy: read-only mode, cannot perform '{action}'")),
             });
         }
 
@@ -154,18 +152,13 @@ impl Tool for CronAddTool {
             }
         };
 
-        let name = args
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
+        let name = args.get("name").and_then(serde_json::Value::as_str).map(str::to_string);
 
         // Support OpenClaw-compatible payload.kind API as an alias for job_type + prompt/command.
         // payload.kind='agentTurn' → agent job (isolated)
         // payload.kind='systemEvent' → agent job (main session, sends text directly)
         let payload = args.get("payload");
-        let payload_kind = payload
-            .and_then(|p| p.get("kind"))
-            .and_then(serde_json::Value::as_str);
+        let payload_kind = payload.and_then(|p| p.get("kind")).and_then(serde_json::Value::as_str);
 
         // If payload.kind is set, it overrides job_type
         let job_type = if let Some(kind) = payload_kind {
@@ -355,17 +348,12 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         new_shared(config)
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ))
+        Arc::new(SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir))
     }
 
     #[tokio::test]
@@ -397,9 +385,7 @@ mod tests {
         };
         config.autonomy.allowed_commands = vec!["echo".into()];
         config.autonomy.level = AutonomyLevel::Supervised;
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         let cfg = new_shared(config);
         let cfg_snap = cfg.load_full();
         let tool = CronAddTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
@@ -469,12 +455,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(
-            denied
-                .error
-                .unwrap_or_default()
-                .contains("explicit approval")
-        );
+        assert!(denied.error.unwrap_or_default().contains("explicit approval"));
 
         let approved = tool
             .execute(json!({
@@ -505,12 +486,7 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("every_ms must be > 0")
-        );
+        assert!(result.error.unwrap_or_default().contains("every_ms must be > 0"));
     }
 
     #[tokio::test]

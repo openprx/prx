@@ -323,8 +323,7 @@ impl EvolutionRuntimeConfigManager {
         };
 
         let handle = tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval_at(Instant::now() + poll_interval, poll_interval);
+            let mut ticker = tokio::time::interval_at(Instant::now() + poll_interval, poll_interval);
             let mut last_hash = initial_hash;
 
             loop {
@@ -493,10 +492,7 @@ same_failure = 25
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         assert!(reloaded);
-        assert_eq!(
-            manager.shared().load_full().runtime.mode,
-            EvolutionMode::Auto
-        );
+        assert_eq!(manager.shared().load_full().runtime.mode, EvolutionMode::Auto);
         assert_eq!(manager.shared().load_full().runtime.batch_size, 64);
     }
 

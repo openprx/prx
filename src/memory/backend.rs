@@ -73,12 +73,8 @@ const CUSTOM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
-const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 4] = [
-    SQLITE_PROFILE,
-    LUCID_PROFILE,
-    MARKDOWN_PROFILE,
-    NONE_PROFILE,
-];
+const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 4] =
+    [SQLITE_PROFILE, LUCID_PROFILE, MARKDOWN_PROFILE, NONE_PROFILE];
 
 pub fn selectable_memory_backends() -> &'static [MemoryBackendProfile] {
     &SELECTABLE_MEMORY_BACKENDS
@@ -118,14 +114,8 @@ mod tests {
     fn classify_known_backends() {
         assert_eq!(classify_memory_backend("sqlite"), MemoryBackendKind::Sqlite);
         assert_eq!(classify_memory_backend("lucid"), MemoryBackendKind::Lucid);
-        assert_eq!(
-            classify_memory_backend("postgres"),
-            MemoryBackendKind::Postgres
-        );
-        assert_eq!(
-            classify_memory_backend("markdown"),
-            MemoryBackendKind::Markdown
-        );
+        assert_eq!(classify_memory_backend("postgres"), MemoryBackendKind::Postgres);
+        assert_eq!(classify_memory_backend("markdown"), MemoryBackendKind::Markdown);
         assert_eq!(classify_memory_backend("none"), MemoryBackendKind::None);
     }
 

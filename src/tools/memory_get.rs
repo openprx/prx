@@ -1,8 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::memory::Memory;
 use crate::memory::principal::{
-    ChatType, MemoryWriteContext, Principal, Role, Visibility, log_access, post_filter,
-    resolve_principal,
+    ChatType, MemoryWriteContext, Principal, Role, Visibility, log_access, post_filter, resolve_principal,
 };
 use async_trait::async_trait;
 use rusqlite::{Connection, params_from_iter, types::Value};
@@ -26,8 +25,7 @@ fn requested_session_id(args: &serde_json::Value) -> Option<&str> {
 }
 
 fn validate_reserved_router_access(key: &str, session_id: Option<&str>) -> anyhow::Result<()> {
-    if key.starts_with("router/") && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
-    {
+    if key.starts_with("router/") && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID) {
         anyhow::bail!("router/ memory requires session_id=\"self_system\"");
     }
     Ok(())
@@ -132,9 +130,7 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
         return None;
     }
 
-    let scope = args
-        .get("_zc_scope")
-        .and_then(serde_json::Value::as_object)?;
+    let scope = args.get("_zc_scope").and_then(serde_json::Value::as_object)?;
 
     let channel = scope
         .get("channel")
@@ -171,11 +167,7 @@ fn fallback_principal(ctx: &MemoryWriteContext) -> Principal {
         blocked_patterns: Vec::new(),
         current_channel: ctx.channel.clone().unwrap_or_default(),
         current_chat_id: ctx.chat_id.clone().unwrap_or_default(),
-        current_chat_type: ctx
-            .chat_type
-            .as_deref()
-            .map(ChatType::from_str)
-            .unwrap_or(ChatType::Dm),
+        current_chat_type: ctx.chat_type.as_deref().map(ChatType::from_str).unwrap_or(ChatType::Dm),
         acl_enforced: true,
     }
 }
@@ -311,9 +303,7 @@ impl Tool for MemoryGetTool {
                 Ok(conn) => conn,
                 Err(error) => {
                     if self.acl_enabled {
-                        tracing::warn!(
-                            "memory_get sqlite open failed while acl is enabled: {error}"
-                        );
+                        tracing::warn!("memory_get sqlite open failed while acl is enabled: {error}");
                         return Ok(ToolResult {
                             success: true,
                             output: format!("No memory entry found for key: '{path}'"),
@@ -333,11 +323,9 @@ impl Tool for MemoryGetTool {
             let (scope_sql, scope_params) = principal.build_sql_scope();
 
             if self.acl_enabled && principal.acl_enforced {
-                let scoped =
-                    fetch_memory_by_key_with_scope(&conn, path, &scope_sql, &scope_params)?;
+                let scoped = fetch_memory_by_key_with_scope(&conn, path, &scope_sql, &scope_params)?;
                 if let Some(row) = scoped {
-                    let filtered =
-                        post_filter(vec![row], &principal, |entry| entry.content.as_str());
+                    let filtered = post_filter(vec![row], &principal, |entry| entry.content.as_str());
                     if let Some(entry) = filtered.into_iter().next() {
                         log_access(
                             &conn,
@@ -374,11 +362,9 @@ impl Tool for MemoryGetTool {
 
             // Observe mode: evaluate ACL but still return unrestricted result.
             let scoped = fetch_memory_by_key_with_scope(&conn, path, &scope_sql, &scope_params)?;
-            let filtered = post_filter(
-                scoped.clone().into_iter().collect::<Vec<_>>(),
-                &principal,
-                |entry| entry.content.as_str(),
-            );
+            let filtered = post_filter(scoped.clone().into_iter().collect::<Vec<_>>(), &principal, |entry| {
+                entry.content.as_str()
+            });
             let unrestricted = fetch_memory_by_key_with_scope(&conn, path, "1=1", &[])?;
 
             let would_deny = unrestricted.is_some() && (scoped.is_none() || filtered.is_empty());
@@ -419,12 +405,7 @@ impl Tool for MemoryGetTool {
 }
 
 impl MemoryGetTool {
-    fn read_fallback_file(
-        &self,
-        path: &str,
-        from: usize,
-        requested_lines: usize,
-    ) -> anyhow::Result<ToolResult> {
+    fn read_fallback_file(&self, path: &str, from: usize, requested_lines: usize) -> anyhow::Result<ToolResult> {
         let resolved = match self.resolve_allowed_path(path) {
             Ok(p) => p,
             Err(e) => {
@@ -507,12 +488,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let memory = SqliteMemory::new(tmp.path()).unwrap();
         memory
-            .store(
-                "memory_key",
-                "line1\nline2\nline3\n",
-                MemoryCategory::Core,
-                None,
-            )
+            .store("memory_key", "line1\nline2\nline3\n", MemoryCategory::Core, None)
             .await
             .unwrap();
 
@@ -547,10 +523,7 @@ mod tests {
     #[tokio::test]
     async fn get_reads_daily_memory_file() {
         let tmp = TempDir::new().unwrap();
-        write_file(
-            &tmp.path().join("memory/2026-02-22.md"),
-            "entry1\nentry2\nentry3\n",
-        );
+        write_file(&tmp.path().join("memory/2026-02-22.md"), "entry1\nentry2\nentry3\n");
 
         let tool = test_tool(&tmp, false);
         let result = tool
@@ -672,12 +645,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let memory = SqliteMemory::new(tmp.path()).unwrap();
         memory
-            .store(
-                "private_key",
-                "acl denied payload",
-                MemoryCategory::Core,
-                None,
-            )
+            .store("private_key", "acl denied payload", MemoryCategory::Core, None)
             .await
             .unwrap();
 
@@ -796,12 +764,7 @@ mod tests {
         let tool = test_tool(&tmp, false);
         let denied = tool.execute(json!({"path": "router/elo/test"})).await;
         assert!(denied.is_err());
-        assert!(
-            denied
-                .unwrap_err()
-                .to_string()
-                .contains("session_id=\"self_system\"")
-        );
+        assert!(denied.unwrap_err().to_string().contains("session_id=\"self_system\""));
 
         let allowed = tool
             .execute(json!({

@@ -14,11 +14,7 @@ use tokio::sync::broadcast;
 const MAX_MESSAGES_PER_SECOND: usize = 100;
 const MAX_WS_CONNECTIONS: usize = 64;
 
-pub async fn ws_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
+pub async fn ws_handler(State(state): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
     let provided_token = extract_resource_auth_token(&headers);
     if state.pairing.require_pairing() && !state.pairing.is_authenticated(&provided_token) {
         return (

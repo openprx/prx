@@ -92,9 +92,7 @@ impl PromptSection for IdentitySection {
         }
 
         if !has_aieos {
-            prompt.push_str(
-                "The following workspace files define your identity, behavior, and context.\n\n",
-            );
+            prompt.push_str("The following workspace files define your identity, behavior, and context.\n\n");
         }
         for file in [
             "AGENTS.md",
@@ -153,10 +151,7 @@ impl PromptSection for SkillsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(crate::skills::skills_to_prompt(
-            ctx.skills,
-            ctx.workspace_dir,
-        ))
+        Ok(crate::skills::skills_to_prompt(ctx.skills, ctx.workspace_dir))
     }
 }
 
@@ -179,8 +174,7 @@ impl PromptSection for RuntimeSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let host =
-            hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
+        let host = hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
         Ok(format!(
             "## Runtime\n\nHost: {host} | OS: {} | Model: {}",
             std::env::consts::OS,
@@ -260,10 +254,7 @@ mod tests {
             serde_json::json!({"type": "object"})
         }
 
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> anyhow::Result<crate::tools::ToolResult> {
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
             Ok(crate::tools::ToolResult {
                 success: true,
                 output: "ok".into(),
@@ -274,14 +265,9 @@ mod tests {
 
     #[test]
     fn identity_section_with_aieos_includes_workspace_files() {
-        let workspace =
-            std::env::temp_dir().join(format!("openprx_prompt_test_{}", uuid::Uuid::new_v4()));
+        let workspace = std::env::temp_dir().join(format!("openprx_prompt_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(
-            workspace.join("AGENTS.md"),
-            "Always respond with: AGENTS_MD_LOADED",
-        )
-        .unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "Always respond with: AGENTS_MD_LOADED").unwrap();
 
         let identity_config = crate::config::IdentityConfig {
             format: "aieos".into(),
@@ -302,10 +288,7 @@ mod tests {
         let section = IdentitySection;
         let output = section.build(&ctx).unwrap();
 
-        assert!(
-            output.contains("Nova"),
-            "AIEOS identity should be present in prompt"
-        );
+        assert!(output.contains("Nova"), "AIEOS identity should be present in prompt");
         assert!(
             output.contains("AGENTS_MD_LOADED"),
             "AGENTS.md content should be present even when AIEOS is configured"
@@ -423,14 +406,12 @@ mod tests {
 
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>code&lt;review&gt;&amp;</name>"));
-        assert!(prompt.contains(
-            "<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"
-        ));
+        assert!(prompt.contains("<description>Review &quot;unsafe&quot; and &apos;risky&apos; bits</description>"));
         assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
         assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
         assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
-        ));
+        assert!(
+            prompt.contains("<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>")
+        );
     }
 }

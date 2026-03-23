@@ -3,13 +3,9 @@ pub mod codex_auth;
 pub mod openai_oauth;
 pub mod profiles;
 
-use crate::auth::codex_auth::{
-    default_codex_auth_json_path, load_openai_codex_profile_from_auth_json,
-};
+use crate::auth::codex_auth::{default_codex_auth_json_path, load_openai_codex_profile_from_auth_json};
 use crate::auth::openai_oauth::refresh_access_token;
-use crate::auth::profiles::{
-    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, profile_id,
-};
+use crate::auth::profiles::{AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, profile_id};
 use crate::config::Config;
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -45,12 +41,7 @@ impl AuthService {
     }
 
     pub fn new(state_dir: &Path, encrypt_secrets: bool) -> Self {
-        Self::new_with_codex_import(
-            state_dir,
-            encrypt_secrets,
-            Some(default_codex_auth_json_path()),
-            true,
-        )
+        Self::new_with_codex_import(state_dir, encrypt_secrets, Some(default_codex_auth_json_path()), true)
     }
 
     pub fn new_with_codex_import(
@@ -126,11 +117,7 @@ impl AuthService {
         self.store.remove_profile(&profile_id)
     }
 
-    pub fn get_profile(
-        &self,
-        provider: &str,
-        profile_override: Option<&str>,
-    ) -> Result<Option<AuthProfile>> {
+    pub fn get_profile(&self, provider: &str, profile_override: Option<&str>) -> Result<Option<AuthProfile>> {
         let provider = normalize_provider(provider)?;
         let data = self.store.load()?;
         let Some(profile_id) = select_profile_id(&data, &provider, profile_override) else {
@@ -139,11 +126,7 @@ impl AuthService {
         Ok(data.profiles.get(&profile_id).cloned())
     }
 
-    pub fn get_provider_bearer_token(
-        &self,
-        provider: &str,
-        profile_override: Option<&str>,
-    ) -> Result<Option<String>> {
+    pub fn get_provider_bearer_token(&self, provider: &str, profile_override: Option<&str>) -> Result<Option<String>> {
         let profile = self.get_profile(provider, profile_override)?;
         let Some(profile) = profile else {
             return Ok(None);
@@ -157,10 +140,7 @@ impl AuthService {
         Ok(credential.filter(|t| !t.trim().is_empty()))
     }
 
-    pub async fn get_valid_openai_access_token(
-        &self,
-        profile_override: Option<&str>,
-    ) -> Result<Option<String>> {
+    pub async fn get_valid_openai_access_token(&self, profile_override: Option<&str>) -> Result<Option<String>> {
         let data = tokio::task::spawn_blocking({
             let auth = self.clone();
             let profile_override = profile_override.map(str::to_string);
@@ -168,8 +148,7 @@ impl AuthService {
         })
         .await
         .map_err(|err| anyhow::anyhow!("Auth profile load task failed: {err}"))??;
-        let Some(profile_id) = select_profile_id(&data, OPENAI_CODEX_PROVIDER, profile_override)
-        else {
+        let Some(profile_id) = select_profile_id(&data, OPENAI_CODEX_PROVIDER, profile_override) else {
             return Ok(None);
         };
 
@@ -214,9 +193,7 @@ impl AuthService {
         let refresh_token = latest_tokens.refresh_token.clone().unwrap_or(refresh_token);
 
         if let Some(remaining) = refresh_backoff_remaining(&profile_id) {
-            anyhow::bail!(
-                "OpenAI token refresh is in backoff for {remaining}s due to previous failures"
-            );
+            anyhow::bail!("OpenAI token refresh is in backoff for {remaining}s due to previous failures");
         }
 
         let mut refreshed = match refresh_access_token(&self.client, &refresh_token).await {
@@ -225,17 +202,12 @@ impl AuthService {
                 tokens
             }
             Err(err) => {
-                set_refresh_backoff(
-                    &profile_id,
-                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
-                );
+                set_refresh_backoff(&profile_id, Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS));
                 return Err(err);
             }
         };
         if refreshed.refresh_token.is_none() {
-            refreshed
-                .refresh_token
-                .clone_from(&latest_tokens.refresh_token);
+            refreshed.refresh_token.clone_from(&latest_tokens.refresh_token);
         }
 
         let account_id = openai_oauth::extract_account_id_from_jwt(&refreshed.access_token)
@@ -261,14 +233,9 @@ impl AuthService {
         Ok(updated.token_set.map(|t| t.access_token))
     }
 
-    fn prepare_openai_profile_data(
-        &self,
-        profile_override: Option<&str>,
-    ) -> Result<AuthProfilesData> {
+    fn prepare_openai_profile_data(&self, profile_override: Option<&str>) -> Result<AuthProfilesData> {
         let data = self.store.load()?;
-        if !self.codex_auth_json_auto_import
-            || !should_attempt_codex_import(&data, profile_override)
-        {
+        if !self.codex_auth_json_auto_import || !should_attempt_codex_import(&data, profile_override) {
             return Ok(data);
         }
 
@@ -293,12 +260,10 @@ impl AuthService {
             .or_else(|| profile_override.map(str::to_string))
             .unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string());
 
-        let mut profile =
-            AuthProfile::new_oauth(OPENAI_CODEX_PROVIDER, &profile_name, imported.token_set);
+        let mut profile = AuthProfile::new_oauth(OPENAI_CODEX_PROVIDER, &profile_name, imported.token_set);
         profile.account_id = Some(imported.account_id);
 
-        self.store
-            .upsert_profile(profile, profile_override.is_none())?;
+        self.store.upsert_profile(profile, profile_override.is_none())?;
         self.store.load()
     }
 }
@@ -332,11 +297,7 @@ fn resolve_requested_profile_id(provider: &str, requested: &str) -> String {
     }
 }
 
-pub fn select_profile_id(
-    data: &AuthProfilesData,
-    provider: &str,
-    profile_override: Option<&str>,
-) -> Option<String> {
+pub fn select_profile_id(data: &AuthProfilesData, provider: &str, profile_override: Option<&str>) -> Option<String> {
     if let Some(override_profile) = profile_override {
         let requested = resolve_requested_profile_id(provider, override_profile);
         if data.profiles.contains_key(&requested) {
@@ -473,17 +434,13 @@ mod tests {
             },
         );
 
-        data.active_profiles
-            .insert("openai-codex".into(), id_active.clone());
+        data.active_profiles.insert("openai-codex".into(), id_active.clone());
 
         assert_eq!(
             select_profile_id(&data, "openai-codex", Some("default")),
             Some(id_default)
         );
-        assert_eq!(
-            select_profile_id(&data, "openai-codex", None),
-            Some(id_active)
-        );
+        assert_eq!(select_profile_id(&data, "openai-codex", None), Some(id_active));
     }
 
     #[tokio::test]

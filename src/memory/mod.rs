@@ -15,8 +15,8 @@ pub mod traits;
 pub mod vector;
 
 pub use backend::{
-    MemoryBackendKind, classify_memory_backend, default_memory_backend_key,
-    memory_backend_profile, selectable_memory_backends,
+    MemoryBackendKind, classify_memory_backend, default_memory_backend_key, memory_backend_profile,
+    selectable_memory_backends,
 };
 pub use filter::should_autosave_content;
 pub use lucid::LucidMemory;
@@ -25,13 +25,12 @@ pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
 pub use principal::MemoryWriteContext;
 pub use sqlite::SqliteMemory;
+pub use traits::LifecycleState;
 pub use traits::Memory;
 pub use traits::{ConversationSessionSummary, MemoryCategory, MemoryEntry};
-pub use traits::LifecycleState;
 
 use crate::config::{
-    EmbeddingRouteConfig, IdentityBindingConfig, MemoryConfig, StorageProviderConfig,
-    UserPolicyConfig,
+    EmbeddingRouteConfig, IdentityBindingConfig, MemoryConfig, StorageProviderConfig, UserPolicyConfig,
 };
 use anyhow::Context;
 use chrono::Local;
@@ -61,18 +60,13 @@ where
         MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
-            tracing::warn!(
-                "Unknown memory backend '{backend_name}'{unknown_context}, falling back to markdown"
-            );
+            tracing::warn!("Unknown memory backend '{backend_name}'{unknown_context}, falling back to markdown");
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
     }
 }
 
-pub fn effective_memory_backend_name(
-    memory_backend: &str,
-    storage_provider: Option<&StorageProviderConfig>,
-) -> String {
+pub fn effective_memory_backend_name(memory_backend: &str, storage_provider: Option<&StorageProviderConfig>) -> String {
     if let Some(override_provider) = storage_provider
         .map(|cfg| cfg.provider.trim())
         .filter(|provider| !provider.is_empty())
@@ -134,10 +128,7 @@ fn resolve_embedding_config(
         return fallback;
     };
 
-    let Some(route) = embedding_routes
-        .iter()
-        .find(|route| route.hint.trim() == hint)
-    else {
+    let Some(route) = embedding_routes.iter().find(|route| route.hint.trim() == hint) else {
         tracing::warn!(
             hint,
             "Unknown embedding route hint; falling back to [memory] embedding settings"
@@ -190,15 +181,7 @@ pub fn create_memory(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes_with_acl(
-        config,
-        &[],
-        None,
-        workspace_dir,
-        api_key,
-        &[],
-        &[],
-    )
+    create_memory_with_storage_and_routes_with_acl(config, &[], None, workspace_dir, api_key, &[], &[])
 }
 
 /// Factory: create memory with optional storage-provider override.
@@ -208,15 +191,7 @@ pub fn create_memory_with_storage(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes_with_acl(
-        config,
-        &[],
-        storage_provider,
-        workspace_dir,
-        api_key,
-        &[],
-        &[],
-    )
+    create_memory_with_storage_and_routes_with_acl(config, &[], storage_provider, workspace_dir, api_key, &[], &[])
 }
 
 /// Factory: create memory with optional storage-provider override and embedding routes.
@@ -261,10 +236,7 @@ pub fn create_memory_with_storage_and_routes_with_acl(
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
     if config.snapshot_enabled
         && config.snapshot_on_hygiene
-        && matches!(
-            backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
+        && matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid)
     {
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
             tracing::warn!("memory snapshot skipped: {e}");
@@ -274,10 +246,7 @@ pub fn create_memory_with_storage_and_routes_with_acl(
     // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
     // restore the "soul" from the snapshot before creating the backend.
     if config.auto_hydrate
-        && matches!(
-            backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
+        && matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid)
         && snapshot::should_hydrate(workspace_dir)
     {
         tracing::info!("🧬 Cold boot detected — hydrating from MEMORY_SNAPSHOT.md");
@@ -298,13 +267,12 @@ pub fn create_memory_with_storage_and_routes_with_acl(
         workspace_dir: &Path,
         resolved_embedding: &ResolvedEmbeddingConfig,
     ) -> anyhow::Result<SqliteMemory> {
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
-            Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.provider,
-                resolved_embedding.api_key.as_deref(),
-                &resolved_embedding.model,
-                resolved_embedding.dimensions,
-            ));
+        let embedder: Arc<dyn embeddings::EmbeddingProvider> = Arc::from(embeddings::create_embedding_provider(
+            &resolved_embedding.provider,
+            resolved_embedding.api_key.as_deref(),
+            &resolved_embedding.model,
+            resolved_embedding.dimensions,
+        ));
 
         #[allow(clippy::cast_possible_truncation)]
         let mem = SqliteMemory::with_embedder_with_acl(
@@ -319,19 +287,15 @@ pub fn create_memory_with_storage_and_routes_with_acl(
         Ok(mem)
     }
 
-    fn build_postgres_memory(
-        storage_provider: Option<&StorageProviderConfig>,
-    ) -> anyhow::Result<PostgresMemory> {
-        let storage_provider = storage_provider
-            .context("memory backend 'postgres' requires [storage.provider.config] settings")?;
+    fn build_postgres_memory(storage_provider: Option<&StorageProviderConfig>) -> anyhow::Result<PostgresMemory> {
+        let storage_provider =
+            storage_provider.context("memory backend 'postgres' requires [storage.provider.config] settings")?;
         let db_url = storage_provider
             .db_url
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .context(
-                "memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)",
-            )?;
+            .context("memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)")?;
 
         PostgresMemory::new(
             db_url,
@@ -349,10 +313,7 @@ pub fn create_memory_with_storage_and_routes_with_acl(
         "",
     )?;
 
-    if matches!(
-        backend_kind,
-        MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-    ) {
+    if matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid) {
         if let Err(error) = upsert_acl_bootstrap(workspace_dir, identity_bindings, user_policies) {
             tracing::warn!("memory ACL bootstrap upsert skipped: {error}");
         }
@@ -425,23 +386,13 @@ fn upsert_acl_bootstrap(
     Ok(())
 }
 
-pub fn create_memory_for_migration(
-    backend: &str,
-    workspace_dir: &Path,
-) -> anyhow::Result<Box<dyn Memory>> {
+pub fn create_memory_for_migration(backend: &str, workspace_dir: &Path) -> anyhow::Result<Box<dyn Memory>> {
     if matches!(classify_memory_backend(backend), MemoryBackendKind::None) {
-        anyhow::bail!(
-            "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration"
-        );
+        anyhow::bail!("memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration");
     }
 
-    if matches!(
-        classify_memory_backend(backend),
-        MemoryBackendKind::Postgres
-    ) {
-        anyhow::bail!(
-            "memory migration for backend 'postgres' is unsupported; migrate with sqlite or markdown first"
-        );
+    if matches!(classify_memory_backend(backend), MemoryBackendKind::Postgres) {
+        anyhow::bail!("memory migration for backend 'postgres' is unsupported; migrate with sqlite or markdown first");
     }
 
     create_memory_with_builders(
@@ -546,10 +497,7 @@ mod tests {
             ..StorageProviderConfig::default()
         };
 
-        assert_eq!(
-            effective_memory_backend_name("sqlite", Some(&storage)),
-            "postgres"
-        );
+        assert_eq!(effective_memory_backend_name("sqlite", Some(&storage)), "postgres");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::multimodal;
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
+    ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -189,11 +189,7 @@ impl AnthropicProvider {
         }
     }
 
-    pub fn with_oauth(
-        credential: Option<&str>,
-        refresh_token: Option<String>,
-        expires_at: Option<i64>,
-    ) -> Self {
+    pub fn with_oauth(credential: Option<&str>, refresh_token: Option<String>, expires_at: Option<i64>) -> Self {
         Self {
             oauth: Mutex::new(OAuthState {
                 credential: credential
@@ -238,9 +234,10 @@ impl AnthropicProvider {
         };
 
         if needs_refresh {
-            let refresh_token = state.refresh_token.clone().ok_or_else(|| {
-                anyhow::anyhow!("OAuth token expired but no refresh_token available")
-            })?;
+            let refresh_token = state
+                .refresh_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("OAuth token expired but no refresh_token available"))?;
             tracing::info!("Proactively refreshing Claude Code OAuth token");
             let refreshed = super::refresh_claude_code_access_token(&refresh_token)?;
 
@@ -255,11 +252,7 @@ impl AnthropicProvider {
             // Persist refreshed credentials to the cached file.
             let write_creds = super::ClaudeCodeCredentials {
                 access_token: refreshed.access_token,
-                refresh_token: Some(
-                    refreshed
-                        .refresh_token
-                        .unwrap_or_else(|| refresh_token.clone()),
-                ),
+                refresh_token: Some(refreshed.refresh_token.unwrap_or_else(|| refresh_token.clone())),
                 expires_at: refreshed.expires_at,
                 subscription_type: None,
             };
@@ -298,11 +291,7 @@ impl AnthropicProvider {
 
         let write_creds = super::ClaudeCodeCredentials {
             access_token: refreshed.access_token.clone(),
-            refresh_token: Some(
-                refreshed
-                    .refresh_token
-                    .unwrap_or_else(|| refresh_token.clone()),
-            ),
+            refresh_token: Some(refreshed.refresh_token.unwrap_or_else(|| refresh_token.clone())),
             expires_at: refreshed.expires_at,
             subscription_type: None,
         };
@@ -319,11 +308,7 @@ impl AnthropicProvider {
         token.starts_with("sk-ant-oat01-")
     }
 
-    fn apply_auth(
-        &self,
-        request: reqwest::RequestBuilder,
-        credential: &str,
-    ) -> reqwest::RequestBuilder {
+    fn apply_auth(&self, request: reqwest::RequestBuilder, credential: &str) -> reqwest::RequestBuilder {
         if Self::is_setup_token(credential) {
             request
                 .header("Authorization", format!("Bearer {credential}"))
@@ -824,11 +809,7 @@ impl Provider for AnthropicProvider {
 
         let request = ProviderChatRequest {
             messages,
-            tools: if tool_specs.is_empty() {
-                None
-            } else {
-                Some(&tool_specs)
-            },
+            tools: if tool_specs.is_empty() { None } else { Some(&tool_specs) },
         };
         self.chat(request, model, temperature).await
     }
@@ -891,10 +872,7 @@ mod tests {
 
     #[test]
     fn creates_with_custom_base_url() {
-        let p = AnthropicProvider::with_base_url(
-            Some("anthropic-credential"),
-            Some("https://api.example.com"),
-        );
+        let p = AnthropicProvider::with_base_url(Some("anthropic-credential"), Some("https://api.example.com"));
         assert_eq!(p.base_url, "https://api.example.com");
         assert_eq!(p.credential().as_deref(), Some("anthropic-credential"));
     }
@@ -914,15 +892,10 @@ mod tests {
     #[tokio::test]
     async fn chat_fails_without_key() {
         let p = AnthropicProvider::new(None);
-        let result = p
-            .chat_with_system(None, "hello", "claude-3-opus", 0.7)
-            .await;
+        let result = p.chat_with_system(None, "hello", "claude-3-opus", 0.7).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("credentials not set"),
-            "Expected key error, got: {err}"
-        );
+        assert!(err.contains("credentials not set"), "Expected key error, got: {err}");
     }
 
     #[test]
@@ -936,26 +909,18 @@ mod tests {
         let provider = AnthropicProvider::new(None);
         let request = provider
             .apply_auth(
-                provider
-                    .http_client()
-                    .get("https://api.anthropic.com/v1/models"),
+                provider.http_client().get("https://api.anthropic.com/v1/models"),
                 "sk-ant-oat01-test-token",
             )
             .build()
             .expect("request should build");
 
         assert_eq!(
-            request
-                .headers()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok()),
+            request.headers().get("authorization").and_then(|v| v.to_str().ok()),
             Some("Bearer sk-ant-oat01-test-token")
         );
         assert_eq!(
-            request
-                .headers()
-                .get("anthropic-beta")
-                .and_then(|v| v.to_str().ok()),
+            request.headers().get("anthropic-beta").and_then(|v| v.to_str().ok()),
             Some("oauth-2025-04-20")
         );
         assert!(request.headers().get("x-api-key").is_none());
@@ -966,19 +931,14 @@ mod tests {
         let provider = AnthropicProvider::new(None);
         let request = provider
             .apply_auth(
-                provider
-                    .http_client()
-                    .get("https://api.anthropic.com/v1/models"),
+                provider.http_client().get("https://api.anthropic.com/v1/models"),
                 "sk-ant-api-key",
             )
             .build()
             .expect("request should build");
 
         assert_eq!(
-            request
-                .headers()
-                .get("x-api-key")
-                .and_then(|v| v.to_str().ok()),
+            request.headers().get("x-api-key").and_then(|v| v.to_str().ok()),
             Some("sk-ant-api-key")
         );
         assert!(request.headers().get("authorization").is_none());
@@ -1007,10 +967,7 @@ mod tests {
             temperature: 0.7,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(
-            !json.contains("system"),
-            "system field should be skipped when None"
-        );
+        assert!(!json.contains("system"), "system field should be skipped when None");
         assert!(json.contains("claude-3-opus"));
         assert!(json.contains("hello"));
     }
@@ -1049,8 +1006,7 @@ mod tests {
 
     #[test]
     fn chat_response_multiple_blocks() {
-        let json =
-            r#"{"content":[{"type":"text","text":"First"},{"type":"text","text":"Second"}]}"#;
+        let json = r#"{"content":[{"type":"text","text":"First"},{"type":"text","text":"Second"}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.content.len(), 2);
         assert_eq!(resp.content[0].text.as_deref(), Some("First"));
@@ -1484,9 +1440,7 @@ mod tests {
 
     #[test]
     fn convert_messages_splits_user_text_and_image_blocks() {
-        let messages = vec![ChatMessage::user(
-            "Look [IMAGE:data:image/png;base64,abcd==] now",
-        )];
+        let messages = vec![ChatMessage::user("Look [IMAGE:data:image/png;base64,abcd==] now")];
 
         let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
 
@@ -1513,9 +1467,8 @@ mod tests {
 
     #[test]
     fn parse_anthropic_image_source_strips_whitespace_from_base64_payload() {
-        let source =
-            AnthropicProvider::parse_anthropic_image_source("data:image/png;base64,Zm9v\n YmFy\t")
-                .expect("expected valid image source");
+        let source = AnthropicProvider::parse_anthropic_image_source("data:image/png;base64,Zm9v\n YmFy\t")
+            .expect("expected valid image source");
 
         assert_eq!(source.media_type, "image/png");
         assert_eq!(source.data, "Zm9vYmFy");
@@ -1562,8 +1515,7 @@ mod tests {
         });
 
         // Create provider pointing at mock server
-        let provider =
-            AnthropicProvider::with_base_url(Some("test-key"), Some(&format!("http://{addr}")));
+        let provider = AnthropicProvider::with_base_url(Some("test-key"), Some(&format!("http://{addr}")));
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
         let messages = vec![
@@ -1595,11 +1547,7 @@ mod tests {
             .await;
         assert!(result.is_ok(), "chat_with_tools failed: {:?}", result.err());
 
-        let body = captured
-            .lock()
-            .unwrap()
-            .take()
-            .expect("No request captured");
+        let body = captured.lock().unwrap().take().expect("No request captured");
 
         // Verify system prompt extracted to top-level field
         let system = &body["system"];
@@ -1620,10 +1568,7 @@ mod tests {
         // Turn 1: user with Go request
         assert_eq!(msgs[0]["role"], "user");
         let turn1_text = msgs[0]["content"].to_string();
-        assert!(
-            turn1_text.contains("2 sum"),
-            "Turn 1 missing Go request: {turn1_text}"
-        );
+        assert!(turn1_text.contains("2 sum"), "Turn 1 missing Go request: {turn1_text}");
 
         // Turn 2: assistant with Go code
         assert_eq!(msgs[1]["role"], "assistant");
@@ -1645,10 +1590,7 @@ mod tests {
         let api_tools = body["tools"].as_array().expect("tools not an array");
         assert_eq!(api_tools.len(), 1);
         assert_eq!(api_tools[0]["name"], "shell");
-        assert!(
-            api_tools[0]["input_schema"].is_object(),
-            "Missing input_schema"
-        );
+        assert!(api_tools[0]["input_schema"].is_object(), "Missing input_schema");
 
         server_handle.abort();
     }

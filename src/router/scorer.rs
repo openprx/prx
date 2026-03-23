@@ -77,10 +77,9 @@ pub fn compute_score(
     let elo_score = normalize_elo(model.dynamic_elo);
     let cost_penalty = model.config.cost_per_million_tokens * estimated_tokens as f32 / 1_000_000.0;
     let latency_penalty = model.recent_latency_ms.min(5_000) as f32 / 5_000.0;
-    let total_score =
-        config.alpha * similarity + config.beta * capability + config.gamma * elo_score
-            - config.delta * cost_penalty
-            - config.epsilon * latency_penalty;
+    let total_score = config.alpha * similarity + config.beta * capability + config.gamma * elo_score
+        - config.delta * cost_penalty
+        - config.epsilon * latency_penalty;
 
     ModelScore {
         model_id: model.config.model_id.clone(),
@@ -122,21 +121,17 @@ pub fn rank_models(
         .collect();
 
     candidates.sort_by(|a, b| {
-        b.total_score
-            .partial_cmp(&a.total_score)
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    "Router scoring: NaN comparison for models {} vs {}, treating as equal",
-                    a.model_id,
-                    b.model_id
-                );
-                std::cmp::Ordering::Equal
-            })
+        b.total_score.partial_cmp(&a.total_score).unwrap_or_else(|| {
+            tracing::warn!(
+                "Router scoring: NaN comparison for models {} vs {}, treating as equal",
+                a.model_id,
+                b.model_id
+            );
+            std::cmp::Ordering::Equal
+        })
     });
 
-    let best = candidates
-        .iter()
-        .find(|candidate| candidate.filtered_reason.is_none());
+    let best = candidates.iter().find(|candidate| candidate.filtered_reason.is_none());
 
     RouterResult {
         chosen_model: best.map(|candidate| candidate.model_id.clone()),
@@ -183,10 +178,7 @@ mod tests {
                 cost_per_million_tokens: cost,
                 max_context,
                 latency_ms: 2_000,
-                categories: categories
-                    .iter()
-                    .map(|value| (*value).to_string())
-                    .collect(),
+                categories: categories.iter().map(|value| (*value).to_string()).collect(),
                 elo_rating: 1_000.0,
             },
             dynamic_elo: 1_000.0,
@@ -217,9 +209,12 @@ mod tests {
 
         let result = rank_models(&RouterIntent::Code, 500, &models, &config, None);
         assert_eq!(result.chosen_model.as_deref(), Some("wide"));
-        assert!(result.candidates.iter().any(|candidate| {
-            candidate.model_id == "tiny" && candidate.filtered_reason.is_some()
-        }));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| { candidate.model_id == "tiny" && candidate.filtered_reason.is_some() })
+        );
     }
 
     #[test]
