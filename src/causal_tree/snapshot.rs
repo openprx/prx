@@ -5,8 +5,7 @@
 //! value consumed by the rest of the Causal Tree Engine.
 
 use super::state::{
-    ArtifactRef, ArtifactSource, ArtifactType, BudgetState, CausalState, SideEffectMode,
-    StepRecord, StepStatus,
+    ArtifactRef, ArtifactSource, ArtifactType, BudgetState, CausalState, SideEffectMode, StepRecord, StepStatus,
 };
 use crate::agent::classifier::{ClassifyResult, TaskIntent};
 use crate::providers::ConversationMessage;
@@ -68,11 +67,7 @@ fn assistant_chat_to_step(content: &str, index: usize, ts: &str) -> StepRecord {
 ///
 /// `_tool_call_id` is kept in the signature for future use (e.g. deduplication
 /// or cross-referencing with the originating tool call).
-fn tool_result_to_artifact(
-    _tool_call_id: &str,
-    content: &str,
-    index: usize,
-) -> ArtifactRef {
+fn tool_result_to_artifact(_tool_call_id: &str, content: &str, index: usize) -> ArtifactRef {
     let summary = truncate_to_chars(content, 256).to_string();
     ArtifactRef {
         artifact_id: format!("artifact-{index}"),
@@ -130,11 +125,7 @@ pub fn build_causal_state(
     for msg in history {
         match msg {
             ConversationMessage::Chat(chat) if chat.role == "assistant" => {
-                completed_steps.push(assistant_chat_to_step(
-                    &chat.content,
-                    step_index,
-                    &snapshot_ts,
-                ));
+                completed_steps.push(assistant_chat_to_step(&chat.content, step_index, &snapshot_ts));
                 step_index += 1;
             }
             ConversationMessage::ToolResults(results) => {
@@ -178,10 +169,10 @@ pub fn build_causal_state(
 
 #[cfg(test)]
 mod tests {
+    use super::super::policy::CausalPolicy;
     use super::*;
     use crate::agent::classifier::{ClassifyResult, TaskIntent};
     use crate::providers::{ChatMessage, ConversationMessage, ToolResultMessage};
-    use super::super::policy::CausalPolicy;
 
     fn default_classify(intent: TaskIntent) -> ClassifyResult {
         ClassifyResult {
@@ -215,10 +206,7 @@ mod tests {
         assert_eq!(state.active_constraints, vec!["no_write"]);
         assert_eq!(state.budget.extra_token_limit, 4096);
         assert_eq!(state.budget.tokens_used, 0);
-        assert_eq!(
-            state.budget.extra_latency_budget_ms,
-            policy.extra_latency_budget_ms,
-        );
+        assert_eq!(state.budget.extra_latency_budget_ms, policy.extra_latency_budget_ms,);
         assert_eq!(state.side_effect_mode, SideEffectMode::ReadOnly);
         // request_id must be a non-empty UUID string.
         assert!(!state.request_id.is_empty());

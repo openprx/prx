@@ -38,30 +38,20 @@ impl fmt::Display for CausalTreeError {
             Self::SnapshotFailed(msg) => write!(f, "snapshot failed: {msg}"),
             Self::ExpansionEmpty => write!(f, "branch expansion produced no candidates"),
             Self::ExpansionFailed(msg) => write!(f, "branch expansion failed: {msg}"),
-            Self::RehearsalTimeout {
-                branch_id,
-                elapsed_ms,
-            } => write!(f, "rehearsal timeout for branch {branch_id} ({elapsed_ms}ms)"),
+            Self::RehearsalTimeout { branch_id, elapsed_ms } => {
+                write!(f, "rehearsal timeout for branch {branch_id} ({elapsed_ms}ms)")
+            }
             Self::RehearsalFailed { branch_id, reason } => {
                 write!(f, "rehearsal failed for branch {branch_id}: {reason}")
             }
-            Self::NoBranchQualified {
-                threshold,
-                best_score,
-            } => write!(
+            Self::NoBranchQualified { threshold, best_score } => write!(
                 f,
                 "no branch met commit threshold {threshold:.2} (best: {best_score:.2})"
             ),
-            Self::PipelineTimeout {
-                budget_ms,
-                elapsed_ms,
-            } => write!(
-                f,
-                "CTE pipeline timeout: budget {budget_ms}ms, elapsed {elapsed_ms}ms"
-            ),
-            Self::CircuitBreakerOpen {
-                consecutive_failures,
-            } => write!(
+            Self::PipelineTimeout { budget_ms, elapsed_ms } => {
+                write!(f, "CTE pipeline timeout: budget {budget_ms}ms, elapsed {elapsed_ms}ms")
+            }
+            Self::CircuitBreakerOpen { consecutive_failures } => write!(
                 f,
                 "CTE circuit breaker open after {consecutive_failures} consecutive failures"
             ),

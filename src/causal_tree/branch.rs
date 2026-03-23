@@ -145,10 +145,7 @@ mod tests {
     #[test]
     fn test_branch_label_display() {
         assert_eq!(BranchLabel::DirectAnswer.as_str(), "direct_answer");
-        assert_eq!(
-            BranchLabel::RetrieveThenAnswer.as_str(),
-            "retrieve_then_answer"
-        );
+        assert_eq!(BranchLabel::RetrieveThenAnswer.as_str(), "retrieve_then_answer");
         assert_eq!(BranchLabel::AskApproval.as_str(), "ask_approval");
     }
 
@@ -180,8 +177,7 @@ mod tests {
             explanation: vec!["simple question".into()],
         };
         let json = serde_json::to_string(&branch).expect("test: serialize");
-        let restored: CausalBranch =
-            serde_json::from_str(&json).expect("test: deserialize");
+        let restored: CausalBranch = serde_json::from_str(&json).expect("test: deserialize");
         assert_eq!(restored.branch_id, "b-1");
         assert_eq!(restored.label, BranchLabel::DirectAnswer);
     }

@@ -60,8 +60,7 @@ impl BudgetState {
 
     /// Remaining latency headroom in milliseconds.
     pub fn remaining_latency_ms(&self) -> u64 {
-        self.extra_latency_budget_ms
-            .saturating_sub(self.latency_used_ms)
+        self.extra_latency_budget_ms.saturating_sub(self.latency_used_ms)
     }
 }
 
@@ -165,17 +164,12 @@ pub struct CausalState {
 impl CausalState {
     /// Returns the highest risk severity among unresolved risks, if any.
     pub fn max_risk_level(&self) -> Option<RiskLevel> {
-        self.unresolved_risks
-            .iter()
-            .map(|r| r.severity)
-            .max()
+        self.unresolved_risks.iter().map(|r| r.severity).max()
     }
 
     /// Returns `true` if any step has failed.
     pub fn has_failed_steps(&self) -> bool {
-        self.completed_steps
-            .iter()
-            .any(|s| s.status == StepStatus::Failed)
+        self.completed_steps.iter().any(|s| s.status == StepStatus::Failed)
     }
 
     /// Convenience: number of completed (succeeded) steps.
@@ -269,8 +263,7 @@ mod tests {
     fn test_serde_roundtrip() {
         let state = sample_state();
         let json = serde_json::to_string(&state).expect("test: serialize");
-        let restored: CausalState =
-            serde_json::from_str(&json).expect("test: deserialize");
+        let restored: CausalState = serde_json::from_str(&json).expect("test: deserialize");
         assert_eq!(restored.session_id, "sess-1");
         assert_eq!(restored.completed_steps.len(), 2);
     }

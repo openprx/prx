@@ -261,14 +261,8 @@ impl Observer for PrometheusObserver {
                 ..
             } => {
                 let committed = if *commit_succeeded { "true" } else { "false" };
-                let cb_tripped = if *circuit_breaker_tripped {
-                    "true"
-                } else {
-                    "false"
-                };
-                self.cte_runs
-                    .with_label_values(&[committed, cb_tripped])
-                    .inc();
+                let cb_tripped = if *circuit_breaker_tripped { "true" } else { "false" };
+                self.cte_runs.with_label_values(&[committed, cb_tripped]).inc();
                 // Latency is recorded via record_metric(CteExtraLatency) to avoid double-counting.
             }
         }
