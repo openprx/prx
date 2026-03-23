@@ -1,6 +1,5 @@
 use crate::channels::traits::{
-    Channel, ChannelMessage, SendMessage, extract_outgoing_media, guess_audio_mime,
-    guess_mime_from_path,
+    Channel, ChannelMessage, SendMessage, extract_outgoing_media, guess_audio_mime, guess_mime_from_path,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -52,23 +51,12 @@ fn mime_to_extension(mime: &str) -> &str {
 
 /// Run an external command and return its stdout as a string (if successful and non-empty).
 async fn run_command(cmd: &str, args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new(cmd)
-        .args(args)
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::process::Command::new(cmd).args(args).output().await.ok()?;
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).to_string();
-        if text.trim().is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        if text.trim().is_empty() { None } else { Some(text) }
     } else {
-        tracing::debug!(
-            "run_command {cmd} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        tracing::debug!("run_command {cmd} failed: {}", String::from_utf8_lossy(&output.stderr));
         None
     }
 }
@@ -136,11 +124,7 @@ async fn extract_document_text(path: &str, content_type: &str, filename: &str) -
     }
 
     // XLSX / XLS → openpyxl or xlsx2csv
-    if ext == "xlsx"
-        || ext == "xls"
-        || content_type.contains("spreadsheet")
-        || content_type.contains("ms-excel")
-    {
+    if ext == "xlsx" || ext == "xls" || content_type.contains("spreadsheet") || content_type.contains("ms-excel") {
         let script = "import sys; import openpyxl; wb=openpyxl.load_workbook(sys.argv[1], read_only=True, data_only=True); \
             [print('\\n=== ' + ws.title + ' ===\\n' + '\\n'.join('\\t'.join(str(c.value or '') for c in row) for row in ws.iter_rows())) for ws in wb.worksheets]";
         if let Some(t) = run_command("python3", &["-c", script, path]).await {
@@ -324,13 +308,7 @@ impl SignalStormGuard {
             .is_some_and(|last_at| now.duration_since(*last_at) < self.settings.min_reply_interval)
     }
 
-    fn record_user_pass(
-        &mut self,
-        key: &str,
-        fingerprint: &str,
-        now: Instant,
-        enforce_min_reply_interval: bool,
-    ) {
+    fn record_user_pass(&mut self, key: &str, fingerprint: &str, now: Instant, enforce_min_reply_interval: bool) {
         if !self.settings.dedupe_ttl.is_zero() {
             self.seen_fingerprints.insert(fingerprint.to_string(), now);
         }
@@ -349,9 +327,8 @@ impl SignalStormGuard {
         }
 
         if !self.settings.min_reply_interval.is_zero() {
-            self.last_reply_by_target.retain(|_, last_at| {
-                now.duration_since(*last_at) <= self.settings.min_reply_interval
-            });
+            self.last_reply_by_target
+                .retain(|_, last_at| now.duration_since(*last_at) <= self.settings.min_reply_interval);
         } else {
             self.last_reply_by_target.clear();
         }
@@ -433,12 +410,7 @@ struct DataMessage {
     expires_in_seconds: Option<u64>,
     #[serde(rename = "isExpirationUpdate", default)]
     is_expiration_update: Option<bool>,
-    #[serde(
-        rename = "storyReply",
-        alias = "storyReplyMessage",
-        alias = "story_reply",
-        default
-    )]
+    #[serde(rename = "storyReply", alias = "storyReplyMessage", alias = "story_reply", default)]
     story_reply: Option<serde_json::Value>,
     #[serde(
         rename = "storyContext",
@@ -558,10 +530,13 @@ impl SignalChannel {
     fn http_client(&self) -> Client {
         let builder = Client::builder().connect_timeout(Duration::from_secs(10));
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "channel.signal");
-        builder.build().map_err(|e| {
-            tracing::error!("proxy build failed for channel.signal, using direct: {e}");
-            e
-        }).unwrap_or_else(|_| Client::new())
+        builder
+            .build()
+            .map_err(|e| {
+                tracing::error!("proxy build failed for channel.signal, using direct: {e}");
+                e
+            })
+            .unwrap_or_else(|_| Client::new())
     }
 
     /// Effective sender: prefer `sourceNumber` (E.164), fall back to `source`.
@@ -612,11 +587,7 @@ impl SignalChannel {
         let Some(ref expected) = self.group_id else {
             return true;
         };
-        match data_msg
-            .group_info
-            .as_ref()
-            .and_then(|g| g.group_id.as_deref())
-        {
+        match data_msg.group_info.as_ref().and_then(|g| g.group_id.as_deref()) {
             Some(gid) => gid == expected.as_str(),
             None => expected.eq_ignore_ascii_case("dm"),
         }
@@ -624,11 +595,7 @@ impl SignalChannel {
 
     /// Determine the send target: group id or the sender's number.
     fn reply_target(&self, data_msg: &DataMessage, sender: &str) -> String {
-        if let Some(group_id) = data_msg
-            .group_info
-            .as_ref()
-            .and_then(|g| g.group_id.as_deref())
-        {
+        if let Some(group_id) = data_msg.group_info.as_ref().and_then(|g| g.group_id.as_deref()) {
             format!("{GROUP_TARGET_PREFIX}{group_id}")
         } else {
             sender.to_string()
@@ -692,12 +659,7 @@ impl SignalChannel {
             .story_reply
             .as_ref()
             .map(|payload| (payload, "storyReply"))
-            .or_else(|| {
-                data_msg
-                    .story_context
-                    .as_ref()
-                    .map(|payload| (payload, "storyContext"))
-            })
+            .or_else(|| data_msg.story_context.as_ref().map(|payload| (payload, "storyContext")))
     }
 
     fn has_story_payload(envelope: &Envelope, data_msg: Option<&DataMessage>) -> bool {
@@ -718,8 +680,7 @@ impl SignalChannel {
         if let Some(contact_message) = data_msg.contact_message.as_ref() {
             if let Some(entries) = contact_message.as_array() {
                 payloads.extend(entries.iter());
-            } else if let Some(entries) = contact_message.get("contacts").and_then(|v| v.as_array())
-            {
+            } else if let Some(entries) = contact_message.get("contacts").and_then(|v| v.as_array()) {
                 payloads.extend(entries.iter());
             } else {
                 payloads.push(contact_message);
@@ -744,11 +705,7 @@ impl SignalChannel {
         values.push(value);
     }
 
-    fn collect_contact_number_fragments(
-        value: &serde_json::Value,
-        hinted_key: bool,
-        out: &mut Vec<String>,
-    ) {
+    fn collect_contact_number_fragments(value: &serde_json::Value, hinted_key: bool, out: &mut Vec<String>) {
         match value {
             serde_json::Value::String(raw) => {
                 if hinted_key {
@@ -804,10 +761,7 @@ impl SignalChannel {
     ) -> Option<serde_json::Map<String, serde_json::Value>> {
         let group_id = Self::map_group_id(map)?;
         let mut meta = serde_json::Map::new();
-        meta.insert(
-            "type".to_string(),
-            serde_json::Value::String("groupUpdate".to_string()),
-        );
+        meta.insert("type".to_string(), serde_json::Value::String("groupUpdate".to_string()));
         meta.insert("group_id".to_string(), serde_json::Value::String(group_id));
 
         let update_type = map
@@ -829,10 +783,7 @@ impl SignalChannel {
                 }
             })
             .unwrap_or_else(|| "groupUpdate".to_string());
-        meta.insert(
-            "update_type".to_string(),
-            serde_json::Value::String(update_type),
-        );
+        meta.insert("update_type".to_string(), serde_json::Value::String(update_type));
 
         let member_count = map
             .get("members")
@@ -900,24 +851,17 @@ impl SignalChannel {
         }
     }
 
-    fn sync_group_update_meta(
-        sync_message: &serde_json::Value,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    fn sync_group_update_meta(sync_message: &serde_json::Value) -> Option<serde_json::Map<String, serde_json::Value>> {
         let node = Self::find_group_update_node(sync_message)?;
         Self::build_group_update_meta_from_map(node)
     }
 
     fn sync_group_id(sync_message: &serde_json::Value) -> Option<String> {
-        Self::sync_group_update_meta(sync_message).and_then(|meta| {
-            meta.get("group_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
+        Self::sync_group_update_meta(sync_message)
+            .and_then(|meta| meta.get("group_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
     }
 
-    fn group_info_update_meta(
-        group_info: &GroupInfo,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    fn group_info_update_meta(group_info: &GroupInfo) -> Option<serde_json::Map<String, serde_json::Value>> {
         let has_update_fields = group_info.r#type.is_some()
             || group_info.members.is_some()
             || group_info.title.is_some()
@@ -928,27 +872,14 @@ impl SignalChannel {
         }
 
         let mut meta = serde_json::Map::new();
-        meta.insert(
-            "type".to_string(),
-            serde_json::Value::String("groupUpdate".to_string()),
-        );
+        meta.insert("type".to_string(), serde_json::Value::String("groupUpdate".to_string()));
         meta.insert(
             "group_id".to_string(),
-            serde_json::Value::String(
-                group_info
-                    .group_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-            ),
+            serde_json::Value::String(group_info.group_id.clone().unwrap_or_else(|| "unknown".to_string())),
         );
         meta.insert(
             "update_type".to_string(),
-            serde_json::Value::String(
-                group_info
-                    .r#type
-                    .clone()
-                    .unwrap_or_else(|| "groupInfo".to_string()),
-            ),
+            serde_json::Value::String(group_info.r#type.clone().unwrap_or_else(|| "groupInfo".to_string())),
         );
 
         if let Some(member_count) = group_info
@@ -1002,15 +933,10 @@ impl SignalChannel {
             let contacts = Self::contact_payloads(data_msg);
             if !contacts.is_empty() {
                 let mut contacts_meta = serde_json::Map::new();
-                contacts_meta.insert(
-                    "type".to_string(),
-                    serde_json::Value::String("contacts".to_string()),
-                );
+                contacts_meta.insert("type".to_string(), serde_json::Value::String("contacts".to_string()));
                 contacts_meta.insert(
                     "count".to_string(),
-                    serde_json::Value::Number(
-                        u64::try_from(contacts.len()).unwrap_or(u64::MAX).into(),
-                    ),
+                    serde_json::Value::Number(u64::try_from(contacts.len()).unwrap_or(u64::MAX).into()),
                 );
                 let mut fragments = Vec::new();
                 for contact in contacts {
@@ -1019,37 +945,21 @@ impl SignalChannel {
                 if !fragments.is_empty() {
                     contacts_meta.insert(
                         "number_fragments".to_string(),
-                        serde_json::Value::Array(
-                            fragments
-                                .into_iter()
-                                .map(serde_json::Value::String)
-                                .collect(),
-                        ),
+                        serde_json::Value::Array(fragments.into_iter().map(serde_json::Value::String).collect()),
                     );
                 }
-                prefixes.push(format!(
-                    "[signal-event {}]",
-                    serde_json::Value::Object(contacts_meta)
-                ));
+                prefixes.push(format!("[signal-event {}]", serde_json::Value::Object(contacts_meta)));
             }
 
             if let Some((story_payload, source_field)) = Self::story_reply_payload(data_msg) {
                 let mut story_reply_meta = serde_json::Map::new();
-                story_reply_meta.insert(
-                    "type".to_string(),
-                    serde_json::Value::String("storyReply".to_string()),
-                );
+                story_reply_meta.insert("type".to_string(), serde_json::Value::String("storyReply".to_string()));
                 story_reply_meta.insert(
                     "source_field".to_string(),
                     serde_json::Value::String(source_field.to_string()),
                 );
-                if let Some(author) =
-                    Self::json_string(story_payload, &["author", "targetAuthor", "storyAuthor"])
-                {
-                    story_reply_meta.insert(
-                        "target_author".to_string(),
-                        serde_json::Value::String(author),
-                    );
+                if let Some(author) = Self::json_string(story_payload, &["author", "targetAuthor", "storyAuthor"]) {
+                    story_reply_meta.insert("target_author".to_string(), serde_json::Value::String(author));
                 }
                 if let Some(target_timestamp) = Self::json_u64(
                     story_payload,
@@ -1081,21 +991,12 @@ impl SignalChannel {
                 }
             }
 
-            if let Some(mentions) = data_msg
-                .mentions
-                .as_ref()
-                .filter(|mentions| !mentions.is_empty())
-            {
+            if let Some(mentions) = data_msg.mentions.as_ref().filter(|mentions| !mentions.is_empty()) {
                 let mut mentions_meta = serde_json::Map::new();
-                mentions_meta.insert(
-                    "type".to_string(),
-                    serde_json::Value::String("mentions".to_string()),
-                );
+                mentions_meta.insert("type".to_string(), serde_json::Value::String("mentions".to_string()));
                 mentions_meta.insert(
                     "count".to_string(),
-                    serde_json::Value::Number(
-                        u64::try_from(mentions.len()).unwrap_or(u64::MAX).into(),
-                    ),
+                    serde_json::Value::Number(u64::try_from(mentions.len()).unwrap_or(u64::MAX).into()),
                 );
                 let mut mention_entries = Vec::new();
                 for mention in mentions {
@@ -1104,47 +1005,31 @@ impl SignalChannel {
                         mention_entry.insert("uuid".to_string(), serde_json::Value::String(uuid));
                     }
                     if let Some(number) = mention.number.clone() {
-                        mention_entry
-                            .insert("number".to_string(), serde_json::Value::String(number));
+                        mention_entry.insert("number".to_string(), serde_json::Value::String(number));
                     }
                     if let Some(name) = mention.name.clone() {
                         mention_entry.insert("name".to_string(), serde_json::Value::String(name));
                     }
                     if let Some(start) = mention.start {
-                        mention_entry
-                            .insert("start".to_string(), serde_json::Value::Number(start.into()));
+                        mention_entry.insert("start".to_string(), serde_json::Value::Number(start.into()));
                     }
                     if let Some(length) = mention.length {
-                        mention_entry.insert(
-                            "length".to_string(),
-                            serde_json::Value::Number(length.into()),
-                        );
+                        mention_entry.insert("length".to_string(), serde_json::Value::Number(length.into()));
                     }
                     if !mention_entry.is_empty() {
                         mention_entries.push(serde_json::Value::Object(mention_entry));
                     }
                 }
                 if !mention_entries.is_empty() {
-                    mentions_meta.insert(
-                        "mentions".to_string(),
-                        serde_json::Value::Array(mention_entries),
-                    );
-                    prefixes.push(format!(
-                        "[signal-event {}]",
-                        serde_json::Value::Object(mentions_meta)
-                    ));
+                    mentions_meta.insert("mentions".to_string(), serde_json::Value::Array(mention_entries));
+                    prefixes.push(format!("[signal-event {}]", serde_json::Value::Object(mentions_meta)));
                 }
             }
 
             if let Some(quote) = data_msg.quote.as_ref() {
                 let mut quote_meta = serde_json::Map::new();
-                quote_meta.insert(
-                    "type".to_string(),
-                    serde_json::Value::String("quote".to_string()),
-                );
-                if let Some(author) =
-                    Self::json_string(quote, &["author", "quoteAuthor", "targetAuthor"])
-                {
+                quote_meta.insert("type".to_string(), serde_json::Value::String("quote".to_string()));
+                if let Some(author) = Self::json_string(quote, &["author", "quoteAuthor", "targetAuthor"]) {
                     quote_meta.insert("author".to_string(), serde_json::Value::String(author));
                 }
                 if let Some(target_timestamp) = Self::json_u64(
@@ -1165,45 +1050,30 @@ impl SignalChannel {
                 if let Some(quoted_text) = Self::json_string(quote, &["text", "message", "body"]) {
                     quote_meta.insert("text".to_string(), serde_json::Value::String(quoted_text));
                 }
-                prefixes.push(format!(
-                    "[signal-event {}]",
-                    serde_json::Value::Object(quote_meta)
-                ));
+                prefixes.push(format!("[signal-event {}]", serde_json::Value::Object(quote_meta)));
             }
 
             if let Some(reaction) = data_msg.reaction.as_ref() {
                 let mut reaction_meta = serde_json::Map::new();
-                reaction_meta.insert(
-                    "type".to_string(),
-                    serde_json::Value::String("reaction".to_string()),
-                );
+                reaction_meta.insert("type".to_string(), serde_json::Value::String("reaction".to_string()));
                 if let Some(emoji) = Self::json_string(reaction, &["emoji", "reaction"]) {
                     reaction_meta.insert("emoji".to_string(), serde_json::Value::String(emoji));
                 }
                 if let Some(remove) = Self::json_bool(reaction, &["remove"]) {
                     reaction_meta.insert("remove".to_string(), serde_json::Value::Bool(remove));
                 }
-                if let Some(target_author) =
-                    Self::json_string(reaction, &["targetAuthor", "target_author", "author"])
-                {
-                    reaction_meta.insert(
-                        "target_author".to_string(),
-                        serde_json::Value::String(target_author),
-                    );
+                if let Some(target_author) = Self::json_string(reaction, &["targetAuthor", "target_author", "author"]) {
+                    reaction_meta.insert("target_author".to_string(), serde_json::Value::String(target_author));
                 }
-                if let Some(target_timestamp) = Self::json_u64(
-                    reaction,
-                    &["targetSentTimestamp", "targetTimestamp", "timestamp"],
-                ) {
+                if let Some(target_timestamp) =
+                    Self::json_u64(reaction, &["targetSentTimestamp", "targetTimestamp", "timestamp"])
+                {
                     reaction_meta.insert(
                         "target_timestamp".to_string(),
                         serde_json::Value::Number(target_timestamp.into()),
                     );
                 }
-                prefixes.push(format!(
-                    "[signal-event {}]",
-                    serde_json::Value::Object(reaction_meta)
-                ));
+                prefixes.push(format!("[signal-event {}]", serde_json::Value::Object(reaction_meta)));
             }
 
             if let Some(remote_delete) = data_msg.remote_delete.as_ref() {
@@ -1212,10 +1082,9 @@ impl SignalChannel {
                     "type".to_string(),
                     serde_json::Value::String("remoteDelete".to_string()),
                 );
-                if let Some(target_timestamp) = Self::json_u64(
-                    remote_delete,
-                    &["targetSentTimestamp", "targetTimestamp", "timestamp"],
-                ) {
+                if let Some(target_timestamp) =
+                    Self::json_u64(remote_delete, &["targetSentTimestamp", "targetTimestamp", "timestamp"])
+                {
                     remote_delete_meta.insert(
                         "target_timestamp".to_string(),
                         serde_json::Value::Number(target_timestamp.into()),
@@ -1229,25 +1098,14 @@ impl SignalChannel {
 
             if let Some(sticker) = data_msg.sticker.as_ref() {
                 let mut sticker_meta = serde_json::Map::new();
-                sticker_meta.insert(
-                    "type".to_string(),
-                    serde_json::Value::String("sticker".to_string()),
-                );
+                sticker_meta.insert("type".to_string(), serde_json::Value::String("sticker".to_string()));
                 if let Some(sticker_id) = Self::json_u64(sticker, &["stickerId", "id"]) {
-                    sticker_meta.insert(
-                        "sticker_id".to_string(),
-                        serde_json::Value::Number(sticker_id.into()),
-                    );
+                    sticker_meta.insert("sticker_id".to_string(), serde_json::Value::Number(sticker_id.into()));
                 }
-                prefixes.push(format!(
-                    "[signal-event {}]",
-                    serde_json::Value::Object(sticker_meta)
-                ));
+                prefixes.push(format!("[signal-event {}]", serde_json::Value::Object(sticker_meta)));
             }
 
-            if data_msg.is_expiration_update.unwrap_or(false)
-                || data_msg.expires_in_seconds.unwrap_or(0) > 0
-            {
+            if data_msg.is_expiration_update.unwrap_or(false) || data_msg.expires_in_seconds.unwrap_or(0) > 0 {
                 let mut expiration_meta = serde_json::Map::new();
                 expiration_meta.insert(
                     "type".to_string(),
@@ -1263,31 +1121,19 @@ impl SignalChannel {
                         serde_json::Value::Number(expires_in_seconds.into()),
                     );
                 }
-                prefixes.push(format!(
-                    "[signal-event {}]",
-                    serde_json::Value::Object(expiration_meta)
-                ));
+                prefixes.push(format!("[signal-event {}]", serde_json::Value::Object(expiration_meta)));
             }
         }
 
         if let Some(edit) = envelope.edit_message.as_ref() {
             let mut edit_meta = serde_json::Map::new();
-            edit_meta.insert(
-                "type".to_string(),
-                serde_json::Value::String("editMessage".to_string()),
-            );
-            if let Some(target_author) =
-                Self::json_string(edit, &["targetAuthor", "target_author", "author"])
-            {
-                edit_meta.insert(
-                    "target_author".to_string(),
-                    serde_json::Value::String(target_author),
-                );
+            edit_meta.insert("type".to_string(), serde_json::Value::String("editMessage".to_string()));
+            if let Some(target_author) = Self::json_string(edit, &["targetAuthor", "target_author", "author"]) {
+                edit_meta.insert("target_author".to_string(), serde_json::Value::String(target_author));
             }
-            if let Some(target_timestamp) = Self::json_u64(
-                edit,
-                &["targetSentTimestamp", "targetTimestamp", "timestamp"],
-            ) {
+            if let Some(target_timestamp) =
+                Self::json_u64(edit, &["targetSentTimestamp", "targetTimestamp", "timestamp"])
+            {
                 edit_meta.insert(
                     "target_timestamp".to_string(),
                     serde_json::Value::Number(target_timestamp.into()),
@@ -1298,15 +1144,9 @@ impl SignalChannel {
                     .and_then(|data_message| Self::json_string(data_message, &["message"]))
             });
             if let Some(edited_text) = edited_text {
-                edit_meta.insert(
-                    "message".to_string(),
-                    serde_json::Value::String(edited_text),
-                );
+                edit_meta.insert("message".to_string(), serde_json::Value::String(edited_text));
             }
-            prefixes.push(format!(
-                "[signal-event {}]",
-                serde_json::Value::Object(edit_meta)
-            ));
+            prefixes.push(format!("[signal-event {}]", serde_json::Value::Object(edit_meta)));
         }
 
         if envelope.typing_message.is_some() {
@@ -1321,37 +1161,23 @@ impl SignalChannel {
                 "type".to_string(),
                 serde_json::Value::String("storyMessage".to_string()),
             );
-            if let Some(author) = Self::json_string(
-                story_message,
-                &["author", "source", "sourceUuid", "sourceNumber"],
-            ) {
+            if let Some(author) = Self::json_string(story_message, &["author", "source", "sourceUuid", "sourceNumber"])
+            {
                 story_meta.insert("author".to_string(), serde_json::Value::String(author));
             }
             if let Some(story_timestamp) = Self::json_u64(
                 story_message,
-                &[
-                    "timestamp",
-                    "storyTimestamp",
-                    "sentTimestamp",
-                    "targetTimestamp",
-                ],
+                &["timestamp", "storyTimestamp", "sentTimestamp", "targetTimestamp"],
             ) {
                 story_meta.insert(
                     "story_timestamp".to_string(),
                     serde_json::Value::Number(story_timestamp.into()),
                 );
             }
-            prefixes.push(format!(
-                "[signal-event {}]",
-                serde_json::Value::Object(story_meta)
-            ));
+            prefixes.push(format!("[signal-event {}]", serde_json::Value::Object(story_meta)));
         }
         if envelope.sync_message.is_some() {
-            if let Some(group_update_meta) = envelope
-                .sync_message
-                .as_ref()
-                .and_then(Self::sync_group_update_meta)
-            {
+            if let Some(group_update_meta) = envelope.sync_message.as_ref().and_then(Self::sync_group_update_meta) {
                 prefixes.push(format!(
                     "[signal-event {}]",
                     serde_json::Value::Object(group_update_meta)
@@ -1389,11 +1215,7 @@ impl SignalChannel {
             .to_ascii_lowercase()
     }
 
-    fn build_event_type_for_fingerprint(
-        event_prefixes: &[String],
-        text: &str,
-        has_attachments: bool,
-    ) -> String {
+    fn build_event_type_for_fingerprint(event_prefixes: &[String], text: &str, has_attachments: bool) -> String {
         let mut kinds = Self::extract_event_types(event_prefixes);
         if !text.trim().is_empty() {
             kinds.push("message".to_string());
@@ -1430,11 +1252,7 @@ impl SignalChannel {
         Self::normalize_content_for_fingerprint(&basis)
     }
 
-    fn build_dedupe_fingerprint(
-        sender: &str,
-        event_type: &str,
-        normalized_content: &str,
-    ) -> String {
+    fn build_dedupe_fingerprint(sender: &str, event_type: &str, normalized_content: &str) -> String {
         let mut hasher = DefaultHasher::new();
         "signal".hash(&mut hasher);
         sender.hash(&mut hasher);
@@ -1480,11 +1298,7 @@ impl SignalChannel {
     }
 
     /// Send a JSON-RPC request to signal-cli daemon.
-    async fn rpc_request(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> anyhow::Result<Option<serde_json::Value>> {
+    async fn rpc_request(&self, method: &str, params: serde_json::Value) -> anyhow::Result<Option<serde_json::Value>> {
         let url = format!("{}/api/v1/rpc", self.http_url);
         let id = Uuid::new_v4().to_string();
 
@@ -1517,10 +1331,7 @@ impl SignalChannel {
         let parsed: serde_json::Value = serde_json::from_str(&text)?;
         if let Some(err) = parsed.get("error") {
             let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-            let msg = err
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown");
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
             anyhow::bail!("Signal RPC error {code}: {msg}");
         }
 
@@ -1533,10 +1344,7 @@ impl SignalChannel {
             .edit_message
             .as_ref()
             .and_then(Self::parse_embedded_data_message);
-        let data_msg = envelope
-            .data_message
-            .as_ref()
-            .or(edit_data_message.as_ref());
+        let data_msg = envelope.data_message.as_ref().or(edit_data_message.as_ref());
         let has_story_payload = Self::has_story_payload(envelope, data_msg);
         if self.ignore_stories && has_story_payload {
             return None;
@@ -1544,8 +1352,7 @@ impl SignalChannel {
 
         let sender = Self::sender(envelope)?;
         let sync_group_id = envelope.sync_message.as_ref().and_then(Self::sync_group_id);
-        let is_group_message =
-            data_msg.and_then(|dm| dm.group_info.as_ref()).is_some() || sync_group_id.is_some();
+        let is_group_message = data_msg.and_then(|dm| dm.group_info.as_ref()).is_some() || sync_group_id.is_some();
 
         if !self.is_sender_allowed(&sender) {
             if !is_group_message {
@@ -1563,9 +1370,7 @@ impl SignalChannel {
                 return None;
             }
         } else if let Some(expected_group) = self.group_id.as_deref() {
-            if !expected_group.eq_ignore_ascii_case("dm")
-                && sync_group_id.as_deref() != Some(expected_group)
-            {
+            if !expected_group.eq_ignore_ascii_case("dm") && sync_group_id.as_deref() != Some(expected_group) {
                 return None;
             }
         }
@@ -1587,11 +1392,9 @@ impl SignalChannel {
             .and_then(|dm| dm.attachments.as_ref())
             .is_some_and(|attachments| !attachments.is_empty());
         let text = data_msg.and_then(|dm| dm.message.as_deref()).unwrap_or("");
-        let has_typing_or_receipt_event =
-            envelope.typing_message.is_some() || envelope.receipt_message.is_some();
+        let has_typing_or_receipt_event = envelope.typing_message.is_some() || envelope.receipt_message.is_some();
         let has_other_event_payload = event_prefixes.iter().any(|prefix| {
-            !prefix.contains(r#""type":"typingMessage""#)
-                && !prefix.contains(r#""type":"receiptMessage""#)
+            !prefix.contains(r#""type":"typingMessage""#) && !prefix.contains(r#""type":"receiptMessage""#)
         });
 
         // Skip attachment-only messages when configured
@@ -1601,18 +1404,14 @@ impl SignalChannel {
 
         let now = Instant::now();
         if self.guard_check_breaker(&storm_key, now) {
-            tracing::warn!(
-                "Signal storm guard dropped envelope due to open breaker key={storm_key}"
-            );
+            tracing::warn!("Signal storm guard dropped envelope due to open breaker key={storm_key}");
             return None;
         }
 
         // Keep non-text Signal events (reaction/delete/sticker/edit/expiration/sync),
         // but avoid routing typing/receipt-only envelopes into the LLM reply path.
-        let is_non_user_message = text.is_empty()
-            && !has_attachments
-            && has_typing_or_receipt_event
-            && !has_other_event_payload;
+        let is_non_user_message =
+            text.is_empty() && !has_attachments && has_typing_or_receipt_event && !has_other_event_payload;
         let is_empty_non_user_message = text.is_empty() && !has_attachments && !has_event_payload;
         if is_non_user_message || is_empty_non_user_message {
             if self.guard_record_non_user_and_maybe_trip(&storm_key, now) {
@@ -1626,17 +1425,13 @@ impl SignalChannel {
             return None;
         }
 
-        let event_type =
-            Self::build_event_type_for_fingerprint(&event_prefixes, text, has_attachments);
-        let normalized_content =
-            Self::build_normalized_content_for_fingerprint(text, &event_prefixes, has_attachments);
+        let event_type = Self::build_event_type_for_fingerprint(&event_prefixes, text, has_attachments);
+        let normalized_content = Self::build_normalized_content_for_fingerprint(text, &event_prefixes, has_attachments);
         let fingerprint = Self::build_dedupe_fingerprint(&sender, &event_type, &normalized_content);
         match self.guard_allow_user_event(&storm_key, &fingerprint, now, is_group_message) {
             UserEventGuardDecision::Allowed => {}
             UserEventGuardDecision::BreakerOpen => {
-                tracing::warn!(
-                    "Signal storm guard dropped user event due to open breaker key={storm_key}"
-                );
+                tracing::warn!("Signal storm guard dropped user event due to open breaker key={storm_key}");
                 return None;
             }
             UserEventGuardDecision::Duplicate => {
@@ -1644,9 +1439,7 @@ impl SignalChannel {
                 return None;
             }
             UserEventGuardDecision::MinReplyInterval => {
-                tracing::warn!(
-                    "Signal storm guard dropped group user event due to min_reply_interval key={storm_key}"
-                );
+                tracing::warn!("Signal storm guard dropped group user event due to min_reply_interval key={storm_key}");
                 return None;
             }
         }
@@ -1760,10 +1553,7 @@ impl SignalChannel {
             .get("contentType")
             .and_then(|v| v.as_str())
             .unwrap_or("application/octet-stream");
-        let filename = att
-            .get("filename")
-            .and_then(|v| v.as_str())
-            .unwrap_or("attachment");
+        let filename = att.get("filename").and_then(|v| v.as_str()).unwrap_or("attachment");
 
         // ── Native mode: read local file directly ────────────────────────────
         if self.is_native {
@@ -1805,13 +1595,7 @@ impl SignalChannel {
                 bytes.len()
             );
 
-            return Self::make_attachment_marker(
-                &temp_path,
-                content_type,
-                filename,
-                &self.media_config,
-            )
-            .await;
+            return Self::make_attachment_marker(&temp_path, content_type, filename, &self.media_config).await;
         }
 
         // ── REST mode: download via signal-cli-rest-api ───────────────────────
@@ -1826,10 +1610,7 @@ impl SignalChannel {
             .ok()?;
 
         if !response.status().is_success() {
-            tracing::warn!(
-                "Signal: failed to download attachment {id}: {}",
-                response.status()
-            );
+            tracing::warn!("Signal: failed to download attachment {id}: {}", response.status());
             return None;
         }
 
@@ -1864,9 +1645,7 @@ impl SignalChannel {
             if let Some(transcription) =
                 crate::media::process_media_attachment(temp_path, content_type, media_config).await
             {
-                return Some(format!(
-                    "[Voice message transcription: \"{transcription}\"]"
-                ));
+                return Some(format!("[Voice message transcription: \"{transcription}\"]"));
             }
             return Some(format!(
                 "<media:audio path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
@@ -1875,9 +1654,7 @@ impl SignalChannel {
 
         // Video: attempt frame extraction via media engine
         if content_type.starts_with("video/") {
-            if let Some(frames) =
-                crate::media::process_media_attachment(temp_path, content_type, media_config).await
-            {
+            if let Some(frames) = crate::media::process_media_attachment(temp_path, content_type, media_config).await {
                 return Some(frames);
             }
             return Some(format!(
@@ -1892,11 +1669,7 @@ impl SignalChannel {
                 while !text.is_char_boundary(boundary) {
                     boundary -= 1;
                 }
-                format!(
-                    "{}...\n[truncated, {} total chars]",
-                    &text[..boundary],
-                    text.len()
-                )
+                format!("{}...\n[truncated, {} total chars]", &text[..boundary], text.len())
             } else {
                 text
             };
@@ -1912,11 +1685,7 @@ impl SignalChannel {
     /// Enrich a `ChannelMessage` with `[IMAGE:...]` or `<media:...>` markers
     /// by downloading any attachments from the original envelope.
     /// Returns the message unchanged when `ignore_attachments` is set.
-    async fn maybe_enrich_with_attachments(
-        &self,
-        mut msg: ChannelMessage,
-        envelope: &Envelope,
-    ) -> ChannelMessage {
+    async fn maybe_enrich_with_attachments(&self, mut msg: ChannelMessage, envelope: &Envelope) -> ChannelMessage {
         if self.ignore_attachments {
             return msg;
         }
@@ -2028,11 +1797,7 @@ impl SignalChannel {
     }
 
     /// Poll-based listener for signal-cli-rest-api `/v1/receive/{account}`.
-    async fn listen_polling(
-        &self,
-        poll_url: &str,
-        tx: mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen_polling(&self, poll_url: &str, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let poll_interval = Duration::from_secs(2);
         let mut retry_delay_secs = 2u64;
         let max_delay_secs = 60u64;
@@ -2059,8 +1824,7 @@ impl SignalChannel {
                         for sse in &envelopes {
                             if let Some(ref envelope) = sse.envelope {
                                 if let Some(msg) = self.process_envelope(envelope) {
-                                    let msg =
-                                        self.maybe_enrich_with_attachments(msg, envelope).await;
+                                    let msg = self.maybe_enrich_with_attachments(msg, envelope).await;
                                     if tx.send(msg).await.is_err() {
                                         return Ok(());
                                     }
@@ -2089,11 +1853,7 @@ impl SignalChannel {
     }
 
     /// SSE-based listener for signal-cli daemon `/api/v1/events`.
-    async fn listen_sse(
-        &self,
-        sse_url: &str,
-        tx: mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen_sse(&self, sse_url: &str, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let url = reqwest::Url::parse(sse_url)?;
 
         let mut retry_delay_secs = 2u64;
@@ -2168,9 +1928,7 @@ impl SignalChannel {
                                 Ok(sse) => {
                                     if let Some(ref envelope) = sse.envelope {
                                         if let Some(msg) = self.process_envelope(envelope) {
-                                            let msg = self
-                                                .maybe_enrich_with_attachments(msg, envelope)
-                                                .await;
+                                            let msg = self.maybe_enrich_with_attachments(msg, envelope).await;
                                             if tx.send(msg).await.is_err() {
                                                 return Ok(());
                                             }
@@ -2221,11 +1979,7 @@ impl Channel for SignalChannel {
         let text_content = &clean_text;
 
         // ── Native mode: JSON-RPC send ────────────────────────────────────────
-        tracing::info!(
-            "Signal send: is_native={} http_url={}",
-            self.is_native,
-            self.http_url
-        );
+        tracing::info!("Signal send: is_native={} http_url={}", self.is_native, self.http_url);
         if self.is_native {
             // In native mode, attachments are referenced as absolute paths.
             // signal-cli JSON-RPC expects plain absolute paths, not file:// URIs.
@@ -2515,12 +2269,7 @@ impl Channel for SignalChannel {
     /// `channel_id` is the recipient.
     /// `thread_id` is the timestamp (ms) of the original message to quote-reply to.
     /// `message` is the reply text.
-    async fn send_thread_reply(
-        &self,
-        channel_id: &str,
-        thread_id: &str,
-        message: &str,
-    ) -> anyhow::Result<()> {
+    async fn send_thread_reply(&self, channel_id: &str, thread_id: &str, message: &str) -> anyhow::Result<()> {
         let ts: u64 = thread_id
             .parse()
             .map_err(|_| anyhow::anyhow!("thread_id must be a numeric timestamp (ms)"))?;
@@ -2803,12 +2552,8 @@ mod tests {
 
     #[test]
     fn is_uuid_valid() {
-        assert!(SignalChannel::is_uuid(
-            "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-        ));
-        assert!(SignalChannel::is_uuid(
-            "00000000-0000-0000-0000-000000000000"
-        ));
+        assert!(SignalChannel::is_uuid("a1b2c3d4-e5f6-7890-abcd-ef1234567890"));
+        assert!(SignalChannel::is_uuid("00000000-0000-0000-0000-000000000000"));
     }
 
     #[test]
@@ -2884,11 +2629,7 @@ mod tests {
             "content: {}",
             msg.content
         );
-        assert!(
-            msg.content.contains("chat_type=direct"),
-            "content: {}",
-            msg.content
-        );
+        assert!(msg.content.contains("chat_type=direct"), "content: {}", msg.content);
 
         // Verify reply routing: UUID sender in DM should route as Direct
         let target = SignalChannel::parse_recipient_target(&msg.reply_target);
@@ -2964,21 +2705,13 @@ mod tests {
         let ch = make_channel();
         let env = make_envelope(Some("+1111111111"), Some("Hello!"));
         let msg = ch.process_envelope(&env).unwrap();
-        assert!(
-            msg.content.starts_with("Hello!"),
-            "content: {}",
-            msg.content
-        );
+        assert!(msg.content.starts_with("Hello!"), "content: {}", msg.content);
         assert!(
             msg.content.contains("[signal-meta sender=+1111111111"),
             "content: {}",
             msg.content
         );
-        assert!(
-            msg.content.contains("chat_type=direct"),
-            "content: {}",
-            msg.content
-        );
+        assert!(msg.content.contains("chat_type=direct"), "content: {}", msg.content);
         assert_eq!(msg.sender, "+1111111111");
         assert_eq!(msg.channel, "signal");
     }
@@ -3195,14 +2928,8 @@ mod tests {
             timestamp: Some(1_700_000_000_100),
             ..Default::default()
         };
-        let msg = ch
-            .process_envelope(&env)
-            .expect("reaction-only should pass");
-        assert!(
-            msg.content.contains(r#""type":"reaction""#),
-            "content: {}",
-            msg.content
-        );
+        let msg = ch.process_envelope(&env).expect("reaction-only should pass");
+        assert!(msg.content.contains(r#""type":"reaction""#), "content: {}", msg.content);
     }
 
     #[test]
@@ -3252,9 +2979,7 @@ mod tests {
             timestamp: Some(1_700_000_000_200),
             ..Default::default()
         };
-        let msg = ch
-            .process_envelope(&env)
-            .expect("remoteDelete-only should pass");
+        let msg = ch.process_envelope(&env).expect("remoteDelete-only should pass");
         assert!(
             msg.content.contains(r#""type":"remoteDelete""#),
             "content: {}",
@@ -3280,9 +3005,7 @@ mod tests {
             timestamp: Some(1_700_000_000_300),
             ..Default::default()
         };
-        let msg = ch
-            .process_envelope(&env)
-            .expect("top-level editMessage should pass");
+        let msg = ch.process_envelope(&env).expect("top-level editMessage should pass");
         assert!(
             msg.content.contains(r#""type":"editMessage""#),
             "content: {}",
@@ -3353,34 +3076,16 @@ mod tests {
             ..Default::default()
         };
 
-        let msg = ch
-            .process_envelope(&env)
-            .expect("contacts-only should pass");
-        assert!(
-            msg.content.contains(r#""type":"contacts""#),
-            "content: {}",
-            msg.content
-        );
-        assert!(
-            msg.content.contains(r#""count":2"#),
-            "content: {}",
-            msg.content
-        );
+        let msg = ch.process_envelope(&env).expect("contacts-only should pass");
+        assert!(msg.content.contains(r#""type":"contacts""#), "content: {}", msg.content);
+        assert!(msg.content.contains(r#""count":2"#), "content: {}", msg.content);
         assert!(
             msg.content.contains(r#""number_fragments":["#),
             "content: {}",
             msg.content
         );
-        assert!(
-            msg.content.contains(r#""5678""#),
-            "content: {}",
-            msg.content
-        );
-        assert!(
-            msg.content.contains(r#""0123""#),
-            "content: {}",
-            msg.content
-        );
+        assert!(msg.content.contains(r#""5678""#), "content: {}", msg.content);
+        assert!(msg.content.contains(r#""0123""#), "content: {}", msg.content);
     }
 
     #[test]
@@ -3402,9 +3107,7 @@ mod tests {
             ..Default::default()
         };
 
-        let msg = ch
-            .process_envelope(&env)
-            .expect("storyReply-only should pass");
+        let msg = ch.process_envelope(&env).expect("storyReply-only should pass");
         assert!(
             msg.content.contains(r#""type":"storyReply""#),
             "content: {}",
@@ -3429,9 +3132,7 @@ mod tests {
             ..Default::default()
         };
 
-        let msg = ch
-            .process_envelope(&env)
-            .expect("group update-only should pass");
+        let msg = ch.process_envelope(&env).expect("group update-only should pass");
         assert_eq!(msg.reply_target, "group:group-v2-1");
         assert!(
             msg.content.contains(r#""type":"groupUpdate""#),
@@ -3448,11 +3149,7 @@ mod tests {
             "content: {}",
             msg.content
         );
-        assert!(
-            msg.content.contains(r#""members_added":2"#),
-            "content: {}",
-            msg.content
-        );
+        assert!(msg.content.contains(r#""members_added":2"#), "content: {}", msg.content);
     }
 
     #[test]
@@ -3477,33 +3174,19 @@ mod tests {
             ..Default::default()
         };
 
-        let msg = ch
-            .process_envelope(&env)
-            .expect("mentions message should pass");
+        let msg = ch.process_envelope(&env).expect("mentions message should pass");
         assert_eq!(
             msg.mentioned_uuids,
             vec!["uuid-mention-1".to_string(), "+12223334444".to_string()]
         );
-        assert!(
-            msg.content.contains(r#""type":"mentions""#),
-            "content: {}",
-            msg.content
-        );
+        assert!(msg.content.contains(r#""type":"mentions""#), "content: {}", msg.content);
         assert!(
             msg.content.contains(r#""name":"openprx_user""#),
             "content: {}",
             msg.content
         );
-        assert!(
-            msg.content.contains(r#""start":0"#),
-            "content: {}",
-            msg.content
-        );
-        assert!(
-            msg.content.contains(r#""length":14"#),
-            "content: {}",
-            msg.content
-        );
+        assert!(msg.content.contains(r#""start":0"#), "content: {}", msg.content);
+        assert!(msg.content.contains(r#""length":14"#), "content: {}", msg.content);
     }
 
     #[test]
@@ -3567,10 +3250,7 @@ mod tests {
         let sse: SseEnvelope = serde_json::from_str(json).unwrap();
         let env = sse.envelope.unwrap();
         let dm = env.data_message.unwrap();
-        assert_eq!(
-            dm.group_info.as_ref().unwrap().group_id.as_deref(),
-            Some("abc123")
-        );
+        assert_eq!(dm.group_info.as_ref().unwrap().group_id.as_deref(), Some("abc123"));
         assert_eq!(
             dm.group_info.as_ref().unwrap().group_name.as_deref(),
             Some("Signal Crew")

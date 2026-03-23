@@ -65,10 +65,7 @@ mod tests {
     fn test_truncate_ascii_with_truncation() {
         // ASCII string longer than limit - truncates
         assert_eq!(truncate_with_ellipsis("hello world", 5), "hello...");
-        assert_eq!(
-            truncate_with_ellipsis("This is a long message", 10),
-            "This is a..."
-        );
+        assert_eq!(truncate_with_ellipsis("This is a long message", 10), "This is a...");
     }
 
     #[test]

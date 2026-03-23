@@ -99,8 +99,7 @@ async fn build_and_store_fitness_report(
     cost_tracker: Option<&CostTracker>,
 ) -> Result<FitnessReport> {
     let window = current_window()?;
-    let (subscores, confidence, evidence) =
-        compute_subscores(memory, config, cost_tracker, window).await;
+    let (subscores, confidence, evidence) = compute_subscores(memory, config, cost_tracker, window).await;
 
     let final_score = clamp_0_1(
         subscores.task_quality * WEIGHT_TASK_QUALITY
@@ -154,14 +153,11 @@ async fn compute_subscores(
     let (task_quality_score, task_quality_confidence, task_quality_evidence) =
         task_quality_from_health(&health_snapshot);
 
-    let (proactive_score, proactive_confidence, proactive_evidence) =
-        proactive_from_cron_runs(config, window);
+    let (proactive_score, proactive_confidence, proactive_evidence) = proactive_from_cron_runs(config, window);
 
-    let (learning_score, learning_confidence, learning_evidence) =
-        learning_from_memory(memory, window).await;
+    let (learning_score, learning_confidence, learning_evidence) = learning_from_memory(memory, window).await;
 
-    let (efficiency_score, efficiency_confidence, efficiency_evidence) =
-        efficiency_from_cost(cost_tracker, window.day);
+    let (efficiency_score, efficiency_confidence, efficiency_evidence) = efficiency_from_cost(cost_tracker, window.day);
 
     let no_repeat_confidence = 0.3_f64;
     let no_repeat_evidence = serde_json::json!({
@@ -233,10 +229,7 @@ fn task_quality_from_health(snapshot: &health::HealthSnapshot) -> (f64, f64, ser
     )
 }
 
-fn proactive_from_cron_runs(
-    config: &Config,
-    window: WindowBounds,
-) -> (f64, f64, serde_json::Value) {
+fn proactive_from_cron_runs(config: &Config, window: WindowBounds) -> (f64, f64, serde_json::Value) {
     let jobs = match cron::list_jobs(config) {
         Ok(jobs) => jobs,
         Err(error) => {
@@ -270,8 +263,7 @@ fn proactive_from_cron_runs(
     let mut success_count: usize = 0;
 
     for job in &heartbeat_jobs {
-        let runs = cron::list_runs(config, &job.id, config.cron.max_run_history as usize)
-            .unwrap_or_default();
+        let runs = cron::list_runs(config, &job.id, config.cron.max_run_history as usize).unwrap_or_default();
         for run in runs {
             if run.started_at < window.start || run.started_at >= window.end {
                 continue;
@@ -314,10 +306,7 @@ fn proactive_from_cron_runs(
     )
 }
 
-async fn learning_from_memory(
-    memory: &dyn Memory,
-    window: WindowBounds,
-) -> (f64, f64, serde_json::Value) {
+async fn learning_from_memory(memory: &dyn Memory, window: WindowBounds) -> (f64, f64, serde_json::Value) {
     let mut entries = match memory.list(None, Some(SELF_SYSTEM_SESSION_ID)).await {
         Ok(entries) => entries,
         Err(error) => {
@@ -378,10 +367,7 @@ async fn learning_from_memory(
     )
 }
 
-fn efficiency_from_cost(
-    cost_tracker: Option<&CostTracker>,
-    day: NaiveDate,
-) -> (f64, f64, serde_json::Value) {
+fn efficiency_from_cost(cost_tracker: Option<&CostTracker>, day: NaiveDate) -> (f64, f64, serde_json::Value) {
     let Some(tracker) = cost_tracker else {
         return (
             EFFICIENCY_FALLBACK_SCORE,
@@ -433,19 +419,13 @@ fn efficiency_from_cost(
 fn is_heartbeat_job(job: &cron::CronJob) -> bool {
     let name = job.name.as_deref().unwrap_or_default().to_ascii_lowercase();
     let command = job.command.to_ascii_lowercase();
-    let prompt = job
-        .prompt
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let prompt = job.prompt.as_deref().unwrap_or_default().to_ascii_lowercase();
 
     name.contains("heartbeat") || command.contains("heartbeat") || prompt.contains("heartbeat")
 }
 
 fn parse_rfc3339_utc(raw: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(raw).ok().map(|dt| dt.with_timezone(&Utc))
 }
 
 fn current_window() -> Result<WindowBounds> {
@@ -464,10 +444,7 @@ fn weighted_confidence(inputs: &[(f64, f64)]) -> f64 {
     if weight_sum <= 0.0 {
         return 0.0;
     }
-    let weighted: f64 = inputs
-        .iter()
-        .map(|(value, weight)| clamp_0_1(*value) * *weight)
-        .sum();
+    let weighted: f64 = inputs.iter().map(|(value, weight)| clamp_0_1(*value) * *weight).sum();
     clamp_0_1(weighted / weight_sum)
 }
 
@@ -500,9 +477,7 @@ mod tests {
         let config = test_config(&tmp);
         let memory = SqliteMemory::new(&config.workspace_dir).unwrap();
 
-        let report = build_and_store_fitness_report(&memory, &config, None)
-            .await
-            .unwrap();
+        let report = build_and_store_fitness_report(&memory, &config, None).await.unwrap();
 
         assert_eq!(report.version, FITNESS_REPORT_VERSION);
         assert!(report.final_score >= 0.0 && report.final_score <= 1.0);
@@ -532,17 +507,9 @@ mod tests {
             last_output: None,
         };
 
-        assert!(is_heartbeat_job(&mk(
-            Some("daily-heartbeat"),
-            "echo ok",
-            None
-        )));
+        assert!(is_heartbeat_job(&mk(Some("daily-heartbeat"), "echo ok", None)));
         assert!(is_heartbeat_job(&mk(None, "run heartbeat check", None)));
-        assert!(is_heartbeat_job(&mk(
-            None,
-            "echo ok",
-            Some("heartbeat task")
-        )));
+        assert!(is_heartbeat_job(&mk(None, "echo ok", Some("heartbeat task"))));
         assert!(!is_heartbeat_job(&mk(
             Some("daily-check"),
             "echo ok",
@@ -572,12 +539,7 @@ mod tests {
                 Ok(())
             }
 
-            async fn recall(
-                &self,
-                _query: &str,
-                _limit: usize,
-                _session_id: Option<&str>,
-            ) -> Result<Vec<MemoryEntry>> {
+            async fn recall(&self, _query: &str, _limit: usize, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
                 Ok(Vec::new())
             }
 
@@ -593,9 +555,7 @@ mod tests {
                 Ok(self
                     .entries
                     .iter()
-                    .filter(|entry| {
-                        session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid))
-                    })
+                    .filter(|entry| session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid)))
                     .cloned()
                     .collect())
             }
@@ -725,12 +685,7 @@ mod tests {
                 Ok(())
             }
 
-            async fn recall(
-                &self,
-                _query: &str,
-                _limit: usize,
-                _session_id: Option<&str>,
-            ) -> Result<Vec<MemoryEntry>> {
+            async fn recall(&self, _query: &str, _limit: usize, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
                 Ok(Vec::new())
             }
 
@@ -860,9 +815,7 @@ mod tests {
             "{\"logged_at\":\"2026-02-23T02:00:00Z\",\"key\":\"router\",\"proposal_text\":\"p\",\"expected_outcome\":\"o\"}\n",
             "- **user/note**: external\n"
         );
-        tokio::fs::write(tmp.path().join("MEMORY.md"), content)
-            .await
-            .unwrap();
+        tokio::fs::write(tmp.path().join("MEMORY.md"), content).await.unwrap();
 
         let start = Utc.with_ymd_and_hms(2026, 2, 23, 0, 0, 0).unwrap();
         let end = start + Duration::days(1);

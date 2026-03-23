@@ -72,11 +72,7 @@ pub trait Tool: Send + Sync {
     }
 
     /// Execute by public tool name. Default maps to `execute`.
-    async fn execute_named(
-        &self,
-        name: &str,
-        args: serde_json::Value,
-    ) -> anyhow::Result<ToolResult> {
+    async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if !self.supports_name(name) {
             bail!("Tool '{}' does not handle name '{}'", self.name(), name);
         }

@@ -1,11 +1,8 @@
 use super::embeddings::EmbeddingProvider;
-use super::principal::{
-    ChatType, MemoryWriteContext, Principal, Role, Visibility, classify_memory, resolve_principal,
-};
+use super::principal::{ChatType, MemoryWriteContext, Principal, Role, Visibility, classify_memory, resolve_principal};
 use super::topic::resolve_topic;
 use super::traits::{
-    ConversationSessionSummary, ConversationTurn, Memory, MemoryCategory, MemoryEntry,
-    validate_memory_write_target,
+    ConversationSessionSummary, ConversationTurn, Memory, MemoryCategory, MemoryEntry, validate_memory_write_target,
 };
 use super::vector;
 use anyhow::Context;
@@ -179,10 +176,7 @@ impl SqliteMemory {
     }
 
     /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
-    fn open_connection(
-        db_path: &Path,
-        open_timeout_secs: Option<u64>,
-    ) -> anyhow::Result<Connection> {
+    fn open_connection(db_path: &Path, open_timeout_secs: Option<u64>) -> anyhow::Result<Connection> {
         let path_buf = db_path.to_path_buf();
 
         let conn = if let Some(secs) = open_timeout_secs {
@@ -448,24 +442,12 @@ impl SqliteMemory {
 
         // Migration: add missing columns for backward compatibility.
         let missing_columns = [
-            (
-                "session_id",
-                "ALTER TABLE memories ADD COLUMN session_id TEXT",
-            ),
+            ("session_id", "ALTER TABLE memories ADD COLUMN session_id TEXT"),
             ("channel", "ALTER TABLE memories ADD COLUMN channel TEXT"),
-            (
-                "chat_type",
-                "ALTER TABLE memories ADD COLUMN chat_type TEXT",
-            ),
+            ("chat_type", "ALTER TABLE memories ADD COLUMN chat_type TEXT"),
             ("chat_id", "ALTER TABLE memories ADD COLUMN chat_id TEXT"),
-            (
-                "sender_id",
-                "ALTER TABLE memories ADD COLUMN sender_id TEXT",
-            ),
-            (
-                "raw_sender",
-                "ALTER TABLE memories ADD COLUMN raw_sender TEXT",
-            ),
+            ("sender_id", "ALTER TABLE memories ADD COLUMN sender_id TEXT"),
+            ("raw_sender", "ALTER TABLE memories ADD COLUMN raw_sender TEXT"),
             ("topic_id", "ALTER TABLE memories ADD COLUMN topic_id TEXT"),
             (
                 "visibility",
@@ -495,9 +477,7 @@ impl SqliteMemory {
                     Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
                         if msg.contains("duplicate column name") =>
                     {
-                        tracing::debug!(
-                            "Column memories.{name} already exists (concurrent migration): {err}"
-                        );
+                        tracing::debug!("Column memories.{name} already exists (concurrent migration): {err}");
                     }
                     Err(e) => {
                         return Err(anyhow::anyhow!("Failed to add memories.{name}: {e}"));
@@ -768,8 +748,7 @@ impl SqliteMemory {
         let now_c = now.clone();
         let cached = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<f32>>> {
             let conn = conn.lock();
-            let mut stmt =
-                conn.prepare("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")?;
+            let mut stmt = conn.prepare("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")?;
             let blob: Option<Vec<u8>> = stmt.query_row(params![hash_c], |row| row.get(0)).ok();
             if let Some(bytes) = blob {
                 conn.execute(
@@ -803,11 +782,7 @@ impl SqliteMemory {
             )?;
             // Two-step LRU eviction: count first, then delete oldest if over limit.
             // Avoids relying on MAX() as a scalar function in a LIMIT clause.
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM embedding_cache",
-                [],
-                |row| row.get(0),
-            )?;
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM embedding_cache", [], |row| row.get(0))?;
             if count > cache_max {
                 let to_delete = count - cache_max;
                 conn.execute(
@@ -826,11 +801,7 @@ impl SqliteMemory {
     }
 
     /// FTS5 BM25 keyword search
-    fn fts5_search(
-        conn: &Connection,
-        query: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<(String, f32)>> {
+    fn fts5_search(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<(String, f32)>> {
         // Escape FTS5 special chars and build query
         let fts_query: String = super::topic::build_safe_fts_query(query);
 
@@ -890,8 +861,7 @@ impl SqliteMemory {
         }
 
         let mut stmt = conn.prepare(&sql)?;
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(AsRef::as_ref).collect();
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(AsRef::as_ref).collect();
         let rows = stmt.query_map(params_ref.as_slice(), |row| {
             let id: String = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
@@ -941,9 +911,7 @@ impl SqliteMemory {
                  WHERE embedding IS NULL
                  AND category NOT IN ('daily', 'conversation')",
             )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
             Ok::<_, anyhow::Error>(rows.filter_map(std::result::Result::ok).collect())
         })
         .await??;
@@ -956,10 +924,7 @@ impl SqliteMemory {
                 let id = id.clone();
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                     let conn = conn.lock();
-                    conn.execute(
-                        "UPDATE memories SET embedding = ?1 WHERE id = ?2",
-                        params![bytes, id],
-                    )?;
+                    conn.execute("UPDATE memories SET embedding = ?1 WHERE id = ?2", params![bytes, id])?;
                     Ok(())
                 })
                 .await??;
@@ -984,8 +949,7 @@ impl Memory for SqliteMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.store_internal(key, content, category, session_id, None)
-            .await
+        self.store_internal(key, content, category, session_id, None).await
     }
 
     async fn store_with_context(
@@ -996,16 +960,10 @@ impl Memory for SqliteMemory {
         session_id: Option<&str>,
         context: Option<&MemoryWriteContext>,
     ) -> anyhow::Result<()> {
-        self.store_internal(key, content, category, session_id, context)
-            .await
+        self.store_internal(key, content, category, session_id, context).await
     }
 
-    async fn recall(
-        &self,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
+    async fn recall(&self, query: &str, limit: usize, session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -1057,13 +1015,7 @@ impl Memory for SqliteMemory {
                     })
                     .collect::<Vec<_>>()
             } else {
-                vector::hybrid_merge(
-                    &vector_results,
-                    &keyword_results,
-                    vector_weight,
-                    keyword_weight,
-                    limit,
-                )
+                vector::hybrid_merge(&vector_results, &keyword_results, vector_weight, keyword_weight, limit)
             };
 
             // Fetch full entries for merged results in a single query
@@ -1083,8 +1035,7 @@ impl Memory for SqliteMemory {
                     .iter()
                     .map(|s| Box::new(s.id.clone()) as Box<dyn rusqlite::types::ToSql>)
                     .collect();
-                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                    id_params.iter().map(AsRef::as_ref).collect();
+                let params_ref: Vec<&dyn rusqlite::types::ToSql> = id_params.iter().map(AsRef::as_ref).collect();
                 let rows = stmt.query_map(params_ref.as_slice(), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -1104,9 +1055,7 @@ impl Memory for SqliteMemory {
                 }
 
                 for scored in &merged {
-                    if let Some((key, content, cat, ts, sid, useful_count)) =
-                        entry_map.remove(&scored.id)
-                    {
+                    if let Some((key, content, cat, ts, sid, useful_count)) = entry_map.remove(&scored.id) {
                         let entry = MemoryEntry {
                             id: scored.id.clone(),
                             key,
@@ -1148,9 +1097,7 @@ impl Memory for SqliteMemory {
                     let conditions: Vec<String> = keywords
                         .iter()
                         .enumerate()
-                        .map(|(i, _)| {
-                            format!("(content LIKE ?{} OR key LIKE ?{})", i * 2 + 1, i * 2 + 2)
-                        })
+                        .map(|(i, _)| format!("(content LIKE ?{} OR key LIKE ?{})", i * 2 + 1, i * 2 + 2))
                         .collect();
                     let where_clause = conditions.join(" OR ");
                     let sql = format!(
@@ -1168,8 +1115,7 @@ impl Memory for SqliteMemory {
                     }
                     #[allow(clippy::cast_possible_wrap)]
                     param_values.push(Box::new(limit as i64));
-                    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                        param_values.iter().map(AsRef::as_ref).collect();
+                    let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(AsRef::as_ref).collect();
                     let rows = stmt.query_map(params_ref.as_slice(), |row| {
                         Ok(MemoryEntry {
                             id: row.get(0)?,
@@ -1354,8 +1300,7 @@ impl Memory for SqliteMemory {
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = conn.lock();
-            let count: i64 =
-                conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(count as usize)
         })
@@ -1407,13 +1352,7 @@ impl Memory for SqliteMemory {
             tx.execute(
                 "INSERT INTO conversation_turns (session_key, role, content, timestamp, message_id)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    &session_key,
-                    &role,
-                    &content,
-                    &timestamp,
-                    message_id.as_deref()
-                ],
+                params![&session_key, &role, &content, &timestamp, message_id.as_deref()],
             )?;
             tx.commit()?;
             Ok(())
@@ -1492,42 +1431,37 @@ impl Memory for SqliteMemory {
         .await?
     }
 
-    async fn get_conversation_session(
-        &self,
-        session_key: &str,
-    ) -> anyhow::Result<Option<ConversationSessionSummary>> {
+    async fn get_conversation_session(&self, session_key: &str) -> anyhow::Result<Option<ConversationSessionSummary>> {
         let conn = self.conn.clone();
         let session_key = session_key.to_string();
 
-        tokio::task::spawn_blocking(
-            move || -> anyhow::Result<Option<ConversationSessionSummary>> {
-                let conn = conn.lock();
-                let mut stmt = conn.prepare(
-                    "SELECT session_key, channel, sender, created_at, updated_at, message_count, last_message_preview
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ConversationSessionSummary>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT session_key, channel, sender, created_at, updated_at, message_count, last_message_preview
                      FROM sessions WHERE session_key = ?1",
-                )?;
-                let row = stmt.query_row(params![session_key], |row| {
-                    let message_count: i64 = row.get(5)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    let message_count = message_count.max(0) as u64;
-                    Ok(ConversationSessionSummary {
-                        session_key: row.get(0)?,
-                        channel: row.get(1)?,
-                        sender: row.get(2)?,
-                        created_at: row.get(3)?,
-                        updated_at: row.get(4)?,
-                        message_count,
-                        last_message_preview: row.get(6)?,
-                    })
-                });
+            )?;
+            let row = stmt.query_row(params![session_key], |row| {
+                let message_count: i64 = row.get(5)?;
+                #[allow(clippy::cast_sign_loss)]
+                let message_count = message_count.max(0) as u64;
+                Ok(ConversationSessionSummary {
+                    session_key: row.get(0)?,
+                    channel: row.get(1)?,
+                    sender: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                    message_count,
+                    last_message_preview: row.get(6)?,
+                })
+            });
 
-                match row {
-                    Ok(summary) => Ok(Some(summary)),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                    Err(error) => Err(error.into()),
-                }
-            },
-        )
+            match row {
+                Ok(summary) => Ok(Some(summary)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
         .await?
     }
 
@@ -1622,10 +1556,7 @@ impl Memory for SqliteMemory {
                     std::collections::HashMap::new();
                 for row in rows {
                     let turn = row?;
-                    histories
-                        .entry(turn.session_key.clone())
-                        .or_default()
-                        .push(turn);
+                    histories.entry(turn.session_key.clone()).or_default().push(turn);
                 }
                 Ok(histories)
             },
@@ -1680,9 +1611,7 @@ mod tests {
         let db_path = tmp.path().join("workers").join("w1").join("brain.db");
 
         let mem = SqliteMemory::new_with_path(db_path.clone()).unwrap();
-        mem.store("k1", "v1", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store("k1", "v1", MemoryCategory::Core, None).await.unwrap();
 
         assert!(db_path.exists());
         assert_eq!(mem.name(), "sqlite");
@@ -1694,9 +1623,7 @@ mod tests {
         let db_path = tmp.path().join("memory").join("brain.db");
         let mem = SqliteMemory::new_with_path_and_acl(db_path, true).unwrap();
 
-        mem.store("k1", "sensitive", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store("k1", "sensitive", MemoryCategory::Core, None).await.unwrap();
 
         assert!(mem.get("k1").await.unwrap().is_some());
         assert!(!tmp.path().join("MEMORY.md").exists());
@@ -1753,22 +1680,13 @@ mod tests {
         mem.store("b", "Python is interpreted", MemoryCategory::Core, None)
             .await
             .unwrap();
-        mem.store(
-            "c",
-            "Rust has zero-cost abstractions",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("c", "Rust has zero-cost abstractions", MemoryCategory::Core, None)
+            .await
+            .unwrap();
 
         let results = mem.recall("Rust", 10, None).await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(
-            results
-                .iter()
-                .all(|r| r.content.to_lowercase().contains("rust"))
-        );
+        assert!(results.iter().all(|r| r.content.to_lowercase().contains("rust")));
     }
 
     #[tokio::test]
@@ -1790,9 +1708,7 @@ mod tests {
     #[tokio::test]
     async fn sqlite_recall_no_match() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "Rust rocks", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store("a", "Rust rocks", MemoryCategory::Core, None).await.unwrap();
         let results = mem.recall("javascript", 10, None).await.unwrap();
         assert!(results.is_empty());
     }
@@ -1820,12 +1736,8 @@ mod tests {
     #[tokio::test]
     async fn sqlite_list_all() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "one", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        mem.store("b", "two", MemoryCategory::Daily, None)
-            .await
-            .unwrap();
+        mem.store("a", "one", MemoryCategory::Core, None).await.unwrap();
+        mem.store("b", "two", MemoryCategory::Daily, None).await.unwrap();
         mem.store("c", "three", MemoryCategory::Conversation, None)
             .await
             .unwrap();
@@ -1837,15 +1749,9 @@ mod tests {
     #[tokio::test]
     async fn sqlite_list_by_category() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "core1", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        mem.store("b", "core2", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        mem.store("c", "daily1", MemoryCategory::Daily, None)
-            .await
-            .unwrap();
+        mem.store("a", "core1", MemoryCategory::Core, None).await.unwrap();
+        mem.store("b", "core2", MemoryCategory::Core, None).await.unwrap();
+        mem.store("c", "daily1", MemoryCategory::Daily, None).await.unwrap();
 
         let core = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
         assert_eq!(core.len(), 2);
@@ -1919,22 +1825,12 @@ mod tests {
         )
         .await
         .unwrap();
-        mem.store(
-            "b",
-            "Python is great for scripting",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
-        mem.store(
-            "c",
-            "Rust and Rust and Rust everywhere",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("b", "Python is great for scripting", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("c", "Rust and Rust and Rust everywhere", MemoryCategory::Core, None)
+            .await
+            .unwrap();
 
         let results = mem.recall("Rust", 10, None).await.unwrap();
         assert!(results.len() >= 2);
@@ -1970,9 +1866,7 @@ mod tests {
     #[tokio::test]
     async fn recall_empty_query_returns_empty() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "data", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store("a", "data", MemoryCategory::Core, None).await.unwrap();
         let results = mem.recall("", 10, None).await.unwrap();
         assert!(results.is_empty());
     }
@@ -1980,9 +1874,7 @@ mod tests {
     #[tokio::test]
     async fn recall_whitespace_query_returns_empty() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "data", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store("a", "data", MemoryCategory::Core, None).await.unwrap();
         let results = mem.recall("   ", 10, None).await.unwrap();
         assert!(results.is_empty());
     }
@@ -2025,14 +1917,9 @@ mod tests {
         mem.store("daily_key", "daily content", MemoryCategory::Daily, None)
             .await
             .unwrap();
-        mem.store(
-            "conv_key",
-            "conversation content",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("conv_key", "conversation content", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
         mem.store(
             "custom_key",
             "custom content",
@@ -2046,32 +1933,24 @@ mod tests {
 
         let conn = mem.conn.lock();
         let core_emb: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT embedding FROM memories WHERE key = ?1",
-                ["core_key"],
-                |row| row.get(0),
-            )
+            .query_row("SELECT embedding FROM memories WHERE key = ?1", ["core_key"], |row| {
+                row.get(0)
+            })
             .unwrap();
         let daily_emb: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT embedding FROM memories WHERE key = ?1",
-                ["daily_key"],
-                |row| row.get(0),
-            )
+            .query_row("SELECT embedding FROM memories WHERE key = ?1", ["daily_key"], |row| {
+                row.get(0)
+            })
             .unwrap();
         let conv_emb: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT embedding FROM memories WHERE key = ?1",
-                ["conv_key"],
-                |row| row.get(0),
-            )
+            .query_row("SELECT embedding FROM memories WHERE key = ?1", ["conv_key"], |row| {
+                row.get(0)
+            })
             .unwrap();
         let custom_emb: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT embedding FROM memories WHERE key = ?1",
-                ["custom_key"],
-                |row| row.get(0),
-            )
+            .query_row("SELECT embedding FROM memories WHERE key = ?1", ["custom_key"], |row| {
+                row.get(0)
+            })
             .unwrap();
 
         assert!(core_emb.is_some());
@@ -2102,14 +1981,9 @@ mod tests {
         mem.store("daily_key", "daily content", MemoryCategory::Daily, None)
             .await
             .unwrap();
-        mem.store(
-            "conv_key",
-            "conversation content",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("conv_key", "conversation content", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
         mem.store(
             "custom_key",
             "custom content",
@@ -2122,8 +1996,7 @@ mod tests {
         calls.store(0, Ordering::SeqCst);
         {
             let conn = mem.conn.lock();
-            conn.execute("UPDATE memories SET embedding = NULL", [])
-                .unwrap();
+            conn.execute("UPDATE memories SET embedding = NULL", []).unwrap();
         }
 
         let reindexed = mem.reindex().await.unwrap();
@@ -2132,32 +2005,24 @@ mod tests {
 
         let conn = mem.conn.lock();
         let core_emb: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT embedding FROM memories WHERE key = ?1",
-                ["core_key"],
-                |row| row.get(0),
-            )
+            .query_row("SELECT embedding FROM memories WHERE key = ?1", ["core_key"], |row| {
+                row.get(0)
+            })
             .unwrap();
         let daily_emb: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT embedding FROM memories WHERE key = ?1",
-                ["daily_key"],
-                |row| row.get(0),
-            )
+            .query_row("SELECT embedding FROM memories WHERE key = ?1", ["daily_key"], |row| {
+                row.get(0)
+            })
             .unwrap();
         let conv_emb: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT embedding FROM memories WHERE key = ?1",
-                ["conv_key"],
-                |row| row.get(0),
-            )
+            .query_row("SELECT embedding FROM memories WHERE key = ?1", ["conv_key"], |row| {
+                row.get(0)
+            })
             .unwrap();
         let custom_emb: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT embedding FROM memories WHERE key = ?1",
-                ["custom_key"],
-                |row| row.get(0),
-            )
+            .query_row("SELECT embedding FROM memories WHERE key = ?1", ["custom_key"], |row| {
+                row.get(0)
+            })
             .unwrap();
 
         assert!(core_emb.is_some());
@@ -2211,14 +2076,9 @@ mod tests {
     #[tokio::test]
     async fn fts5_syncs_on_insert() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store(
-            "test_key",
-            "unique_searchterm_xyz",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("test_key", "unique_searchterm_xyz", MemoryCategory::Core, None)
+            .await
+            .unwrap();
 
         let conn = mem.conn.lock();
         let count: i64 = conn
@@ -2234,14 +2094,9 @@ mod tests {
     #[tokio::test]
     async fn fts5_syncs_on_delete() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store(
-            "del_key",
-            "deletable_content_abc",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("del_key", "deletable_content_abc", MemoryCategory::Core, None)
+            .await
+            .unwrap();
         mem.forget("del_key").await.unwrap();
 
         let conn = mem.conn.lock();
@@ -2258,14 +2113,9 @@ mod tests {
     #[tokio::test]
     async fn fts5_syncs_on_update() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store(
-            "upd_key",
-            "original_content_111",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("upd_key", "original_content_111", MemoryCategory::Core, None)
+            .await
+            .unwrap();
         mem.store("upd_key", "updated_content_222", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -2315,10 +2165,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
         let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000, Some(5));
-        assert!(
-            mem.is_ok(),
-            "open with 5s timeout should succeed on fast path"
-        );
+        assert!(mem.is_ok(), "open with 5s timeout should succeed on fast path");
         assert_eq!(mem.unwrap().name(), "sqlite");
     }
 
@@ -2334,14 +2181,9 @@ mod tests {
             Some(2),
         )
         .unwrap();
-        mem.store(
-            "timeout_key",
-            "value with timeout",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("timeout_key", "value with timeout", MemoryCategory::Core, None)
+            .await
+            .unwrap();
         let entry = mem.get("timeout_key").await.unwrap().unwrap();
         assert_eq!(entry.content, "value with timeout");
     }
@@ -2455,10 +2297,7 @@ mod tests {
             .await
             .unwrap();
         // Should not crash or leak data
-        let results = mem
-            .recall("'; DROP TABLE memories; --", 10, None)
-            .await
-            .unwrap();
+        let results = mem.recall("'; DROP TABLE memories; --", 10, None).await.unwrap();
         assert!(results.len() <= 10);
         // Table should still exist
         assert_eq!(mem.count().await.unwrap(), 1);
@@ -2469,9 +2308,7 @@ mod tests {
     #[tokio::test]
     async fn store_empty_content() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("empty", "", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store("empty", "", MemoryCategory::Core, None).await.unwrap();
         let entry = mem.get("empty").await.unwrap().unwrap();
         assert_eq!(entry.content, "");
     }
@@ -2500,14 +2337,9 @@ mod tests {
     #[tokio::test]
     async fn store_unicode_and_emoji() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store(
-            "emoji_key_🦀",
-            "こんにちは 🚀 Ñoño",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("emoji_key_🦀", "こんにちは 🚀 Ñoño", MemoryCategory::Core, None)
+            .await
+            .unwrap();
         let entry = mem.get("emoji_key_🦀").await.unwrap().unwrap();
         assert_eq!(entry.content, "こんにちは 🚀 Ñoño");
     }
@@ -2593,9 +2425,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         {
             let mem = SqliteMemory::new(tmp.path()).unwrap();
-            mem.store("k1", "v1", MemoryCategory::Core, None)
-                .await
-                .unwrap();
+            mem.store("k1", "v1", MemoryCategory::Core, None).await.unwrap();
         }
         // Open again — init_schema runs again on existing DB
         let mem2 = SqliteMemory::new(tmp.path()).unwrap();
@@ -2603,9 +2433,7 @@ mod tests {
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().content, "v1");
         // Store more data — should work fine
-        mem2.store("k2", "v2", MemoryCategory::Daily, None)
-            .await
-            .unwrap();
+        mem2.store("k2", "v2", MemoryCategory::Daily, None).await.unwrap();
         assert_eq!(mem2.count().await.unwrap(), 2);
     }
 
@@ -2623,20 +2451,12 @@ mod tests {
     #[tokio::test]
     async fn forget_then_recall_no_ghost_results() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store(
-            "ghost",
-            "phantom memory content",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("ghost", "phantom memory content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
         mem.forget("ghost").await.unwrap();
         let results = mem.recall("phantom memory", 10, None).await.unwrap();
-        assert!(
-            results.is_empty(),
-            "Deleted memory should not appear in recall"
-        );
+        assert!(results.is_empty(), "Deleted memory should not appear in recall");
     }
 
     #[tokio::test]
@@ -2727,25 +2547,13 @@ mod tests {
     #[tokio::test]
     async fn list_custom_category() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store(
-            "c1",
-            "custom1",
-            MemoryCategory::Custom("project".into()),
-            None,
-        )
-        .await
-        .unwrap();
-        mem.store(
-            "c2",
-            "custom2",
-            MemoryCategory::Custom("project".into()),
-            None,
-        )
-        .await
-        .unwrap();
-        mem.store("c3", "other", MemoryCategory::Core, None)
+        mem.store("c1", "custom1", MemoryCategory::Custom("project".into()), None)
             .await
             .unwrap();
+        mem.store("c2", "custom2", MemoryCategory::Custom("project".into()), None)
+            .await
+            .unwrap();
+        mem.store("c3", "other", MemoryCategory::Core, None).await.unwrap();
 
         let project = mem
             .list(Some(&MemoryCategory::Custom("project".into())), None)
@@ -2792,9 +2600,7 @@ mod tests {
         mem.store("k2", "beta fact", MemoryCategory::Core, Some("sess-b"))
             .await
             .unwrap();
-        mem.store("k3", "gamma fact", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store("k3", "gamma fact", MemoryCategory::Core, None).await.unwrap();
 
         // Recall without session filter returns all matching entries
         let results = mem.recall("fact", 10, None).await.unwrap();
@@ -2804,14 +2610,9 @@ mod tests {
     #[tokio::test]
     async fn cross_session_recall_isolation() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store(
-            "secret",
-            "session A secret data",
-            MemoryCategory::Core,
-            Some("sess-a"),
-        )
-        .await
-        .unwrap();
+        mem.store("secret", "session A secret data", MemoryCategory::Core, Some("sess-a"))
+            .await
+            .unwrap();
 
         // Session B cannot see session A data
         let results = mem.recall("secret", 10, Some("sess-b")).await.unwrap();
@@ -2834,24 +2635,15 @@ mod tests {
         mem.store("k3", "b1", MemoryCategory::Core, Some("sess-b"))
             .await
             .unwrap();
-        mem.store("k4", "none1", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store("k4", "none1", MemoryCategory::Core, None).await.unwrap();
 
         // List with session-a filter
         let results = mem.list(None, Some("sess-a")).await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(
-            results
-                .iter()
-                .all(|e| e.session_id.as_deref() == Some("sess-a"))
-        );
+        assert!(results.iter().all(|e| e.session_id.as_deref() == Some("sess-a")));
 
         // List with session-a + category filter
-        let results = mem
-            .list(Some(&MemoryCategory::Core), Some("sess-a"))
-            .await
-            .unwrap();
+        let results = mem.list(Some(&MemoryCategory::Core), Some("sess-a")).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "k1");
     }
@@ -2905,10 +2697,7 @@ mod tests {
         }
 
         let count = mem.count().await.unwrap();
-        assert_eq!(
-            count, 10,
-            "all 10 concurrent writes must succeed without data loss"
-        );
+        assert_eq!(count, 10, "all 10 concurrent writes must succeed without data loss");
     }
 
     #[tokio::test]
@@ -2935,14 +2724,9 @@ mod tests {
         for i in 0..5 {
             let mem = std::sync::Arc::clone(&mem);
             handles.push(tokio::spawn(async move {
-                mem.store(
-                    &format!("key_{i}"),
-                    &format!("val_{i}"),
-                    MemoryCategory::Core,
-                    None,
-                )
-                .await
-                .unwrap();
+                mem.store(&format!("key_{i}"), &format!("val_{i}"), MemoryCategory::Core, None)
+                    .await
+                    .unwrap();
             }));
         }
 
@@ -2979,9 +2763,7 @@ mod tests {
     #[tokio::test]
     async fn sqlite_reindex_idempotent() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("x", "test data", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store("x", "test data", MemoryCategory::Core, None).await.unwrap();
 
         // Multiple reindex calls should be safe
         mem.reindex().await.unwrap();
@@ -3026,10 +2808,7 @@ mod tests {
         assert_eq!(sessions[0].updated_at, "2026-03-05T00:00:01Z");
         assert_eq!(sessions[0].last_message_preview, "first assistant message");
 
-        let turns = mem
-            .list_conversation_turns("signal_alice", 50, 0)
-            .await
-            .unwrap();
+        let turns = mem.list_conversation_turns("signal_alice", 50, 0).await.unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].timestamp, "2026-03-05T00:00:00Z");
@@ -3082,10 +2861,7 @@ mod tests {
             .unwrap();
         }
 
-        let turns = mem
-            .list_conversation_turns("signal_latest_window", 2, 0)
-            .await
-            .unwrap();
+        let turns = mem.list_conversation_turns("signal_latest_window", 2, 0).await.unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].content, "turn-2");
         assert_eq!(turns[1].content, "turn-3");

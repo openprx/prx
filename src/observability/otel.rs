@@ -68,8 +68,7 @@ impl OtelObserver {
             .build()
             .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
 
-        let metric_reader =
-            opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+        let metric_reader = opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
 
         let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
             .with_reader(metric_reader)
@@ -214,9 +213,7 @@ impl Observer for OtelObserver {
                     ],
                 );
             }
-            ObserverEvent::LlmRequest { .. }
-            | ObserverEvent::ToolCallStart { .. }
-            | ObserverEvent::TurnComplete => {}
+            ObserverEvent::LlmRequest { .. } | ObserverEvent::ToolCallStart { .. } | ObserverEvent::TurnComplete => {}
             ObserverEvent::LlmResponse {
                 provider,
                 model,
@@ -234,9 +231,7 @@ impl Observer for OtelObserver {
                 self.llm_duration.record(secs, &attrs);
 
                 // Create a completed span for visibility in trace backends.
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
+                let start_time = SystemTime::now().checked_sub(*duration).unwrap_or(SystemTime::now());
                 let mut span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("llm.call")
                         .with_kind(SpanKind::Internal)
@@ -263,9 +258,7 @@ impl Observer for OtelObserver {
                 cost_usd,
             } => {
                 let secs = duration.as_secs_f64();
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
+                let start_time = SystemTime::now().checked_sub(*duration).unwrap_or(SystemTime::now());
 
                 // Create a completed span with correct timing
                 let mut span = tracer.build(
@@ -302,15 +295,9 @@ impl Observer for OtelObserver {
                 success,
             } => {
                 let secs = duration.as_secs_f64();
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
+                let start_time = SystemTime::now().checked_sub(*duration).unwrap_or(SystemTime::now());
 
-                let status = if *success {
-                    Status::Ok
-                } else {
-                    Status::error("")
-                };
+                let status = if *success { Status::Ok } else { Status::error("") };
 
                 let mut span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("tool.call")
@@ -330,8 +317,7 @@ impl Observer for OtelObserver {
                     KeyValue::new("success", success.to_string()),
                 ];
                 self.tool_calls.add(1, &attrs);
-                self.tool_duration
-                    .record(secs, &[KeyValue::new("tool", tool.clone())]);
+                self.tool_duration.record(secs, &[KeyValue::new("tool", tool.clone())]);
             }
             ObserverEvent::ToolBatch {
                 rollout_stage,
@@ -379,8 +365,7 @@ impl Observer for OtelObserver {
                 span.set_status(Status::error(message.clone()));
                 span.end();
 
-                self.errors
-                    .add(1, &[KeyValue::new("component", component.clone())]);
+                self.errors.add(1, &[KeyValue::new("component", component.clone())]);
             }
         }
     }
@@ -477,9 +462,7 @@ mod tests {
             tokens_used: None,
             cost_usd: None,
         });
-        obs.record_event(&ObserverEvent::ToolCallStart {
-            tool: "shell".into(),
-        });
+        obs.record_event(&ObserverEvent::ToolCallStart { tool: "shell".into() });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
             duration: Duration::from_millis(10),

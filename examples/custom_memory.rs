@@ -33,8 +33,7 @@ pub struct MemoryEntry {
 #[async_trait]
 pub trait Memory: Send + Sync {
     fn name(&self) -> &str;
-    async fn store(&self, key: &str, content: &str, category: MemoryCategory)
-    -> anyhow::Result<()>;
+    async fn store(&self, key: &str, content: &str, category: MemoryCategory) -> anyhow::Result<()>;
     async fn recall(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryEntry>>;
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>>;
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;
@@ -68,12 +67,7 @@ impl Memory for InMemoryBackend {
         "in-memory"
     }
 
-    async fn store(
-        &self,
-        key: &str,
-        content: &str,
-        category: MemoryCategory,
-    ) -> anyhow::Result<()> {
+    async fn store(&self, key: &str, content: &str, category: MemoryCategory) -> anyhow::Result<()> {
         let entry = MemoryEntry {
             id: uuid::Uuid::new_v4().to_string(),
             key: key.to_string(),
@@ -131,9 +125,7 @@ async fn main() -> anyhow::Result<()> {
     brain
         .store("user_lang", "User prefers Rust", MemoryCategory::Core)
         .await?;
-    brain
-        .store("user_tz", "Timezone is EST", MemoryCategory::Core)
-        .await?;
+    brain.store("user_tz", "Timezone is EST", MemoryCategory::Core).await?;
     brain
         .store(
             "today_note",

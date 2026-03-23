@@ -77,9 +77,6 @@ mod tests {
     #[test]
     fn infer_long_doc_from_length() {
         let message = "a".repeat(2_100);
-        assert_eq!(
-            infer_router_intent(TaskIntent::Stream, &message),
-            RouterIntent::LongDoc
-        );
+        assert_eq!(infer_router_intent(TaskIntent::Stream, &message), RouterIntent::LongDoc);
     }
 }

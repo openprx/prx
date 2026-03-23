@@ -166,10 +166,7 @@ fn is_image_upload(content_type: &str, file_name: &str) -> bool {
 
 fn is_video_upload(content_type: &str, file_name: &str) -> bool {
     content_type.starts_with("video/")
-        || has_extension(
-            file_name,
-            &[".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv", ".ogg"],
-        )
+        || has_extension(file_name, &[".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv", ".ogg"])
 }
 
 fn media_content_type_for_path(path: &StdPath) -> &'static str {
@@ -207,10 +204,7 @@ async fn parse_json_message(state: &AppState, request: Request) -> Result<String
 
     let message = payload.message.trim().to_string();
     if message.is_empty() {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "message must not be empty",
-        ));
+        return Err(json_error(StatusCode::BAD_REQUEST, "message must not be empty"));
     }
 
     Ok(message)
@@ -228,22 +222,18 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
 
     fs::create_dir_all(&uploads_root).await.map_err(|error| {
         tracing::error!("Failed to create uploads directory: {error}");
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to prepare uploads directory",
-        )
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to prepare uploads directory")
     })?;
 
     let mut message = String::new();
     let mut attachments = Vec::new();
     let mut file_count = 0usize;
 
-    while let Some(field) = multipart.next_field().await.map_err(|_| {
-        json_error(
-            StatusCode::BAD_REQUEST,
-            "Failed to parse multipart form fields",
-        )
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "Failed to parse multipart form fields"))?
+    {
         let field_name = field.name().unwrap_or_default().to_string();
         match field_name.as_str() {
             "message" => {
@@ -257,21 +247,16 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
             "files" => {
                 file_count += 1;
                 if file_count > MAX_UPLOAD_FILES {
-                    return Err(json_error(
-                        StatusCode::BAD_REQUEST,
-                        "Too many files (max 10)",
-                    ));
+                    return Err(json_error(StatusCode::BAD_REQUEST, "Too many files (max 10)"));
                 }
 
                 let original_name = field.file_name().unwrap_or("upload.bin").to_string();
                 let safe_name = sanitize_upload_filename(&original_name);
                 let content_type = field.content_type().unwrap_or("").to_string();
-                let bytes = field.bytes().await.map_err(|_| {
-                    json_error(
-                        StatusCode::BAD_REQUEST,
-                        "Failed to read uploaded file content",
-                    )
-                })?;
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|_| json_error(StatusCode::BAD_REQUEST, "Failed to read uploaded file content"))?;
 
                 if bytes.len() > MAX_UPLOAD_FILE_SIZE_BYTES {
                     return Err(json_error(
@@ -280,20 +265,12 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
                     ));
                 }
 
-                let stored_name = format!(
-                    "{}_{}_{}",
-                    Utc::now().timestamp_millis(),
-                    file_count,
-                    safe_name
-                );
+                let stored_name = format!("{}_{}_{}", Utc::now().timestamp_millis(), file_count, safe_name);
                 let stored_path = uploads_root.join(stored_name);
 
                 fs::write(&stored_path, &bytes).await.map_err(|error| {
                     tracing::error!("Failed to persist uploaded file: {error}");
-                    json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to persist uploaded file",
-                    )
+                    json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist uploaded file")
                 })?;
 
                 if is_image_upload(&content_type, &safe_name) {
@@ -318,19 +295,13 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
     };
 
     if combined.trim().is_empty() {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "message must not be empty",
-        ));
+        return Err(json_error(StatusCode::BAD_REQUEST, "message must not be empty"));
     }
 
     Ok(combined)
 }
 
-async fn parse_message_from_request(
-    state: &AppState,
-    request: Request,
-) -> Result<String, Response> {
+async fn parse_message_from_request(state: &AppState, request: Request) -> Result<String, Response> {
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -345,10 +316,7 @@ async fn parse_message_from_request(
     }
 }
 
-pub async fn get_sessions(
-    State(state): State<AppState>,
-    Query(query): Query<SessionsQuery>,
-) -> impl IntoResponse {
+pub async fn get_sessions(State(state): State<AppState>, Query(query): Query<SessionsQuery>) -> impl IntoResponse {
     let limit = normalize_limit(query.limit);
     let offset = normalize_offset(query.offset);
     let status_filter = query
@@ -395,11 +363,7 @@ pub async fn get_sessions(
 
         let batch_len = sessions.len();
         for session in sessions {
-            if !matches_session_filters(
-                &session,
-                status_filter.as_deref(),
-                search_filter.as_deref(),
-            ) {
+            if !matches_session_filters(&session, status_filter.as_deref(), search_filter.as_deref()) {
                 continue;
             }
 
@@ -408,8 +372,7 @@ pub async fn get_sessions(
                 continue;
             }
 
-            let status =
-                derive_session_status(&session.last_message_preview, session.message_count);
+            let status = derive_session_status(&session.last_message_preview, session.message_count);
             response.push(SessionSummary {
                 session_id: session.session_key,
                 sender: session.sender,
@@ -461,11 +424,7 @@ pub async fn get_session_messages(
 
     let limit = normalize_limit(query.limit);
     let offset = normalize_offset(query.offset);
-    let turns = match state
-        .mem
-        .list_conversation_turns(&session_id, limit, offset)
-        .await
-    {
+    let turns = match state.mem.list_conversation_turns(&session_id, limit, offset).await {
         Ok(turns) => turns,
         Err(error) => {
             tracing::error!("Failed to load conversation turns from DB: {error}");
@@ -518,11 +477,7 @@ pub async fn post_session_message(
             .into_response();
     };
 
-    let turns = match state
-        .mem
-        .list_conversation_turns(&session_id, MAX_PAGE_LIMIT, 0)
-        .await
-    {
+    let turns = match state.mem.list_conversation_turns(&session_id, MAX_PAGE_LIMIT, 0).await {
         Ok(turns) => turns,
         Err(error) => {
             tracing::error!("Failed to load conversation history from DB: {error}");

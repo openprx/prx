@@ -36,20 +36,13 @@ impl Tunnel for TailscaleTunnel {
             h.clone()
         } else {
             // Query tailscale for the current hostname
-            let output = Command::new("tailscale")
-                .args(["status", "--json"])
-                .output()
-                .await?;
+            let output = Command::new("tailscale").args(["status", "--json"]).output().await?;
 
             if !output.status.success() {
-                bail!(
-                    "tailscale status failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                bail!("tailscale status failed: {}", String::from_utf8_lossy(&output.stderr));
             }
 
-            let status: serde_json::Value =
-                serde_json::from_slice(&output.stdout).unwrap_or_default();
+            let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
             status["Self"]["DNSName"]
                 .as_str()
                 .unwrap_or("localhost")

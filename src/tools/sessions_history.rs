@@ -72,9 +72,7 @@ impl Tool for SessionsHistoryTool {
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
-            .map_or(DEFAULT_LIMIT, |v| {
-                usize::try_from(v).unwrap_or(DEFAULT_LIMIT)
-            });
+            .map_or(DEFAULT_LIMIT, |v| usize::try_from(v).unwrap_or(DEFAULT_LIMIT));
 
         let runs = self.active_runs.read().await;
         let Some(run) = runs.iter().find(|r| r.id == run_id) else {
@@ -174,22 +172,14 @@ mod tests {
         let tool = SessionsHistoryTool::new(runs);
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("Missing 'run_id'")
-        );
+        assert!(result.error.unwrap_or_default().contains("Missing 'run_id'"));
     }
 
     #[tokio::test]
     async fn unknown_run_id_returns_error() {
         let runs = Arc::new(RwLock::new(Vec::new()));
         let tool = SessionsHistoryTool::new(runs);
-        let result = tool
-            .execute(json!({"run_id": "nonexistent"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"run_id": "nonexistent"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("No run found"));
     }
@@ -225,16 +215,11 @@ mod tests {
 
     #[tokio::test]
     async fn limit_truncates_output() {
-        let entries: Vec<HistoryEntry> = (0..20)
-            .map(|i| make_entry("user", &format!("message {i}")))
-            .collect();
+        let entries: Vec<HistoryEntry> = (0..20).map(|i| make_entry("user", &format!("message {i}"))).collect();
         let run = make_run("run-3", SubAgentStatus::Completed("done".into()), entries);
         let runs = Arc::new(RwLock::new(vec![run]));
         let tool = SessionsHistoryTool::new(runs);
-        let result = tool
-            .execute(json!({"run_id": "run-3", "limit": 5}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"run_id": "run-3", "limit": 5})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("showing 5/20"));
     }

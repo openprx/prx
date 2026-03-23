@@ -65,17 +65,9 @@ pub fn render_markdown_with_highlighting(text: &str) -> String {
         if !in_code_block && (line.starts_with("```") || line.starts_with("~~~")) {
             // Start of code block
             in_code_block = true;
-            let fence = if line.starts_with("```") {
-                "```"
-            } else {
-                "~~~"
-            };
+            let fence = if line.starts_with("```") { "```" } else { "~~~" };
             let lang = line[fence.len()..].trim();
-            code_language = if lang.is_empty() {
-                None
-            } else {
-                Some(lang.to_string())
-            };
+            code_language = if lang.is_empty() { None } else { Some(lang.to_string()) };
             code_buffer.clear();
             // Print a visual separator
             result.push_str("  ┌─");

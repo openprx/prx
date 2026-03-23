@@ -333,8 +333,7 @@ impl LarkChannel {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(2 * 1024 * 1024);
         ws_config.max_frame_size = Some(1024 * 1024);
-        let (ws_stream, _) =
-            tokio_tungstenite::connect_async_with_config(&wss_url, Some(ws_config), false).await?;
+        let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(&wss_url, Some(ws_config), false).await?;
         let (mut write, mut read) = ws_stream.split();
         tracing::info!("Lark: WS connected (service_id={service_id})");
 
@@ -596,10 +595,7 @@ impl LarkChannel {
 
         let code = data.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
-            let msg = data
-                .get("msg")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
+            let msg = data.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown error");
             anyhow::bail!("Lark tenant_access_token failed: {msg}");
         }
 
@@ -646,8 +642,8 @@ impl LarkChannel {
             .await?;
         let status = resp.status();
         let raw = resp.text().await.unwrap_or_default();
-        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
-            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        let parsed =
+            serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
         Ok((status, parsed))
     }
 
@@ -693,10 +689,7 @@ impl LarkChannel {
             .and_then(|t| t.as_str())
             .unwrap_or("");
 
-        let content_str = event
-            .pointer("/message/content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+        let content_str = event.pointer("/message/content").and_then(|c| c.as_str()).unwrap_or("");
 
         let text: String = match msg_type {
             "text" => {
@@ -779,13 +772,10 @@ impl Channel for LarkChannel {
             // Token expired/invalid, invalidate and retry once.
             self.invalidate_token().await;
             let new_token = self.get_tenant_access_token().await?;
-            let (retry_status, retry_response) =
-                self.send_text_once(&url, &new_token, &body).await?;
+            let (retry_status, retry_response) = self.send_text_once(&url, &new_token, &body).await?;
 
             if should_refresh_lark_tenant_token(retry_status, &retry_response) {
-                anyhow::bail!(
-                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
-                );
+                anyhow::bail!("Lark send failed after token refresh: status={retry_status}, body={retry_response}");
             }
 
             ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
@@ -812,10 +802,7 @@ impl Channel for LarkChannel {
 impl LarkChannel {
     /// HTTP callback server (legacy — requires a public endpoint).
     /// Use `listen()` (WS long-connection) for new deployments.
-    pub async fn listen_http(
-        &self,
-        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    pub async fn listen_http(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         use axum::{Json, Router, extract::State, routing::post};
 
         #[derive(Clone)]
@@ -857,9 +844,9 @@ impl LarkChannel {
             (StatusCode::OK, "ok").into_response()
         }
 
-        let port = self.port.ok_or_else(|| {
-            anyhow::anyhow!("Lark webhook mode requires `port` to be set in [channels_config.lark]")
-        })?;
+        let port = self
+            .port
+            .ok_or_else(|| anyhow::anyhow!("Lark webhook mode requires `port` to be set in [channels_config.lark]"))?;
 
         let state = AppState {
             verification_token: self.verification_token.clone(),
@@ -873,9 +860,7 @@ impl LarkChannel {
             tx,
         };
 
-        let app = Router::new()
-            .route("/lark", post(handle_event))
-            .with_state(state);
+        let app = Router::new().route("/lark", post(handle_event)).with_state(state);
 
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
         tracing::info!("Lark event callback server listening on {addr}");
@@ -901,19 +886,11 @@ fn parse_post_content(content: &str) -> Option<String> {
     let locale = parsed
         .get("zh_cn")
         .or_else(|| parsed.get("en_us"))
-        .or_else(|| {
-            parsed
-                .as_object()
-                .and_then(|m| m.values().find(|v| v.is_object()))
-        })?;
+        .or_else(|| parsed.as_object().and_then(|m| m.values().find(|v| v.is_object())))?;
 
     let mut text = String::new();
 
-    if let Some(title) = locale
-        .get("title")
-        .and_then(|t| t.as_str())
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(title) = locale.get("title").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
         text.push_str(title);
         text.push_str("\n\n");
     }
@@ -955,11 +932,7 @@ fn parse_post_content(content: &str) -> Option<String> {
     }
 
     let result = text.trim().to_string();
-    if result.is_empty() {
-        None
-    } else {
-        Some(result)
-    }
+    if result.is_empty() { None } else { Some(result) }
 }
 
 /// Remove `@_user_N` placeholder tokens injected by Feishu in group chats.
@@ -970,8 +943,7 @@ fn strip_at_placeholders(text: &str) -> String {
         if ch == '@' {
             let rest: String = chars.clone().map(|(_, c)| c).collect();
             if let Some(after) = rest.strip_prefix("_user_") {
-                let skip =
-                    "_user_".len() + after.chars().take_while(|c| c.is_ascii_digit()).count();
+                let skip = "_user_".len() + after.chars().take_while(|c| c.is_ascii_digit()).count();
                 for _ in 0..=skip {
                     chars.next();
                 }
@@ -1013,9 +985,7 @@ mod tests {
 
     #[test]
     fn lark_ws_activity_refreshes_heartbeat_watchdog() {
-        assert!(should_refresh_last_recv(&WsMsg::Binary(
-            vec![1, 2, 3].into()
-        )));
+        assert!(should_refresh_last_recv(&WsMsg::Binary(vec![1, 2, 3].into())));
         assert!(should_refresh_last_recv(&WsMsg::Ping(vec![9, 9].into())));
         assert!(should_refresh_last_recv(&WsMsg::Pong(vec![8, 8].into())));
     }
@@ -1041,19 +1011,13 @@ mod tests {
             "code": LARK_INVALID_ACCESS_TOKEN_CODE,
             "msg": "Invalid access token for authorization."
         });
-        assert!(should_refresh_lark_tenant_token(
-            reqwest::StatusCode::OK,
-            &body
-        ));
+        assert!(should_refresh_lark_tenant_token(reqwest::StatusCode::OK, &body));
     }
 
     #[test]
     fn lark_should_not_refresh_token_on_success_body() {
         let body = serde_json::json!({ "code": 0, "msg": "ok" });
-        assert!(!should_refresh_lark_tenant_token(
-            reqwest::StatusCode::OK,
-            &body
-        ));
+        assert!(!should_refresh_lark_tenant_token(reqwest::StatusCode::OK, &body));
     }
 
     #[test]
@@ -1097,13 +1061,7 @@ mod tests {
 
     #[test]
     fn lark_user_allowed_wildcard() {
-        let ch = LarkChannel::new(
-            "id".into(),
-            "secret".into(),
-            "token".into(),
-            None,
-            vec!["*".into()],
-        );
+        let ch = LarkChannel::new("id".into(), "secret".into(), "token".into(), None, vec!["*".into()]);
         assert!(ch.is_user_allowed("ou_anyone"));
     }
 
@@ -1178,13 +1136,7 @@ mod tests {
 
     #[test]
     fn lark_parse_non_text_message_skipped() {
-        let ch = LarkChannel::new(
-            "id".into(),
-            "secret".into(),
-            "token".into(),
-            None,
-            vec!["*".into()],
-        );
+        let ch = LarkChannel::new("id".into(), "secret".into(), "token".into(), None, vec!["*".into()]);
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
             "event": {
@@ -1203,13 +1155,7 @@ mod tests {
 
     #[test]
     fn lark_parse_empty_text_skipped() {
-        let ch = LarkChannel::new(
-            "id".into(),
-            "secret".into(),
-            "token".into(),
-            None,
-            vec!["*".into()],
-        );
+        let ch = LarkChannel::new("id".into(), "secret".into(), "token".into(), None, vec!["*".into()]);
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
             "event": {
@@ -1240,13 +1186,7 @@ mod tests {
 
     #[test]
     fn lark_parse_missing_sender() {
-        let ch = LarkChannel::new(
-            "id".into(),
-            "secret".into(),
-            "token".into(),
-            None,
-            vec!["*".into()],
-        );
+        let ch = LarkChannel::new("id".into(), "secret".into(), "token".into(), None, vec!["*".into()]);
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
             "event": {
@@ -1264,13 +1204,7 @@ mod tests {
 
     #[test]
     fn lark_parse_unicode_message() {
-        let ch = LarkChannel::new(
-            "id".into(),
-            "secret".into(),
-            "token".into(),
-            None,
-            vec!["*".into()],
-        );
+        let ch = LarkChannel::new("id".into(), "secret".into(), "token".into(), None, vec!["*".into()]);
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
             "event": {
@@ -1302,13 +1236,7 @@ mod tests {
 
     #[test]
     fn lark_parse_invalid_content_json() {
-        let ch = LarkChannel::new(
-            "id".into(),
-            "secret".into(),
-            "token".into(),
-            None,
-            vec!["*".into()],
-        );
+        let ch = LarkChannel::new("id".into(), "secret".into(), "token".into(), None, vec!["*".into()]);
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
             "event": {
@@ -1406,13 +1334,7 @@ mod tests {
     #[test]
     fn lark_parse_fallback_sender_to_open_id() {
         // When chat_id is missing, sender should fall back to open_id
-        let ch = LarkChannel::new(
-            "id".into(),
-            "secret".into(),
-            "token".into(),
-            None,
-            vec!["*".into()],
-        );
+        let ch = LarkChannel::new("id".into(), "secret".into(), "token".into(), None, vec!["*".into()]);
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
             "event": {

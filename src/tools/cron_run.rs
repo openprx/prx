@@ -96,10 +96,7 @@ impl Tool for CronRunTool {
         };
 
         if matches!(job.job_type, JobType::Shell) {
-            if let Err(reason) = self
-                .security
-                .validate_command_execution(&job.command, approved)
-            {
+            if let Err(reason) = self.security.validate_command_execution(&job.command, approved) {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -163,17 +160,12 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         new_shared(config)
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ))
+        Arc::new(SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir))
     }
 
     #[tokio::test]
@@ -198,10 +190,7 @@ mod tests {
         let cfg_snap = cfg.load_full();
         let tool = CronRunTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
 
-        let result = tool
-            .execute(json!({ "job_id": "missing-job-id" }))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({ "job_id": "missing-job-id" })).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not found"));
     }
@@ -244,12 +233,7 @@ mod tests {
 
         let denied = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(!denied.success);
-        assert!(
-            denied
-                .error
-                .unwrap_or_default()
-                .contains("explicit approval")
-        );
+        assert!(denied.error.unwrap_or_default().contains("explicit approval"));
 
         let approved = tool
             .execute(json!({ "job_id": job.id, "approved": true }))

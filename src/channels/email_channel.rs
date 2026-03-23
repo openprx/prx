@@ -239,11 +239,7 @@ impl EmailChannel {
         debug!("Found {} unseen messages", uids.len());
 
         let mut results = Vec::new();
-        let uid_set: String = uids
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        let uid_set: String = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
 
         // Fetch message bodies
         let messages = session.uid_fetch(&uid_set, "RFC822").await?;
@@ -266,18 +262,11 @@ impl EmailChannel {
                     let ts = parsed
                         .date()
                         .map(|d| {
-                            let naive = chrono::NaiveDate::from_ymd_opt(
-                                d.year as i32,
-                                u32::from(d.month),
-                                u32::from(d.day),
-                            )
-                            .and_then(|date| {
-                                date.and_hms_opt(
-                                    u32::from(d.hour),
-                                    u32::from(d.minute),
-                                    u32::from(d.second),
-                                )
-                            });
+                            let naive =
+                                chrono::NaiveDate::from_ymd_opt(d.year as i32, u32::from(d.month), u32::from(d.day))
+                                    .and_then(|date| {
+                                        date.and_hms_opt(u32::from(d.hour), u32::from(d.minute), u32::from(d.second))
+                                    });
                             naive.map_or(0, |n| n.and_utc().timestamp() as u64)
                         })
                         .unwrap_or_else(|| {
@@ -312,10 +301,7 @@ impl EmailChannel {
 
     /// Run the IDLE loop, returning when a new message arrives or timeout
     /// Note: IDLE consumes the session and returns it via done()
-    async fn wait_for_changes(
-        &self,
-        session: ImapSession,
-    ) -> Result<(IdleWaitResult, ImapSession)> {
+    async fn wait_for_changes(&self, session: ImapSession) -> Result<(IdleWaitResult, ImapSession)> {
         let idle_timeout = Duration::from_secs(self.config.idle_timeout_secs);
 
         // Start IDLE mode - this consumes the session
@@ -368,10 +354,7 @@ impl EmailChannel {
                     return Ok(());
                 }
                 Err(e) => {
-                    error!(
-                        "IMAP session error: {}. Reconnecting in {:?}...",
-                        e, backoff
-                    );
+                    error!("IMAP session error: {}. Reconnecting in {:?}...", e, backoff);
                     sleep(backoff).await;
                     // Exponential backoff with cap
                     backoff = std::cmp::min(backoff * 2, max_backoff);
@@ -421,11 +404,7 @@ impl EmailChannel {
     }
 
     /// Fetch unseen messages and send to channel
-    async fn process_unseen(
-        &self,
-        session: &mut ImapSession,
-        tx: &mpsc::Sender<ChannelMessage>,
-    ) -> Result<()> {
+    async fn process_unseen(&self, session: &mut ImapSession, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
         let messages = self.fetch_unseen(session).await?;
 
         for email in messages {
@@ -817,10 +796,7 @@ mod tests {
     fn strip_html_handles_malformed() {
         assert_eq!(EmailChannel::strip_html("<p>Unclosed"), "Unclosed");
         // The function removes everything between < and >, so "Text>with>brackets" becomes "Textwithbrackets"
-        assert_eq!(
-            EmailChannel::strip_html("Text>with>brackets"),
-            "Textwithbrackets"
-        );
+        assert_eq!(EmailChannel::strip_html("Text>with>brackets"), "Textwithbrackets");
     }
 
     #[test]
@@ -840,18 +816,12 @@ mod tests {
 
     #[test]
     fn strip_html_multiple_spaces_collapsed() {
-        assert_eq!(
-            EmailChannel::strip_html("<p>Word</p>  <p>Word</p>"),
-            "Word Word"
-        );
+        assert_eq!(EmailChannel::strip_html("<p>Word</p>  <p>Word</p>"), "Word Word");
     }
 
     #[test]
     fn strip_html_special_characters() {
-        assert_eq!(
-            EmailChannel::strip_html("<span>&lt;tag&gt;</span>"),
-            "&lt;tag&gt;"
-        );
+        assert_eq!(EmailChannel::strip_html("<span>&lt;tag&gt;</span>"), "&lt;tag&gt;");
     }
 
     // Default function tests

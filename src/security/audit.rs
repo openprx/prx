@@ -90,12 +90,7 @@ impl AuditEvent {
     }
 
     /// Set the actor
-    pub fn with_actor(
-        mut self,
-        channel: String,
-        user_id: Option<String>,
-        username: Option<String>,
-    ) -> Self {
+    pub fn with_actor(mut self, channel: String, user_id: Option<String>, username: Option<String>) -> Self {
         self.actor = Some(Actor {
             channel,
             user_id,
@@ -105,13 +100,7 @@ impl AuditEvent {
     }
 
     /// Set the action
-    pub fn with_action(
-        mut self,
-        command: String,
-        risk_level: String,
-        approved: bool,
-        allowed: bool,
-    ) -> Self {
+    pub fn with_action(mut self, command: String, risk_level: String, approved: bool, allowed: bool) -> Self {
         self.action = Some(Action {
             command: Some(command),
             risk_level: Some(risk_level),
@@ -207,10 +196,7 @@ impl AuditLogger {
 
         // Serialize and write
         let line = serde_json::to_string(event)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&self.log_path)?;
 
         writeln!(file, "{}", line)?;
         file.sync_all()?;

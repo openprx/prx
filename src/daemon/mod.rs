@@ -1,9 +1,8 @@
 use crate::config::{Config, HotReloadManager, new_shared};
 use crate::self_system::evolution::{
-    AsyncJsonlWriter, EvolutionAnalyzer, EvolutionConfig, EvolutionPipeline,
-    EvolutionRetentionConfig, EvolutionRuntimeConfig, EvolutionScheduler, JsonlRetentionPolicy,
-    JsonlStoragePaths, MemoryEvolutionEngine, PromptEvolutionEngine, StrategyEvolutionEngine,
-    new_shared_evolution_config,
+    AsyncJsonlWriter, EvolutionAnalyzer, EvolutionConfig, EvolutionPipeline, EvolutionRetentionConfig,
+    EvolutionRuntimeConfig, EvolutionScheduler, JsonlRetentionPolicy, JsonlStoragePaths, MemoryEvolutionEngine,
+    PromptEvolutionEngine, StrategyEvolutionEngine, new_shared_evolution_config,
 };
 use anyhow::{Context, Result};
 use chrono::{Timelike, Utc};
@@ -17,10 +16,7 @@ const STATUS_FLUSH_SECONDS: u64 = 5;
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
-    let max_backoff = config
-        .reliability
-        .channel_max_backoff_secs
-        .max(initial_backoff);
+    let max_backoff = config.reliability.channel_max_backoff_secs.max(initial_backoff);
 
     // Activate hot-reload watcher so config.toml changes take effect without restart.
     let _hot_reload = {
@@ -32,9 +28,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     crate::health::mark_component_ok("daemon");
 
     if config.heartbeat.enabled {
-        let _ =
-            crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir)
-                .await;
+        let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir).await;
     }
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
@@ -123,8 +117,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     // xin.enabled + xin.builtin_tasks + xin.evolution_integration.
     // If builtin_tasks is false, xin won't register the fitness task, so
     // the standalone worker must still run.
-    let xin_manages_evolution =
-        config.xin.enabled && config.xin.builtin_tasks && config.xin.evolution_integration;
+    let xin_manages_evolution = config.xin.enabled && config.xin.builtin_tasks && config.xin.evolution_integration;
     let spawn_fitness = config.self_system.enabled && !xin_manages_evolution;
     if spawn_fitness {
         let fitness_cfg = config.clone();
@@ -178,18 +171,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = webhook_cfg.clone();
                 async move {
-                    let token = cfg.webhook.token.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "webhook.token must be configured when webhook.enabled=true"
-                        )
-                    })?;
-                    crate::webhook::run(
-                        &cfg.webhook.bind,
-                        token,
-                        &cfg.workspace_dir,
-                        cfg.memory.acl_enabled,
-                    )
-                    .await
+                    let token =
+                        cfg.webhook.token.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("webhook.token must be configured when webhook.enabled=true")
+                        })?;
+                    crate::webhook::run(&cfg.webhook.bind, token, &cfg.workspace_dir, cfg.memory.acl_enabled).await
                 }
             },
         ));
@@ -240,10 +226,7 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
             interval.tick().await;
             let mut json = crate::health::snapshot_json();
             if let Some(obj) = json.as_object_mut() {
-                obj.insert(
-                    "written_at".into(),
-                    serde_json::json!(Utc::now().to_rfc3339()),
-                );
+                obj.insert("written_at".into(), serde_json::json!(Utc::now().to_rfc3339()));
             }
             let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
             if let Err(e) = tokio::fs::write(&path, &data).await {
@@ -305,10 +288,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     loop {
         interval.tick().await;
         let local_hour = chrono::Local::now().hour() as u8;
-        if !crate::heartbeat::engine::HeartbeatEngine::is_within_active_hours(
-            &config.heartbeat,
-            local_hour,
-        ) {
+        if !crate::heartbeat::engine::HeartbeatEngine::is_within_active_hours(&config.heartbeat, local_hour) {
             continue;
         }
 
@@ -320,8 +300,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         for task in tasks {
             let prompt = format!("{}\n\n[Heartbeat Task] {task}", config.heartbeat.prompt);
             let temp = config.default_temperature;
-            if let Err(e) = crate::agent::run(config.clone(), Some(prompt), None, None, temp).await
-            {
+            if let Err(e) = crate::agent::run(config.clone(), Some(prompt), None, None, temp).await {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
             } else {
@@ -333,8 +312,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
 async fn run_fitness_worker(config: Config) -> Result<()> {
     let interval_hours = config.self_system.fitness_interval_hours.max(1);
-    let mut interval =
-        tokio::time::interval(Duration::from_secs(interval_hours.saturating_mul(3600)));
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_hours.saturating_mul(3600)));
 
     loop {
         interval.tick().await;
@@ -362,9 +340,7 @@ async fn run_fitness_worker(config: Config) -> Result<()> {
 
 async fn run_evolution_scheduler_worker(config: Config) -> Result<()> {
     let (mut scheduler, interval_hours) = build_evolution_scheduler(&config).await?;
-    let mut interval = tokio::time::interval(Duration::from_secs(
-        interval_hours.max(1).saturating_mul(3600),
-    ));
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_hours.max(1).saturating_mul(3600)));
 
     loop {
         interval.tick().await;
@@ -412,26 +388,12 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
         )
         .await?,
     );
-    let analyzer = Arc::new(EvolutionAnalyzer::new(
-        writer.clone(),
-        storage_root.join("analysis"),
-    ));
-    let pipeline = EvolutionPipeline::new(
-        shared.clone(),
-        analyzer.clone(),
-        writer.clone(),
-        &config.workspace_dir,
-    );
+    let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
+    let pipeline = EvolutionPipeline::new(shared.clone(), analyzer.clone(), writer.clone(), &config.workspace_dir);
 
     let memory_engine = Box::new(
-        MemoryEvolutionEngine::new(shared.clone(), &cfg_path, Some(writer.clone())).with_context(
-            || {
-                format!(
-                    "failed to initialize memory evolution engine: {}",
-                    cfg_path.display()
-                )
-            },
-        )?,
+        MemoryEvolutionEngine::new(shared.clone(), &cfg_path, Some(writer.clone()))
+            .with_context(|| format!("failed to initialize memory evolution engine: {}", cfg_path.display()))?,
     );
     let prompt_engine = Box::new(PromptEvolutionEngine::new(
         shared.clone(),
@@ -454,10 +416,7 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
         strategy_engine,
     );
 
-    Ok((
-        scheduler,
-        u64::from(config.self_system.evolution_interval_hours.max(1)),
-    ))
+    Ok((scheduler, u64::from(config.self_system.evolution_interval_hours.max(1))))
 }
 
 async fn load_evolution_config(config: &Config) -> Result<(EvolutionConfig, PathBuf)> {
@@ -473,10 +432,9 @@ async fn load_evolution_config(config: &Config) -> Result<(EvolutionConfig, Path
 }
 
 fn discover_evolution_config_path(config: &Config) -> PathBuf {
-    if let Ok(raw) = std::env::var("OPENPRX_EVOLUTION_CONFIG").or_else(|_| {
-        std::env::var("OPENPRX_EVOLUTION_CONFIG")
-            .or_else(|_| std::env::var("ZEROCLAW_EVOLUTION_CONFIG"))
-    }) {
+    if let Ok(raw) = std::env::var("OPENPRX_EVOLUTION_CONFIG")
+        .or_else(|_| std::env::var("OPENPRX_EVOLUTION_CONFIG").or_else(|_| std::env::var("ZEROCLAW_EVOLUTION_CONFIG")))
+    {
         let path = PathBuf::from(raw);
         if !path.as_os_str().is_empty() {
             return path;
@@ -609,18 +567,13 @@ mod tests {
         let config = test_config(&tmp);
 
         let (cfg, path) = load_evolution_config(&config).await.unwrap();
-        assert_eq!(
-            cfg.runtime.mode,
-            crate::self_system::evolution::EvolutionMode::Shadow
-        );
+        assert_eq!(cfg.runtime.mode, crate::self_system::evolution::EvolutionMode::Shadow);
         assert_eq!(path, config.workspace_dir.join("evolution_config.toml"));
     }
 
     #[tokio::test]
     async fn supervisor_marks_error_and_restart_on_failure() {
-        let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, || async {
-            anyhow::bail!("boom")
-        });
+        let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, || async { anyhow::bail!("boom") });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
@@ -630,12 +583,7 @@ mod tests {
         let component = &snapshot["components"]["daemon-test-fail"];
         assert_eq!(component["status"], "error");
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
-        assert!(
-            component["last_error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("boom")
-        );
+        assert!(component["last_error"].as_str().unwrap_or("").contains("boom"));
     }
 
     #[tokio::test]

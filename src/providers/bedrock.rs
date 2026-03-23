@@ -5,8 +5,8 @@
 //! using hmac/sha2 crates — no AWS SDK dependency.
 
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, ToolCall as ProviderToolCall, ToolsPayload,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
+    ProviderCapabilities, ToolCall as ProviderToolCall, ToolsPayload,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -120,22 +120,14 @@ fn build_authorization_header(
         canonical_headers.push('\n');
     }
 
-    let signed_headers: String = headers
-        .iter()
-        .map(|(k, _)| k.as_str())
-        .collect::<Vec<_>>()
-        .join(";");
+    let signed_headers: String = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
 
     let payload_hash = sha256_hex(payload);
 
-    let canonical_request = format!(
-        "{method}\n{canonical_uri}\n{query_string}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    );
+    let canonical_request =
+        format!("{method}\n{canonical_uri}\n{query_string}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
-    let credential_scope = format!(
-        "{date_stamp}/{}/{SIGNING_SERVICE}/aws4_request",
-        credentials.region
-    );
+    let credential_scope = format!("{date_stamp}/{}/{SIGNING_SERVICE}/aws4_request", credentials.region);
 
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
@@ -401,9 +393,7 @@ impl BedrockProvider {
 
     // ── Message conversion ──────────────────────────────────────
 
-    fn convert_messages(
-        messages: &[ChatMessage],
-    ) -> (Option<Vec<SystemBlock>>, Vec<ConverseMessage>) {
+    fn convert_messages(messages: &[ChatMessage]) -> (Option<Vec<SystemBlock>>, Vec<ConverseMessage>) {
         let mut system_blocks = Vec::new();
         let mut converse_messages = Vec::new();
 
@@ -476,9 +466,7 @@ impl BedrockProvider {
             .map(str::trim)
             .filter(|t| !t.is_empty())
         {
-            blocks.push(ContentBlock::Text(TextBlock {
-                text: text.to_string(),
-            }));
+            blocks.push(ContentBlock::Text(TextBlock { text: text.to_string() }));
         }
         for call in tool_calls {
             let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
@@ -681,9 +669,7 @@ impl Provider for BedrockProvider {
         let credentials = self.require_credentials()?;
 
         let system = system_prompt.map(|text| {
-            let mut blocks = vec![SystemBlock::Text(TextBlock {
-                text: text.to_string(),
-            })];
+            let mut blocks = vec![SystemBlock::Text(TextBlock { text: text.to_string() })];
             if Self::should_cache_system(text) {
                 blocks.push(SystemBlock::CachePoint(CachePointWrapper {
                     cache_point: CachePoint::default_cache(),
@@ -707,9 +693,7 @@ impl Provider for BedrockProvider {
             tool_config: None,
         };
 
-        let response = self
-            .send_converse_request(credentials, model, &request)
-            .await?;
+        let response = self.send_converse_request(credentials, model, &request).await?;
 
         Self::parse_converse_response(response)
             .text
@@ -742,11 +726,9 @@ impl Provider for BedrockProvider {
         // Apply cachePoint to last message if conversation is long.
         if Self::should_cache_conversation(request.messages) {
             if let Some(last_msg) = converse_messages.last_mut() {
-                last_msg
-                    .content
-                    .push(ContentBlock::CachePointBlock(CachePointWrapper {
-                        cache_point: CachePoint::default_cache(),
-                    }));
+                last_msg.content.push(ContentBlock::CachePointBlock(CachePointWrapper {
+                    cache_point: CachePoint::default_cache(),
+                }));
             }
         }
 
@@ -894,10 +876,7 @@ mod tests {
                 "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
             ),
             ("x-amz-date".to_string(), "20240115T120000Z".to_string()),
-            (
-                "x-amz-security-token".to_string(),
-                "session-token-value".to_string(),
-            ),
+            ("x-amz-security-token".to_string(), "session-token-value".to_string()),
         ];
 
         let auth = build_authorization_header(
@@ -962,8 +941,7 @@ mod tests {
     #[test]
     fn endpoint_url_keeps_raw_colon() {
         // Endpoint URL uses raw colon so reqwest sends `:` on the wire.
-        let url =
-            BedrockProvider::endpoint_url("us-west-2", "anthropic.claude-3-5-haiku-20241022-v1:0");
+        let url = BedrockProvider::endpoint_url("us-west-2", "anthropic.claude-3-5-haiku-20241022-v1:0");
         assert!(url.contains("/model/anthropic.claude-3-5-haiku-20241022-v1:0/converse"));
     }
 
@@ -971,10 +949,7 @@ mod tests {
     fn canonical_uri_encodes_colon() {
         // Canonical URI must encode `:` as `%3A` for SigV4 signing.
         let uri = BedrockProvider::canonical_uri("anthropic.claude-3-5-haiku-20241022-v1:0");
-        assert_eq!(
-            uri,
-            "/model/anthropic.claude-3-5-haiku-20241022-v1%3A0/converse"
-        );
+        assert_eq!(uri, "/model/anthropic.claude-3-5-haiku-20241022-v1%3A0/converse");
     }
 
     #[test]
@@ -987,10 +962,7 @@ mod tests {
 
     #[test]
     fn convert_messages_system_extracted() {
-        let messages = vec![
-            ChatMessage::system("You are helpful"),
-            ChatMessage::user("Hello"),
-        ];
+        let messages = vec![ChatMessage::system("You are helpful"), ChatMessage::user("Hello")];
         let (system, msgs) = BedrockProvider::convert_messages(&messages);
         assert!(system.is_some());
         let system_blocks = system.unwrap();
@@ -1001,10 +973,7 @@ mod tests {
 
     #[test]
     fn convert_messages_user_and_assistant() {
-        let messages = vec![
-            ChatMessage::user("Hello"),
-            ChatMessage::assistant("Hi there"),
-        ];
+        let messages = vec![ChatMessage::user("Hello"), ChatMessage::assistant("Hi there")];
         let (system, msgs) = BedrockProvider::convert_messages(&messages);
         assert!(system.is_none());
         assert_eq!(msgs.len(), 2);

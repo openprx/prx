@@ -47,13 +47,7 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
 
     let rows: Vec<(String, String, String, String, String)> = stmt
         .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -73,10 +67,7 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     for (key, content, _category, created_at, updated_at) in &rows {
         write!(output, "### 🔑 `{key}`\n\n")?;
         write!(output, "{content}\n\n")?;
-        write!(
-            output,
-            "*Created: {created_at} | Updated: {updated_at}*\n\n---\n\n"
-        )?;
+        write!(output, "*Created: {created_at} | Updated: {updated_at}*\n\n---\n\n")?;
     }
 
     let snapshot_path = snapshot_path(workspace_dir);
@@ -250,9 +241,7 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
 
     // Safety migration: if embedding_cache was created by an older schema without
     // accessed_at, add the column. Ignore the error if it already exists.
-    let _ = conn.execute_batch(
-        "ALTER TABLE embedding_cache ADD COLUMN accessed_at TEXT NOT NULL DEFAULT ''",
-    );
+    let _ = conn.execute_batch("ALTER TABLE embedding_cache ADD COLUMN accessed_at TEXT NOT NULL DEFAULT ''");
 
     let now = Local::now().to_rfc3339();
     let mut hydrated = 0;
@@ -639,11 +628,9 @@ Rule 3: Protect the user.
         assert_eq!(count, 2);
 
         let identity: String = conn
-            .query_row(
-                "SELECT content FROM memories WHERE key = 'identity'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT content FROM memories WHERE key = 'identity'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(identity, "I am a test agent");
     }
@@ -702,11 +689,9 @@ Rule 3: Protect the user.
 
         let conn = Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
         let visibility: String = conn
-            .query_row(
-                "SELECT visibility FROM memories WHERE key = 'MEMORY.md:2'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT visibility FROM memories WHERE key = 'MEMORY.md:2'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(visibility, "owner");
     }

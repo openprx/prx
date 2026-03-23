@@ -63,8 +63,7 @@ impl PluginMetrics {
     #[cfg(test)]
     fn record_compilation(&self, compile_ms: u64) {
         self.compilations.fetch_add(1, Ordering::Relaxed);
-        self.total_compile_ms
-            .fetch_add(compile_ms, Ordering::Relaxed);
+        self.total_compile_ms.fetch_add(compile_ms, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -134,9 +133,8 @@ impl PluginManager {
         config.wasm_component_model(true);
         config.consume_fuel(true);
 
-        let engine = wasmtime::Engine::new(&config).map_err(|e| {
-            PluginError::Compilation(format!("failed to create wasmtime engine: {e}"))
-        })?;
+        let engine = wasmtime::Engine::new(&config)
+            .map_err(|e| PluginError::Compilation(format!("failed to create wasmtime engine: {e}")))?;
 
         let cache_dir = plugins_dir.join(".cwasm-cache");
         let precompile_cache = PrecompileCache::new(cache_dir).map_err(PluginError::Io)?;
@@ -227,12 +225,7 @@ impl PluginManager {
             let comp = self
                 .precompile_cache
                 .get_or_compile(&self.engine, &wasm_bytes)
-                .map_err(|e| {
-                    PluginError::Compilation(format!(
-                        "failed to compile '{}': {e}",
-                        wasm_path.display()
-                    ))
-                })?;
+                .map_err(|e| PluginError::Compilation(format!("failed to compile '{}': {e}", wasm_path.display())))?;
             // Mirror running totals from the precompile cache into aggregated
             // PluginMetrics so callers can read one place for all stats.
             // Using .store() is correct here because the precompile cache
@@ -281,13 +274,11 @@ impl PluginManager {
 
     /// Reload a plugin by name (unload + load from its original directory).
     pub async fn reload_plugin(&self, name: &str) -> PluginResult<()> {
-        let source_dir =
-            self.registry
-                .get_source_dir(name)
-                .await
-                .ok_or_else(|| PluginError::NotFound {
-                    name: name.to_string(),
-                })?;
+        let source_dir = self
+            .registry
+            .get_source_dir(name)
+            .await
+            .ok_or_else(|| PluginError::NotFound { name: name.to_string() })?;
 
         self.registry.unregister(name).await;
         self.load_plugin(&source_dir).await
@@ -299,9 +290,7 @@ impl PluginManager {
             tracing::info!(plugin = %name, "plugin unloaded");
             Ok(())
         } else {
-            Err(PluginError::NotFound {
-                name: name.to_string(),
-            })
+            Err(PluginError::NotFound { name: name.to_string() })
         }
     }
 
@@ -478,11 +467,7 @@ impl PluginManager {
         let mut executor = capabilities::hook::WasmHookExecutor::new();
 
         for info in &plugins {
-            let hook_caps: Vec<_> = info
-                .capabilities
-                .iter()
-                .filter(|c| c.starts_with("hook"))
-                .collect();
+            let hook_caps: Vec<_> = info.capabilities.iter().filter(|c| c.starts_with("hook")).collect();
             if hook_caps.is_empty() {
                 continue;
             }
@@ -549,11 +534,7 @@ impl PluginManager {
         let mut manager = capabilities::cron::WasmCronManager::new();
 
         for info in &plugins {
-            let cron_caps: Vec<_> = info
-                .capabilities
-                .iter()
-                .filter(|c| c.starts_with("cron"))
-                .collect();
+            let cron_caps: Vec<_> = info.capabilities.iter().filter(|c| c.starts_with("cron")).collect();
             if cron_caps.is_empty() {
                 continue;
             }
@@ -628,11 +609,7 @@ impl PluginManager {
         let mut providers = Vec::new();
 
         for info in &plugins {
-            let provider_caps: Vec<_> = info
-                .capabilities
-                .iter()
-                .filter(|c| c.starts_with("provider"))
-                .collect();
+            let provider_caps: Vec<_> = info.capabilities.iter().filter(|c| c.starts_with("provider")).collect();
             if provider_caps.is_empty() {
                 continue;
             }
@@ -698,11 +675,7 @@ impl PluginManager {
         let mut storages = Vec::new();
 
         for info in &plugins {
-            let storage_caps: Vec<_> = info
-                .capabilities
-                .iter()
-                .filter(|c| c.starts_with("storage"))
-                .collect();
+            let storage_caps: Vec<_> = info.capabilities.iter().filter(|c| c.starts_with("storage")).collect();
             if storage_caps.is_empty() {
                 continue;
             }
@@ -1005,11 +978,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let manager = init_plugin_manager(tmp.path()).await;
         assert!(manager.is_some());
-        let plugins = manager
-            .as_ref()
-            .expect("test: manager")
-            .list_plugins()
-            .await;
+        let plugins = manager.as_ref().expect("test: manager").list_plugins().await;
         assert!(plugins.is_empty());
     }
 

@@ -262,14 +262,8 @@ pub trait Provider: Send + Sync {
     /// Simple one-shot chat (single user message, no explicit system prompt).
     ///
     /// This is the preferred API for non-agentic direct interactions.
-    async fn simple_chat(
-        &self,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        self.chat_with_system(None, message, model, temperature)
-            .await
+    async fn simple_chat(&self, message: &str, model: &str, temperature: f64) -> anyhow::Result<String> {
+        self.chat_with_system(None, message, model, temperature).await
     }
 
     /// One-shot chat with optional system prompt.
@@ -291,26 +285,17 @@ pub trait Provider: Send + Sync {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let system = messages
-            .iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.as_str());
+        let system = messages.iter().find(|m| m.role == "system").map(|m| m.content.as_str());
         let last_user = messages
             .iter()
             .rfind(|m| m.role == "user")
             .map(|m| m.content.as_str())
             .unwrap_or("");
-        self.chat_with_system(system, last_user, model, temperature)
-            .await
+        self.chat_with_system(system, last_user, model, temperature).await
     }
 
     /// Structured chat API for agent loop callers.
-    async fn chat(
-        &self,
-        request: ChatRequest<'_>,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
+    async fn chat(&self, request: ChatRequest<'_>, model: &str, temperature: f64) -> anyhow::Result<ChatResponse> {
         // If tools are provided but provider doesn't support native tools,
         // inject tool instructions into system prompt as fallback.
         if let Some(tools) = request.tools {
@@ -327,9 +312,7 @@ pub trait Provider: Send + Sync {
 
                 // Inject tool instructions into an existing system message.
                 // If none exists, prepend one to the conversation.
-                if let Some(system_message) =
-                    modified_messages.iter_mut().find(|m| m.role == "system")
-                {
+                if let Some(system_message) = modified_messages.iter_mut().find(|m| m.role == "system") {
                     if !system_message.content.is_empty() {
                         system_message.content.push_str("\n\n");
                     }
@@ -338,9 +321,7 @@ pub trait Provider: Send + Sync {
                     modified_messages.insert(0, ChatMessage::system(tool_instructions));
                 }
 
-                let text = self
-                    .chat_with_history(&modified_messages, model, temperature)
-                    .await?;
+                let text = self.chat_with_history(&modified_messages, model, temperature).await?;
                 return Ok(ChatResponse {
                     text: Some(text),
                     tool_calls: Vec::new(),
@@ -348,9 +329,7 @@ pub trait Provider: Send + Sync {
             }
         }
 
-        let text = self
-            .chat_with_history(request.messages, model, temperature)
-            .await?;
+        let text = self.chat_with_history(request.messages, model, temperature).await?;
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
@@ -445,18 +424,14 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     instructions.push_str("\n</tool_call>\n\n");
     instructions.push_str("You may use multiple tool calls in a single response. ");
     instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions
-        .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    instructions.push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools {
-        writeln!(&mut instructions, "**{}**: {}", tool.name, tool.description)
-            .expect("writing to String cannot fail");
+        writeln!(&mut instructions, "**{}**: {}", tool.name, tool.description).expect("writing to String cannot fail");
 
-        let parameters =
-            serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_string());
-        writeln!(&mut instructions, "Parameters: `{parameters}`")
-            .expect("writing to String cannot fail");
+        let parameters = serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_string());
+        writeln!(&mut instructions, "Parameters: `{parameters}`").expect("writing to String cannot fail");
         instructions.push('\n');
     }
 
@@ -695,9 +670,7 @@ mod tests {
 
     #[test]
     fn provider_convert_tools_default() {
-        let provider = MockProvider {
-            supports_native: false,
-        };
+        let provider = MockProvider { supports_native: false };
 
         let tools = vec![ToolSpec {
             name: "test_tool".to_string(),
@@ -718,9 +691,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_chat_prompt_guided_fallback() {
-        let provider = MockProvider {
-            supports_native: false,
-        };
+        let provider = MockProvider { supports_native: false };
 
         let tools = vec![ToolSpec {
             name: "shell".to_string(),
@@ -741,9 +712,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_chat_without_tools() {
-        let provider = MockProvider {
-            supports_native: true,
-        };
+        let provider = MockProvider { supports_native: true };
 
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
@@ -832,9 +801,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_chat_prompt_guided_preserves_existing_system_not_first() {
-        let provider = EchoSystemProvider {
-            supports_native: false,
-        };
+        let provider = EchoSystemProvider { supports_native: false };
 
         let tools = vec![ToolSpec {
             name: "shell".to_string(),
@@ -843,10 +810,7 @@ mod tests {
         }];
 
         let request = ChatRequest {
-            messages: &[
-                ChatMessage::user("Hello"),
-                ChatMessage::system("BASE_SYSTEM_PROMPT"),
-            ],
+            messages: &[ChatMessage::user("Hello"), ChatMessage::system("BASE_SYSTEM_PROMPT")],
             tools: Some(&tools),
         };
 

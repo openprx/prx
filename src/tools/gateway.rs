@@ -119,14 +119,9 @@ impl GatewayTool {
             .await
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
 
-        let raw_toml: toml::Value = toml::from_str(&raw).with_context(|| {
-            format!(
-                "Failed to parse config.toml before patch: {}",
-                config_path.display()
-            )
-        })?;
-        let mut raw_json = serde_json::to_value(raw_toml)
-            .context("Failed to convert config TOML into JSON value")?;
+        let raw_toml: toml::Value = toml::from_str(&raw)
+            .with_context(|| format!("Failed to parse config.toml before patch: {}", config_path.display()))?;
+        let mut raw_json = serde_json::to_value(raw_toml).context("Failed to convert config TOML into JSON value")?;
 
         Self::merge_json_patch(&mut raw_json, patch);
 
@@ -208,8 +203,7 @@ impl Tool for GatewayTool {
                     success: false,
                     output: String::new(),
                     error: Some(
-                        "Destructive gateway action requires trusted scope (_prx_scope_trusted=true)"
-                            .to_string(),
+                        "Destructive gateway action requires trusted scope (_prx_scope_trusted=true)".to_string(),
                     ),
                 });
             }
@@ -248,19 +242,14 @@ impl Tool for GatewayTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(
-                                "Invalid 'patch': expected an object for action 'config.patch'"
-                                    .to_string(),
-                            ),
+                            error: Some("Invalid 'patch': expected an object for action 'config.patch'".to_string()),
                         });
                     }
                     None => {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(
-                                "Missing 'patch' parameter for action 'config.patch'".to_string(),
-                            ),
+                            error: Some("Missing 'patch' parameter for action 'config.patch'".to_string()),
                         });
                     }
                 };
@@ -291,11 +280,7 @@ impl Tool for GatewayTool {
                     uptime_str,
                     gw.host,
                     gw.port,
-                    if gw.require_pairing {
-                        "required"
-                    } else {
-                        "disabled"
-                    },
+                    if gw.require_pairing { "required" } else { "disabled" },
                 );
                 Ok(ToolResult {
                     success: true,
@@ -373,9 +358,7 @@ impl Tool for GatewayTool {
                     if ret == 0 {
                         Ok(ToolResult {
                             success: true,
-                            output: format!(
-                                "SIGHUP sent to PID {pid} — daemon will restart gracefully."
-                            ),
+                            output: format!("SIGHUP sent to PID {pid} — daemon will restart gracefully."),
                             error: None,
                         })
                     } else {
@@ -392,10 +375,7 @@ impl Tool for GatewayTool {
                     Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(
-                            "Graceful restart via SIGHUP is only supported on Unix systems."
-                                .to_string(),
-                        ),
+                        error: Some("Graceful restart via SIGHUP is only supported on Unix systems.".to_string()),
                     })
                 }
             }
@@ -423,13 +403,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         });
-        GatewayTool::new(
-            config,
-            "anthropic",
-            "claude-sonnet-4-6",
-            vec!["signal".to_string()],
-        )
-        .with_tools_count(12)
+        GatewayTool::new(config, "anthropic", "claude-sonnet-4-6", vec!["signal".to_string()]).with_tools_count(12)
     }
 
     #[test]
@@ -493,12 +467,7 @@ mod tests {
         let tool = make_tool(&tmp);
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("Missing 'action'")
-        );
+        assert!(result.error.unwrap_or_default().contains("Missing 'action'"));
     }
 
     #[tokio::test]

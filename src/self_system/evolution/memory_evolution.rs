@@ -1,23 +1,17 @@
 use crate::memory::{Memory, MemoryCategory, SqliteMemory};
 use crate::self_system::evolution::analyzer::{CandidatePriority, EvolutionCandidate};
-use crate::self_system::evolution::config::{
-    EvolutionConfig, EvolutionMode, SharedEvolutionConfig,
-};
+use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode, SharedEvolutionConfig};
 use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput, EvolutionEngine};
 use crate::self_system::evolution::gate::{EvolutionGate, GateMetrics, GateResult};
 use crate::self_system::evolution::judge::{JudgeConfig, JudgeEngine, MockJudgeModel};
-use crate::self_system::evolution::memory_compressor::{
-    EmbeddingSimilarityDetector, MemoryCompressor,
-};
-use crate::self_system::evolution::record::{
-    ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult,
-};
+use crate::self_system::evolution::memory_compressor::{EmbeddingSimilarityDetector, MemoryCompressor};
+use crate::self_system::evolution::record::{ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult};
 use crate::self_system::evolution::rollback::RollbackManager;
 use crate::self_system::evolution::safety_utils::atomic_write;
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::{
-    ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
-    EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
+    ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
+    EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -68,12 +62,7 @@ impl MemoryEvolutionEngine {
             config_path: config_path.clone(),
             writer,
             judge: JudgeEngine::new(JudgeConfig::default(), MockJudgeModel),
-            rollback: RollbackManager::new(
-                workspace_root,
-                &config_path,
-                rollback_dir,
-                max_versions,
-            )?,
+            rollback: RollbackManager::new(workspace_root, &config_path, rollback_dir, max_versions)?,
         })
     }
 
@@ -87,17 +76,10 @@ impl MemoryEvolutionEngine {
         sorted.into_iter().next()
     }
 
-    fn build_mutation_plan(
-        &self,
-        cfg: &EvolutionConfig,
-        candidate: &EvolutionCandidate,
-    ) -> MutationPlan {
+    fn build_mutation_plan(&self, cfg: &EvolutionConfig, candidate: &EvolutionCandidate) -> MutationPlan {
         if candidate.target.contains_key("task_type") {
             let choices = [
-                (
-                    "retrieval.score_weights.recency",
-                    cfg.retrieval.score_weights.recency,
-                ),
+                ("retrieval.score_weights.recency", cfg.retrieval.score_weights.recency),
                 (
                     "retrieval.score_weights.access_freq",
                     cfg.retrieval.score_weights.access_freq,
@@ -128,9 +110,7 @@ impl MemoryEvolutionEngine {
 
         if candidate.target.contains_key("memory_id") {
             let before = cfg.memory.max_tokens as f64;
-            let after = mutate_numeric(before, candidate, "memory.max_tokens")
-                .round()
-                .max(64.0);
+            let after = mutate_numeric(before, candidate, "memory.max_tokens").round().max(64.0);
             let degradation = ((after - before) / before.max(1.0)).max(0.0);
             return MutationPlan {
                 key: "memory.max_tokens".to_string(),
@@ -141,18 +121,9 @@ impl MemoryEvolutionEngine {
         }
 
         let fusion_choices = [
-            (
-                "memory.retrieval_fusion.bm25",
-                cfg.memory.retrieval_fusion.bm25,
-            ),
-            (
-                "memory.retrieval_fusion.vector",
-                cfg.memory.retrieval_fusion.vector,
-            ),
-            (
-                "memory.retrieval_fusion.metadata",
-                cfg.memory.retrieval_fusion.metadata,
-            ),
+            ("memory.retrieval_fusion.bm25", cfg.memory.retrieval_fusion.bm25),
+            ("memory.retrieval_fusion.vector", cfg.memory.retrieval_fusion.vector),
+            ("memory.retrieval_fusion.metadata", cfg.memory.retrieval_fusion.metadata),
         ];
         let index = candidate.evidence_ids.len() % fusion_choices.len();
         let (key, value) = fusion_choices[index];
@@ -167,18 +138,10 @@ impl MemoryEvolutionEngine {
     fn apply_plan_to_config(cfg: &mut EvolutionConfig, plan: &MutationPlan) {
         match plan.key.as_str() {
             "retrieval.score_weights.recency" => cfg.retrieval.score_weights.recency = plan.after,
-            "retrieval.score_weights.access_freq" => {
-                cfg.retrieval.score_weights.access_freq = plan.after
-            }
-            "retrieval.score_weights.category_weight" => {
-                cfg.retrieval.score_weights.category_weight = plan.after
-            }
-            "retrieval.score_weights.useful_ratio" => {
-                cfg.retrieval.score_weights.useful_ratio = plan.after
-            }
-            "retrieval.score_weights.source_confidence" => {
-                cfg.retrieval.score_weights.source_confidence = plan.after
-            }
+            "retrieval.score_weights.access_freq" => cfg.retrieval.score_weights.access_freq = plan.after,
+            "retrieval.score_weights.category_weight" => cfg.retrieval.score_weights.category_weight = plan.after,
+            "retrieval.score_weights.useful_ratio" => cfg.retrieval.score_weights.useful_ratio = plan.after,
+            "retrieval.score_weights.source_confidence" => cfg.retrieval.score_weights.source_confidence = plan.after,
             "memory.max_tokens" => cfg.memory.max_tokens = plan.after as usize,
             "memory.retrieval_fusion.bm25" => cfg.memory.retrieval_fusion.bm25 = plan.after,
             "memory.retrieval_fusion.vector" => cfg.memory.retrieval_fusion.vector = plan.after,
@@ -194,9 +157,7 @@ impl MemoryEvolutionEngine {
         }
 
         let memory = SqliteMemory::new_with_path(db_path)?;
-        let entries = memory
-            .list(Some(&MemoryCategory::Conversation), None)
-            .await?;
+        let entries = memory.list(Some(&MemoryCategory::Conversation), None).await?;
         if entries.len() < 2 {
             return Ok(0);
         }
@@ -244,17 +205,16 @@ impl EvolutionEngine for MemoryEvolutionEngine {
         };
 
         let current = self.shared_config.load_full();
-        let deduplicated_conversation_memories =
-            match self.prune_redundant_conversation_memories().await {
-                Ok(count) => count,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "self_system",
-                        "memory redundancy cleanup skipped: {error}"
-                    );
-                    0
-                }
-            };
+        let deduplicated_conversation_memories = match self.prune_redundant_conversation_memories().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(
+                    target: "self_system",
+                    "memory redundancy cleanup skipped: {error}"
+                );
+                0
+            }
+        };
         let mode = current.runtime.mode.clone();
         let candidate = self
             .select_candidate(&input.analyzer_candidates)
@@ -313,12 +273,7 @@ impl EvolutionEngine for MemoryEvolutionEngine {
                             fs::create_dir_all(parent).await?;
                         }
                     }
-                    atomic_write(
-                        &self.workspace_root,
-                        &self.config_path,
-                        serialized.as_bytes(),
-                    )
-                    .await?;
+                    atomic_write(&self.workspace_root, &self.config_path, serialized.as_bytes()).await?;
                     self.shared_config.store(Arc::new(next_cfg));
                     applied = true;
                     outcome = CycleOutcome::Applied;
@@ -339,14 +294,8 @@ impl EvolutionEngine for MemoryEvolutionEngine {
         }
 
         let mut key_metrics = HashMap::from([
-            (
-                "average_improvement".to_string(),
-                gate_metrics.average_improvement,
-            ),
-            (
-                "token_degradation".to_string(),
-                gate_metrics.token_degradation,
-            ),
+            ("average_improvement".to_string(), gate_metrics.average_improvement),
+            ("token_degradation".to_string(), gate_metrics.token_degradation),
         ]);
         key_metrics.insert(
             "deduplicated_conversation_memories".to_string(),
@@ -416,10 +365,9 @@ impl EvolutionEngine for MemoryEvolutionEngine {
             outcome,
             alert: match gate_result {
                 GateResult::Passed => None,
-                GateResult::Rejected(ref rejection) => Some(format!(
-                    "gate_rejected:{}:{}",
-                    rejection.reason, rejection.details
-                )),
+                GateResult::Rejected(ref rejection) => {
+                    Some(format!("gate_rejected:{}:{}", rejection.reason, rejection.details))
+                }
             },
             errors: Vec::new(),
         };
@@ -436,10 +384,7 @@ impl EvolutionEngine for MemoryEvolutionEngine {
 }
 
 fn mutate_numeric(value: f64, candidate: &EvolutionCandidate, salt: &str) -> f64 {
-    let seed = format!(
-        "{}:{}:{}",
-        candidate.current_value, candidate.suggested_value, salt
-    );
+    let seed = format!("{}:{}:{}", candidate.current_value, candidate.suggested_value, salt);
     let dir = if stable_hash(&seed) % 2 == 0 {
         1.0 + MUTATION_RATIO
     } else {
@@ -471,9 +416,7 @@ fn default_candidate() -> EvolutionCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::self_system::evolution::config::{
-        EvolutionConfig, EvolutionMode, new_shared_evolution_config,
-    };
+    use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode, new_shared_evolution_config};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -482,9 +425,7 @@ mod tests {
         let path = dir.path().join("evolution_config.toml");
         let mut cfg = EvolutionConfig::default();
         cfg.runtime.mode = EvolutionMode::Shadow;
-        fs::write(&path, toml::to_string_pretty(&cfg).unwrap())
-            .await
-            .unwrap();
+        fs::write(&path, toml::to_string_pretty(&cfg).unwrap()).await.unwrap();
 
         let shared = new_shared_evolution_config(cfg);
         let mut engine = MemoryEvolutionEngine::new(shared, &path, None).unwrap();
@@ -506,9 +447,7 @@ mod tests {
         let path = dir.path().join("evolution_config.toml");
         let mut cfg = EvolutionConfig::default();
         cfg.runtime.mode = EvolutionMode::Auto;
-        fs::write(&path, toml::to_string_pretty(&cfg).unwrap())
-            .await
-            .unwrap();
+        fs::write(&path, toml::to_string_pretty(&cfg).unwrap()).await.unwrap();
 
         let shared = new_shared_evolution_config(cfg);
         let mut engine = MemoryEvolutionEngine::new(shared.clone(), &path, None).unwrap();

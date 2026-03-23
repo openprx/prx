@@ -75,10 +75,7 @@ fn agent_config_default_tool_dispatcher() {
 #[test]
 fn agent_config_default_compact_context_off() {
     let agent = AgentConfig::default();
-    assert!(
-        !agent.compact_context,
-        "compact_context should default to false"
-    );
+    assert!(!agent.compact_context, "compact_context should default to false");
 }
 
 #[test]
@@ -96,10 +93,7 @@ fn agent_config_default_concurrency_rollout_is_off() {
 #[test]
 fn memory_config_default_backend() {
     let memory = MemoryConfig::default();
-    assert!(
-        !memory.backend.is_empty(),
-        "memory backend should have a default value"
-    );
+    assert!(!memory.backend.is_empty(), "memory backend should have a default value");
 }
 
 #[test]
@@ -229,8 +223,7 @@ default_temperature = 0.7
 max_tool_iterations = 3
 compact_context = true
 "#;
-    let parsed: Config =
-        toml::from_str(toml_with_agent).expect("TOML with agent section should parse");
+    let parsed: Config = toml::from_str(toml_with_agent).expect("TOML with agent section should parse");
 
     assert_eq!(parsed.agent.max_tool_iterations, 3);
     assert!(parsed.agent.compact_context);
@@ -249,10 +242,7 @@ fn workspace_dir_creation_in_tempdir() {
 
     fs::create_dir_all(&workspace_dir).expect("workspace dir creation should succeed");
     assert!(workspace_dir.exists(), "workspace dir should exist");
-    assert!(
-        workspace_dir.is_dir(),
-        "workspace path should be a directory"
-    );
+    assert!(workspace_dir.is_dir(), "workspace path should be a directory");
 }
 
 #[test]

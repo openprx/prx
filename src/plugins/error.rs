@@ -9,10 +9,7 @@ pub enum PluginError {
     Manifest(String),
 
     #[error("manifest parse error in {path}: {source}")]
-    ManifestParse {
-        path: String,
-        source: toml::de::Error,
-    },
+    ManifestParse { path: String, source: toml::de::Error },
 
     #[error("plugin '{name}' not found")]
     NotFound { name: String },

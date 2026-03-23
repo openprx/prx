@@ -202,10 +202,7 @@ mod tests {
             .name
             .to_lowercase();
 
-        let result = handle_command(
-            crate::IntegrationCommands::Info { name: first_name },
-            &config,
-        );
+        let result = handle_command(crate::IntegrationCommands::Info { name: first_name }, &config);
 
         assert!(result.is_ok());
     }

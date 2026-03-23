@@ -1,6 +1,4 @@
-use crate::config::schema::{
-    QueryClassificationConfig, TaskRoutingConfig, TaskRoutingIntentConfig,
-};
+use crate::config::schema::{QueryClassificationConfig, TaskRoutingConfig, TaskRoutingIntentConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskIntent {
@@ -60,10 +58,7 @@ pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<Str
             .keywords
             .iter()
             .any(|kw: &String| lower.contains(&kw.to_lowercase()));
-        let pattern_hit = rule
-            .patterns
-            .iter()
-            .any(|pat: &String| message.contains(pat.as_str()));
+        let pattern_hit = rule.patterns.iter().any(|pat: &String| message.contains(pat.as_str()));
 
         if keyword_hit || pattern_hit {
             return Some(rule.hint.clone());
@@ -124,10 +119,7 @@ pub fn classify_intent(config: &TaskRoutingConfig, message: &str) -> ClassifyRes
         return ClassifyResult {
             intent,
             model_hint,
-            reason: format!(
-                "matched keywords {:?} (priority {})",
-                rule.keywords, rule.priority
-            ),
+            reason: format!("matched keywords {:?} (priority {})", rule.keywords, rule.priority),
         };
     }
 
@@ -142,8 +134,7 @@ pub fn classify_intent(config: &TaskRoutingConfig, message: &str) -> ClassifyRes
 mod tests {
     use super::*;
     use crate::config::schema::{
-        ClassificationRule, QueryClassificationConfig, TaskRoutingConfig, TaskRoutingIntentConfig,
-        TaskRoutingRule,
+        ClassificationRule, QueryClassificationConfig, TaskRoutingConfig, TaskRoutingIntentConfig, TaskRoutingRule,
     };
 
     fn make_config(enabled: bool, rules: Vec<ClassificationRule>) -> QueryClassificationConfig {
@@ -208,10 +199,7 @@ mod tests {
             }],
         );
         assert_eq!(classify(&config, "hi"), Some("fast".into()));
-        assert_eq!(
-            classify(&config, "hi there, how are you doing today?"),
-            None
-        );
+        assert_eq!(classify(&config, "hi there, how are you doing today?"), None);
 
         let config2 = make_config(
             true,

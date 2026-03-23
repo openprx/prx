@@ -131,10 +131,7 @@ mod tests {
     #[tokio::test]
     async fn lists_agents() {
         let mut agents = HashMap::new();
-        agents.insert(
-            "researcher".to_string(),
-            make_agent("anthropic", "claude-3-5-sonnet"),
-        );
+        agents.insert("researcher".to_string(), make_agent("anthropic", "claude-3-5-sonnet"));
         agents.insert("coder".to_string(), make_agent("openai", "gpt-4o"));
         let tool = AgentsListTool::new(agents);
 

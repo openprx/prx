@@ -110,10 +110,7 @@ pub async fn hydrate_skill_embeddings(
         return Ok(());
     }
 
-    let descriptions: Vec<&str> = pending
-        .iter()
-        .map(|(_, description)| description.as_str())
-        .collect();
+    let descriptions: Vec<&str> = pending.iter().map(|(_, description)| description.as_str()).collect();
     let embeddings = embedder.embed(&descriptions).await?;
 
     for ((idx, _), embedding) in pending.into_iter().zip(embeddings.into_iter()) {
@@ -191,13 +188,8 @@ fn lexical_skill_selection(query: &str, skills: &[Skill], top_k: usize) -> Vec<S
         .iter()
         .enumerate()
         .map(|(idx, skill)| {
-            let haystack = format!(
-                "{} {} {}",
-                skill.name,
-                skill.description,
-                skill.tags.join(" ")
-            )
-            .to_ascii_lowercase();
+            let haystack =
+                format!("{} {} {}", skill.name, skill.description, skill.tags.join(" ")).to_ascii_lowercase();
             let score = query_tokens
                 .iter()
                 .filter(|token| haystack.contains(token.as_str()))
@@ -206,10 +198,7 @@ fn lexical_skill_selection(query: &str, skills: &[Skill], top_k: usize) -> Vec<S
         })
         .collect();
 
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| skills[a.1].name.cmp(&skills[b.1].name))
-    });
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| skills[a.1].name.cmp(&skills[b.1].name)));
     scored
         .into_iter()
         .take(top_k)
@@ -227,16 +216,12 @@ fn load_skills_with_open_skills_config(
     let mut skills = Vec::new();
 
     // 1. Open skills (community)
-    if let Some(open_skills_dir) =
-        ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
-    {
+    if let Some(open_skills_dir) = ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir) {
         skills.extend(load_open_skills(&open_skills_dir));
     }
 
     // 2. OpenClaw skills — clone/pull from GitHub, load `skills/` subdir in lazy mode
-    if let Some(repo_dir) =
-        ensure_openclaw_skills_repo(config_openclaw_skills_enabled, config_openclaw_skills_dir)
-    {
+    if let Some(repo_dir) = ensure_openclaw_skills_repo(config_openclaw_skills_enabled, config_openclaw_skills_dir) {
         let skills_subdir = repo_dir.join("skills");
         tracing::info!("Loading OpenClaw skills from: {}", skills_subdir.display());
         skills.extend(load_openclaw_skills_from_dir(&skills_subdir));
@@ -332,18 +317,13 @@ fn parse_open_skills_enabled(raw: &str) -> Option<bool> {
     }
 }
 
-fn open_skills_enabled_from_sources(
-    config_open_skills_enabled: Option<bool>,
-    env_override: Option<&str>,
-) -> bool {
+fn open_skills_enabled_from_sources(config_open_skills_enabled: Option<bool>, env_override: Option<&str>) -> bool {
     if let Some(raw) = env_override {
         if let Some(enabled) = parse_open_skills_enabled(&raw) {
             return enabled;
         }
         if !raw.trim().is_empty() {
-            tracing::warn!(
-                "Ignoring invalid ZEROCLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
-            );
+            tracing::warn!("Ignoring invalid ZEROCLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)");
         }
     }
 
@@ -381,11 +361,7 @@ fn resolve_open_skills_dir_from_sources(
 fn resolve_open_skills_dir(config_open_skills_dir: Option<&str>) -> Option<PathBuf> {
     let env_dir = std::env::var("ZEROCLAW_OPEN_SKILLS_DIR").ok();
     let home_dir = UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
-    resolve_open_skills_dir_from_sources(
-        env_dir.as_deref(),
-        config_open_skills_dir,
-        home_dir.as_deref(),
-    )
+    resolve_open_skills_dir_from_sources(env_dir.as_deref(), config_open_skills_dir, home_dir.as_deref())
 }
 
 fn ensure_open_skills_repo(
@@ -685,9 +661,7 @@ fn clone_openclaw_skills_repo(repo_dir: &Path) -> bool {
                 }
                 Ok(r) => {
                     let stderr = String::from_utf8_lossy(&r.stderr);
-                    tracing::warn!(
-                        "sparse-checkout set failed ({stderr}); full clone will be used"
-                    );
+                    tracing::warn!("sparse-checkout set failed ({stderr}); full clone will be used");
                 }
                 Err(err) => {
                     tracing::warn!("failed to run git sparse-checkout for openclaw-skills: {err}");
@@ -874,12 +848,10 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
 
-        let location = skill.location.clone().unwrap_or_else(|| {
-            workspace_dir
-                .join("skills")
-                .join(&skill.name)
-                .join("SKILL.md")
-        });
+        let location = skill
+            .location
+            .clone()
+            .unwrap_or_else(|| workspace_dir.join("skills").join(&skill.name).join("SKILL.md"));
         write_xml_text_element(&mut prompt, 4, "location", &location.display().to_string());
 
         if !skill.prompts.is_empty() {
@@ -1025,9 +997,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 println!("No skills installed.");
                 println!();
                 println!("  Create one: mkdir -p ~/.openprx/workspace/skills/my-skill");
-                println!(
-                    "              echo '# My Skill' > ~/.openprx/workspace/skills/my-skill/SKILL.md"
-                );
+                println!("              echo '# My Skill' > ~/.openprx/workspace/skills/my-skill/SKILL.md");
                 println!();
                 println!("  Or install: prx skills install <source>");
             } else {
@@ -1073,10 +1043,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                     .output()?;
 
                 if output.status.success() {
-                    println!(
-                        "  {} Skill installed successfully!",
-                        console::style("✓").green().bold()
-                    );
+                    println!("  {} Skill installed successfully!", console::style("✓").green().bold());
                     println!("  Restart `prx channel start` to activate.");
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1173,11 +1140,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             }
 
             std::fs::remove_dir_all(&skill_path)?;
-            println!(
-                "  {} Skill '{}' removed.",
-                console::style("✓").green().bold(),
-                name
-            );
+            println!("  {} Skill '{}' removed.", console::style("✓").green().bold(), name);
             Ok(())
         }
     }
@@ -1271,11 +1234,7 @@ command = "echo hello"
         let skill_dir = skills_dir.join("md-skill");
         fs::create_dir_all(&skill_dir).unwrap();
 
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "# My Skill\nThis skill does cool things.\n",
-        )
-        .unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "# My Skill\nThis skill does cool things.\n").unwrap();
 
         let skills = load_skills(dir.path());
         assert_eq!(skills.len(), 1);
@@ -1518,9 +1477,7 @@ description = "Bare minimum"
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<name>xml&lt;skill&gt;</name>"));
         assert!(prompt.contains("<description>A &amp; B</description>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool&gt; &amp; check &quot;quotes&quot;.</instruction>"
-        ));
+        assert!(prompt.contains("<instruction>Use &lt;tool&gt; &amp; check &quot;quotes&quot;.</instruction>"));
     }
 
     #[test]
@@ -1535,10 +1492,7 @@ description = "Bare minimum"
         ];
 
         for source in sources {
-            assert!(
-                is_git_source(source),
-                "expected git source detection for '{source}'"
-            );
+            assert!(is_git_source(source), "expected git source detection for '{source}'");
         }
     }
 
@@ -1595,33 +1549,19 @@ description = "Bare minimum"
         assert!(!open_skills_enabled_from_sources(Some(true), Some("0")));
         assert!(open_skills_enabled_from_sources(Some(false), Some("yes")));
         // Invalid env values should fall back to config.
-        assert!(open_skills_enabled_from_sources(
-            Some(true),
-            Some("invalid")
-        ));
-        assert!(!open_skills_enabled_from_sources(
-            Some(false),
-            Some("invalid")
-        ));
+        assert!(open_skills_enabled_from_sources(Some(true), Some("invalid")));
+        assert!(!open_skills_enabled_from_sources(Some(false), Some("invalid")));
     }
 
     #[test]
     fn resolve_open_skills_dir_resolution_prefers_env_then_config_then_home() {
         let home = Path::new("/tmp/home-dir");
         assert_eq!(
-            resolve_open_skills_dir_from_sources(
-                Some("/tmp/env-skills"),
-                Some("/tmp/config"),
-                Some(home)
-            ),
+            resolve_open_skills_dir_from_sources(Some("/tmp/env-skills"), Some("/tmp/config"), Some(home)),
             Some(PathBuf::from("/tmp/env-skills"))
         );
         assert_eq!(
-            resolve_open_skills_dir_from_sources(
-                Some("   "),
-                Some("/tmp/config-skills"),
-                Some(home)
-            ),
+            resolve_open_skills_dir_from_sources(Some("   "), Some("/tmp/config-skills"), Some(home)),
             Some(PathBuf::from("/tmp/config-skills"))
         );
         assert_eq!(
@@ -1666,14 +1606,12 @@ description = "Bare minimum"
 
     #[test]
     fn parse_openclaw_frontmatter_returns_name_and_description() {
-        let content = "---\nname: weather\ndescription: \"Get current weather info\"\nmetadata: {}\n---\n# Weather Skill\n...";
+        let content =
+            "---\nname: weather\ndescription: \"Get current weather info\"\nmetadata: {}\n---\n# Weather Skill\n...";
         let result = parse_openclaw_frontmatter(content);
         assert_eq!(
             result,
-            Some((
-                "weather".to_string(),
-                "Get current weather info".to_string()
-            ))
+            Some(("weather".to_string(), "Get current weather info".to_string()))
         );
     }
 
@@ -1768,9 +1706,7 @@ description = "Bare minimum"
     #[test]
     #[allow(unsafe_code)]
     fn resolve_openclaw_skills_dir_env_takes_priority_over_config() {
-        let _env_lock = open_skills_env_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
         // SAFETY: test-only, single-threaded test runner
         unsafe { std::env::set_var("ZEROCLAW_OPENCLAW_SKILLS_DIR", "/tmp/env-openclaw") };
@@ -1783,9 +1719,7 @@ description = "Bare minimum"
 
     #[test]
     fn openclaw_skills_not_loaded_when_disabled_via_config() {
-        let _env_lock = open_skills_env_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
 
         // Disabled in config — should return None without touching filesystem/network.
@@ -1796,9 +1730,7 @@ description = "Bare minimum"
     #[test]
     #[allow(unsafe_code)]
     fn openclaw_skills_not_loaded_when_disabled_via_env() {
-        let _env_lock = open_skills_env_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
         // SAFETY: test-only, single-threaded test runner
         unsafe { std::env::set_var("ZEROCLAW_OPENCLAW_SKILLS_ENABLED", "false") };
@@ -1812,9 +1744,7 @@ description = "Bare minimum"
 
     #[test]
     fn openclaw_skills_disabled_returns_only_workspace_skills() {
-        let _env_lock = open_skills_env_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _env_enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
         let _env_dir_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
 
@@ -1833,9 +1763,7 @@ description = "Bare minimum"
 
     #[test]
     fn openclaw_skills_loads_from_local_dir_via_config() {
-        let _env_lock = open_skills_env_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _env_enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
         let _env_dir_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
         let _open_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_ENABLED");
@@ -1904,9 +1832,7 @@ description = "Bare minimum"
         let embedder = TestEmbeddingProvider {
             response: vec![0.25, 0.75],
         };
-        hydrate_skill_embeddings(&mut skills, &embedder)
-            .await
-            .unwrap();
+        hydrate_skill_embeddings(&mut skills, &embedder).await.unwrap();
 
         assert_eq!(skills[0].embedding, Some(vec![0.25, 0.75]));
     }

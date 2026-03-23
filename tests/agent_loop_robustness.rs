@@ -48,12 +48,7 @@ impl Provider for MockProvider {
         Ok("fallback".into())
     }
 
-    async fn chat(
-        &self,
-        _request: ChatRequest<'_>,
-        _model: &str,
-        _temperature: f64,
-    ) -> Result<ChatResponse> {
+    async fn chat(&self, _request: ChatRequest<'_>, _model: &str, _temperature: f64) -> Result<ChatResponse> {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {
@@ -128,12 +123,7 @@ struct CountingTool {
 impl CountingTool {
     fn new() -> (Self, Arc<Mutex<usize>>) {
         let count = Arc::new(Mutex::new(0));
-        (
-            Self {
-                count: count.clone(),
-            },
-            count,
-        )
+        (Self { count: count.clone() }, count)
     }
 }
 
@@ -251,10 +241,7 @@ async fn agent_handles_nonexistent_tool_gracefully() {
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("call missing tool").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "agent should recover from unknown tool"
-    );
+    assert!(!response.is_empty(), "agent should recover from unknown tool");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -434,8 +421,5 @@ async fn agent_handles_sequential_tool_then_text() {
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("two step").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "should produce final text after tool execution"
-    );
+    assert!(!response.is_empty(), "should produce final text after tool execution");
 }

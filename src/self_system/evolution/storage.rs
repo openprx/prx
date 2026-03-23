@@ -98,11 +98,7 @@ pub struct AsyncJsonlWriter {
 
 impl AsyncJsonlWriter {
     /// Create a writer and initialize required directories.
-    pub async fn new(
-        paths: JsonlStoragePaths,
-        retention: JsonlRetentionPolicy,
-        batch_size: usize,
-    ) -> Result<Self> {
+    pub async fn new(paths: JsonlStoragePaths, retention: JsonlRetentionPolicy, batch_size: usize) -> Result<Self> {
         let writer = Self {
             paths,
             retention,
@@ -116,8 +112,7 @@ impl AsyncJsonlWriter {
 
     /// Append a memory-access event into JSONL storage.
     pub async fn append_memory_access(&self, log: &MemoryAccessLog) -> Result<()> {
-        self.append_log(LogKind::MemoryAccess, &log.timestamp, log)
-            .await
+        self.append_log(LogKind::MemoryAccess, &log.timestamp, log).await
     }
 
     /// Append a decision event into JSONL storage.
@@ -132,19 +127,13 @@ impl AsyncJsonlWriter {
 
     /// Append an evolution-change event into JSONL storage.
     pub async fn append_evolution(&self, log: &EvolutionLog) -> Result<()> {
-        self.append_log(LogKind::Evolution, &log.timestamp, log)
-            .await
+        self.append_log(LogKind::Evolution, &log.timestamp, log).await
     }
 
     /// Read memory access events written at or after `since`.
-    pub async fn read_memory_access_since(
-        &self,
-        since: DateTime<Utc>,
-    ) -> Result<Vec<MemoryAccessLog>> {
-        self.read_logs_since::<MemoryAccessLog, _>(LogKind::MemoryAccess, since, |item| {
-            &item.timestamp
-        })
-        .await
+    pub async fn read_memory_access_since(&self, since: DateTime<Utc>) -> Result<Vec<MemoryAccessLog>> {
+        self.read_logs_since::<MemoryAccessLog, _>(LogKind::MemoryAccess, since, |item| &item.timestamp)
+            .await
     }
 
     /// Read decision events written at or after `since`.
@@ -182,33 +171,20 @@ impl AsyncJsonlWriter {
     /// - `cold_days`: older files under `cold/`
     /// - files older than `cold_days` are removed
     pub async fn enforce_retention(&self) -> Result<()> {
-        for kind in [
-            LogKind::MemoryAccess,
-            LogKind::Decisions,
-            LogKind::Evolution,
-        ] {
+        for kind in [LogKind::MemoryAccess, LogKind::Decisions, LogKind::Evolution] {
             self.reconcile_kind_tiers(kind).await?;
         }
         Ok(())
     }
 
-    async fn append_log<T: serde::Serialize>(
-        &self,
-        kind: LogKind,
-        timestamp: &str,
-        log: &T,
-    ) -> Result<()> {
+    async fn append_log<T: serde::Serialize>(&self, kind: LogKind, timestamp: &str, log: &T) -> Result<()> {
         let date = extract_event_date(timestamp);
         let path = self.file_path(kind, date);
         let line = serde_json::to_string(log)?;
 
         let should_flush = {
             let mut state = self.state.lock().await;
-            state
-                .buffers
-                .entry(path)
-                .or_default()
-                .push(format!("{line}\n"));
+            state.buffers.entry(path).or_default().push(format!("{line}\n"));
             state.buffered_lines += 1;
             state.buffered_lines >= self.batch_size
         };
@@ -220,11 +196,7 @@ impl AsyncJsonlWriter {
     }
 
     async fn ensure_directories(&self) -> Result<()> {
-        for kind in [
-            LogKind::MemoryAccess,
-            LogKind::Decisions,
-            LogKind::Evolution,
-        ] {
+        for kind in [LogKind::MemoryAccess, LogKind::Decisions, LogKind::Evolution] {
             for tier in [RetentionTier::Hot, RetentionTier::Warm, RetentionTier::Cold] {
                 fs::create_dir_all(self.tier_dir(kind, tier)).await?;
             }
@@ -241,11 +213,7 @@ impl AsyncJsonlWriter {
             fs::create_dir_all(parent).await?;
         }
 
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(path).await?;
 
         for line in lines {
             file.write_all(line.as_bytes()).await?;
@@ -263,12 +231,7 @@ impl AsyncJsonlWriter {
             .clone()
     }
 
-    async fn read_logs_since<T, F>(
-        &self,
-        kind: LogKind,
-        since: DateTime<Utc>,
-        ts_of: F,
-    ) -> Result<Vec<T>>
+    async fn read_logs_since<T, F>(&self, kind: LogKind, since: DateTime<Utc>, ts_of: F) -> Result<Vec<T>>
     where
         T: DeserializeOwned,
         F: Fn(&T) -> &str,
@@ -392,10 +355,7 @@ impl AsyncJsonlWriter {
     }
 
     fn tier_dir(&self, kind: LogKind, tier: RetentionTier) -> PathBuf {
-        self.paths
-            .root
-            .join(kind.as_dir_name())
-            .join(tier.as_dir_name())
+        self.paths.root.join(kind.as_dir_name()).join(tier.as_dir_name())
     }
 }
 
@@ -484,11 +444,7 @@ mod tests {
         writer.append_decision(&log).await.unwrap();
         writer.flush().await.unwrap();
 
-        let path = dir
-            .path()
-            .join("decisions")
-            .join("hot")
-            .join("2026-02-24.jsonl");
+        let path = dir.path().join("decisions").join("hot").join("2026-02-24.jsonl");
         let contents = fs::read_to_string(path).await.unwrap();
         let first_line = contents.lines().next().unwrap();
         let stored: DecisionLog = serde_json::from_str(first_line).unwrap();
@@ -512,9 +468,7 @@ mod tests {
             .join("memory_access")
             .join("cold")
             .join(format!("{old_date}.jsonl"));
-        fs::create_dir_all(expired_path.parent().unwrap())
-            .await
-            .unwrap();
+        fs::create_dir_all(expired_path.parent().unwrap()).await.unwrap();
         fs::write(&expired_path, "{}\n").await.unwrap();
 
         writer.enforce_retention().await.unwrap();
@@ -572,24 +526,14 @@ mod tests {
         writer.flush().await.unwrap();
 
         assert!(
-            path_exists(
-                &dir.path()
-                    .join("memory_access")
-                    .join("hot")
-                    .join("2026-02-24.jsonl")
-            )
-            .await
-            .unwrap()
+            path_exists(&dir.path().join("memory_access").join("hot").join("2026-02-24.jsonl"))
+                .await
+                .unwrap()
         );
         assert!(
-            path_exists(
-                &dir.path()
-                    .join("evolution")
-                    .join("hot")
-                    .join("2026-02-24.jsonl")
-            )
-            .await
-            .unwrap()
+            path_exists(&dir.path().join("evolution").join("hot").join("2026-02-24.jsonl"))
+                .await
+                .unwrap()
         );
     }
 
@@ -691,16 +635,9 @@ mod tests {
         }
         writer.flush().await.unwrap();
 
-        let path = dir
-            .path()
-            .join("memory_access")
-            .join("hot")
-            .join("2026-02-24.jsonl");
+        let path = dir.path().join("memory_access").join("hot").join("2026-02-24.jsonl");
         let raw = fs::read_to_string(path).await.unwrap();
-        let lines = raw
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect::<Vec<_>>();
+        let lines = raw.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>();
         assert_eq!(lines.len(), 20);
         for line in lines {
             let _: MemoryAccessLog = serde_json::from_str(line).unwrap();
@@ -726,9 +663,7 @@ mod tests {
             .join("memory_access")
             .join("hot")
             .join(format!("{old_date}.jsonl"));
-        fs::create_dir_all(hot_path.parent().unwrap())
-            .await
-            .unwrap();
+        fs::create_dir_all(hot_path.parent().unwrap()).await.unwrap();
         fs::write(&hot_path, "{}\n").await.unwrap();
 
         let lock = writer.file_mutex_for(&hot_path).await;

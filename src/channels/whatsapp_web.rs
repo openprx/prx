@@ -103,10 +103,7 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone(&self, phone: &str) -> String {
         let trimmed = phone.trim();
-        let user_part = trimmed
-            .split_once('@')
-            .map(|(user, _)| user)
-            .unwrap_or(trimmed);
+        let user_part = trimmed.split_once('@').map(|(user, _)| user).unwrap_or(trimmed);
         let normalized_user = user_part.trim_start_matches('+');
         format!("+{normalized_user}")
     }
@@ -161,10 +158,7 @@ impl Channel for WhatsAppWebChannel {
         if !Self::is_jid(&message.recipient) {
             let normalized = self.normalize_phone(&message.recipient);
             if !self.is_number_allowed(&normalized) {
-                tracing::warn!(
-                    "WhatsApp Web: recipient {} not in allowed list",
-                    message.recipient
-                );
+                tracing::warn!("WhatsApp Web: recipient {} not in allowed list", message.recipient);
                 return Ok(());
             }
         }
@@ -197,10 +191,7 @@ impl Channel for WhatsAppWebChannel {
         use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
         use wa_rs_ureq_http::UreqHttpClient;
 
-        tracing::info!(
-            "WhatsApp Web channel starting (session: {})",
-            self.session_path
-        );
+        tracing::info!("WhatsApp Web channel starting (session: {})", self.session_path);
 
         // Initialize storage backend
         let storage = RusqliteStore::new(&self.session_path)?;
@@ -216,9 +207,7 @@ impl Channel for WhatsAppWebChannel {
                 anyhow::bail!("Device exists but failed to load");
             }
         } else {
-            tracing::info!(
-                "WhatsApp Web: no existing session, new device will be created during pairing"
-            );
+            tracing::info!("WhatsApp Web: no existing session, new device will be created during pairing");
         };
 
         // Create transport factory
@@ -249,12 +238,7 @@ impl Channel for WhatsAppWebChannel {
                             let sender = info.source.sender.user().to_string();
                             let chat = info.source.chat.to_string();
 
-                            tracing::info!(
-                                "WhatsApp Web message from {} in {}: {}",
-                                sender,
-                                chat,
-                                text
-                            );
+                            tracing::info!("WhatsApp Web message from {} in {}: {}", sender, chat, text);
 
                             // Check if sender is allowed
                             let normalized = if sender.starts_with('+') {
@@ -304,21 +288,16 @@ impl Channel for WhatsAppWebChannel {
                         }
                         Event::PairingCode { code, .. } => {
                             tracing::info!("WhatsApp Web pair code received: {}", code);
-                            tracing::info!(
-                                "Link your phone by entering this code in WhatsApp > Linked Devices"
-                            );
+                            tracing::info!("Link your phone by entering this code in WhatsApp > Linked Devices");
                         }
                         Event::PairingQrCode { code, .. } => {
-                            tracing::info!(
-                                "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)"
-                            );
+                            tracing::info!("WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)");
                             tracing::debug!("QR code: {}", code);
                         }
                         _ => {}
                     }
                 }
-            })
-            ;
+            });
 
         // Configure pair-code flow when a phone number is provided.
         if let Some(ref phone) = self.pair_phone {
@@ -329,9 +308,7 @@ impl Channel for WhatsAppWebChannel {
                 ..Default::default()
             });
         } else if self.pair_code.is_some() {
-            tracing::warn!(
-                "WhatsApp Web: pair_code is set but pair_phone is missing; pair code config is ignored"
-            );
+            tracing::warn!("WhatsApp Web: pair_code is set but pair_phone is missing; pair code config is ignored");
         }
 
         let mut bot = builder.build().await?;
@@ -377,10 +354,7 @@ impl Channel for WhatsAppWebChannel {
         if !Self::is_jid(recipient) {
             let normalized = self.normalize_phone(recipient);
             if !self.is_number_allowed(&normalized) {
-                tracing::warn!(
-                    "WhatsApp Web: typing target {} not in allowed list",
-                    recipient
-                );
+                tracing::warn!("WhatsApp Web: typing target {} not in allowed list", recipient);
                 return Ok(());
             }
         }
@@ -405,10 +379,7 @@ impl Channel for WhatsAppWebChannel {
         if !Self::is_jid(recipient) {
             let normalized = self.normalize_phone(recipient);
             if !self.is_number_allowed(&normalized) {
-                tracing::warn!(
-                    "WhatsApp Web: typing target {} not in allowed list",
-                    recipient
-                );
+                tracing::warn!("WhatsApp Web: typing target {} not in allowed list", recipient);
                 return Ok(());
             }
         }
@@ -489,12 +460,7 @@ mod tests {
 
     #[cfg(feature = "whatsapp-web")]
     fn make_channel() -> WhatsAppWebChannel {
-        WhatsAppWebChannel::new(
-            "/tmp/test-whatsapp.db".into(),
-            None,
-            None,
-            vec!["+1234567890".into()],
-        )
+        WhatsAppWebChannel::new("/tmp/test-whatsapp.db".into(), None, None, vec!["+1234567890".into()])
     }
 
     #[test]
@@ -546,10 +512,7 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_normalize_phone_from_jid() {
         let ch = make_channel();
-        assert_eq!(
-            ch.normalize_phone("1234567890@s.whatsapp.net"),
-            "+1234567890"
-        );
+        assert_eq!(ch.normalize_phone("1234567890@s.whatsapp.net"), "+1234567890");
     }
 
     #[tokio::test]

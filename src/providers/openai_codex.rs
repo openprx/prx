@@ -2,8 +2,8 @@ use crate::auth::AuthService;
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::providers::ProviderRuntimeOptions;
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
+    ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -105,10 +105,7 @@ struct ResponsesContent {
 
 impl OpenAiCodexProvider {
     pub fn new(options: &ProviderRuntimeOptions) -> Self {
-        let state_dir = options
-            .openprx_dir
-            .clone()
-            .unwrap_or_else(default_openprx_dir);
+        let state_dir = options.openprx_dir.clone().unwrap_or_else(default_openprx_dir);
         let auth = AuthService::new_with_codex_import(
             &state_dir,
             options.secrets_encrypt,
@@ -354,10 +351,7 @@ fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<serde_json
     }
 }
 
-fn extract_tool_calls(
-    response: &ResponsesResponse,
-    tool_name_map: &HashMap<String, String>,
-) -> Vec<ProviderToolCall> {
+fn extract_tool_calls(response: &ResponsesResponse, tool_name_map: &HashMap<String, String>) -> Vec<ProviderToolCall> {
     response
         .output
         .iter()
@@ -371,14 +365,9 @@ fn extract_tool_calls(
                 if name.is_empty() {
                     return None;
                 }
-                let name = tool_name_map
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| name.to_string());
+                let name = tool_name_map.get(name).cloned().unwrap_or_else(|| name.to_string());
                 Some(ProviderToolCall {
-                    id: call_id
-                        .clone()
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    id: call_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
                     arguments: arguments.clone().unwrap_or_else(|| "{}".to_string()),
                 })
@@ -389,19 +378,14 @@ fn extract_tool_calls(
 }
 
 fn has_semantic_output(response: &ResponsesResponse) -> bool {
-    extract_responses_text(response).is_some()
-        || !extract_tool_calls(response, &HashMap::new()).is_empty()
+    extract_responses_text(response).is_some() || !extract_tool_calls(response, &HashMap::new()).is_empty()
 }
 
 fn extract_stream_event_text(event: &Value, saw_delta: bool) -> Option<String> {
     let event_type = event.get("type").and_then(Value::as_str);
     match event_type {
-        Some("response.output_text.delta") => {
-            nonempty_preserve(event.get("delta").and_then(Value::as_str))
-        }
-        Some("response.output_text.done") if !saw_delta => {
-            nonempty_preserve(event.get("text").and_then(Value::as_str))
-        }
+        Some("response.output_text.delta") => nonempty_preserve(event.get("delta").and_then(Value::as_str)),
+        Some("response.output_text.done") if !saw_delta => nonempty_preserve(event.get("text").and_then(Value::as_str)),
         Some("response.completed" | "response.done") => event
             .get("response")
             .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
@@ -534,10 +518,7 @@ fn parse_sse_text(body: &str) -> anyhow::Result<Option<ResponsesResponse>> {
         return Ok(None);
     }
 
-    Ok(Some(ResponsesResponse {
-        output,
-        output_text,
-    }))
+    Ok(Some(ResponsesResponse { output, output_text }))
 }
 
 fn extract_stream_error_message(event: &Value) -> Option<String> {
@@ -615,18 +596,14 @@ fn normalize_content_type(value: Option<&str>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn decode_responses_payload(
-    body: &str,
-    content_type: Option<&str>,
-) -> anyhow::Result<ResponsesResponse> {
+fn decode_responses_payload(body: &str, content_type: Option<&str>) -> anyhow::Result<ResponsesResponse> {
     let normalized_content_type = normalize_content_type(content_type);
     let trimmed = body.trim_start();
     let looks_like_sse = normalized_content_type.contains("text/event-stream")
         || trimmed.starts_with("event:")
         || trimmed.starts_with("data:");
-    let looks_like_json = normalized_content_type.contains("application/json")
-        || trimmed.starts_with('{')
-        || trimmed.starts_with('[');
+    let looks_like_json =
+        normalized_content_type.contains("application/json") || trimmed.starts_with('{') || trimmed.starts_with('[');
 
     if looks_like_sse {
         if let Some(response) = parse_sse_text(body)? {
@@ -688,15 +665,13 @@ async fn decode_responses_body(
     let mut body_bytes = Vec::new();
 
     loop {
-        let next = tokio::time::timeout(idle_timeout, stream.next())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "OpenAI Codex provider_response_timeout kind=stream_idle_timeout timeout_ms={} content_type={}",
-                    idle_timeout.as_millis(),
-                    normalized_content_type
-                )
-            })?;
+        let next = tokio::time::timeout(idle_timeout, stream.next()).await.map_err(|_| {
+            anyhow::anyhow!(
+                "OpenAI Codex provider_response_timeout kind=stream_idle_timeout timeout_ms={} content_type={}",
+                idle_timeout.as_millis(),
+                normalized_content_type
+            )
+        })?;
 
         match next {
             Some(Ok(chunk)) => {
@@ -710,9 +685,8 @@ async fn decode_responses_body(
                 }
 
                 let current = String::from_utf8_lossy(&body_bytes);
-                let looks_sse_by_body = current.contains("\ndata:")
-                    || current.starts_with("data:")
-                    || current.contains("\nevent:");
+                let looks_sse_by_body =
+                    current.contains("\ndata:") || current.starts_with("data:") || current.contains("\nevent:");
                 if is_sse_by_header || looks_sse_by_body {
                     if contains_done_event(&current) || contains_terminal_response_event(&current) {
                         break;
@@ -747,9 +721,7 @@ impl OpenAiCodexProvider {
             .get_valid_openai_access_token(self.auth_profile_override.as_deref())
             .await?
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "OpenAI Codex auth profile not found. Run `prx auth login --provider openai-codex`."
-                )
+                anyhow::anyhow!("OpenAI Codex auth profile not found. Run `prx auth login --provider openai-codex`.")
             })?;
         let profile = self
             .auth
@@ -813,8 +785,7 @@ impl OpenAiCodexProvider {
         let response = self
             .send_and_decode_full_response(input, instructions, model, None)
             .await?;
-        extract_responses_text(&response)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
+        extract_responses_text(&response).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
     }
 }
 
@@ -852,8 +823,7 @@ impl Provider for OpenAiCodexProvider {
         _temperature: f64,
     ) -> anyhow::Result<String> {
         let (instructions, input) = build_responses_input(messages);
-        self.send_responses_request(input, instructions, model)
-            .await
+        self.send_responses_request(input, instructions, model).await
     }
 
     async fn chat(
@@ -938,10 +908,7 @@ mod tests {
 
     #[test]
     fn resolve_instructions_uses_default_when_missing() {
-        assert_eq!(
-            resolve_instructions(None),
-            DEFAULT_CODEX_INSTRUCTIONS.to_string()
-        );
+        assert_eq!(resolve_instructions(None), DEFAULT_CODEX_INSTRUCTIONS.to_string());
     }
 
     #[test]
@@ -954,22 +921,13 @@ mod tests {
 
     #[test]
     fn resolve_instructions_uses_system_prompt_when_present() {
-        assert_eq!(
-            resolve_instructions(Some("Be strict")),
-            "Be strict".to_string()
-        );
+        assert_eq!(resolve_instructions(Some("Be strict")), "Be strict".to_string());
     }
 
     #[test]
     fn clamp_reasoning_effort_adjusts_known_models() {
-        assert_eq!(
-            clamp_reasoning_effort("gpt-5.3-codex", "minimal"),
-            "low".to_string()
-        );
-        assert_eq!(
-            clamp_reasoning_effort("gpt-5.1", "xhigh"),
-            "high".to_string()
-        );
+        assert_eq!(clamp_reasoning_effort("gpt-5.3-codex", "minimal"), "low".to_string());
+        assert_eq!(clamp_reasoning_effort("gpt-5.1", "xhigh"), "high".to_string());
         assert_eq!(
             clamp_reasoning_effort("gpt-5.1-codex-mini", "low"),
             "medium".to_string()
@@ -978,10 +936,7 @@ mod tests {
             clamp_reasoning_effort("gpt-5.1-codex-mini", "xhigh"),
             "high".to_string()
         );
-        assert_eq!(
-            clamp_reasoning_effort("gpt-5.3-codex", "xhigh"),
-            "xhigh".to_string()
-        );
+        assert_eq!(clamp_reasoning_effort("gpt-5.3-codex", "xhigh"), "xhigh".to_string());
     }
 
     #[test]
@@ -1032,10 +987,7 @@ data: [DONE]
         assert_eq!(instructions, "You are helpful.");
         assert_eq!(input.len(), 3);
 
-        let json: Vec<Value> = input
-            .iter()
-            .map(|item| serde_json::to_value(item).unwrap())
-            .collect();
+        let json: Vec<Value> = input.iter().map(|item| serde_json::to_value(item).unwrap()).collect();
         assert_eq!(json[0]["role"], "user");
         assert_eq!(json[0]["content"][0]["type"], "input_text");
         assert_eq!(json[1]["role"], "assistant");
@@ -1140,10 +1092,7 @@ data: [DONE]
         let (sanitized, mapping) = sanitize_codex_tools(tools).expect("sanitize should succeed");
         let sanitized = sanitized.expect("sanitized tools must exist");
         assert_eq!(sanitized[0]["name"], "email_execute");
-        assert_eq!(
-            mapping.get("email_execute").map(String::as_str),
-            Some("email.execute")
-        );
+        assert_eq!(mapping.get("email_execute").map(String::as_str), Some("email.execute"));
     }
 
     #[test]

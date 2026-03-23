@@ -158,10 +158,7 @@ impl SkillForge {
                     }
                 }
                 ScoutSource::ClawHub | ScoutSource::HuggingFace => {
-                    info!(
-                        source = src.as_str(),
-                        "Source not yet implemented — skipping"
-                    );
+                    info!(source = src.as_str(), "Source not yet implemented — skipping");
                 }
             }
         }
@@ -172,10 +169,7 @@ impl SkillForge {
         info!(discovered, "Total unique candidates after dedup");
 
         // --- Evaluate -------------------------------------------------------
-        let results: Vec<EvalResult> = candidates
-            .into_iter()
-            .map(|c| self.evaluator.evaluate(c))
-            .collect();
+        let results: Vec<EvalResult> = candidates.into_iter().map(|c| self.evaluator.evaluate(c)).collect();
         let evaluated = results.len();
 
         // --- Integrate ------------------------------------------------------
@@ -213,10 +207,7 @@ impl SkillForge {
             }
         }
 
-        info!(
-            auto_integrated,
-            manual_review, skipped, "Forge pipeline complete"
-        );
+        info!(auto_integrated, manual_review, skipped, "Forge pipeline complete");
 
         Ok(ForgeReport {
             discovered,

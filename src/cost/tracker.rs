@@ -22,9 +22,8 @@ impl CostTracker {
     pub fn new(config: CostConfig, workspace_dir: &Path) -> Result<Self> {
         let storage_path = resolve_storage_path(workspace_dir)?;
 
-        let storage = CostStorage::new(&storage_path).with_context(|| {
-            format!("Failed to open cost storage at {}", storage_path.display())
-        })?;
+        let storage = CostStorage::new(&storage_path)
+            .with_context(|| format!("Failed to open cost storage at {}", storage_path.display()))?;
 
         Ok(Self {
             config,
@@ -54,9 +53,7 @@ impl CostTracker {
         }
 
         if !estimated_cost_usd.is_finite() || estimated_cost_usd < 0.0 {
-            return Err(anyhow!(
-                "Estimated cost must be a finite, non-negative value"
-            ));
+            return Err(anyhow!("Estimated cost must be a finite, non-negative value"));
         }
 
         let mut storage = self.lock_storage();
@@ -113,9 +110,7 @@ impl CostTracker {
         }
 
         if !usage.cost_usd.is_finite() || usage.cost_usd < 0.0 {
-            return Err(anyhow!(
-                "Token usage cost must be a finite, non-negative value"
-            ));
+            return Err(anyhow!("Token usage cost must be a finite, non-negative value"));
         }
 
         let record = CostRecord::new(&self.session_id, usage);
@@ -141,14 +136,8 @@ impl CostTracker {
         };
 
         let session_costs = self.lock_session_costs();
-        let session_cost: f64 = session_costs
-            .iter()
-            .map(|record| record.usage.cost_usd)
-            .sum();
-        let total_tokens: u64 = session_costs
-            .iter()
-            .map(|record| record.usage.total_tokens)
-            .sum();
+        let session_cost: f64 = session_costs.iter().map(|record| record.usage.cost_usd).sum();
+        let total_tokens: u64 = session_costs.iter().map(|record| record.usage.total_tokens).sum();
         let request_count = session_costs.len();
         let by_model = build_session_model_stats(&session_costs);
 
@@ -181,8 +170,7 @@ fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
 
     if !storage_path.exists() && legacy_path.exists() {
         if let Some(parent) = storage_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
 
         if let Err(error) = fs::rename(&legacy_path, &storage_path) {
@@ -239,8 +227,7 @@ impl CostStorage {
     /// Create or open cost storage.
     fn new(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
 
         let now = Utc::now();
@@ -253,11 +240,7 @@ impl CostStorage {
             cached_month: now.month(),
         };
 
-        storage.rebuild_aggregates(
-            storage.cached_day,
-            storage.cached_year,
-            storage.cached_month,
-        )?;
+        storage.rebuild_aggregates(storage.cached_day, storage.cached_year, storage.cached_month)?;
 
         Ok(storage)
     }
@@ -474,15 +457,8 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
 
-        let old_record = CostRecord::new(
-            "old-session",
-            TokenUsage::new("legacy/model", 500, 500, 1.0, 1.0),
-        );
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(storage_path)
-            .unwrap();
+        let old_record = CostRecord::new("old-session", TokenUsage::new("legacy/model", 500, 500, 1.0, 1.0));
+        let mut file = OpenOptions::new().create(true).append(true).open(storage_path).unwrap();
         writeln!(file, "{}", serde_json::to_string(&old_record).unwrap()).unwrap();
         file.sync_all().unwrap();
 
@@ -508,11 +484,7 @@ mod tests {
         let valid_usage = TokenUsage::new("test/model", 1000, 0, 1.0, 1.0);
         let valid_record = CostRecord::new("session-a", valid_usage.clone());
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(storage_path)
-            .unwrap();
+        let mut file = OpenOptions::new().create(true).append(true).open(storage_path).unwrap();
         writeln!(file, "{}", serde_json::to_string(&valid_record).unwrap()).unwrap();
         writeln!(file, "not-a-json-line").unwrap();
         writeln!(file).unwrap();

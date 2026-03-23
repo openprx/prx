@@ -1,7 +1,5 @@
 use crate::multimodal;
-use crate::providers::traits::{
-    ChatMessage, ChatResponse, Provider, ProviderCapabilities, ToolCall,
-};
+use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ProviderCapabilities, ToolCall};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -96,11 +94,7 @@ impl OllamaProvider {
         Self::new_with_reasoning(base_url, api_key, None)
     }
 
-    pub fn new_with_reasoning(
-        base_url: Option<&str>,
-        api_key: Option<&str>,
-        reasoning_enabled: Option<bool>,
-    ) -> Self {
+    pub fn new_with_reasoning(base_url: Option<&str>, api_key: Option<&str>, reasoning_enabled: Option<bool>) -> Self {
         let api_key = api_key.and_then(|value| {
             let trimmed = value.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -215,8 +209,7 @@ impl OllamaProvider {
                 if message.role == "assistant" {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) {
                         if let Some(tool_calls_value) = value.get("tool_calls") {
-                            if let Ok(parsed_calls) =
-                                serde_json::from_value::<Vec<ToolCall>>(tool_calls_value.clone())
+                            if let Ok(parsed_calls) = serde_json::from_value::<Vec<ToolCall>>(tool_calls_value.clone())
                             {
                                 let outgoing_calls: Vec<OutgoingToolCall> = parsed_calls
                                     .into_iter()
@@ -226,9 +219,7 @@ impl OllamaProvider {
                                             kind: "function".to_string(),
                                             function: OutgoingFunction {
                                                 name: call.name,
-                                                arguments: Self::parse_tool_arguments(
-                                                    &call.arguments,
-                                                ),
+                                                arguments: Self::parse_tool_arguments(&call.arguments),
                                             },
                                         }
                                     })
@@ -266,10 +257,7 @@ impl OllamaProvider {
                             .get("content")
                             .and_then(serde_json::Value::as_str)
                             .map(ToString::to_string)
-                            .or_else(|| {
-                                (!message.content.trim().is_empty())
-                                    .then_some(message.content.clone())
-                            });
+                            .or_else(|| (!message.content.trim().is_empty()).then_some(message.content.clone()));
 
                         return Message {
                             role: "tool".to_string(),
@@ -345,11 +333,7 @@ impl OllamaProvider {
         if !status.is_success() {
             let raw = String::from_utf8_lossy(&body);
             let sanitized = super::sanitize_api_error(&raw);
-            tracing::error!(
-                "Ollama error response: status={} body_excerpt={}",
-                status,
-                sanitized
-            );
+            tracing::error!("Ollama error response: status={} body_excerpt={}", status, sanitized);
             anyhow::bail!(
                 "Ollama API error ({}): {}. Is Ollama running? (brew install ollama && ollama serve)",
                 status,
@@ -385,8 +369,7 @@ impl OllamaProvider {
                 let (tool_name, tool_args) = self.extract_tool_name_and_args(tc);
 
                 // Arguments must be a JSON string for parse_tool_calls compatibility
-                let args_str =
-                    serde_json::to_string(&tool_args).unwrap_or_else(|_| "{}".to_string());
+                let args_str = serde_json::to_string(&tool_args).unwrap_or_else(|_| "{}".to_string());
 
                 serde_json::json!({
                     "id": tc.id,
@@ -421,10 +404,7 @@ impl OllamaProvider {
             || name.starts_with("tool_call<")
         {
             if let Some(nested_name) = args.get("name").and_then(|v| v.as_str()) {
-                let nested_args = args
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(serde_json::json!({}));
+                let nested_args = args.get("arguments").cloned().unwrap_or(serde_json::json!({}));
                 tracing::debug!(
                     "Unwrapped nested tool call: {} -> {} with args {:?}",
                     name,
@@ -537,13 +517,7 @@ impl Provider for OllamaProvider {
         let api_messages = self.convert_messages(messages);
 
         let response = self
-            .send_request(
-                api_messages,
-                &normalized_model,
-                temperature,
-                should_auth,
-                None,
-            )
+            .send_request(api_messages, &normalized_model, temperature, should_auth, None)
             .await?;
 
         // If model returned tool calls, format them for loop_.rs's parse_tool_calls
@@ -602,13 +576,7 @@ impl Provider for OllamaProvider {
         let tools_opt = if tools.is_empty() { None } else { Some(tools) };
 
         let response = self
-            .send_request(
-                api_messages,
-                &normalized_model,
-                temperature,
-                should_auth,
-                tools_opt,
-            )
+            .send_request(api_messages, &normalized_model, temperature, should_auth, tools_opt)
             .await?;
 
         // Native tool calls returned by the model.
@@ -620,13 +588,9 @@ impl Provider for OllamaProvider {
                 .map(|tc| {
                     let (name, args) = self.extract_tool_name_and_args(tc);
                     ToolCall {
-                        id: tc
-                            .id
-                            .clone()
-                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        id: tc.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                         name,
-                        arguments: serde_json::to_string(&args)
-                            .unwrap_or_else(|_| "{}".to_string()),
+                        arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
                     }
                 })
                 .collect();
@@ -819,8 +783,7 @@ mod tests {
 
     #[test]
     fn response_with_thinking_field_extracts_content() {
-        let json =
-            r#"{"message":{"role":"assistant","content":"hello","thinking":"internal reasoning"}}"#;
+        let json = r#"{"message":{"role":"assistant","content":"hello","thinking":"internal reasoning"}}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.message.content, "hello");
     }
@@ -911,7 +874,9 @@ mod tests {
         let provider = OllamaProvider::new(None, None);
         let messages = vec![ChatMessage {
             role: "assistant".into(),
-            content: r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"}]}"#.into(),
+            content:
+                r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"}]}"#
+                    .into(),
         }];
 
         let converted = provider.convert_messages(&messages);
@@ -919,10 +884,7 @@ mod tests {
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "assistant");
         assert!(converted[0].content.is_none());
-        let calls = converted[0]
-            .tool_calls
-            .as_ref()
-            .expect("tool calls expected");
+        let calls = converted[0].tool_calls.as_ref().expect("tool calls expected");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].kind, "function");
         assert_eq!(calls[0].function.name, "shell");
@@ -963,14 +925,8 @@ mod tests {
         let converted = provider.convert_messages(&messages);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "user");
-        assert_eq!(
-            converted[0].content.as_deref(),
-            Some("Inspect this screenshot")
-        );
-        let images = converted[0]
-            .images
-            .as_ref()
-            .expect("images should be present");
+        assert_eq!(converted[0].content.as_deref(), Some("Inspect this screenshot"));
+        let images = converted[0].images.as_ref().expect("images should be present");
         assert_eq!(images, &vec!["abcd==".to_string()]);
     }
 

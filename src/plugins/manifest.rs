@@ -161,23 +161,17 @@ impl PluginManifest {
     /// Basic validation of required fields.
     fn validate(&self) -> PluginResult<()> {
         if self.plugin.name.is_empty() {
-            return Err(PluginError::Manifest(
-                "plugin name cannot be empty".to_string(),
-            ));
+            return Err(PluginError::Manifest("plugin name cannot be empty".to_string()));
         }
         if self.plugin.version.is_empty() {
-            return Err(PluginError::Manifest(
-                "plugin version cannot be empty".to_string(),
-            ));
+            return Err(PluginError::Manifest("plugin version cannot be empty".to_string()));
         }
         Ok(())
     }
 
     /// Check if this manifest declares a specific capability type.
     pub fn has_capability(&self, cap_type: &str) -> bool {
-        self.capabilities
-            .iter()
-            .any(|c| c.capability_type == cap_type)
+        self.capabilities.iter().any(|c| c.capability_type == cap_type)
     }
 
     /// Get all capabilities of a specific type.
@@ -246,10 +240,7 @@ default_units = "metric"
         assert_eq!(manifest.permissions.optional.len(), 2);
         assert_eq!(manifest.permissions.http_allowlist.len(), 2);
         assert_eq!(manifest.resources.max_fuel, 1_000_000_000);
-        assert_eq!(
-            manifest.config.get("api_key"),
-            Some(&"test-key".to_string())
-        );
+        assert_eq!(manifest.config.get("api_key"), Some(&"test-key".to_string()));
     }
 
     #[test]
@@ -371,15 +362,9 @@ version = ""
 "#;
         let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
         let result = manifest.validate();
-        assert!(
-            result.is_err(),
-            "empty plugin version should fail validation"
-        );
+        assert!(result.is_err(), "empty plugin version should fail validation");
         let err = format!("{}", result.unwrap_err());
-        assert!(
-            err.contains("version"),
-            "error should mention version: {err}"
-        );
+        assert!(err.contains("version"), "error should mention version: {err}");
     }
 
     #[test]
@@ -404,10 +389,7 @@ name = "no-pool"
 version = "0.1.0"
 "#;
         let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
-        assert_eq!(
-            manifest.resources.pool_size, 0,
-            "pool_size should default to 0"
-        );
+        assert_eq!(manifest.resources.pool_size, 0, "pool_size should default to 0");
     }
 
     #[test]

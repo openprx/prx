@@ -8,16 +8,17 @@ pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result
     match schedule {
         Schedule::Cron { expr, tz } => {
             let normalized = normalize_expression(expr)?;
-            let cron = CronExprSchedule::from_str(&normalized)
-                .with_context(|| format!("Invalid cron expression: {expr}"))?;
+            let cron =
+                CronExprSchedule::from_str(&normalized).with_context(|| format!("Invalid cron expression: {expr}"))?;
 
             if let Some(tz_name) = tz {
-                let timezone = chrono_tz::Tz::from_str(tz_name)
-                    .with_context(|| format!("Invalid IANA timezone: {tz_name}"))?;
+                let timezone =
+                    chrono_tz::Tz::from_str(tz_name).with_context(|| format!("Invalid IANA timezone: {tz_name}"))?;
                 let localized_from = from.with_timezone(&timezone);
-                let next_local = cron.after(&localized_from).next().ok_or_else(|| {
-                    anyhow::anyhow!("No future occurrence for expression: {expr}")
-                })?;
+                let next_local = cron
+                    .after(&localized_from)
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("No future occurrence for expression: {expr}"))?;
                 Ok(next_local.with_timezone(&Utc))
             } else {
                 cron.after(&from)
@@ -76,9 +77,7 @@ pub fn normalize_expression(expression: &str) -> Result<String> {
         5 => Ok(format!("0 {expression}")),
         // crate-native syntax includes seconds (+ optional year)
         6 | 7 => Ok(expression.to_string()),
-        _ => anyhow::bail!(
-            "Invalid cron expression: {expression} (expected 5, 6, or 7 fields, got {field_count})"
-        ),
+        _ => anyhow::bail!("Invalid cron expression: {expression} (expected 5, 6, or 7 fields, got {field_count})"),
     }
 }
 
@@ -253,10 +252,7 @@ mod tests {
             expr: "0 9 * * *".into(),
             tz: None,
         };
-        assert_eq!(
-            schedule_cron_expression(&schedule),
-            Some("0 9 * * *".into())
-        );
+        assert_eq!(schedule_cron_expression(&schedule), Some("0 9 * * *".into()));
     }
 
     #[test]

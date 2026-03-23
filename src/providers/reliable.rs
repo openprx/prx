@@ -1,7 +1,5 @@
 use super::Provider;
-use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
-};
+use super::traits::{ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use std::collections::HashMap;
@@ -56,10 +54,7 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
         "invalid token",
     ];
 
-    if auth_failure_hints
-        .iter()
-        .any(|hint| msg_lower.contains(hint))
-    {
+    if auth_failure_hints.iter().any(|hint| msg_lower.contains(hint)) {
         return true;
     }
     if msg_lower.contains("provider_response_parse_error") {
@@ -100,19 +95,13 @@ fn is_non_retryable_provider_response_parse_error(msg_lower: &str) -> bool {
         return true;
     }
 
-    if RETRYABLE_PARSE_ERROR_KINDS
-        .iter()
-        .any(|kind| msg_lower.contains(kind))
-    {
+    if RETRYABLE_PARSE_ERROR_KINDS.iter().any(|kind| msg_lower.contains(kind)) {
         return false;
     }
 
     // Keep transient network read failures retryable even when kind tagging
     // differs by provider implementation details.
-    if TRANSIENT_BODY_READ_HINTS
-        .iter()
-        .any(|hint| msg_lower.contains(hint))
-    {
+    if TRANSIENT_BODY_READ_HINTS.iter().any(|hint| msg_lower.contains(hint)) {
         return false;
     }
 
@@ -145,8 +134,7 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
         }
     }
     let msg = err.to_string();
-    msg.contains("429")
-        && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
+    msg.contains("429") && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
 }
 
 /// Check if a 429 is a business/quota-plan error that retries cannot fix.
@@ -202,12 +190,7 @@ fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
     let lower = msg.to_lowercase();
 
     // Look for "retry-after: <number>" or "retry_after: <number>"
-    for prefix in &[
-        "retry-after:",
-        "retry_after:",
-        "retry-after ",
-        "retry_after ",
-    ] {
+    for prefix in &["retry-after:", "retry_after:", "retry-after ", "retry_after "] {
         if let Some(pos) = lower.find(prefix) {
             let after = &msg[pos + prefix.len()..];
             let num_str: String = after
@@ -286,11 +269,7 @@ pub struct ReliableProvider {
 }
 
 impl ReliableProvider {
-    pub fn new(
-        providers: Vec<(String, Box<dyn Provider>)>,
-        max_retries: u32,
-        base_backoff_ms: u64,
-    ) -> Self {
+    pub fn new(providers: Vec<(String, Box<dyn Provider>)>, max_retries: u32, base_backoff_ms: u64) -> Self {
         Self {
             providers,
             max_retries,
@@ -324,11 +303,7 @@ impl ReliableProvider {
         super::provider_matches_model_prefix(provider_name, model)
     }
 
-    fn all_failed_message(
-        &self,
-        failures: &[String],
-        runtime_unavailable: &[(String, String)],
-    ) -> String {
+    fn all_failed_message(&self, failures: &[String], runtime_unavailable: &[(String, String)]) -> String {
         let available = self
             .providers
             .iter()
@@ -551,10 +526,7 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
-                    match provider
-                        .chat_with_history(messages, current_model, temperature)
-                        .await
-                    {
+                    match provider.chat_with_history(messages, current_model, temperature).await {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
@@ -644,12 +616,7 @@ impl Provider for ReliableProvider {
         anyhow::bail!(self.all_failed_message(&failures, &runtime_unavailable))
     }
 
-    async fn chat(
-        &self,
-        request: ChatRequest<'_>,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<ChatResponse> {
+    async fn chat(&self, request: ChatRequest<'_>, model: &str, temperature: f64) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
         let mut runtime_unavailable = Vec::new();
@@ -667,10 +634,7 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
-                    match provider
-                        .chat(request.clone(), current_model, temperature)
-                        .await
-                    {
+                    match provider.chat(request.clone(), current_model, temperature).await {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
@@ -767,9 +731,7 @@ impl Provider for ReliableProvider {
     }
 
     fn supports_vision(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+        self.providers.iter().any(|(_, provider)| provider.supports_vision())
     }
 
     async fn chat_with_tools(
@@ -919,13 +881,7 @@ impl Provider for ReliableProvider {
 
             // For streaming, we attempt once and propagate errors
             // The caller can retry the entire request if needed
-            let stream = provider.stream_chat_with_system(
-                system_prompt,
-                message,
-                &current_model,
-                temperature,
-                options,
-            );
+            let stream = provider.stream_chat_with_system(system_prompt, message, &current_model, temperature, options);
 
             // Use a channel to bridge the stream with logging
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
@@ -934,11 +890,7 @@ impl Provider for ReliableProvider {
                 let mut stream = stream;
                 while let Some(chunk) = stream.next().await {
                     if let Err(ref e) = chunk {
-                        tracing::warn!(
-                            provider = provider_clone,
-                            model = current_model,
-                            "Streaming error: {e}"
-                        );
+                        tracing::warn!(provider = provider_clone, model = current_model, "Streaming error: {e}");
                     }
                     if tx.send(chunk).await.is_err() {
                         break; // Receiver dropped
@@ -947,10 +899,7 @@ impl Provider for ReliableProvider {
             });
 
             // Convert channel receiver to stream
-            return stream::unfold(rx, |mut rx| async move {
-                rx.recv().await.map(|chunk| (chunk, rx))
-            })
-            .boxed();
+            return stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed();
         }
 
         // No streaming support available
@@ -1180,27 +1129,17 @@ mod tests {
         assert!(is_non_retryable(&anyhow::anyhow!("401 Unauthorized")));
         assert!(is_non_retryable(&anyhow::anyhow!("403 Forbidden")));
         assert!(is_non_retryable(&anyhow::anyhow!("404 Not Found")));
-        assert!(is_non_retryable(&anyhow::anyhow!(
-            "invalid api key provided"
-        )));
+        assert!(is_non_retryable(&anyhow::anyhow!("invalid api key provided")));
         assert!(is_non_retryable(&anyhow::anyhow!("authentication failed")));
-        assert!(is_non_retryable(&anyhow::anyhow!(
-            "model glm-4.7 not found"
-        )));
-        assert!(is_non_retryable(&anyhow::anyhow!(
-            "unsupported model: glm-4.7"
-        )));
+        assert!(is_non_retryable(&anyhow::anyhow!("model glm-4.7 not found")));
+        assert!(is_non_retryable(&anyhow::anyhow!("unsupported model: glm-4.7")));
         assert!(!is_non_retryable(&anyhow::anyhow!("429 Too Many Requests")));
         assert!(!is_non_retryable(&anyhow::anyhow!("408 Request Timeout")));
-        assert!(!is_non_retryable(&anyhow::anyhow!(
-            "500 Internal Server Error"
-        )));
+        assert!(!is_non_retryable(&anyhow::anyhow!("500 Internal Server Error")));
         assert!(!is_non_retryable(&anyhow::anyhow!("502 Bad Gateway")));
         assert!(!is_non_retryable(&anyhow::anyhow!("timeout")));
         assert!(!is_non_retryable(&anyhow::anyhow!("connection reset")));
-        assert!(!is_non_retryable(&anyhow::anyhow!(
-            "model overloaded, try again later"
-        )));
+        assert!(!is_non_retryable(&anyhow::anyhow!("model overloaded, try again later")));
         assert!(is_non_retryable(&anyhow::anyhow!(
             "OpenAI Codex stream error: Your input exceeds the context window of this model."
         )));
@@ -1210,10 +1149,7 @@ mod tests {
     async fn context_window_error_aborts_retries_and_model_fallbacks() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut model_fallbacks = std::collections::HashMap::new();
-        model_fallbacks.insert(
-            "gpt-5.3-codex".to_string(),
-            vec!["gpt-5.2-codex".to_string()],
-        );
+        model_fallbacks.insert("gpt-5.3-codex".to_string(), vec!["gpt-5.2-codex".to_string()]);
 
         let provider = ReliableProvider::new(
             vec![(
@@ -1325,10 +1261,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
-        let result = provider
-            .chat_with_history(&messages, "test", 0.0)
-            .await
-            .unwrap();
+        let result = provider.chat_with_history(&messages, "test", 0.0).await.unwrap();
         assert_eq!(result, "history ok");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
@@ -1364,10 +1297,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let result = provider
-            .chat_with_history(&messages, "test", 0.0)
-            .await
-            .unwrap();
+        let result = provider.chat_with_history(&messages, "test", 0.0).await.unwrap();
         assert_eq!(result, "fallback ok");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
@@ -1389,19 +1319,13 @@ mod tests {
         fallbacks.insert("claude-opus".to_string(), vec!["claude-sonnet".to_string()]);
 
         let provider = ReliableProvider::new(
-            vec![(
-                "anthropic".into(),
-                Box::new(mock.clone()) as Box<dyn Provider>,
-            )],
+            vec![("anthropic".into(), Box::new(mock.clone()) as Box<dyn Provider>)],
             0, // no retries — force immediate model failover
             1,
         )
         .with_model_fallbacks(fallbacks);
 
-        let result = provider
-            .simple_chat("hello", "claude-opus", 0.0)
-            .await
-            .unwrap();
+        let result = provider.simple_chat("hello", "claude-opus", 0.0).await.unwrap();
         assert_eq!(result, "ok from sonnet");
 
         let seen = mock.models_seen.lock();
@@ -1426,12 +1350,8 @@ mod tests {
             vec!["model-b".to_string(), "model-c".to_string()],
         );
 
-        let provider = ReliableProvider::new(
-            vec![("p1".into(), Box::new(mock.clone()) as Box<dyn Provider>)],
-            0,
-            1,
-        )
-        .with_model_fallbacks(fallbacks);
+        let provider = ReliableProvider::new(vec![("p1".into(), Box::new(mock.clone()) as Box<dyn Provider>)], 0, 1)
+            .with_model_fallbacks(fallbacks);
 
         let err = provider
             .simple_chat("hello", "model-a", 0.0)
@@ -1518,13 +1438,9 @@ mod tests {
     #[test]
     fn rate_limited_detection() {
         assert!(is_rate_limited(&anyhow::anyhow!("429 Too Many Requests")));
-        assert!(is_rate_limited(&anyhow::anyhow!(
-            "HTTP 429 rate limit exceeded"
-        )));
+        assert!(is_rate_limited(&anyhow::anyhow!("HTTP 429 rate limit exceeded")));
         assert!(!is_rate_limited(&anyhow::anyhow!("401 Unauthorized")));
-        assert!(!is_rate_limited(&anyhow::anyhow!(
-            "500 Internal Server Error"
-        )));
+        assert!(!is_rate_limited(&anyhow::anyhow!("500 Internal Server Error")));
     }
 
     #[test]
@@ -1586,28 +1502,19 @@ mod tests {
     #[test]
     fn non_retryable_detects_401() {
         let err = anyhow::anyhow!("API error (401 Unauthorized): invalid api key");
-        assert!(
-            is_non_retryable(&err),
-            "401 errors must be detected as non-retryable"
-        );
+        assert!(is_non_retryable(&err), "401 errors must be detected as non-retryable");
     }
 
     #[test]
     fn non_retryable_detects_403() {
         let err = anyhow::anyhow!("API error (403 Forbidden): access denied");
-        assert!(
-            is_non_retryable(&err),
-            "403 errors must be detected as non-retryable"
-        );
+        assert!(is_non_retryable(&err), "403 errors must be detected as non-retryable");
     }
 
     #[test]
     fn non_retryable_detects_404() {
         let err = anyhow::anyhow!("API error (404 Not Found): model not found");
-        assert!(
-            is_non_retryable(&err),
-            "404 errors must be detected as non-retryable"
-        );
+        assert!(is_non_retryable(&err), "404 errors must be detected as non-retryable");
     }
 
     #[test]
@@ -1640,10 +1547,7 @@ mod tests {
     #[test]
     fn non_retryable_does_not_flag_502() {
         let err = anyhow::anyhow!("502 Bad Gateway");
-        assert!(
-            !is_non_retryable(&err),
-            "502 must NOT be treated as non-retryable"
-        );
+        assert!(!is_non_retryable(&err), "502 must NOT be treated as non-retryable");
     }
 
     #[test]
@@ -1853,10 +1757,7 @@ mod tests {
             0,
             1,
         )
-        .with_unavailable_providers(vec![(
-            "anthropic".into(),
-            "missing credential/api key".into(),
-        )]);
+        .with_unavailable_providers(vec![("anthropic".into(), "missing credential/api key".into())]);
 
         let err = provider
             .simple_chat("hello", "openai/gpt-4o", 0.0)
@@ -1872,16 +1773,8 @@ mod tests {
     fn supports_native_tools_is_true_if_any_provider_supports_it() {
         let provider = ReliableProvider::new(
             vec![
-                (
-                    "primary".into(),
-                    Box::new(NativeCapabilityMock {
-                        native_tools: false,
-                    }),
-                ),
-                (
-                    "fallback".into(),
-                    Box::new(NativeCapabilityMock { native_tools: true }),
-                ),
+                ("primary".into(), Box::new(NativeCapabilityMock { native_tools: false })),
+                ("fallback".into(), Box::new(NativeCapabilityMock { native_tools: true })),
             ],
             0,
             1,

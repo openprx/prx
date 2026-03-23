@@ -78,10 +78,7 @@ impl Tool for ConfigReloadTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Failed to read config file {}: {e}",
-                        config_path.display()
-                    )),
+                    error: Some(format!("Failed to read config file {}: {e}", config_path.display())),
                 });
             }
         };
@@ -141,13 +138,10 @@ impl Tool for ConfigReloadTool {
                     old.agent.compact_context, fresh.agent.compact_context
                 ));
             }
-            if old.agent.read_only_tool_concurrency_window
-                != fresh.agent.read_only_tool_concurrency_window
-            {
+            if old.agent.read_only_tool_concurrency_window != fresh.agent.read_only_tool_concurrency_window {
                 changes.push(format!(
                     "agent.read_only_tool_concurrency_window: {} → {}",
-                    old.agent.read_only_tool_concurrency_window,
-                    fresh.agent.read_only_tool_concurrency_window
+                    old.agent.read_only_tool_concurrency_window, fresh.agent.read_only_tool_concurrency_window
                 ));
             }
             if old.agent.read_only_tool_timeout_secs != fresh.agent.read_only_tool_timeout_secs {
@@ -168,13 +162,10 @@ impl Tool for ConfigReloadTool {
                     old.agent.low_priority_tools, fresh.agent.low_priority_tools
                 ));
             }
-            if old.agent.concurrency_kill_switch_force_serial
-                != fresh.agent.concurrency_kill_switch_force_serial
-            {
+            if old.agent.concurrency_kill_switch_force_serial != fresh.agent.concurrency_kill_switch_force_serial {
                 changes.push(format!(
                     "agent.concurrency_kill_switch_force_serial: {} → {}",
-                    old.agent.concurrency_kill_switch_force_serial,
-                    fresh.agent.concurrency_kill_switch_force_serial
+                    old.agent.concurrency_kill_switch_force_serial, fresh.agent.concurrency_kill_switch_force_serial
                 ));
             }
             if old.agent.concurrency_rollout_stage != fresh.agent.concurrency_rollout_stage {
@@ -183,29 +174,22 @@ impl Tool for ConfigReloadTool {
                     old.agent.concurrency_rollout_stage, fresh.agent.concurrency_rollout_stage
                 ));
             }
-            if old.agent.concurrency_rollout_sample_percent
-                != fresh.agent.concurrency_rollout_sample_percent
-            {
+            if old.agent.concurrency_rollout_sample_percent != fresh.agent.concurrency_rollout_sample_percent {
                 changes.push(format!(
                     "agent.concurrency_rollout_sample_percent: {} → {}",
-                    old.agent.concurrency_rollout_sample_percent,
-                    fresh.agent.concurrency_rollout_sample_percent
+                    old.agent.concurrency_rollout_sample_percent, fresh.agent.concurrency_rollout_sample_percent
                 ));
             }
             if old.agent.concurrency_rollout_channels != fresh.agent.concurrency_rollout_channels {
                 changes.push(format!(
                     "agent.concurrency_rollout_channels: {:?} → {:?}",
-                    old.agent.concurrency_rollout_channels,
-                    fresh.agent.concurrency_rollout_channels
+                    old.agent.concurrency_rollout_channels, fresh.agent.concurrency_rollout_channels
                 ));
             }
-            if old.agent.concurrency_auto_rollback_enabled
-                != fresh.agent.concurrency_auto_rollback_enabled
-            {
+            if old.agent.concurrency_auto_rollback_enabled != fresh.agent.concurrency_auto_rollback_enabled {
                 changes.push(format!(
                     "agent.concurrency_auto_rollback_enabled: {} → {}",
-                    old.agent.concurrency_auto_rollback_enabled,
-                    fresh.agent.concurrency_auto_rollback_enabled
+                    old.agent.concurrency_auto_rollback_enabled, fresh.agent.concurrency_auto_rollback_enabled
                 ));
             }
             if (old.agent.concurrency_rollback_timeout_rate_threshold
@@ -258,10 +242,7 @@ impl Tool for ConfigReloadTool {
 
             // Cron
             if old.cron.enabled != fresh.cron.enabled {
-                changes.push(format!(
-                    "cron.enabled: {} → {}",
-                    old.cron.enabled, fresh.cron.enabled
-                ));
+                changes.push(format!("cron.enabled: {} → {}", old.cron.enabled, fresh.cron.enabled));
             }
             if old.cron.max_run_history != fresh.cron.max_run_history {
                 changes.push(format!(

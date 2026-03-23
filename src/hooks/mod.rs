@@ -96,9 +96,7 @@ pub struct HookManager {
     state: RwLock<RuntimeState>,
     /// Optional WASM hook executor for plugins with hook capability.
     #[cfg(feature = "wasm-plugins")]
-    wasm_executor: tokio::sync::RwLock<
-        Option<std::sync::Arc<crate::plugins::capabilities::hook::WasmHookExecutor>>,
-    >,
+    wasm_executor: tokio::sync::RwLock<Option<std::sync::Arc<crate::plugins::capabilities::hook::WasmHookExecutor>>>,
     /// Optional event bus for bridging lifecycle events to inter-plugin messaging.
     #[cfg(feature = "wasm-plugins")]
     event_bus: tokio::sync::RwLock<Option<std::sync::Arc<crate::plugins::event_bus::EventBus>>>,
@@ -141,12 +139,7 @@ impl HookManager {
                 (
                     state.config.enabled,
                     state.config.timeout_ms,
-                    state
-                        .config
-                        .hooks
-                        .get(event.as_str())
-                        .cloned()
-                        .unwrap_or_default(),
+                    state.config.hooks.get(event.as_str()).cloned().unwrap_or_default(),
                 )
             };
 
@@ -256,10 +249,7 @@ impl HookManager {
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         if let Err(e) = std::fs::write(&payload_file_path, payload_json.as_bytes()) {
-            tracing::warn!(
-                "Failed to write hook payload temp file {:?}: {e}",
-                payload_file_path
-            );
+            tracing::warn!("Failed to write hook payload temp file {:?}: {e}", payload_file_path);
         } else {
             cmd.env("ZERO_HOOK_PAYLOAD_FILE", &payload_file_path);
         }
@@ -319,10 +309,9 @@ impl HookManager {
         }
 
         let timeout_ms = action.timeout_ms.unwrap_or(default_timeout_ms);
-        let output =
-            tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
-                .await
-                .map_err(|_| anyhow::anyhow!("hook timed out after {timeout_ms} ms"))??;
+        let output = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
+            .await
+            .map_err(|_| anyhow::anyhow!("hook timed out after {timeout_ms} ms"))??;
 
         let _ = std::fs::remove_file(&payload_file_path);
 
@@ -528,11 +517,7 @@ mod tests {
     #[test]
     fn refresh_disabled_flag() {
         let temp = TempDir::new().unwrap();
-        std::fs::write(
-            temp.path().join(HOOKS_JSON_FILE),
-            r#"{"enabled": false, "hooks": {}}"#,
-        )
-        .unwrap();
+        std::fs::write(temp.path().join(HOOKS_JSON_FILE), r#"{"enabled": false, "hooks": {}}"#).unwrap();
         let manager = HookManager::new(temp.path().to_path_buf());
         manager.refresh_if_changed().unwrap();
         let state = manager.state.read();
@@ -553,9 +538,7 @@ mod tests {
             timeout_ms: Some(1000),
             stdin_json: false,
         };
-        let result = manager
-            .run_action(HookEvent::ToolCall, &json!({}), 1000, &action)
-            .await;
+        let result = manager.run_action(HookEvent::ToolCall, &json!({}), 1000, &action).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty"));
     }
@@ -590,16 +573,9 @@ mod tests {
             timeout_ms: Some(2000),
             stdin_json: false,
         };
-        let result = manager
-            .run_action(HookEvent::Error, &json!({}), 2000, &action)
-            .await;
+        let result = manager.run_action(HookEvent::Error, &json!({}), 2000, &action).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("exited with status")
-        );
+        assert!(result.unwrap_err().to_string().contains("exited with status"));
     }
 
     #[tokio::test]
@@ -614,9 +590,7 @@ mod tests {
             timeout_ms: Some(100),
             stdin_json: false,
         };
-        let result = manager
-            .run_action(HookEvent::ToolCall, &json!({}), 100, &action)
-            .await;
+        let result = manager.run_action(HookEvent::ToolCall, &json!({}), 100, &action).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
     }
@@ -627,9 +601,7 @@ mod tests {
     async fn emit_no_hooks_does_not_panic() {
         let temp = TempDir::new().unwrap();
         let manager = HookManager::new(temp.path().to_path_buf());
-        manager
-            .emit(HookEvent::AgentStart, json!({"test": true}))
-            .await;
+        manager.emit(HookEvent::AgentStart, json!({"test": true})).await;
         // Should not panic even with no hooks.json
     }
 
@@ -642,8 +614,7 @@ mod tests {
             command: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "test -n \"$ZERO_HOOK_PAYLOAD_FILE\" && test -f \"$ZERO_HOOK_PAYLOAD_FILE\""
-                    .to_string(),
+                "test -n \"$ZERO_HOOK_PAYLOAD_FILE\" && test -f \"$ZERO_HOOK_PAYLOAD_FILE\"".to_string(),
             ],
             env: std::collections::HashMap::new(),
             cwd: None,

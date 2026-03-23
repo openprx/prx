@@ -1,16 +1,14 @@
 use crate::self_system::evolution::analyzer::{CandidatePriority, EvolutionCandidate};
 use crate::self_system::evolution::config::{EvolutionMode, SharedEvolutionConfig};
 use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput, EvolutionEngine};
-use crate::self_system::evolution::record::{
-    ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult,
-};
+use crate::self_system::evolution::record::{ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult};
 use crate::self_system::evolution::safety_utils::{
     atomic_write, is_raw_debug_enabled, sha256_hex, validate_path_in_workspace,
 };
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::{
-    ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
-    EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
+    ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
+    EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -158,12 +156,8 @@ impl PromptEvolutionEngine {
             bail!("mutation touched immutable section");
         }
         for kw in blocked_keywords {
-            let before_has = before
-                .to_ascii_lowercase()
-                .contains(&kw.to_ascii_lowercase());
-            let after_has = after
-                .to_ascii_lowercase()
-                .contains(&kw.to_ascii_lowercase());
+            let before_has = before.to_ascii_lowercase().contains(&kw.to_ascii_lowercase());
+            let after_has = after.to_ascii_lowercase().contains(&kw.to_ascii_lowercase());
             if after_has && !before_has {
                 bail!("mutation introduced blocked keyword: {kw}");
             }
@@ -171,21 +165,13 @@ impl PromptEvolutionEngine {
         Ok(())
     }
 
-    async fn backup_version(
-        &self,
-        target: &Path,
-        content: &str,
-        max_versions: usize,
-    ) -> Result<()> {
+    async fn backup_version(&self, target: &Path, content: &str, max_versions: usize) -> Result<()> {
         let rel = target
             .strip_prefix(&self.workspace_root)
             .unwrap_or(target)
             .to_string_lossy()
             .replace('/', "__");
-        let versions_dir = self
-            .workspace_root
-            .join(".evolution/prompt_versions")
-            .join(rel);
+        let versions_dir = self.workspace_root.join(".evolution/prompt_versions").join(rel);
         fs::create_dir_all(&versions_dir).await?;
         let file = versions_dir.join(format!("{}.bak", Uuid::now_v7()));
         atomic_write(&self.workspace_root, &file, content.as_bytes()).await?;
@@ -240,16 +226,11 @@ impl EvolutionEngine for PromptEvolutionEngine {
         let Some(relative_target) = prompt_cfg.mutable_files.first() else {
             bail!("prompt.mutable_files is empty");
         };
-        if prompt_cfg
-            .immutable_files
-            .iter()
-            .any(|item| item == relative_target)
-        {
+        if prompt_cfg.immutable_files.iter().any(|item| item == relative_target) {
             bail!("target file is immutable: {relative_target}");
         }
 
-        let target_path =
-            validate_path_in_workspace(&self.workspace_root, Path::new(relative_target))?;
+        let target_path = validate_path_in_workspace(&self.workspace_root, Path::new(relative_target))?;
         let before = fs::read_to_string(&target_path)
             .await
             .with_context(|| format!("failed to read prompt file: {}", target_path.display()))?;
@@ -273,9 +254,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
             target: ChangeTarget::WorkspaceFile {
                 path: relative_target.clone(),
             },
-            operation: ChangeOperation::Write {
-                content: after.clone(),
-            },
+            operation: ChangeOperation::Write { content: after.clone() },
         };
 
         let mut outcome = CycleOutcome::NoAction;
@@ -295,8 +274,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
                 notes = "prompt mutation applied".to_string();
             }
         }
-        let (log_before, log_after, log_diff) =
-            Self::redact_evolution_content(&before, &after, &diff);
+        let (log_before, log_after, log_diff) = Self::redact_evolution_content(&before, &after, &diff);
 
         let evolution_log = EvolutionLog {
             experiment_id: proposal.id.clone(),
@@ -311,10 +289,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
                     .as_ref()
                     .map(|item| item.evidence_ids.len() as u32)
                     .unwrap_or(1),
-                time_range_days: candidate
-                    .as_ref()
-                    .map(|item| item.backfill_after_days)
-                    .unwrap_or(1),
+                time_range_days: candidate.as_ref().map(|item| item.backfill_after_days).unwrap_or(1),
                 key_metrics: HashMap::from([("severity".to_string(), f64::from(severity))]),
                 patterns_found: vec![format!("mutation_type={:?}", mutation_type)],
             },
@@ -391,9 +366,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::self_system::evolution::config::{
-        EvolutionConfig, EvolutionMode, new_shared_evolution_config,
-    };
+    use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode, new_shared_evolution_config};
     use tempfile::tempdir;
 
     #[tokio::test]

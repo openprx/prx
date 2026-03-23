@@ -4,9 +4,7 @@
 //! Pattern follows `cron/store.rs`: `with_connection()` + `rusqlite::params!`.
 
 use crate::config::Config;
-use crate::xin::types::{
-    ExecutionMode, NewXinTask, TaskKind, TaskPriority, TaskStatus, XinTask, XinTaskPatch,
-};
+use crate::xin::types::{ExecutionMode, NewXinTask, TaskKind, TaskPriority, TaskStatus, XinTask, XinTaskPatch};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
@@ -23,8 +21,7 @@ pub fn add_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
     let max = config.xin.max_tasks;
     if max > 0 {
         let current = with_connection(config, |conn| {
-            let count: i64 =
-                conn.query_row("SELECT COUNT(*) FROM xin_tasks", [], |row| row.get(0))?;
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM xin_tasks", [], |row| row.get(0))?;
             Ok(count)
         })?;
         if current >= max as i64 {
@@ -185,9 +182,7 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
             )
             .context("Failed to update xin task")?;
         if changed == 0 {
-            anyhow::bail!(
-                "xin task '{task_id}' was modified by another process (optimistic concurrency conflict)"
-            );
+            anyhow::bail!("xin task '{task_id}' was modified by another process (optimistic concurrency conflict)");
         }
         Ok(())
     })?;
@@ -307,11 +302,8 @@ pub fn remove_task(config: &Config, task_id: &str) -> Result<()> {
 /// Remove all completed (non-recurring) tasks.
 pub fn remove_completed(config: &Config) -> Result<usize> {
     with_connection(config, |conn| {
-        conn.execute(
-            "DELETE FROM xin_tasks WHERE status = 'completed' AND recurring = 0",
-            [],
-        )
-        .context("Failed to clean completed xin tasks")
+        conn.execute("DELETE FROM xin_tasks WHERE status = 'completed' AND recurring = 0", [])
+            .context("Failed to clean completed xin tasks")
     })
 }
 
@@ -333,8 +325,7 @@ pub fn mark_stale(config: &Config, stale_timeout_minutes: u32) -> Result<usize> 
 pub fn ensure_system_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
     // Check if a system task with this name already exists
     let existing = with_connection(config, |conn| {
-        let mut stmt =
-            conn.prepare("SELECT id FROM xin_tasks WHERE name = ?1 AND kind = 'system'")?;
+        let mut stmt = conn.prepare("SELECT id FROM xin_tasks WHERE name = ?1 AND kind = 'system'")?;
         let mut rows = stmt.query(params![new.name])?;
         if let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
@@ -401,16 +392,14 @@ pub fn record_run(
         )
         .context("Failed to prune xin run history")?;
 
-        tx.commit()
-            .context("Failed to commit xin run transaction")?;
+        tx.commit().context("Failed to commit xin run transaction")?;
         Ok(())
     })
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-const SELECT_ALL_COLUMNS: &str =
-    "SELECT id, name, description, kind, status, priority, execution_mode,
+const SELECT_ALL_COLUMNS: &str = "SELECT id, name, description, kind, status, priority, execution_mode,
             payload, recurring, interval_secs, created_at, updated_at,
             last_run_at, next_run_at, last_status, last_output,
             run_count, fail_count, max_failures, enabled
@@ -433,8 +422,8 @@ fn truncate_output(output: &str) -> String {
 }
 
 fn parse_rfc3339(raw: &str) -> Result<DateTime<Utc>> {
-    let parsed = DateTime::parse_from_rfc3339(raw)
-        .with_context(|| format!("Invalid RFC3339 timestamp in xin DB: {raw}"))?;
+    let parsed =
+        DateTime::parse_from_rfc3339(raw).with_context(|| format!("Invalid RFC3339 timestamp in xin DB: {raw}"))?;
     Ok(parsed.with_timezone(&Utc))
 }
 
@@ -482,8 +471,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             .with_context(|| format!("Failed to create xin directory: {}", parent.display()))?;
     }
 
-    let conn = Connection::open(&db_path)
-        .with_context(|| format!("Failed to open xin DB: {}", db_path.display()))?;
+    let conn = Connection::open(&db_path).with_context(|| format!("Failed to open xin DB: {}", db_path.display()))?;
 
     // Avoid SQLITE_BUSY under concurrent task execution
     conn.busy_timeout(std::time::Duration::from_secs(5))?;

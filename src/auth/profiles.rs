@@ -41,8 +41,7 @@ impl TokenSet {
     pub fn is_expiring_within(&self, skew: Duration) -> bool {
         match self.expires_at {
             Some(expires_at) => {
-                let now_plus_skew =
-                    Utc::now() + chrono::Duration::from_std(skew).unwrap_or_default();
+                let now_plus_skew = Utc::now() + chrono::Duration::from_std(skew).unwrap_or_default();
                 expires_at <= now_plus_skew
             }
             None => false,
@@ -181,8 +180,7 @@ impl AuthProfilesStore {
             return Ok(false);
         }
 
-        data.active_profiles
-            .retain(|_, active| active != profile_id);
+        data.active_profiles.retain(|_, active| active != profile_id);
         data.updated_at = Utc::now();
         self.save_locked(&data)?;
         Ok(true)
@@ -236,10 +234,8 @@ impl AuthProfilesStore {
 
         let mut profiles = BTreeMap::new();
         for (id, p) in &mut persisted.profiles {
-            let (access_token, access_migrated) =
-                self.decrypt_optional(p.access_token.as_deref())?;
-            let (refresh_token, refresh_migrated) =
-                self.decrypt_optional(p.refresh_token.as_deref())?;
+            let (access_token, access_migrated) = self.decrypt_optional(p.access_token.as_deref())?;
+            let (refresh_token, refresh_migrated) = self.decrypt_optional(p.refresh_token.as_deref())?;
             let (id_token, id_migrated) = self.decrypt_optional(p.id_token.as_deref())?;
             let (token, token_migrated) = self.decrypt_optional(p.token.as_deref())?;
 
@@ -263,9 +259,8 @@ impl AuthProfilesStore {
             let kind = parse_profile_kind(&p.kind)?;
             let token_set = match kind {
                 AuthProfileKind::OAuth => {
-                    let access = access_token.ok_or_else(|| {
-                        anyhow::anyhow!("OAuth profile missing access_token: {id}")
-                    })?;
+                    let access =
+                        access_token.ok_or_else(|| anyhow::anyhow!("OAuth profile missing access_token: {id}"))?;
                     Some(TokenSet {
                         access_token: access,
                         refresh_token,
@@ -362,24 +357,15 @@ impl AuthProfilesStore {
             return Ok(PersistedAuthProfiles::default());
         }
 
-        let bytes = fs::read(&self.path).with_context(|| {
-            format!(
-                "Failed to read auth profile store at {}",
-                self.path.display()
-            )
-        })?;
+        let bytes = fs::read(&self.path)
+            .with_context(|| format!("Failed to read auth profile store at {}", self.path.display()))?;
 
         if bytes.is_empty() {
             return Ok(PersistedAuthProfiles::default());
         }
 
-        let mut persisted: PersistedAuthProfiles =
-            serde_json::from_slice(&bytes).with_context(|| {
-                format!(
-                    "Failed to parse auth profile store at {}",
-                    self.path.display()
-                )
-            })?;
+        let mut persisted: PersistedAuthProfiles = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to parse auth profile store at {}", self.path.display()))?;
 
         if persisted.schema_version == 0 {
             persisted.schema_version = CURRENT_SCHEMA_VERSION;
@@ -398,16 +384,11 @@ impl AuthProfilesStore {
 
     fn write_persisted_locked(&self, persisted: &PersistedAuthProfiles) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create auth profile directory at {}",
-                    parent.display()
-                )
-            })?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create auth profile directory at {}", parent.display()))?;
         }
 
-        let json =
-            serde_json::to_vec_pretty(persisted).context("Failed to serialize auth profiles")?;
+        let json = serde_json::to_vec_pretty(persisted).context("Failed to serialize auth profiles")?;
         let tmp_name = format!(
             "{}.tmp.{}.{}",
             PROFILES_FILENAME,
@@ -416,19 +397,11 @@ impl AuthProfilesStore {
         );
         let tmp_path = self.path.with_file_name(tmp_name);
 
-        fs::write(&tmp_path, &json).with_context(|| {
-            format!(
-                "Failed to write temporary auth profile file at {}",
-                tmp_path.display()
-            )
-        })?;
+        fs::write(&tmp_path, &json)
+            .with_context(|| format!("Failed to write temporary auth profile file at {}", tmp_path.display()))?;
 
-        fs::rename(&tmp_path, &self.path).with_context(|| {
-            format!(
-                "Failed to replace auth profile store at {}",
-                self.path.display()
-            )
-        })?;
+        fs::rename(&tmp_path, &self.path)
+            .with_context(|| format!("Failed to replace auth profile store at {}", self.path.display()))?;
 
         Ok(())
     }
@@ -452,18 +425,13 @@ impl AuthProfilesStore {
 
     fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
         if let Some(parent) = self.lock_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create lock directory at {}", parent.display())
-            })?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create lock directory at {}", parent.display()))?;
         }
 
         let mut waited = 0_u64;
         loop {
-            match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&self.lock_path)
-            {
+            match OpenOptions::new().create_new(true).write(true).open(&self.lock_path) {
                 Ok(mut file) => {
                     let _ = writeln!(file, "pid={}", std::process::id());
                     return Ok(AuthProfileLockGuard {
@@ -482,10 +450,7 @@ impl AuthProfilesStore {
                 }
                 Err(e) => {
                     return Err(e).with_context(|| {
-                        format!(
-                            "Failed to create auth profile lock at {}",
-                            self.lock_path.display()
-                        )
+                        format!("Failed to create auth profile lock at {}", self.lock_path.display())
                     });
                 }
             }
@@ -605,10 +570,7 @@ mod tests {
 
     #[test]
     fn profile_id_format() {
-        assert_eq!(
-            profile_id("openai-codex", "default"),
-            "openai-codex:default"
-        );
+        assert_eq!(profile_id("openai-codex", "default"), "openai-codex:default");
     }
 
     #[test]
@@ -654,10 +616,7 @@ mod tests {
         assert_eq!(loaded.profile_name, "default");
         assert_eq!(loaded.account_id.as_deref(), Some("acct_123"));
         assert_eq!(
-            loaded
-                .token_set
-                .as_ref()
-                .and_then(|t| t.refresh_token.as_deref()),
+            loaded.token_set.as_ref().and_then(|t| t.refresh_token.as_deref()),
             Some("refresh-123")
         );
 

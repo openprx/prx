@@ -15,10 +15,7 @@ pub struct FileReadTool {
 
 impl FileReadTool {
     pub fn new(security: Arc<SecurityPolicy>, acl_enabled: bool) -> Self {
-        Self {
-            security,
-            acl_enabled,
-        }
+        Self { security, acl_enabled }
     }
 
     fn is_protected_memory_markdown(&self, resolved_path: &Path) -> bool {
@@ -30,14 +27,9 @@ impl FileReadTool {
             return false;
         };
 
-        if rel
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.eq_ignore_ascii_case("MEMORY.md")
-                    || name.eq_ignore_ascii_case("MEMORY_SNAPSHOT.md")
-            })
-        {
+        if rel.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+            name.eq_ignore_ascii_case("MEMORY.md") || name.eq_ignore_ascii_case("MEMORY_SNAPSHOT.md")
+        }) {
             return true;
         }
 
@@ -144,10 +136,7 @@ impl Tool for FileReadTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Resolved path escapes workspace: {}",
-                    resolved_path.display()
-                )),
+                error: Some(format!("Resolved path escapes workspace: {}", resolved_path.display())),
             });
         }
 
@@ -234,12 +223,7 @@ mod tests {
         let tool = FileReadTool::new(test_security(std::env::temp_dir()), false);
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
-        assert!(
-            schema["required"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("path"))
-        );
+        assert!(schema["required"].as_array().unwrap().contains(&json!("path")));
     }
 
     #[tokio::test]
@@ -247,9 +231,7 @@ mod tests {
         let dir = std::env::temp_dir().join("openprx_test_file_read");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "hello world")
-            .await
-            .unwrap();
+        tokio::fs::write(dir.join("test.txt"), "hello world").await.unwrap();
 
         let tool = FileReadTool::new(test_security(dir.clone()), false);
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
@@ -281,10 +263,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let tool = FileReadTool::new(test_security(dir.clone()), false);
-        let result = tool
-            .execute(json!({"path": "../../../etc/passwd"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"path": "../../../etc/passwd"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
 
@@ -304,24 +283,13 @@ mod tests {
         let dir = std::env::temp_dir().join("openprx_test_file_read_rate_limited");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "hello world")
-            .await
-            .unwrap();
+        tokio::fs::write(dir.join("test.txt"), "hello world").await.unwrap();
 
-        let tool = FileReadTool::new(
-            test_security_with(dir.clone(), AutonomyLevel::Supervised, 0),
-            false,
-        );
+        let tool = FileReadTool::new(test_security_with(dir.clone(), AutonomyLevel::Supervised, 0), false);
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Rate limit exceeded")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit exceeded"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -331,14 +299,9 @@ mod tests {
         let dir = std::env::temp_dir().join("openprx_test_file_read_readonly");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "readonly ok")
-            .await
-            .unwrap();
+        tokio::fs::write(dir.join("test.txt"), "readonly ok").await.unwrap();
 
-        let tool = FileReadTool::new(
-            test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20),
-            false,
-        );
+        let tool = FileReadTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20), false);
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
 
         assert!(result.success);
@@ -373,18 +336,13 @@ mod tests {
     async fn file_read_nested_path() {
         let dir = std::env::temp_dir().join("openprx_test_file_read_nested");
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(dir.join("sub/dir"))
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(dir.join("sub/dir")).await.unwrap();
         tokio::fs::write(dir.join("sub/dir/deep.txt"), "deep content")
             .await
             .unwrap();
 
         let tool = FileReadTool::new(test_security(dir.clone()), false);
-        let result = tool
-            .execute(json!({"path": "sub/dir/deep.txt"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"path": "sub/dir/deep.txt"})).await.unwrap();
         assert!(result.success);
         assert_eq!(result.output, "deep content");
 
@@ -414,13 +372,7 @@ mod tests {
         let result = tool.execute(json!({"path": "escape.txt"})).await.unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("escapes workspace")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("escapes workspace"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
@@ -432,10 +384,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         // Allow only 2 actions total
-        let tool = FileReadTool::new(
-            test_security_with(dir.clone(), AutonomyLevel::Supervised, 2),
-            false,
-        );
+        let tool = FileReadTool::new(test_security_with(dir.clone(), AutonomyLevel::Supervised, 2), false);
 
         // Both reads fail (file doesn't exist) but should consume budget
         let r1 = tool.execute(json!({"path": "nope1.txt"})).await.unwrap();
@@ -480,12 +429,8 @@ mod tests {
     async fn file_read_acl_enabled_blocks_memory_markdown_files() {
         let dir = std::env::temp_dir().join("openprx_test_file_read_acl_blocks");
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(dir.join("memory/sub"))
-            .await
-            .unwrap();
-        tokio::fs::write(dir.join("MEMORY.md"), "legacy memory")
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(dir.join("memory/sub")).await.unwrap();
+        tokio::fs::write(dir.join("MEMORY.md"), "legacy memory").await.unwrap();
         tokio::fs::write(dir.join("memory/sub/topic.md"), "memory topic")
             .await
             .unwrap();
@@ -498,10 +443,7 @@ mod tests {
             Some("Access denied: memory files are protected by ACL policy")
         );
 
-        let memory_result = tool
-            .execute(json!({"path": "memory/sub/topic.md"}))
-            .await
-            .unwrap();
+        let memory_result = tool.execute(json!({"path": "memory/sub/topic.md"})).await.unwrap();
         assert!(!memory_result.success);
         assert_eq!(
             memory_result.error.as_deref(),
@@ -515,9 +457,7 @@ mod tests {
     async fn file_read_acl_enabled_blocks_memory_markdown_case_variants() {
         let dir = std::env::temp_dir().join("openprx_test_file_read_acl_case_variants");
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(dir.join("MeMoRy/Sub"))
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(dir.join("MeMoRy/Sub")).await.unwrap();
         tokio::fs::write(dir.join("memory.md"), "legacy memory lowercase")
             .await
             .unwrap();
@@ -533,10 +473,7 @@ mod tests {
             Some("Access denied: memory files are protected by ACL policy")
         );
 
-        let nested_result = tool
-            .execute(json!({"path": "MeMoRy/Sub/topic.MD"}))
-            .await
-            .unwrap();
+        let nested_result = tool.execute(json!({"path": "MeMoRy/Sub/topic.MD"})).await.unwrap();
         assert!(!nested_result.success);
         assert_eq!(
             nested_result.error.as_deref(),
@@ -562,29 +499,20 @@ mod tests {
             .unwrap();
 
         let tool = FileReadTool::new(test_security(dir.clone()), true);
-        let snapshot_result = tool
-            .execute(json!({"path": "MEMORY_SNAPSHOT.md"}))
-            .await
-            .unwrap();
+        let snapshot_result = tool.execute(json!({"path": "MEMORY_SNAPSHOT.md"})).await.unwrap();
         assert!(!snapshot_result.success);
         assert_eq!(
             snapshot_result.error.as_deref(),
             Some("Access denied: memory files are protected by ACL policy")
         );
 
-        let db_result = tool
-            .execute(json!({"path": "memory/brain.db"}))
-            .await
-            .unwrap();
+        let db_result = tool.execute(json!({"path": "memory/brain.db"})).await.unwrap();
         assert!(!db_result.success);
         assert_eq!(
             db_result.error.as_deref(),
             Some("Access denied: memory files are protected by ACL policy")
         );
-        let wal_result = tool
-            .execute(json!({"path": "memory/brain.db-wal"}))
-            .await
-            .unwrap();
+        let wal_result = tool.execute(json!({"path": "memory/brain.db-wal"})).await.unwrap();
         assert!(!wal_result.success);
         assert_eq!(
             wal_result.error.as_deref(),
@@ -623,9 +551,7 @@ mod tests {
         let dir = std::env::temp_dir().join("openprx_test_file_read_acl_disabled");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(dir.join("memory")).await.unwrap();
-        tokio::fs::write(dir.join("MEMORY.md"), "legacy memory")
-            .await
-            .unwrap();
+        tokio::fs::write(dir.join("MEMORY.md"), "legacy memory").await.unwrap();
         tokio::fs::write(dir.join("memory/topic.md"), "memory topic")
             .await
             .unwrap();
@@ -635,10 +561,7 @@ mod tests {
         assert!(root_result.success);
         assert_eq!(root_result.output, "legacy memory");
 
-        let memory_result = tool
-            .execute(json!({"path": "memory/topic.md"}))
-            .await
-            .unwrap();
+        let memory_result = tool.execute(json!({"path": "memory/topic.md"})).await.unwrap();
         assert!(memory_result.success);
         assert_eq!(memory_result.output, "memory topic");
 

@@ -9,8 +9,8 @@ use crate::self_system::evolution::rollback::RollbackManager;
 use crate::self_system::evolution::safety_utils::{atomic_write, validate_path_in_workspace};
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::{
-    ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
-    EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
+    ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
+    EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -56,18 +56,9 @@ impl StrategyEvolutionEngine {
     ) -> Result<Self> {
         let workspace_root = workspace_root.as_ref().to_path_buf();
         let cfg = shared_config.load_full();
-        let policy_path = validate_path_in_workspace(
-            &workspace_root,
-            Path::new(&cfg.strategy.decision_policy_path),
-        )?;
-        let rollback_dir =
-            validate_path_in_workspace(&workspace_root, Path::new(".evolution/rollback/strategy"))?;
-        let rollback = RollbackManager::new(
-            &workspace_root,
-            &policy_path,
-            rollback_dir,
-            cfg.rollback.max_versions,
-        )?;
+        let policy_path = validate_path_in_workspace(&workspace_root, Path::new(&cfg.strategy.decision_policy_path))?;
+        let rollback_dir = validate_path_in_workspace(&workspace_root, Path::new(".evolution/rollback/strategy"))?;
+        let rollback = RollbackManager::new(&workspace_root, &policy_path, rollback_dir, cfg.rollback.max_versions)?;
         Ok(Self {
             shared_config,
             workspace_root,
@@ -99,14 +90,10 @@ impl StrategyEvolutionEngine {
         if scalar_params.is_empty() {
             bail!("decision policy has no mutable scalar parameter");
         }
-        let pivot = worst
-            .map(|item| stable_hash(&item.task_type) as usize)
-            .unwrap_or(0);
+        let pivot = worst.map(|item| stable_hash(&item.task_type) as usize).unwrap_or(0);
         let (path, before_value) = scalar_params[pivot % scalar_params.len()].clone();
         let after_value = match before_value {
-            toml::Value::Integer(v) => {
-                toml::Value::Integer(mutate_numeric(v as f64, mutation_range).round() as i64)
-            }
+            toml::Value::Integer(v) => toml::Value::Integer(mutate_numeric(v as f64, mutation_range).round() as i64),
             toml::Value::Float(v) => toml::Value::Float(mutate_numeric(v, mutation_range)),
             toml::Value::Boolean(v) => toml::Value::Boolean(!v),
             _ => bail!("unsupported mutable type at {path}"),
@@ -138,10 +125,8 @@ impl EvolutionEngine for StrategyEvolutionEngine {
         };
         let cfg = self.shared_config.load_full();
         let mode = cfg.runtime.mode.clone();
-        let policy_path = validate_path_in_workspace(
-            &self.workspace_root,
-            Path::new(&cfg.strategy.decision_policy_path),
-        )?;
+        let policy_path =
+            validate_path_in_workspace(&self.workspace_root, Path::new(&cfg.strategy.decision_policy_path))?;
         let raw = fs::read_to_string(&policy_path)
             .await
             .with_context(|| format!("failed reading {}", policy_path.display()))?;
@@ -149,11 +134,7 @@ impl EvolutionEngine for StrategyEvolutionEngine {
 
         let summaries = self.collect_daily_summary().await?;
         let worst = self.select_worst_summary(&summaries);
-        let plan = self.choose_mutation_plan(
-            &parsed,
-            cfg.strategy.param_mutation_range.max(0.0),
-            worst.as_ref(),
-        )?;
+        let plan = self.choose_mutation_plan(&parsed, cfg.strategy.param_mutation_range.max(0.0), worst.as_ref())?;
         set_value_at_path(&mut parsed, &plan.path, plan.after.clone())?;
         let serialized = toml::to_string_pretty(&parsed)?;
 
@@ -167,10 +148,7 @@ impl EvolutionEngine for StrategyEvolutionEngine {
             summary: format!("Mutate strategy parameter {}", plan.path),
             rationale: format!(
                 "based on worst efficiency task_type={}",
-                worst
-                    .as_ref()
-                    .map(|item| item.task_type.as_str())
-                    .unwrap_or("unknown")
+                worst.as_ref().map(|item| item.task_type.as_str()).unwrap_or("unknown")
             ),
             risk_level: RiskLevel::Medium,
             target: ChangeTarget::ConfigFile {
@@ -228,21 +206,12 @@ impl EvolutionEngine for StrategyEvolutionEngine {
                 sample_count: summaries.iter().map(|item| item.total).sum(),
                 time_range_days: 1,
                 key_metrics: HashMap::from([
-                    (
-                        "average_improvement".to_string(),
-                        gate_metrics.average_improvement,
-                    ),
-                    (
-                        "token_degradation".to_string(),
-                        gate_metrics.token_degradation,
-                    ),
+                    ("average_improvement".to_string(), gate_metrics.average_improvement),
+                    ("token_degradation".to_string(), gate_metrics.token_degradation),
                 ]),
                 patterns_found: vec![format!(
                     "worst_task_type={}",
-                    worst
-                        .as_ref()
-                        .map(|item| item.task_type.as_str())
-                        .unwrap_or("unknown")
+                    worst.as_ref().map(|item| item.task_type.as_str()).unwrap_or("unknown")
                 )],
             },
             result: Some(if matches!(outcome, CycleOutcome::Applied) {
@@ -295,10 +264,9 @@ impl EvolutionEngine for StrategyEvolutionEngine {
             outcome,
             alert: match gate_result {
                 GateResult::Passed => None,
-                GateResult::Rejected(rejection) => Some(format!(
-                    "gate_rejected:{}:{}",
-                    rejection.reason, rejection.details
-                )),
+                GateResult::Rejected(rejection) => {
+                    Some(format!("gate_rejected:{}:{}", rejection.reason, rejection.details))
+                }
             },
             errors: Vec::new(),
         };
@@ -403,8 +371,7 @@ fn build_task_daily_summary(decisions: &[DecisionLog]) -> Vec<TaskDailySummary> 
             let success_rate = success as f64 / total_f;
             let avg_tokens = tokens as f64 / total_f;
             let avg_latency_ms = latency as f64 / total_f;
-            let efficiency_score =
-                success_rate / (1.0 + avg_tokens / 500.0 + avg_latency_ms / 2000.0);
+            let efficiency_score = success_rate / (1.0 + avg_tokens / 500.0 + avg_latency_ms / 2000.0);
             TaskDailySummary {
                 task_type,
                 total,
@@ -421,9 +388,7 @@ fn build_task_daily_summary(decisions: &[DecisionLog]) -> Vec<TaskDailySummary> 
 mod tests {
     use super::*;
     use crate::self_system::evolution::config::{EvolutionConfig, new_shared_evolution_config};
-    use crate::self_system::evolution::storage::{
-        AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths,
-    };
+    use crate::self_system::evolution::storage::{AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths};
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -485,11 +450,7 @@ mod tests {
         );
         let mut cfg = EvolutionConfig::default();
         cfg.strategy.decision_policy_path = "../outside.toml".to_string();
-        let err = match StrategyEvolutionEngine::new(
-            new_shared_evolution_config(cfg),
-            dir.path(),
-            writer,
-        ) {
+        let err = match StrategyEvolutionEngine::new(new_shared_evolution_config(cfg), dir.path(), writer) {
             Ok(_) => panic!("expected traversal path validation to fail"),
             Err(err) => err,
         };

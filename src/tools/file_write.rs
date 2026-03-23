@@ -236,9 +236,7 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("8 bytes"));
 
-        let content = tokio::fs::read_to_string(dir.join("out.txt"))
-            .await
-            .unwrap();
+        let content = tokio::fs::read_to_string(dir.join("out.txt")).await.unwrap();
         assert_eq!(content, "written!");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -257,9 +255,7 @@ mod tests {
             .unwrap();
         assert!(result.success);
 
-        let content = tokio::fs::read_to_string(dir.join("a/b/c/deep.txt"))
-            .await
-            .unwrap();
+        let content = tokio::fs::read_to_string(dir.join("a/b/c/deep.txt")).await.unwrap();
         assert_eq!(content, "deep");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -270,9 +266,7 @@ mod tests {
         let dir = std::env::temp_dir().join("openprx_test_file_write_overwrite");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("exist.txt"), "old")
-            .await
-            .unwrap();
+        tokio::fs::write(dir.join("exist.txt"), "old").await.unwrap();
 
         let tool = FileWriteTool::new(test_security(dir.clone()));
         let result = tool
@@ -281,9 +275,7 @@ mod tests {
             .unwrap();
         assert!(result.success);
 
-        let content = tokio::fs::read_to_string(dir.join("exist.txt"))
-            .await
-            .unwrap();
+        let content = tokio::fs::read_to_string(dir.join("exist.txt")).await.unwrap();
         assert_eq!(content, "new");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -338,10 +330,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let tool = FileWriteTool::new(test_security(dir.clone()));
-        let result = tool
-            .execute(json!({"path": "empty.txt", "content": ""}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"path": "empty.txt", "content": ""})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("0 bytes"));
 
@@ -370,13 +359,7 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("escapes workspace")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("escapes workspace"));
         assert!(!outside.join("hijack.txt").exists());
 
         let _ = tokio::fs::remove_dir_all(&root).await;
@@ -407,24 +390,14 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security_with(
-            dir.clone(),
-            AutonomyLevel::Supervised,
-            0,
-        ));
+        let tool = FileWriteTool::new(test_security_with(dir.clone(), AutonomyLevel::Supervised, 0));
         let result = tool
             .execute(json!({"path": "out.txt", "content": "should-block"}))
             .await
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Rate limit exceeded")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit exceeded"));
         assert!(!dir.join("out.txt").exists());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -446,9 +419,7 @@ mod tests {
         tokio::fs::create_dir_all(&outside).await.unwrap();
 
         // Create a file outside and symlink to it inside workspace
-        tokio::fs::write(outside.join("target.txt"), "original")
-            .await
-            .unwrap();
+        tokio::fs::write(outside.join("target.txt"), "original").await.unwrap();
         symlink(outside.join("target.txt"), workspace.join("linked.txt")).unwrap();
 
         let tool = FileWriteTool::new(test_security(workspace.clone()));
@@ -464,9 +435,7 @@ mod tests {
         );
 
         // Verify original file was not modified
-        let content = tokio::fs::read_to_string(outside.join("target.txt"))
-            .await
-            .unwrap();
+        let content = tokio::fs::read_to_string(outside.join("target.txt")).await.unwrap();
         assert_eq!(content, "original", "original file must not be modified");
 
         let _ = tokio::fs::remove_dir_all(&root).await;

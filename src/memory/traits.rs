@@ -68,9 +68,7 @@ pub enum MemoryCategory {
 pub fn validate_memory_write_target(key: &str, session_id: Option<&str>) -> anyhow::Result<()> {
     const RESERVED_PREFIXES: &[&str] = &["self/", "router/"];
 
-    if RESERVED_PREFIXES
-        .iter()
-        .any(|prefix| key.starts_with(prefix))
+    if RESERVED_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
         && session_id != Some(crate::self_system::SELF_SYSTEM_SESSION_ID)
     {
         anyhow::bail!("refusing to write reserved memory namespace without self_system session");
@@ -145,12 +143,7 @@ pub trait Memory: Send + Sync {
     }
 
     /// Recall memories matching a query (keyword search), optionally scoped to a session
-    async fn recall(
-        &self,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>>;
+    async fn recall(&self, query: &str, limit: usize, session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>>;
 
     /// Get a specific memory by key
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>>;
@@ -193,15 +186,7 @@ pub trait Memory: Send + Sync {
         timestamp: Option<&str>,
         message_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let _ = (
-            session_key,
-            channel,
-            sender,
-            role,
-            content,
-            timestamp,
-            message_id,
-        );
+        let _ = (session_key, channel, sender, role, content, timestamp, message_id);
         Ok(())
     }
 
@@ -217,10 +202,7 @@ pub trait Memory: Send + Sync {
     }
 
     /// Get one persisted conversation session by key.
-    async fn get_conversation_session(
-        &self,
-        session_key: &str,
-    ) -> anyhow::Result<Option<ConversationSessionSummary>> {
+    async fn get_conversation_session(&self, session_key: &str) -> anyhow::Result<Option<ConversationSessionSummary>> {
         let _ = session_key;
         Ok(None)
     }
@@ -307,10 +289,7 @@ mod tests {
         assert_eq!(parsed.useful_count, Some(3));
         assert_eq!(parsed.source.as_deref(), Some("task-2026-02-16"));
         assert_eq!(parsed.source_confidence, Some(0.92));
-        assert_eq!(
-            parsed.verification_status,
-            Some(VerificationStatus::Verified)
-        );
+        assert_eq!(parsed.verification_status, Some(VerificationStatus::Verified));
         assert_eq!(parsed.lifecycle_state, Some(LifecycleState::Active));
         assert_eq!(parsed.compressed_from.as_ref().map(Vec::len), Some(2));
     }

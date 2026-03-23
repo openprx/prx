@@ -1,12 +1,10 @@
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SignalChannel, SlackChannel,
-    TelegramChannel,
+    Channel, DiscordChannel, MattermostChannel, SendMessage, SignalChannel, SlackChannel, TelegramChannel,
 };
 use crate::config::Config;
 use crate::cron::{
     CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget, claim_job, due_jobs,
-    next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    update_job,
+    next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run, update_job,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -25,10 +23,7 @@ pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
@@ -55,11 +50,7 @@ pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     execute_job_with_retry(config, &security, job).await
 }
 
-async fn execute_job_with_retry(
-    config: &Config,
-    security: &SecurityPolicy,
-    job: &CronJob,
-) -> (bool, String) {
+async fn execute_job_with_retry(config: &Config, security: &SecurityPolicy, job: &CronJob) -> (bool, String) {
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
@@ -90,28 +81,18 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
-async fn process_due_jobs(
-    config: &Config,
-    security: &Arc<SecurityPolicy>,
-    jobs: Vec<CronJob>,
-    component: &str,
-) {
+async fn process_due_jobs(config: &Config, security: &Arc<SecurityPolicy>, jobs: Vec<CronJob>, component: &str) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight =
-        stream::iter(
-            jobs.into_iter().map(|job| {
-                let config = config.clone();
-                let security = Arc::clone(security);
-                let component = component.to_owned();
-                async move {
-                    execute_and_persist_job(&config, security.as_ref(), &job, &component).await
-                }
-            }),
-        )
-        .buffer_unordered(max_concurrent);
+    let mut in_flight = stream::iter(jobs.into_iter().map(|job| {
+        let config = config.clone();
+        let security = Arc::clone(security);
+        let component = component.to_owned();
+        async move { execute_and_persist_job(&config, security.as_ref(), &job, &component).await }
+    }))
+    .buffer_unordered(max_concurrent);
 
     while let Some((job_id, success)) = in_flight.next().await {
         if !success {
@@ -150,30 +131,17 @@ async fn execute_and_persist_job(
     (job.id.clone(), success)
 }
 
-async fn run_agent_job(
-    config: &Config,
-    security: &SecurityPolicy,
-    job: &CronJob,
-) -> (bool, String) {
+async fn run_agent_job(config: &Config, security: &SecurityPolicy, job: &CronJob) -> (bool, String) {
     if !security.can_act() {
-        return (
-            false,
-            "blocked by security policy: autonomy is read-only".to_string(),
-        );
+        return (false, "blocked by security policy: autonomy is read-only".to_string());
     }
 
     if security.is_rate_limited() {
-        return (
-            false,
-            "blocked by security policy: rate limit exceeded".to_string(),
-        );
+        return (false, "blocked by security policy: rate limit exceeded".to_string());
     }
 
     if !security.record_action() {
-        return (
-            false,
-            "blocked by security policy: action budget exhausted".to_string(),
-        );
+        return (false, "blocked by security policy: action budget exhausted".to_string());
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
@@ -183,9 +151,7 @@ async fn run_agent_job(
     // Cap tool iterations for cron jobs to prevent runaway context growth.
     const CRON_MAX_TOOL_ITERATIONS: usize = 30;
     let mut cron_config = config.clone();
-    if cron_config.agent.max_tool_iterations == 0
-        || cron_config.agent.max_tool_iterations > CRON_MAX_TOOL_ITERATIONS
-    {
+    if cron_config.agent.max_tool_iterations == 0 || cron_config.agent.max_tool_iterations > CRON_MAX_TOOL_ITERATIONS {
         cron_config.agent.max_tool_iterations = CRON_MAX_TOOL_ITERATIONS;
     }
 
@@ -281,10 +247,7 @@ async fn persist_job_result(
                 ..CronJobPatch::default()
             },
         ) {
-            tracing::warn!(
-                "Failed to disable deterministically failing cron job '{}': {e}",
-                job.id
-            );
+            tracing::warn!("Failed to disable deterministically failing cron job '{}': {e}", job.id);
         } else {
             tracing::warn!(
                 "Disabled cron job '{}' after deterministic configuration failure",
@@ -322,10 +285,7 @@ fn should_disable_after_deterministic_failure(job: &CronJob, output: &str) -> bo
         "not allowed",
         "permission denied",
     ];
-    if permission_markers
-        .iter()
-        .any(|marker| normalized.contains(marker))
-    {
+    if permission_markers.iter().any(|marker| normalized.contains(marker)) {
         return false;
     }
 
@@ -341,9 +301,7 @@ fn should_disable_after_deterministic_failure(job: &CronJob, output: &str) -> bo
         "api key is required",
     ];
 
-    deterministic_markers
-        .iter()
-        .any(|marker| normalized.contains(marker))
+    deterministic_markers.iter().any(|marker| normalized.contains(marker))
 }
 
 fn warn_if_high_frequency_agent_job(job: &CronJob) {
@@ -406,11 +364,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, raw_output: &str)
                 .telegram
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
-            let channel = TelegramChannel::new(
-                tg.bot_token.clone(),
-                tg.allowed_users.clone(),
-                tg.mention_only,
-            );
+            let channel = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone(), tg.mention_only);
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "discord" => {
@@ -434,11 +388,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, raw_output: &str)
                 .slack
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
-            let channel = SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.channel_id.clone(),
-                sl.allowed_users.clone(),
-            );
+            let channel = SlackChannel::new(sl.bot_token.clone(), sl.channel_id.clone(), sl.allowed_users.clone());
             channel.send(&SendMessage::new(output, target)).await?;
         }
         "mattermost" => {
@@ -484,11 +434,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, raw_output: &str)
 }
 
 fn is_env_assignment(word: &str) -> bool {
-    word.contains('=')
-        && word
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    word.contains('=') && word.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
 fn strip_wrapping_quotes(token: &str) -> &str {
@@ -541,18 +487,8 @@ fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<S
     None
 }
 
-async fn run_job_command(
-    config: &Config,
-    security: &SecurityPolicy,
-    job: &CronJob,
-) -> (bool, String) {
-    run_job_command_with_timeout(
-        config,
-        security,
-        job,
-        Duration::from_secs(SHELL_JOB_TIMEOUT_SECS),
-    )
-    .await
+async fn run_job_command(config: &Config, security: &SecurityPolicy, job: &CronJob) -> (bool, String) {
+    run_job_command_with_timeout(config, security, job, Duration::from_secs(SHELL_JOB_TIMEOUT_SECS)).await
 }
 
 async fn run_job_command_with_timeout(
@@ -562,26 +498,17 @@ async fn run_job_command_with_timeout(
     timeout: Duration,
 ) -> (bool, String) {
     if !security.can_act() {
-        return (
-            false,
-            "blocked by security policy: autonomy is read-only".to_string(),
-        );
+        return (false, "blocked by security policy: autonomy is read-only".to_string());
     }
 
     if security.is_rate_limited() {
-        return (
-            false,
-            "blocked by security policy: rate limit exceeded".to_string(),
-        );
+        return (false, "blocked by security policy: rate limit exceeded".to_string());
     }
 
     if !security.is_command_allowed(&job.command) {
         return (
             false,
-            format!(
-                "blocked by security policy: command not allowed: {}",
-                job.command
-            ),
+            format!("blocked by security policy: command not allowed: {}", job.command),
         );
     }
 
@@ -593,10 +520,7 @@ async fn run_job_command_with_timeout(
     }
 
     if !security.record_action() {
-        return (
-            false,
-            "blocked by security policy: action budget exhausted".to_string(),
-        );
+        return (false, "blocked by security policy: action budget exhausted".to_string());
     }
 
     let child = match Command::new("sh")
@@ -626,10 +550,7 @@ async fn run_job_command_with_timeout(
             (output.status.success(), combined)
         }
         Ok(Err(e)) => (false, format!("spawn error: {e}")),
-        Err(_) => (
-            false,
-            format!("job timed out after {}s", timeout.as_secs_f64()),
-        ),
+        Err(_) => (false, format!("job timed out after {}s", timeout.as_secs_f64())),
     }
 }
 
@@ -648,9 +569,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         config
     }
 
@@ -717,8 +636,7 @@ mod tests {
         let job = test_job("sleep 1");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) =
-            run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
+        let (success, output) = run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
         assert!(!success);
         assert!(output.contains("job timed out after"));
     }
@@ -867,10 +785,7 @@ mod tests {
     async fn process_due_jobs_marks_component_ok_even_when_idle() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
-            &config.workspace_dir,
-        ));
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
@@ -888,10 +803,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let job = test_job("ls definitely_missing_file_for_scheduler_component_health_test");
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
-            &config.workspace_dir,
-        ));
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);

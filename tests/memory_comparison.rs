@@ -80,52 +80,24 @@ async fn compare_recall_quality() {
 
     // Seed both with identical data
     let entries = vec![
-        (
-            "lang_pref",
-            "User prefers Rust over Python",
-            MemoryCategory::Core,
-        ),
-        (
-            "editor",
-            "Uses VS Code with rust-analyzer",
-            MemoryCategory::Core,
-        ),
+        ("lang_pref", "User prefers Rust over Python", MemoryCategory::Core),
+        ("editor", "Uses VS Code with rust-analyzer", MemoryCategory::Core),
         ("tz", "Timezone is EST, works 9-5", MemoryCategory::Core),
-        (
-            "proj1",
-            "Working on ZeroClaw AI assistant",
-            MemoryCategory::Daily,
-        ),
+        ("proj1", "Working on ZeroClaw AI assistant", MemoryCategory::Daily),
         (
             "proj2",
             "Previous project was a web scraper in Python",
             MemoryCategory::Daily,
         ),
-        (
-            "deploy",
-            "Deploys to Hetzner VPS via Docker",
-            MemoryCategory::Core,
-        ),
-        (
-            "model",
-            "Prefers Claude Sonnet for coding tasks",
-            MemoryCategory::Core,
-        ),
-        (
-            "style",
-            "Likes concise responses, no fluff",
-            MemoryCategory::Core,
-        ),
+        ("deploy", "Deploys to Hetzner VPS via Docker", MemoryCategory::Core),
+        ("model", "Prefers Claude Sonnet for coding tasks", MemoryCategory::Core),
+        ("style", "Likes concise responses, no fluff", MemoryCategory::Core),
         (
             "rust_note",
             "Rust's ownership model prevents memory bugs",
             MemoryCategory::Daily,
         ),
-        (
-            "perf",
-            "Cares about binary size and startup time",
-            MemoryCategory::Core,
-        ),
+        ("perf", "Cares about binary size and startup time", MemoryCategory::Core),
     ];
 
     for (key, content, cat) in &entries {
@@ -229,25 +201,15 @@ async fn compare_persistence() {
     // Store in both, then drop and re-open
     {
         let sq = sqlite_backend(tmp_sq.path());
-        sq.store(
-            "persist_test",
-            "I should survive",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
+        sq.store("persist_test", "I should survive", MemoryCategory::Core, None)
+            .await
+            .unwrap();
     }
     {
         let md = markdown_backend(tmp_md.path());
-        md.store(
-            "persist_test",
-            "I should survive",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
+        md.store("persist_test", "I should survive", MemoryCategory::Core, None)
+            .await
+            .unwrap();
     }
 
     // Re-open
@@ -261,19 +223,11 @@ async fn compare_persistence() {
     println!("PERSISTENCE (store → drop → re-open → get):");
     println!(
         "  SQLite:   {}",
-        if sq_entry.is_some() {
-            "✅ Survived"
-        } else {
-            "❌ Lost"
-        }
+        if sq_entry.is_some() { "✅ Survived" } else { "❌ Lost" }
     );
     println!(
         "  Markdown: {}",
-        if md_entry.is_some() {
-            "✅ Survived"
-        } else {
-            "❌ Lost"
-        }
+        if md_entry.is_some() { "✅ Survived" } else { "❌ Lost" }
     );
 
     // SQLite should always persist by key
@@ -384,35 +338,20 @@ async fn compare_category_filter() {
     let md = markdown_backend(tmp_md.path());
 
     // Mix of categories
-    sq.store("a", "core fact 1", MemoryCategory::Core, None)
-        .await
-        .unwrap();
-    sq.store("b", "core fact 2", MemoryCategory::Core, None)
-        .await
-        .unwrap();
-    sq.store("c", "daily note", MemoryCategory::Daily, None)
-        .await
-        .unwrap();
+    sq.store("a", "core fact 1", MemoryCategory::Core, None).await.unwrap();
+    sq.store("b", "core fact 2", MemoryCategory::Core, None).await.unwrap();
+    sq.store("c", "daily note", MemoryCategory::Daily, None).await.unwrap();
     sq.store("d", "convo msg", MemoryCategory::Conversation, None)
         .await
         .unwrap();
 
-    md.store("a", "core fact 1", MemoryCategory::Core, None)
-        .await
-        .unwrap();
-    md.store("b", "core fact 2", MemoryCategory::Core, None)
-        .await
-        .unwrap();
-    md.store("c", "daily note", MemoryCategory::Daily, None)
-        .await
-        .unwrap();
+    md.store("a", "core fact 1", MemoryCategory::Core, None).await.unwrap();
+    md.store("b", "core fact 2", MemoryCategory::Core, None).await.unwrap();
+    md.store("c", "daily note", MemoryCategory::Daily, None).await.unwrap();
 
     let sq_core = sq.list(Some(&MemoryCategory::Core), None).await.unwrap();
     let sq_daily = sq.list(Some(&MemoryCategory::Daily), None).await.unwrap();
-    let sq_conv = sq
-        .list(Some(&MemoryCategory::Conversation), None)
-        .await
-        .unwrap();
+    let sq_conv = sq.list(Some(&MemoryCategory::Conversation), None).await.unwrap();
     let sq_all = sq.list(None, None).await.unwrap();
 
     let md_core = md.list(Some(&MemoryCategory::Core), None).await.unwrap();

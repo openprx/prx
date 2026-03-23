@@ -832,9 +832,7 @@ async fn main() -> Result<()> {
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
     let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .finish();
 
     if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
@@ -864,9 +862,7 @@ async fn main() -> Result<()> {
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
-        if channels_only
-            && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
-        {
+        if channels_only && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some()) {
             bail!("--channels-only does not accept --api-key, --provider, --model, or --memory");
         }
         let config = if channels_only {
@@ -885,8 +881,7 @@ async fn main() -> Result<()> {
         // Auto-start channels if user said yes during wizard
         if std::env::var("OPENPRX_AUTOSTART_CHANNELS")
             .or_else(|_| {
-                std::env::var("OPENPRX_AUTOSTART_CHANNELS")
-                    .or_else(|_| std::env::var("ZEROCLAW_AUTOSTART_CHANNELS"))
+                std::env::var("OPENPRX_AUTOSTART_CHANNELS").or_else(|_| std::env::var("ZEROCLAW_AUTOSTART_CHANNELS"))
             })
             .as_deref()
             == Ok("1")
@@ -921,18 +916,7 @@ async fn main() -> Result<()> {
             plain,
             session,
             list_sessions,
-        } => {
-            chat::run(
-                config,
-                provider,
-                model,
-                temperature,
-                plain,
-                session,
-                list_sessions,
-            )
-            .await
-        }
+        } => chat::run(config, provider, model, temperature, plain, session, list_sessions).await,
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);
@@ -974,10 +958,8 @@ async fn main() -> Result<()> {
             println!("📊 Observability:  {}", config.observability.backend);
             println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
             println!("⚙️  Runtime:       {}", config.runtime.kind);
-            let effective_memory_backend = memory::effective_memory_backend_name(
-                &config.memory.backend,
-                Some(&config.storage.provider.config),
-            );
+            let effective_memory_backend =
+                memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
             println!(
                 "💓 Heartbeat:      {}",
                 if config.heartbeat.enabled {
@@ -995,14 +977,8 @@ async fn main() -> Result<()> {
             println!();
             println!("Security:");
             println!("  Workspace only:    {}", config.autonomy.workspace_only);
-            println!(
-                "  Allowed commands:  {}",
-                config.autonomy.allowed_commands.join(", ")
-            );
-            println!(
-                "  Max actions/hour:  {}",
-                config.autonomy.max_actions_per_hour
-            );
+            println!("  Allowed commands:  {}", config.autonomy.allowed_commands.join(", "));
+            println!("  Max actions/hour:  {}", config.autonomy.max_actions_per_hour);
             println!(
                 "  Max cost/day:      ${:.2}",
                 f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
@@ -1061,9 +1037,7 @@ async fn main() -> Result<()> {
             println!("  ─────────────────── ───────────");
             for p in &providers {
                 let is_active = p.name.eq_ignore_ascii_case(&current)
-                    || p.aliases
-                        .iter()
-                        .any(|alias| alias.eq_ignore_ascii_case(&current));
+                    || p.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(&current));
                 let marker = if is_active { " (active)" } else { "" };
                 let local_tag = if p.local { " [local]" } else { "" };
                 let aliases = if p.aliases.is_empty() {
@@ -1071,10 +1045,7 @@ async fn main() -> Result<()> {
                 } else {
                     format!("  (aliases: {})", p.aliases.join(", "))
                 };
-                println!(
-                    "  {:<19} {}{}{}{}",
-                    p.name, p.display_name, local_tag, marker, aliases
-                );
+                println!("  {:<19} {}{}{}{}", p.name, p.display_name, local_tag, marker, aliases);
             }
             println!("\n  custom:<URL>   Any OpenAI-compatible endpoint");
             println!("  anthropic-custom:<URL>  Any Anthropic-compatible endpoint");
@@ -1090,10 +1061,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Doctor { doctor_command } => match doctor_command {
-            Some(DoctorCommands::Models {
-                provider,
-                use_cache,
-            }) => {
+            Some(DoctorCommands::Models { provider, use_cache }) => {
                 let config_for_models = config.clone();
                 tokio::task::spawn_blocking(move || {
                     doctor::run_models(&config_for_models, provider.as_deref(), use_cache)
@@ -1110,15 +1078,11 @@ async fn main() -> Result<()> {
             other => channels::handle_command(other, &config).await,
         },
 
-        Commands::Integrations {
-            integration_command,
-        } => integrations::handle_command(integration_command, &config),
+        Commands::Integrations { integration_command } => integrations::handle_command(integration_command, &config),
 
         Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
 
-        Commands::Migrate { migrate_command } => {
-            migration::handle_command(migrate_command, &config).await
-        }
+        Commands::Migrate { migrate_command } => migration::handle_command(migrate_command, &config).await,
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
 
@@ -1195,10 +1159,7 @@ fn pending_openai_login_path(config: &Config) -> std::path::PathBuf {
 }
 
 fn pending_openai_secret_store(config: &Config) -> security::secrets::SecretStore {
-    security::secrets::SecretStore::new(
-        &auth::state_dir_from_config(config),
-        config.secrets.encrypt,
-    )
+    security::secrets::SecretStore::new(&auth::state_dir_from_config(config), config.secrets.encrypt)
 }
 
 #[cfg(unix)]
@@ -1300,11 +1261,7 @@ fn extract_openai_account_id_for_profile(access_token: &str) -> Option<String> {
 }
 
 fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
-    match profile
-        .token_set
-        .as_ref()
-        .and_then(|token_set| token_set.expires_at)
-    {
+    match profile.token_set.as_ref().and_then(|token_set| token_set.expires_at) {
         Some(ts) => {
             let now = chrono::Utc::now();
             if ts <= now {
@@ -1348,10 +1305,8 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                             println!("{message}");
                         }
 
-                        let token_set =
-                            auth::openai_oauth::poll_device_code_tokens(&client, &device).await?;
-                        let account_id =
-                            extract_openai_account_id_for_profile(&token_set.access_token);
+                        let token_set = auth::openai_oauth::poll_device_code_tokens(&client, &device).await?;
+                        let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
 
                         auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
                         clear_pending_openai_login(config);
@@ -1361,9 +1316,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         return Ok(());
                     }
                     Err(e) => {
-                        println!(
-                            "Device-code flow unavailable: {e}. Falling back to browser/paste flow."
-                        );
+                        println!("Device-code flow unavailable: {e}. Falling back to browser/paste flow.");
                     }
                 }
             }
@@ -1383,24 +1336,18 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             println!();
             println!("Waiting for callback at http://localhost:1455/auth/callback ...");
 
-            let code = match auth::openai_oauth::receive_loopback_code(
-                &pkce.state,
-                std::time::Duration::from_secs(180),
-            )
-            .await
+            let code = match auth::openai_oauth::receive_loopback_code(&pkce.state, std::time::Duration::from_secs(180))
+                .await
             {
                 Ok(code) => code,
                 Err(e) => {
                     println!("Callback capture failed: {e}");
-                    println!(
-                        "Run `prx auth paste-redirect --provider openai-codex --profile {profile}`"
-                    );
+                    println!("Run `prx auth paste-redirect --provider openai-codex --profile {profile}`");
                     return Ok(());
                 }
             };
 
-            let token_set =
-                auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+            let token_set = auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
             let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
 
             auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
@@ -1422,9 +1369,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             }
 
             let pending = load_pending_openai_login(config)?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No pending OpenAI login found. Run `prx auth login --provider openai-codex` first."
-                )
+                anyhow::anyhow!("No pending OpenAI login found. Run `prx auth login --provider openai-codex` first.")
             })?;
 
             if pending.profile != profile {
@@ -1440,10 +1385,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 None => read_plain_input("Paste redirect URL or OAuth code")?,
             };
 
-            let code = auth::openai_oauth::parse_code_from_redirect(
-                &redirect_input,
-                Some(&pending.state),
-            )?;
+            let code = auth::openai_oauth::parse_code_from_redirect(&redirect_input, Some(&pending.state))?;
 
             let pkce = auth::openai_oauth::PkceState {
                 code_verifier: pending.code_verifier.clone(),
@@ -1452,8 +1394,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             };
 
             let client = reqwest::Client::new();
-            let token_set =
-                auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
+            let token_set = auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
             let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
 
             auth_service.store_openai_tokens(&profile, token_set, account_id, true)?;
@@ -1481,10 +1422,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             let kind = auth::anthropic_token::detect_auth_kind(&token, auth_kind.as_deref());
             let mut metadata = std::collections::HashMap::new();
-            metadata.insert(
-                "auth_kind".to_string(),
-                kind.as_metadata_value().to_string(),
-            );
+            metadata.insert("auth_kind".to_string(), kind.as_metadata_value().to_string());
 
             auth_service.store_provider_token(&provider, &profile, &token, metadata, true)?;
             println!("Saved profile {profile}");
@@ -1501,10 +1439,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             let kind = auth::anthropic_token::detect_auth_kind(&token, Some("authorization"));
             let mut metadata = std::collections::HashMap::new();
-            metadata.insert(
-                "auth_kind".to_string(),
-                kind.as_metadata_value().to_string(),
-            );
+            metadata.insert("auth_kind".to_string(), kind.as_metadata_value().to_string());
 
             auth_service.store_provider_token(&provider, &profile, &token, metadata, true)?;
             println!("Saved profile {profile}");
@@ -1518,18 +1453,13 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 bail!("`auth refresh` currently supports only --provider openai-codex");
             }
 
-            match auth_service
-                .get_valid_openai_access_token(profile.as_deref())
-                .await?
-            {
+            match auth_service.get_valid_openai_access_token(profile.as_deref()).await? {
                 Some(_) => {
                     println!("OpenAI Codex token is valid (refresh completed if needed).");
                     Ok(())
                 }
                 None => {
-                    bail!(
-                        "No OpenAI Codex auth profile found. Run `prx auth login --provider openai-codex`."
-                    )
+                    bail!("No OpenAI Codex auth profile found. Run `prx auth login --provider openai-codex`.")
                 }
             }
         }
@@ -1669,8 +1599,7 @@ mod tests {
     #[test]
     fn completions_cli_parses_supported_shells() {
         for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
-            let cli = Cli::try_parse_from(["prx", "completions", shell])
-                .expect("completions invocation should parse");
+            let cli = Cli::try_parse_from(["prx", "completions", shell]).expect("completions invocation should parse");
             match cli.command {
                 Commands::Completions { .. } => {}
                 other => panic!("expected completions command, got {other:?}"),
@@ -1681,12 +1610,8 @@ mod tests {
     #[test]
     fn completion_generation_mentions_binary_name() {
         let mut output = Vec::new();
-        write_shell_completion(CompletionShell::Bash, &mut output)
-            .expect("completion generation should succeed");
+        write_shell_completion(CompletionShell::Bash, &mut output).expect("completion generation should succeed");
         let script = String::from_utf8(output).expect("completion output should be valid utf-8");
-        assert!(
-            script.contains("prx"),
-            "completion script should reference binary name"
-        );
+        assert!(script.contains("prx"), "completion script should reference binary name");
     }
 }

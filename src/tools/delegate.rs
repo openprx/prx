@@ -55,9 +55,7 @@ fn parse_delegate_scope(args: &serde_json::Value) -> Option<DelegateScope> {
         return None;
     }
 
-    let scope = args
-        .get("_zc_scope")
-        .and_then(serde_json::Value::as_object)?;
+    let scope = args.get("_zc_scope").and_then(serde_json::Value::as_object)?;
     let sender = scope
         .get("sender")
         .and_then(serde_json::Value::as_str)
@@ -263,8 +261,7 @@ impl Tool for DelegateTool {
         let agent_config = match self.agents.get(agent_name) {
             Some(cfg) => cfg,
             None => {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
+                let available: Vec<&str> = self.agents.keys().map(|s: &String| s.as_str()).collect();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -294,10 +291,7 @@ impl Tool for DelegateTool {
             });
         }
 
-        if let Err(error) = self
-            .security
-            .enforce_tool_operation(ToolOperation::Act, "delegate")
-        {
+        if let Err(error) = self.security.enforce_tool_operation(ToolOperation::Act, "delegate") {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -372,9 +366,7 @@ impl Tool for DelegateTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s"
-                    )),
+                    error: Some(format!("Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s")),
                 });
             }
         };
@@ -809,9 +801,7 @@ mod tests {
     fn schema_lists_agent_names() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
         let schema = tool.parameters_schema();
-        let desc = schema["properties"]["agent"]["description"]
-            .as_str()
-            .unwrap();
+        let desc = schema["properties"]["agent"]["description"].as_str().unwrap();
         assert!(desc.contains("researcher") || desc.contains("coder"));
     }
 
@@ -855,10 +845,7 @@ mod tests {
     async fn depth_limit_per_agent() {
         // coder has max_depth=2, so depth=2 should be blocked
         let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 2);
-        let result = tool
-            .execute(json!({"agent": "coder", "prompt": "test"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"agent": "coder", "prompt": "test"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("depth limit"));
     }
@@ -867,9 +854,7 @@ mod tests {
     fn empty_agents_schema() {
         let tool = DelegateTool::new(HashMap::new(), None, test_security());
         let schema = tool.parameters_schema();
-        let desc = schema["properties"]["agent"]["description"]
-            .as_str()
-            .unwrap();
+        let desc = schema["properties"]["agent"]["description"].as_str().unwrap();
         assert!(desc.contains("none configured"));
     }
 
@@ -905,10 +890,7 @@ mod tests {
     #[tokio::test]
     async fn blank_agent_rejected() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
-        let result = tool
-            .execute(json!({"agent": "  ", "prompt": "test"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"agent": "  ", "prompt": "test"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("must not be empty"));
     }
@@ -934,14 +916,7 @@ mod tests {
             .unwrap();
         // Should find "researcher" after trim — will fail at provider level
         // since ollama isn't running, but must NOT get "Unknown agent".
-        assert!(
-            result.error.is_none()
-                || !result
-                    .error
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains("Unknown agent")
-        );
+        assert!(result.error.is_none() || !result.error.as_deref().unwrap_or("").contains("Unknown agent"));
     }
 
     #[tokio::test]
@@ -956,13 +931,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("read-only mode")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only mode"));
     }
 
     #[tokio::test]
@@ -977,13 +946,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Rate limit exceeded")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit exceeded"));
     }
 
     #[tokio::test]
@@ -1075,10 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn delegate_no_agents_configured() {
         let tool = DelegateTool::new(HashMap::new(), None, test_security());
-        let result = tool
-            .execute(json!({"agent": "any", "prompt": "test"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"agent": "any", "prompt": "test"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("none configured"));
     }
@@ -1095,13 +1055,7 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("allowed_tools is empty")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("allowed_tools is empty"));
     }
 
     #[tokio::test]
@@ -1112,32 +1066,24 @@ mod tests {
             agentic_config(vec!["missing_tool".to_string()], 10),
         );
 
-        let tool = DelegateTool::new(agents, None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+        let tool =
+            DelegateTool::new(agents, None, test_security()).with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
         let result = tool
             .execute(json!({"agent": "agentic", "prompt": "test"}))
             .await
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("no executable tools")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("no executable tools"));
     }
 
     #[tokio::test]
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
-        let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![
-                Arc::new(EchoTool),
-                Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
-            ]),
-        );
+        let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(Arc::new(vec![
+            Arc::new(EchoTool),
+            Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
+        ]));
 
         let provider = OneToolThenFinalProvider;
         let result = tool
@@ -1153,13 +1099,10 @@ mod tests {
     #[tokio::test]
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
         let config = agentic_config(vec!["delegate".to_string()], 10);
-        let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![Arc::new(DelegateTool::new(
-                HashMap::new(),
-                None,
-                test_security(),
-            ))]),
-        );
+        let tool =
+            DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(Arc::new(vec![Arc::new(
+                DelegateTool::new(HashMap::new(), None, test_security()),
+            )]));
 
         let provider = OneToolThenFinalProvider;
         let result = tool
@@ -1168,13 +1111,7 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("no executable tools")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("no executable tools"));
     }
 
     #[tokio::test]
@@ -1212,12 +1149,6 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("provider boom")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("provider boom"));
     }
 }

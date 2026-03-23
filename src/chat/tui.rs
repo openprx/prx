@@ -11,9 +11,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 
 /// State for the TUI layout.
 pub struct TuiState {
@@ -162,8 +160,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &TuiState) {
         state.provider, state.model, title, state.turn_count
     );
 
-    let status =
-        Paragraph::new(status_text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
+    let status = Paragraph::new(status_text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
     frame.render_widget(status, area);
 }
 
@@ -175,9 +172,7 @@ fn render_output(frame: &mut Frame, area: Rect, state: &mut TuiState) {
             ConversationRole::User => {
                 lines.push(Line::from(vec![Span::styled(
                     "You: ",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                 )]));
                 for text_line in conv_line.content.lines() {
                     lines.push(Line::from(format!("  {text_line}")));
@@ -187,9 +182,7 @@ fn render_output(frame: &mut Frame, area: Rect, state: &mut TuiState) {
             ConversationRole::Assistant => {
                 lines.push(Line::from(vec![Span::styled(
                     "PRX: ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 )]));
                 for text_line in conv_line.content.lines() {
                     lines.push(Line::from(format!("  {text_line}")));
@@ -263,9 +256,7 @@ pub fn render_approval(frame: &mut Frame, area: Rect, tool_name: &str, args: &st
         Line::from(vec![
             Span::styled(
                 "Tool: ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
             Span::raw(tool_name),
         ]),
@@ -275,24 +266,11 @@ pub fn render_approval(frame: &mut Frame, area: Rect, tool_name: &str, args: &st
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(
-                "[y]",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("[y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::raw(" approve  "),
-            Span::styled(
-                "[n]",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("[n]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Span::raw(" deny  "),
-            Span::styled(
-                "[a]",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("[a]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw(" always"),
         ]),
     ];

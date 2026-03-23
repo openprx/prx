@@ -2,8 +2,8 @@ use crate::memory::{LifecycleState, Memory, MemoryCategory, MemoryEntry};
 use crate::self_system::SELF_SYSTEM_SESSION_ID;
 use crate::self_system::evolution::safety_utils::{is_raw_debug_enabled, sha256_hex};
 use crate::self_system::evolution::{
-    Actor, AsyncJsonlWriter, EvolutionConfig, MemoryAccessLog, MemoryAction, SharedEvolutionConfig,
-    TaskType, current_trace,
+    Actor, AsyncJsonlWriter, EvolutionConfig, MemoryAccessLog, MemoryAction, SharedEvolutionConfig, TaskType,
+    current_trace,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -25,16 +25,8 @@ pub struct EvolutionMemoryRetriever {
 }
 
 impl EvolutionMemoryRetriever {
-    pub fn new(
-        memory: Arc<dyn Memory>,
-        config: SharedEvolutionConfig,
-        writer: Option<Arc<AsyncJsonlWriter>>,
-    ) -> Self {
-        Self {
-            memory,
-            config,
-            writer,
-        }
+    pub fn new(memory: Arc<dyn Memory>, config: SharedEvolutionConfig, writer: Option<Arc<AsyncJsonlWriter>>) -> Self {
+        Self { memory, config, writer }
     }
 
     async fn base_retrieval(&self, query: &str) -> Result<Vec<MemoryEntry>> {
@@ -54,11 +46,7 @@ impl EvolutionMemoryRetriever {
             .collect())
     }
 
-    async fn maybe_vector_retrieve(
-        &self,
-        query: &str,
-        threshold: usize,
-    ) -> Result<Vec<MemoryEntry>> {
+    async fn maybe_vector_retrieve(&self, query: &str, threshold: usize) -> Result<Vec<MemoryEntry>> {
         let count = self.memory.count().await?;
         if count > threshold {
             // Reserved for vector retrieval integration.
@@ -88,12 +76,7 @@ impl EvolutionMemoryRetriever {
             + weights.source_confidence * source_confidence
     }
 
-    async fn write_access_logs(
-        &self,
-        query: &str,
-        selected: &[MemoryEntry],
-        token_budget: usize,
-    ) -> Result<()> {
+    async fn write_access_logs(&self, query: &str, selected: &[MemoryEntry], token_budget: usize) -> Result<()> {
         let Some(writer) = &self.writer else {
             return Ok(());
         };
@@ -160,8 +143,7 @@ impl EvolutionAwareRetrieval for EvolutionMemoryRetriever {
             selected.push(entry);
         }
 
-        self.write_access_logs(query, &selected, token_budget)
-            .await?;
+        self.write_access_logs(query, &selected, token_budget).await?;
         Ok(selected)
     }
 }
@@ -184,11 +166,10 @@ fn keyword_or_tag_match(entry: &MemoryEntry, query_terms: &[String]) -> bool {
 
     let key_lc = entry.key.to_ascii_lowercase();
     let content_lc = entry.content.to_ascii_lowercase();
-    let tags_lc = entry.tags.as_ref().map(|tags| {
-        tags.iter()
-            .map(|v| v.to_ascii_lowercase())
-            .collect::<Vec<String>>()
-    });
+    let tags_lc = entry
+        .tags
+        .as_ref()
+        .map(|tags| tags.iter().map(|v| v.to_ascii_lowercase()).collect::<Vec<String>>());
 
     query_terms.iter().any(|term| {
         key_lc.contains(term)
@@ -238,9 +219,7 @@ fn estimate_tokens(content: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::self_system::evolution::storage::{
-        AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths,
-    };
+    use crate::self_system::evolution::storage::{AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths};
     use crate::self_system::evolution::{EvolutionConfig, new_shared_evolution_config};
     use anyhow::Result;
     use async_trait::async_trait;
@@ -268,12 +247,7 @@ mod tests {
             Ok(())
         }
 
-        async fn recall(
-            &self,
-            _query: &str,
-            _limit: usize,
-            _session_id: Option<&str>,
-        ) -> Result<Vec<MemoryEntry>> {
+        async fn recall(&self, _query: &str, _limit: usize, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
 
@@ -354,11 +328,8 @@ mod tests {
                 ),
             ],
         });
-        let retriever = EvolutionMemoryRetriever::new(
-            memory,
-            new_shared_evolution_config(EvolutionConfig::default()),
-            None,
-        );
+        let retriever =
+            EvolutionMemoryRetriever::new(memory, new_shared_evolution_config(EvolutionConfig::default()), None);
 
         let result = retriever.retrieve("alpha", 128).await.unwrap();
         assert_eq!(result.len(), 1);
@@ -389,11 +360,8 @@ mod tests {
                 ),
             ],
         });
-        let retriever = EvolutionMemoryRetriever::new(
-            memory,
-            new_shared_evolution_config(EvolutionConfig::default()),
-            None,
-        );
+        let retriever =
+            EvolutionMemoryRetriever::new(memory, new_shared_evolution_config(EvolutionConfig::default()), None);
 
         let result = retriever.retrieve("alpha", 6).await.unwrap();
         assert_eq!(result.len(), 1);
@@ -429,10 +397,7 @@ mod tests {
             Some(writer.clone()),
         );
 
-        let _ = retriever
-            .retrieve("alpha api_key=secret", 128)
-            .await
-            .unwrap();
+        let _ = retriever.retrieve("alpha api_key=secret", 128).await.unwrap();
         writer.flush().await.unwrap();
         let logs = writer
             .read_memory_access_since(Utc::now() - Duration::hours(1))
@@ -476,11 +441,8 @@ mod tests {
                 ),
             ],
         });
-        let retriever = EvolutionMemoryRetriever::new(
-            memory,
-            new_shared_evolution_config(EvolutionConfig::default()),
-            None,
-        );
+        let retriever =
+            EvolutionMemoryRetriever::new(memory, new_shared_evolution_config(EvolutionConfig::default()), None);
 
         let result = retriever.retrieve("alpha", 128).await.unwrap();
 

@@ -40,15 +40,11 @@ impl H2Transport {
             .build()
             .context("failed to build HTTP/2 transport client")?;
 
-        Ok(Self {
-            client,
-            max_retries,
-        })
+        Ok(Self { client, max_retries })
     }
 
     pub fn validate_endpoint(endpoint: &str) -> Result<()> {
-        let url = reqwest::Url::parse(endpoint)
-            .with_context(|| format!("invalid node endpoint URL: {endpoint}"))?;
+        let url = reqwest::Url::parse(endpoint).with_context(|| format!("invalid node endpoint URL: {endpoint}"))?;
 
         if url.scheme() == "https" {
             return Ok(());
@@ -75,8 +71,7 @@ impl H2Transport {
 
     fn sign(secret: &str, timestamp: i64, body: &str) -> Result<String> {
         let payload = format!("{timestamp}.{body}");
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-            .map_err(|_| anyhow!("invalid hmac key length"))?;
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| anyhow!("invalid hmac key length"))?;
         mac.update(payload.as_bytes());
         Ok(hex::encode(mac.finalize().into_bytes()))
     }
@@ -86,11 +81,7 @@ impl H2Transport {
 impl NodeTransport for H2Transport {
     async fn call(&self, request: &TransportRequest) -> Result<Value> {
         Self::validate_endpoint(&request.endpoint)?;
-        let rpc = JsonRpcRequest::new(
-            Uuid::new_v4().to_string(),
-            &request.method,
-            request.params.clone(),
-        );
+        let rpc = JsonRpcRequest::new(Uuid::new_v4().to_string(), &request.method, request.params.clone());
         let body = serde_json::to_string(&rpc).context("failed to encode JSON-RPC request")?;
         let url = Self::rpc_url(&request.endpoint);
 
@@ -115,10 +106,7 @@ impl NodeTransport for H2Transport {
             match req.send().await {
                 Ok(response) => {
                     let status = response.status();
-                    let payload = response
-                        .text()
-                        .await
-                        .context("failed reading JSON-RPC response body")?;
+                    let payload = response.text().await.context("failed reading JSON-RPC response body")?;
 
                     if !status.is_success() {
                         last_err = Some(anyhow!("remote status {status}: {payload}"));
@@ -127,11 +115,7 @@ impl NodeTransport for H2Transport {
                             serde_json::from_str(&payload).context("invalid JSON-RPC response")?;
 
                         if let Some(error) = rpc_response.error {
-                            return Err(anyhow!(
-                                "JSON-RPC error {}: {}",
-                                error.code,
-                                error.message
-                            ));
+                            return Err(anyhow!("JSON-RPC error {}: {}", error.code, error.message));
                         }
 
                         return rpc_response

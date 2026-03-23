@@ -93,11 +93,7 @@ impl JudgeHealthMonitor {
         let round_mean = if results.is_empty() {
             0.0
         } else {
-            results
-                .iter()
-                .map(|item| item.scores.overall())
-                .sum::<f64>()
-                / results.len() as f64
+            results.iter().map(|item| item.scores.overall()).sum::<f64>() / results.len() as f64
         };
 
         if self.recent_round_means.len() >= 8 {
@@ -161,12 +157,7 @@ fn score_bucket(value: f64) -> String {
 /// LLM scoring interface. Current default can use mock implementation.
 #[async_trait]
 pub trait JudgeScoringModel: Send + Sync {
-    async fn score(
-        &self,
-        task_description: &str,
-        execution_result: &str,
-        config: &JudgeConfig,
-    ) -> Result<String>;
+    async fn score(&self, task_description: &str, execution_result: &str, config: &JudgeConfig) -> Result<String>;
 }
 
 /// Mock scoring implementation with deterministic heuristics.
@@ -174,12 +165,7 @@ pub struct MockJudgeModel;
 
 #[async_trait]
 impl JudgeScoringModel for MockJudgeModel {
-    async fn score(
-        &self,
-        task_description: &str,
-        execution_result: &str,
-        _config: &JudgeConfig,
-    ) -> Result<String> {
+    async fn score(&self, task_description: &str, execution_result: &str, _config: &JudgeConfig) -> Result<String> {
         let text = format!(
             "{} {}",
             task_description.to_ascii_lowercase(),
@@ -229,19 +215,15 @@ impl<M: JudgeScoringModel> JudgeEngine<M> {
             .score(task_description, execution_result, &self.config)
             .await?;
 
-        let scores = parse_scores(&raw_output)
-            .with_context(|| "judge output does not satisfy StructuredScores schema")?;
+        let scores =
+            parse_scores(&raw_output).with_context(|| "judge output does not satisfy StructuredScores schema")?;
 
         Ok(JudgeResult {
             experiment_id: experiment_id.to_string(),
             task_id: task_id.to_string(),
             scores,
             raw_output,
-            needs_human_review: should_sample_human_review(
-                experiment_id,
-                task_id,
-                self.config.human_sample_rate,
-            ),
+            needs_human_review: should_sample_human_review(experiment_id, task_id, self.config.human_sample_rate),
         })
     }
 
@@ -319,12 +301,7 @@ mod tests {
         );
 
         let result = engine
-            .judge_task(
-                "exp-1",
-                "task-1",
-                "Complete task",
-                "success with safe execution",
-            )
+            .judge_task("exp-1", "task-1", "Complete task", "success with safe execution")
             .await
             .unwrap();
 

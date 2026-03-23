@@ -34,20 +34,16 @@ impl WebFetchTool {
         // Remove script/style/head blocks (case-insensitive, multiline).
         // Rust's regex crate does not support backreferences, so use three
         // separate patterns instead of the combined `(?si)<(script|style|head)[^>]*>.*?</\1>`.
-        let re_script = Regex::new(r"(?si)<script[^>]*>.*?</script>")
-            .expect("compile regex: strip script tags");
+        let re_script = Regex::new(r"(?si)<script[^>]*>.*?</script>").expect("compile regex: strip script tags");
         let text = re_script.replace_all(html, "");
-        let re_style =
-            Regex::new(r"(?si)<style[^>]*>.*?</style>").expect("compile regex: strip style tags");
+        let re_style = Regex::new(r"(?si)<style[^>]*>.*?</style>").expect("compile regex: strip style tags");
         let text = re_style.replace_all(&text, "");
-        let re_head =
-            Regex::new(r"(?si)<head[^>]*>.*?</head>").expect("compile regex: strip head tags");
+        let re_head = Regex::new(r"(?si)<head[^>]*>.*?</head>").expect("compile regex: strip head tags");
         let text = re_head.replace_all(&text, "");
 
         // Replace block-level elements with newlines so paragraphs separate cleanly
-        let re_block =
-            Regex::new(r"(?i)<(br\s*/?|p|div|h[1-6]|li|tr|article|section|header|footer)[^>]*>")
-                .expect("compile regex: block-level HTML elements");
+        let re_block = Regex::new(r"(?i)<(br\s*/?|p|div|h[1-6]|li|tr|article|section|header|footer)[^>]*>")
+            .expect("compile regex: block-level HTML elements");
         let text = re_block.replace_all(&text, "\n");
 
         // Strip all remaining tags
@@ -201,16 +197,15 @@ impl Tool for WebFetchTool {
                     .ok_or_else(|| anyhow::anyhow!("Redirect with no Location header"))?
                     .to_string();
                 // Resolve relative redirects against the current URL.
-                let next_url =
-                    if location.starts_with("http://") || location.starts_with("https://") {
-                        location
-                    } else {
-                        let base = reqwest::Url::parse(&current_url)
-                            .map_err(|e| anyhow::anyhow!("Invalid base URL: {e}"))?;
-                        base.join(&location)
-                            .map_err(|e| anyhow::anyhow!("Invalid redirect URL: {e}"))?
-                            .to_string()
-                    };
+                let next_url = if location.starts_with("http://") || location.starts_with("https://") {
+                    location
+                } else {
+                    let base =
+                        reqwest::Url::parse(&current_url).map_err(|e| anyhow::anyhow!("Invalid base URL: {e}"))?;
+                    base.join(&location)
+                        .map_err(|e| anyhow::anyhow!("Invalid redirect URL: {e}"))?
+                        .to_string()
+                };
                 // Re-validate the redirect target before following.
                 current_url = self.validate_url(&next_url)?;
                 redirect_count += 1;
@@ -233,9 +228,7 @@ impl Tool for WebFetchTool {
             .to_ascii_lowercase();
 
         let is_html = content_type.contains("html");
-        let is_text = content_type.contains("text")
-            || content_type.contains("json")
-            || content_type.contains("xml");
+        let is_text = content_type.contains("text") || content_type.contains("json") || content_type.contains("xml");
 
         if !is_html && !is_text && !content_type.is_empty() {
             anyhow::bail!(
@@ -310,10 +303,7 @@ fn normalize_domain(raw: &str) -> Option<String> {
         domain = host.to_string();
     }
 
-    domain = domain
-        .trim_start_matches('.')
-        .trim_end_matches('.')
-        .to_string();
+    domain = domain.trim_start_matches('.').trim_end_matches('.').to_string();
 
     if let Some((host, _)) = domain.split_once(':') {
         domain = host.to_string();
@@ -365,12 +355,9 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
 }
 
 fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
+    allowed_domains
+        .iter()
+        .any(|domain| host == domain || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.')))
 }
 
 fn is_private_or_local_host(host: &str) -> bool {
@@ -379,10 +366,7 @@ fn is_private_or_local_host(host: &str) -> bool {
         .and_then(|candidate| candidate.strip_suffix(']'))
         .unwrap_or(host);
 
-    let has_local_tld = bare
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
+    let has_local_tld = bare.rsplit('.').next().is_some_and(|label| label == "local");
 
     if bare == "localhost" || bare.ends_with(".localhost") || has_local_tld {
         return true;
@@ -489,10 +473,7 @@ mod tests {
     fn test_html_to_text_decodes_entities() {
         let html = "<p>1 &lt; 2 &amp; 3 &gt; 0 &quot;quoted&quot; it&#39;s</p>";
         let text = WebFetchTool::html_to_text(html);
-        assert!(
-            text.contains("1 < 2 & 3 > 0 \"quoted\" it's"),
-            "got: {text}"
-        );
+        assert!(text.contains("1 < 2 & 3 > 0 \"quoted\" it's"), "got: {text}");
     }
 
     #[test]

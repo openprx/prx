@@ -29,17 +29,10 @@ async fn sqlite_memory_store_same_key_deduplicates() {
 
     // Should have exactly 1 entry, not 2
     let count = mem.count().await.unwrap();
-    assert_eq!(
-        count, 1,
-        "storing same key twice should not create duplicates"
-    );
+    assert_eq!(count, 1, "storing same key twice should not create duplicates");
 
     // Content should be the latest version
-    let entry = mem
-        .get("greeting")
-        .await
-        .unwrap()
-        .expect("entry should exist");
+    let entry = mem.get("greeting").await.unwrap().expect("entry should exist");
     assert_eq!(entry.content, "hello updated");
 }
 
@@ -70,14 +63,9 @@ async fn sqlite_memory_persists_across_reinitialization() {
     // First "session": store data
     {
         let mem = SqliteMemory::new(tmp.path()).unwrap();
-        mem.store(
-            "persistent_fact",
-            "Rust is great",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("persistent_fact", "Rust is great", MemoryCategory::Core, None)
+            .await
+            .unwrap();
     }
 
     // Second "session": re-create memory from same path
@@ -157,11 +145,7 @@ async fn sqlite_memory_session_scoped_store_and_recall() {
         .list(Some(&MemoryCategory::Conversation), Some("session_a"))
         .await
         .unwrap();
-    assert_eq!(
-        session_a_entries.len(),
-        1,
-        "session_a should have exactly 1 entry"
-    );
+    assert_eq!(session_a_entries.len(), 1, "session_a should have exactly 1 entry");
     assert_eq!(session_a_entries[0].content, "fact from session A");
 }
 
@@ -170,24 +154,16 @@ async fn sqlite_memory_global_recall_includes_all_sessions() {
     let tmp = tempfile::TempDir::new().unwrap();
     let mem = SqliteMemory::new(tmp.path()).unwrap();
 
-    mem.store(
-        "global_a",
-        "alpha content",
-        MemoryCategory::Core,
-        Some("s1"),
-    )
-    .await
-    .unwrap();
+    mem.store("global_a", "alpha content", MemoryCategory::Core, Some("s1"))
+        .await
+        .unwrap();
     mem.store("global_b", "beta content", MemoryCategory::Core, Some("s2"))
         .await
         .unwrap();
 
     // Global count should include all
     let count = mem.count().await.unwrap();
-    assert_eq!(
-        count, 2,
-        "global count should include entries from all sessions"
-    );
+    assert_eq!(count, 2, "global count should include entries from all sessions");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -199,22 +175,12 @@ async fn sqlite_memory_recall_returns_relevant_results() {
     let tmp = tempfile::TempDir::new().unwrap();
     let mem = SqliteMemory::new(tmp.path()).unwrap();
 
-    mem.store(
-        "lang_pref",
-        "User prefers Rust programming",
-        MemoryCategory::Core,
-        None,
-    )
-    .await
-    .unwrap();
-    mem.store(
-        "food_pref",
-        "User likes sushi for lunch",
-        MemoryCategory::Core,
-        None,
-    )
-    .await
-    .unwrap();
+    mem.store("lang_pref", "User prefers Rust programming", MemoryCategory::Core, None)
+        .await
+        .unwrap();
+    mem.store("food_pref", "User likes sushi for lunch", MemoryCategory::Core, None)
+        .await
+        .unwrap();
 
     let results = mem.recall("Rust programming", 10, None).await.unwrap();
     assert!(!results.is_empty(), "recall should find matching entries");
@@ -328,10 +294,7 @@ async fn sqlite_memory_concurrent_stores_no_data_loss() {
     }
 
     let count = mem.count().await.unwrap();
-    assert_eq!(
-        count, 5,
-        "all concurrent stores should succeed, got {count}"
-    );
+    assert_eq!(count, 5, "all concurrent stores should succeed, got {count}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -349,14 +312,9 @@ async fn sqlite_memory_list_by_category() {
     mem.store("daily_note", "daily note", MemoryCategory::Daily, None)
         .await
         .unwrap();
-    mem.store(
-        "conv_msg",
-        "conversation msg",
-        MemoryCategory::Conversation,
-        None,
-    )
-    .await
-    .unwrap();
+    mem.store("conv_msg", "conversation msg", MemoryCategory::Conversation, None)
+        .await
+        .unwrap();
 
     let core_entries = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
     assert_eq!(core_entries.len(), 1, "should have 1 Core entry");

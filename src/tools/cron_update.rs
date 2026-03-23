@@ -21,9 +21,7 @@ impl CronUpdateTool {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
+                error: Some(format!("Security policy: read-only mode, cannot perform '{action}'")),
             });
         }
 
@@ -163,17 +161,12 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         new_shared(config)
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ))
+        Arc::new(SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir))
     }
 
     #[tokio::test]
@@ -205,9 +198,7 @@ mod tests {
             ..Config::default()
         };
         config.autonomy.allowed_commands = vec!["echo".into()];
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         let cfg_snap = Arc::new(config.clone());
         let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo ok").unwrap();
         let cfg = new_shared(config);
@@ -274,12 +265,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(
-            denied
-                .error
-                .unwrap_or_default()
-                .contains("explicit approval")
-        );
+        assert!(denied.error.unwrap_or_default().contains("explicit approval"));
 
         let approved = tool
             .execute(json!({

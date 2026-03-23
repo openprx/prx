@@ -257,21 +257,16 @@ impl IrcChannel {
         if self.allowed_users.iter().any(|u| u == "*") {
             return true;
         }
-        self.allowed_users
-            .iter()
-            .any(|u| u.eq_ignore_ascii_case(nick))
+        self.allowed_users.iter().any(|u| u.eq_ignore_ascii_case(nick))
     }
 
     /// Create a TLS connection to the IRC server.
-    async fn connect(
-        &self,
-    ) -> anyhow::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    async fn connect(&self) -> anyhow::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
         let addr = format!("{}:{}", self.server, self.port);
         let tcp = tokio::net::TcpStream::connect(&addr).await?;
 
         let tls_config = if self.verify_tls {
-            let root_store: rustls::RootCertStore =
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+            let root_store: rustls::RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
             rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
@@ -348,9 +343,7 @@ impl Channel for IrcChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut guard = self.writer.lock().await;
-        let writer = guard
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("IRC not connected"))?;
+        let writer = guard.as_mut().ok_or_else(|| anyhow::anyhow!("IRC not connected"))?;
 
         // Calculate safe payload size:
         // 512 - sender prefix (~64 bytes for :nick!user@host) - "PRIVMSG " - target - " :" - "\r\n"
@@ -406,9 +399,7 @@ impl Channel for IrcChannel {
             line.clear();
             let n = tokio::time::timeout(READ_TIMEOUT, buf_reader.read_line(&mut line))
                 .await
-                .map_err(|_| {
-                    anyhow::anyhow!("IRC read timed out (no data for {READ_TIMEOUT:?})")
-                })??;
+                .map_err(|_| anyhow::anyhow!("IRC read timed out (no data for {READ_TIMEOUT:?})"))??;
             if n == 0 {
                 anyhow::bail!("IRC connection closed by server");
             }
@@ -437,9 +428,7 @@ impl Channel for IrcChannel {
                             }
                         } else if msg.params.iter().any(|p| p.contains("NAK")) {
                             // CAP * NAK :sasl — server rejected SASL, proceed without it
-                            tracing::warn!(
-                                "IRC server does not support SASL, continuing without it"
-                            );
+                            tracing::warn!("IRC server does not support SASL, continuing without it");
                             sasl_pending = false;
                             let mut guard = self.writer.lock().await;
                             if let Some(ref mut w) = *guard {
@@ -501,8 +490,7 @@ impl Channel for IrcChannel {
                     if let Some(ref pass) = self.nickserv_password {
                         let mut guard = self.writer.lock().await;
                         if let Some(ref mut w) = *guard {
-                            Self::send_raw(w, &format!("PRIVMSG NickServ :IDENTIFY {pass}"))
-                                .await?;
+                            Self::send_raw(w, &format!("PRIVMSG NickServ :IDENTIFY {pass}")).await?;
                         }
                     }
 
@@ -536,9 +524,7 @@ impl Channel for IrcChannel {
                     let sender_nick = msg.nick().unwrap_or("unknown");
 
                     // Skip messages from NickServ/ChanServ
-                    if sender_nick.eq_ignore_ascii_case("NickServ")
-                        || sender_nick.eq_ignore_ascii_case("ChanServ")
-                    {
+                    if sender_nick.eq_ignore_ascii_case("NickServ") || sender_nick.eq_ignore_ascii_case("ChanServ") {
                         continue;
                     }
 

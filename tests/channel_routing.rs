@@ -72,10 +72,7 @@ fn channel_message_fields_not_swapped() {
         mentioned_uuids: vec![],
     };
 
-    assert_eq!(
-        msg.sender, "sender_value",
-        "sender field should not be swapped"
-    );
+    assert_eq!(msg.sender, "sender_value", "sender field should not be swapped");
     assert_eq!(
         msg.reply_target, "target_value",
         "reply_target field should not be swapped"
@@ -254,10 +251,7 @@ async fn channel_send_reply_uses_sender_from_listen() {
 #[tokio::test]
 async fn channel_health_check_default_returns_true() {
     let channel = CapturingChannel::new();
-    assert!(
-        channel.health_check().await,
-        "default health_check should return true"
-    );
+    assert!(channel.health_check().await, "default health_check should return true");
 }
 
 #[tokio::test]
@@ -272,27 +266,11 @@ async fn channel_draft_defaults() {
     let channel = CapturingChannel::new();
     assert!(!channel.supports_draft_updates());
 
-    let draft_result = channel
-        .send_draft(&SendMessage::new("draft", "target"))
-        .await
-        .unwrap();
-    assert!(
-        draft_result.is_none(),
-        "default send_draft should return None"
-    );
+    let draft_result = channel.send_draft(&SendMessage::new("draft", "target")).await.unwrap();
+    assert!(draft_result.is_none(), "default send_draft should return None");
 
-    assert!(
-        channel
-            .update_draft("target", "msg_1", "updated")
-            .await
-            .is_ok()
-    );
-    assert!(
-        channel
-            .finalize_draft("target", "msg_1", "final")
-            .await
-            .is_ok()
-    );
+    assert!(channel.update_draft("target", "msg_1", "updated").await.is_ok());
+    assert!(channel.finalize_draft("target", "msg_1", "final").await.is_ok());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,18 +281,9 @@ async fn channel_draft_defaults() {
 async fn channel_multiple_sends_preserve_order_and_recipients() {
     let channel = CapturingChannel::new();
 
-    channel
-        .send(&SendMessage::new("msg 1", "target_a"))
-        .await
-        .unwrap();
-    channel
-        .send(&SendMessage::new("msg 2", "target_b"))
-        .await
-        .unwrap();
-    channel
-        .send(&SendMessage::new("msg 3", "target_a"))
-        .await
-        .unwrap();
+    channel.send(&SendMessage::new("msg 1", "target_a")).await.unwrap();
+    channel.send(&SendMessage::new("msg 2", "target_b")).await.unwrap();
+    channel.send(&SendMessage::new("msg 3", "target_a")).await.unwrap();
 
     let sent = channel.sent_messages();
     assert_eq!(sent.len(), 3);

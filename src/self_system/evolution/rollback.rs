@@ -31,10 +31,8 @@ impl RollbackManager {
         versions_dir: impl AsRef<Path>,
         max_versions: usize,
     ) -> Result<Self> {
-        let target_path =
-            normalize_path_in_workspace(workspace_root.as_ref(), target_path.as_ref())?;
-        let versions_dir =
-            normalize_path_in_workspace(workspace_root.as_ref(), versions_dir.as_ref())?;
+        let target_path = normalize_path_in_workspace(workspace_root.as_ref(), target_path.as_ref())?;
+        let versions_dir = normalize_path_in_workspace(workspace_root.as_ref(), versions_dir.as_ref())?;
         Ok(Self {
             target_path,
             versions_dir,
@@ -76,13 +74,9 @@ impl RollbackManager {
             }
         }
         let workspace_root = self.target_path.parent().unwrap_or_else(|| Path::new("."));
-        atomic_write(
-            workspace_root,
-            &self.target_path,
-            snapshot.content.as_bytes(),
-        )
-        .await
-        .context("failed writing rollback target")?;
+        atomic_write(workspace_root, &self.target_path, snapshot.content.as_bytes())
+            .await
+            .context("failed writing rollback target")?;
         Ok(())
     }
 

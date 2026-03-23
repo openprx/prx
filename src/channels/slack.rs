@@ -46,9 +46,7 @@ impl SlackChannel {
             .await
             .ok()?;
 
-        resp.get("user_id")
-            .and_then(|u| u.as_str())
-            .map(String::from)
+        resp.get("user_id").and_then(|u| u.as_str()).map(String::from)
     }
 
     /// Resolve the thread identifier for inbound Slack messages.
@@ -98,10 +96,7 @@ impl Channel for SlackChannel {
         // Slack returns 200 for most app-level errors; check JSON "ok" field
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
         if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            let err = parsed
-                .get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("unknown");
+            let err = parsed.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
             anyhow::bail!("Slack chat.postMessage failed: {err}");
         }
 
@@ -154,10 +149,7 @@ impl Channel for SlackChannel {
                 // Messages come newest-first, reverse to process oldest first
                 for msg in messages.iter().rev() {
                     let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-                    let user = msg
-                        .get("user")
-                        .and_then(|u| u.as_str())
-                        .unwrap_or("unknown");
+                    let user = msg.get("user").and_then(|u| u.as_str()).unwrap_or("unknown");
                     let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
 
                     // Skip bot's own messages

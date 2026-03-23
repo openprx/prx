@@ -23,10 +23,7 @@ fn shared_config_swap_visible_to_readers() {
     };
     let shared = new_shared(config);
 
-    assert_eq!(
-        shared.load_full().default_provider.as_deref(),
-        Some("anthropic")
-    );
+    assert_eq!(shared.load_full().default_provider.as_deref(), Some("anthropic"));
 
     // Simulate hot-reload: swap in new config
     let new_config = Config {
@@ -35,10 +32,7 @@ fn shared_config_swap_visible_to_readers() {
     };
     shared.store(std::sync::Arc::new(new_config));
 
-    assert_eq!(
-        shared.load_full().default_provider.as_deref(),
-        Some("openai")
-    );
+    assert_eq!(shared.load_full().default_provider.as_deref(), Some("openai"));
 }
 
 #[test]
@@ -90,10 +84,7 @@ async fn concurrent_readers_during_swap() {
         h.await.unwrap();
     }
 
-    assert_eq!(
-        shared.load_full().default_provider.as_deref(),
-        Some("provider-4")
-    );
+    assert_eq!(shared.load_full().default_provider.as_deref(), Some("provider-4"));
 }
 
 #[test]
@@ -107,14 +98,8 @@ fn shared_config_clone_shares_same_cell() {
     };
     clone.store(std::sync::Arc::new(cfg));
 
-    assert_eq!(
-        shared.load_full().default_provider.as_deref(),
-        Some("from-clone")
-    );
-    assert_eq!(
-        clone.load_full().default_provider.as_deref(),
-        Some("from-clone")
-    );
+    assert_eq!(shared.load_full().default_provider.as_deref(), Some("from-clone"));
+    assert_eq!(clone.load_full().default_provider.as_deref(), Some("from-clone"));
 }
 
 #[test]

@@ -2,17 +2,14 @@ use crate::config::schema::{
     DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
-    AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig, HeartbeatConfig,
+    IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig,
+    SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
 };
-use crate::memory::{
-    default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
-};
+use crate::memory::{default_memory_backend_key, memory_backend_profile, selectable_memory_backends};
 use crate::providers::{
-    canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
-    is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
-    is_zai_cn_alias,
+    canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias, is_moonshot_alias,
+    is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{Context, Result, bail};
 use console::style;
@@ -142,11 +139,7 @@ pub async fn run_wizard() -> Result<Config> {
     let config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
-        api_key: if api_key.is_empty() {
-            None
-        } else {
-            Some(api_key)
-        },
+        api_key: if api_key.is_empty() { None } else { Some(api_key) },
         api_url: provider_api_url,
         default_provider: Some(provider),
         default_model: Some(model),
@@ -326,11 +319,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         vector_weight: 0.7,
         keyword_weight: 0.3,
         min_relevance_score: 0.4,
-        embedding_cache_size: if profile.uses_sqlite_hygiene {
-            10000
-        } else {
-            0
-        },
+        embedding_cache_size: if profile.uses_sqlite_hygiene { 10000 } else { 0 },
         snapshot_enabled: false,
         snapshot_on_hygiene: false,
         auto_hydrate: true,
@@ -349,14 +338,7 @@ pub async fn run_quick_setup(
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
 
-    run_quick_setup_with_home(
-        credential_override,
-        provider,
-        model_override,
-        memory_backend,
-        &home,
-    )
-    .await
+    run_quick_setup_with_home(credential_override, provider, model_override, memory_backend, &home).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -386,9 +368,7 @@ async fn run_quick_setup_with_home(
     let model = model_override
         .map(str::to_string)
         .unwrap_or_else(|| default_model_for_provider(&provider_name));
-    let memory_backend_name = memory_backend
-        .unwrap_or(default_memory_backend_key())
-        .to_string();
+    let memory_backend_name = memory_backend.unwrap_or(default_memory_backend_key()).to_string();
 
     // Create memory config based on backend choice
     let memory_config = memory_config_defaults_for_backend(&memory_backend_name);
@@ -457,8 +437,7 @@ async fn run_quick_setup_with_home(
         timezone: "UTC".into(),
         agent_name: "OpenPRX".into(),
         communication_style:
-            "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
-                .into(),
+            "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing.".into(),
     };
     scaffold_workspace(&workspace_dir, &default_ctx)?;
 
@@ -472,11 +451,7 @@ async fn run_quick_setup_with_home(
         style("✓").green().bold(),
         style(&provider_name).green()
     );
-    println!(
-        "  {} Model:      {}",
-        style("✓").green().bold(),
-        style(&model).green()
-    );
+    println!("  {} Model:      {}", style("✓").green().bold(), style(&model).green());
     println!(
         "  {} API Key:    {}",
         style("✓").green().bold(),
@@ -495,11 +470,7 @@ async fn run_quick_setup_with_home(
         "  {} Memory:     {} (auto-save: {})",
         style("✓").green().bold(),
         style(&memory_backend_name).green(),
-        if memory_backend_name == "none" {
-            "off"
-        } else {
-            "on"
-        }
+        if memory_backend_name == "none" { "off" } else { "on" }
     );
     println!(
         "  {} Secrets:    {}",
@@ -611,10 +582,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "anthropic/claude-sonnet-4.6".to_string(),
                 "Claude Sonnet 4.6 (balanced, recommended)".to_string(),
             ),
-            (
-                "openai/gpt-5.2".to_string(),
-                "GPT-5.2 (latest flagship)".to_string(),
-            ),
+            ("openai/gpt-5.2".to_string(), "GPT-5.2 (latest flagship)".to_string()),
             (
                 "openai/gpt-5-mini".to_string(),
                 "GPT-5 mini (fast, cost-efficient)".to_string(),
@@ -655,24 +623,15 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "gpt-5.2".to_string(),
                 "GPT-5.2 (latest coding/agentic flagship)".to_string(),
             ),
-            (
-                "gpt-5-mini".to_string(),
-                "GPT-5 mini (faster, cheaper)".to_string(),
-            ),
-            (
-                "gpt-5-nano".to_string(),
-                "GPT-5 nano (lowest latency/cost)".to_string(),
-            ),
+            ("gpt-5-mini".to_string(), "GPT-5 mini (faster, cheaper)".to_string()),
+            ("gpt-5-nano".to_string(), "GPT-5 nano (lowest latency/cost)".to_string()),
             (
                 "gpt-5.2-codex".to_string(),
                 "GPT-5.2 Codex (agentic coding)".to_string(),
             ),
         ],
         "openai-codex" => vec![
-            (
-                "gpt-5-codex".to_string(),
-                "GPT-5 Codex (recommended)".to_string(),
-            ),
+            ("gpt-5-codex".to_string(), "GPT-5 Codex (recommended)".to_string()),
             (
                 "gpt-5.2-codex".to_string(),
                 "GPT-5.2 Codex (agentic coding)".to_string(),
@@ -720,10 +679,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "mistral-medium-latest".to_string(),
                 "Mistral Medium (balanced)".to_string(),
             ),
-            (
-                "codestral-latest".to_string(),
-                "Codestral (code-focused)".to_string(),
-            ),
+            ("codestral-latest".to_string(), "Codestral (code-focused)".to_string()),
             (
                 "devstral-latest".to_string(),
                 "Devstral (software engineering specialist)".to_string(),
@@ -837,16 +793,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "glm-4.7".to_string(),
                 "GLM-4.7 (strong general-purpose quality)".to_string(),
             ),
-            (
-                "glm-4.5-air".to_string(),
-                "GLM-4.5 Air (lower latency)".to_string(),
-            ),
+            ("glm-4.5-air".to_string(), "GLM-4.5 Air (lower latency)".to_string()),
         ],
         "minimax" => vec![
-            (
-                "MiniMax-M2.5".to_string(),
-                "MiniMax M2.5 (latest flagship)".to_string(),
-            ),
+            ("MiniMax-M2.5".to_string(), "MiniMax M2.5 (latest flagship)".to_string()),
             (
                 "MiniMax-M2.5-highspeed".to_string(),
                 "MiniMax M2.5 High-Speed (fast)".to_string(),
@@ -857,14 +807,8 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
         ],
         "qwen" => vec![
-            (
-                "qwen-max".to_string(),
-                "Qwen Max (highest quality)".to_string(),
-            ),
-            (
-                "qwen-plus".to_string(),
-                "Qwen Plus (balanced default)".to_string(),
-            ),
+            ("qwen-max".to_string(), "Qwen Max (highest quality)".to_string()),
+            ("qwen-plus".to_string(), "Qwen Plus (balanced default)".to_string()),
             (
                 "qwen-turbo".to_string(),
                 "Qwen Turbo (fast and cost-efficient)".to_string(),
@@ -907,24 +851,15 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "anthropic/claude-sonnet-4.6".to_string(),
                 "Claude Sonnet 4.6 (balanced default)".to_string(),
             ),
-            (
-                "openai/gpt-5.2".to_string(),
-                "GPT-5.2 (latest flagship)".to_string(),
-            ),
+            ("openai/gpt-5.2".to_string(), "GPT-5.2 (latest flagship)".to_string()),
             (
                 "deepseek/deepseek-v3.2".to_string(),
                 "DeepSeek V3.2 (agentic + affordable)".to_string(),
             ),
-            (
-                "z-ai/glm-5".to_string(),
-                "GLM-5 (high reasoning)".to_string(),
-            ),
+            ("z-ai/glm-5".to_string(), "GLM-5 (high reasoning)".to_string()),
         ],
         "ollama" => vec![
-            (
-                "llama3.2".to_string(),
-                "Llama 3.2 (recommended local)".to_string(),
-            ),
+            ("llama3.2".to_string(), "Llama 3.2 (recommended local)".to_string()),
             ("mistral".to_string(), "Mistral 7B".to_string()),
             ("codellama".to_string(), "Code Llama".to_string()),
             ("phi3".to_string(), "Phi-3 (small, fast)".to_string()),
@@ -1087,11 +1022,7 @@ fn parse_gemini_model_ids(payload: &Value) -> Vec<String> {
         let supports_generate_content = model
             .get("supportedGenerationMethods")
             .and_then(Value::as_array)
-            .is_none_or(|methods| {
-                methods
-                    .iter()
-                    .any(|method| method.as_str() == Some("generateContent"))
-            });
+            .is_none_or(|methods| methods.iter().any(|method| method.as_str() == Some("generateContent")));
 
         if !supports_generate_content {
             continue;
@@ -1227,15 +1158,9 @@ fn fetch_ollama_models() -> Result<Vec<String>> {
     Ok(parse_ollama_model_ids(&payload))
 }
 
-fn resolve_live_models_endpoint(
-    provider_name: &str,
-    provider_api_url: Option<&str>,
-) -> Option<String> {
+fn resolve_live_models_endpoint(provider_name: &str, provider_api_url: Option<&str>) -> Option<String> {
     if canonical_provider_name(provider_name) == "llamacpp" {
-        if let Some(url) = provider_api_url
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-        {
+        if let Some(url) = provider_api_url.map(str::trim).filter(|url| !url.is_empty()) {
             let normalized = url.trim_end_matches('/');
             if normalized.ends_with("/models") {
                 return Some(normalized.to_string());
@@ -1297,16 +1222,9 @@ fn fetch_live_models_for_provider(
             }
         }
         _ => {
-            if let Some(endpoint) =
-                resolve_live_models_endpoint(requested_provider_name, provider_api_url)
-            {
-                let allow_unauthenticated =
-                    allows_unauthenticated_model_fetch(requested_provider_name);
-                fetch_openai_compatible_models(
-                    &endpoint,
-                    api_key.as_deref(),
-                    allow_unauthenticated,
-                )?
+            if let Some(endpoint) = resolve_live_models_endpoint(requested_provider_name, provider_api_url) {
+                let allow_unauthenticated = allows_unauthenticated_model_fetch(requested_provider_name);
+                fetch_openai_compatible_models(&endpoint, api_key.as_deref(), allow_unauthenticated)?
             } else {
                 Vec::new()
             }
@@ -1350,8 +1268,7 @@ fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
         return Ok(ModelCacheState::default());
     }
 
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read model cache at {}", path.display()))?;
+    let raw = fs::read_to_string(&path).with_context(|| format!("failed to read model cache at {}", path.display()))?;
 
     match serde_json::from_str::<ModelCacheState>(&raw) {
         Ok(state) => Ok(state),
@@ -1362,26 +1279,17 @@ fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
 fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Result<()> {
     let path = model_cache_path(workspace_dir);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create model cache directory {}",
-                parent.display()
-            )
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create model cache directory {}", parent.display()))?;
     }
 
     let json = serde_json::to_vec_pretty(state).context("failed to serialize model cache")?;
-    fs::write(&path, json)
-        .with_context(|| format!("failed to write model cache at {}", path.display()))?;
+    fs::write(&path, json).with_context(|| format!("failed to write model cache at {}", path.display()))?;
 
     Ok(())
 }
 
-fn cache_live_models_for_provider(
-    workspace_dir: &Path,
-    provider_name: &str,
-    models: &[String],
-) -> Result<()> {
+fn cache_live_models_for_provider(workspace_dir: &Path, provider_name: &str, models: &[String]) -> Result<()> {
     let normalized_models = normalize_model_ids(models.to_vec());
     if normalized_models.is_empty() {
         return Ok(());
@@ -1390,11 +1298,7 @@ fn cache_live_models_for_provider(
     let mut state = load_model_cache_state(workspace_dir)?;
     let now = now_unix_secs();
 
-    if let Some(entry) = state
-        .entries
-        .iter_mut()
-        .find(|entry| entry.provider == provider_name)
-    {
+    if let Some(entry) = state.entries.iter_mut().find(|entry| entry.provider == provider_name) {
         entry.fetched_at_unix = now;
         entry.models = normalized_models;
     } else {
@@ -1416,11 +1320,7 @@ fn load_cached_models_for_provider_internal(
     let state = load_model_cache_state(workspace_dir)?;
     let now = now_unix_secs();
 
-    let Some(entry) = state
-        .entries
-        .into_iter()
-        .find(|entry| entry.provider == provider_name)
-    else {
+    let Some(entry) = state.entries.into_iter().find(|entry| entry.provider == provider_name) else {
         return Ok(None);
     };
 
@@ -1447,10 +1347,7 @@ fn load_cached_models_for_provider(
     load_cached_models_for_provider_internal(workspace_dir, provider_name, Some(ttl_secs))
 }
 
-fn load_any_cached_models_for_provider(
-    workspace_dir: &Path,
-    provider_name: &str,
-) -> Result<Option<CachedModels>> {
+fn load_any_cached_models_for_provider(workspace_dir: &Path, provider_name: &str) -> Result<Option<CachedModels>> {
     load_cached_models_for_provider_internal(workspace_dir, provider_name, None)
 }
 
@@ -1480,19 +1377,11 @@ fn print_model_preview(models: &[String]) {
     }
 
     if models.len() > MODEL_PREVIEW_LIMIT {
-        println!(
-            "  {} ... and {} more",
-            style("-"),
-            models.len() - MODEL_PREVIEW_LIMIT
-        );
+        println!("  {} ... and {} more", style("-"), models.len() - MODEL_PREVIEW_LIMIT);
     }
 }
 
-pub fn run_models_refresh(
-    config: &Config,
-    provider_override: Option<&str>,
-    force: bool,
-) -> Result<()> {
+pub fn run_models_refresh(config: &Config, provider_override: Option<&str>, force: bool) -> Result<()> {
     let provider_name = provider_override
         .or(config.default_provider.as_deref())
         .unwrap_or("openrouter")
@@ -1508,11 +1397,9 @@ pub fn run_models_refresh(
     }
 
     if !force {
-        if let Some(cached) = load_cached_models_for_provider(
-            &config.workspace_dir,
-            &provider_name,
-            MODEL_CACHE_TTL_SECS,
-        )? {
+        if let Some(cached) =
+            load_cached_models_for_provider(&config.workspace_dir, &provider_name, MODEL_CACHE_TTL_SECS)?
+        {
             println!(
                 "Using cached model list for '{}' (updated {} ago):",
                 provider_name,
@@ -1542,9 +1429,7 @@ pub fn run_models_refresh(
             Ok(())
         }
         Ok(_) => {
-            if let Some(stale_cache) =
-                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)?
-            {
+            if let Some(stale_cache) = load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)? {
                 println!(
                     "Provider returned no models; using stale cache (updated {} ago):",
                     humanize_age(stale_cache.age_secs)
@@ -1556,9 +1441,7 @@ pub fn run_models_refresh(
             anyhow::bail!("Provider '{}' returned an empty model list", provider_name)
         }
         Err(error) => {
-            if let Some(stale_cache) =
-                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)?
-            {
+            if let Some(stale_cache) = load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)? {
                 println!(
                     "Live refresh failed ({}). Falling back to stale cache (updated {} ago):",
                     error,
@@ -1568,8 +1451,7 @@ pub fn run_models_refresh(
                 return Ok(());
             }
 
-            Err(error)
-                .with_context(|| format!("failed to refresh models for provider '{provider_name}'"))
+            Err(error).with_context(|| format!("failed to refresh models for provider '{provider_name}'"))
         }
     }
 }
@@ -1612,10 +1494,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
         .context("Could not find home directory")?;
     let default_dir = default_user_config_dir(&home);
 
-    print_bullet(&format!(
-        "Default location: {}",
-        style(default_dir.display()).green()
-    ));
+    print_bullet(&format!("Default location: {}", style(default_dir.display()).green()));
 
     let use_default = Confirm::new()
         .with_prompt("  Use default workspace location?")
@@ -1625,9 +1504,7 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
     let openprx_dir = if use_default {
         default_dir
     } else {
-        let custom: String = Input::new()
-            .with_prompt("  Enter workspace path")
-            .interact_text()?;
+        let custom: String = Input::new().with_prompt("  Enter workspace path").interact_text()?;
         let expanded = shellexpand::tilde(&custom).to_string();
         PathBuf::from(expanded)
     };
@@ -1680,25 +1557,16 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
 
     let providers: Vec<(&str, &str)> = match tier_idx {
         0 => vec![
-            (
-                "openrouter",
-                "OpenRouter — 200+ models, 1 API key (recommended)",
-            ),
+            ("openrouter", "OpenRouter — 200+ models, 1 API key (recommended)"),
             ("venice", "Venice AI — privacy-first (Llama, Opus)"),
             ("anthropic", "Anthropic — Claude Sonnet & Opus (direct)"),
             ("openai", "OpenAI — GPT-4o, o1, GPT-5 (direct)"),
-            (
-                "openai-codex",
-                "OpenAI Codex (ChatGPT subscription OAuth, no API key)",
-            ),
+            ("openai-codex", "OpenAI Codex (ChatGPT subscription OAuth, no API key)"),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
             ("mistral", "Mistral — Large & Codestral"),
             ("xai", "xAI — Grok 3 & 4"),
             ("perplexity", "Perplexity — search-augmented AI"),
-            (
-                "gemini",
-                "Google Gemini — Gemini 2.0 Flash & Pro (supports CLI auth)",
-            ),
+            ("gemini", "Google Gemini — Gemini 2.0 Flash & Pro (supports CLI auth)"),
         ],
         1 => vec![
             ("groq", "Groq — ultra-fast LPU inference"),
@@ -1716,25 +1584,16 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("bedrock", "Amazon Bedrock — AWS managed models"),
         ],
         3 => vec![
-            (
-                "kimi-code",
-                "Kimi Code — coding-optimized Kimi API (KimiCLI)",
-            ),
+            ("kimi-code", "Kimi Code — coding-optimized Kimi API (KimiCLI)"),
             (
                 "qwen-code",
                 "Qwen Code — OAuth tokens reused from ~/.qwen/oauth_creds.json",
             ),
             ("moonshot", "Moonshot — Kimi API (China endpoint)"),
-            (
-                "moonshot-intl",
-                "Moonshot — Kimi API (international endpoint)",
-            ),
+            ("moonshot-intl", "Moonshot — Kimi API (international endpoint)"),
             ("glm", "GLM — ChatGLM / Zhipu (international endpoint)"),
             ("glm-cn", "GLM — ChatGLM / Zhipu (China endpoint)"),
-            (
-                "minimax",
-                "MiniMax — international endpoint (api.minimax.io)",
-            ),
+            ("minimax", "MiniMax — international endpoint (api.minimax.io)"),
             ("minimax-cn", "MiniMax — China endpoint (api.minimaxi.com)"),
             ("qwen", "Qwen — DashScope China endpoint"),
             ("qwen-intl", "Qwen — DashScope international endpoint"),
@@ -1748,10 +1607,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         ],
         4 => vec![
             ("ollama", "Ollama — local models (Llama, Mistral, Phi)"),
-            (
-                "llamacpp",
-                "llama.cpp server — local OpenAI-compatible endpoint",
-            ),
+            ("llamacpp", "llama.cpp server — local OpenAI-compatible endpoint"),
         ],
         _ => vec![], // Custom — handled below
     };
@@ -1903,10 +1759,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 .interact()?;
 
             if use_cli {
-                println!(
-                    "  {} Using Gemini CLI OAuth tokens",
-                    style("✓").green().bold()
-                );
+                println!("  {} Using Gemini CLI OAuth tokens", style("✓").green().bold());
                 String::new() // Empty key = will use CLI tokens
             } else {
                 print_bullet("Get your API key at: https://aistudio.google.com/app/apikey");
@@ -1947,9 +1800,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         } else {
             print_bullet(&format!(
                 "Get your API key at: {}",
-                style("https://console.anthropic.com/settings/keys")
-                    .cyan()
-                    .underlined()
+                style("https://console.anthropic.com/settings/keys").cyan().underlined()
             ));
             print_bullet("Or run `claude setup-token` to get an OAuth setup-token.");
             println!();
@@ -1977,19 +1828,13 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ));
             "qwen-oauth".to_string()
         } else {
-            print_bullet(
-                "Qwen Code OAuth credentials are usually stored in ~/.qwen/oauth_creds.json.",
-            );
-            print_bullet(
-                "Run `qwen` once and complete OAuth login to populate cached credentials.",
-            );
+            print_bullet("Qwen Code OAuth credentials are usually stored in ~/.qwen/oauth_creds.json.");
+            print_bullet("Run `qwen` once and complete OAuth login to populate cached credentials.");
             print_bullet("You can also set QWEN_OAUTH_TOKEN directly.");
             println!();
 
             let key: String = Input::new()
-                .with_prompt(
-                    "  Paste your Qwen OAuth token (or press Enter to auto-detect cached OAuth)",
-                )
+                .with_prompt("  Paste your Qwen OAuth token (or press Enter to auto-detect cached OAuth)")
                 .allow_empty(true)
                 .interact_text()?;
 
@@ -2005,9 +1850,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             }
         }
     } else {
-        let key_url = if is_moonshot_alias(provider_name)
-            || canonical_provider_name(provider_name) == "kimi-code"
-        {
+        let key_url = if is_moonshot_alias(provider_name) || canonical_provider_name(provider_name) == "kimi-code" {
             "https://platform.moonshot.cn/console/api-keys"
         } else if canonical_provider_name(provider_name) == "qwen-code" {
             "https://qwen.readthedocs.io/en/latest/getting_started/installation.html"
@@ -2067,10 +1910,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             String::new()
         } else {
             if !key_url.is_empty() {
-                print_bullet(&format!(
-                    "Get your API key at: {}",
-                    style(key_url).cyan().underlined()
-                ));
+                print_bullet(&format!("Get your API key at: {}", style(key_url).cyan().underlined()));
             }
             print_bullet("You can also set it later via env var or config file.");
             println!();
@@ -2110,9 +1950,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                     .is_some_and(|value| !value.trim().is_empty()));
 
         if can_fetch_without_key || has_api_key {
-            if let Some(cached) =
-                load_cached_models_for_provider(workspace_dir, provider_name, MODEL_CACHE_TTL_SECS)?
-            {
+            if let Some(cached) = load_cached_models_for_provider(workspace_dir, provider_name, MODEL_CACHE_TTL_SECS)? {
                 let shown_count = cached.models.len().min(LIVE_MODEL_MAX_OPTIONS);
                 print_bullet(&format!(
                     "Found cached models ({shown_count}) updated {} ago.",
@@ -2120,11 +1958,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 ));
 
                 live_options = Some(build_model_options(
-                    cached
-                        .models
-                        .into_iter()
-                        .take(LIVE_MODEL_MAX_OPTIONS)
-                        .collect(),
+                    cached.models.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
                     "cached",
                 ));
             }
@@ -2139,29 +1973,17 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                 .interact()?;
 
             if should_fetch_now {
-                match fetch_live_models_for_provider(
-                    provider_name,
-                    &api_key,
-                    provider_api_url.as_deref(),
-                ) {
+                match fetch_live_models_for_provider(provider_name, &api_key, provider_api_url.as_deref()) {
                     Ok(live_model_ids) if !live_model_ids.is_empty() => {
-                        cache_live_models_for_provider(
-                            workspace_dir,
-                            provider_name,
-                            &live_model_ids,
-                        )?;
+                        cache_live_models_for_provider(workspace_dir, provider_name, &live_model_ids)?;
 
                         let fetched_count = live_model_ids.len();
                         let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
-                        let shown_models: Vec<String> = live_model_ids
-                            .into_iter()
-                            .take(LIVE_MODEL_MAX_OPTIONS)
-                            .collect();
+                        let shown_models: Vec<String> =
+                            live_model_ids.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect();
 
                         if shown_count < fetched_count {
-                            print_bullet(&format!(
-                                "Fetched {fetched_count} models. Showing first {shown_count}."
-                            ));
+                            print_bullet(&format!("Fetched {fetched_count} models. Showing first {shown_count}."));
                         } else {
                             print_bullet(&format!("Fetched {shown_count} live models."));
                         }
@@ -2178,20 +2000,14 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                         ));
 
                         if live_options.is_none() {
-                            if let Some(stale) =
-                                load_any_cached_models_for_provider(workspace_dir, provider_name)?
-                            {
+                            if let Some(stale) = load_any_cached_models_for_provider(workspace_dir, provider_name)? {
                                 print_bullet(&format!(
                                     "Loaded stale cache from {} ago.",
                                     humanize_age(stale.age_secs)
                                 ));
 
                                 live_options = Some(build_model_options(
-                                    stale
-                                        .models
-                                        .into_iter()
-                                        .take(LIVE_MODEL_MAX_OPTIONS)
-                                        .collect(),
+                                    stale.models.into_iter().take(LIVE_MODEL_MAX_OPTIONS).collect(),
                                     "stale-cache",
                                 ));
                             }
@@ -2306,10 +2122,7 @@ fn provider_env_var(name: &str) -> &'static str {
 }
 
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
-    matches!(
-        canonical_provider_name(provider_name),
-        "ollama" | "llamacpp"
-    )
+    matches!(canonical_provider_name(provider_name), "ollama" | "llamacpp")
 }
 
 // ── Step 5: Tool Mode & Security ────────────────────────────────
@@ -2439,12 +2252,7 @@ fn setup_project_context() -> Result<ProjectContext> {
             .interact_text()?
     } else {
         // Extract the short label before the parenthetical
-        tz_options[tz_idx]
-            .split('(')
-            .next()
-            .unwrap_or("UTC")
-            .trim()
-            .to_string()
+        tz_options[tz_idx].split('(').next().unwrap_or("UTC").trim().to_string()
     };
 
     let agent_name: String = Input::new()
@@ -2690,10 +2498,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
             .default(options.len() - 1)
             .interact()?;
 
-        let choice = menu_choices
-            .get(selection)
-            .copied()
-            .unwrap_or(ChannelMenuChoice::Done);
+        let choice = menu_choices.get(selection).copied().unwrap_or(ChannelMenuChoice::Done);
 
         match choice {
             ChannelMenuChoice::Telegram => {
@@ -2739,10 +2544,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 .join();
                 match thread_result {
                     Ok(Ok((true, bot_name))) => {
-                        println!(
-                            "\r  {} Connected as @{bot_name}        ",
-                            style("✅").green().bold()
-                        );
+                        println!("\r  {} Connected as @{bot_name}        ", style("✅").green().bold());
                     }
                     _ => {
                         println!(
@@ -2753,12 +2555,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                print_bullet(
-                    "Allowlist your own Telegram identity first (recommended for secure + fast setup).",
-                );
-                print_bullet(
-                    "Use your @username without '@' (example: argenis), or your numeric Telegram user ID.",
-                );
+                print_bullet("Allowlist your own Telegram identity first (recommended for secure + fast setup).");
+                print_bullet("Use your @username without '@' (example: argenis), or your numeric Telegram user ID.");
                 print_bullet("Use '*' only for temporary open testing.");
 
                 let users_str: String = Input::new()
@@ -2836,10 +2634,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 .join();
                 match thread_result {
                     Ok(Ok((true, bot_name))) => {
-                        println!(
-                            "\r  {} Connected as {bot_name}        ",
-                            style("✅").green().bold()
-                        );
+                        println!("\r  {} Connected as {bot_name}        ", style("✅").green().bold());
                     }
                     _ => {
                         println!(
@@ -2862,9 +2657,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("Use '*' only for temporary open testing.");
 
                 let allowed_users_str: String = Input::new()
-                    .with_prompt(
-                        "  Allowed Discord user IDs (comma-separated, recommended: your own ID, '*' for all)",
-                    )
+                    .with_prompt("  Allowed Discord user IDs (comma-separated, recommended: your own ID, '*' for all)")
                     .allow_empty(true)
                     .interact_text()?;
 
@@ -2906,9 +2699,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Install to workspace and copy the Bot Token");
                 println!();
 
-                let token: String = Input::new()
-                    .with_prompt("  Bot token (xoxb-...)")
-                    .interact_text()?;
+                let token: String = Input::new().with_prompt("  Bot token (xoxb-...)").interact_text()?;
 
                 if token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
@@ -2926,10 +2717,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .send()?;
                     let ok = resp.status().is_success();
                     let data: serde_json::Value = resp.json().unwrap_or_default();
-                    let api_ok = data
-                        .get("ok")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
+                    let api_ok = data.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false);
                     let team = data
                         .get("team")
                         .and_then(serde_json::Value::as_str)
@@ -2955,10 +2743,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         continue;
                     }
                     _ => {
-                        println!(
-                            "\r  {} Connection failed — check your token",
-                            style("❌").red().bold()
-                        );
+                        println!("\r  {} Connection failed — check your token", style("❌").red().bold());
                         continue;
                     }
                 }
@@ -2974,9 +2759,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .interact_text()?;
 
                 print_bullet("Allowlist your own Slack member ID first (recommended).");
-                print_bullet(
-                    "Member IDs usually start with 'U' (open your Slack profile -> More -> Copy member ID).",
-                );
+                print_bullet("Member IDs usually start with 'U' (open your Slack profile -> More -> Copy member ID).");
                 print_bullet("Use '*' only for temporary open testing.");
 
                 let allowed_users_str: String = Input::new()
@@ -3005,16 +2788,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 config.slack = Some(SlackConfig {
                     bot_token: token,
-                    app_token: if app_token.is_empty() {
-                        None
-                    } else {
-                        Some(app_token)
-                    },
-                    channel_id: if channel.is_empty() {
-                        None
-                    } else {
-                        Some(channel)
-                    },
+                    app_token: if app_token.is_empty() { None } else { Some(app_token) },
+                    channel_id: if channel.is_empty() { None } else { Some(channel) },
                     allowed_users,
                     mention_only: false,
                 });
@@ -3029,17 +2804,12 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 );
 
                 if !cfg!(target_os = "macos") {
-                    println!(
-                        "  {} iMessage is only available on macOS.",
-                        style("⚠").yellow().bold()
-                    );
+                    println!("  {} iMessage is only available on macOS.", style("⚠").yellow().bold());
                     continue;
                 }
 
                 print_bullet("OpenPRX reads your iMessage database and replies via AppleScript.");
-                print_bullet(
-                    "You need to grant Full Disk Access to your terminal in System Settings.",
-                );
+                print_bullet("You need to grant Full Disk Access to your terminal in System Settings.");
                 println!();
 
                 let contacts_str: String = Input::new()
@@ -3050,10 +2820,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let allowed_contacts = if contacts_str.trim() == "*" {
                     vec!["*".into()]
                 } else {
-                    contacts_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .collect()
+                    contacts_str.split(',').map(|s| s.trim().to_string()).collect()
                 };
 
                 config.imessage = Some(IMessageConfig {
@@ -3087,8 +2854,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let access_token: String =
-                    Input::new().with_prompt("  Access token").interact_text()?;
+                let access_token: String = Input::new().with_prompt("  Access token").interact_text()?;
 
                 if access_token.trim().is_empty() {
                     println!("  {} Skipped — token required", style("→").dim());
@@ -3131,10 +2897,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let (detected_user_id, detected_device_id) = match thread_result {
                     Ok(Ok((true, user_id, device_id))) => {
-                        println!(
-                            "\r  {} Connection verified        ",
-                            style("✅").green().bold()
-                        );
+                        println!("\r  {} Connection verified        ", style("✅").green().bold());
 
                         if device_id.is_none() {
                             println!(
@@ -3197,9 +2960,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 if mode_idx == 0 {
                     println!("  {}", style("Mode: WhatsApp Web").dim());
                     print_bullet("1. Build with --features whatsapp-web");
-                    print_bullet(
-                        "2. Start channel/daemon and scan QR in WhatsApp > Linked Devices",
-                    );
+                    print_bullet("2. Start channel/daemon and scan QR in WhatsApp > Linked Devices");
                     print_bullet("3. Keep session_path persistent so relogin is not required");
                     println!();
 
@@ -3214,9 +2975,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
 
                     let pair_phone: String = Input::new()
-                        .with_prompt(
-                            "  Pair phone (optional, digits only; leave empty to use QR flow)",
-                        )
+                        .with_prompt("  Pair phone (optional, digits only; leave empty to use QR flow)")
                         .allow_empty(true)
                         .interact_text()?;
 
@@ -3224,17 +2983,13 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         String::new()
                     } else {
                         Input::new()
-                            .with_prompt(
-                                "  Custom pair code (optional, leave empty for auto-generated)",
-                            )
+                            .with_prompt("  Custom pair code (optional, leave empty for auto-generated)")
                             .allow_empty(true)
                             .interact_text()?
                     };
 
                     let users_str: String = Input::new()
-                        .with_prompt(
-                            "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
-                        )
+                        .with_prompt("  Allowed phone numbers (comma-separated +1234567890, or * for all)")
                         .default("*".into())
                         .interact_text()?;
 
@@ -3250,10 +3005,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         verify_token: None,
                         app_secret: None,
                         session_path: Some(session_path.trim().to_string()),
-                        pair_phone: (!pair_phone.trim().is_empty())
-                            .then(|| pair_phone.trim().to_string()),
-                        pair_code: (!pair_code.trim().is_empty())
-                            .then(|| pair_code.trim().to_string()),
+                        pair_phone: (!pair_phone.trim().is_empty()).then(|| pair_phone.trim().to_string()),
+                        pair_code: (!pair_code.trim().is_empty()).then(|| pair_code.trim().to_string()),
                         allowed_numbers,
                         dm_policy: crate::config::schema::DmPolicy::default(),
                         group_policy: crate::config::schema::GroupPolicy::default(),
@@ -3261,18 +3014,11 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         mention_only: false,
                     });
 
-                    println!(
-                        "  {} WhatsApp Web configuration saved.",
-                        style("✅").green().bold()
-                    );
+                    println!("  {} WhatsApp Web configuration saved.", style("✅").green().bold());
                     continue;
                 }
 
-                println!(
-                    "  {} {}",
-                    style("Mode:").dim(),
-                    style("Business Cloud API").dim()
-                );
+                println!("  {} {}", style("Mode:").dim(), style("Business Cloud API").dim());
                 print_bullet("1. Go to developers.facebook.com and create a WhatsApp app");
                 print_bullet("2. Add the WhatsApp product and get your phone number ID");
                 print_bullet("3. Generate a temporary access token (System User)");
@@ -3308,26 +3054,17 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let access_token_clone = access_token.clone();
                 let thread_result = std::thread::spawn(move || {
                     let client = reqwest::blocking::Client::new();
-                    let url = format!(
-                        "https://graph.facebook.com/v18.0/{}",
-                        phone_number_id_clone.trim()
-                    );
+                    let url = format!("https://graph.facebook.com/v18.0/{}", phone_number_id_clone.trim());
                     let resp = client
                         .get(&url)
-                        .header(
-                            "Authorization",
-                            format!("Bearer {}", access_token_clone.trim()),
-                        )
+                        .header("Authorization", format!("Bearer {}", access_token_clone.trim()))
                         .send()?;
                     Ok::<_, reqwest::Error>(resp.status().is_success())
                 })
                 .join();
                 match thread_result {
                     Ok(Ok(true)) => {
-                        println!(
-                            "\r  {} Connected to WhatsApp API        ",
-                            style("✅").green().bold()
-                        );
+                        println!("\r  {} Connected to WhatsApp API        ", style("✅").green().bold());
                     }
                     _ => {
                         println!(
@@ -3339,9 +3076,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 }
 
                 let users_str: String = Input::new()
-                    .with_prompt(
-                        "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
-                    )
+                    .with_prompt("  Allowed phone numbers (comma-separated +1234567890, or * for all)")
                     .default("*".into())
                     .interact_text()?;
 
@@ -3405,34 +3140,23 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     let url = "https://api.linqapp.com/api/partner/v3/phonenumbers";
                     let resp = client
                         .get(url)
-                        .header(
-                            "Authorization",
-                            format!("Bearer {}", api_token_clone.trim()),
-                        )
+                        .header("Authorization", format!("Bearer {}", api_token_clone.trim()))
                         .send()?;
                     Ok::<_, reqwest::Error>(resp.status().is_success())
                 })
                 .join();
                 match thread_result {
                     Ok(Ok(true)) => {
-                        println!(
-                            "\r  {} Connected to Linq API              ",
-                            style("✅").green().bold()
-                        );
+                        println!("\r  {} Connected to Linq API              ", style("✅").green().bold());
                     }
                     _ => {
-                        println!(
-                            "\r  {} Connection failed — check API token",
-                            style("❌").red().bold()
-                        );
+                        println!("\r  {} Connection failed — check API token", style("❌").red().bold());
                         continue;
                     }
                 }
 
                 let users_str: String = Input::new()
-                    .with_prompt(
-                        "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
-                    )
+                    .with_prompt("  Allowed sender numbers (comma-separated +1234567890, or * for all)")
                     .default("*".into())
                     .interact_text()?;
 
@@ -3471,9 +3195,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("Supports SASL PLAIN and NickServ authentication");
                 println!();
 
-                let server: String = Input::new()
-                    .with_prompt("  IRC server (hostname)")
-                    .interact_text()?;
+                let server: String = Input::new().with_prompt("  IRC server (hostname)").interact_text()?;
 
                 if server.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
@@ -3493,8 +3215,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 };
 
-                let nickname: String =
-                    Input::new().with_prompt("  Bot nickname").interact_text()?;
+                let nickname: String = Input::new().with_prompt("  Bot nickname").interact_text()?;
 
                 if nickname.trim().is_empty() {
                     println!("  {} Skipped — nickname required", style("→").dim());
@@ -3516,9 +3237,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .collect()
                 };
 
-                print_bullet(
-                    "Allowlist nicknames that can interact with the bot (case-insensitive).",
-                );
+                print_bullet("Allowlist nicknames that can interact with the bot (case-insensitive).");
                 print_bullet("Use '*' to allow anyone (not recommended for production).");
 
                 let users_str: String = Input::new()
@@ -3537,9 +3256,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 };
 
                 if allowed_users.is_empty() {
-                    print_bullet(
-                        "⚠️  Empty allowlist — only you can interact. Add nicknames above.",
-                    );
+                    print_bullet("⚠️  Empty allowlist — only you can interact. Add nicknames above.");
                 }
 
                 println!();
@@ -3620,11 +3337,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 config.webhook = Some(WebhookConfig {
                     port: port.parse().unwrap_or(8080),
-                    secret: if secret.is_empty() {
-                        None
-                    } else {
-                        Some(secret)
-                    },
+                    secret: if secret.is_empty() { None } else { Some(secret) },
                 });
                 println!(
                     "  {} Webhook on port {}",
@@ -3645,9 +3358,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Copy the Client ID (AppKey) and Client Secret (AppSecret)");
                 println!();
 
-                let client_id: String = Input::new()
-                    .with_prompt("  Client ID (AppKey)")
-                    .interact_text()?;
+                let client_id: String = Input::new().with_prompt("  Client ID (AppKey)").interact_text()?;
 
                 if client_id.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
@@ -3723,8 +3434,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let app_secret: String =
-                    Input::new().with_prompt("  App Secret").interact_text()?;
+                let app_secret: String = Input::new().with_prompt("  App Secret").interact_text()?;
 
                 // Test connection
                 print!("  {} Testing connection... ", style("⏳").dim());
@@ -3741,15 +3451,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     Ok(resp) if resp.status().is_success() => {
                         let data: serde_json::Value = resp.json().unwrap_or_default();
                         if data.get("access_token").is_some() {
-                            println!(
-                                "\r  {} QQ Bot credentials verified        ",
-                                style("✅").green().bold()
-                            );
+                            println!("\r  {} QQ Bot credentials verified        ", style("✅").green().bold());
                         } else {
-                            println!(
-                                "\r  {} Auth error — check your credentials",
-                                style("❌").red().bold()
-                            );
+                            println!("\r  {} Auth error — check your credentials", style("❌").red().bold());
                             continue;
                         }
                     }
@@ -3788,9 +3492,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style("Lark/Feishu Setup").white().bold(),
                     style("— talk to OpenPRX from Lark or Feishu").dim()
                 );
-                print_bullet(
-                    "1. Go to Lark/Feishu Open Platform (open.larksuite.com / open.feishu.cn)",
-                );
+                print_bullet("1. Go to Lark/Feishu Open Platform (open.larksuite.com / open.feishu.cn)");
                 print_bullet("2. Create an app and enable 'Bot' capability");
                 print_bullet("3. Copy the App ID and App Secret");
                 println!();
@@ -3803,8 +3505,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let app_secret: String =
-                    Input::new().with_prompt("  App Secret").interact_text()?;
+                let app_secret: String = Input::new().with_prompt("  App Secret").interact_text()?;
                 let app_secret = app_secret.trim().to_string();
 
                 if app_secret.is_empty() {
@@ -4025,8 +3726,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 #[allow(clippy::too_many_lines)]
 fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
     use crate::config::schema::{
-        CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TailscaleTunnelConfig,
-        TunnelConfig,
+        CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TailscaleTunnelConfig, TunnelConfig,
     };
 
     print_bullet("A tunnel exposes your gateway to the internet securely.");
@@ -4051,9 +3751,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
         1 => {
             println!();
             print_bullet("Get your tunnel token from the Cloudflare Zero Trust dashboard.");
-            let tunnel_value: String = Input::new()
-                .with_prompt("  Cloudflare tunnel token")
-                .interact_text()?;
+            let tunnel_value: String = Input::new().with_prompt("  Cloudflare tunnel token").interact_text()?;
             if tunnel_value.trim().is_empty() {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()
@@ -4065,9 +3763,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
                 );
                 TunnelConfig {
                     provider: "cloudflare".into(),
-                    cloudflare: Some(CloudflareTunnelConfig {
-                        token: tunnel_value,
-                    }),
+                    cloudflare: Some(CloudflareTunnelConfig { token: tunnel_value }),
                     ..TunnelConfig::default()
                 }
             }
@@ -4091,21 +3787,14 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
             );
             TunnelConfig {
                 provider: "tailscale".into(),
-                tailscale: Some(TailscaleTunnelConfig {
-                    funnel,
-                    hostname: None,
-                }),
+                tailscale: Some(TailscaleTunnelConfig { funnel, hostname: None }),
                 ..TunnelConfig::default()
             }
         }
         3 => {
             println!();
-            print_bullet(
-                "Get your auth token at https://dashboard.ngrok.com/get-started/your-authtoken",
-            );
-            let auth_token: String = Input::new()
-                .with_prompt("  ngrok auth token")
-                .interact_text()?;
+            print_bullet("Get your auth token at https://dashboard.ngrok.com/get-started/your-authtoken");
+            let auth_token: String = Input::new().with_prompt("  ngrok auth token").interact_text()?;
             if auth_token.trim().is_empty() {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()
@@ -4114,20 +3803,12 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
                     .with_prompt("  Custom domain (optional, Enter to skip)")
                     .allow_empty(true)
                     .interact_text()?;
-                println!(
-                    "  {} Tunnel: {}",
-                    style("✓").green().bold(),
-                    style("ngrok").green()
-                );
+                println!("  {} Tunnel: {}", style("✓").green().bold(), style("ngrok").green());
                 TunnelConfig {
                     provider: "ngrok".into(),
                     ngrok: Some(NgrokTunnelConfig {
                         auth_token,
-                        domain: if domain.is_empty() {
-                            None
-                        } else {
-                            Some(domain)
-                        },
+                        domain: if domain.is_empty() { None } else { Some(domain) },
                     }),
                     ..TunnelConfig::default()
                 }
@@ -4138,9 +3819,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
             print_bullet("Enter the command to start your tunnel.");
             print_bullet("Use {port} and {host} as placeholders.");
             print_bullet("Example: bore local {port} --to bore.pub");
-            let cmd: String = Input::new()
-                .with_prompt("  Start command")
-                .interact_text()?;
+            let cmd: String = Input::new().with_prompt("  Start command").interact_text()?;
             if cmd.trim().is_empty() {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()
@@ -4189,11 +3868,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
     } else {
         &ctx.user_name
     };
-    let tz = if ctx.timezone.is_empty() {
-        "UTC"
-    } else {
-        &ctx.timezone
-    };
+    let tz = if ctx.timezone.is_empty() { "UTC" } else { &ctx.timezone };
     let comm_style = if ctx.communication_style.is_empty() {
         "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
     } else {
@@ -4434,19 +4109,12 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
     // Show workspace tree
     println!();
     println!("  {}", style("Workspace layout:").dim());
-    println!(
-        "  {}",
-        style(format!("  {}/", workspace_dir.display())).dim()
-    );
+    println!("  {}", style(format!("  {}/", workspace_dir.display())).dim());
     for dir in &subdirs {
         println!("  {}", style(format!("  ├── {dir}/")).dim());
     }
     for (i, (filename, _)) in files.iter().enumerate() {
-        let prefix = if i == files.len() - 1 {
-            "└──"
-        } else {
-            "├──"
-        };
+        let prefix = if i == files.len() - 1 { "└──" } else { "├──" };
         println!("  {}", style(format!("  {prefix} {filename}")).dim());
     }
 
@@ -4490,11 +4158,7 @@ fn print_summary(config: &Config) {
         style("🧠").cyan(),
         config.default_model.as_deref().unwrap_or("(default)")
     );
-    println!(
-        "    {} Autonomy:      {:?}",
-        style("🛡️").cyan(),
-        config.autonomy.level
-    );
+    println!("    {} Autonomy:      {:?}", style("🛡️").cyan(), config.autonomy.level);
     println!(
         "    {} Memory:        {} (auto-save: {})",
         style("🧠").cyan(),
@@ -4528,11 +4192,7 @@ fn print_summary(config: &Config) {
     if config.channels_config.lark.is_some() {
         channels.push("Lark");
     }
-    println!(
-        "    {} Channels:      {}",
-        style("📡").cyan(),
-        channels.join(", ")
-    );
+    println!("    {} Channels:      {}", style("📡").cyan(), channels.join(", "));
 
     println!(
         "    {} API Key:       {}",
@@ -4540,9 +4200,7 @@ fn print_summary(config: &Config) {
         if config.api_key.is_some() {
             style("configured").green().to_string()
         } else {
-            style("not set (set via env var or config)")
-                .yellow()
-                .to_string()
+            style("not set (set via env var or config)").yellow().to_string()
         }
     );
 
@@ -4604,25 +4262,15 @@ fn print_summary(config: &Config) {
                 "    {} Configure Anthropic auth:",
                 style(format!("{step}.")).cyan().bold()
             );
+            println!("       {}", style("export ANTHROPIC_API_KEY=\"sk-ant-...\"").yellow());
             println!(
                 "       {}",
-                style("export ANTHROPIC_API_KEY=\"sk-ant-...\"").yellow()
-            );
-            println!(
-                "       {}",
-                style("or: prx auth paste-token --provider anthropic --auth-kind authorization")
-                    .yellow()
+                style("or: prx auth paste-token --provider anthropic --auth-kind authorization").yellow()
             );
         } else {
             let env_var = provider_env_var(provider);
-            println!(
-                "    {} Set your API key:",
-                style(format!("{step}.")).cyan().bold()
-            );
-            println!(
-                "       {}",
-                style(format!("export {env_var}=\"sk-...\"")).yellow()
-            );
+            println!("    {} Set your API key:", style(format!("{step}.")).cyan().bold());
+            println!("       {}", style(format!("export {env_var}=\"sk-...\"")).yellow());
         }
         println!();
         step += 1;
@@ -4640,14 +4288,8 @@ fn print_summary(config: &Config) {
         step += 1;
     }
 
-    println!(
-        "    {} Send a quick message:",
-        style(format!("{step}.")).cyan().bold()
-    );
-    println!(
-        "       {}",
-        style("prx agent -m \"Hello, OpenPRX!\"").yellow()
-    );
+    println!("    {} Send a quick message:", style(format!("{step}.")).cyan().bold());
+    println!("       {}", style("prx agent -m \"Hello, OpenPRX!\"").yellow());
     println!();
     step += 1;
 
@@ -4659,10 +4301,7 @@ fn print_summary(config: &Config) {
     println!();
     step += 1;
 
-    println!(
-        "    {} Check full status:",
-        style(format!("{step}.")).cyan().bold()
-    );
+    println!("    {} Check full status:", style(format!("{step}.")).cyan().bold());
     println!("       {}", style("prx status").yellow());
     println!();
     println!(
@@ -4675,11 +4314,7 @@ fn print_summary(config: &Config) {
     );
 
     println!();
-    println!(
-        "  {} {}",
-        style("⚡").cyan(),
-        style("Happy hacking! 🦀").white().bold()
-    );
+    println!("  {} {}", style("⚡").cyan(), style("Happy hacking! 🦀").white().bold());
     println!();
 }
 
@@ -4729,15 +4364,10 @@ mod tests {
     async fn quick_setup_without_model_uses_provider_default_model() {
         let tmp = TempDir::new().unwrap();
 
-        let config = run_quick_setup_with_home(
-            Some("sk-issue946"),
-            Some("anthropic"),
-            None,
-            Some("sqlite"),
-            tmp.path(),
-        )
-        .await
-        .unwrap();
+        let config =
+            run_quick_setup_with_home(Some("sk-issue946"), Some("anthropic"), None, Some("sqlite"), tmp.path())
+                .await
+                .unwrap();
 
         let expected = default_model_for_provider("anthropic");
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
@@ -4789,21 +4419,13 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
-            .await
-            .unwrap();
-        assert!(
-            user_md.contains("**Name:** Alice"),
-            "USER.md should contain user name"
-        );
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md")).await.unwrap();
+        assert!(user_md.contains("**Name:** Alice"), "USER.md should contain user name");
 
         let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
             .await
             .unwrap();
-        assert!(
-            bootstrap.contains("**Alice**"),
-            "BOOTSTRAP.md should contain user name"
-        );
+        assert!(bootstrap.contains("**Alice**"), "BOOTSTRAP.md should contain user name");
     }
 
     #[tokio::test]
@@ -4815,9 +4437,7 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
-            .await
-            .unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md")).await.unwrap();
         assert!(
             user_md.contains("**Timezone:** US/Pacific"),
             "USER.md should contain timezone"
@@ -4826,10 +4446,7 @@ mod tests {
         let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
             .await
             .unwrap();
-        assert!(
-            bootstrap.contains("US/Pacific"),
-            "BOOTSTRAP.md should contain timezone"
-        );
+        assert!(bootstrap.contains("US/Pacific"), "BOOTSTRAP.md should contain timezone");
     }
 
     #[tokio::test]
@@ -4841,25 +4458,16 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
-            .await
-            .unwrap();
+        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md")).await.unwrap();
         assert!(
             identity.contains("**Name:** Crabby"),
             "IDENTITY.md should contain agent name"
         );
 
-        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
-            .await
-            .unwrap();
-        assert!(
-            soul.contains("You are **Crabby**"),
-            "SOUL.md should contain agent name"
-        );
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md")).await.unwrap();
+        assert!(soul.contains("You are **Crabby**"), "SOUL.md should contain agent name");
 
-        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
-            .await
-            .unwrap();
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md")).await.unwrap();
         assert!(
             agents.contains("Crabby Personal Assistant"),
             "AGENTS.md should contain agent name"
@@ -4868,10 +4476,7 @@ mod tests {
         let heartbeat = tokio::fs::read_to_string(tmp.path().join("HEARTBEAT.md"))
             .await
             .unwrap();
-        assert!(
-            heartbeat.contains("Crabby"),
-            "HEARTBEAT.md should contain agent name"
-        );
+        assert!(heartbeat.contains("Crabby"), "HEARTBEAT.md should contain agent name");
 
         let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
             .await
@@ -4891,17 +4496,13 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
-            .await
-            .unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md")).await.unwrap();
         assert!(
             soul.contains("Be technical and detailed."),
             "SOUL.md should contain communication style"
         );
 
-        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
-            .await
-            .unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md")).await.unwrap();
         assert!(
             user_md.contains("Be technical and detailed."),
             "USER.md should contain communication style"
@@ -4924,29 +4525,17 @@ mod tests {
         let ctx = ProjectContext::default(); // all empty
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
-            .await
-            .unwrap();
+        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md")).await.unwrap();
         assert!(
             identity.contains("**Name:** OpenPRX"),
             "should default agent name to OpenPRX"
         );
 
-        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
-            .await
-            .unwrap();
-        assert!(
-            user_md.contains("**Name:** User"),
-            "should default user name to User"
-        );
-        assert!(
-            user_md.contains("**Timezone:** UTC"),
-            "should default timezone to UTC"
-        );
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md")).await.unwrap();
+        assert!(user_md.contains("**Name:** User"), "should default user name to User");
+        assert!(user_md.contains("**Timezone:** UTC"), "should default timezone to UTC");
 
-        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
-            .await
-            .unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md")).await.unwrap();
         assert!(
             soul.contains("Be warm, natural, and clear."),
             "should default communication style"
@@ -4981,9 +4570,7 @@ mod tests {
         );
 
         // But USER.md should be created fresh
-        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
-            .await
-            .unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md")).await.unwrap();
         assert!(user_md.contains("**Name:** Bob"));
     }
 
@@ -4999,15 +4586,11 @@ mod tests {
         };
 
         scaffold_workspace(tmp.path(), &ctx).unwrap();
-        let soul_v1 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
-            .await
-            .unwrap();
+        let soul_v1 = tokio::fs::read_to_string(tmp.path().join("SOUL.md")).await.unwrap();
 
         // Run again — should not change anything
         scaffold_workspace(tmp.path(), &ctx).unwrap();
-        let soul_v2 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
-            .await
-            .unwrap();
+        let soul_v2 = tokio::fs::read_to_string(tmp.path().join("SOUL.md")).await.unwrap();
 
         assert_eq!(soul_v1, soul_v2, "scaffold should be idempotent");
     }
@@ -5043,9 +4626,7 @@ mod tests {
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
-            .await
-            .unwrap();
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md")).await.unwrap();
         assert!(
             agents.contains("memory_recall"),
             "AGENTS.md should reference memory_recall for on-demand access"
@@ -5064,9 +4645,7 @@ mod tests {
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md"))
-            .await
-            .unwrap();
+        let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md")).await.unwrap();
         assert!(
             memory.contains("costs tokens"),
             "MEMORY.md should warn about token cost"
@@ -5085,9 +4664,7 @@ mod tests {
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md"))
-            .await
-            .unwrap();
+        let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md")).await.unwrap();
         for tool in &[
             "shell",
             "file_read",
@@ -5096,10 +4673,7 @@ mod tests {
             "memory_recall",
             "memory_forget",
         ] {
-            assert!(
-                tools.contains(tool),
-                "TOOLS.md should list built-in tool: {tool}"
-            );
+            assert!(tools.contains(tool), "TOOLS.md should list built-in tool: {tool}");
         }
         assert!(
             tools.contains("Use when:"),
@@ -5117,9 +4691,7 @@ mod tests {
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
-            .await
-            .unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md")).await.unwrap();
         assert!(
             soul.contains("Use emojis naturally (0-2 max"),
             "SOUL.md should include emoji usage guidance"
@@ -5143,14 +4715,10 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
-            .await
-            .unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md")).await.unwrap();
         assert!(user_md.contains("José María"));
 
-        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
-            .await
-            .unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md")).await.unwrap();
         assert!(soul.contains("OpenPRX-v2"));
     }
 
@@ -5170,27 +4738,19 @@ mod tests {
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
         // Verify every file got personalized
-        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
-            .await
-            .unwrap();
+        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md")).await.unwrap();
         assert!(identity.contains("**Name:** Claw"));
 
-        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
-            .await
-            .unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md")).await.unwrap();
         assert!(soul.contains("You are **Claw**"));
         assert!(soul.contains("Be friendly, human, and conversational"));
 
-        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
-            .await
-            .unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md")).await.unwrap();
         assert!(user_md.contains("**Name:** Argenis"));
         assert!(user_md.contains("**Timezone:** US/Eastern"));
         assert!(user_md.contains("Be friendly, human, and conversational"));
 
-        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
-            .await
-            .unwrap();
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md")).await.unwrap();
         assert!(agents.contains("Claw Personal Assistant"));
 
         let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
@@ -5210,16 +4770,10 @@ mod tests {
 
     #[test]
     fn default_model_for_provider_uses_latest_defaults() {
-        assert_eq!(
-            default_model_for_provider("openrouter"),
-            "anthropic/claude-sonnet-4.6"
-        );
+        assert_eq!(default_model_for_provider("openrouter"), "anthropic/claude-sonnet-4.6");
         assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(default_model_for_provider("openai-codex"), "gpt-5-codex");
-        assert_eq!(
-            default_model_for_provider("anthropic"),
-            "claude-sonnet-4-5-20250929"
-        );
+        assert_eq!(default_model_for_provider("anthropic"), "claude-sonnet-4-5-20250929");
         assert_eq!(default_model_for_provider("qwen"), "qwen-plus");
         assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
         assert_eq!(default_model_for_provider("qwen-code"), "qwen3-coder-plus");
@@ -5233,28 +4787,13 @@ mod tests {
             default_model_for_provider("bedrock"),
             "anthropic.claude-sonnet-4-5-20250929-v1:0"
         );
-        assert_eq!(
-            default_model_for_provider("google-gemini"),
-            "gemini-2.5-pro"
-        );
+        assert_eq!(default_model_for_provider("google-gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
-        assert_eq!(
-            default_model_for_provider("nvidia"),
-            "meta/llama-3.3-70b-instruct"
-        );
-        assert_eq!(
-            default_model_for_provider("nvidia-nim"),
-            "meta/llama-3.3-70b-instruct"
-        );
-        assert_eq!(
-            default_model_for_provider("llamacpp"),
-            "ggml-org/gpt-oss-20b-GGUF"
-        );
-        assert_eq!(
-            default_model_for_provider("astrai"),
-            "anthropic/claude-sonnet-4.6"
-        );
+        assert_eq!(default_model_for_provider("nvidia"), "meta/llama-3.3-70b-instruct");
+        assert_eq!(default_model_for_provider("nvidia-nim"), "meta/llama-3.3-70b-instruct");
+        assert_eq!(default_model_for_provider("llamacpp"), "ggml-org/gpt-oss-20b-GGUF");
+        assert_eq!(default_model_for_provider("astrai"), "anthropic/claude-sonnet-4.6");
     }
 
     #[test]
@@ -5412,10 +4951,7 @@ mod tests {
 
     #[test]
     fn curated_models_provider_aliases_share_same_catalog() {
-        assert_eq!(
-            curated_models_for_provider("xai"),
-            curated_models_for_provider("grok")
-        );
+        assert_eq!(curated_models_for_provider("xai"), curated_models_for_provider("grok"));
         assert_eq!(
             curated_models_for_provider("together-ai"),
             curated_models_for_provider("together")
@@ -5592,10 +5128,7 @@ mod tests {
         });
 
         let ids = parse_gemini_model_ids(&payload);
-        assert_eq!(
-            ids,
-            vec!["gemini-2.5-flash".to_string(), "gemini-2.5-pro".to_string()]
-        );
+        assert_eq!(ids, vec!["gemini-2.5-flash".to_string(), "gemini-2.5-pro".to_string()]);
     }
 
     #[test]
@@ -5609,10 +5142,7 @@ mod tests {
         });
 
         let ids = parse_ollama_model_ids(&payload);
-        assert_eq!(
-            ids,
-            vec!["llama3.2:latest".to_string(), "mistral:latest".to_string()]
-        );
+        assert_eq!(ids, vec!["llama3.2:latest".to_string(), "mistral:latest".to_string()]);
     }
 
     #[test]
@@ -5622,8 +5152,7 @@ mod tests {
 
         cache_live_models_for_provider(tmp.path(), "openai", &models).unwrap();
 
-        let cached =
-            load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
+        let cached = load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
         let cached = cached.expect("expected fresh cached models");
 
         assert_eq!(cached.models.len(), 2);
@@ -5644,8 +5173,7 @@ mod tests {
 
         save_model_cache_state(tmp.path(), &stale).unwrap();
 
-        let fresh =
-            load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
+        let fresh = load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
         assert!(fresh.is_none());
 
         let stale_any = load_any_cached_models_for_provider(tmp.path(), "openai").unwrap();
@@ -5679,10 +5207,7 @@ mod tests {
         };
 
         let err = run_models_refresh(&config, None, true).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("does not support live model discovery")
-        );
+        assert!(err.to_string().contains("does not support live model discovery"));
     }
 
     // ── provider_env_var ────────────────────────────────────────

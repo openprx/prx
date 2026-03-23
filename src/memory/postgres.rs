@@ -21,12 +21,7 @@ pub struct PostgresMemory {
 }
 
 impl PostgresMemory {
-    pub fn new(
-        db_url: &str,
-        schema: &str,
-        table: &str,
-        connect_timeout_secs: Option<u64>,
-    ) -> Result<Self> {
+    pub fn new(db_url: &str, schema: &str, table: &str, connect_timeout_secs: Option<u64>) -> Result<Self> {
         validate_identifier(schema, "storage schema")?;
         validate_identifier(table, "storage table")?;
 
@@ -56,9 +51,7 @@ impl PostgresMemory {
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())
             .spawn(move || -> Result<Client> {
-                let mut config: postgres::Config = db_url
-                    .parse()
-                    .context("invalid PostgreSQL connection URL")?;
+                let mut config: postgres::Config = db_url.parse().context("invalid PostgreSQL connection URL")?;
 
                 if let Some(timeout_secs) = connect_timeout_secs {
                     let bounded = timeout_secs.min(POSTGRES_CONNECT_TIMEOUT_CAP_SECS);
@@ -176,9 +169,7 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     }
 
     if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
-        anyhow::bail!(
-            "{field_name} can only contain ASCII letters, numbers, and underscores; got '{value}'"
-        );
+        anyhow::bail!("{field_name} can only contain ASCII letters, numbers, and underscores; got '{value}'");
     }
 
     Ok(())
@@ -194,13 +185,7 @@ impl Memory for PostgresMemory {
         "postgres"
     }
 
-    async fn store(
-        &self,
-        key: &str,
-        content: &str,
-        category: MemoryCategory,
-        session_id: Option<&str>,
-    ) -> Result<()> {
+    async fn store(&self, key: &str, content: &str, category: MemoryCategory, session_id: Option<&str>) -> Result<()> {
         validate_memory_write_target(key, session_id)?;
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
@@ -233,12 +218,7 @@ impl Memory for PostgresMemory {
         .await?
     }
 
-    async fn recall(
-        &self,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-    ) -> Result<Vec<MemoryEntry>> {
+    async fn recall(&self, query: &str, limit: usize, session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let query = query.trim().to_string();
@@ -297,11 +277,7 @@ impl Memory for PostgresMemory {
         .await?
     }
 
-    async fn list(
-        &self,
-        category: Option<&MemoryCategory>,
-        session_id: Option<&str>,
-    ) -> Result<Vec<MemoryEntry>> {
+    async fn list(&self, category: Option<&MemoryCategory>, session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let category = category.map(Self::category_to_str);
@@ -353,8 +329,7 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!("SELECT COUNT(*) FROM {qualified_table}");
             let count: i64 = client.query_one(&stmt, &[])?.get(0);
-            let count =
-                usize::try_from(count).context("PostgreSQL returned a negative memory count")?;
+            let count = usize::try_from(count).context("PostgreSQL returned a negative memory count")?;
             Ok(count)
         })
         .await?
@@ -408,10 +383,7 @@ mod tests {
     #[test]
     fn parse_category_maps_known_and_custom_values() {
         assert_eq!(PostgresMemory::parse_category("core"), MemoryCategory::Core);
-        assert_eq!(
-            PostgresMemory::parse_category("daily"),
-            MemoryCategory::Daily
-        );
+        assert_eq!(PostgresMemory::parse_category("daily"), MemoryCategory::Daily);
         assert_eq!(
             PostgresMemory::parse_category("conversation"),
             MemoryCategory::Conversation

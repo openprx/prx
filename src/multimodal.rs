@@ -5,13 +5,7 @@ use reqwest::Client;
 use std::path::Path;
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
-const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
-    "image/png",
-    "image/jpeg",
-    "image/webp",
-    "image/gif",
-    "image/bmp",
-];
+const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp"];
 
 #[derive(Debug, Clone)]
 pub struct PreparedMessages {
@@ -24,9 +18,7 @@ pub enum MultimodalError {
     #[error("multimodal image limit exceeded: max_images={max_images}, found={found}")]
     TooManyImages { max_images: usize, found: usize },
 
-    #[error(
-        "multimodal image size limit exceeded for '{input}': {size_bytes} bytes > {max_bytes} bytes"
-    )]
+    #[error("multimodal image size limit exceeded for '{input}': {size_bytes} bytes > {max_bytes} bytes")]
     ImageTooLarge {
         input: String,
         size_bytes: usize,
@@ -157,8 +149,7 @@ pub async fn prepare_messages_for_provider(
 
         let mut normalized_refs = Vec::with_capacity(refs.len());
         for reference in refs {
-            let data_uri =
-                normalize_image_reference(&reference, config, max_bytes, &remote_client).await?;
+            let data_uri = normalize_image_reference(&reference, config, max_bytes, &remote_client).await?;
             normalized_refs.push(data_uri);
         }
 
@@ -262,11 +253,7 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
 }
 
-async fn normalize_remote_image(
-    source: &str,
-    max_bytes: usize,
-    remote_client: &Client,
-) -> anyhow::Result<String> {
+async fn normalize_remote_image(source: &str, max_bytes: usize, remote_client: &Client) -> anyhow::Result<String> {
     // SSRF protection: block requests to private/local addresses
     let host = crate::tools::http_request::extract_host(source)?;
     if crate::tools::http_request::is_private_or_local_host(&host) {
@@ -277,12 +264,14 @@ async fn normalize_remote_image(
         .into());
     }
 
-    let response = remote_client.get(source).send().await.map_err(|error| {
-        MultimodalError::RemoteFetchFailed {
+    let response = remote_client
+        .get(source)
+        .send()
+        .await
+        .map_err(|error| MultimodalError::RemoteFetchFailed {
             input: source.to_string(),
             reason: error.to_string(),
-        }
-    })?;
+        })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -314,12 +303,11 @@ async fn normalize_remote_image(
 
     validate_size(source, bytes.len(), max_bytes)?;
 
-    let mime = detect_mime(None, bytes.as_ref(), content_type.as_deref()).ok_or_else(|| {
-        MultimodalError::UnsupportedMime {
+    let mime =
+        detect_mime(None, bytes.as_ref(), content_type.as_deref()).ok_or_else(|| MultimodalError::UnsupportedMime {
             input: source.to_string(),
             mime: "unknown".to_string(),
-        }
-    })?;
+        })?;
 
     validate_mime(source, &mime)?;
 
@@ -335,13 +323,12 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
         .into());
     }
 
-    let metadata =
-        tokio::fs::metadata(path)
-            .await
-            .map_err(|error| MultimodalError::LocalReadFailed {
-                input: source.to_string(),
-                reason: error.to_string(),
-            })?;
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| MultimodalError::LocalReadFailed {
+            input: source.to_string(),
+            reason: error.to_string(),
+        })?;
 
     validate_size(source, metadata.len() as usize, max_bytes)?;
 
@@ -354,11 +341,10 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
 
     validate_size(source, bytes.len(), max_bytes)?;
 
-    let mime =
-        detect_mime(Some(path), &bytes, None).ok_or_else(|| MultimodalError::UnsupportedMime {
-            input: source.to_string(),
-            mime: "unknown".to_string(),
-        })?;
+    let mime = detect_mime(Some(path), &bytes, None).ok_or_else(|| MultimodalError::UnsupportedMime {
+        input: source.to_string(),
+        mime: "unknown".to_string(),
+    })?;
 
     validate_mime(source, &mime)?;
 
@@ -379,10 +365,7 @@ fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::R
 }
 
 fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
-    if ALLOWED_IMAGE_MIME_TYPES
-        .iter()
-        .any(|allowed| *allowed == mime)
-    {
+    if ALLOWED_IMAGE_MIME_TYPES.iter().any(|allowed| *allowed == mime) {
         return Ok(());
     }
 
@@ -393,11 +376,7 @@ fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
     .into())
 }
 
-fn detect_mime(
-    path: Option<&Path>,
-    bytes: &[u8],
-    header_content_type: Option<&str>,
-) -> Option<String> {
+fn detect_mime(path: Option<&Path>, bytes: &[u8], header_content_type: Option<&str>) -> Option<String> {
     // Magic bytes have highest priority — they reflect the actual binary content
     // regardless of the (potentially wrong) file extension or server-provided header.
     // Signal attachments are commonly downloaded with mismatched extensions
@@ -488,12 +467,8 @@ mod tests {
         // JPEG magic bytes with a .png extension — magic should win
         let jpeg_magic = &[0xff, 0xd8, 0xff, 0xe0];
         let path = std::path::Path::new("photo.png");
-        let mime = super::detect_mime(Some(path), jpeg_magic, None)
-            .expect("should detect JPEG from magic bytes");
-        assert_eq!(
-            mime, "image/jpeg",
-            "magic bytes should override .png extension"
-        );
+        let mime = super::detect_mime(Some(path), jpeg_magic, None).expect("should detect JPEG from magic bytes");
+        assert_eq!(mime, "image/jpeg", "magic bytes should override .png extension");
     }
 
     #[test]
@@ -501,8 +476,7 @@ mod tests {
         // Unknown magic bytes — should fall back to extension
         let unknown_bytes = &[0x00, 0x01, 0x02, 0x03];
         let path = std::path::Path::new("image.webp");
-        let mime = super::detect_mime(Some(path), unknown_bytes, None)
-            .expect("should detect WEBP from extension");
+        let mime = super::detect_mime(Some(path), unknown_bytes, None).expect("should detect WEBP from extension");
         assert_eq!(mime, "image/webp");
     }
 
@@ -520,11 +494,7 @@ mod tests {
         let image_path = temp.path().join("sample.png");
 
         // Minimal PNG signature bytes are enough for MIME detection.
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
 
         let messages = vec![ChatMessage::user(format!(
             "Please inspect this screenshot [IMAGE:{}]",
@@ -546,9 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_messages_rejects_too_many_images() {
-        let messages = vec![ChatMessage::user(
-            "[IMAGE:/tmp/1.png]\n[IMAGE:/tmp/2.png]".to_string(),
-        )];
+        let messages = vec![ChatMessage::user("[IMAGE:/tmp/1.png]\n[IMAGE:/tmp/2.png]".to_string())];
 
         let config = MultimodalConfig {
             max_images: 1,
@@ -560,11 +528,7 @@ mod tests {
             .await
             .expect_err("should reject image count overflow");
 
-        assert!(
-            error
-                .to_string()
-                .contains("multimodal image limit exceeded")
-        );
+        assert!(error.to_string().contains("multimodal image limit exceeded"));
     }
 
     #[tokio::test]
@@ -577,11 +541,7 @@ mod tests {
             .await
             .expect_err("should reject remote image URL when fetch is disabled");
 
-        assert!(
-            error
-                .to_string()
-                .contains("multimodal remote image fetch is disabled")
-        );
+        assert!(error.to_string().contains("multimodal remote image fetch is disabled"));
     }
 
     #[tokio::test]
@@ -592,10 +552,7 @@ mod tests {
         let bytes = vec![0u8; 1024 * 1024 + 1];
         std::fs::write(&image_path, bytes).unwrap();
 
-        let messages = vec![ChatMessage::user(format!(
-            "[IMAGE:{}]",
-            image_path.display()
-        ))];
+        let messages = vec![ChatMessage::user(format!("[IMAGE:{}]", image_path.display()))];
         let config = MultimodalConfig {
             max_images: 4,
             max_image_size_mb: 1,
@@ -606,17 +563,13 @@ mod tests {
             .await
             .expect_err("should reject oversized local image");
 
-        assert!(
-            error
-                .to_string()
-                .contains("multimodal image size limit exceeded")
-        );
+        assert!(error.to_string().contains("multimodal image size limit exceeded"));
     }
 
     #[test]
     fn extract_ollama_image_payload_supports_data_uris() {
-        let payload = extract_ollama_image_payload("data:image/png;base64,abcd==")
-            .expect("payload should be extracted");
+        let payload =
+            extract_ollama_image_payload("data:image/png;base64,abcd==").expect("payload should be extracted");
         assert_eq!(payload, "abcd==");
     }
 
@@ -626,10 +579,7 @@ mod tests {
         let err = normalize_remote_image("http://localhost/evil.png", 1024 * 1024, &client)
             .await
             .expect_err("should block localhost SSRF");
-        assert!(
-            err.to_string().contains("SSRF blocked"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
     }
 
     #[tokio::test]
@@ -638,39 +588,25 @@ mod tests {
         let err = normalize_remote_image("http://10.0.0.1/secret.png", 1024 * 1024, &client)
             .await
             .expect_err("should block 10.x.x.x SSRF");
-        assert!(
-            err.to_string().contains("SSRF blocked"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
     }
 
     #[tokio::test]
     async fn ssrf_blocks_private_ipv4_192_168() {
         let client = Client::new();
-        let err =
-            normalize_remote_image("http://192.168.1.1/admin.png", 1024 * 1024, &client)
-                .await
-                .expect_err("should block 192.168.x.x SSRF");
-        assert!(
-            err.to_string().contains("SSRF blocked"),
-            "unexpected error: {err}"
-        );
+        let err = normalize_remote_image("http://192.168.1.1/admin.png", 1024 * 1024, &client)
+            .await
+            .expect_err("should block 192.168.x.x SSRF");
+        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
     }
 
     #[tokio::test]
     async fn ssrf_blocks_cloud_metadata_endpoint() {
         let client = Client::new();
-        let err = normalize_remote_image(
-            "http://169.254.169.254/latest/meta-data/",
-            1024 * 1024,
-            &client,
-        )
-        .await
-        .expect_err("should block cloud metadata SSRF");
-        assert!(
-            err.to_string().contains("SSRF blocked"),
-            "unexpected error: {err}"
-        );
+        let err = normalize_remote_image("http://169.254.169.254/latest/meta-data/", 1024 * 1024, &client)
+            .await
+            .expect_err("should block cloud metadata SSRF");
+        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
     }
 
     #[tokio::test]
@@ -679,23 +615,16 @@ mod tests {
         let err = normalize_remote_image("http://172.16.0.1/img.png", 1024 * 1024, &client)
             .await
             .expect_err("should block 172.16.x.x SSRF");
-        assert!(
-            err.to_string().contains("SSRF blocked"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
     }
 
     #[tokio::test]
     async fn ssrf_blocks_loopback_127_0_0_1() {
         let client = Client::new();
-        let err =
-            normalize_remote_image("http://127.0.0.1:8080/img.png", 1024 * 1024, &client)
-                .await
-                .expect_err("should block 127.0.0.1 SSRF");
-        assert!(
-            err.to_string().contains("SSRF blocked"),
-            "unexpected error: {err}"
-        );
+        let err = normalize_remote_image("http://127.0.0.1:8080/img.png", 1024 * 1024, &client)
+            .await
+            .expect_err("should block 127.0.0.1 SSRF");
+        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
     }
 
     #[tokio::test]
@@ -704,8 +633,7 @@ mod tests {
         // It will fail at the HTTP fetch stage (connection error or non-image),
         // but that error should NOT be "SSRF blocked".
         let client = Client::new();
-        let result =
-            normalize_remote_image("https://example.com/image.png", 1024 * 1024, &client).await;
+        let result = normalize_remote_image("https://example.com/image.png", 1024 * 1024, &client).await;
         match result {
             Ok(_) => {} // unlikely but acceptable
             Err(err) => {

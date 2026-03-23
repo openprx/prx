@@ -114,10 +114,7 @@ impl IdempotencyStore {
             return false;
         }
         if keys.len() >= self.max_keys {
-            let evict_key = keys
-                .iter()
-                .min_by_key(|(_, seen_at)| *seen_at)
-                .map(|(k, _)| k.clone());
+            let evict_key = keys.iter().min_by_key(|(_, seen_at)| *seen_at).map(|(k, _)| k.clone());
             if let Some(evict_key) = evict_key {
                 keys.remove(&evict_key);
             }
@@ -219,9 +216,7 @@ async fn handle_webhook_event(
 
     // HMAC signature verification (when signing secret is configured)
     if let Some(ref signing_secret) = state.signing_secret {
-        let signature = headers
-            .get("X-Webhook-Signature")
-            .and_then(|v| v.to_str().ok());
+        let signature = headers.get("X-Webhook-Signature").and_then(|v| v.to_str().ok());
         match signature {
             Some(sig) if verify_webhook_hmac_signature(signing_secret, &body, sig) => {}
             _ => {
@@ -278,15 +273,10 @@ async fn handle_webhook_event(
 
     let db_path = (*state.db_path).clone();
     let acl_enabled = state.acl_enabled;
-    let saved =
-        tokio::task::spawn_blocking(move || persist_event(&db_path, &event, acl_enabled)).await;
+    let saved = tokio::task::spawn_blocking(move || persist_event(&db_path, &event, acl_enabled)).await;
 
     match saved {
-        Ok(Ok(topic_id)) => (
-            StatusCode::OK,
-            Json(serde_json::json!(WebhookAck { topic_id })),
-        )
-            .into_response(),
+        Ok(Ok(topic_id)) => (StatusCode::OK, Json(serde_json::json!(WebhookAck { topic_id }))).into_response(),
         Ok(Err(error)) => {
             tracing::error!("failed to persist webhook event: {error}");
             (
@@ -330,10 +320,7 @@ fn is_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
     // Try X-Webhook-Token first (preferred, matches gateway behavior)
     if let Some(raw) = headers.get("X-Webhook-Token") {
         if let Ok(token) = raw.to_str() {
-            return expected_token
-                .as_bytes()
-                .ct_eq(token.trim().as_bytes())
-                .into();
+            return expected_token.as_bytes().ct_eq(token.trim().as_bytes()).into();
         }
     }
 
@@ -350,10 +337,7 @@ fn is_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
         return false;
     };
 
-    expected_token
-        .as_bytes()
-        .ct_eq(token.trim().as_bytes())
-        .into()
+    expected_token.as_bytes().ct_eq(token.trim().as_bytes()).into()
 }
 
 fn parse_webhook_event(payload: Value) -> Result<WebhookEvent> {
@@ -361,8 +345,8 @@ fn parse_webhook_event(payload: Value) -> Result<WebhookEvent> {
         return map_openpr_event(&payload);
     }
 
-    let mut event: WebhookEvent = serde_json::from_value(payload)
-        .context("payload does not match generic webhook event format")?;
+    let mut event: WebhookEvent =
+        serde_json::from_value(payload).context("payload does not match generic webhook event format")?;
 
     normalize_event(&mut event);
     validate_event(&event)?;
@@ -441,41 +425,22 @@ fn map_openpr_event(payload: &Value) -> Result<WebhookEvent> {
 
     let external_url = first_string(
         payload,
-        &[
-            "external_url",
-            "issue_url",
-            "comment_url",
-            "url",
-            "html_url",
-        ],
+        &["external_url", "issue_url", "comment_url", "url", "html_url"],
     );
 
-    let title = first_string(
-        payload,
-        &["title", "issue_title", "comment_title", "subject", "name"],
-    )
-    .unwrap_or_else(|| format!("OpenPR {}", external_id));
+    let title = first_string(payload, &["title", "issue_title", "comment_title", "subject", "name"])
+        .unwrap_or_else(|| format!("OpenPR {}", external_id));
 
     let content = first_string(
         payload,
-        &[
-            "content",
-            "body",
-            "description",
-            "text",
-            "comment",
-            "message",
-        ],
+        &["content", "body", "description", "text", "comment", "message"],
     )
     .unwrap_or_else(|| title.clone());
 
     let actor = first_string(payload, &["actor", "operator", "author", "user"]);
 
-    let timestamp = first_string(
-        payload,
-        &["timestamp", "occurred_at", "created_at", "updated_at"],
-    )
-    .unwrap_or_else(|| Utc::now().to_rfc3339());
+    let timestamp = first_string(payload, &["timestamp", "occurred_at", "created_at", "updated_at"])
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
 
     let mut event = WebhookEvent {
         source,
@@ -533,8 +498,7 @@ fn normalize_openpr_event_type(raw: &str) -> String {
 }
 
 fn persist_event(db_path: &Path, event: &WebhookEvent, acl_enabled: bool) -> Result<String> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("failed to open webhook db {}", db_path.display()))?;
+    let conn = Connection::open(db_path).with_context(|| format!("failed to open webhook db {}", db_path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))
         .context("failed to configure webhook sqlite busy_timeout")?;
 
@@ -545,11 +509,7 @@ fn persist_event(db_path: &Path, event: &WebhookEvent, acl_enabled: bool) -> Res
     )? {
         Some(topic) => topic.id,
         None => {
-            let fingerprint = webhook_topic_fingerprint(
-                event.project.as_deref(),
-                &event.external_id,
-                &event.title,
-            );
+            let fingerprint = webhook_topic_fingerprint(event.project.as_deref(), &event.external_id, &event.title);
             crate::memory::topic::create_topic(
                 &conn,
                 &event.title,
@@ -573,12 +533,7 @@ fn persist_event(db_path: &Path, event: &WebhookEvent, acl_enabled: bool) -> Res
     let system_sender = format!("system:{}", event.source);
     crate::memory::topic::add_participant(&conn, &topic_id, &system_sender, "observer")?;
 
-    let memory_key = format!(
-        "webhook:{}:{}:{}",
-        event.source,
-        event.external_id,
-        Uuid::new_v4()
-    );
+    let memory_key = format!("webhook:{}:{}:{}", event.source, event.external_id, Uuid::new_v4());
     let content = format_event_memory(event);
     let memory_ctx = MemoryWriteContext {
         channel: Some("webhook".to_string()),
@@ -660,19 +615,9 @@ fn webhook_replay_fingerprint(event: &WebhookEvent) -> String {
         "{}:{}:{}:{}:{}:{}",
         event.source.trim().to_lowercase(),
         event.event_type.trim().to_lowercase(),
-        event
-            .project
-            .as_deref()
-            .unwrap_or("_global")
-            .trim()
-            .to_lowercase(),
+        event.project.as_deref().unwrap_or("_global").trim().to_lowercase(),
         event.external_id.trim().to_lowercase(),
-        event
-            .actor
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .to_lowercase(),
+        event.actor.as_deref().unwrap_or_default().trim().to_lowercase(),
         event.timestamp.trim()
     );
     let digest = Sha256::digest(payload.as_bytes());
@@ -825,10 +770,7 @@ mod tests {
 
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let topic_id = parsed
-            .get("topic_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap();
+        let topic_id = parsed.get("topic_id").and_then(serde_json::Value::as_str).unwrap();
         assert!(!topic_id.is_empty());
 
         let conn = Connection::open(db_path).unwrap();
@@ -915,9 +857,7 @@ mod tests {
     async fn webhook_server_starts_with_listener() {
         let tmp = TempDir::new().unwrap();
         let state = setup_state(&tmp, "secret");
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .unwrap();
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let handle = tokio::spawn(async move {

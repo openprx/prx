@@ -90,10 +90,8 @@ async fn next_core_index(memory: &dyn Memory, day: &str, prefix: &str) -> Result
         .await?
         .into_iter()
         .filter(|entry| {
-            matches!(
-                entry.session_id.as_deref(),
-                Some(SELF_SYSTEM_SESSION_ID) | None
-            ) && entry.key.starts_with("self/decisions/")
+            matches!(entry.session_id.as_deref(), Some(SELF_SYSTEM_SESSION_ID) | None)
+                && entry.key.starts_with("self/decisions/")
         })
         .filter(|entry| entry.key.starts_with(&key_prefix))
         .filter(|entry| seen.insert(entry_fingerprint((&entry.key, &entry.content))))
@@ -168,12 +166,7 @@ mod tests {
             Ok(())
         }
 
-        async fn recall(
-            &self,
-            _query: &str,
-            _limit: usize,
-            _session_id: Option<&str>,
-        ) -> Result<Vec<MemoryEntry>> {
+        async fn recall(&self, _query: &str, _limit: usize, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
 
@@ -182,18 +175,12 @@ mod tests {
             Ok(entries.get(key).cloned())
         }
 
-        async fn list(
-            &self,
-            category: Option<&MemoryCategory>,
-            session_id: Option<&str>,
-        ) -> Result<Vec<MemoryEntry>> {
+        async fn list(&self, category: Option<&MemoryCategory>, session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
             let entries = self.entries.lock().await;
             Ok(entries
                 .values()
                 .filter(|entry| category.is_none_or(|c| &entry.category == c))
-                .filter(|entry| {
-                    session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid))
-                })
+                .filter(|entry| session_id.is_none_or(|sid| entry.session_id.as_deref() == Some(sid)))
                 .cloned()
                 .collect())
         }
@@ -216,22 +203,12 @@ mod tests {
     #[tokio::test]
     async fn proposal_log_uses_core_category_and_incrementing_index() {
         let memory = TestMemory::new();
-        log_change_proposal(
-            &memory,
-            "policy.rate_limit",
-            "raise to 200",
-            "fewer retries",
-        )
-        .await
-        .unwrap();
-        log_change_proposal(
-            &memory,
-            "policy.timeout",
-            "set to 8s",
-            "reduce hanging calls",
-        )
-        .await
-        .unwrap();
+        log_change_proposal(&memory, "policy.rate_limit", "raise to 200", "fewer retries")
+            .await
+            .unwrap();
+        log_change_proposal(&memory, "policy.timeout", "set to 8s", "reduce hanging calls")
+            .await
+            .unwrap();
 
         let day = Utc::now().date_naive().to_string();
         let key1 = format!("self/decisions/{day}/proposal_1");
@@ -249,15 +226,9 @@ mod tests {
     #[tokio::test]
     async fn outcome_log_uses_separate_core_index_space() {
         let memory = TestMemory::new();
-        log_change_proposal(&memory, "k1", "proposal", "expect")
-            .await
-            .unwrap();
-        log_change_outcome(&memory, "k1", "actual", 0.12)
-            .await
-            .unwrap();
-        log_change_outcome(&memory, "k2", "actual-2", -0.05)
-            .await
-            .unwrap();
+        log_change_proposal(&memory, "k1", "proposal", "expect").await.unwrap();
+        log_change_outcome(&memory, "k1", "actual", 0.12).await.unwrap();
+        log_change_outcome(&memory, "k2", "actual-2", -0.05).await.unwrap();
 
         let day = Utc::now().date_naive().to_string();
         let outcome1 = format!("self/decisions/{day}/outcome_1");
@@ -338,12 +309,7 @@ mod tests {
             Ok(())
         }
 
-        async fn recall(
-            &self,
-            _query: &str,
-            _limit: usize,
-            _session_id: Option<&str>,
-        ) -> Result<Vec<MemoryEntry>> {
+        async fn recall(&self, _query: &str, _limit: usize, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
 
@@ -352,11 +318,7 @@ mod tests {
             Ok(entries.get(key).cloned())
         }
 
-        async fn list(
-            &self,
-            category: Option<&MemoryCategory>,
-            _session_id: Option<&str>,
-        ) -> Result<Vec<MemoryEntry>> {
+        async fn list(&self, category: Option<&MemoryCategory>, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
             let entries = self.entries.lock().await;
             Ok(entries
                 .values()
@@ -422,9 +384,7 @@ mod tests {
         let content = format!(
             "# Long-Term Memory\n\n- **self/decisions/{day}/proposal_1**: legacy\n- **self/decisions/{day}/proposal_1**: legacy\n"
         );
-        tokio::fs::write(tmp.path().join("MEMORY.md"), content)
-            .await
-            .unwrap();
+        tokio::fs::write(tmp.path().join("MEMORY.md"), content).await.unwrap();
 
         log_change_proposal(&memory, "policy.window", "raise to 50", "match new default")
             .await

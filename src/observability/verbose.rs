@@ -27,9 +27,7 @@ impl Observer for VerboseObserver {
                     provider, model, messages_count
                 );
             }
-            ObserverEvent::LlmResponse {
-                duration, success, ..
-            } => {
+            ObserverEvent::LlmResponse { duration, success, .. } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 eprintln!("< Receive (success={success}, duration_ms={ms})");
             }
@@ -101,9 +99,7 @@ mod tests {
             success: true,
             error_message: None,
         });
-        obs.record_event(&ObserverEvent::ToolCallStart {
-            tool: "shell".into(),
-        });
+        obs.record_event(&ObserverEvent::ToolCallStart { tool: "shell".into() });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
             duration: Duration::from_millis(2),

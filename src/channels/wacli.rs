@@ -22,9 +22,7 @@
 //! sends the JSON-RPC request, reads the response, and closes. This keeps the
 //! implementation simple and avoids shared state for the send path.
 
-use super::traits::{
-    Channel, ChannelCapabilities, ChannelMessage, SendMessage, extract_outgoing_media,
-};
+use super::traits::{Channel, ChannelCapabilities, ChannelMessage, SendMessage, extract_outgoing_media};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -85,8 +83,7 @@ fn next_id() -> u64 {
 
 fn parse_response_id(id: &Option<Value>) -> Option<u64> {
     let id = id.as_ref()?;
-    id.as_u64()
-        .or_else(|| id.as_str().and_then(|s| s.parse::<u64>().ok()))
+    id.as_u64().or_else(|| id.as_str().and_then(|s| s.parse::<u64>().ok()))
 }
 
 /// Configuration for the wacli channel.
@@ -192,8 +189,8 @@ impl WacliChannel {
             method,
             params,
         };
-        let mut line = serde_json::to_string(&req)
-            .with_context(|| format!("serializing JSON-RPC request for '{method}'"))?;
+        let mut line =
+            serde_json::to_string(&req).with_context(|| format!("serializing JSON-RPC request for '{method}'"))?;
         line.push('\n');
         writer
             .write_all(line.as_bytes())
@@ -214,9 +211,7 @@ impl WacliChannel {
                 .with_context(|| format!("reading JSON-RPC response for '{method}'"))?;
 
             if n == 0 {
-                anyhow::bail!(
-                    "wacli daemon closed connection before sending response to '{method}'"
-                );
+                anyhow::bail!("wacli daemon closed connection before sending response to '{method}'");
             }
 
             let trimmed = response_line.trim();
@@ -230,12 +225,7 @@ impl WacliChannel {
                     continue;
                 }
                 if let Some(ref err) = resp.error {
-                    anyhow::bail!(
-                        "wacli RPC '{}' returned error {}: {}",
-                        method,
-                        err.code,
-                        err.message
-                    );
+                    anyhow::bail!("wacli RPC '{}' returned error {}: {}", method, err.code, err.message);
                 }
                 return resp
                     .result
@@ -358,10 +348,7 @@ impl WacliChannel {
     async fn handle_event(&self, notif: RpcNotification, tx: &mpsc::Sender<ChannelMessage>) {
         let Some(params) = notif.params else { return };
 
-        let event_type = params
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
+        let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or_default();
 
         if event_type != "message.received" {
             return;
@@ -376,10 +363,7 @@ impl WacliChannel {
         };
 
         // Skip messages sent by us.
-        let from_me = payload
-            .get("fromMe")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let from_me = payload.get("fromMe").and_then(|v| v.as_bool()).unwrap_or(false);
         if from_me {
             return;
         }
@@ -401,30 +385,14 @@ impl WacliChannel {
             return;
         }
 
-        let chat_jid = payload
-            .get("chatJid")
-            .and_then(|v| v.as_str())
-            .unwrap_or(sender);
+        let chat_jid = payload.get("chatJid").and_then(|v| v.as_str()).unwrap_or(sender);
         let group_name = payload.get("groupName").and_then(|v| v.as_str());
-        let sender_name = payload
-            .get("pushName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let self_jid = payload
-            .get("selfJid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let sender_name = payload.get("pushName").and_then(|v| v.as_str()).unwrap_or("");
+        let self_jid = payload.get("selfJid").and_then(|v| v.as_str()).unwrap_or("");
         let is_group = chat_jid.contains("@g.us");
-        let sender_display = if sender_name.is_empty() {
-            sender
-        } else {
-            sender_name
-        };
+        let sender_display = if sender_name.is_empty() { sender } else { sender_name };
 
-        let text = payload
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
+        let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or_default();
 
         // Build attachment description if media is present.
         let media_desc = payload.get("media").and_then(|m| {
@@ -491,11 +459,7 @@ impl WacliChannel {
         let mentioned_uuids: Vec<String> = payload
             .get("mentionedJids")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
         let channel_msg = ChannelMessage {
@@ -561,10 +525,7 @@ impl Channel for WacliChannel {
         struct ListChatsParams {
             limit: i32,
         }
-        match self
-            .rpc_call("listChats", ListChatsParams { limit: 1 })
-            .await
-        {
+        match self.rpc_call("listChats", ListChatsParams { limit: 1 }).await {
             Ok(_) => true,
             Err(e) => {
                 tracing::debug!("wacli health_check failed: {e}");
@@ -640,11 +601,7 @@ mod tests {
 
     #[test]
     fn specific_allowlist_filters() {
-        let ch = WacliChannel::with_params(
-            "127.0.0.1".into(),
-            16867,
-            vec!["alice@s.whatsapp.net".into()],
-        );
+        let ch = WacliChannel::with_params("127.0.0.1".into(), 16867, vec!["alice@s.whatsapp.net".into()]);
         assert!(ch.is_allowed("alice@s.whatsapp.net"));
         assert!(!ch.is_allowed("bob@s.whatsapp.net"));
     }
@@ -785,11 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_event_blocked_by_allowlist() {
-        let ch = WacliChannel::with_params(
-            "127.0.0.1".into(),
-            16867,
-            vec!["allowed@s.whatsapp.net".into()],
-        );
+        let ch = WacliChannel::with_params("127.0.0.1".into(), 16867, vec!["allowed@s.whatsapp.net".into()]);
         let (tx, mut rx) = mpsc::channel(1);
 
         let notif = RpcNotification {
@@ -806,10 +759,7 @@ mod tests {
         };
 
         ch.handle_event(notif, &tx).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "non-allowlisted sender should be blocked"
-        );
+        assert!(rx.try_recv().is_err(), "non-allowlisted sender should be blocked");
     }
 
     #[tokio::test]

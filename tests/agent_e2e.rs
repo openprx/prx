@@ -17,9 +17,7 @@ use openprx::memory;
 use openprx::memory::Memory;
 use openprx::observability::{NoopObserver, Observer};
 use openprx::providers::traits::ChatMessage;
-use openprx::providers::{
-    ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderRuntimeOptions, ToolCall,
-};
+use openprx::providers::{ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderRuntimeOptions, ToolCall};
 use openprx::tools::{Tool, ToolResult};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -53,12 +51,7 @@ impl Provider for MockProvider {
         Ok("fallback".into())
     }
 
-    async fn chat(
-        &self,
-        _request: ChatRequest<'_>,
-        _model: &str,
-        _temperature: f64,
-    ) -> Result<ChatResponse> {
+    async fn chat(&self, _request: ChatRequest<'_>, _model: &str, _temperature: f64) -> Result<ChatResponse> {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {
@@ -111,12 +104,7 @@ struct CountingTool {
 impl CountingTool {
     fn new() -> (Self, Arc<Mutex<usize>>) {
         let count = Arc::new(Mutex::new(0));
-        (
-            Self {
-                count: count.clone(),
-            },
-            count,
-        )
+        (Self { count: count.clone() }, count)
     }
 }
 
@@ -172,16 +160,8 @@ impl Provider for RecordingProvider {
         Ok("fallback".into())
     }
 
-    async fn chat(
-        &self,
-        request: ChatRequest<'_>,
-        _model: &str,
-        _temperature: f64,
-    ) -> Result<ChatResponse> {
-        self.recorded_requests
-            .lock()
-            .unwrap()
-            .push(request.messages.to_vec());
+    async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> Result<ChatResponse> {
+        self.recorded_requests.lock().unwrap().push(request.messages.to_vec());
 
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
@@ -296,9 +276,7 @@ fn build_recording_agent(
 /// Validates the simplest happy path: user message → LLM text response.
 #[tokio::test]
 async fn e2e_simple_text_response() {
-    let provider = Box::new(MockProvider::new(vec![text_response(
-        "Hello from mock provider",
-    )]));
+    let provider = Box::new(MockProvider::new(vec![text_response("Hello from mock provider")]));
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
 
     let response = agent.turn("hi").await.unwrap();
@@ -319,10 +297,7 @@ async fn e2e_single_tool_call_cycle() {
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("run echo").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "Expected non-empty response after tool execution"
-    );
+    assert!(!response.is_empty(), "Expected non-empty response after tool execution");
 }
 
 /// Validates multi-step tool chain: tool A → tool B → tool C → final response.
@@ -346,10 +321,7 @@ async fn e2e_multi_step_tool_chain() {
 
     let mut agent = build_agent(provider, vec![Box::new(counting_tool)]);
     let response = agent.turn("count twice").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "Expected non-empty response after tool chain"
-    );
+    assert!(!response.is_empty(), "Expected non-empty response after tool chain");
     assert_eq!(*count.lock().unwrap(), 2);
 }
 
@@ -371,10 +343,7 @@ async fn e2e_xml_dispatcher_tool_call() {
 
     let mut agent = build_agent_xml(provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("test xml dispatch").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "Expected non-empty response from XML dispatcher"
-    );
+    assert!(!response.is_empty(), "Expected non-empty response from XML dispatcher");
 }
 
 /// Validates that multiple sequential turns maintain conversation coherence.
@@ -490,11 +459,7 @@ async fn e2e_multi_turn_history_fidelity() {
     let req2_users: Vec<&ChatMessage> = req2.iter().filter(|m| m.role == "user").collect();
     let req2_assts: Vec<&ChatMessage> = req2.iter().filter(|m| m.role == "assistant").collect();
     assert_eq!(req2_users.len(), 2, "Request 2: expected 2 user messages");
-    assert_eq!(
-        req2_assts.len(),
-        1,
-        "Request 2: expected 1 assistant message"
-    );
+    assert_eq!(req2_assts.len(), 1, "Request 2: expected 1 assistant message");
     assert!(req2_users[0].content.contains("msg 1"));
     assert!(req2_users[1].content.contains("msg 2"));
     assert_eq!(req2_assts[0].content, "response 1");
@@ -504,11 +469,7 @@ async fn e2e_multi_turn_history_fidelity() {
     let req3_users: Vec<&ChatMessage> = req3.iter().filter(|m| m.role == "user").collect();
     let req3_assts: Vec<&ChatMessage> = req3.iter().filter(|m| m.role == "assistant").collect();
     assert_eq!(req3_users.len(), 3, "Request 3: expected 3 user messages");
-    assert_eq!(
-        req3_assts.len(),
-        2,
-        "Request 3: expected 2 assistant messages"
-    );
+    assert_eq!(req3_assts.len(), 2, "Request 3: expected 2 assistant messages");
     assert!(req3_users[0].content.contains("msg 1"));
     assert!(req3_users[1].content.contains("msg 2"));
     assert!(req3_users[2].content.contains("msg 3"));
@@ -521,9 +482,7 @@ async fn e2e_multi_turn_history_fidelity() {
     assert!(matches!(&history[0], ConversationMessage::Chat(c) if c.role == "system"));
     assert!(matches!(&history[1], ConversationMessage::Chat(c) if c.role == "user"));
     assert!(matches!(&history[2], ConversationMessage::Chat(c) if c.role == "assistant"));
-    assert!(
-        matches!(&history[6], ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "response 3")
-    );
+    assert!(matches!(&history[6], ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "response 3"));
 }
 
 /// Validates that a custom MemoryLoader injects RAG context into user
@@ -575,8 +534,7 @@ async fn e2e_memory_enrichment_injects_context() {
 /// message is enriched, and the provider sees the full enriched history.
 #[tokio::test]
 async fn e2e_multi_turn_with_memory_enrichment() {
-    let (provider, recorded) =
-        RecordingProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
+    let (provider, recorded) = RecordingProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
 
     let memory_context = "[Memory context]\n- project: openprx\n\n";
     let loader = StaticMemoryLoader::new(memory_context);
@@ -611,10 +569,7 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     assert!(req2_users[1].content.ends_with("second question"));
 
     // Assistant response from turn 1 preserved
-    let req2_assts: Vec<&ChatMessage> = requests[1]
-        .iter()
-        .filter(|m| m.role == "assistant")
-        .collect();
+    let req2_assts: Vec<&ChatMessage> = requests[1].iter().filter(|m| m.role == "assistant").collect();
     assert_eq!(req2_assts.len(), 1);
     assert_eq!(req2_assts[0].content, "answer 1");
 
@@ -665,9 +620,7 @@ async fn e2e_live_openai_codex_multi_turn() {
         ChatMessage::system("You are a concise assistant. Reply in one short sentence."),
         ChatMessage::user("The secret word is \"zephyr\". Just confirm you noted it."),
     ];
-    let response1 = provider
-        .chat_with_history(&messages_turn1, model, 0.0)
-        .await;
+    let response1 = provider.chat_with_history(&messages_turn1, model, 0.0).await;
     assert!(response1.is_ok(), "Turn 1 failed: {:?}", response1.err());
     let r1 = response1.unwrap();
     assert!(!r1.is_empty(), "Turn 1 returned empty response");
@@ -679,9 +632,7 @@ async fn e2e_live_openai_codex_multi_turn() {
         ChatMessage::assistant(&r1),
         ChatMessage::user("What is the secret word?"),
     ];
-    let response2 = provider
-        .chat_with_history(&messages_turn2, model, 0.0)
-        .await;
+    let response2 = provider.chat_with_history(&messages_turn2, model, 0.0).await;
     assert!(response2.is_ok(), "Turn 2 failed: {:?}", response2.err());
     let r2 = response2.unwrap().to_lowercase();
     assert!(

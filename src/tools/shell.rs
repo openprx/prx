@@ -51,9 +51,7 @@ impl ShellTool {
             "memory/brain.db-journal",
             "memory/",
         ];
-        protected_markers
-            .iter()
-            .any(|marker| lowered.contains(marker))
+        protected_markers.iter().any(|marker| lowered.contains(marker))
     }
 }
 
@@ -90,18 +88,13 @@ impl Tool for ShellTool {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
-        let approved = args
-            .get("approved")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
 
         if self.acl_enabled && Self::references_protected_memory_path(command) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(
-                    "Access denied: shell command references ACL-protected memory path".into(),
-                ),
+                error: Some("Access denied: shell command references ACL-protected memory path".into()),
             });
         }
 
@@ -135,10 +128,7 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
-        let mut cmd = match self
-            .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
-        {
+        let mut cmd = match self.runtime.build_shell_command(command, &self.security.workspace_dir) {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -158,10 +148,7 @@ impl Tool for ShellTool {
         // Override PATH with a safe default to prevent execution of binaries from
         // untrusted directories.  The inherited PATH may include user-writable dirs.
         if cfg!(target_os = "windows") {
-            cmd.env(
-                "PATH",
-                r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem",
-            );
+            cmd.env("PATH", r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem");
         } else {
             cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
         }
@@ -177,8 +164,7 @@ impl Tool for ShellTool {
             });
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
+        let result = tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -198,11 +184,7 @@ impl Tool for ShellTool {
                 Ok(ToolResult {
                     success: output.status.success(),
                     output: stdout,
-                    error: if stderr.is_empty() {
-                        None
-                    } else {
-                        Some(stderr)
-                    },
+                    error: if stderr.is_empty() { None } else { Some(stderr) },
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
@@ -213,9 +195,7 @@ impl Tool for ShellTool {
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
-                )),
+                error: Some(format!("Command timed out after {SHELL_TIMEOUT_SECS}s and was killed")),
             }),
         }
     }
@@ -425,12 +405,7 @@ mod tests {
         let _g1 = EnvGuard::set("API_KEY", "sk-test-secret-12345");
         let _g2 = EnvGuard::set("ZEROCLAW_API_KEY", "sk-test-secret-67890");
 
-        let tool = ShellTool::new(
-            test_security_with_env_cmd(),
-            test_runtime(),
-            test_sandbox(),
-            false,
-        );
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime(), test_sandbox(), false);
         let result = tool
             .execute(json!({"command": "env"}))
             .await
@@ -448,32 +423,21 @@ mod tests {
 
     #[tokio::test]
     async fn shell_preserves_path_and_home() {
-        let tool = ShellTool::new(
-            test_security_with_env_cmd(),
-            test_runtime(),
-            test_sandbox(),
-            false,
-        );
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime(), test_sandbox(), false);
 
         let result = tool
             .execute(json!({"command": "echo $HOME"}))
             .await
             .expect("echo HOME command should succeed");
         assert!(result.success);
-        assert!(
-            !result.output.trim().is_empty(),
-            "HOME should be available in shell"
-        );
+        assert!(!result.output.trim().is_empty(), "HOME should be available in shell");
 
         let result = tool
             .execute(json!({"command": "echo $PATH"}))
             .await
             .expect("echo PATH command should succeed");
         assert!(result.success);
-        assert!(
-            !result.output.trim().is_empty(),
-            "PATH should be available in shell"
-        );
+        assert!(!result.output.trim().is_empty(), "PATH should be available in shell");
     }
 
     #[tokio::test]
@@ -491,13 +455,7 @@ mod tests {
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
-        assert!(
-            denied
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("explicit approval")
-        );
+        assert!(denied.error.as_deref().unwrap_or("").contains("explicit approval"));
 
         let allowed = tool
             .execute(json!({
@@ -508,8 +466,7 @@ mod tests {
             .expect("approved command execution should succeed");
         assert!(allowed.success);
 
-        let _ =
-            tokio::fs::remove_file(std::env::temp_dir().join("openprx_shell_approval_test")).await;
+        let _ = tokio::fs::remove_file(std::env::temp_dir().join("openprx_shell_approval_test")).await;
     }
 
     // -- Shell timeout enforcement tests --
@@ -521,10 +478,7 @@ mod tests {
 
     #[test]
     fn shell_output_limit_is_1mb() {
-        assert_eq!(
-            MAX_OUTPUT_BYTES, 1_048_576,
-            "max output must be 1 MB to prevent OOM"
-        );
+        assert_eq!(MAX_OUTPUT_BYTES, 1_048_576, "max output must be 1 MB to prevent OOM");
     }
 
     // -- Non-UTF8 binary output tests --
@@ -542,18 +496,9 @@ mod tests {
 
     #[test]
     fn shell_safe_env_vars_includes_essentials() {
-        assert!(
-            SAFE_ENV_VARS.contains(&"PATH"),
-            "PATH must be in safe env vars"
-        );
-        assert!(
-            SAFE_ENV_VARS.contains(&"HOME"),
-            "HOME must be in safe env vars"
-        );
-        assert!(
-            SAFE_ENV_VARS.contains(&"TERM"),
-            "TERM must be in safe env vars"
-        );
+        assert!(SAFE_ENV_VARS.contains(&"PATH"), "PATH must be in safe env vars");
+        assert!(SAFE_ENV_VARS.contains(&"HOME"), "HOME must be in safe env vars");
+        assert!(SAFE_ENV_VARS.contains(&"TERM"), "TERM must be in safe env vars");
     }
 
     #[tokio::test]
@@ -618,10 +563,7 @@ mod tests {
             "PATH should use safe defaults, got: {path_output}"
         );
         // Should NOT contain user-specific paths like .cargo/bin or node_modules
-        assert!(
-            !path_output.contains(".cargo"),
-            "safe PATH should not contain .cargo"
-        );
+        assert!(!path_output.contains(".cargo"), "safe PATH should not contain .cargo");
     }
 
     #[tokio::test]
@@ -638,11 +580,7 @@ mod tests {
             .await
             .expect("test: should execute");
         assert!(result.success);
-        assert_eq!(
-            result.output.trim(),
-            "unset",
-            "API keys should not be in child env"
-        );
+        assert_eq!(result.output.trim(), "unset", "API keys should not be in child env");
     }
 
     #[tokio::test]

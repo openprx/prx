@@ -93,12 +93,7 @@ impl EventBus {
     }
 
     /// Internal publish with recursion depth tracking.
-    pub async fn publish_with_depth(
-        &self,
-        topic: &str,
-        payload: &str,
-        depth: u32,
-    ) -> Result<(), String> {
+    pub async fn publish_with_depth(&self, topic: &str, payload: &str, depth: u32) -> Result<(), String> {
         if depth > MAX_RECURSION_DEPTH {
             return Err(format!(
                 "event bus: recursion depth limit ({MAX_RECURSION_DEPTH}) exceeded for topic '{topic}'"
@@ -246,20 +241,12 @@ impl EventBus {
             }
         }
 
-        Err(format!(
-            "event bus: subscription ID {subscription_id} not found"
-        ))
+        Err(format!("event bus: subscription ID {subscription_id} not found"))
     }
 
     /// Returns the number of active subscriptions (exact + wildcard).
     pub async fn subscription_count(&self) -> usize {
-        let exact: usize = self
-            .subscriptions
-            .read()
-            .await
-            .values()
-            .map(|v| v.len())
-            .sum();
+        let exact: usize = self.subscriptions.read().await.values().map(|v| v.len()).sum();
         let wildcard = self.wildcard_subscriptions.read().await.len();
         exact + wildcard
     }
@@ -282,10 +269,7 @@ mod tests {
 
     /// Helper: receive one message from `rx` with a short timeout.
     async fn recv_one(rx: &mut mpsc::UnboundedReceiver<EventMessage>) -> Option<EventMessage> {
-        timeout(Duration::from_millis(100), rx.recv())
-            .await
-            .ok()
-            .flatten()
+        timeout(Duration::from_millis(100), rx.recv()).await.ok().flatten()
     }
 
     // 1. Publish to empty bus — no subscribers, should succeed without panic.
@@ -303,9 +287,7 @@ mod tests {
         let (sub_id, mut rx) = bus.subscribe("plugin-a", "weather.update").await.unwrap();
         assert!(sub_id > 0);
 
-        bus.publish("weather.update", r#"{"temp":22}"#)
-            .await
-            .unwrap();
+        bus.publish("weather.update", r#"{"temp":22}"#).await.unwrap();
 
         let msg = recv_one(&mut rx).await.expect("should receive event");
         assert_eq!(msg.topic, "weather.update");
@@ -323,14 +305,10 @@ mod tests {
         // Non-matching topic — should NOT be received.
         bus.publish("news.latest", "payload3").await.unwrap();
 
-        let msg1 = recv_one(&mut rx)
-            .await
-            .expect("should receive weather.update");
+        let msg1 = recv_one(&mut rx).await.expect("should receive weather.update");
         assert_eq!(msg1.topic, "weather.update");
 
-        let msg2 = recv_one(&mut rx)
-            .await
-            .expect("should receive weather.forecast");
+        let msg2 = recv_one(&mut rx).await.expect("should receive weather.forecast");
         assert_eq!(msg2.topic, "weather.forecast");
 
         // No third message.
@@ -396,10 +374,7 @@ mod tests {
         bus.publish("topic.b", "wrong").await.unwrap();
 
         let nothing = recv_one(&mut rx).await;
-        assert!(
-            nothing.is_none(),
-            "cross-topic event should not be received"
-        );
+        assert!(nothing.is_none(), "cross-topic event should not be received");
     }
 
     // 8. Recursion depth limit — depth > MAX_RECURSION_DEPTH returns error.
@@ -426,10 +401,7 @@ mod tests {
         let bus = Arc::new(EventBus::new());
 
         // Subscribe to all events so we can count deliveries.
-        let (_sub_id, mut rx) = bus
-            .subscribe("stress-consumer", "stress.event")
-            .await
-            .unwrap();
+        let (_sub_id, mut rx) = bus.subscribe("stress-consumer", "stress.event").await.unwrap();
 
         // Spawn NUM_PUBLISHERS tasks, each publishing EVENTS_PER_PUBLISHER events.
         let mut handles = Vec::with_capacity(NUM_PUBLISHERS);
@@ -492,9 +464,6 @@ mod tests {
     async fn unsubscribe_unknown_id_returns_error() {
         let bus = EventBus::new();
         let result = bus.unsubscribe(99999).await;
-        assert!(
-            result.is_err(),
-            "unknown subscription ID should return error"
-        );
+        assert!(result.is_err(), "unknown subscription ID should return error");
     }
 }

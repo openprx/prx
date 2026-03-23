@@ -6,9 +6,7 @@ use matrix_sdk::{
     config::SyncSettings,
     ruma::{
         OwnedRoomId, OwnedUserId,
-        events::room::message::{
-            MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
-        },
+        events::room::message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
     },
 };
 use reqwest::Client;
@@ -100,12 +98,7 @@ impl MatrixChannel {
             .filter(|entry| !entry.is_empty())
     }
 
-    pub fn new(
-        homeserver: String,
-        access_token: String,
-        room_id: String,
-        allowed_users: Vec<String>,
-    ) -> Self {
+    pub fn new(homeserver: String, access_token: String, room_id: String, allowed_users: Vec<String>) -> Self {
         Self::new_with_session_hint(homeserver, access_token, room_id, allowed_users, None, None)
     }
 
@@ -347,10 +340,7 @@ impl MatrixChannel {
 
         if configured.starts_with('#') {
             let encoded_alias = Self::encode_path_segment(configured);
-            let url = format!(
-                "{}/_matrix/client/v3/directory/room/{}",
-                self.homeserver, encoded_alias
-            );
+            let url = format!("{}/_matrix/client/v3/directory/room/{}", self.homeserver, encoded_alias);
 
             let resp = self
                 .http_client
@@ -368,9 +358,7 @@ impl MatrixChannel {
             return Ok(resolved.room_id);
         }
 
-        anyhow::bail!(
-            "Matrix room reference must start with '!' (room ID) or '#' (room alias), got: {configured}"
-        )
+        anyhow::bail!("Matrix room reference must start with '!' (room ID) or '#' (room alias), got: {configured}")
     }
 
     async fn ensure_room_accessible(&self, room_id: &str) -> anyhow::Result<()> {
@@ -452,10 +440,7 @@ impl MatrixChannel {
         match client.encryption().get_own_device().await {
             Ok(Some(device)) => {
                 if device.is_verified() {
-                    tracing::info!(
-                        "Matrix device '{}' is verified for E2EE.",
-                        device.device_id()
-                    );
+                    tracing::info!("Matrix device '{}' is verified for E2EE.", device.device_id());
                 } else {
                     tracing::warn!(
                         "Matrix device '{}' is not verified. Some clients may label bot messages as unverified until you sign/verify this device from a trusted session.",
@@ -935,18 +920,9 @@ mod tests {
         let room = resp.rooms.join.get("!room:matrix.org").unwrap();
         assert_eq!(room.timeline.events.len(), 1);
         assert_eq!(room.timeline.events[0].sender, "@user:matrix.org");
-        assert_eq!(
-            room.timeline.events[0].event_id.as_deref(),
-            Some("$event:matrix.org")
-        );
-        assert_eq!(
-            room.timeline.events[0].content.body.as_deref(),
-            Some("Hello!")
-        );
-        assert_eq!(
-            room.timeline.events[0].content.msgtype.as_deref(),
-            Some("m.text")
-        );
+        assert_eq!(room.timeline.events[0].event_id.as_deref(), Some("$event:matrix.org"));
+        assert_eq!(room.timeline.events[0].content.body.as_deref(), Some("Hello!"));
+        assert_eq!(room.timeline.events[0].content.msgtype.as_deref(), Some("m.text"));
     }
 
     #[test]

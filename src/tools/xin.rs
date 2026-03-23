@@ -47,9 +47,7 @@ impl XinTool {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
+                error: Some(format!("Security policy: read-only mode, cannot perform '{action}'")),
             });
         }
         if self.security.is_rate_limited() {
@@ -328,10 +326,7 @@ impl Tool for XinTool {
                         });
                     }
                 };
-                let description = args
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+                let description = args.get("description").and_then(|v| v.as_str()).map(String::from);
                 let execution_mode = match args
                     .get("execution_mode")
                     .and_then(|v| v.as_str())
@@ -340,29 +335,17 @@ impl Tool for XinTool {
                     "shell" => ExecutionMode::Shell,
                     _ => ExecutionMode::AgentSession,
                 };
-                let priority = TaskPriority::from_str_lossy(
-                    args.get("priority")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("normal"),
-                );
-                let recurring = args
-                    .get("recurring")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let interval_secs = args
-                    .get("interval_secs")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let priority =
+                    TaskPriority::from_str_lossy(args.get("priority").and_then(|v| v.as_str()).unwrap_or("normal"));
+                let recurring = args.get("recurring").and_then(|v| v.as_bool()).unwrap_or(false);
+                let interval_secs = args.get("interval_secs").and_then(|v| v.as_u64()).unwrap_or(0);
 
                 // Prevent busy-loop: recurring tasks must have ≥60s interval.
                 if recurring && interval_secs < 60 {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(
-                            "Recurring tasks require interval_secs >= 60 to prevent busy-loops"
-                                .to_string(),
-                        ),
+                        error: Some("Recurring tasks require interval_secs >= 60 to prevent busy-loops".to_string()),
                     });
                 }
 

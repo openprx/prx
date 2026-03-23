@@ -22,24 +22,20 @@ pub mod trace;
 
 #[allow(unused_imports)]
 pub use analyzer::{
-    CandidatePriority, ConfigEfficiencyIssue, DailyDigest, EvolutionAnalyzer, EvolutionCandidate,
-    MetricShift, NoiseMemoryPattern, TaskTypeDigest, TaskTypeWeakness, TrendAnalysis,
-    UserCorrectionCluster,
+    CandidatePriority, ConfigEfficiencyIssue, DailyDigest, EvolutionAnalyzer, EvolutionCandidate, MetricShift,
+    NoiseMemoryPattern, TaskTypeDigest, TaskTypeWeakness, TrendAnalysis, UserCorrectionCluster,
 };
 #[allow(unused_imports)]
 pub use config::{
     DataThresholds, EvolutionConfig, EvolutionGateConfig, EvolutionMode, EvolutionRetentionConfig,
-    EvolutionRuntimeConfig, EvolutionRuntimeConfigManager, MemoryEvolutionConfig,
-    PromptEvolutionConfig, RetrievalFusionWeights, RollbackConfig, StrategyEvolutionConfig,
+    EvolutionRuntimeConfig, EvolutionRuntimeConfigManager, MemoryEvolutionConfig, PromptEvolutionConfig,
+    RetrievalFusionWeights, RollbackConfig, StrategyEvolutionConfig,
 };
 #[allow(unused_imports)]
-pub use config::{
-    EvolutionRetrievalConfig, RetrievalScoreWeights, SharedEvolutionConfig,
-    new_shared_evolution_config,
-};
+pub use config::{EvolutionRetrievalConfig, RetrievalScoreWeights, SharedEvolutionConfig, new_shared_evolution_config};
 pub use cycle_types::{
-    ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal,
-    EvolutionSignals, EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
+    ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
+    EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
 #[allow(unused_imports)]
 pub use engine::{CycleResult, EngineCycleInput, EvolutionEngine, run_engine_cycle};
@@ -47,21 +43,20 @@ pub use engine::{CycleResult, EngineCycleInput, EvolutionEngine, run_engine_cycl
 pub use gate::{EvolutionGate, GateMetrics, GateRejection, GateResult};
 #[allow(unused_imports)]
 pub use judge::{
-    JudgeConfig, JudgeDriftAlert, JudgeEngine, JudgeHealthMonitor, JudgeHealthReport, JudgeResult,
-    JudgeScoringModel, MockJudgeModel, StructuredScores,
+    JudgeConfig, JudgeDriftAlert, JudgeEngine, JudgeHealthMonitor, JudgeHealthReport, JudgeResult, JudgeScoringModel,
+    MockJudgeModel, StructuredScores,
 };
 #[allow(unused_imports)]
 pub use memory_compressor::{
-    CompressionLimits, CompressionResult, EmbeddingSimilarityDetector, FidelityReport,
-    MemoryCompressor, SimilarityDetector,
+    CompressionLimits, CompressionResult, EmbeddingSimilarityDetector, FidelityReport, MemoryCompressor,
+    SimilarityDetector,
 };
 pub use memory_evolution::MemoryEvolutionEngine;
 #[allow(unused_imports)]
 pub use memory_retrieval::{EvolutionAwareRetrieval, EvolutionMemoryRetriever};
 #[allow(unused_imports)]
 pub use memory_safety::{
-    ConflictChecker, MemorySafetyFilter, SafetyCheckResult, SafetyIssue, SafetyIssueKind,
-    SourceMetadata,
+    ConflictChecker, MemorySafetyFilter, SafetyCheckResult, SafetyIssue, SafetyIssueKind, SourceMetadata,
 };
 #[allow(unused_imports)]
 pub use pipeline::{EvolutionPipeline, EvolutionTrigger, PipelineRunReport};
@@ -69,8 +64,8 @@ pub use pipeline::{EvolutionPipeline, EvolutionTrigger, PipelineRunReport};
 pub use prompt_evolution::{PromptEvolutionEngine, PromptMutationType};
 #[allow(unused_imports)]
 pub use record::{
-    Actor, AnnotationSource, ChangeType, DataBasis, DecisionLog, DecisionType, EvolutionLayer,
-    EvolutionLog, EvolutionResult, MemoryAccessLog, MemoryAction, Outcome, TaskType,
+    Actor, AnnotationSource, ChangeType, DataBasis, DecisionLog, DecisionType, EvolutionLayer, EvolutionLog,
+    EvolutionResult, MemoryAccessLog, MemoryAction, Outcome, TaskType,
 };
 #[allow(unused_imports)]
 pub use rollback::{CircuitBreaker, CircuitBreakerState, RollbackManager, VersionSnapshot};
@@ -80,6 +75,4 @@ pub use storage::{AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths};
 #[allow(unused_imports)]
 pub use strategy_evolution::{StrategyEvolutionEngine, TaskDailySummary};
 #[allow(unused_imports)]
-pub use trace::{
-    TraceContext, current_trace, generate_experiment_id, generate_trace_id, with_trace,
-};
+pub use trace::{TraceContext, current_trace, generate_experiment_id, generate_trace_id, with_trace};

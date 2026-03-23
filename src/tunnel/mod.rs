@@ -76,9 +76,7 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
 
         "cloudflare" => {
             let cf = config.cloudflare.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "tunnel.provider = \"cloudflare\" but [tunnel.cloudflare] section is missing"
-                )
+                anyhow::anyhow!("tunnel.provider = \"cloudflare\" but [tunnel.cloudflare] section is missing")
             })?;
             Ok(Some(Box::new(CloudflareTunnel::new(cf.token.clone()))))
         }
@@ -88,16 +86,14 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
                 funnel: false,
                 hostname: None,
             });
-            Ok(Some(Box::new(TailscaleTunnel::new(
-                ts.funnel,
-                ts.hostname.clone(),
-            ))))
+            Ok(Some(Box::new(TailscaleTunnel::new(ts.funnel, ts.hostname.clone()))))
         }
 
         "ngrok" => {
-            let ng = config.ngrok.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("tunnel.provider = \"ngrok\" but [tunnel.ngrok] section is missing")
-            })?;
+            let ng = config
+                .ngrok
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("tunnel.provider = \"ngrok\" but [tunnel.ngrok] section is missing"))?;
             Ok(Some(Box::new(NgrokTunnel::new(
                 ng.auth_token.clone(),
                 ng.domain.clone(),
@@ -106,9 +102,7 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
 
         "custom" => {
             let cu = config.custom.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "tunnel.provider = \"custom\" but [tunnel.custom] section is missing"
-                )
+                anyhow::anyhow!("tunnel.provider = \"custom\" but [tunnel.custom] section is missing")
             })?;
             Ok(Some(Box::new(CustomTunnel::new(
                 cu.start_command.clone(),
@@ -117,9 +111,7 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
             ))))
         }
 
-        other => bail!(
-            "Unknown tunnel provider: \"{other}\". Valid: none, cloudflare, tailscale, ngrok, custom"
-        ),
+        other => bail!("Unknown tunnel provider: \"{other}\". Valid: none, cloudflare, tailscale, ngrok, custom"),
     }
 }
 
@@ -128,9 +120,7 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{
-        CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TunnelConfig,
-    };
+    use crate::config::schema::{CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TunnelConfig};
     use tokio::process::Command;
 
     /// Helper: assert `create_tunnel` returns an error containing `needle`.

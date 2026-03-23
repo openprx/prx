@@ -62,18 +62,14 @@ struct NodeConfigFile {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("info".parse().expect("BUG: static directive")),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().expect("BUG: static directive")))
         .init();
 
     let cli = Cli::parse();
     let mut cfg = NodeServerConfig::default();
 
     if let Some(path) = &cli.config {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("failed reading config file {path}"))?;
+        let raw = std::fs::read_to_string(path).with_context(|| format!("failed reading config file {path}"))?;
         let parsed: NodeConfigFile =
             toml::from_str(&raw).with_context(|| format!("failed parsing config file {path}"))?;
 

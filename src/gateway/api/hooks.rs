@@ -121,10 +121,7 @@ fn read_hooks_file(state: &AppState) -> Result<HooksFile, (StatusCode, Json<serd
     })
 }
 
-fn write_hooks_file(
-    state: &AppState,
-    file: &HooksFile,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+fn write_hooks_file(state: &AppState, file: &HooksFile) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let path = hooks_json_path(state);
     let content = serde_json::to_string_pretty(file).map_err(|e| {
         tracing::warn!("Failed to serialize hooks: {e}");
@@ -160,9 +157,7 @@ fn validate_hook_event(raw_event: &str) -> Result<String, (StatusCode, Json<serd
     }
 }
 
-fn validate_hook_command(
-    raw_command: &str,
-) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+fn validate_hook_command(raw_command: &str) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     let command = raw_command.trim().to_string();
     if command.is_empty() {
         Err((
@@ -174,9 +169,7 @@ fn validate_hook_command(
     }
 }
 
-fn validate_hook_timeout(
-    timeout_ms: Option<u64>,
-) -> Result<Option<u64>, (StatusCode, Json<serde_json::Value>)> {
+fn validate_hook_timeout(timeout_ms: Option<u64>) -> Result<Option<u64>, (StatusCode, Json<serde_json::Value>)> {
     match timeout_ms {
         Some(value) if value < MIN_HOOK_TIMEOUT_MS => Err((
             StatusCode::BAD_REQUEST,

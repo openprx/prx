@@ -359,10 +359,7 @@ mod tests {
     #[tokio::test]
     async fn readonly_blocks_eval() {
         let tool = canvas(AutonomyLevel::ReadOnly);
-        let result = tool
-            .execute(json!({"action": "eval", "script": "1+1"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "eval", "script": "1+1"})).await.unwrap();
         assert!(!result.success);
     }
 
@@ -423,9 +420,7 @@ mod tests {
     #[tokio::test]
     async fn hide_clears_visible() {
         let tool = canvas(AutonomyLevel::Full);
-        let _ = tool
-            .execute(json!({"action": "present", "content": "x"}))
-            .await;
+        let _ = tool.execute(json!({"action": "present", "content": "x"})).await;
         let result = tool.execute(json!({"action": "hide"})).await.unwrap();
         assert!(result.success);
         let out: Value = serde_json::from_str(&result.output).unwrap();
@@ -458,10 +453,7 @@ mod tests {
     #[tokio::test]
     async fn navigate_empty_url_fails() {
         let tool = canvas(AutonomyLevel::Full);
-        let result = tool
-            .execute(json!({"action": "navigate", "url": ""}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "navigate", "url": ""})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("url"));
     }
@@ -469,10 +461,7 @@ mod tests {
     #[tokio::test]
     async fn navigate_whitespace_url_fails() {
         let tool = canvas(AutonomyLevel::Full);
-        let result = tool
-            .execute(json!({"action": "navigate", "url": "   "}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "navigate", "url": "   "})).await.unwrap();
         assert!(!result.success);
     }
 
@@ -488,12 +477,7 @@ mod tests {
         assert!(result.success);
         let out: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(out["action"], "eval");
-        assert!(
-            out["result"]["value"]
-                .as_str()
-                .unwrap_or("")
-                .contains("14 characters")
-        );
+        assert!(out["result"]["value"].as_str().unwrap_or("").contains("14 characters"));
     }
 
     #[tokio::test]
@@ -507,10 +491,7 @@ mod tests {
     #[tokio::test]
     async fn eval_empty_script_fails() {
         let tool = canvas(AutonomyLevel::Full);
-        let result = tool
-            .execute(json!({"action": "eval", "script": ""}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "eval", "script": ""})).await.unwrap();
         assert!(!result.success);
     }
 
@@ -519,9 +500,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_returns_full_state() {
         let tool = canvas(AutonomyLevel::Full);
-        let _ = tool
-            .execute(json!({"action": "present", "content": "snap-test"}))
-            .await;
+        let _ = tool.execute(json!({"action": "present", "content": "snap-test"})).await;
         let _ = tool
             .execute(json!({"action": "navigate", "url": "https://x.com"}))
             .await;
@@ -559,13 +538,7 @@ mod tests {
         let tool = canvas(AutonomyLevel::Full);
         let result = tool.execute(json!({"action": "destroy"})).await.unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Unsupported")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("Unsupported"));
     }
 
     // ── State continuity across actions ─────────────────────────
@@ -573,9 +546,7 @@ mod tests {
     #[tokio::test]
     async fn present_then_hide_then_snapshot_tracks_state() {
         let tool = canvas(AutonomyLevel::Full);
-        let _ = tool
-            .execute(json!({"action": "present", "content": "hello"}))
-            .await;
+        let _ = tool.execute(json!({"action": "present", "content": "hello"})).await;
         let _ = tool.execute(json!({"action": "hide"})).await;
 
         let result = tool.execute(json!({"action": "snapshot"})).await.unwrap();
@@ -587,9 +558,7 @@ mod tests {
     #[tokio::test]
     async fn eval_then_snapshot_captures_eval_result() {
         let tool = canvas(AutonomyLevel::Full);
-        let _ = tool
-            .execute(json!({"action": "eval", "script": "test()"}))
-            .await;
+        let _ = tool.execute(json!({"action": "eval", "script": "test()"})).await;
 
         let result = tool.execute(json!({"action": "snapshot"})).await.unwrap();
         let out: Value = serde_json::from_str(&result.output).unwrap();

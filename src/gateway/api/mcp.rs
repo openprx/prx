@@ -36,10 +36,7 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
     for (name, server_config) in &mcp.servers {
         let url = match &server_config.url {
             Some(u) => u.clone(),
-            None => server_config
-                .command
-                .clone()
-                .unwrap_or_else(|| "stdio".to_string()),
+            None => server_config.command.clone().unwrap_or_else(|| "stdio".to_string()),
         };
 
         let has_runtime_tools = discovered.contains_key(name);

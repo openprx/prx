@@ -77,10 +77,7 @@ mod tests {
         assert_eq!(parsed.identity_dir.as_deref(), Some("identity/worker"));
         assert_eq!(parsed.scope_sender.as_deref(), Some("openprx_user"));
         assert_eq!(parsed.spawn_depth, 1);
-        assert_eq!(
-            parsed.session_scope_key,
-            "telegram:chat-1:openprx_user".to_string()
-        );
+        assert_eq!(parsed.session_scope_key, "telegram:chat-1:openprx_user".to_string());
         assert_eq!(parsed.parent_run_id.as_deref(), Some("run-0"));
         assert!(parsed.compaction_config.is_some());
     }

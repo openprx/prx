@@ -13,9 +13,7 @@ const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
-        anyhow::bail!(
-            "Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https"
-        );
+        anyhow::bail!("Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https");
     }
     Ok(())
 }
@@ -66,12 +64,7 @@ impl QQChannel {
             "clientSecret": self.app_secret,
         });
 
-        let resp = self
-            .http_client()
-            .post(QQ_AUTH_URL)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.http_client().post(QQ_AUTH_URL).json(&body).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -197,10 +190,7 @@ impl Channel for QQChannel {
                 }),
             )
         } else {
-            let user_id = message
-                .recipient
-                .strip_prefix("user:")
-                .unwrap_or(&message.recipient);
+            let user_id = message.recipient.strip_prefix("user:").unwrap_or(&message.recipient);
             (
                 format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
                 json!({
@@ -241,15 +231,11 @@ impl Channel for QQChannel {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(2 * 1024 * 1024);
         ws_config.max_frame_size = Some(1024 * 1024);
-        let (ws_stream, _) =
-            tokio_tungstenite::connect_async_with_config(&gw_url, Some(ws_config), false).await?;
+        let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(&gw_url, Some(ws_config), false).await?;
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)
-        let hello = read
-            .next()
-            .await
-            .ok_or(anyhow::anyhow!("QQ: no hello frame"))??;
+        let hello = read.next().await.ok_or(anyhow::anyhow!("QQ: no hello frame"))??;
         let hello_data: serde_json::Value = serde_json::from_str(&hello.to_string())?;
         let heartbeat_interval = hello_data
             .get("d")
@@ -272,9 +258,7 @@ impl Channel for QQChannel {
                 }
             }
         });
-        write
-            .send(Message::Text(identify.to_string().into()))
-            .await?;
+        write.send(Message::Text(identify.to_string().into())).await?;
 
         tracing::info!("QQ: connected and identified");
 

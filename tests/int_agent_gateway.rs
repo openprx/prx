@@ -61,12 +61,7 @@ impl Provider for MockProvider {
         Ok("fallback".into())
     }
 
-    async fn chat(
-        &self,
-        _request: ChatRequest<'_>,
-        _model: &str,
-        _temperature: f64,
-    ) -> Result<ChatResponse> {
+    async fn chat(&self, _request: ChatRequest<'_>, _model: &str, _temperature: f64) -> Result<ChatResponse> {
         let mut guard = self.responses.lock().expect("test: lock mock responses");
         if guard.is_empty() {
             return Ok(ChatResponse {
@@ -107,15 +102,8 @@ impl Provider for HangingProvider {
         Ok("fallback".into())
     }
 
-    async fn chat(
-        &self,
-        _request: ChatRequest<'_>,
-        _model: &str,
-        _temperature: f64,
-    ) -> Result<ChatResponse> {
-        let call_idx = self
-            .call_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    async fn chat(&self, _request: ChatRequest<'_>, _model: &str, _temperature: f64) -> Result<ChatResponse> {
+        let call_idx = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if call_idx >= self.hang_on_call {
             // Hang for a very long time (simulates timeout)
             tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -190,12 +178,7 @@ struct CountingTool {
 impl CountingTool {
     fn new() -> (Self, Arc<std::sync::Mutex<usize>>) {
         let count = Arc::new(std::sync::Mutex::new(0));
-        (
-            Self {
-                count: count.clone(),
-            },
-            count,
-        )
+        (Self { count: count.clone() }, count)
     }
 }
 
@@ -241,12 +224,7 @@ impl Memory for MockMemory {
         Ok(())
     }
 
-    async fn recall(
-        &self,
-        _query: &str,
-        _limit: usize,
-        _session_id: Option<&str>,
-    ) -> Result<Vec<MemoryEntry>> {
+    async fn recall(&self, _query: &str, _limit: usize, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
         Ok(vec![])
     }
 
@@ -254,11 +232,7 @@ impl Memory for MockMemory {
         Ok(None)
     }
 
-    async fn list(
-        &self,
-        _category: Option<&MemoryCategory>,
-        _session_id: Option<&str>,
-    ) -> Result<Vec<MemoryEntry>> {
+    async fn list(&self, _category: Option<&MemoryCategory>, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
         Ok(vec![])
     }
 
@@ -284,10 +258,7 @@ fn make_memory() -> Arc<dyn Memory> {
         backend: "none".into(),
         ..MemoryConfig::default()
     };
-    Arc::from(
-        memory::create_memory(&cfg, &std::env::temp_dir(), None)
-            .expect("test: create none-backend memory"),
-    )
+    Arc::from(memory::create_memory(&cfg, &std::env::temp_dir(), None).expect("test: create none-backend memory"))
 }
 
 fn make_observer() -> Arc<dyn Observer> {
@@ -320,11 +291,7 @@ fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent 
         .expect("test: build agent")
 }
 
-fn build_agent_with_config(
-    provider: Box<dyn Provider>,
-    tools: Vec<Box<dyn Tool>>,
-    config: AgentConfig,
-) -> Agent {
+fn build_agent_with_config(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>, config: AgentConfig) -> Agent {
     Agent::builder()
         .provider(provider)
         .tools(tools)
@@ -342,9 +309,7 @@ fn build_test_app_state(overrides: TestAppStateOverrides) -> AppState {
     AppState {
         config: Arc::new(Mutex::new(Config::default())),
         shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
-        provider: overrides
-            .provider
-            .unwrap_or_else(|| Arc::new(GatewayMockProvider)),
+        provider: overrides.provider.unwrap_or_else(|| Arc::new(GatewayMockProvider)),
         model: "test-model".into(),
         temperature: 0.0,
         mem: Arc::new(MockMemory),
@@ -410,10 +375,7 @@ fn build_test_router(state: AppState) -> Router {
     // API routes with auth middleware
     let api_routes = Router::new()
         .route("/chat", post(test_api_chat_handler))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            test_auth_middleware,
-        ))
+        .route_layer(middleware::from_fn_with_state(state.clone(), test_auth_middleware))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
 
     Router::new()
@@ -447,11 +409,7 @@ async fn test_auth_middleware(
         .unwrap_or("");
 
     if state.pairing.require_pairing() && !state.pairing.is_authenticated(token) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "Unauthorized"})),
-        )
-            .into_response();
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
 
     next.run(request).await
@@ -525,8 +483,7 @@ fn compute_hmac_signature(secret: &str, body: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("test: create HMAC from secret");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("test: create HMAC from secret");
     mac.update(body);
     let result = mac.finalize();
     format!("sha256={}", hex::encode(result.into_bytes()))
@@ -540,12 +497,9 @@ async fn spawn_test_server(router: Router) -> (SocketAddr, tokio::task::JoinHand
     let addr = listener.local_addr().expect("test: get local address");
 
     let handle = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .expect("test: axum serve");
+        axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .expect("test: axum serve");
     });
 
     // Give the server a moment to start.
@@ -631,10 +585,7 @@ async fn int_agent_gateway_ap02_malformed_tool_call_json() {
         Err(e) => {
             // An error is acceptable too — the key point is no panic.
             let err_msg = e.to_string();
-            assert!(
-                !err_msg.is_empty(),
-                "Error message should be non-empty: {err_msg}"
-            );
+            assert!(!err_msg.is_empty(), "Error message should be non-empty: {err_msg}");
         }
     }
 }
@@ -667,10 +618,7 @@ async fn int_agent_gateway_ap03_provider_timeout_during_tool_loop() {
     match result {
         Ok(Ok(response)) => {
             // If the agent returns a partial result, that is acceptable.
-            assert!(
-                !response.is_empty(),
-                "Expected non-empty partial response on timeout"
-            );
+            assert!(!response.is_empty(), "Expected non-empty partial response on timeout");
         }
         Ok(Err(_e)) => {
             // An error is also acceptable — the agent detected the hang.
@@ -712,13 +660,8 @@ async fn int_agent_gateway_ap06_max_tool_iterations_prevents_runaway() {
     let mut agent = build_agent_with_config(provider, vec![Box::new(EchoTool)], config);
 
     let result = agent.turn("infinite loop").await;
-    assert!(
-        result.is_err(),
-        "Expected error when max tool iterations exceeded"
-    );
-    let err = result
-        .expect_err("test: expected max iterations error")
-        .to_string();
+    assert!(result.is_err(), "Expected error when max tool iterations exceeded");
+    let err = result.expect_err("test: expected max iterations error").to_string();
     assert!(
         err.contains("maximum tool iterations"),
         "Error should mention max iterations limit, got: {err}"
@@ -953,8 +896,7 @@ async fn int_agent_gateway_ap04_empty_provider_response() {
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
 
     // The agent should handle the empty response without panicking or infinite looping.
-    let result =
-        tokio::time::timeout(Duration::from_secs(5), agent.turn("empty response test")).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), agent.turn("empty response test")).await;
 
     match result {
         Ok(Ok(response)) => {
@@ -1005,10 +947,7 @@ async fn int_agent_gateway_at03_unknown_tool_name() {
         Err(e) => {
             // An error is also acceptable — the key point is no panic.
             let err_msg = e.to_string();
-            assert!(
-                !err_msg.is_empty(),
-                "Error message should be non-empty: {err_msg}"
-            );
+            assert!(!err_msg.is_empty(), "Error message should be non-empty: {err_msg}");
         }
     }
 }

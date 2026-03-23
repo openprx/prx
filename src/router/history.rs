@@ -23,12 +23,7 @@ pub struct RouterHistory {
 }
 
 impl RouterHistory {
-    pub fn new(
-        store: KnnStore,
-        embedder: Arc<dyn EmbeddingProvider>,
-        knn_k: usize,
-        knn_min_records: usize,
-    ) -> Self {
+    pub fn new(store: KnnStore, embedder: Arc<dyn EmbeddingProvider>, knn_k: usize, knn_min_records: usize) -> Self {
         Self {
             store,
             embedder,
@@ -44,12 +39,7 @@ impl RouterHistory {
         self
     }
 
-    pub async fn record_query(
-        &self,
-        message: &str,
-        chosen_model: &str,
-        success: bool,
-    ) -> Result<()> {
+    pub async fn record_query(&self, message: &str, chosen_model: &str, success: bool) -> Result<()> {
         let embedding = self.embedder.embed_one(message).await?;
         self.store
             .insert(QueryRecord {
@@ -139,12 +129,7 @@ mod tests {
     fn make_history() -> RouterHistory {
         let memory = Arc::new(NoneMemory);
         let store = KnnStore::new(memory).unwrap();
-        RouterHistory::new(
-            store,
-            Arc::new(FixedEmbedder),
-            DEFAULT_KNN_K,
-            MIN_RECORDS_FOR_KNN,
-        )
+        RouterHistory::new(store, Arc::new(FixedEmbedder), DEFAULT_KNN_K, MIN_RECORDS_FOR_KNN)
     }
 
     #[test]

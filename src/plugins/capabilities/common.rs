@@ -16,9 +16,7 @@ use crate::plugins::error::{PluginError, PluginResult};
 use crate::plugins::host::HostState;
 
 /// Register `prx:host/log@0.1.0` host functions into the linker.
-pub fn register_log_host_functions(
-    linker: &mut wasmtime::component::Linker<HostState>,
-) -> PluginResult<()> {
+pub fn register_log_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
     for iface in ["prx:host/log@0.1.0", "prx:host/log"] {
         let mut log_inst = linker
             .instance(iface)
@@ -26,8 +24,7 @@ pub fn register_log_host_functions(
         log_inst
             .func_wrap(
                 "log",
-                |store: wasmtime::StoreContextMut<'_, HostState>,
-                 (level, message): (String, String)| {
+                |store: wasmtime::StoreContextMut<'_, HostState>, (level, message): (String, String)| {
                     let name = store.data().plugin_name.clone();
                     match level.as_str() {
                         "trace" => tracing::trace!(plugin = %name, "{message}"),
@@ -46,9 +43,7 @@ pub fn register_log_host_functions(
 }
 
 /// Register `prx:host/config@0.1.0` host functions into the linker.
-pub fn register_config_host_functions(
-    linker: &mut wasmtime::component::Linker<HostState>,
-) -> PluginResult<()> {
+pub fn register_config_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
     for iface in ["prx:host/config@0.1.0", "prx:host/config"] {
         let mut config_inst = linker
             .instance(iface)
@@ -63,18 +58,15 @@ pub fn register_config_host_functions(
             )
             .map_err(|e| PluginError::Instantiation(format!("link {iface}.get: {e}")))?;
         config_inst
-            .func_wrap(
-                "get-all",
-                |store: wasmtime::StoreContextMut<'_, HostState>, (): ()| {
-                    let pairs: Vec<(String, String)> = store
-                        .data()
-                        .config
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    Ok((pairs,))
-                },
-            )
+            .func_wrap("get-all", |store: wasmtime::StoreContextMut<'_, HostState>, (): ()| {
+                let pairs: Vec<(String, String)> = store
+                    .data()
+                    .config
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                Ok((pairs,))
+            })
             .map_err(|e| PluginError::Instantiation(format!("link {iface}.get-all: {e}")))?;
     }
     Ok(())
@@ -86,9 +78,7 @@ pub fn register_config_host_functions(
 /// middleware, hook, and cron WIT worlds. Permission is checked on every call;
 /// violations are logged and silently ignored (get → `None`, set → no-op,
 /// delete → `false`).
-pub fn register_kv_host_functions(
-    linker: &mut wasmtime::component::Linker<HostState>,
-) -> PluginResult<()> {
+pub fn register_kv_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
     for iface in ["prx:host/kv@0.1.0", "prx:host/kv"] {
         let mut kv_inst = linker
             .instance(iface)
@@ -115,8 +105,7 @@ pub fn register_kv_host_functions(
         kv_inst
             .func_wrap_async(
                 "set",
-                |store: wasmtime::StoreContextMut<'_, HostState>,
-                 (key, value): (String, Vec<u8>)| {
+                |store: wasmtime::StoreContextMut<'_, HostState>, (key, value): (String, Vec<u8>)| {
                     Box::new(async move {
                         if let Err(e) = store.data().check_permission("kv") {
                             tracing::warn!("{e}");
@@ -160,11 +149,7 @@ pub fn register_kv_host_functions(
                         }
                         let kv = store.data().kv_store.clone();
                         let guard = kv.read().await;
-                        let keys: Vec<String> = guard
-                            .keys()
-                            .filter(|k| k.starts_with(&prefix))
-                            .cloned()
-                            .collect();
+                        let keys: Vec<String> = guard.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
                         Ok((keys,))
                     })
                 },
@@ -180,9 +165,7 @@ pub fn register_kv_host_functions(
 /// Exposes `publish`, `subscribe`, and `unsubscribe` to WASM plugins.
 /// All calls require the `"events"` permission; violations return an error
 /// string to the plugin rather than panicking.
-pub fn register_event_host_functions(
-    linker: &mut wasmtime::component::Linker<HostState>,
-) -> PluginResult<()> {
+pub fn register_event_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
     use crate::plugins::event_bus::MAX_PAYLOAD_BYTES;
 
     for iface in ["prx:host/events@0.1.0", "prx:host/events"] {
@@ -193,8 +176,7 @@ pub fn register_event_host_functions(
         // ── publish ──
         inst.func_wrap_async(
             "publish",
-            |store: wasmtime::StoreContextMut<'_, HostState>,
-             (topic, payload): (String, String)| {
+            |store: wasmtime::StoreContextMut<'_, HostState>, (topic, payload): (String, String)| {
                 Box::new(async move {
                     // Permission check.
                     if let Err(e) = store.data().check_permission("events") {
@@ -300,9 +282,7 @@ pub fn register_event_host_functions(
 ///
 /// Exposes an HTTP `request` function to WASM plugins. Calls are guarded by
 /// the `"http-outbound"` permission and the configured URL allowlist.
-pub fn register_http_host_functions(
-    linker: &mut wasmtime::component::Linker<HostState>,
-) -> PluginResult<()> {
+pub fn register_http_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
     for iface in ["prx:host/http-outbound@0.1.0", "prx:host/http-outbound"] {
         let mut http_inst = linker
             .instance(iface)
@@ -376,13 +356,8 @@ pub fn register_http_host_functions(
 /// Exposes websocket connect/send/receive/close operations to WASM plugins.
 /// Calls are guarded by the `"websocket-outbound"` permission and the
 /// configured outbound URL allowlist.
-pub fn register_websocket_host_functions(
-    linker: &mut wasmtime::component::Linker<HostState>,
-) -> PluginResult<()> {
-    for iface in [
-        "prx:host/websocket-outbound@0.1.0",
-        "prx:host/websocket-outbound",
-    ] {
+pub fn register_websocket_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
+    for iface in ["prx:host/websocket-outbound@0.1.0", "prx:host/websocket-outbound"] {
         let mut ws_inst = linker
             .instance(iface)
             .map_err(|e| PluginError::Instantiation(format!("linker error ({iface}): {e}")))?;
@@ -421,8 +396,7 @@ pub fn register_websocket_host_functions(
         ws_inst
             .func_wrap_async(
                 "send",
-                |store: wasmtime::StoreContextMut<'_, HostState>,
-                 (session_id, message): (u64, String)| {
+                |store: wasmtime::StoreContextMut<'_, HostState>, (session_id, message): (u64, String)| {
                     let permission = store.data().check_permission("websocket-outbound");
                     let timeout_ms = store.data().timeout_ms;
                     let sessions = Arc::clone(&store.data().websocket_sessions);
@@ -430,10 +404,8 @@ pub fn register_websocket_host_functions(
                         if let Err(error) = permission {
                             return Ok((Err::<(), String>(error),));
                         }
-                        let result = crate::plugins::host::websocket_send_with(
-                            sessions, timeout_ms, session_id, message,
-                        )
-                        .await;
+                        let result =
+                            crate::plugins::host::websocket_send_with(sessions, timeout_ms, session_id, message).await;
                         Ok((result,))
                     })
                 },
@@ -451,10 +423,8 @@ pub fn register_websocket_host_functions(
                         if let Err(error) = permission {
                             return Ok((Err::<String, String>(error),));
                         }
-                        let result = crate::plugins::host::websocket_receive_with(
-                            sessions, timeout_ms, session_id,
-                        )
-                        .await;
+                        let result =
+                            crate::plugins::host::websocket_receive_with(sessions, timeout_ms, session_id).await;
                         Ok((result,))
                     })
                 },
@@ -472,10 +442,7 @@ pub fn register_websocket_host_functions(
                         if let Err(error) = permission {
                             return Ok((Err::<(), String>(error),));
                         }
-                        let result = crate::plugins::host::websocket_close_with(
-                            sessions, timeout_ms, session_id,
-                        )
-                        .await;
+                        let result = crate::plugins::host::websocket_close_with(sessions, timeout_ms, session_id).await;
                         Ok((result,))
                     })
                 },
@@ -491,9 +458,7 @@ pub fn register_websocket_host_functions(
 /// Used by middleware, hook, and cron capability adapters. Tool adapters have
 /// a different kv interface (`result<T, string>` return types) and call the
 /// individual helpers instead.
-pub fn register_common_host_functions(
-    linker: &mut wasmtime::component::Linker<HostState>,
-) -> PluginResult<()> {
+pub fn register_common_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> PluginResult<()> {
     register_log_host_functions(linker)?;
     register_config_host_functions(linker)?;
     register_kv_host_functions(linker)?;

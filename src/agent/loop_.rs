@@ -4,9 +4,7 @@ use crate::hooks::{HookEvent, HookManager, payload_error};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
-};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -117,10 +115,8 @@ static SENSITIVE_LOG_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     .expect("compile regex: sensitive log key-value pattern")
 });
 
-static SENSITIVE_BEARER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}"#)
-        .expect("compile regex: bearer token pattern")
-});
+static SENSITIVE_BEARER_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}"#).expect("compile regex: bearer token pattern"));
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
@@ -171,10 +167,7 @@ fn sanitize_tool_parse_log_preview(input: &str) -> String {
         return with_kv_scrubbed;
     }
 
-    with_kv_scrubbed
-        .chars()
-        .take(TOOL_PARSE_LOG_PREVIEW_CHARS)
-        .collect()
+    with_kv_scrubbed.chars().take(TOOL_PARSE_LOG_PREVIEW_CHARS).collect()
 }
 
 /// Sensitive JSON field names whose values are redacted in tool argument logging.
@@ -207,9 +200,7 @@ pub(crate) fn redact_sensitive_json_keys(value: &serde_json::Value) -> serde_jso
                 .collect();
             serde_json::Value::Object(redacted)
         }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(redact_sensitive_json_keys).collect())
-        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(arr.iter().map(redact_sensitive_json_keys).collect()),
         other => other.clone(),
     }
 }
@@ -249,11 +240,7 @@ fn autosave_memory_key(prefix: &str) -> String {
 fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
-    let non_system_count = if has_system {
-        history.len() - 1
-    } else {
-        history.len()
-    };
+    let non_system_count = if has_system { history.len() - 1 } else { history.len() };
 
     if non_system_count <= max_history {
         return;
@@ -333,12 +320,7 @@ fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
     }
 }
 
-fn apply_compaction_summary(
-    history: &mut Vec<ChatMessage>,
-    start: usize,
-    compact_end: usize,
-    summary: &str,
-) {
+fn apply_compaction_summary(history: &mut Vec<ChatMessage>, start: usize, compact_end: usize, summary: &str) {
     let summary_msg = ChatMessage::assistant(format!("[Compaction summary]\n{}", summary.trim()));
     history.splice(start..compact_end, std::iter::once(summary_msg));
 }
@@ -566,8 +548,7 @@ async fn pre_compaction_flush(
         if !text.is_empty() && text.to_uppercase() != "NONE" {
             let date = chrono::Local::now().format("%Y-%m-%d_%H-%M");
             let key = format!("compaction_flush_{date}");
-            mem.store(&key, &text, MemoryCategory::Conversation, None)
-                .await?;
+            mem.store(&key, &text, MemoryCategory::Conversation, None).await?;
             tracing::info!(
                 chars = text.len(),
                 key = %key,
@@ -608,9 +589,7 @@ async fn auto_compact_history(
     let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
 
     // Pre-compaction flush: extract and persist key facts before they are lost.
-    pre_compaction_flush(&to_compact, mem, provider, model)
-        .await
-        .ok(); // soft failure — never block compaction
+    pre_compaction_flush(&to_compact, mem, provider, model).await.ok(); // soft failure — never block compaction
 
     let transcript = build_compaction_transcript(&to_compact);
 
@@ -638,11 +617,7 @@ async fn auto_compact_history(
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
-pub(crate) async fn build_context(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-) -> RecalledMemoryContext {
+pub(crate) async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> RecalledMemoryContext {
     let mut context = String::new();
     let mut ids = Vec::new();
 
@@ -688,10 +663,7 @@ pub(crate) async fn build_context(
         }
     }
 
-    RecalledMemoryContext {
-        preamble: context,
-        ids,
-    }
+    RecalledMemoryContext { preamble: context, ids }
 }
 
 pub(crate) async fn increment_recalled_useful_counts(mem: &dyn Memory, recalled_ids: &[String]) {
@@ -724,11 +696,7 @@ pub(crate) fn build_runtime_system_prompt(
     native_tools: bool,
     tools_registry: &[Box<dyn Tool>],
 ) -> String {
-    let bootstrap_max_chars = if config.agent.compact_context {
-        Some(6000)
-    } else {
-        None
-    };
+    let bootstrap_max_chars = if config.agent.compact_context { Some(6000) } else { None };
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         model_name,
@@ -748,10 +716,7 @@ pub(crate) fn build_runtime_system_prompt(
 
 /// Find a tool by name in the registry.
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
-    tools
-        .iter()
-        .find(|t| t.supports_name(name))
-        .map(|t| t.as_ref())
+    tools.iter().find(|t| t.supports_name(name)).map(|t| t.as_ref())
 }
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
@@ -772,11 +737,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
             .trim()
             .to_string();
         if !name.is_empty() {
-            let arguments = parse_arguments_value(
-                function
-                    .get("arguments")
-                    .or_else(|| function.get("parameters")),
-            );
+            let arguments = parse_arguments_value(function.get("arguments").or_else(|| function.get("parameters")));
             return Some(ParsedToolCall { name, arguments });
         }
     }
@@ -792,8 +753,7 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
         return None;
     }
 
-    let arguments =
-        parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
+    let arguments = parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
     Some(ParsedToolCall { name, arguments })
 }
 
@@ -940,8 +900,7 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
         let (byte_idx, ch) = char_positions[idx];
         if ch == '{' || ch == '[' {
             let slice = &trimmed[byte_idx..];
-            let mut stream =
-                serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+            let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
             if let Some(Ok(value)) = stream.next() {
                 let consumed = stream.byte_offset();
                 if consumed > 0 {
@@ -1050,8 +1009,7 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
                                     continue;
                                 };
                                 serde_json::json!({"command": command})
-                            } else if value.starts_with("http://") || value.starts_with("https://")
-                            {
+                            } else if value.starts_with("http://") || value.starts_with("https://") {
                                 if let Some(command) = build_curl_command(value) {
                                     serde_json::json!({"command": command})
                                 } else {
@@ -1163,13 +1121,12 @@ fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) 
     let mut current_recipient: Option<String> = None;
     let mut current_body = String::new();
 
-    let flush_current =
-        |recipient: &mut Option<String>, body: &mut String, out_calls: &mut Vec<ParsedToolCall>| {
-            if let Some(recipient) = recipient.take() {
-                out_calls.extend(parse_recipient_tool_calls(&recipient, body));
-                body.clear();
-            }
-        };
+    let flush_current = |recipient: &mut Option<String>, body: &mut String, out_calls: &mut Vec<ParsedToolCall>| {
+        if let Some(recipient) = recipient.take() {
+            out_calls.extend(parse_recipient_tool_calls(&recipient, body));
+            body.clear();
+        }
+    };
 
     for line in text.lines() {
         if let Some(cap) = CODEX_TO_HEADER_RE.captures(line) {
@@ -1205,8 +1162,7 @@ fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) 
 
 fn parse_assistant_recipient_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
     static ASSISTANT_RECIPIENT_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#)
-            .expect("compile regex: assistant XML tag pattern")
+        Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#).expect("compile regex: assistant XML tag pattern")
     });
     static RECIPIENT_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)\brecipient\s*=\s*["']?([a-zA-Z0-9_.-]+)["']?"#)
@@ -1340,9 +1296,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             remaining = &after_open[close_idx + close_tag.len()..];
         } else {
             if let Some(json_end) = find_json_end(after_open) {
-                if let Ok(value) =
-                    serde_json::from_str::<serde_json::Value>(&after_open[..json_end])
-                {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&after_open[..json_end]) {
                     let parsed_calls = parse_tool_calls_from_json_value(&value);
                     if !parsed_calls.is_empty() {
                         calls.extend(parsed_calls);
@@ -1531,17 +1485,16 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
-static TOOL_BARRIERS: LazyLock<
-    parking_lot::Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>,
-> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+static TOOL_BARRIERS: LazyLock<parking_lot::Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 fn tool_barrier_key(name: &str) -> Option<&'static str> {
     match name {
         // Workspace mutations / command execution.
         "file_write" | "shell" | "git_operations" => Some("workspace_write"),
         // Shared runtime configuration / scheduler state.
-        "config_reload" | "cron" | "cron_add" | "cron_update" | "cron_remove" | "cron_run"
-        | "schedule" | "proxy_config" => Some("runtime_config"),
+        "config_reload" | "cron" | "cron_add" | "cron_update" | "cron_remove" | "cron_run" | "schedule"
+        | "proxy_config" => Some("runtime_config"),
         // Shared long-term memory writes.
         "memory_store" | "memory_forget" => Some("memory_write"),
         // Background session lifecycle operations.
@@ -1554,10 +1507,7 @@ fn tool_barrier_key(name: &str) -> Option<&'static str> {
 /// hangs, we proceed without serialisation rather than deadlocking forever.
 const TOOL_BARRIER_TIMEOUT_SECS: u64 = 60;
 
-async fn acquire_tool_barrier(
-    key: &'static str,
-    tool_name: &str,
-) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+async fn acquire_tool_barrier(key: &'static str, tool_name: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     let barrier = {
         let mut barriers = TOOL_BARRIERS.lock();
         barriers
@@ -1661,17 +1611,11 @@ async fn execute_one_tool(
                 "chat_id": ctx.chat_id,
             }),
         );
-        root.insert(
-            "_zc_scope_trusted".to_string(),
-            serde_json::Value::Bool(true),
-        );
+        root.insert("_zc_scope_trusted".to_string(), serde_json::Value::Bool(true));
     } else {
         // Never trust user-provided scope payloads when runtime has no trusted scope.
         root.remove("_zc_scope");
-        root.insert(
-            "_zc_scope_trusted".to_string(),
-            serde_json::Value::Bool(false),
-        );
+        root.insert("_zc_scope_trusted".to_string(), serde_json::Value::Bool(false));
     }
 
     let _barrier_guard = if let Some(key) = tool_barrier_key(call_name) {
@@ -1795,10 +1739,7 @@ fn rollout_effective_sample_percent(stage: &str, configured_percent: u8) -> u8 {
 
 fn rollout_sampling_key(channel_name: &str, scope_ctx: Option<&ScopeContext<'_>>) -> String {
     if let Some(scope) = scope_ctx {
-        format!(
-            "{}:{}:{}:{}",
-            channel_name, scope.channel, scope.sender, scope.chat_id
-        )
+        format!("{}:{}:{}:{}", channel_name, scope.channel, scope.sender, scope.chat_id)
     } else {
         channel_name.to_string()
     }
@@ -1849,12 +1790,7 @@ fn resolve_rollout_decision(
         };
     }
 
-    if !governance.rollout_channels.is_empty()
-        && !governance
-            .rollout_channels
-            .iter()
-            .any(|name| name == channel_name)
-    {
+    if !governance.rollout_channels.is_empty() && !governance.rollout_channels.iter().any(|name| name == channel_name) {
         return RolloutDecision {
             enabled: false,
             stage,
@@ -1872,12 +1808,8 @@ fn resolve_rollout_decision(
         };
     }
 
-    let sample_percent =
-        rollout_effective_sample_percent(&stage, governance.rollout_sample_percent).min(100);
-    let selected = rollout_sample_selected(
-        &rollout_sampling_key(channel_name, scope_ctx),
-        sample_percent,
-    );
+    let sample_percent = rollout_effective_sample_percent(&stage, governance.rollout_sample_percent).min(100);
+    let selected = rollout_sample_selected(&rollout_sampling_key(channel_name, scope_ctx), sample_percent);
     RolloutDecision {
         enabled: selected,
         stage,
@@ -1940,10 +1872,7 @@ fn is_read_only_tool_name(name: &str) -> bool {
     )
 }
 
-fn scope_or_pipeline_denial(
-    call: &ParsedToolCall,
-    scope_ctx: Option<&ScopeContext<'_>>,
-) -> Option<String> {
+fn scope_or_pipeline_denial(call: &ParsedToolCall, scope_ctx: Option<&ScopeContext<'_>>) -> Option<String> {
     let ctx = scope_ctx?;
     if !ctx
         .policy
@@ -2032,66 +1961,59 @@ async fn execute_read_only_batch(
     let timeout = Duration::from_secs(schedule.timeout_secs);
     let batch_calls: Vec<ParsedToolCall> = calls.to_vec();
 
-    let mut indexed_results: Vec<(usize, String)> =
-        stream::iter(batch_calls.into_iter().enumerate())
-            .map(|(idx, call)| async move {
-                if let Some(denied) = scope_or_pipeline_denial(&call, scope_ctx) {
-                    return Ok((idx, denied));
+    let mut indexed_results: Vec<(usize, String)> = stream::iter(batch_calls.into_iter().enumerate())
+        .map(|(idx, call)| async move {
+            if let Some(denied) = scope_or_pipeline_denial(&call, scope_ctx) {
+                return Ok((idx, denied));
+            }
+
+            let execute_future = execute_one_tool(
+                &call.name,
+                call.arguments.clone(),
+                tools_registry,
+                observer,
+                cancellation_token,
+                scope_ctx,
+            );
+
+            let bounded = async {
+                match tokio::time::timeout(timeout, execute_future).await {
+                    Ok(result) => result,
+                    Err(_) => Ok(format!(
+                        "Error: Tool '{}' timed out after {}s.",
+                        call.name, schedule.timeout_secs
+                    )),
                 }
+            };
 
-                let execute_future = execute_one_tool(
-                    &call.name,
-                    call.arguments.clone(),
-                    tools_registry,
-                    observer,
-                    cancellation_token,
-                    scope_ctx,
-                );
+            let result = if let Some(token) = cancellation_token {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    bounded_result = bounded => bounded_result?,
+                }
+            } else {
+                bounded.await?
+            };
 
-                let bounded = async {
-                    match tokio::time::timeout(timeout, execute_future).await {
-                        Ok(result) => result,
-                        Err(_) => Ok(format!(
-                            "Error: Tool '{}' timed out after {}s.",
-                            call.name, schedule.timeout_secs
-                        )),
-                    }
-                };
-
-                let result = if let Some(token) = cancellation_token {
-                    tokio::select! {
-                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                        bounded_result = bounded => bounded_result?,
-                    }
-                } else {
-                    bounded.await?
-                };
-
-                Ok((idx, result))
-            })
-            .buffer_unordered(schedule.concurrency_window)
-            .collect::<Vec<Result<(usize, String)>>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<(usize, String)>>>()?;
+            Ok((idx, result))
+        })
+        .buffer_unordered(schedule.concurrency_window)
+        .collect::<Vec<Result<(usize, String)>>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<(usize, String)>>>()?;
 
     indexed_results.sort_by_key(|(idx, _)| *idx);
     let results = indexed_results
         .into_iter()
         .map(|(_, result)| result)
         .collect::<Vec<String>>();
-    let timeout_count = results
-        .iter()
-        .filter(|value| value.contains("timed out"))
-        .count();
+    let timeout_count = results.iter().filter(|value| value.contains("timed out")).count();
     let cancel_count = results
         .iter()
         .filter(|value| value.contains("cancelled") || value.contains("Cancelled"))
         .count();
-    let error_count = results
-        .iter()
-        .filter(|value| value.starts_with("Error"))
-        .count();
+    let error_count = results.iter().filter(|value| value.starts_with("Error")).count();
 
     Ok(BatchExecutionOutcome {
         total_calls: results.len(),
@@ -2147,9 +2069,7 @@ async fn execute_tools_with_policy(
                 let next_index = ordered_indices[batch_end];
                 let next_call = &tool_calls[next_index];
                 let next_approval = approval.is_some_and(|mgr| mgr.needs_approval(&next_call.name));
-                if classify_tool_call(&next_call.name) != ToolSchedulingClass::ReadOnly
-                    || next_approval
-                {
+                if classify_tool_call(&next_call.name) != ToolSchedulingClass::ReadOnly || next_approval {
                     break;
                 }
                 batch_end += 1;
@@ -2296,16 +2216,8 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations.min(MAX_TOOL_ITERATIONS_CAP)
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
-        .iter()
-        .flat_map(|tool| tool.specs())
-        .collect();
-    let rollout = resolve_rollout_decision(
-        parallel_tools_enabled,
-        &concurrency_governance,
-        channel_name,
-        scope_ctx,
-    );
+    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry.iter().flat_map(|tool| tool.specs()).collect();
+    let rollout = resolve_rollout_decision(parallel_tools_enabled, &concurrency_governance, channel_name, scope_ctx);
     tracing::info!(
         channel = channel_name,
         rollout_stage = %rollout.stage,
@@ -2323,15 +2235,9 @@ pub(crate) async fn run_tool_call_loop(
         rollout_stage: rollout.stage.clone(),
         kill_switch_applied: rollout.kill_switch_applied,
         auto_rollback_enabled: concurrency_governance.auto_rollback_enabled,
-        rollback_timeout_rate_threshold: concurrency_governance
-            .rollback_timeout_rate_threshold
-            .clamp(0.0, 1.0),
-        rollback_cancel_rate_threshold: concurrency_governance
-            .rollback_cancel_rate_threshold
-            .clamp(0.0, 1.0),
-        rollback_error_rate_threshold: concurrency_governance
-            .rollback_error_rate_threshold
-            .clamp(0.0, 1.0),
+        rollback_timeout_rate_threshold: concurrency_governance.rollback_timeout_rate_threshold.clamp(0.0, 1.0),
+        rollback_cancel_rate_threshold: concurrency_governance.rollback_cancel_rate_threshold.clamp(0.0, 1.0),
+        rollback_error_rate_threshold: concurrency_governance.rollback_error_rate_threshold.clamp(0.0, 1.0),
     };
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
@@ -2368,10 +2274,7 @@ pub(crate) async fn run_tool_call_loop(
     let mut overflow_retries: usize = 0;
 
     for _iteration in 0..max_iterations {
-        if cancellation_token
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
+        if cancellation_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return Err(ToolLoopCancelled.into());
         }
 
@@ -2413,8 +2316,7 @@ pub(crate) async fn run_tool_call_loop(
             .into());
         }
 
-        let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+        let prepared_messages = multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
         for tool in tools_registry {
             if let Err(err) = tool.refresh().await {
                 let message = format!("refresh failed for tool {}: {err}", tool.name());
@@ -2559,9 +2461,7 @@ pub(crate) async fn run_tool_call_loop(
                     success: false,
                     error_message: Some(error_message.clone()),
                 });
-                hooks
-                    .emit(HookEvent::Error, payload_error("llm", &error_message))
-                    .await;
+                hooks.emit(HookEvent::Error, payload_error("llm", &error_message)).await;
                 Err(e)
             }
         };
@@ -2569,9 +2469,7 @@ pub(crate) async fn run_tool_call_loop(
         // P0-1: On context overflow, run compaction and retry (up to MAX_OVERFLOW_RETRIES).
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
             match chat_processed {
-                Err(ref e)
-                    if is_context_overflow_error(e) && overflow_retries < MAX_OVERFLOW_RETRIES =>
-                {
+                Err(ref e) if is_context_overflow_error(e) && overflow_retries < MAX_OVERFLOW_RETRIES => {
                     overflow_retries += 1;
                     tracing::warn!(
                         attempt = overflow_retries,
@@ -2588,9 +2486,7 @@ pub(crate) async fn run_tool_call_loop(
                             Ok(Ok(_)) => {}
                             Ok(Err(e)) => tracing::warn!("Overflow retry compaction failed: {e}"),
                             Err(_) => {
-                                tracing::warn!(
-                                    "Overflow retry compaction timed out, applying aggressive trim"
-                                );
+                                tracing::warn!("Overflow retry compaction timed out, applying aggressive trim");
                                 apply_aggressive_trim(history, config.keep_recent_messages);
                             }
                         }
@@ -2618,16 +2514,11 @@ pub(crate) async fn run_tool_call_loop(
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
-                    if cancellation_token
-                        .as_ref()
-                        .is_some_and(CancellationToken::is_cancelled)
-                    {
+                    if cancellation_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
                         return Err(ToolLoopCancelled.into());
                     }
                     chunk.push_str(word);
-                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS
-                        && tx.send(std::mem::take(&mut chunk)).await.is_err()
-                    {
+                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS && tx.send(std::mem::take(&mut chunk)).await.is_err() {
                         break; // receiver dropped
                     }
                 }
@@ -2707,9 +2598,7 @@ pub(crate) async fn run_tool_call_loop(
                     .await;
             }
             if !success {
-                hooks
-                    .emit(HookEvent::Error, payload_error("tool", result))
-                    .await;
+                hooks.emit(HookEvent::Error, payload_error("tool", result)).await;
             }
             // P0-2: Truncate oversized tool results before inserting into history.
             let truncated_result = truncate_tool_result_if_needed(result, MAX_TOOL_RESULT_CHARS);
@@ -2730,8 +2619,7 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
                 // P0-2: Also truncate native tool result content.
-                let truncated_result =
-                    truncate_tool_result_if_needed(result, MAX_TOOL_RESULT_CHARS);
+                let truncated_result = truncate_tool_result_if_needed(result, MAX_TOOL_RESULT_CHARS);
                 let tool_msg = serde_json::json!({
                     "tool_call_id": native_call.id,
                     "content": truncated_result,
@@ -2743,15 +2631,9 @@ pub(crate) async fn run_tool_call_loop(
         // P1-4: Token-aware mid-turn trim (primary) + count-based safety net (secondary).
         if let Some(config) = compaction_config {
             let mid_turn_tokens = estimate_history_tokens(history);
-            let mid_turn_limit = config
-                .max_context_tokens
-                .saturating_sub(config.reserve_tokens);
+            let mid_turn_limit = config.max_context_tokens.saturating_sub(config.reserve_tokens);
             if mid_turn_tokens > mid_turn_limit {
-                tracing::warn!(
-                    mid_turn_tokens,
-                    mid_turn_limit,
-                    "Mid-turn token trim triggered"
-                );
+                tracing::warn!(mid_turn_tokens, mid_turn_limit, "Mid-turn token trim triggered");
                 trim_history_token_aware(history, mid_turn_limit);
             }
         }
@@ -2776,15 +2658,14 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-    instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
     instructions.push_str(
-        "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
+        "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n",
     );
+    instructions.push_str("CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n");
     instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
     instructions.push_str("You may use multiple tool calls in a single response. ");
     instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions
-        .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    instructions.push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
@@ -2818,12 +2699,8 @@ pub async fn run(
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
     let hooks = HookManager::new(config.workspace_dir.clone());
-    let runtime: Arc<dyn runtime::RuntimeAdapter> =
-        Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
 
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
@@ -2936,10 +2813,7 @@ pub async fn run(
         "cron_add",
         "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
     ));
-    tool_descs.push((
-        "cron_list",
-        "List all cron jobs with schedule, status, and metadata.",
-    ));
+    tool_descs.push(("cron_list", "List all cron jobs with schedule, status, and metadata."));
     tool_descs.push(("cron_remove", "Remove a cron job by job_id."));
     tool_descs.push((
         "cron_update",
@@ -2996,8 +2870,7 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        let selected_skills =
-            select_prompt_skills(&msg, &skills, &config, skill_embedder.as_ref()).await;
+        let selected_skills = select_prompt_skills(&msg, &skills, &config, skill_embedder.as_ref()).await;
         let system_prompt = build_runtime_system_prompt(
             &config,
             model_name,
@@ -3013,14 +2886,11 @@ pub async fn run(
             && memory::should_autosave_content(&msg)
         {
             let user_key = autosave_memory_key("user_msg");
-            let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation, None)
-                .await;
+            let _ = mem.store(&user_key, &msg, MemoryCategory::Conversation, None).await;
         }
 
         // Inject memory context into user message
-        let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+        let mem_context = build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
         let context = mem_context.preamble.clone();
         let enriched = if context.is_empty() {
             msg.clone()
@@ -3028,10 +2898,7 @@ pub async fn run(
             format!("{context}{msg}")
         };
 
-        let mut history = vec![
-            ChatMessage::system(&system_prompt),
-            ChatMessage::user(&enriched),
-        ];
+        let mut history = vec![ChatMessage::system(&system_prompt), ChatMessage::user(&enriched)];
 
         let response = run_tool_call_loop(
             provider.as_ref(),
@@ -3058,15 +2925,9 @@ pub async fn run(
                 rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
                 rollout_channels: config.agent.concurrency_rollout_channels.clone(),
                 auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-                rollback_timeout_rate_threshold: config
-                    .agent
-                    .concurrency_rollback_timeout_rate_threshold,
-                rollback_cancel_rate_threshold: config
-                    .agent
-                    .concurrency_rollback_cancel_rate_threshold,
-                rollback_error_rate_threshold: config
-                    .agent
-                    .concurrency_rollback_error_rate_threshold,
+                rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
+                rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
+                rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
             },
             Some(&config.agent.compaction),
             None,
@@ -3135,9 +2996,7 @@ pub async fn run(
                     continue;
                 }
                 "/clear" | "/new" => {
-                    println!(
-                        "This will clear the current conversation and delete all session memory."
-                    );
+                    println!("This will clear the current conversation and delete all session memory.");
                     println!("Core memories (long-term facts/preferences) will be preserved.");
                     print!("Continue? [y/N] ");
                     let _ = std::io::stdout().flush();
@@ -3194,8 +3053,7 @@ pub async fn run(
             }
 
             // Inject memory context into user message
-            let mem_context =
-                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+            let mem_context = build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
             let context = mem_context.preamble.clone();
             let enriched = if context.is_empty() {
                 user_input.clone()
@@ -3203,8 +3061,7 @@ pub async fn run(
                 format!("{context}{user_input}")
             };
 
-            let selected_skills =
-                select_prompt_skills(&user_input, &skills, &config, skill_embedder.as_ref()).await;
+            let selected_skills = select_prompt_skills(&user_input, &skills, &config, skill_embedder.as_ref()).await;
             let system_prompt = build_runtime_system_prompt(
                 &config,
                 model_name,
@@ -3245,15 +3102,9 @@ pub async fn run(
                     rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
                     rollout_channels: config.agent.concurrency_rollout_channels.clone(),
                     auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-                    rollback_timeout_rate_threshold: config
-                        .agent
-                        .concurrency_rollback_timeout_rate_threshold,
-                    rollback_cancel_rate_threshold: config
-                        .agent
-                        .concurrency_rollback_cancel_rate_threshold,
-                    rollback_error_rate_threshold: config
-                        .agent
-                        .concurrency_rollback_error_rate_threshold,
+                    rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
+                    rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
+                    rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
                 },
                 Some(&config.agent.compaction),
                 None,
@@ -3267,10 +3118,7 @@ pub async fn run(
                 Err(e) => {
                     eprintln!("\nError: {e}\n");
                     hooks
-                        .emit(
-                            HookEvent::Error,
-                            payload_error("agent-turn", &e.to_string()),
-                        )
+                        .emit(HookEvent::Error, payload_error("agent-turn", &e.to_string()))
                         .await;
                     continue;
                 }
@@ -3340,15 +3188,10 @@ pub async fn run(
 /// Process a single message through the full agent (with tools and memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+    let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
     let hooks = HookManager::new(config.workspace_dir.clone());
-    let runtime: Arc<dyn runtime::RuntimeAdapter> =
-        Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
         &config.memory,
         &config.embedding_routes,
@@ -3427,8 +3270,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     if config.skill_rag.enabled {
         crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
     }
-    let selected_skills =
-        select_prompt_skills(message, &skills, &config, skill_embedder.as_ref()).await;
+    let selected_skills = select_prompt_skills(message, &skills, &config, skill_embedder.as_ref()).await;
     let system_prompt = build_runtime_system_prompt(
         &config,
         &model_name,
@@ -3446,10 +3288,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         format!("{context}{message}")
     };
 
-    let mut history = vec![
-        ChatMessage::system(&system_prompt),
-        ChatMessage::user(&enriched),
-    ];
+    let mut history = vec![ChatMessage::system(&system_prompt), ChatMessage::user(&enriched)];
 
     let response = agent_turn(
         provider.as_ref(),
@@ -3474,9 +3313,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
             rollout_channels: config.agent.concurrency_rollout_channels.clone(),
             auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-            rollback_timeout_rate_threshold: config
-                .agent
-                .concurrency_rollback_timeout_rate_threshold,
+            rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
             rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
             rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
         },
@@ -3647,10 +3484,7 @@ mod tests {
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<ChatResponse> {
-            let mut responses = self
-                .responses
-                .lock()
-                .expect("responses lock should be valid");
+            let mut responses = self.responses.lock().expect("responses lock should be valid");
             responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
@@ -3665,12 +3499,7 @@ mod tests {
     }
 
     impl DelayTool {
-        fn new(
-            name: &str,
-            delay_ms: u64,
-            active: Arc<AtomicUsize>,
-            max_active: Arc<AtomicUsize>,
-        ) -> Self {
+        fn new(name: &str, delay_ms: u64, active: Arc<AtomicUsize>, max_active: Arc<AtomicUsize>) -> Self {
             Self {
                 name: name.to_string(),
                 delay_ms,
@@ -3700,10 +3529,7 @@ mod tests {
             })
         }
 
-        async fn execute(
-            &self,
-            args: serde_json::Value,
-        ) -> anyhow::Result<crate::tools::ToolResult> {
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
             let now_active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(now_active, Ordering::SeqCst);
 
@@ -3821,10 +3647,7 @@ mod tests {
         .await
         .expect_err("oversized payload must fail");
 
-        assert!(
-            err.to_string()
-                .contains("multimodal image size limit exceeded")
-        );
+        assert!(err.to_string().contains("multimodal image size limit exceeded"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -3919,10 +3742,7 @@ mod tests {
             serde_json::json!({"type": "object"})
         }
 
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> anyhow::Result<crate::tools::ToolResult> {
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
             self.execution_order
                 .lock()
                 .expect("execution order lock should be valid")
@@ -3937,14 +3757,8 @@ mod tests {
 
     #[test]
     fn classify_tool_call_marks_known_read_only_tools() {
-        assert_eq!(
-            classify_tool_call("file_read"),
-            ToolSchedulingClass::ReadOnly
-        );
-        assert_eq!(
-            classify_tool_call("memory_search"),
-            ToolSchedulingClass::ReadOnly
-        );
+        assert_eq!(classify_tool_call("file_read"), ToolSchedulingClass::ReadOnly);
+        assert_eq!(classify_tool_call("memory_search"), ToolSchedulingClass::ReadOnly);
     }
 
     #[test]
@@ -4021,10 +3835,7 @@ mod tests {
         };
         let approval_mgr = ApprovalManager::from_config(&approval_cfg);
 
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("run tool calls"),
-        ];
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("run tool calls")];
         let observer = NoopObserver;
 
         let started = std::time::Instant::now();
@@ -4124,10 +3935,7 @@ mod tests {
         };
         let approval_mgr = ApprovalManager::from_config(&approval_cfg);
 
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("run tool calls"),
-        ];
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("run tool calls")];
         let observer = NoopObserver;
 
         let started = std::time::Instant::now();
@@ -4303,10 +4111,7 @@ mod tests {
             1,
             "rollback should force subsequent read-only calls into serial lane"
         );
-        assert!(matches!(
-            events[0],
-            ObserverEvent::ToolBatch { rollback: true, .. }
-        ));
+        assert!(matches!(events[0], ObserverEvent::ToolBatch { rollback: true, .. }));
     }
 
     #[tokio::test]
@@ -4356,10 +4161,7 @@ mod tests {
         assert_eq!(text, "Let me check that.");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "ls -la"
-        );
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "ls -la");
     }
 
     #[test]
@@ -4420,10 +4222,7 @@ After text."#;
         assert_eq!(text, "Let me check that for you.");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "ls -la"
-        );
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "ls -la");
     }
 
     #[test]
@@ -4439,7 +4238,8 @@ After text."#;
     #[test]
     fn parse_tool_calls_openai_format_without_content() {
         // Some providers don't include content field with tool_calls
-        let response = r#"{"tool_calls": [{"type": "function", "function": {"name": "memory_recall", "arguments": "{}"}}]}"#;
+        let response =
+            r#"{"tool_calls": [{"type": "function", "function": {"name": "memory_recall", "arguments": "{}"}}]}"#;
 
         let (text, calls) = parse_tool_calls(response);
         assert!(text.is_empty()); // No content field
@@ -4459,10 +4259,7 @@ After text."#;
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "file_write");
-        assert_eq!(
-            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
-            "test.py"
-        );
+        assert_eq!(calls[0].arguments.get("path").unwrap().as_str().unwrap(), "test.py");
     }
 
     #[test]
@@ -4476,10 +4273,7 @@ I will now call the tool with this payload:
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "pwd"
-        );
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "pwd");
     }
 
     #[test]
@@ -4493,10 +4287,7 @@ Done."#;
         let (text, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "pwd"
-        );
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "pwd");
         assert!(text.contains("I'll check that."));
         assert!(text.contains("Done."));
         assert!(!text.contains("```tool_call"));
@@ -4513,10 +4304,7 @@ Tail"#;
         let (text, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "date"
-        );
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "date");
         assert!(text.contains("Preface"));
         assert!(text.contains("Tail"));
         assert!(!text.contains("```tool-call"));
@@ -4533,10 +4321,7 @@ Done."#;
         let (text, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "date"
-        );
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "date");
         assert!(text.contains("Checking."));
         assert!(text.contains("Done."));
     }
@@ -4551,10 +4336,7 @@ Done."#;
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "date"
-        );
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "date");
     }
 
     #[test]
@@ -4567,10 +4349,7 @@ Done."#;
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "whoami"
-        );
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "whoami");
     }
 
     #[test]
@@ -4583,10 +4362,7 @@ Done."#;
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "date"
-        );
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "date");
     }
 
     #[test]
@@ -4599,10 +4375,7 @@ Done."#;
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "uptime"
-        );
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "uptime");
     }
 
     #[test]
@@ -4685,10 +4458,7 @@ ls -la
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
-        assert_eq!(
-            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
-            "uptime"
-        );
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "uptime");
     }
 
     #[test]
@@ -4713,11 +4483,7 @@ ls -la
 
         let (text, calls) = parse_tool_calls(response);
         assert!(text.contains("Sure, creating the file now."));
-        assert_eq!(
-            calls.len(),
-            0,
-            "Raw JSON without wrappers should not be parsed"
-        );
+        assert_eq!(calls.len(), 0, "Raw JSON without wrappers should not be parsed");
     }
 
     #[test]
@@ -4781,10 +4547,7 @@ ls -la
         assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
         // Most recent messages preserved
         let last = &history[history.len() - 1];
-        assert_eq!(
-            last.content,
-            format!("msg {}", DEFAULT_MAX_HISTORY_MESSAGES + 19)
-        );
+        assert_eq!(last.content, format!("msg {}", DEFAULT_MAX_HISTORY_MESSAGES + 19));
     }
 
     #[test]
@@ -4800,10 +4563,7 @@ ls -la
 
     #[test]
     fn build_compaction_transcript_formats_roles() {
-        let messages = vec![
-            ChatMessage::user("I like dark mode"),
-            ChatMessage::assistant("Got it"),
-        ];
+        let messages = vec![ChatMessage::user("I like dark mode"), ChatMessage::assistant("Got it")];
         let transcript = build_compaction_transcript(&messages);
         assert!(transcript.contains("USER: I like dark mode"));
         assert!(transcript.contains("ASSISTANT: Got it"));
@@ -4859,9 +4619,11 @@ ls -la
             .await
             .unwrap();
         assert!(compacted);
-        assert!(history.iter().any(|msg| {
-            msg.content.contains("[Context compacted at") && msg.content.contains("Summary:")
-        }));
+        assert!(
+            history
+                .iter()
+                .any(|msg| { msg.content.contains("[Context compacted at") && msg.content.contains("Summary:") })
+        );
     }
 
     #[tokio::test]
@@ -4885,11 +4647,7 @@ ls -la
             .await
             .unwrap();
         assert!(compacted);
-        assert!(
-            history
-                .iter()
-                .any(|msg| msg.content.contains("[Memory flush at"))
-        );
+        assert!(history.iter().any(|msg| msg.content.contains("[Memory flush at")));
     }
 
     #[test]
@@ -5139,10 +4897,7 @@ Done."#;
         });
         let result = parse_tool_call_value(&value).expect("tool call should parse");
         assert_eq!(result.name, "schedule");
-        assert_eq!(
-            result.arguments.get("action").and_then(|v| v.as_str()),
-            Some("create")
-        );
+        assert_eq!(result.arguments.get("action").and_then(|v| v.as_str()), Some("create"));
     }
 
     #[test]
@@ -5155,10 +4910,7 @@ Done."#;
         });
         let result = parse_tool_call_value(&value).expect("tool call should parse");
         assert_eq!(result.name, "shell");
-        assert_eq!(
-            result.arguments.get("command").and_then(|v| v.as_str()),
-            Some("date")
-        );
+        assert_eq!(result.arguments.get("command").and_then(|v| v.as_str()), Some("date"));
     }
 
     #[test]
@@ -5199,12 +4951,7 @@ Done."#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "shell");
         assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
-        assert!(
-            calls[0].1["command"]
-                .as_str()
-                .unwrap()
-                .contains("example.com")
-        );
+        assert!(calls[0].1["command"].as_str().unwrap().contains("example.com"));
     }
 
     #[test]
@@ -5364,24 +5111,15 @@ browser_open/url>https://example.com"#;
         let response = "<tool_call>{}</tool_call>";
         let (_text, calls) = parse_tool_calls(response);
         // Empty JSON object has no name field — should not produce valid tool call
-        assert!(
-            calls.is_empty(),
-            "empty JSON object should not produce a tool call"
-        );
+        assert!(calls.is_empty(), "empty JSON object should not produce a tool call");
     }
 
     #[test]
     fn parse_tool_calls_closing_tag_only_returns_text() {
         let response = "Some text </tool_call> more text";
         let (text, calls) = parse_tool_calls(response);
-        assert!(
-            calls.is_empty(),
-            "closing tag only should not produce calls"
-        );
-        assert!(
-            !text.is_empty(),
-            "text around orphaned closing tag should be preserved"
-        );
+        assert!(calls.is_empty(), "closing tag only should not produce calls");
+        assert!(!text.is_empty(), "text around orphaned closing tag should be preserved");
     }
 
     #[test]
@@ -5426,16 +5164,9 @@ browser_open/url>https://example.com"#;
 
 Let me check the result."#;
         let (text, calls) = parse_tool_calls(response);
-        assert_eq!(
-            calls.len(),
-            1,
-            "should extract one tool call from mixed content"
-        );
+        assert_eq!(calls.len(), 1, "should extract one tool call from mixed content");
         assert_eq!(calls[0].name, "shell");
-        assert!(
-            text.contains("help you"),
-            "text before tool call should be preserved"
-        );
+        assert!(text.contains("help you"), "text before tool call should be preserved");
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -5452,10 +5183,7 @@ Let me check the result."#;
     fn scrub_credentials_no_sensitive_data() {
         let input = "normal text without any secrets";
         let result = scrub_credentials(input);
-        assert_eq!(
-            result, input,
-            "non-sensitive text should pass through unchanged"
-        );
+        assert_eq!(result, input, "non-sensitive text should pass through unchanged");
     }
 
     #[test]

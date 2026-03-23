@@ -56,16 +56,10 @@ impl NodesTool {
 
     fn make_client(&self, node: &RemoteNodeConfig) -> anyhow::Result<RemoteNodeClient> {
         let cfg = self.config.load_full();
-        let timeout_ms = node
-            .timeout_ms
-            .unwrap_or(cfg.nodes.request_timeout_ms)
-            .max(100);
+        let timeout_ms = node.timeout_ms.unwrap_or(cfg.nodes.request_timeout_ms).max(100);
         let retry_max = node.retry_max.unwrap_or(cfg.nodes.retry_max);
 
-        let transport = Arc::new(H2Transport::new(
-            Duration::from_millis(timeout_ms),
-            retry_max,
-        )?);
+        let transport = Arc::new(H2Transport::new(Duration::from_millis(timeout_ms), retry_max)?);
 
         Ok(RemoteNodeClient::new(node.clone(), transport))
     }
@@ -90,11 +84,7 @@ impl NodesTool {
 
     fn optional_bool_arg(args: &Value, key: &str) -> anyhow::Result<Option<bool>> {
         args.get(key)
-            .map(|value| {
-                value
-                    .as_bool()
-                    .ok_or_else(|| anyhow!("'{key}' must be a boolean"))
-            })
+            .map(|value| value.as_bool().ok_or_else(|| anyhow!("'{key}' must be a boolean")))
             .transpose()
     }
 }
@@ -376,10 +366,7 @@ mod tests {
     #[test]
     fn require_string_arg_valid() {
         let args = json!({"key": "value"});
-        assert_eq!(
-            NodesTool::require_string_arg(&args, "key").unwrap(),
-            "value"
-        );
+        assert_eq!(NodesTool::require_string_arg(&args, "key").unwrap(), "value");
     }
 
     #[test]
@@ -437,10 +424,7 @@ mod tests {
     #[test]
     fn optional_bool_valid() {
         let args = json!({"x": true});
-        assert_eq!(
-            NodesTool::optional_bool_arg(&args, "x").unwrap(),
-            Some(true)
-        );
+        assert_eq!(NodesTool::optional_bool_arg(&args, "x").unwrap(), Some(true));
     }
 
     #[test]
@@ -484,8 +468,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_with_nodes() {
-        let tool =
-            make_tool_with_nodes(vec![test_node("n1"), test_node("n2")], AutonomyLevel::Full);
+        let tool = make_tool_with_nodes(vec![test_node("n1"), test_node("n2")], AutonomyLevel::Full);
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(result.success);
         let out: Value = serde_json::from_str(&result.output).unwrap();
@@ -541,10 +524,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_action_fails() {
         let tool = make_tool();
-        let err = tool
-            .execute(json!({"action": "destroy"}))
-            .await
-            .unwrap_err();
+        let err = tool.execute(json!({"action": "destroy"})).await.unwrap_err();
         assert!(err.to_string().contains("Unknown action"));
     }
 
@@ -592,11 +572,7 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Missing or invalid 'command' parameter")
-        );
+        assert!(error.to_string().contains("Missing or invalid 'command' parameter"));
     }
 
     #[tokio::test]
@@ -611,11 +587,7 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("'offset' must be an unsigned integer")
-        );
+        assert!(error.to_string().contains("'offset' must be an unsigned integer"));
     }
 
     #[tokio::test]

@@ -45,11 +45,7 @@ impl NextcloudTalkChannel {
         .unwrap_or_else(Self::now_unix_secs);
 
         // Some payloads use milliseconds.
-        if raw > 1_000_000_000_000 {
-            raw / 1000
-        } else {
-            raw
-        }
+        if raw > 1_000_000_000_000 { raw / 1000 } else { raw }
     }
 
     fn value_to_string(value: Option<&serde_json::Value>) -> Option<String> {
@@ -156,8 +152,7 @@ impl NextcloudTalkChannel {
             return messages;
         };
 
-        let message_id = Self::value_to_string(message_obj.get("id"))
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let message_id = Self::value_to_string(message_obj.get("id")).unwrap_or_else(|| Uuid::new_v4().to_string());
         let timestamp = Self::parse_timestamp_secs(message_obj.get("timestamp"));
 
         messages.push(ChannelMessage {
@@ -209,8 +204,7 @@ impl Channel for NextcloudTalkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        self.send_to_room(&message.recipient, &message.content)
-            .await
+        self.send_to_room(&message.recipient, &message.content).await
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -241,23 +235,14 @@ impl Channel for NextcloudTalkChannel {
 ///
 /// Signature calculation (official Talk bot docs):
 /// `hex(hmac_sha256(secret, X-Nextcloud-Talk-Random + raw_body))`
-pub fn verify_nextcloud_talk_signature(
-    secret: &str,
-    random: &str,
-    body: &str,
-    signature: &str,
-) -> bool {
+pub fn verify_nextcloud_talk_signature(secret: &str, random: &str, body: &str, signature: &str) -> bool {
     let random = random.trim();
     if random.is_empty() {
         tracing::warn!("Nextcloud Talk: missing X-Nextcloud-Talk-Random header");
         return false;
     }
 
-    let signature_hex = signature
-        .trim()
-        .strip_prefix("sha256=")
-        .unwrap_or(signature)
-        .trim();
+    let signature_hex = signature.trim().strip_prefix("sha256=").unwrap_or(signature).trim();
 
     let Ok(provided) = hex::decode(signature_hex) else {
         tracing::warn!("Nextcloud Talk: invalid signature format");
@@ -297,11 +282,8 @@ mod tests {
         assert!(channel.is_user_allowed("user_a"));
         assert!(!channel.is_user_allowed("user_b"));
 
-        let wildcard = NextcloudTalkChannel::new(
-            "https://cloud.example.com".into(),
-            "app-token".into(),
-            vec!["*".into()],
-        );
+        let wildcard =
+            NextcloudTalkChannel::new("https://cloud.example.com".into(), "app-token".into(), vec!["*".into()]);
         assert!(wildcard.is_user_allowed("any_user"));
     }
 
@@ -358,11 +340,8 @@ mod tests {
 
     #[test]
     fn nextcloud_talk_parse_skips_bot_messages() {
-        let channel = NextcloudTalkChannel::new(
-            "https://cloud.example.com".into(),
-            "app-token".into(),
-            vec!["*".into()],
-        );
+        let channel =
+            NextcloudTalkChannel::new("https://cloud.example.com".into(), "app-token".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "type": "message",
             "object": {"token": "room-token-123"},
@@ -396,11 +375,8 @@ mod tests {
 
     #[test]
     fn nextcloud_talk_parse_skips_system_message() {
-        let channel = NextcloudTalkChannel::new(
-            "https://cloud.example.com".into(),
-            "app-token".into(),
-            vec!["*".into()],
-        );
+        let channel =
+            NextcloudTalkChannel::new("https://cloud.example.com".into(), "app-token".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "type": "message",
             "object": {"token": "room-token-123"},
@@ -419,11 +395,8 @@ mod tests {
 
     #[test]
     fn nextcloud_talk_parse_timestamp_millis_to_seconds() {
-        let channel = NextcloudTalkChannel::new(
-            "https://cloud.example.com".into(),
-            "app-token".into(),
-            vec!["*".into()],
-        );
+        let channel =
+            NextcloudTalkChannel::new("https://cloud.example.com".into(), "app-token".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "type": "message",
             "object": {"token": "room-token-123"},
@@ -453,9 +426,7 @@ mod tests {
         mac.update(payload.as_bytes());
         let signature = hex::encode(mac.finalize().into_bytes());
 
-        assert!(verify_nextcloud_talk_signature(
-            secret, random, body, &signature
-        ));
+        assert!(verify_nextcloud_talk_signature(secret, random, body, &signature));
     }
 
     #[test]
@@ -479,8 +450,6 @@ mod tests {
         mac.update(payload.as_bytes());
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
 
-        assert!(verify_nextcloud_talk_signature(
-            secret, random, body, &signature
-        ));
+        assert!(verify_nextcloud_talk_signature(secret, random, body, &signature));
     }
 }

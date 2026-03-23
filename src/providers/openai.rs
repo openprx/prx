@@ -1,6 +1,6 @@
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
+    ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -90,8 +90,8 @@ struct NativeToolFunctionSpec {
 }
 
 fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
-    let spec: NativeToolSpec = serde_json::from_value(value)
-        .map_err(|e| anyhow::anyhow!("Invalid OpenAI tool specification: {e}"))?;
+    let spec: NativeToolSpec =
+        serde_json::from_value(value).map_err(|e| anyhow::anyhow!("Invalid OpenAI tool specification: {e}"))?;
 
     if spec.kind != "function" {
         anyhow::bail!(
@@ -188,9 +188,7 @@ impl OpenAiProvider {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
                         if let Some(tool_calls_value) = value.get("tool_calls") {
                             if let Ok(parsed_calls) =
-                                serde_json::from_value::<Vec<ProviderToolCall>>(
-                                    tool_calls_value.clone(),
-                                )
+                                serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
                             {
                                 let tool_calls = parsed_calls
                                     .into_iter()
@@ -289,9 +287,10 @@ impl Provider for OpenAiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
-        })?;
+        let credential = self
+            .credential
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml."))?;
 
         let mut messages = Vec::new();
 
@@ -341,9 +340,10 @@ impl Provider for OpenAiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
-        })?;
+        let credential = self
+            .credential
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml."))?;
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -387,9 +387,10 @@ impl Provider for OpenAiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
-        })?;
+        let credential = self
+            .credential
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml."))?;
 
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
             None
@@ -479,9 +480,7 @@ mod tests {
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
         let p = OpenAiProvider::new(None);
-        let result = p
-            .chat_with_system(Some("You are OpenPRX"), "test", "gpt-4o", 0.5)
-            .await;
+        let result = p.chat_with_system(Some("You are OpenPRX"), "test", "gpt-4o", 0.5).await;
         assert!(result.is_err());
     }
 
@@ -549,10 +548,7 @@ mod tests {
     fn response_with_unicode() {
         let json = r#"{"choices":[{"message":{"content":"Hello \u03A9"}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            resp.choices[0].message.effective_content(),
-            "Hello \u{03A9}"
-        );
+        assert_eq!(resp.choices[0].message.effective_content(), "Hello \u{03A9}");
     }
 
     #[test]
@@ -560,10 +556,7 @@ mod tests {
         let long = "x".repeat(100_000);
         let json = format!(r#"{{"choices":[{{"message":{{"content":"{long}"}}}}]}}"#);
         let resp: ChatResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            resp.choices[0].message.content.as_ref().unwrap().len(),
-            100_000
-        );
+        assert_eq!(resp.choices[0].message.content.as_ref().unwrap().len(), 100_000);
     }
 
     #[tokio::test]
@@ -586,8 +579,7 @@ mod tests {
 
     #[test]
     fn reasoning_content_fallback_null_content() {
-        let json =
-            r#"{"choices":[{"message":{"content":null,"reasoning_content":"Thinking..."}}]}"#;
+        let json = r#"{"choices":[{"message":{"content":null,"reasoning_content":"Thinking..."}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices[0].message.effective_content(), "Thinking...");
     }
@@ -601,8 +593,7 @@ mod tests {
 
     #[test]
     fn native_response_reasoning_content_fallback() {
-        let json =
-            r#"{"choices":[{"message":{"content":"","reasoning_content":"Native thinking"}}]}"#;
+        let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Native thinking"}}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
         assert_eq!(msg.effective_content(), Some("Native thinking".to_string()));
@@ -610,8 +601,7 @@ mod tests {
 
     #[test]
     fn native_response_reasoning_content_ignored_when_content_present() {
-        let json =
-            r#"{"choices":[{"message":{"content":"Real answer","reasoning_content":"Ignored"}}]}"#;
+        let json = r#"{"choices":[{"message":{"content":"Real answer","reasoning_content":"Ignored"}}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
         assert_eq!(msg.effective_content(), Some("Real answer".to_string()));

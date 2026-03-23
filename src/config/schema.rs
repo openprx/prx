@@ -46,12 +46,10 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tunnel.custom",
 ];
 
-const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] =
-    &["provider.*", "channel.*", "tool.*", "memory.*", "tunnel.*"];
+const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &["provider.*", "channel.*", "tool.*", "memory.*", "tunnel.*"];
 
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
-static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
-    OnceLock::new();
+static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> = OnceLock::new();
 
 // ── Top-level config ──────────────────────────────────────────────
 
@@ -1970,13 +1968,8 @@ impl ProxyConfig {
             );
         }
 
-        if self.enabled
-            && self.scope == ProxyScope::Services
-            && self.normalized_services().is_empty()
-        {
-            anyhow::bail!(
-                "proxy.scope='services' requires a non-empty proxy.services list when proxy is enabled"
-            );
+        if self.enabled && self.scope == ProxyScope::Services && self.normalized_services().is_empty() {
+            anyhow::bail!("proxy.scope='services' requires a non-empty proxy.services list when proxy is enabled");
         }
 
         Ok(())
@@ -2174,15 +2167,13 @@ fn service_selector_matches(selector: &str, service_key: &str) -> bool {
 
 fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
     let redacted = redact_url_credentials(url);
-    let parsed = reqwest::Url::parse(url)
-        .with_context(|| format!("Invalid {field} URL: '{redacted}' is not a valid URL"))?;
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("Invalid {field} URL: '{redacted}' is not a valid URL"))?;
 
     match parsed.scheme() {
         "http" | "https" | "socks5" | "socks5h" => {}
         scheme => {
-            anyhow::bail!(
-                "Invalid {field} URL scheme '{scheme}'. Allowed: http, https, socks5, socks5h"
-            );
+            anyhow::bail!("Invalid {field} URL scheme '{scheme}'. Allowed: http, https, socks5, socks5h");
         }
     }
 
@@ -2241,11 +2232,7 @@ fn clear_runtime_proxy_client_cache() {
     }
 }
 
-fn runtime_proxy_cache_key(
-    service_key: &str,
-    timeout_secs: Option<u64>,
-    connect_timeout_secs: Option<u64>,
-) -> String {
+fn runtime_proxy_cache_key(service_key: &str, timeout_secs: Option<u64>, connect_timeout_secs: Option<u64>) -> String {
     format!(
         "{}|timeout={}|connect_timeout={}",
         service_key.trim().to_ascii_lowercase(),
@@ -2296,10 +2283,7 @@ pub fn runtime_proxy_config() -> ProxyConfig {
     }
 }
 
-pub fn apply_runtime_proxy_to_builder(
-    builder: reqwest::ClientBuilder,
-    service_key: &str,
-) -> reqwest::ClientBuilder {
+pub fn apply_runtime_proxy_to_builder(builder: reqwest::ClientBuilder, service_key: &str) -> reqwest::ClientBuilder {
     runtime_proxy_config().apply_to_reqwest_builder(builder, service_key)
 }
 
@@ -2322,8 +2306,7 @@ pub fn build_runtime_proxy_client_with_timeouts(
     timeout_secs: u64,
     connect_timeout_secs: u64,
 ) -> Result<reqwest::Client> {
-    let cache_key =
-        runtime_proxy_cache_key(service_key, Some(timeout_secs), Some(connect_timeout_secs));
+    let cache_key = runtime_proxy_cache_key(service_key, Some(timeout_secs), Some(connect_timeout_secs));
     if let Some(client) = runtime_proxy_cached_client(&cache_key) {
         return Ok(client);
     }
@@ -2382,12 +2365,7 @@ pub struct StorageProviderConfig {
 
     /// Connection URL for remote providers.
     /// Accepts legacy aliases: dbURL, database_url, databaseUrl.
-    #[serde(
-        default,
-        alias = "dbURL",
-        alias = "database_url",
-        alias = "databaseUrl"
-    )]
+    #[serde(default, alias = "dbURL", alias = "database_url", alias = "databaseUrl")]
     pub db_url: Option<String>,
 
     /// Database schema for SQL backends.
@@ -4191,8 +4169,7 @@ pub struct QQConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        let home =
-            UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
+        let home = UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
         let openprx_dir = preferred_user_config_dir(&home);
 
         Self {
@@ -4287,9 +4264,7 @@ fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
     default_dir.join(ACTIVE_WORKSPACE_STATE_FILE)
 }
 
-async fn load_persisted_workspace_dirs(
-    default_config_dir: &Path,
-) -> Result<Option<(PathBuf, PathBuf)>> {
+async fn load_persisted_workspace_dirs(default_config_dir: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
     let state_path = active_workspace_state_path(default_config_dir);
     if !state_path.exists() {
         return Ok(None);
@@ -4341,35 +4316,26 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
 
     if config_dir == default_config_dir {
         if state_path.exists() {
-            fs::remove_file(&state_path).await.with_context(|| {
-                format!(
-                    "Failed to clear active workspace marker: {}",
-                    state_path.display()
-                )
-            })?;
+            fs::remove_file(&state_path)
+                .await
+                .with_context(|| format!("Failed to clear active workspace marker: {}", state_path.display()))?;
         }
         return Ok(());
     }
 
-    fs::create_dir_all(&default_config_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create default config directory: {}",
-                default_config_dir.display()
-            )
-        })?;
+    fs::create_dir_all(&default_config_dir).await.with_context(|| {
+        format!(
+            "Failed to create default config directory: {}",
+            default_config_dir.display()
+        )
+    })?;
 
     let state = ActiveWorkspaceState {
         config_dir: config_dir.to_string_lossy().into_owned(),
     };
-    let serialized =
-        toml::to_string_pretty(&state).context("Failed to serialize active workspace marker")?;
+    let serialized = toml::to_string_pretty(&state).context("Failed to serialize active workspace marker")?;
 
-    let temp_path = default_config_dir.join(format!(
-        ".{ACTIVE_WORKSPACE_STATE_FILE}.tmp-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_path = default_config_dir.join(format!(".{ACTIVE_WORKSPACE_STATE_FILE}.tmp-{}", uuid::Uuid::new_v4()));
     fs::write(&temp_path, serialized).await.with_context(|| {
         format!(
             "Failed to write temporary active workspace marker: {}",
@@ -4392,10 +4358,7 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
 fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
     let workspace_config_dir = workspace_dir.to_path_buf();
     if workspace_config_dir.join("config.toml").exists() {
-        return (
-            workspace_config_dir.clone(),
-            workspace_config_dir.join("workspace"),
-        );
+        return (workspace_config_dir.clone(), workspace_config_dir.join("workspace"));
     }
 
     let legacy_candidates = workspace_dir.parent().map(|parent| {
@@ -4419,10 +4382,7 @@ fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) 
         }
     }
 
-    (
-        workspace_config_dir.clone(),
-        workspace_config_dir.join("workspace"),
-    )
+    (workspace_config_dir.clone(), workspace_config_dir.join("workspace"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4466,19 +4426,12 @@ async fn resolve_runtime_config_dirs(
 
     if let Ok(custom_workspace) = env_openprx("WORKSPACE") {
         if !custom_workspace.is_empty() {
-            let (openprx_dir, workspace_dir) =
-                resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
-            return Ok((
-                openprx_dir,
-                workspace_dir,
-                ConfigResolutionSource::EnvWorkspace,
-            ));
+            let (openprx_dir, workspace_dir) = resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
+            return Ok((openprx_dir, workspace_dir, ConfigResolutionSource::EnvWorkspace));
         }
     }
 
-    if let Some((openprx_dir, workspace_dir)) =
-        load_persisted_workspace_dirs(default_openprx_dir).await?
-    {
+    if let Some((openprx_dir, workspace_dir)) = load_persisted_workspace_dirs(default_openprx_dir).await? {
         return Ok((
             openprx_dir,
             workspace_dir,
@@ -4538,11 +4491,7 @@ fn config_dir_creation_error(path: &Path) -> String {
 fn decrypt_config_secrets(config: &mut Config, openprx_dir: &Path) -> Result<()> {
     let store = crate::security::SecretStore::new(openprx_dir, config.secrets.encrypt);
     decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
-    decrypt_optional_secret(
-        &store,
-        &mut config.composio.api_key,
-        "config.composio.api_key",
-    )?;
+    decrypt_optional_secret(&store, &mut config.composio.api_key, "config.composio.api_key")?;
 
     decrypt_optional_secret(
         &store,
@@ -4572,9 +4521,7 @@ fn decrypt_config_secrets(config: &mut Config, openprx_dir: &Path) -> Result<()>
 impl Config {
     pub(crate) fn load_from_path(config_path: &Path, workspace_dir: PathBuf) -> Result<Self> {
         let merged = read_merged_toml(config_path)?;
-        let mut config: Config = merged
-            .try_into()
-            .context("Failed to deserialize merged config")?;
+        let mut config: Config = merged.try_into().context("Failed to deserialize merged config")?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
 
@@ -4671,9 +4618,7 @@ impl Config {
             self.webhook
                 .bind
                 .parse::<std::net::SocketAddr>()
-                .with_context(|| {
-                    format!("invalid webhook.bind socket address: {}", self.webhook.bind)
-                })?;
+                .with_context(|| format!("invalid webhook.bind socket address: {}", self.webhook.bind))?;
             if self
                 .webhook
                 .token
@@ -4702,9 +4647,7 @@ impl Config {
             self.agent.concurrency_rollout_stage.as_str(),
             "off" | "stage_a" | "stage_b" | "stage_c" | "full"
         ) {
-            anyhow::bail!(
-                "agent.concurrency_rollout_stage must be one of: off|stage_a|stage_b|stage_c|full"
-            );
+            anyhow::bail!("agent.concurrency_rollout_stage must be one of: off|stage_a|stage_b|stage_c|full");
         }
         if !(0.0..=1.0).contains(&self.agent.concurrency_rollback_timeout_rate_threshold) {
             anyhow::bail!("agent.concurrency_rollback_timeout_rate_threshold must be in [0,1]");
@@ -4788,10 +4731,10 @@ impl Config {
                 self.default_provider = Some(provider);
             }
         } else if let Ok(provider) = std::env::var("PROVIDER") {
-            let should_apply_legacy_provider =
-                self.default_provider.as_deref().map_or(true, |configured| {
-                    configured.trim().eq_ignore_ascii_case("openrouter")
-                });
+            let should_apply_legacy_provider = self
+                .default_provider
+                .as_deref()
+                .map_or(true, |configured| configured.trim().eq_ignore_ascii_case("openrouter"));
             if should_apply_legacy_provider && !provider.is_empty() {
                 self.default_provider = Some(provider);
             }
@@ -4807,8 +4750,7 @@ impl Config {
         // Workspace directory: OPENPRX_WORKSPACE
         if let Ok(workspace) = env_openprx("WORKSPACE") {
             if !workspace.is_empty() {
-                let (_, workspace_dir) =
-                    resolve_config_dir_for_workspace(&PathBuf::from(workspace));
+                let (_, workspace_dir) = resolve_config_dir_for_workspace(&PathBuf::from(workspace));
                 self.workspace_dir = workspace_dir;
             }
         }
@@ -4899,19 +4841,14 @@ impl Config {
             }
         }
         if let Ok(enabled) = env_openprx("PRIORITY_SCHEDULING_ENABLED") {
-            self.agent.priority_scheduling_enabled =
-                enabled == "1" || enabled.eq_ignore_ascii_case("true");
+            self.agent.priority_scheduling_enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
         if let Ok(enabled) = env_openprx("CONCURRENCY_KILL_SWITCH_FORCE_SERIAL") {
-            self.agent.concurrency_kill_switch_force_serial =
-                enabled == "1" || enabled.eq_ignore_ascii_case("true");
+            self.agent.concurrency_kill_switch_force_serial = enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
         if let Ok(stage) = env_openprx("CONCURRENCY_ROLLOUT_STAGE") {
             let stage = stage.trim().to_ascii_lowercase();
-            if matches!(
-                stage.as_str(),
-                "off" | "stage_a" | "stage_b" | "stage_c" | "full"
-            ) {
+            if matches!(stage.as_str(), "off" | "stage_a" | "stage_b" | "stage_c" | "full") {
                 self.agent.concurrency_rollout_stage = stage;
             }
         }
@@ -4930,8 +4867,7 @@ impl Config {
             self.agent.concurrency_rollout_channels = parsed;
         }
         if let Ok(enabled) = env_openprx("CONCURRENCY_AUTO_ROLLBACK_ENABLED") {
-            self.agent.concurrency_auto_rollback_enabled =
-                enabled == "1" || enabled.eq_ignore_ascii_case("true");
+            self.agent.concurrency_auto_rollback_enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
         if let Ok(threshold) = env_openprx("CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD") {
             if let Ok(threshold) = threshold.parse::<f64>() {
@@ -4956,9 +4892,7 @@ impl Config {
         }
 
         // Reasoning override: OPENPRX_REASONING_ENABLED or REASONING_ENABLED
-        if let Ok(flag) =
-            env_openprx("REASONING_ENABLED").or_else(|_| std::env::var("REASONING_ENABLED"))
-        {
+        if let Ok(flag) = env_openprx("REASONING_ENABLED").or_else(|_| std::env::var("REASONING_ENABLED")) {
             let normalized = flag.trim().to_ascii_lowercase();
             match normalized.as_str() {
                 "1" | "true" | "yes" | "on" => self.runtime.reasoning_enabled = Some(true),
@@ -4968,16 +4902,12 @@ impl Config {
         }
 
         // Web search enabled: OPENPRX_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
-        if let Ok(enabled) =
-            env_openprx("WEB_SEARCH_ENABLED").or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
-        {
+        if let Ok(enabled) = env_openprx("WEB_SEARCH_ENABLED").or_else(|_| std::env::var("WEB_SEARCH_ENABLED")) {
             self.web_search.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
 
         // Web search provider: OPENPRX_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
-        if let Ok(provider) =
-            env_openprx("WEB_SEARCH_PROVIDER").or_else(|_| std::env::var("WEB_SEARCH_PROVIDER"))
-        {
+        if let Ok(provider) = env_openprx("WEB_SEARCH_PROVIDER").or_else(|_| std::env::var("WEB_SEARCH_PROVIDER")) {
             let provider = provider.trim();
             if !provider.is_empty() {
                 self.web_search.provider = provider.to_string();
@@ -4985,9 +4915,7 @@ impl Config {
         }
 
         // Brave API key: OPENPRX_BRAVE_API_KEY or BRAVE_API_KEY
-        if let Ok(api_key) =
-            env_openprx("BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY"))
-        {
+        if let Ok(api_key) = env_openprx("BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY")) {
             let api_key = api_key.trim();
             if !api_key.is_empty() {
                 self.web_search.brave_api_key = Some(api_key.to_string());
@@ -4995,8 +4923,8 @@ impl Config {
         }
 
         // Web search max results: OPENPRX_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
-        if let Ok(max_results) = env_openprx("WEB_SEARCH_MAX_RESULTS")
-            .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
+        if let Ok(max_results) =
+            env_openprx("WEB_SEARCH_MAX_RESULTS").or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
         {
             if let Ok(max_results) = max_results.parse::<usize>() {
                 if (1..=10).contains(&max_results) {
@@ -5006,8 +4934,8 @@ impl Config {
         }
 
         // Web search timeout: OPENPRX_WEB_SEARCH_TIMEOUT_SECS or WEB_SEARCH_TIMEOUT_SECS
-        if let Ok(timeout_secs) = env_openprx("WEB_SEARCH_TIMEOUT_SECS")
-            .or_else(|_| std::env::var("WEB_SEARCH_TIMEOUT_SECS"))
+        if let Ok(timeout_secs) =
+            env_openprx("WEB_SEARCH_TIMEOUT_SECS").or_else(|_| std::env::var("WEB_SEARCH_TIMEOUT_SECS"))
         {
             if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
                 if timeout_secs > 0 {
@@ -5055,8 +4983,7 @@ impl Config {
             self.proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
-        if let Ok(proxy_url) = env_openprx("HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
-        {
+        if let Ok(proxy_url) = env_openprx("HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY")) {
             self.proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
@@ -5068,10 +4995,7 @@ impl Config {
             self.proxy.no_proxy = normalize_no_proxy_list(vec![no_proxy]);
         }
 
-        if explicit_proxy_enabled.is_none()
-            && proxy_url_overridden
-            && self.proxy.has_any_proxy_url()
-        {
+        if explicit_proxy_enabled.is_none() && proxy_url_overridden && self.proxy.has_any_proxy_url() {
             self.proxy.enabled = true;
         }
 
@@ -5117,11 +5041,7 @@ impl Config {
         let store = crate::security::SecretStore::new(openprx_dir, self.secrets.encrypt);
 
         encrypt_optional_secret(&store, &mut config_to_save.api_key, "config.api_key")?;
-        encrypt_optional_secret(
-            &store,
-            &mut config_to_save.composio.api_key,
-            "config.composio.api_key",
-        )?;
+        encrypt_optional_secret(&store, &mut config_to_save.composio.api_key, "config.composio.api_key")?;
 
         encrypt_optional_secret(
             &store,
@@ -5156,8 +5076,7 @@ impl Config {
     pub fn to_split_toml_strings(&self) -> Result<(String, Vec<(String, String)>)> {
         let value = self.to_stored_toml_value()?;
         let (main_value, fragment_values) = build_split_tables(&value)?;
-        let main =
-            toml::to_string_pretty(&main_value).context("Failed to serialize main config")?;
+        let main = toml::to_string_pretty(&main_value).context("Failed to serialize main config")?;
         let mut fragments = Vec::with_capacity(fragment_values.len());
         for (name, value) in fragment_values {
             let rendered = toml::to_string_pretty(&value)
@@ -5169,30 +5088,19 @@ impl Config {
 }
 
 pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Result<()> {
-    let parent_dir = path
-        .parent()
-        .context("Config path must have a parent directory")?;
+    let parent_dir = path.parent().context("Config path must have a parent directory")?;
 
     if let Ok(metadata) = fs::symlink_metadata(path).await {
         if metadata.file_type().is_symlink() {
-            anyhow::bail!(
-                "Refusing to replace config via symlink path: {}",
-                path.display()
-            );
+            anyhow::bail!("Refusing to replace config via symlink path: {}", path.display());
         }
     }
 
-    fs::create_dir_all(parent_dir).await.with_context(|| {
-        format!(
-            "Failed to create config directory: {}",
-            parent_dir.display()
-        )
-    })?;
+    fs::create_dir_all(parent_dir)
+        .await
+        .with_context(|| format!("Failed to create config directory: {}", parent_dir.display()))?;
 
-    let file_name = path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("config.toml");
+    let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or("config.toml");
     let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
     let backup_path = parent_dir.join(format!("{file_name}.bak"));
 
@@ -5201,12 +5109,10 @@ pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Res
     #[cfg(unix)]
     open_options.mode(0o600);
 
-    let mut temp_file = open_options.open(&temp_path).await.with_context(|| {
-        format!(
-            "Failed to create temporary config file: {}",
-            temp_path.display()
-        )
-    })?;
+    let mut temp_file = open_options
+        .open(&temp_path)
+        .await
+        .with_context(|| format!("Failed to create temporary config file: {}", temp_path.display()))?;
     temp_file
         .write_all(toml_str.as_bytes())
         .await
@@ -5323,9 +5229,7 @@ mod tests {
         let schema_json = serde_json::to_value(&schema).expect("schema should serialize to json");
 
         assert_eq!(
-            schema_json
-                .get("$schema")
-                .and_then(serde_json::Value::as_str),
+            schema_json.get("$schema").and_then(serde_json::Value::as_str),
             Some("https://json-schema.org/draft/2020-12/schema")
         );
 
@@ -5582,10 +5486,7 @@ default_temperature = 0.7
         assert!(parsed.heartbeat.enabled);
         assert_eq!(parsed.heartbeat.interval_minutes, 15);
         assert!(parsed.channels_config.telegram.is_some());
-        assert_eq!(
-            parsed.channels_config.telegram.unwrap().bot_token,
-            "123:ABC"
-        );
+        assert_eq!(parsed.channels_config.telegram.unwrap().bot_token, "123:ABC");
     }
 
     #[test]
@@ -5674,10 +5575,7 @@ connect_timeout_secs = 12
         );
         assert_eq!(parsed.storage.provider.config.schema, "public");
         assert_eq!(parsed.storage.provider.config.table, "memories");
-        assert_eq!(
-            parsed.storage.provider.config.connect_timeout_secs,
-            Some(12)
-        );
+        assert_eq!(parsed.storage.provider.config.connect_timeout_secs, Some(12));
     }
 
     #[test]
@@ -5747,35 +5645,20 @@ concurrency_rollback_error_rate_threshold = 0.23
         assert_eq!(parsed.agent.read_only_tool_concurrency_window, 4);
         assert_eq!(parsed.agent.read_only_tool_timeout_secs, 45);
         assert!(parsed.agent.priority_scheduling_enabled);
-        assert_eq!(
-            parsed.agent.low_priority_tools,
-            vec!["sessions_spawn", "delegate"]
-        );
+        assert_eq!(parsed.agent.low_priority_tools, vec!["sessions_spawn", "delegate"]);
         assert!(!parsed.agent.concurrency_kill_switch_force_serial);
         assert_eq!(parsed.agent.concurrency_rollout_stage, "stage_b");
         assert_eq!(parsed.agent.concurrency_rollout_sample_percent, 25);
-        assert_eq!(
-            parsed.agent.concurrency_rollout_channels,
-            vec!["telegram", "discord"]
-        );
+        assert_eq!(parsed.agent.concurrency_rollout_channels, vec!["telegram", "discord"]);
         assert!(parsed.agent.concurrency_auto_rollback_enabled);
-        assert!(
-            (parsed.agent.concurrency_rollback_timeout_rate_threshold - 0.21).abs() < f64::EPSILON
-        );
-        assert!(
-            (parsed.agent.concurrency_rollback_cancel_rate_threshold - 0.22).abs() < f64::EPSILON
-        );
-        assert!(
-            (parsed.agent.concurrency_rollback_error_rate_threshold - 0.23).abs() < f64::EPSILON
-        );
+        assert!((parsed.agent.concurrency_rollback_timeout_rate_threshold - 0.21).abs() < f64::EPSILON);
+        assert!((parsed.agent.concurrency_rollback_cancel_rate_threshold - 0.22).abs() < f64::EPSILON);
+        assert!((parsed.agent.concurrency_rollback_error_rate_threshold - 0.23).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
     async fn sync_directory_handles_existing_directory() {
-        let dir = std::env::temp_dir().join(format!(
-            "openprx_test_sync_directory_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("openprx_test_sync_directory_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).await.unwrap();
 
         sync_directory(&dir).await.unwrap();
@@ -5863,10 +5746,7 @@ concurrency_rollback_error_rate_threshold = 0.23
 
     #[tokio::test]
     async fn config_load_from_path_supports_single_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "openprx_test_single_file_load_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("openprx_test_single_file_load_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).await.unwrap();
 
         let config_path = dir.join("config.toml");
@@ -5889,10 +5769,7 @@ default_model = "single-file"
 
     #[tokio::test]
     async fn config_load_from_path_merges_config_dir_and_replaces_arrays() {
-        let dir = std::env::temp_dir().join(format!(
-            "openprx_test_config_merge_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("openprx_test_config_merge_{}", uuid::Uuid::new_v4()));
         let config_dir = dir.join("config.d");
         fs::create_dir_all(&config_dir).await.unwrap();
 
@@ -5966,10 +5843,7 @@ model = "override-beta"
     #[tokio::test]
     async fn config_split_and_reload_roundtrip_matches_original() {
         let _env_guard = env_override_lock().await;
-        let dir = std::env::temp_dir().join(format!(
-            "openprx_test_split_reload_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("openprx_test_split_reload_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).await.unwrap();
 
         let mut config = Config::default();
@@ -6010,12 +5884,9 @@ model = "override-beta"
         );
 
         let expected = serde_json::to_value(&config).unwrap();
-        crate::config::files::write_split_config(&config, false)
-            .await
-            .unwrap();
+        crate::config::files::write_split_config(&config, false).await.unwrap();
 
-        let reloaded =
-            Config::load_from_path(&config.config_path, config.workspace_dir.clone()).unwrap();
+        let reloaded = Config::load_from_path(&config.config_path, config.workspace_dir.clone()).unwrap();
         let actual = serde_json::to_value(&reloaded).unwrap();
         assert_eq!(actual, expected);
 
@@ -6034,16 +5905,11 @@ model = "override-beta"
         config.default_model = Some("preserve-fragments".into());
         config.memory.backend = "markdown".into();
 
-        fs::write(
-            config_dir.join("99-local.toml"),
-            "default_temperature = 0.9\n",
-        )
-        .await
-        .unwrap();
-
-        crate::config::files::write_split_config(&config, false)
+        fs::write(config_dir.join("99-local.toml"), "default_temperature = 0.9\n")
             .await
             .unwrap();
+
+        crate::config::files::write_split_config(&config, false).await.unwrap();
 
         assert!(config_dir.join("99-local.toml").exists());
     }
@@ -6060,16 +5926,11 @@ model = "override-beta"
         config.default_model = Some("merge-guard".into());
         config.save().await.unwrap();
 
-        fs::write(
-            config_dir.join("99-local.toml"),
-            "default_temperature = 0.9\n",
-        )
-        .await
-        .unwrap();
-
-        let error = crate::config::files::merge_split_config(&config)
+        fs::write(config_dir.join("99-local.toml"), "default_temperature = 0.9\n")
             .await
-            .unwrap_err();
+            .unwrap();
+
+        let error = crate::config::files::merge_split_config(&config).await.unwrap_err();
         assert!(
             error.to_string().contains("unmanaged config fragments"),
             "unexpected error: {error}"
@@ -6078,10 +5939,7 @@ model = "override-beta"
 
     #[tokio::test]
     async fn config_save_encrypts_nested_credentials() {
-        let dir = std::env::temp_dir().join(format!(
-            "openprx_test_nested_credentials_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("openprx_test_nested_credentials_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).await.unwrap();
 
         let mut config = Config::default();
@@ -6113,9 +5971,7 @@ model = "override-beta"
 
         config.save().await.unwrap();
 
-        let contents = tokio::fs::read_to_string(config.config_path.clone())
-            .await
-            .unwrap();
+        let contents = tokio::fs::read_to_string(config.config_path.clone()).await.unwrap();
         let stored: Config = toml::from_str(&contents).unwrap();
         let store = crate::security::SecretStore::new(&dir, true);
 
@@ -6124,31 +5980,16 @@ model = "override-beta"
         assert_eq!(store.decrypt(root_encrypted).unwrap(), "root-credential");
 
         let composio_encrypted = stored.composio.api_key.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(
-            composio_encrypted
-        ));
-        assert_eq!(
-            store.decrypt(composio_encrypted).unwrap(),
-            "composio-credential"
-        );
+        assert!(crate::security::SecretStore::is_encrypted(composio_encrypted));
+        assert_eq!(store.decrypt(composio_encrypted).unwrap(), "composio-credential");
 
         let browser_encrypted = stored.browser.computer_use.api_key.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(
-            browser_encrypted
-        ));
-        assert_eq!(
-            store.decrypt(browser_encrypted).unwrap(),
-            "browser-credential"
-        );
+        assert!(crate::security::SecretStore::is_encrypted(browser_encrypted));
+        assert_eq!(store.decrypt(browser_encrypted).unwrap(), "browser-credential");
 
         let web_search_encrypted = stored.web_search.brave_api_key.as_deref().unwrap();
-        assert!(crate::security::SecretStore::is_encrypted(
-            web_search_encrypted
-        ));
-        assert_eq!(
-            store.decrypt(web_search_encrypted).unwrap(),
-            "brave-credential"
-        );
+        assert!(crate::security::SecretStore::is_encrypted(web_search_encrypted));
+        assert_eq!(store.decrypt(web_search_encrypted).unwrap(), "brave-credential");
 
         let worker = stored.agents.get("worker").unwrap();
         let worker_encrypted = worker.api_key.as_deref().unwrap();
@@ -6157,18 +5998,14 @@ model = "override-beta"
 
         let storage_db_url = stored.storage.provider.config.db_url.as_deref().unwrap();
         assert!(crate::security::SecretStore::is_encrypted(storage_db_url));
-        assert_eq!(
-            store.decrypt(storage_db_url).unwrap(),
-            "postgres://user:pw@host/db"
-        );
+        assert_eq!(store.decrypt(storage_db_url).unwrap(), "postgres://user:pw@host/db");
 
         let _ = fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn config_save_atomic_cleanup() {
-        let dir =
-            std::env::temp_dir().join(format!("openprx_test_config_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("openprx_test_config_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).await.unwrap();
 
         let config_path = dir.join("config.toml");
@@ -6712,19 +6549,13 @@ channel_id = "C123"
     #[test]
     async fn checklist_gateway_default_blocks_public_bind() {
         let g = GatewayConfig::default();
-        assert!(
-            !g.allow_public_bind,
-            "Public bind must be blocked by default"
-        );
+        assert!(!g.allow_public_bind, "Public bind must be blocked by default");
     }
 
     #[test]
     async fn checklist_gateway_default_no_tokens() {
         let g = GatewayConfig::default();
-        assert!(
-            g.paired_tokens.is_empty(),
-            "No pre-paired tokens by default"
-        );
+        assert!(g.paired_tokens.is_empty(), "No pre-paired tokens by default");
         assert_eq!(g.pair_rate_limit_per_minute, 10);
         assert_eq!(g.webhook_rate_limit_per_minute, 60);
         assert_eq!(g.api_rate_limit_per_minute, 60);
@@ -6739,14 +6570,8 @@ channel_id = "C123"
         // The CLI default for --host is 127.0.0.1 (checked in main.rs)
         // Here we verify the config default matches
         let c = Config::default();
-        assert!(
-            c.gateway.require_pairing,
-            "Config default must require pairing"
-        );
-        assert!(
-            !c.gateway.allow_public_bind,
-            "Config default must block public bind"
-        );
+        assert!(c.gateway.require_pairing, "Config default must require pairing");
+        assert!(!c.gateway.allow_public_bind, "Config default must block public bind");
     }
 
     #[test]
@@ -6804,18 +6629,9 @@ default_temperature = 0.7
     async fn checklist_autonomy_default_is_workspace_scoped() {
         let a = AutonomyConfig::default();
         assert!(a.workspace_only, "Default autonomy must be workspace_only");
-        assert!(
-            a.forbidden_paths.contains(&"/etc".to_string()),
-            "Must block /etc"
-        );
-        assert!(
-            a.forbidden_paths.contains(&"/proc".to_string()),
-            "Must block /proc"
-        );
-        assert!(
-            a.forbidden_paths.contains(&"~/.ssh".to_string()),
-            "Must block ~/.ssh"
-        );
+        assert!(a.forbidden_paths.contains(&"/etc".to_string()), "Must block /etc");
+        assert!(a.forbidden_paths.contains(&"/proc".to_string()), "Must block /proc");
+        assert!(a.forbidden_paths.contains(&"~/.ssh".to_string()), "Must block ~/.ssh");
     }
 
     // ══════════════════════════════════════════════════════════
@@ -6852,10 +6668,7 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
-        assert!(
-            !parsed.composio.enabled,
-            "Missing [composio] must default to disabled"
-        );
+        assert!(!parsed.composio.enabled, "Missing [composio] must default to disabled");
         assert!(parsed.composio.api_key.is_none());
     }
 
@@ -6907,10 +6720,7 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
-        assert!(
-            parsed.secrets.encrypt,
-            "Missing [secrets] must default to encrypt=true"
-        );
+        assert!(parsed.secrets.encrypt, "Missing [secrets] must default to encrypt=true");
     }
 
     #[test]
@@ -6929,10 +6739,7 @@ default_temperature = 0.7
         let toml_str = toml::to_string(&auth).unwrap();
         let parsed: AuthConfig = toml::from_str(&toml_str).unwrap();
         assert!(!parsed.codex_auth_json_auto_import);
-        assert_eq!(
-            parsed.codex_auth_json_path,
-            PathBuf::from("/tmp/custom-auth.json")
-        );
+        assert_eq!(parsed.codex_auth_json_path, PathBuf::from("/tmp/custom-auth.json"));
     }
 
     #[test]
@@ -6991,10 +6798,7 @@ default_temperature = 0.7
         assert_eq!(parsed.backend, "auto");
         assert!(!parsed.native_headless);
         assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
-        assert_eq!(
-            parsed.native_chrome_path.as_deref(),
-            Some("/usr/bin/chromium")
-        );
+        assert_eq!(parsed.native_chrome_path.as_deref(), Some("/usr/bin/chromium"));
         assert_eq!(
             parsed.computer_use.endpoint,
             "https://computer-use.example.com/v1/actions"
@@ -7098,10 +6902,7 @@ default_temperature = 0.7
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
-        assert_eq!(
-            config.skills.open_skills_dir.as_deref(),
-            Some("/tmp/open-skills")
-        );
+        assert_eq!(config.skills.open_skills_dir.as_deref(), Some("/tmp/open-skills"));
 
         test_remove_env("OPENPRX_OPEN_SKILLS_ENABLED");
         test_remove_env("OPENPRX_OPEN_SKILLS_DIR");
@@ -7219,10 +7020,7 @@ default_temperature = 0.7
         test_remove_env("OPENPRX_MODEL");
         test_set_env("MODEL", "anthropic/claude-3.5-sonnet");
         config.apply_env_overrides();
-        assert_eq!(
-            config.default_model.as_deref(),
-            Some("anthropic/claude-3.5-sonnet")
-        );
+        assert_eq!(config.default_model.as_deref(), Some("anthropic/claude-3.5-sonnet"));
 
         test_remove_env("MODEL");
     }
@@ -7273,9 +7071,7 @@ default_temperature = 0.7
         let state = ActiveWorkspaceState {
             config_dir: marker_config_dir.to_string_lossy().into_owned(),
         };
-        fs::write(&state_path, toml::to_string(&state).unwrap())
-            .await
-            .unwrap();
+        fs::write(&state_path, toml::to_string(&state).unwrap()).await.unwrap();
 
         test_set_env("OPENPRX_CONFIG_DIR", &explicit_config_dir);
         test_remove_env("OPENPRX_WORKSPACE");
@@ -7287,10 +7083,7 @@ default_temperature = 0.7
 
         assert_eq!(source, ConfigResolutionSource::EnvConfigDir);
         assert_eq!(config_dir, explicit_config_dir);
-        assert_eq!(
-            resolved_workspace_dir,
-            explicit_config_dir.join("workspace")
-        );
+        assert_eq!(resolved_workspace_dir, explicit_config_dir.join("workspace"));
 
         test_remove_env("OPENPRX_CONFIG_DIR");
         let _ = fs::remove_dir_all(default_config_dir).await;
@@ -7309,9 +7102,7 @@ default_temperature = 0.7
         let state = ActiveWorkspaceState {
             config_dir: marker_config_dir.to_string_lossy().into_owned(),
         };
-        fs::write(&state_path, toml::to_string(&state).unwrap())
-            .await
-            .unwrap();
+        fs::write(&state_path, toml::to_string(&state).unwrap()).await.unwrap();
 
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
@@ -7347,8 +7138,7 @@ default_temperature = 0.7
     #[test]
     async fn load_or_init_workspace_override_uses_workspace_root_for_config() {
         let _env_guard = env_override_lock().await;
-        let temp_home =
-            std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
+        let temp_home = std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
         let workspace_dir = temp_home.join("profile-a");
 
         let original_home = std::env::var("HOME").ok();
@@ -7373,8 +7163,7 @@ default_temperature = 0.7
     #[test]
     async fn load_or_init_workspace_suffix_uses_legacy_config_layout() {
         let _env_guard = env_override_lock().await;
-        let temp_home =
-            std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
+        let temp_home = std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
         let workspace_dir = temp_home.join("workspace");
         let legacy_config_path = temp_home.join(".openprx").join("config.toml");
 
@@ -7400,8 +7189,7 @@ default_temperature = 0.7
     #[test]
     async fn load_or_init_workspace_override_keeps_existing_legacy_config() {
         let _env_guard = env_override_lock().await;
-        let temp_home =
-            std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
+        let temp_home = std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
         let workspace_dir = temp_home.join("custom-workspace");
         let legacy_config_dir = temp_home.join(".openprx");
         let legacy_config_path = legacy_config_dir.join("config.toml");
@@ -7438,8 +7226,7 @@ default_model = "legacy-model"
     #[test]
     async fn load_or_init_uses_persisted_active_workspace_marker() {
         let _env_guard = env_override_lock().await;
-        let temp_home =
-            std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
+        let temp_home = std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
         let custom_config_dir = temp_home.join("profiles").join("agent-alpha");
 
         fs::create_dir_all(&custom_config_dir).await.unwrap();
@@ -7454,9 +7241,7 @@ default_model = "legacy-model"
         test_set_env("HOME", &temp_home);
         test_remove_env("OPENPRX_WORKSPACE");
 
-        persist_active_workspace_config_dir(&custom_config_dir)
-            .await
-            .unwrap();
+        persist_active_workspace_config_dir(&custom_config_dir).await.unwrap();
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -7475,8 +7260,7 @@ default_model = "legacy-model"
     #[test]
     async fn load_or_init_env_workspace_override_takes_priority_over_marker() {
         let _env_guard = env_override_lock().await;
-        let temp_home =
-            std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
+        let temp_home = std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
         let marker_config_dir = temp_home.join("profiles").join("persisted-profile");
         let env_workspace_dir = temp_home.join("env-workspace");
 
@@ -7490,9 +7274,7 @@ default_model = "legacy-model"
 
         let original_home = std::env::var("HOME").ok();
         test_set_env("HOME", &temp_home);
-        persist_active_workspace_config_dir(&marker_config_dir)
-            .await
-            .unwrap();
+        persist_active_workspace_config_dir(&marker_config_dir).await.unwrap();
         test_set_env("OPENPRX_WORKSPACE", &env_workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
@@ -7512,8 +7294,7 @@ default_model = "legacy-model"
     #[test]
     async fn persist_active_workspace_marker_is_cleared_for_default_config_dir() {
         let _env_guard = env_override_lock().await;
-        let temp_home =
-            std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
+        let temp_home = std::env::temp_dir().join(format!("openprx_test_home_{}", uuid::Uuid::new_v4()));
         let default_config_dir = temp_home.join(".openprx");
         let custom_config_dir = temp_home.join("profiles").join("custom-profile");
         let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
@@ -7521,14 +7302,10 @@ default_model = "legacy-model"
         let original_home = std::env::var("HOME").ok();
         test_set_env("HOME", &temp_home);
 
-        persist_active_workspace_config_dir(&custom_config_dir)
-            .await
-            .unwrap();
+        persist_active_workspace_config_dir(&custom_config_dir).await.unwrap();
         assert!(marker_path.exists());
 
-        persist_active_workspace_config_dir(&default_config_dir)
-            .await
-            .unwrap();
+        persist_active_workspace_config_dir(&default_config_dir).await.unwrap();
         assert!(!marker_path.exists());
 
         if let Some(home) = original_home {
@@ -7696,10 +7473,7 @@ default_model = "legacy-model"
         assert_eq!(config.web_search.provider, "brave");
         assert_eq!(config.web_search.max_results, 7);
         assert_eq!(config.web_search.timeout_secs, 20);
-        assert_eq!(
-            config.web_search.brave_api_key.as_deref(),
-            Some("brave-test-key")
-        );
+        assert_eq!(config.web_search.brave_api_key.as_deref(), Some("brave-test-key"));
 
         test_remove_env("WEB_SEARCH_ENABLED");
         test_remove_env("WEB_SEARCH_PROVIDER");
@@ -7743,10 +7517,7 @@ default_model = "legacy-model"
             config.storage.provider.config.db_url.as_deref(),
             Some("postgres://example/db")
         );
-        assert_eq!(
-            config.storage.provider.config.connect_timeout_secs,
-            Some(15)
-        );
+        assert_eq!(config.storage.provider.config.connect_timeout_secs, Some(15));
 
         test_remove_env("OPENPRX_STORAGE_PROVIDER");
         test_remove_env("OPENPRX_STORAGE_DB_URL");
@@ -7763,10 +7534,7 @@ default_model = "legacy-model"
         test_set_env("OPENPRX_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT", "40");
         test_set_env("OPENPRX_CONCURRENCY_ROLLOUT_CHANNELS", "telegram,discord");
         test_set_env("OPENPRX_CONCURRENCY_AUTO_ROLLBACK_ENABLED", "false");
-        test_set_env(
-            "OPENPRX_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD",
-            "0.31",
-        );
+        test_set_env("OPENPRX_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD", "0.31");
         test_set_env("OPENPRX_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD", "0.32");
         test_set_env("OPENPRX_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD", "0.33");
 
@@ -7775,10 +7543,7 @@ default_model = "legacy-model"
         assert!(config.agent.concurrency_kill_switch_force_serial);
         assert_eq!(config.agent.concurrency_rollout_stage, "stage_c");
         assert_eq!(config.agent.concurrency_rollout_sample_percent, 40);
-        assert_eq!(
-            config.agent.concurrency_rollout_channels,
-            vec!["telegram", "discord"]
-        );
+        assert_eq!(config.agent.concurrency_rollout_channels, vec!["telegram", "discord"]);
         assert!(!config.agent.concurrency_auto_rollback_enabled);
         assert!((config.agent.concurrency_rollback_timeout_rate_threshold - 0.31).abs() < 1e-9);
         assert!((config.agent.concurrency_rollback_cancel_rate_threshold - 0.32).abs() < 1e-9);
@@ -7818,20 +7583,14 @@ default_model = "legacy-model"
         let mut config = Config::default();
         test_set_env("OPENPRX_PROXY_ENABLED", "true");
         test_set_env("OPENPRX_HTTP_PROXY", "http://127.0.0.1:7890");
-        test_set_env(
-            "OPENPRX_PROXY_SERVICES",
-            "provider.openai, tool.http_request",
-        );
+        test_set_env("OPENPRX_PROXY_SERVICES", "provider.openai, tool.http_request");
         test_set_env("OPENPRX_PROXY_SCOPE", "services");
 
         config.apply_env_overrides();
 
         assert!(config.proxy.enabled);
         assert_eq!(config.proxy.scope, ProxyScope::Services);
-        assert_eq!(
-            config.proxy.http_proxy.as_deref(),
-            Some("http://127.0.0.1:7890")
-        );
+        assert_eq!(config.proxy.http_proxy.as_deref(), Some("http://127.0.0.1:7890"));
         assert!(config.proxy.should_apply_to_service("provider.openai"));
         assert!(config.proxy.should_apply_to_service("tool.http_request"));
         assert!(!config.proxy.should_apply_to_service("provider.anthropic"));
@@ -7945,8 +7704,7 @@ default_model = "legacy-model"
         let cache_key = runtime_proxy_cache_key(&service_key, Some(30), Some(5));
 
         clear_runtime_proxy_client_cache();
-        build_runtime_proxy_client_with_timeouts(&service_key, 30, 5)
-            .expect("test: proxy client with timeouts build");
+        build_runtime_proxy_client_with_timeouts(&service_key, 30, 5).expect("test: proxy client with timeouts build");
         assert!(runtime_proxy_cache_contains(&cache_key));
 
         set_runtime_proxy_config(ProxyConfig::default());
@@ -8064,10 +7822,7 @@ allowed_from = ["*"]
     async fn lark_config_defaults_to_lark_endpoint() {
         let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
-        assert!(
-            !parsed.use_feishu,
-            "use_feishu should default to false (Lark)"
-        );
+        assert!(!parsed.use_feishu, "use_feishu should default to false (Lark)");
     }
 
     #[test]
@@ -8118,10 +7873,7 @@ allowed_from = ["*"]
 
         let meta = fs::metadata(&config_path).await.unwrap();
         let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "New config file should be owner-only (0600), got {mode:o}"
-        );
+        assert_eq!(mode, 0o600, "New config file should be owner-only (0600), got {mode:o}");
     }
 
     #[cfg(unix)]
@@ -8138,10 +7890,7 @@ allowed_from = ["*"]
         let error = write_toml_string_atomic(&symlink_path, "default_temperature = 1.0\n")
             .await
             .unwrap_err();
-        assert!(
-            error.to_string().contains("symlink"),
-            "unexpected error: {error}"
-        );
+        assert!(error.to_string().contains("symlink"), "unexpected error: {error}");
     }
 
     #[cfg(unix)]

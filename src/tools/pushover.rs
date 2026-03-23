@@ -25,8 +25,7 @@ impl PushoverTool {
         let raw = raw.trim();
 
         let unquoted = if raw.len() >= 2
-            && ((raw.starts_with('"') && raw.ends_with('"'))
-                || (raw.starts_with('\'') && raw.ends_with('\'')))
+            && ((raw.starts_with('"') && raw.ends_with('"')) || (raw.starts_with('\'') && raw.ends_with('\'')))
         {
             &raw[1..raw.len() - 1]
         } else {
@@ -35,10 +34,9 @@ impl PushoverTool {
 
         // Keep support for inline comments in unquoted values:
         // KEY=value # comment
-        unquoted.split_once(" #").map_or_else(
-            || unquoted.trim().to_string(),
-            |(value, _)| value.trim().to_string(),
-        )
+        unquoted
+            .split_once(" #")
+            .map_or_else(|| unquoted.trim().to_string(), |(value, _)| value.trim().to_string())
     }
 
     async fn get_credentials(&self) -> anyhow::Result<(String, String)> {
@@ -69,8 +67,7 @@ impl PushoverTool {
         }
 
         let token = token.ok_or_else(|| anyhow::anyhow!("PUSHOVER_TOKEN not found in .env"))?;
-        let user_key =
-            user_key.ok_or_else(|| anyhow::anyhow!("PUSHOVER_USER_KEY not found in .env"))?;
+        let user_key = user_key.ok_or_else(|| anyhow::anyhow!("PUSHOVER_USER_KEY not found in .env"))?;
 
         Ok((token, user_key))
     }
@@ -144,9 +141,7 @@ impl Tool for PushoverTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Invalid 'priority': {value}. Expected integer in range -2..=2"
-                    )),
+                    error: Some(format!("Invalid 'priority': {value}. Expected integer in range -2..=2")),
                 });
             }
             None => None,
@@ -198,10 +193,7 @@ impl Tool for PushoverTool {
         if api_status == Some(1) {
             Ok(ToolResult {
                 success: true,
-                output: format!(
-                    "Pushover notification sent successfully. Response: {}",
-                    body
-                ),
+                output: format!("Pushover notification sent successfully. Response: {}", body),
                 error: None,
             })
         } else {
@@ -232,28 +224,19 @@ mod tests {
 
     #[test]
     fn pushover_tool_name() {
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            PathBuf::from("/tmp"),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), PathBuf::from("/tmp"));
         assert_eq!(tool.name(), "pushover");
     }
 
     #[test]
     fn pushover_tool_description() {
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            PathBuf::from("/tmp"),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), PathBuf::from("/tmp"));
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn pushover_tool_has_parameters_schema() {
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            PathBuf::from("/tmp"),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), PathBuf::from("/tmp"));
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"].get("message").is_some());
@@ -261,10 +244,7 @@ mod tests {
 
     #[test]
     fn pushover_tool_requires_message() {
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            PathBuf::from("/tmp"),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), PathBuf::from("/tmp"));
         let schema = tool.parameters_schema();
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&serde_json::Value::String("message".to_string())));
@@ -274,16 +254,9 @@ mod tests {
     async fn credentials_parsed_from_env_file() {
         let tmp = TempDir::new().unwrap();
         let env_path = tmp.path().join(".env");
-        fs::write(
-            &env_path,
-            "PUSHOVER_TOKEN=testtoken123\nPUSHOVER_USER_KEY=userkey456\n",
-        )
-        .unwrap();
+        fs::write(&env_path, "PUSHOVER_TOKEN=testtoken123\nPUSHOVER_USER_KEY=userkey456\n").unwrap();
 
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            tmp.path().to_path_buf(),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), tmp.path().to_path_buf());
         let result = tool.get_credentials().await;
 
         assert!(result.is_ok());
@@ -295,10 +268,7 @@ mod tests {
     #[tokio::test]
     async fn credentials_fail_without_env_file() {
         let tmp = TempDir::new().unwrap();
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            tmp.path().to_path_buf(),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), tmp.path().to_path_buf());
         let result = tool.get_credentials().await;
 
         assert!(result.is_err());
@@ -310,10 +280,7 @@ mod tests {
         let env_path = tmp.path().join(".env");
         fs::write(&env_path, "PUSHOVER_USER_KEY=userkey456\n").unwrap();
 
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            tmp.path().to_path_buf(),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), tmp.path().to_path_buf());
         let result = tool.get_credentials().await;
 
         assert!(result.is_err());
@@ -325,10 +292,7 @@ mod tests {
         let env_path = tmp.path().join(".env");
         fs::write(&env_path, "PUSHOVER_TOKEN=testtoken123\n").unwrap();
 
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            tmp.path().to_path_buf(),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), tmp.path().to_path_buf());
         let result = tool.get_credentials().await;
 
         assert!(result.is_err());
@@ -338,12 +302,13 @@ mod tests {
     async fn credentials_ignore_comments() {
         let tmp = TempDir::new().unwrap();
         let env_path = tmp.path().join(".env");
-        fs::write(&env_path, "# This is a comment\nPUSHOVER_TOKEN=realtoken\n# Another comment\nPUSHOVER_USER_KEY=realuser\n").unwrap();
+        fs::write(
+            &env_path,
+            "# This is a comment\nPUSHOVER_TOKEN=realtoken\n# Another comment\nPUSHOVER_USER_KEY=realuser\n",
+        )
+        .unwrap();
 
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            tmp.path().to_path_buf(),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), tmp.path().to_path_buf());
         let result = tool.get_credentials().await;
 
         assert!(result.is_ok());
@@ -354,20 +319,14 @@ mod tests {
 
     #[test]
     fn pushover_tool_supports_priority() {
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            PathBuf::from("/tmp"),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), PathBuf::from("/tmp"));
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("priority").is_some());
     }
 
     #[test]
     fn pushover_tool_supports_sound() {
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            PathBuf::from("/tmp"),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), PathBuf::from("/tmp"));
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("sound").is_some());
     }
@@ -382,10 +341,7 @@ mod tests {
         )
         .unwrap();
 
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            tmp.path().to_path_buf(),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), tmp.path().to_path_buf());
         let result = tool.get_credentials().await;
 
         assert!(result.is_ok());
@@ -396,10 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_blocks_readonly_mode() {
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::ReadOnly, 100),
-            PathBuf::from("/tmp"),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::ReadOnly, 100), PathBuf::from("/tmp"));
 
         let result = tool.execute(json!({"message": "hello"})).await.unwrap();
         assert!(!result.success);
@@ -417,15 +370,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_rejects_priority_out_of_range() {
-        let tool = PushoverTool::new(
-            test_security(AutonomyLevel::Full, 100),
-            PathBuf::from("/tmp"),
-        );
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Full, 100), PathBuf::from("/tmp"));
 
-        let result = tool
-            .execute(json!({"message": "hello", "priority": 5}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"message": "hello", "priority": 5})).await.unwrap();
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("-2..=2"));

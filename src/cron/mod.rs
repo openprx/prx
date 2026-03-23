@@ -8,12 +8,10 @@ mod types;
 
 pub mod scheduler;
 
-pub use schedule::{
-    next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
-};
+pub use schedule::{next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule};
 pub use store::{
-    add_agent_job, add_job, add_shell_job, claim_job, due_jobs, get_job, list_jobs, list_runs,
-    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    add_agent_job, add_job, add_shell_job, claim_job, due_jobs, get_job, list_jobs, list_runs, record_last_run,
+    record_run, remove_job, reschedule_after_run, update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 
@@ -31,9 +29,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
 
             println!("🕒 Scheduled jobs ({}):", jobs.len());
             for job in jobs {
-                let last_run = job
-                    .last_run
-                    .map_or_else(|| "never".into(), |d| d.to_rfc3339());
+                let last_run = job.last_run.map_or_else(|| "never".into(), |d| d.to_rfc3339());
                 let last_status = job.last_status.unwrap_or_else(|| "n/a".into());
                 println!(
                     "- {} | {:?} | next={} | last={} ({})",
@@ -57,10 +53,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             tz,
             command,
         } => {
-            let schedule = Schedule::Cron {
-                expr: expression,
-                tz,
-            };
+            let schedule = Schedule::Cron { expr: expression, tz };
             let job = add_shell_job(config, None, schedule, &command)?;
             println!("✅ Added cron job {}", job.id);
             println!("  Expr: {}", job.expression);
@@ -112,10 +105,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             let schedule = if expression.is_some() || tz.is_some() {
                 let existing = get_job(config, &id)?;
                 let (existing_expr, existing_tz) = match existing.schedule {
-                    Schedule::Cron {
-                        expr,
-                        tz: existing_tz,
-                    } => (expr, existing_tz),
+                    Schedule::Cron { expr, tz: existing_tz } => (expr, existing_tz),
                     _ => bail!("Cannot update expression/tz on a non-cron schedule"),
                 };
                 Some(Schedule::Cron {
@@ -167,11 +157,7 @@ pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> 
     add_once_at(config, at, command)
 }
 
-pub fn add_once_at(
-    config: &Config,
-    at: chrono::DateTime<chrono::Utc>,
-    command: &str,
-) -> Result<CronJob> {
+pub fn add_once_at(config: &Config, at: chrono::DateTime<chrono::Utc>, command: &str) -> Result<CronJob> {
     let schedule = Schedule::At { at };
     add_shell_job(config, None, schedule, command)
 }
@@ -203,9 +189,7 @@ fn parse_delay(input: &str) -> Result<chrono::Duration> {
     if input.is_empty() {
         anyhow::bail!("delay must not be empty");
     }
-    let split = input
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(input.len());
+    let split = input.find(|c: char| !c.is_ascii_digit()).unwrap_or(input.len());
     let (num, unit) = input.split_at(split);
     let amount: i64 = num.parse()?;
     let unit = if unit.is_empty() { "m" } else { unit };
@@ -310,15 +294,7 @@ mod tests {
         let config = test_config(&tmp);
         let job = make_job(&config, "*/5 * * * *", None, "echo test");
 
-        run_update(
-            &config,
-            &job.id,
-            None,
-            Some("America/Los_Angeles"),
-            None,
-            None,
-        )
-        .unwrap();
+        run_update(&config, &job.id, None, Some("America/Los_Angeles"), None, None).unwrap();
 
         let updated = get_job(&config, &job.id).unwrap();
         assert_eq!(
@@ -334,12 +310,7 @@ mod tests {
     fn update_expression_preserves_existing_tz() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
-        let job = make_job(
-            &config,
-            "*/5 * * * *",
-            Some("America/Los_Angeles"),
-            "echo test",
-        );
+        let job = make_job(&config, "*/5 * * * *", Some("America/Los_Angeles"), "echo test");
 
         run_update(&config, &job.id, Some("0 9 * * *"), None, None, None).unwrap();
 
@@ -392,14 +363,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
-        let result = run_update(
-            &config,
-            "nonexistent-id",
-            None,
-            None,
-            Some("echo test"),
-            None,
-        );
+        let result = run_update(&config, "nonexistent-id", None, None, Some("echo test"), None);
         assert!(result.is_err());
     }
 

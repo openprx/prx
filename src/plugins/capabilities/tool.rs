@@ -94,9 +94,7 @@ impl WasmToolAdapter {
         let instance = linker
             .instantiate_async(&mut store, component)
             .await
-            .map_err(|e| {
-                PluginError::Instantiation(format!("failed to instantiate component: {e}"))
-            })?;
+            .map_err(|e| PluginError::Instantiation(format!("failed to instantiate component: {e}")))?;
 
         // Call get-spec to cache the tool specification
         let spec = Self::call_get_spec(&instance, &mut store).await?;
@@ -111,9 +109,7 @@ impl WasmToolAdapter {
     }
 
     /// Register all host functions in the linker.
-    fn register_host_functions(
-        linker: &mut wasmtime::component::Linker<HostState>,
-    ) -> Result<(), PluginError> {
+    fn register_host_functions(linker: &mut wasmtime::component::Linker<HostState>) -> Result<(), PluginError> {
         // Add WASI interfaces to the linker so WASM components that import
         // wasi:* (e.g. wasi:cli/environment) resolve correctly.
         wasmtime_wasi::p2::add_to_linker_async(linker)
@@ -152,8 +148,7 @@ impl WasmToolAdapter {
             kv_inst
                 .func_wrap_async(
                     "set",
-                    |store: wasmtime::StoreContextMut<'_, HostState>,
-                     (key, value): (String, Vec<u8>)| {
+                    |store: wasmtime::StoreContextMut<'_, HostState>, (key, value): (String, Vec<u8>)| {
                         Box::new(async move {
                             if let Err(e) = store.data().check_permission("kv") {
                                 return Ok((Err::<(), String>(e),));
@@ -195,11 +190,7 @@ impl WasmToolAdapter {
                             }
                             let kv = store.data().kv_store.clone();
                             let guard = kv.read().await;
-                            let keys: Vec<String> = guard
-                                .keys()
-                                .filter(|k| k.starts_with(&prefix))
-                                .cloned()
-                                .collect();
+                            let keys: Vec<String> = guard.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
                             Ok((keys,))
                         })
                     },
@@ -287,8 +278,7 @@ impl WasmToolAdapter {
             mem_inst
                 .func_wrap_async(
                     "store",
-                    |store: wasmtime::StoreContextMut<'_, HostState>,
-                     (text, category): (String, String)| {
+                    |store: wasmtime::StoreContextMut<'_, HostState>, (text, category): (String, String)| {
                         Box::new(async move {
                             if let Err(e) = store.data().check_permission("memory") {
                                 return Ok((Err::<String, String>(e),));
@@ -296,9 +286,7 @@ impl WasmToolAdapter {
                             let mem = match &store.data().memory {
                                 Some(m) => Arc::clone(m),
                                 None => {
-                                    return Ok((Err::<String, String>(
-                                        "memory backend not configured".to_string(),
-                                    ),));
+                                    return Ok((Err::<String, String>("memory backend not configured".to_string()),));
                                 }
                             };
                             let plugin_name = store.data().plugin_name.clone();
@@ -306,12 +294,8 @@ impl WasmToolAdapter {
                             let cat = match category.as_str() {
                                 "core" => crate::memory::traits::MemoryCategory::Core,
                                 "daily" => crate::memory::traits::MemoryCategory::Daily,
-                                "conversation" => {
-                                    crate::memory::traits::MemoryCategory::Conversation
-                                }
-                                other => {
-                                    crate::memory::traits::MemoryCategory::Custom(other.to_string())
-                                }
+                                "conversation" => crate::memory::traits::MemoryCategory::Conversation,
+                                other => crate::memory::traits::MemoryCategory::Custom(other.to_string()),
                             };
                             match mem.store(&key, &text, cat, None).await {
                                 Ok(()) => Ok((Ok::<String, String>(key),)),
@@ -325,8 +309,7 @@ impl WasmToolAdapter {
             mem_inst
                 .func_wrap_async(
                     "recall",
-                    |store: wasmtime::StoreContextMut<'_, HostState>,
-                     (query, limit): (String, u32)| {
+                    |store: wasmtime::StoreContextMut<'_, HostState>, (query, limit): (String, u32)| {
                         Box::new(async move {
                             if let Err(e) = store.data().check_permission("memory") {
                                 return Ok((Err::<Vec<(String, String, String, f64)>, String>(e),));
@@ -334,25 +317,16 @@ impl WasmToolAdapter {
                             let mem = match &store.data().memory {
                                 Some(m) => Arc::clone(m),
                                 None => {
-                                    return Ok((
-                                        Err::<Vec<(String, String, String, f64)>, String>(
-                                            "memory backend not configured".to_string(),
-                                        ),
-                                    ));
+                                    return Ok((Err::<Vec<(String, String, String, f64)>, String>(
+                                        "memory backend not configured".to_string(),
+                                    ),));
                                 }
                             };
                             match mem.recall(&query, limit as usize, None).await {
                                 Ok(entries) => {
                                     let results: Vec<(String, String, String, f64)> = entries
                                         .into_iter()
-                                        .map(|e| {
-                                            (
-                                                e.id,
-                                                e.content,
-                                                e.category.to_string(),
-                                                e.score.unwrap_or(0.0),
-                                            )
-                                        })
+                                        .map(|e| (e.id, e.content, e.category.to_string(), e.score.unwrap_or(0.0)))
                                         .collect();
                                     Ok((Ok(results),))
                                 }
@@ -393,9 +367,7 @@ impl WasmToolAdapter {
         // Get the get-spec function from within that interface
         let func_idx = instance
             .get_export_index(store.as_context_mut(), Some(&iface_idx), "get-spec")
-            .ok_or_else(|| {
-                PluginError::Instantiation("get-spec not found in tool-exports".to_string())
-            })?;
+            .ok_or_else(|| PluginError::Instantiation("get-spec not found in tool-exports".to_string()))?;
 
         let get_spec_fn = instance
             .get_func(store.as_context_mut(), &func_idx)
@@ -572,10 +544,6 @@ impl WasmToolAdapter {
             }
         };
 
-        Ok(ToolResult {
-            success,
-            output,
-            error,
-        })
+        Ok(ToolResult { success, output, error })
     }
 }

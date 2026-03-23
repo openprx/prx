@@ -53,12 +53,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
             CommandResult::Handled
         }
         "/cost" => {
-            let total_chars: usize = ctx
-                .chat_session
-                .turns
-                .iter()
-                .map(|t| t.content.chars().count())
-                .sum();
+            let total_chars: usize = ctx.chat_session.turns.iter().map(|t| t.content.chars().count()).sum();
             let est_tokens = total_chars / 4;
             println!("Session cost estimate:");
             println!("  Turns:        {}", ctx.chat_session.turn_count());
@@ -97,10 +92,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
                 Ok(entries) => {
                     println!("Memory results for \"{query}\":\n");
                     for entry in &entries {
-                        let score = entry
-                            .score
-                            .map(|s| format!(" ({s:.2})"))
-                            .unwrap_or_default();
+                        let score = entry.score.map(|s| format!(" ({s:.2})")).unwrap_or_default();
                         let preview = if entry.content.chars().count() > 80 {
                             format!("{}...", entry.content.chars().take(80).collect::<String>())
                         } else {
@@ -150,9 +142,7 @@ pub async fn handle_clear(mem: &dyn Memory, session_id: Option<&str>) -> u32 {
         for entry in entries {
             // When session-scoped, preserve other sessions' data.
             if let Some(sid) = session_id {
-                if entry.key.starts_with(super::session::SESSION_MEMORY_PREFIX)
-                    && !entry.key.ends_with(sid)
-                {
+                if entry.key.starts_with(super::session::SESSION_MEMORY_PREFIX) && !entry.key.ends_with(sid) {
                     continue; // belongs to a different session — skip
                 }
             }
@@ -174,9 +164,7 @@ fn export_session(session: &session::ChatSession, format: &str) -> Result<String
     let filename = format!("prx_chat_{timestamp}.{ext}");
 
     let content = match format {
-        "json" => session
-            .to_json()
-            .map_err(|e| anyhow::anyhow!("JSON serialize: {e}"))?,
+        "json" => session.to_json().map_err(|e| anyhow::anyhow!("JSON serialize: {e}"))?,
         _ => {
             let mut md = String::new();
             md.push_str(&format!(

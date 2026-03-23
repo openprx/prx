@@ -11,9 +11,7 @@ mod api;
 mod ui;
 
 use crate::agent::loop_::{ToolConcurrencyGovernanceConfig, run_tool_call_loop};
-use crate::channels::{
-    Channel, LinqChannel, NextcloudTalkChannel, SendMessage, SignalChannel, WhatsAppChannel,
-};
+use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, SignalChannel, WhatsAppChannel};
 use crate::config::Config;
 use crate::hooks::HookManager;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -194,12 +192,7 @@ pub struct GatewayRateLimiter {
 }
 
 impl GatewayRateLimiter {
-    pub fn new(
-        pair_per_minute: u32,
-        webhook_per_minute: u32,
-        api_per_minute: u32,
-        max_keys: usize,
-    ) -> Self {
+    pub fn new(pair_per_minute: u32, webhook_per_minute: u32, api_per_minute: u32, max_keys: usize) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
@@ -254,10 +247,7 @@ impl IdempotencyStore {
         }
 
         if keys.len() >= self.max_keys {
-            let evict_key = keys
-                .iter()
-                .min_by_key(|(_, seen_at)| *seen_at)
-                .map(|(k, _)| k.clone());
+            let evict_key = keys.iter().min_by_key(|(_, seen_at)| *seen_at).map(|(k, _)| k.clone());
             if let Some(evict_key) = evict_key {
                 keys.remove(&evict_key);
             }
@@ -327,11 +317,7 @@ pub(super) fn client_key_from_request(
 }
 
 fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
-    if configured == 0 {
-        fallback.max(1)
-    } else {
-        configured
-    }
+    if configured == 0 { fallback.max(1) } else { configured }
 }
 
 /// Shared state for all axum handlers
@@ -399,8 +385,7 @@ pub struct AppState {
 pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let start_time = Instant::now();
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
-    if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
-    {
+    if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind {
         anyhow::bail!(
             "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
              Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
@@ -440,12 +425,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-    let runtime: Arc<dyn runtime::RuntimeAdapter> =
-        Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -475,19 +456,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let mcp_tool = tools_result.mcp_tool;
     let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
     // Generic /webhook auth can require a standalone token and/or HMAC signature.
-    let webhook_token_hash: Option<Arc<str>> =
-        config.webhook.token.as_ref().and_then(|raw_token| {
-            let trimmed_token = raw_token.trim();
-            (!trimmed_token.is_empty())
-                .then(|| Arc::<str>::from(hash_webhook_secret(trimmed_token)))
-        });
-    let webhook_signing_secret: Option<Arc<str>> =
-        config.channels_config.webhook.as_ref().and_then(|webhook| {
-            webhook.secret.as_ref().and_then(|raw_secret| {
-                let trimmed_secret = raw_secret.trim();
-                (!trimmed_secret.is_empty()).then(|| Arc::<str>::from(trimmed_secret.to_string()))
-            })
-        });
+    let webhook_token_hash: Option<Arc<str>> = config.webhook.token.as_ref().and_then(|raw_token| {
+        let trimmed_token = raw_token.trim();
+        (!trimmed_token.is_empty()).then(|| Arc::<str>::from(hash_webhook_secret(trimmed_token)))
+    });
+    let webhook_signing_secret: Option<Arc<str>> = config.channels_config.webhook.as_ref().and_then(|webhook| {
+        webhook.secret.as_ref().and_then(|raw_secret| {
+            let trimmed_secret = raw_secret.trim();
+            (!trimmed_secret.is_empty()).then(|| Arc::<str>::from(trimmed_secret.to_string()))
+        })
+    });
 
     // WhatsApp channel (if configured)
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
@@ -504,21 +482,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             ))
         });
     let signal_media_config = config.media.clone();
-    let signal_channel: Option<Arc<SignalChannel>> =
-        config.channels_config.signal.as_ref().map(|sg| {
-            Arc::new(SignalChannel::new_with_mode(
-                sg.effective_http_url(),
-                sg.account.clone(),
-                sg.group_id.clone(),
-                sg.allowed_from.clone(),
-                sg.ignore_attachments,
-                sg.ignore_stories,
-                signal_media_config.clone(),
-                sg.is_native_mode(),
-                sg.data_dir.clone(),
-                sg.storm_protection.clone(),
-            ))
-        });
+    let signal_channel: Option<Arc<SignalChannel>> = config.channels_config.signal.as_ref().map(|sg| {
+        Arc::new(SignalChannel::new_with_mode(
+            sg.effective_http_url(),
+            sg.account.clone(),
+            sg.group_id.clone(),
+            sg.allowed_from.clone(),
+            sg.ignore_attachments,
+            sg.ignore_stories,
+            signal_media_config.clone(),
+            sg.is_native_mode(),
+            sg.data_dir.clone(),
+            sg.storm_protection.clone(),
+        ))
+    });
 
     // Register message_send tool backed by Signal when the channel is configured.
     // For other channels (WhatsApp, Linq, etc.) we register a generic sender without
@@ -539,11 +516,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // fire off async sub-agent tasks that announce their results when complete.
     // Keep the OnceLock handle so we can inject the full tools_registry post-wrap.
     let spawn_tools_handle = if let Some(ref sc) = signal_channel {
-        let provider_name = config
-            .default_provider
-            .as_deref()
-            .unwrap_or("openrouter")
-            .to_string();
+        let provider_name = config.default_provider.as_deref().unwrap_or("openrouter").to_string();
         let spawn_tool = tools::SessionsSpawnTool::new(
             sc.clone() as Arc<dyn Channel>,
             Arc::clone(&provider),
@@ -684,47 +657,36 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Nextcloud Talk webhook secret for signature verification
     // Priority: environment variable > config file
-    let nextcloud_talk_webhook_secret: Option<Arc<str>> =
-        std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
-            .ok()
-            .and_then(|secret| {
-                let secret = secret.trim();
-                (!secret.is_empty()).then(|| secret.to_owned())
+    let nextcloud_talk_webhook_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
+        .ok()
+        .and_then(|secret| {
+            let secret = secret.trim();
+            (!secret.is_empty()).then(|| secret.to_owned())
+        })
+        .or_else(|| {
+            config.channels_config.nextcloud_talk.as_ref().and_then(|nc| {
+                nc.webhook_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|secret| !secret.is_empty())
+                    .map(ToOwned::to_owned)
             })
-            .or_else(|| {
-                config
-                    .channels_config
-                    .nextcloud_talk
-                    .as_ref()
-                    .and_then(|nc| {
-                        nc.webhook_secret
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|secret| !secret.is_empty())
-                            .map(ToOwned::to_owned)
-                    })
-            })
-            .map(Arc::from);
+        })
+        .map(Arc::from);
 
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
     ));
-    let rate_limit_max_keys = normalize_max_keys(
-        config.gateway.rate_limit_max_keys,
-        RATE_LIMIT_MAX_KEYS_DEFAULT,
-    );
+    let rate_limit_max_keys = normalize_max_keys(config.gateway.rate_limit_max_keys, RATE_LIMIT_MAX_KEYS_DEFAULT);
     let rate_limiter = Arc::new(GatewayRateLimiter::new(
         config.gateway.pair_rate_limit_per_minute,
         config.gateway.webhook_rate_limit_per_minute,
         config.gateway.api_rate_limit_per_minute,
         rate_limit_max_keys,
     ));
-    let idempotency_max_keys = normalize_max_keys(
-        config.gateway.idempotency_max_keys,
-        IDEMPOTENCY_MAX_KEYS_DEFAULT,
-    );
+    let idempotency_max_keys = normalize_max_keys(config.gateway.idempotency_max_keys, IDEMPOTENCY_MAX_KEYS_DEFAULT);
     let idempotency_store = Arc::new(IdempotencyStore::new(
         Duration::from_secs(config.gateway.idempotency_ttl_secs.max(1)),
         idempotency_max_keys,
@@ -848,8 +810,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
 
-    let api_routes =
-        api::router(state.clone()).layer(RequestBodyLimitLayer::new(MAX_API_BODY_SIZE));
+    let api_routes = api::router(state.clone()).layer(RequestBodyLimitLayer::new(MAX_API_BODY_SIZE));
 
     // Build router with middleware
     let app = Router::new()
@@ -865,11 +826,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         ));
 
     // Run the server
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
 }
@@ -901,16 +858,10 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
     {
         prom.encode()
     } else {
-        String::from(
-            "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n",
-        )
+        String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
     };
 
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
-        body,
-    )
+    (StatusCode::OK, [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)], body)
 }
 
 /// POST /pair — exchange one-time code for bearer token
@@ -920,8 +871,7 @@ async fn handle_pair(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let rate_key =
-        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    let rate_key = client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_pair(&rate_key) {
         tracing::warn!("/pair rate limit exceeded");
         let err = serde_json::json!({
@@ -964,9 +914,7 @@ async fn handle_pair(
             (StatusCode::FORBIDDEN, Json(err))
         }
         Err(lockout_secs) => {
-            tracing::warn!(
-                "🔐 Pairing locked out — too many failed attempts ({lockout_secs}s remaining)"
-            );
+            tracing::warn!("🔐 Pairing locked out — too many failed attempts ({lockout_secs}s remaining)");
             let err = serde_json::json!({
                 "error": format!("Too many failed attempts. Try again in {lockout_secs}s."),
                 "retry_after": lockout_secs
@@ -1021,12 +969,9 @@ async fn run_gateway_chat_with_multimodal(
         )
     };
     let native_tools = state.provider.supports_native_tools();
-    let mut skills =
-        crate::skills::load_skills_with_config(&config_snapshot.workspace_dir, &config_snapshot);
-    let skill_embedder = crate::memory::create_embedder_from_config(
-        &config_snapshot,
-        config_snapshot.api_key.as_deref(),
-    );
+    let mut skills = crate::skills::load_skills_with_config(&config_snapshot.workspace_dir, &config_snapshot);
+    let skill_embedder =
+        crate::memory::create_embedder_from_config(&config_snapshot, config_snapshot.api_key.as_deref());
     if config_snapshot.skill_rag.enabled {
         crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
     }
@@ -1092,15 +1037,9 @@ async fn run_gateway_chat_with_multimodal(
             rollout_sample_percent: config_snapshot.agent.concurrency_rollout_sample_percent,
             rollout_channels: config_snapshot.agent.concurrency_rollout_channels.clone(),
             auto_rollback_enabled: config_snapshot.agent.concurrency_auto_rollback_enabled,
-            rollback_timeout_rate_threshold: config_snapshot
-                .agent
-                .concurrency_rollback_timeout_rate_threshold,
-            rollback_cancel_rate_threshold: config_snapshot
-                .agent
-                .concurrency_rollback_cancel_rate_threshold,
-            rollback_error_rate_threshold: config_snapshot
-                .agent
-                .concurrency_rollback_error_rate_threshold,
+            rollback_timeout_rate_threshold: config_snapshot.agent.concurrency_rollback_timeout_rate_threshold,
+            rollback_cancel_rate_threshold: config_snapshot.agent.concurrency_rollback_cancel_rate_threshold,
+            rollback_error_rate_threshold: config_snapshot.agent.concurrency_rollback_error_rate_threshold,
         },
         None,
         None, // no cancellation token
@@ -1143,8 +1082,7 @@ async fn handle_webhook(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    let rate_key =
-        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    let rate_key = client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
         tracing::warn!("/webhook rate limit exceeded");
         let err = serde_json::json!({
@@ -1183,9 +1121,7 @@ async fn handle_webhook(
         match webhook_signature_header {
             Some(signature) if verify_webhook_hmac_signature(signing_secret, &body, signature) => {}
             _ => {
-                tracing::warn!(
-                    "Webhook: rejected request — invalid or missing X-Webhook-Signature"
-                );
+                tracing::warn!("Webhook: rejected request — invalid or missing X-Webhook-Signature");
                 let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Signature header"});
                 return (StatusCode::UNAUTHORIZED, Json(err));
             }
@@ -1202,10 +1138,7 @@ async fn handle_webhook(
     } else {
         "public".to_string()
     };
-    if !state
-        .rate_limiter
-        .allow_webhook_credential(&credential_rate_key)
-    {
+    if !state.rate_limiter.allow_webhook_credential(&credential_rate_key) {
         tracing::warn!("/webhook credential rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many webhook requests. Please retry later.",
@@ -1246,14 +1179,9 @@ async fn handle_webhook(
 
     let message = &webhook_body.message;
 
-    if state.auto_save
-        && should_autosave_gateway_message(webhook_body.reply_target.as_deref(), message)
-    {
+    if state.auto_save && should_autosave_gateway_message(webhook_body.reply_target.as_deref(), message) {
         let key = webhook_memory_key();
-        let _ = state
-            .mem
-            .store(&key, message, MemoryCategory::Conversation, None)
-            .await;
+        let _ = state.mem.store(&key, message, MemoryCategory::Conversation, None).await;
     }
 
     let provider_label = state
@@ -1291,9 +1219,9 @@ async fn handle_webhook(
                     success: true,
                     error_message: None,
                 });
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
+            state
+                .observer
+                .record_metric(&crate::observability::traits::ObserverMetric::RequestLatency(duration));
             state
                 .observer
                 .record_event(&crate::observability::ObserverEvent::AgentEnd {
@@ -1320,9 +1248,9 @@ async fn handle_webhook(
                     success: false,
                     error_message: Some(sanitized.clone()),
                 });
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
+            state
+                .observer
+                .record_metric(&crate::observability::traits::ObserverMetric::RequestLatency(duration));
             state
                 .observer
                 .record_event(&crate::observability::ObserverEvent::Error {
@@ -1411,11 +1339,7 @@ pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header
 }
 
 /// POST /whatsapp — incoming message webhook
-async fn handle_whatsapp_message(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn handle_whatsapp_message(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
     let Some(ref wa) = state.whatsapp else {
         return (
             StatusCode::NOT_FOUND,
@@ -1427,9 +1351,7 @@ async fn handle_whatsapp_message(
     let app_secret = match &state.whatsapp_app_secret {
         Some(secret) => secret,
         None => {
-            tracing::error!(
-                "WhatsApp webhook received but signing secret not configured — rejecting"
-            );
+            tracing::error!("WhatsApp webhook received but signing secret not configured — rejecting");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "Webhook signing secret not configured"})),
@@ -1445,11 +1367,7 @@ async fn handle_whatsapp_message(
         if !verify_whatsapp_signature(app_secret, &body, signature) {
             tracing::warn!(
                 "WhatsApp webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
+                if signature.is_empty() { "missing" } else { "invalid" }
             );
             return (
                 StatusCode::UNAUTHORIZED,
@@ -1489,8 +1407,7 @@ async fn handle_whatsapp_message(
         );
 
         // Auto-save to memory
-        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content)
-        {
+        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content) {
             let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
@@ -1501,10 +1418,7 @@ async fn handle_whatsapp_message(
         match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
             Ok(response) => {
                 // Send reply via WhatsApp
-                if let Err(e) = wa
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
+                if let Err(e) = wa.send(&SendMessage::new(response, &msg.reply_target)).await {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
                 }
             }
@@ -1525,11 +1439,7 @@ async fn handle_whatsapp_message(
 }
 
 /// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
-async fn handle_linq_webhook(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn handle_linq_webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
     let Some(ref linq) = state.linq else {
         return (
             StatusCode::NOT_FOUND,
@@ -1561,19 +1471,10 @@ async fn handle_linq_webhook(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        if !crate::channels::linq::verify_linq_signature(
-            signing_secret,
-            &body_str,
-            timestamp,
-            signature,
-        ) {
+        if !crate::channels::linq::verify_linq_signature(signing_secret, &body_str, timestamp, signature) {
             tracing::warn!(
                 "Linq webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
+                if signature.is_empty() { "missing" } else { "invalid" }
             );
             return (
                 StatusCode::UNAUTHORIZED,
@@ -1613,8 +1514,7 @@ async fn handle_linq_webhook(
         );
 
         // Auto-save to memory
-        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content)
-        {
+        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content) {
             let key = linq_memory_key(msg);
             let _ = state
                 .mem
@@ -1626,10 +1526,7 @@ async fn handle_linq_webhook(
         match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
             Ok(response) => {
                 // Send reply via Linq
-                if let Err(e) = linq
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
+                if let Err(e) = linq.send(&SendMessage::new(response, &msg.reply_target)).await {
                     tracing::error!("Failed to send Linq reply: {e}");
                 }
             }
@@ -1668,9 +1565,7 @@ async fn handle_nextcloud_talk_webhook(
     let webhook_secret = match &state.nextcloud_talk_webhook_secret {
         Some(secret) => secret,
         None => {
-            tracing::error!(
-                "Nextcloud Talk webhook received but signing secret not configured — rejecting"
-            );
+            tracing::error!("Nextcloud Talk webhook received but signing secret not configured — rejecting");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "Webhook signing secret not configured"})),
@@ -1696,11 +1591,7 @@ async fn handle_nextcloud_talk_webhook(
         ) {
             tracing::warn!(
                 "Nextcloud Talk webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
+                if signature.is_empty() { "missing" } else { "invalid" }
             );
             return (
                 StatusCode::UNAUTHORIZED,
@@ -1738,8 +1629,7 @@ async fn handle_nextcloud_talk_webhook(
             truncate_with_ellipsis(&msg.content, 50)
         );
 
-        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content)
-        {
+        if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content) {
             let key = nextcloud_talk_memory_key(msg);
             let _ = state
                 .mem
@@ -1802,10 +1692,7 @@ mod tests {
 
     #[test]
     fn security_timeout_uses_gateway_config_default() {
-        assert_eq!(
-            crate::config::GatewayConfig::default().request_timeout_secs,
-            60
-        );
+        assert_eq!(crate::config::GatewayConfig::default().request_timeout_secs, 60);
     }
 
     #[test]
@@ -2045,14 +1932,8 @@ mod tests {
 
         let guard = limiter.requests.lock();
         assert_eq!(guard.0.len(), 2);
-        assert!(
-            guard.0.contains_key("ip-1"),
-            "ip-1 (most active) must survive"
-        );
-        assert!(
-            guard.0.contains_key("ip-3"),
-            "ip-3 (just inserted) must be present"
-        );
+        assert!(guard.0.contains_key("ip-1"), "ip-1 (most active) must survive");
+        assert!(guard.0.contains_key("ip-3"), "ip-3 (just inserted) must be present");
     }
 
     #[test]
@@ -2138,9 +2019,7 @@ mod tests {
         assert!(guard.is_authenticated(&token));
 
         let shared_config = Arc::new(Mutex::new(config));
-        persist_pairing_tokens(shared_config.clone(), &guard)
-            .await
-            .unwrap();
+        persist_pairing_tokens(shared_config.clone(), &guard).await.unwrap();
 
         let saved = tokio::fs::read_to_string(config_path).await.unwrap();
         let parsed: Config = toml::from_str(&saved).unwrap();
@@ -2653,10 +2532,7 @@ mod tests {
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Webhook-Token",
-            HeaderValue::from_str(&wrong_secret).unwrap(),
-        );
+        headers.insert("X-Webhook-Token", HeaderValue::from_str(&wrong_secret).unwrap());
 
         let response = handle_webhook(
             State(state),
@@ -2845,21 +2721,12 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Webhook-Signature",
-            HeaderValue::from_str(&format!(
-                "sha256={}",
-                compute_whatsapp_signature_hex(&secret, body)
-            ))
-            .unwrap(),
+            HeaderValue::from_str(&format!("sha256={}", compute_whatsapp_signature_hex(&secret, body))).unwrap(),
         );
 
-        let response = handle_webhook(
-            State(state),
-            test_connect_info(),
-            headers,
-            Bytes::from_static(body),
-        )
-        .await
-        .into_response();
+        let response = handle_webhook(State(state), test_connect_info(), headers, Bytes::from_static(body))
+            .await
+            .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
@@ -2990,10 +2857,7 @@ mod tests {
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Nextcloud-Talk-Random",
-            HeaderValue::from_str(random).unwrap(),
-        );
+        headers.insert("X-Nextcloud-Talk-Random", HeaderValue::from_str(random).unwrap());
         headers.insert(
             "X-Nextcloud-Talk-Signature",
             HeaderValue::from_str(invalid_signature).unwrap(),
@@ -3030,11 +2894,7 @@ mod tests {
 
         let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
+        assert!(verify_whatsapp_signature(&app_secret, body, &signature_header));
     }
 
     #[test]
@@ -3045,11 +2905,7 @@ mod tests {
 
         let signature_header = compute_whatsapp_signature_header(&wrong_secret, body);
 
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
+        assert!(!verify_whatsapp_signature(&app_secret, body, &signature_header));
     }
 
     #[test]
@@ -3076,11 +2932,7 @@ mod tests {
         // Signature without "sha256=" prefix
         let signature_header = "abc123def456";
 
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            signature_header
-        ));
+        assert!(!verify_whatsapp_signature(&app_secret, body, signature_header));
     }
 
     #[test]
@@ -3099,11 +2951,7 @@ mod tests {
         // Invalid hex characters
         let signature_header = "sha256=not_valid_hex_zzz";
 
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            signature_header
-        ));
+        assert!(!verify_whatsapp_signature(&app_secret, body, signature_header));
     }
 
     #[test]
@@ -3113,11 +2961,7 @@ mod tests {
 
         let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
+        assert!(verify_whatsapp_signature(&app_secret, body, &signature_header));
     }
 
     #[test]
@@ -3127,25 +2971,18 @@ mod tests {
 
         let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
+        assert!(verify_whatsapp_signature(&app_secret, body, &signature_header));
     }
 
     #[test]
     fn whatsapp_signature_json_payload() {
         let app_secret = generate_test_secret();
-        let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
+        let body =
+            br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
 
         let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
+        assert!(verify_whatsapp_signature(&app_secret, body, &signature_header));
     }
 
     #[test]
@@ -3161,11 +2998,7 @@ mod tests {
 
         // Correct prefix should pass
         let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &correct_prefix
-        ));
+        assert!(verify_whatsapp_signature(&app_secret, body, &correct_prefix));
     }
 
     #[test]
@@ -3177,11 +3010,7 @@ mod tests {
         let truncated = &hex_sig[..32]; // Only half the signature
         let signature_header = format!("sha256={truncated}");
 
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
+        assert!(!verify_whatsapp_signature(&app_secret, body, &signature_header));
     }
 
     #[test]
@@ -3193,11 +3022,7 @@ mod tests {
         let extended = format!("{hex_sig}deadbeef");
         let signature_header = format!("sha256={extended}");
 
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
+        assert!(!verify_whatsapp_signature(&app_secret, body, &signature_header));
     }
 
     // ══════════════════════════════════════════════════════════

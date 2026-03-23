@@ -43,8 +43,7 @@ pub fn load_openai_codex_profile_from_auth_json(path: &Path) -> Result<ImportedO
     let expanded = expand_codex_auth_json_path(path);
     let raw = fs::read_to_string(&expanded)
         .with_context(|| format!("Failed to read Codex auth.json from {}", expanded.display()))?;
-    let parsed: CodexAuthFile =
-        serde_json::from_str(&raw).context("Failed to parse Codex auth.json")?;
+    let parsed: CodexAuthFile = serde_json::from_str(&raw).context("Failed to parse Codex auth.json")?;
 
     if parsed.auth_mode != "chatgpt" {
         anyhow::bail!(
@@ -124,10 +123,7 @@ mod tests {
 
         let imported = load_openai_codex_profile_from_auth_json(&path).unwrap();
         assert_eq!(imported.token_set.id_token.as_deref(), Some("id-token"));
-        assert_eq!(
-            imported.token_set.refresh_token.as_deref(),
-            Some("refresh-token")
-        );
+        assert_eq!(imported.token_set.refresh_token.as_deref(), Some("refresh-token"));
     }
 
     #[test]

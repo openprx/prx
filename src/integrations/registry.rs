@@ -1,7 +1,7 @@
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
 use crate::providers::{
-    is_glm_alias, is_huggingface_alias, is_litellm_alias, is_minimax_alias, is_moonshot_alias,
-    is_qianfan_alias, is_qwen_alias, is_vllm_alias, is_zai_alias,
+    is_glm_alias, is_huggingface_alias, is_litellm_alias, is_minimax_alias, is_moonshot_alias, is_qianfan_alias,
+    is_qwen_alias, is_vllm_alias, is_zai_alias,
 };
 
 /// Returns the full catalog of integrations
@@ -201,10 +201,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Gemini 2.5 Pro/Flash",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.default_model
-                    .as_deref()
-                    .is_some_and(|m| m.starts_with("google/"))
-                {
+                if c.default_model.as_deref().is_some_and(|m| m.starts_with("google/")) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -216,10 +213,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "DeepSeek V3 & R1",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.default_model
-                    .as_deref()
-                    .is_some_and(|m| m.starts_with("deepseek/"))
-                {
+                if c.default_model.as_deref().is_some_and(|m| m.starts_with("deepseek/")) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -231,10 +225,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Grok 3 & 4",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.default_model
-                    .as_deref()
-                    .is_some_and(|m| m.starts_with("x-ai/"))
-                {
+                if c.default_model.as_deref().is_some_and(|m| m.starts_with("x-ai/")) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -246,10 +237,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Mistral Large & Codestral",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.default_model
-                    .as_deref()
-                    .is_some_and(|m| m.starts_with("mistral"))
-                {
+                if c.default_model.as_deref().is_some_and(|m| m.starts_with("mistral")) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -285,10 +273,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Open-source models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.default_provider
-                    .as_deref()
-                    .is_some_and(is_huggingface_alias)
-                {
+                if c.default_provider.as_deref().is_some_and(is_huggingface_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -764,11 +749,7 @@ mod tests {
     #[test]
     fn registry_has_entries() {
         let entries = all_integrations();
-        assert!(
-            entries.len() >= 50,
-            "Expected 50+ integrations, got {}",
-            entries.len()
-        );
+        assert!(entries.len() >= 50, "Expected 50+ integrations, got {}", entries.len());
     }
 
     #[test]
@@ -794,11 +775,7 @@ mod tests {
         let entries = all_integrations();
         let mut seen = std::collections::HashSet::new();
         for entry in &entries {
-            assert!(
-                seen.insert(entry.name),
-                "Duplicate integration name: {}",
-                entry.name
-            );
+            assert!(seen.insert(entry.name), "Duplicate integration name: {}", entry.name);
         }
     }
 
@@ -836,10 +813,7 @@ mod tests {
         let config = Config::default();
         let entries = all_integrations();
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();
-        assert!(matches!(
-            (tg.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
+        assert!(matches!((tg.status_fn)(&config), IntegrationStatus::Available));
     }
 
     #[test]
@@ -859,10 +833,7 @@ mod tests {
         let config = Config::default();
         let entries = all_integrations();
         let im = entries.iter().find(|e| e.name == "iMessage").unwrap();
-        assert!(matches!(
-            (im.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
+        assert!(matches!((im.status_fn)(&config), IntegrationStatus::Available));
     }
 
     #[test]
@@ -887,10 +858,7 @@ mod tests {
         let config = Config::default();
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
-        assert!(matches!(
-            (mx.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
+        assert!(matches!((mx.status_fn)(&config), IntegrationStatus::Available));
     }
 
     #[test]
@@ -911,10 +879,7 @@ mod tests {
         let config = Config::default();
         let entries = all_integrations();
         let wa = entries.iter().find(|e| e.name == "WhatsApp").unwrap();
-        assert!(matches!(
-            (wa.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
+        assert!(matches!((wa.status_fn)(&config), IntegrationStatus::Available));
     }
 
     #[test]
@@ -922,10 +887,7 @@ mod tests {
         let config = Config::default();
         let entries = all_integrations();
         let email = entries.iter().find(|e| e.name == "Email").unwrap();
-        assert!(matches!(
-            (email.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
+        assert!(matches!((email.status_fn)(&config), IntegrationStatus::Available));
     }
 
     #[test]
@@ -965,14 +927,8 @@ mod tests {
             .iter()
             .filter(|e| e.category == IntegrationCategory::AiModel)
             .count();
-        assert!(
-            chat_count >= 5,
-            "Expected 5+ chat integrations, got {chat_count}"
-        );
-        assert!(
-            ai_count >= 5,
-            "Expected 5+ AI model integrations, got {ai_count}"
-        );
+        assert!(chat_count >= 5, "Expected 5+ chat integrations, got {chat_count}");
+        assert!(ai_count >= 5, "Expected 5+ AI model integrations, got {ai_count}");
     }
 
     #[test]
@@ -984,65 +940,38 @@ mod tests {
         };
 
         let minimax = entries.iter().find(|e| e.name == "MiniMax").unwrap();
-        assert!(matches!(
-            (minimax.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!((minimax.status_fn)(&config), IntegrationStatus::Active));
 
         config.default_provider = Some("glm-cn".to_string());
         let glm = entries.iter().find(|e| e.name == "GLM").unwrap();
-        assert!(matches!(
-            (glm.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!((glm.status_fn)(&config), IntegrationStatus::Active));
 
         config.default_provider = Some("moonshot-intl".to_string());
         let moonshot = entries.iter().find(|e| e.name == "Moonshot").unwrap();
-        assert!(matches!(
-            (moonshot.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!((moonshot.status_fn)(&config), IntegrationStatus::Active));
 
         config.default_provider = Some("qwen-intl".to_string());
         let qwen = entries.iter().find(|e| e.name == "Qwen").unwrap();
-        assert!(matches!(
-            (qwen.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!((qwen.status_fn)(&config), IntegrationStatus::Active));
 
         config.default_provider = Some("zai-cn".to_string());
         let zai = entries.iter().find(|e| e.name == "Z.AI").unwrap();
-        assert!(matches!(
-            (zai.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!((zai.status_fn)(&config), IntegrationStatus::Active));
 
         config.default_provider = Some("baidu".to_string());
         let qianfan = entries.iter().find(|e| e.name == "Qianfan").unwrap();
-        assert!(matches!(
-            (qianfan.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!((qianfan.status_fn)(&config), IntegrationStatus::Active));
 
         config.default_provider = Some("lite-llm".to_string());
         let litellm = entries.iter().find(|e| e.name == "LiteLLM").unwrap();
-        assert!(matches!(
-            (litellm.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!((litellm.status_fn)(&config), IntegrationStatus::Active));
 
         config.default_provider = Some("v-llm".to_string());
         let vllm = entries.iter().find(|e| e.name == "vLLM").unwrap();
-        assert!(matches!(
-            (vllm.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!((vllm.status_fn)(&config), IntegrationStatus::Active));
 
         config.default_provider = Some("hf".to_string());
         let huggingface = entries.iter().find(|e| e.name == "Hugging Face").unwrap();
-        assert!(matches!(
-            (huggingface.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!((huggingface.status_fn)(&config), IntegrationStatus::Active));
     }
 }

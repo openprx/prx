@@ -98,10 +98,7 @@ fn is_excluded(patterns: &[String], path: &str) -> bool {
 #[tokio::test]
 async fn dockerignore_file_exists() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".dockerignore");
-    assert!(
-        path.exists(),
-        ".dockerignore file must exist at project root"
-    );
+    assert!(path.exists(), ".dockerignore file must exist at project root");
 }
 
 #[tokio::test]
@@ -157,10 +154,7 @@ async fn dockerignore_excludes_git_directory() {
 
     // .git directory and its contents must be excluded
     assert!(is_excluded(&patterns, ".git"), ".git must be excluded");
-    assert!(
-        is_excluded(&patterns, ".git/config"),
-        ".git/config must be excluded"
-    );
+    assert!(is_excluded(&patterns, ".git/config"), ".git/config must be excluded");
     assert!(
         is_excluded(&patterns, ".git/objects/pack/pack-abc123.pack"),
         ".git subdirectories must be excluded"
@@ -194,14 +188,8 @@ async fn dockerignore_excludes_database_files() {
         .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
-    assert!(
-        is_excluded(&patterns, "brain.db"),
-        "*.db files must be excluded"
-    );
-    assert!(
-        is_excluded(&patterns, "memory.db"),
-        "*.db files must be excluded"
-    );
+    assert!(is_excluded(&patterns, "brain.db"), "*.db files must be excluded");
+    assert!(is_excluded(&patterns, "memory.db"), "*.db files must be excluded");
     assert!(
         is_excluded(&patterns, "brain.db-journal"),
         "*.db-journal files must be excluded"
@@ -216,18 +204,9 @@ async fn dockerignore_excludes_markdown_files() {
         .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
-    assert!(
-        is_excluded(&patterns, "README.md"),
-        "*.md files must be excluded"
-    );
-    assert!(
-        is_excluded(&patterns, "CHANGELOG.md"),
-        "*.md files must be excluded"
-    );
-    assert!(
-        is_excluded(&patterns, "CONTRIBUTING.md"),
-        "*.md files must be excluded"
-    );
+    assert!(is_excluded(&patterns, "README.md"), "*.md files must be excluded");
+    assert!(is_excluded(&patterns, "CHANGELOG.md"), "*.md files must be excluded");
+    assert!(is_excluded(&patterns, "CONTRIBUTING.md"), "*.md files must be excluded");
 }
 
 #[tokio::test]
@@ -238,14 +217,8 @@ async fn dockerignore_excludes_image_files() {
         .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
-    assert!(
-        is_excluded(&patterns, "openprx.png"),
-        "*.png files must be excluded"
-    );
-    assert!(
-        is_excluded(&patterns, "logo.png"),
-        "*.png files must be excluded"
-    );
+    assert!(is_excluded(&patterns, "openprx.png"), "*.png files must be excluded");
+    assert!(is_excluded(&patterns, "logo.png"), "*.png files must be excluded");
 }
 
 #[tokio::test]
@@ -270,10 +243,7 @@ async fn dockerignore_excludes_ci_configs() {
         .expect("Failed to read .dockerignore");
     let patterns = parse_dockerignore(&content);
 
-    assert!(
-        is_excluded(&patterns, ".github"),
-        ".github must be excluded"
-    );
+    assert!(is_excluded(&patterns, ".github"), ".github must be excluded");
     assert!(
         is_excluded(&patterns, ".github/workflows/ci.yml"),
         ".github/workflows must be excluded"

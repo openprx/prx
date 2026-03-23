@@ -212,11 +212,7 @@ mod tests {
 
     #[test]
     fn request_roundtrip() {
-        let req = JsonRpcRequest::new(
-            "5".into(),
-            "read",
-            serde_json::json!({"path": "/etc/hosts"}),
-        );
+        let req = JsonRpcRequest::new("5".into(), "read", serde_json::json!({"path": "/etc/hosts"}));
         let json_str = serde_json::to_string(&req).expect("test: ser");
         let restored: JsonRpcRequest = serde_json::from_str(&json_str).expect("test: deser");
         assert_eq!(restored.id, "5");

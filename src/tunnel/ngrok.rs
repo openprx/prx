@@ -66,8 +66,7 @@ impl Tunnel for NgrokTunnel {
         // Wait up to 15s for the tunnel URL
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
         while tokio::time::Instant::now() < deadline {
-            let line =
-                tokio::time::timeout(tokio::time::Duration::from_secs(3), reader.next_line()).await;
+            let line = tokio::time::timeout(tokio::time::Duration::from_secs(3), reader.next_line()).await;
 
             match line {
                 Ok(Ok(Some(l))) => {
@@ -76,9 +75,7 @@ impl Tunnel for NgrokTunnel {
                     if let Some(idx) = l.find("url=https://") {
                         let url_start = idx + 4; // skip "url="
                         let url_part = &l[url_start..];
-                        let end = url_part
-                            .find(|c: char| c.is_whitespace())
-                            .unwrap_or(url_part.len());
+                        let end = url_part.find(|c: char| c.is_whitespace()).unwrap_or(url_part.len());
                         public_url = url_part[..end].to_string();
                         break;
                     }

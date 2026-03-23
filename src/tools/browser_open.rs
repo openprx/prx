@@ -141,9 +141,7 @@ async fn open_in_brave(url: &str) -> anyhow::Result<()> {
                 }
             }
         }
-        anyhow::bail!(
-            "Brave Browser was not found (tried macOS app names 'Brave Browser' and 'Brave')"
-        );
+        anyhow::bail!("Brave Browser was not found (tried macOS app names 'Brave Browser' and 'Brave')");
     }
 
     #[cfg(target_os = "linux")]
@@ -273,19 +271,13 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
 }
 
 fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
+    allowed_domains
+        .iter()
+        .any(|domain| host == domain || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.')))
 }
 
 fn is_private_or_local_host(host: &str) -> bool {
-    let has_local_tld = host
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
+    let has_local_tld = host.rsplit('.').next().is_some_and(|label| label == "local");
 
     if host == "localhost" || host.ends_with(".localhost") || has_local_tld || host == "::1" {
         return true;
@@ -327,10 +319,7 @@ mod tests {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
         });
-        BrowserOpenTool::new(
-            security,
-            allowed_domains.into_iter().map(String::from).collect(),
-        )
+        BrowserOpenTool::new(security, allowed_domains.into_iter().map(String::from).collect())
     }
 
     #[test]
@@ -365,40 +354,28 @@ mod tests {
     #[test]
     fn validate_rejects_http() {
         let tool = test_tool(vec!["example.com"]);
-        let err = tool
-            .validate_url("http://example.com")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("http://example.com").unwrap_err().to_string();
         assert!(err.contains("https://"));
     }
 
     #[test]
     fn validate_rejects_localhost() {
         let tool = test_tool(vec!["localhost"]);
-        let err = tool
-            .validate_url("https://localhost:8080")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("https://localhost:8080").unwrap_err().to_string();
         assert!(err.contains("local/private"));
     }
 
     #[test]
     fn validate_rejects_private_ipv4() {
         let tool = test_tool(vec!["192.168.1.5"]);
-        let err = tool
-            .validate_url("https://192.168.1.5")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("https://192.168.1.5").unwrap_err().to_string();
         assert!(err.contains("local/private"));
     }
 
     #[test]
     fn validate_rejects_allowlist_miss() {
         let tool = test_tool(vec!["example.com"]);
-        let err = tool
-            .validate_url("https://google.com")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("https://google.com").unwrap_err().to_string();
         assert!(err.contains("allowed_domains"));
     }
 
@@ -415,10 +392,7 @@ mod tests {
     #[test]
     fn validate_rejects_userinfo() {
         let tool = test_tool(vec!["example.com"]);
-        let err = tool
-            .validate_url("https://user@example.com")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("https://user@example.com").unwrap_err().to_string();
         assert!(err.contains("userinfo"));
     }
 
@@ -426,10 +400,7 @@ mod tests {
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
         let tool = BrowserOpenTool::new(security, vec![]);
-        let err = tool
-            .validate_url("https://example.com")
-            .unwrap_err()
-            .to_string();
+        let err = tool.validate_url("https://example.com").unwrap_err().to_string();
         assert!(err.contains("allowed_domains"));
     }
 
@@ -452,10 +423,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
-        let result = tool
-            .execute(json!({"url": "https://example.com"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"url": "https://example.com"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));
     }
@@ -467,10 +435,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
-        let result = tool
-            .execute(json!({"url": "https://example.com"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"url": "https://example.com"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("rate limit"));
     }

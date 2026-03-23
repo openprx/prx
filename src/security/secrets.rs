@@ -133,12 +133,8 @@ impl SecretStore {
 
     /// Decrypt using ChaCha20-Poly1305 (current secure format).
     fn decrypt_chacha20(&self, hex_str: &str) -> Result<String> {
-        let blob =
-            hex_decode(hex_str).context("Failed to decode encrypted secret (corrupt hex)")?;
-        anyhow::ensure!(
-            blob.len() > NONCE_LEN,
-            "Encrypted value too short (missing nonce)"
-        );
+        let blob = hex_decode(hex_str).context("Failed to decode encrypted secret (corrupt hex)")?;
+        anyhow::ensure!(blob.len() > NONCE_LEN, "Encrypted value too short (missing nonce)");
 
         let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
         let nonce = Nonce::from_slice(nonce_bytes);
@@ -157,14 +153,12 @@ impl SecretStore {
             .decrypt(nonce, ciphertext)
             .map_err(|_| anyhow::anyhow!("Decryption failed — wrong key or tampered data"))?;
 
-        String::from_utf8(plaintext_bytes)
-            .context("Decrypted secret is not valid UTF-8 — corrupt data")
+        String::from_utf8(plaintext_bytes).context("Decrypted secret is not valid UTF-8 — corrupt data")
     }
 
     /// Decrypt using legacy XOR cipher (insecure, for backward compatibility only).
     fn decrypt_legacy_xor(&self, hex_str: &str) -> Result<String> {
-        let ciphertext = hex_decode(hex_str)
-            .context("Failed to decode legacy encrypted secret (corrupt hex)")?;
+        let ciphertext = hex_decode(hex_str).context("Failed to decode legacy encrypted secret (corrupt hex)")?;
         let key = self.load_or_create_key()?;
         let plaintext_bytes = xor_cipher(&ciphertext, &key);
         String::from_utf8(plaintext_bytes)
@@ -184,16 +178,14 @@ impl SecretStore {
     /// Load the encryption key from disk, or create one if it doesn't exist.
     fn load_or_create_key(&self) -> Result<Vec<u8>> {
         if self.key_path.exists() {
-            let hex_key =
-                fs::read_to_string(&self.key_path).context("Failed to read secret key file")?;
+            let hex_key = fs::read_to_string(&self.key_path).context("Failed to read secret key file")?;
             hex_decode(hex_key.trim()).context("Secret key file is corrupt")
         } else {
             let key = generate_random_key();
             if let Some(parent) = self.key_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(&self.key_path, hex_encode(&key))
-                .context("Failed to write secret key file")?;
+            fs::write(&self.key_path, hex_encode(&key)).context("Failed to write secret key file")?;
 
             // Set restrictive permissions
             #[cfg(unix)]
@@ -253,10 +245,7 @@ fn xor_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
     if key.is_empty() {
         return data.to_vec();
     }
-    data.iter()
-        .enumerate()
-        .map(|(i, &b)| b ^ key[i % key.len()])
-        .collect()
+    data.iter().enumerate().map(|(i, &b)| b ^ key[i % key.len()]).collect()
 }
 
 /// Generate a random 256-bit key using the OS CSPRNG.
@@ -297,8 +286,7 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
     (0..hex.len())
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|e| anyhow::anyhow!("Invalid hex at position {i}: {e}"))
+            u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| anyhow::anyhow!("Invalid hex at position {i}: {e}"))
         })
         .collect()
 }
@@ -367,11 +355,7 @@ mod tests {
         assert!(store.key_path.exists(), "Key file should be created");
 
         let key_hex = tokio::fs::read_to_string(&store.key_path).await.unwrap();
-        assert_eq!(
-            key_hex.len(),
-            KEY_LEN * 2,
-            "Key should be {KEY_LEN} bytes hex-encoded"
-        );
+        assert_eq!(key_hex.len(), KEY_LEN * 2, "Key should be {KEY_LEN} bytes hex-encoded");
     }
 
     #[test]
@@ -521,10 +505,7 @@ mod tests {
 
         let (plaintext, migrated) = store.decrypt_and_migrate(&encrypted).unwrap();
         assert_eq!(plaintext, "my-secret");
-        assert!(
-            migrated.is_none(),
-            "enc2: values should not trigger migration"
-        );
+        assert!(migrated.is_none(), "enc2: values should not trigger migration");
     }
 
     #[test]
@@ -534,10 +515,7 @@ mod tests {
 
         let (plaintext, migrated) = store.decrypt_and_migrate("sk-plaintext-key").unwrap();
         assert_eq!(plaintext, "sk-plaintext-key");
-        assert!(
-            migrated.is_none(),
-            "Plaintext values should not trigger migration"
-        );
+        assert!(migrated.is_none(), "Plaintext values should not trigger migration");
     }
 
     #[test]
@@ -563,10 +541,7 @@ mod tests {
         assert!(migrated.is_some(), "Legacy value should trigger migration");
 
         let new_value = migrated.unwrap();
-        assert!(
-            new_value.starts_with("enc2:"),
-            "Migrated value must use enc2: prefix"
-        );
+        assert!(new_value.starts_with("enc2:"), "Migrated value must use enc2: prefix");
         assert!(
             !SecretStore::needs_migration(&new_value),
             "Migrated value should not need migration"
@@ -574,10 +549,7 @@ mod tests {
 
         // Verify the migrated value decrypts correctly
         let (decrypted2, migrated2) = store.decrypt_and_migrate(&new_value).unwrap();
-        assert_eq!(
-            decrypted2, plaintext,
-            "Migrated value must decrypt to same plaintext"
-        );
+        assert_eq!(decrypted2, plaintext, "Migrated value must decrypt to same plaintext");
         assert!(
             migrated2.is_none(),
             "Migrated value should not trigger another migration"
@@ -679,17 +651,11 @@ mod tests {
         match store2.decrypt_and_migrate(&legacy_value) {
             Ok((decrypted, _)) => {
                 // If it succeeds, the plaintext should be garbage (not the original)
-                assert_ne!(
-                    decrypted, plaintext,
-                    "Wrong key should produce garbage plaintext"
-                );
+                assert_ne!(decrypted, plaintext, "Wrong key should produce garbage plaintext");
             }
             Err(e) => {
                 // Expected: UTF-8 decoding failure from garbage bytes
-                assert!(
-                    e.to_string().contains("UTF-8"),
-                    "Error should be UTF-8 related: {e}"
-                );
+                assert!(e.to_string().contains("UTF-8"), "Error should be UTF-8 related: {e}");
             }
         }
     }
@@ -790,10 +756,7 @@ mod tests {
 
     #[test]
     fn windows_icacls_grant_arg_trims_username() {
-        assert_eq!(
-            build_windows_icacls_grant_arg("  alice  "),
-            Some("alice:F".to_string())
-        );
+        assert_eq!(build_windows_icacls_grant_arg("  alice  "), Some("alice:F".to_string()));
     }
 
     #[test]
@@ -865,10 +828,6 @@ mod tests {
         store.encrypt("trigger key creation").unwrap();
 
         let perms = fs::metadata(&store.key_path).unwrap().permissions();
-        assert_eq!(
-            perms.mode() & 0o777,
-            0o600,
-            "Key file must be owner-only (0600)"
-        );
+        assert_eq!(perms.mode() & 0o777, 0o600, "Key file must be owner-only (0600)");
     }
 }

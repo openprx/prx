@@ -51,10 +51,7 @@ impl MarkdownMemory {
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path_buf)?;
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path_buf)?;
 
             // NOTE: TOCTOU benign — the length check only decides whether to
             // prepend a Markdown header. A race at worst produces a duplicate
@@ -84,15 +81,8 @@ impl MarkdownMemory {
         Ok(())
     }
 
-    fn parse_entries_from_file(
-        path: &Path,
-        content: &str,
-        category: &MemoryCategory,
-    ) -> Vec<MemoryEntry> {
-        let filename = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
+    fn parse_entries_from_file(path: &Path, content: &str, category: &MemoryCategory) -> Vec<MemoryEntry> {
+        let filename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
 
         content
             .lines()
@@ -104,8 +94,8 @@ impl MarkdownMemory {
             .map(|(i, line)| {
                 let trimmed = line.trim();
                 let clean = trimmed.strip_prefix("- ").unwrap_or(trimmed);
-                let (key, parsed_content) = parse_markdown_entry(clean)
-                    .unwrap_or_else(|| (format!("{filename}:{i}"), clean.to_string()));
+                let (key, parsed_content) =
+                    parse_markdown_entry(clean).unwrap_or_else(|| (format!("{filename}:{i}"), clean.to_string()));
                 let timestamp = normalized_entry_timestamp(filename, &parsed_content);
                 MemoryEntry {
                     id: format!("{filename}:{i}"),
@@ -154,11 +144,7 @@ impl MarkdownMemory {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("md") {
                     let content = fs::read_to_string(&path).await?;
-                    entries.extend(Self::parse_entries_from_file(
-                        &path,
-                        &content,
-                        &MemoryCategory::Daily,
-                    ));
+                    entries.extend(Self::parse_entries_from_file(&path, &content, &MemoryCategory::Daily));
                 }
             }
         }
@@ -189,10 +175,7 @@ fn normalized_entry_timestamp(filename: &str, content: &str) -> String {
         }
     }
 
-    if filename.len() == 10
-        && filename.as_bytes().get(4) == Some(&b'-')
-        && filename.as_bytes().get(7) == Some(&b'-')
-    {
+    if filename.len() == 10 && filename.as_bytes().get(4) == Some(&b'-') && filename.as_bytes().get(7) == Some(&b'-') {
         return format!("{filename}T00:00:00Z");
     }
 
@@ -221,12 +204,7 @@ impl Memory for MarkdownMemory {
         self.append_to_file(&path, &entry).await
     }
 
-    async fn recall(
-        &self,
-        query: &str,
-        limit: usize,
-        _session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
+    async fn recall(&self, query: &str, limit: usize, _session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
         let all = self.read_all_entries().await?;
         let query_lower = query.to_lowercase();
         let keywords: Vec<&str> = query_lower.split_whitespace().collect();
@@ -235,10 +213,7 @@ impl Memory for MarkdownMemory {
             .into_iter()
             .filter_map(|mut entry| {
                 let content_lower = entry.content.to_lowercase();
-                let matched = keywords
-                    .iter()
-                    .filter(|kw| content_lower.contains(**kw))
-                    .count();
+                let matched = keywords.iter().filter(|kw| content_lower.contains(**kw)).count();
                 if matched > 0 {
                     #[allow(clippy::cast_precision_loss)]
                     let score = matched as f64 / keywords.len() as f64;
@@ -250,20 +225,14 @@ impl Memory for MarkdownMemory {
             })
             .collect();
 
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
         Ok(scored)
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
         let all = self.read_all_entries().await?;
-        Ok(all
-            .into_iter()
-            .find(|e| e.key == key || e.content.contains(key)))
+        Ok(all.into_iter().find(|e| e.key == key || e.content.contains(key)))
     }
 
     async fn list(
@@ -358,11 +327,7 @@ mod tests {
 
         let results = mem.recall("Rust", 10, None).await.unwrap();
         assert!(results.len() >= 2);
-        assert!(
-            results
-                .iter()
-                .all(|r| r.content.to_lowercase().contains("rust"))
-        );
+        assert!(results.iter().all(|r| r.content.to_lowercase().contains("rust")));
     }
 
     #[tokio::test]
@@ -378,12 +343,8 @@ mod tests {
     #[tokio::test]
     async fn markdown_count() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("a", "first", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        mem.store("b", "second", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store("a", "first", MemoryCategory::Core, None).await.unwrap();
+        mem.store("b", "second", MemoryCategory::Core, None).await.unwrap();
         let count = mem.count().await.unwrap();
         assert!(count >= 2);
     }
@@ -391,12 +352,8 @@ mod tests {
     #[tokio::test]
     async fn markdown_list_by_category() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("a", "core fact", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        mem.store("b", "daily note", MemoryCategory::Daily, None)
-            .await
-            .unwrap();
+        mem.store("a", "core fact", MemoryCategory::Core, None).await.unwrap();
+        mem.store("b", "daily note", MemoryCategory::Daily, None).await.unwrap();
 
         let core = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
         assert!(core.iter().all(|e| e.category == MemoryCategory::Core));
@@ -408,9 +365,7 @@ mod tests {
     #[tokio::test]
     async fn markdown_forget_is_noop() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("a", "permanent", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store("a", "permanent", MemoryCategory::Core, None).await.unwrap();
         let removed = mem.forget("a").await.unwrap();
         assert!(!removed, "Markdown memory is append-only");
     }
@@ -447,12 +402,7 @@ mod tests {
             .expect("structured entry");
 
         assert_eq!(entry.content, r#"{"score":0.9,"note":"legacy"}"#);
-        assert!(
-            mem.get("self/fitness/daily/2026-03-10")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(mem.get("self/fitness/daily/2026-03-10").await.unwrap().is_some());
     }
 
     #[tokio::test]

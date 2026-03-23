@@ -1,7 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::config::{
-    Config, ProxyConfig, ProxyScope, SharedConfig, runtime_proxy_config, set_runtime_proxy_config,
-};
+use crate::config::{Config, ProxyConfig, ProxyScope, SharedConfig, runtime_proxy_config, set_runtime_proxy_config};
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
 use async_trait::async_trait;
@@ -22,17 +20,11 @@ impl ProxyConfigTool {
     fn load_config_without_env(&self) -> anyhow::Result<Config> {
         let current = self.config.load_full();
         let contents = fs::read_to_string(&current.config_path).map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to read config file {}: {error}",
-                current.config_path.display()
-            )
+            anyhow::anyhow!("Failed to read config file {}: {error}", current.config_path.display())
         })?;
 
         let mut parsed: Config = toml::from_str(&contents).map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to parse config file {}: {error}",
-                current.config_path.display()
-            )
+            anyhow::anyhow!("Failed to parse config file {}: {error}", current.config_path.display())
         })?;
         parsed.config_path = current.config_path.clone();
         parsed.workspace_dir = current.workspace_dir.clone();
@@ -185,9 +177,8 @@ impl ProxyConfigTool {
             let scope = scope_raw
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("'scope' must be a string"))?;
-            proxy.scope = Self::parse_scope(scope).ok_or_else(|| {
-                anyhow::anyhow!("Invalid scope '{scope}'. Use environment|prx|services")
-            })?;
+            proxy.scope = Self::parse_scope(scope)
+                .ok_or_else(|| anyhow::anyhow!("Invalid scope '{scope}'. Use environment|prx|services"))?;
         }
 
         match Self::parse_optional_string_update(args, "http_proxy")? {
@@ -465,10 +456,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
 
-        let result = tool
-            .execute(json!({"action": "list_services"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "list_services"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("provider.openai"));
         assert!(result.output.contains("tool.http_request"));
@@ -491,12 +479,7 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("proxy.scope='services'")
-        );
+        assert!(result.error.unwrap_or_default().contains("proxy.scope='services'"));
     }
 
     #[tokio::test]

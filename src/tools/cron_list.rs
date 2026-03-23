@@ -69,9 +69,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         new_shared(config)
     }
 
@@ -99,11 +97,6 @@ mod tests {
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("cron is disabled")
-        );
+        assert!(result.error.unwrap_or_default().contains("cron is disabled"));
     }
 }

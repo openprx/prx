@@ -161,8 +161,7 @@ pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
-    let sandbox: Arc<dyn crate::security::traits::Sandbox> =
-        Arc::new(crate::security::traits::NoopSandbox);
+    let sandbox: Arc<dyn crate::security::traits::Sandbox> = Arc::new(crate::security::traits::NoopSandbox);
     vec![
         Box::new(ShellTool::new(security.clone(), runtime, sandbox, false)),
         Box::new(FileReadTool::new(security.clone(), false)),
@@ -261,12 +260,10 @@ pub fn all_tools_with_runtime_ext(
     root_config: &crate::config::Config,
 ) -> ToolsRegistryResult {
     // Wrap Arc<Config> into a SharedConfig (ArcSwap) for tools that support hot-reload.
-    let shared_config: crate::config::SharedConfig =
-        Arc::new(arc_swap::ArcSwap::from(config.clone()));
+    let shared_config: crate::config::SharedConfig = Arc::new(arc_swap::ArcSwap::from(config.clone()));
 
     // Create a sandbox from the security configuration for shell command isolation.
-    let sandbox: Arc<dyn crate::security::traits::Sandbox> =
-        crate::security::create_sandbox(&root_config.security);
+    let sandbox: Arc<dyn crate::security::traits::Sandbox> = crate::security::create_sandbox(&root_config.security);
 
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(
@@ -275,10 +272,7 @@ pub fn all_tools_with_runtime_ext(
             sandbox,
             config.memory.acl_enabled,
         )),
-        Arc::new(FileReadTool::new(
-            security.clone(),
-            config.memory.acl_enabled,
-        )),
+        Arc::new(FileReadTool::new(security.clone(), config.memory.acl_enabled)),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(CanvasTool::new(security.clone())),
         Arc::new(CronTool::new(shared_config.clone(), security.clone())),
@@ -305,31 +299,19 @@ pub fn all_tools_with_runtime_ext(
             security.clone(),
             Arc::new(arc_swap::ArcSwap::from_pointee(root_config.clone())),
         )),
-        Arc::new(ProxyConfigTool::new(
-            shared_config.clone(),
-            security.clone(),
-        )),
+        Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
         Arc::new(NodesTool::new(shared_config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
-        Arc::new(PushoverTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-        )),
+        Arc::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())),
+        Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
     ];
 
     if config.memory.acl_enabled {
-        tracing::warn!(
-            "memory_recall disabled because memory ACL is enabled; skipping tool registration"
-        );
+        tracing::warn!("memory_recall disabled because memory ACL is enabled; skipping tool registration");
     } else {
         tool_arcs.push(Arc::new(MemoryRecallTool::new(memory.clone(), false)));
     }
 
-    let mcp_tool_ref: Option<Arc<McpTool>> = if config.mcp.enabled && !config.mcp.servers.is_empty()
-    {
+    let mcp_tool_ref: Option<Arc<McpTool>> = if config.mcp.enabled && !config.mcp.servers.is_empty() {
         let mcp = Arc::new(McpTool::new(
             security.clone(),
             config.mcp.clone(),
@@ -433,11 +415,7 @@ pub fn all_tools_with_runtime_ext(
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
-            tool_arcs.push(Arc::new(ComposioTool::new(
-                key,
-                composio_entity_id,
-                security.clone(),
-            )));
+            tool_arcs.push(Arc::new(ComposioTool::new(key, composio_entity_id, security.clone())));
         }
     }
 
@@ -450,10 +428,8 @@ pub fn all_tools_with_runtime_ext(
 
     // Add delegation tool when agents are configured
     if !agents.is_empty() {
-        let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
-            .iter()
-            .map(|(name, cfg)| (name.clone(), cfg.clone()))
-            .collect();
+        let delegate_agents: HashMap<String, DelegateAgentConfig> =
+            agents.iter().map(|(name, cfg)| (name.clone(), cfg.clone())).collect();
         let delegate_fallback_credential = fallback_api_key.and_then(|value| {
             let trimmed_value = value.trim();
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
@@ -465,10 +441,7 @@ pub fn all_tools_with_runtime_ext(
             security.clone(),
             crate::providers::ProviderRuntimeOptions {
                 auth_profile_override: None,
-                openprx_dir: root_config
-                    .config_path
-                    .parent()
-                    .map(std::path::PathBuf::from),
+                openprx_dir: root_config.config_path.parent().map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
                 codex_auth_json_path: Some(root_config.auth.codex_auth_json_path.clone()),
                 codex_auth_json_auto_import: root_config.auth.codex_auth_json_auto_import,
@@ -516,8 +489,7 @@ mod tests {
             backend: "markdown".into(),
             ..MemoryConfig::default()
         };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mem: Arc<dyn Memory> = Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let browser = BrowserConfig {
             enabled: false,
@@ -556,8 +528,7 @@ mod tests {
             backend: "markdown".into(),
             ..MemoryConfig::default()
         };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mem: Arc<dyn Memory> = Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let browser = BrowserConfig {
             enabled: true,
@@ -596,8 +567,7 @@ mod tests {
             acl_enabled: true,
             ..MemoryConfig::default()
         };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mem: Arc<dyn Memory> = Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();
@@ -652,11 +622,7 @@ mod tests {
         let tools = default_tools(security);
         for tool in &tools {
             let schema = tool.parameters_schema();
-            assert!(
-                schema.is_object(),
-                "Tool {} schema is not an object",
-                tool.name()
-            );
+            assert!(schema.is_object(), "Tool {} schema is not an object", tool.name());
             assert!(
                 schema["properties"].is_object(),
                 "Tool {} schema has no properties",
@@ -725,8 +691,7 @@ mod tests {
             backend: "markdown".into(),
             ..MemoryConfig::default()
         };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mem: Arc<dyn Memory> = Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();
@@ -776,8 +741,7 @@ mod tests {
             backend: "markdown".into(),
             ..MemoryConfig::default()
         };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mem: Arc<dyn Memory> = Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();

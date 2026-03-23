@@ -63,11 +63,7 @@ pub trait RuntimeAdapter: Send + Sync {
     ///
     /// Returns an error if the runtime does not support shell access or if
     /// the command cannot be constructed (e.g., missing shell binary).
-    fn build_shell_command(
-        &self,
-        command: &str,
-        workspace_dir: &Path,
-    ) -> anyhow::Result<tokio::process::Command>;
+    fn build_shell_command(&self, command: &str, workspace_dir: &Path) -> anyhow::Result<tokio::process::Command>;
 }
 
 #[cfg(test)]
@@ -97,11 +93,7 @@ mod tests {
             true
         }
 
-        fn build_shell_command(
-            &self,
-            command: &str,
-            workspace_dir: &Path,
-        ) -> anyhow::Result<tokio::process::Command> {
+        fn build_shell_command(&self, command: &str, workspace_dir: &Path) -> anyhow::Result<tokio::process::Command> {
             let mut cmd = tokio::process::Command::new("echo");
             cmd.arg(command);
             cmd.current_dir(workspace_dir);
@@ -129,9 +121,7 @@ mod tests {
     #[tokio::test]
     async fn build_shell_command_executes() {
         let runtime = DummyRuntime;
-        let mut cmd = runtime
-            .build_shell_command("hello-runtime", Path::new("."))
-            .unwrap();
+        let mut cmd = runtime.build_shell_command("hello-runtime", Path::new(".")).unwrap();
 
         let output = cmd.output().await.unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
