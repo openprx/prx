@@ -1,3 +1,14 @@
+#![allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::needless_collect,
+    clippy::unreadable_literal,
+    clippy::ignore_without_reason
+)]
 //! End-to-end integration tests for agent orchestration.
 //!
 //! These tests exercise the full agent turn cycle through the public API,
@@ -6,7 +17,6 @@
 //! `src/agent/tests.rs` by running at the integration test boundary.
 //!
 //! Ref: <https://github.com/openprx-labs/openprx/issues/618> (item 6)
-#![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
 use anyhow::Result;
 use async_trait::async_trait;

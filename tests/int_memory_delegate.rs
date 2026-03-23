@@ -1,5 +1,16 @@
 //! P0 integration tests — memory auto-save, recall injection, snapshot round-trip,
 //! delegate depth/scope/security, evolution memory-safety, and E2E scope-denial flow.
+#![allow(
+    clippy::items_after_statements,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::needless_collect,
+    clippy::unreadable_literal
+)]
 
 use openprx::config::{DelegateAgentConfig, ScopeRule};
 use openprx::memory::snapshot::{export_snapshot, hydrate_from_snapshot};

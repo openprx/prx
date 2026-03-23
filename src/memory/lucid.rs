@@ -370,6 +370,17 @@ impl Memory for LucidMemory {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::needless_collect,
+        clippy::unreadable_literal,
+        clippy::literal_string_with_formatting_args
+    )]
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

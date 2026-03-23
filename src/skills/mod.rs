@@ -1160,8 +1160,18 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
 }
 
 #[cfg(test)]
-#[allow(clippy::similar_names)]
 mod tests {
+    #![allow(
+        clippy::similar_names,
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::needless_collect,
+        clippy::unreadable_literal
+    )]
     use super::*;
     use async_trait::async_trait;
     use std::fs;

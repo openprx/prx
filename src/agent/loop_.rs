@@ -3342,6 +3342,16 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::needless_collect,
+        clippy::unreadable_literal
+    )]
     use super::*;
     use async_trait::async_trait;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -4028,7 +4038,7 @@ mod tests {
                 concurrency_window: 2,
                 timeout_secs: 30,
                 priority_enabled: true,
-                low_priority_tool_names: ["sessions_spawn".to_string()].into_iter().collect(),
+                low_priority_tool_names: std::iter::once("sessions_spawn".to_string()).collect(),
                 rollout_stage: "full".to_string(),
                 kill_switch_applied: false,
                 auto_rollback_enabled: true,

@@ -1,3 +1,13 @@
+#![allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::needless_collect,
+    clippy::unreadable_literal
+)]
 //! TG3: Channel Message Identity & Routing Tests
 //!
 //! Prevents: Pattern 3 — Channel message routing & identity bugs (17% of user bugs).
@@ -6,7 +16,6 @@
 //! Tests that `ChannelMessage` fields are used consistently and that the
 //! `SendMessage` → Channel trait contract preserves correct identity semantics.
 //! Verifies `sender/reply_target` field contracts to prevent field swaps.
-#![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
 use async_trait::async_trait;
 use openprx::channels::traits::{Channel, ChannelMessage, SendMessage};

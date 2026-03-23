@@ -102,6 +102,7 @@ async fn ensure_atomic_tmp_dir(canonical_root: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 fn atomic_write_test_hook_cell() -> &'static std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> {
     use std::sync::{Mutex, OnceLock};
     static HOOK: OnceLock<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = OnceLock::new();
@@ -241,6 +242,16 @@ pub async fn acquire_file_lock(path: &Path) -> Result<FileLockGuard> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        clippy::needless_collect,
+        clippy::unreadable_literal
+    )]
     use super::*;
     use tempfile::tempdir;
 

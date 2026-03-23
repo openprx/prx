@@ -1,3 +1,14 @@
+#![allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::needless_collect,
+    clippy::unreadable_literal,
+    clippy::cast_precision_loss
+)]
 //! P0 Security Integration Tests — scope rules, scope forgery, pairing guard,
 //! constant-time comparison, reserved memory namespace, and concurrent memory safety.
 //!
@@ -5,7 +16,6 @@
 //! `SecurityPolicy` scope rules, `PairingGuard` brute-force protection,
 //! scope-injection stripping in `Agent::execute_tool_call`, reserved memory
 //! namespace enforcement, and concurrent `SQLite` memory safety.
-#![allow(clippy::indexing_slicing)]
 
 use openprx::config::ScopeRule;
 use openprx::memory::sqlite::SqliteMemory;

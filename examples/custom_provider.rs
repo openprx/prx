@@ -2,6 +2,16 @@
 //!
 //! This shows how to add a new LLM backend in ~30 lines of code.
 //! Copy this file, modify the API call, and register in `src/providers/mod.rs`.
+#![allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    clippy::needless_collect,
+    clippy::unreadable_literal
+)]
 
 use anyhow::Result;
 use async_trait::async_trait;
