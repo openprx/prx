@@ -202,6 +202,14 @@ mod tests {
             component: "provider".into(),
             message: "timeout".into(),
         });
+        obs.record_event(&ObserverEvent::CteRun {
+            branch_count: 2,
+            chosen_branch: "branch-abc".into(),
+            chosen_label: "RetrieveThenAnswer".into(),
+            extra_latency_ms: 55,
+            commit_succeeded: true,
+            circuit_breaker_tripped: false,
+        });
     }
 
     #[test]
@@ -212,5 +220,6 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(u64::MAX));
         obs.record_metric(&ObserverMetric::ActiveSessions(1));
         obs.record_metric(&ObserverMetric::QueueDepth(999));
+        obs.record_metric(&ObserverMetric::CteExtraLatency(Duration::from_millis(20)));
     }
 }

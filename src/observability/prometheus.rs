@@ -365,6 +365,22 @@ mod tests {
             component: "provider".into(),
             message: "timeout".into(),
         });
+        obs.record_event(&ObserverEvent::CteRun {
+            branch_count: 3,
+            chosen_branch: "branch-1".into(),
+            chosen_label: "DirectAnswer".into(),
+            extra_latency_ms: 42,
+            commit_succeeded: true,
+            circuit_breaker_tripped: false,
+        });
+        obs.record_event(&ObserverEvent::CteRun {
+            branch_count: 0,
+            chosen_branch: String::new(),
+            chosen_label: String::new(),
+            extra_latency_ms: 0,
+            commit_succeeded: false,
+            circuit_breaker_tripped: true,
+        });
     }
 
     #[test]
@@ -375,6 +391,7 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(0));
         obs.record_metric(&ObserverMetric::ActiveSessions(3));
         obs.record_metric(&ObserverMetric::QueueDepth(42));
+        obs.record_metric(&ObserverMetric::CteExtraLatency(Duration::from_millis(30)));
     }
 
     #[test]

@@ -65,6 +65,14 @@ mod tests {
             component: "test".into(),
             message: "boom".into(),
         });
+        obs.record_event(&ObserverEvent::CteRun {
+            branch_count: 1,
+            chosen_branch: "branch-noop".into(),
+            chosen_label: "DirectAnswer".into(),
+            extra_latency_ms: 10,
+            commit_succeeded: true,
+            circuit_breaker_tripped: false,
+        });
     }
 
     #[test]
@@ -74,6 +82,7 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(1000));
         obs.record_metric(&ObserverMetric::ActiveSessions(5));
         obs.record_metric(&ObserverMetric::QueueDepth(0));
+        obs.record_metric(&ObserverMetric::CteExtraLatency(Duration::from_millis(5)));
     }
 
     #[test]

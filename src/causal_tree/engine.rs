@@ -116,15 +116,17 @@ impl CausalTreeEngine {
         };
         if let Some(consecutive_failures) = cb_open_info {
             self.metrics.lock().record_circuit_breaker_trip();
-            let elapsed_ms = pipeline_start.elapsed().as_millis() as u64;
+            let elapsed = pipeline_start.elapsed();
             self.observer.record_event(&ObserverEvent::CteRun {
                 branch_count: 0,
                 chosen_branch: String::new(),
                 chosen_label: String::new(),
-                extra_latency_ms: elapsed_ms,
+                extra_latency_ms: elapsed.as_millis() as u64,
                 commit_succeeded: false,
                 circuit_breaker_tripped: true,
             });
+            self.observer
+                .record_metric(&ObserverMetric::CteExtraLatency(elapsed));
             return Err(CausalTreeError::CircuitBreakerOpen {
                 consecutive_failures,
             });
