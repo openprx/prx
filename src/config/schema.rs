@@ -298,6 +298,7 @@ impl std::fmt::Debug for Config {
             .field("nodes", &self.nodes)
             .field("agents", &self.agents)
             .field("media", &self.media)
+            .field("causal_tree", &self.causal_tree)
             .field("security", &self.security)
             .finish()
     }

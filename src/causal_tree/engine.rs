@@ -74,12 +74,12 @@ impl CausalTreeEngine {
     }
 
     /// Returns `true` if the CTE is enabled in the configuration.
-    pub fn is_enabled(&self) -> bool {
+    pub const fn is_enabled(&self) -> bool {
         self.config.enabled
     }
 
     /// Returns a reference to the engine's configuration.
-    pub fn config(&self) -> &CausalTreeConfig {
+    pub const fn config(&self) -> &CausalTreeConfig {
         &self.config
     }
 
@@ -279,6 +279,7 @@ impl CausalTreeEngine {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::causal_tree::branch::BranchLabel;

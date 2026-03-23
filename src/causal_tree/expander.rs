@@ -43,9 +43,17 @@ fn intent_contains_any(intent: &str, keywords: &[&str]) -> bool {
                 return false;
             }
             // Check left boundary: start of string or non-alphanumeric.
-            let left_ok = i == 0 || !text_bytes[i - 1].is_ascii_alphanumeric();
+            let left_ok = i == 0
+                || text_bytes
+                    .get(i - 1)
+                    .map(|b| !b.is_ascii_alphanumeric())
+                    .unwrap_or(true);
             // Check right boundary: end of string or non-alphanumeric.
-            let right_ok = i + klen == text_bytes.len() || !text_bytes[i + klen].is_ascii_alphanumeric();
+            let right_ok = i + klen == text_bytes.len()
+                || text_bytes
+                    .get(i + klen)
+                    .map(|b| !b.is_ascii_alphanumeric())
+                    .unwrap_or(true);
             left_ok && right_ok
         })
     })
@@ -96,7 +104,7 @@ pub struct DefaultTreeExpander {
 
 impl DefaultTreeExpander {
     /// Create a new expander with its sequence counter reset to zero.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             seq: std::sync::atomic::AtomicU64::new(0),
         }
@@ -193,7 +201,7 @@ impl DefaultTreeExpander {
         }
         matches!(
             state.max_risk_level(),
-            Some(RiskLevel::High) | Some(RiskLevel::Critical)
+            Some(RiskLevel::High | RiskLevel::Critical)
         )
     }
 }
@@ -319,6 +327,7 @@ impl TreeExpander for DefaultTreeExpander {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::needless_collect)]
 mod tests {
     use super::*;
     use crate::causal_tree::state::{BudgetState, RiskFlag};

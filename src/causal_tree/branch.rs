@@ -16,7 +16,7 @@ pub enum BranchLabel {
 
 impl BranchLabel {
     /// Human-readable short name for logging / tracing.
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::DirectAnswer => "direct_answer",
             Self::RetrieveThenAnswer => "retrieve_then_answer",
@@ -139,6 +139,7 @@ pub struct PathCommitDecision {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

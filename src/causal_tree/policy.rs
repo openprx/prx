@@ -74,16 +74,16 @@ pub struct CausalTreeConfig {
     pub write_metrics: bool,
 }
 
-fn default_w_confidence() -> f32 {
+const fn default_w_confidence() -> f32 {
     0.50
 }
-fn default_w_cost() -> f32 {
+const fn default_w_cost() -> f32 {
     0.25
 }
-fn default_w_latency() -> f32 {
+const fn default_w_latency() -> f32 {
     0.25
 }
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -119,13 +119,13 @@ impl Default for CircuitBreakerState {
 
 impl CircuitBreakerState {
     /// Record a successful CTE run — resets the failure counter.
-    pub fn record_success(&mut self) {
+    pub const fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.open_since = None;
     }
 
     /// Record a failed CTE run — increments the failure counter.
-    pub fn record_failure(&mut self) {
+    pub const fn record_failure(&mut self) {
         self.consecutive_failures += 1;
     }
 
@@ -135,10 +135,8 @@ impl CircuitBreakerState {
             return false;
         }
         // If open, check whether the cooldown has elapsed.
-        match self.open_since {
-            Some(opened_at) => opened_at.elapsed().as_secs() < policy.circuit_breaker_cooldown_secs,
-            None => true,
-        }
+        self.open_since
+            .map_or(true, |opened_at| opened_at.elapsed().as_secs() < policy.circuit_breaker_cooldown_secs)
     }
 
     /// Transition to the open state if the threshold has been reached.
@@ -150,6 +148,7 @@ impl CircuitBreakerState {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
