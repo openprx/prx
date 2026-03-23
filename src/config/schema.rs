@@ -238,6 +238,11 @@ pub struct Config {
     #[serde(default)]
     pub media: MediaConfig,
 
+    /// Causal Tree Engine configuration (`[causal_tree]`).
+    /// Default: disabled. Enable via `enabled = true` in config.
+    #[serde(default)]
+    pub causal_tree: crate::causal_tree::CausalTreeConfig,
+
     /// Security configuration: sandboxing, resource limits, audit, tool policy (`[security]`).
     #[serde(default)]
     pub security: SecurityConfig,
@@ -4193,6 +4198,7 @@ impl Default for Config {
             agents: HashMap::new(),
             query_classification: QueryClassificationConfig::default(),
             media: MediaConfig::default(),
+            causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
         }
     }
@@ -5460,6 +5466,7 @@ default_temperature = 0.7
             nodes: NodesConfig::default(),
             agents: HashMap::new(),
             media: MediaConfig::default(),
+            causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
         };
 
@@ -5712,6 +5719,7 @@ concurrency_rollback_error_rate_threshold = 0.23
             nodes: NodesConfig::default(),
             agents: HashMap::new(),
             media: MediaConfig::default(),
+            causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
         };
 
