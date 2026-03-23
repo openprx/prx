@@ -32,6 +32,10 @@ pub struct OtelObserver {
     tokens_used: Counter<u64>,
     active_sessions: Gauge<u64>,
     queue_depth: Gauge<u64>,
+
+    // CTE metrics
+    cte_runs: Counter<u64>,
+    cte_extra_latency: Histogram<f64>,
 }
 
 impl OtelObserver {
@@ -174,6 +178,17 @@ impl OtelObserver {
             .with_description("Current message queue depth")
             .build();
 
+        let cte_runs = meter
+            .u64_counter("prx.cte.runs")
+            .with_description("Total CTE pipeline runs")
+            .build();
+
+        let cte_extra_latency = meter
+            .f64_histogram("prx.cte.extra_latency")
+            .with_description("Extra latency from CTE pipeline")
+            .with_unit("s")
+            .build();
+
         Ok(Self {
             tracer_provider,
             meter_provider: meter_provider_clone,
@@ -195,6 +210,8 @@ impl OtelObserver {
             tokens_used,
             active_sessions,
             queue_depth,
+            cte_runs,
+            cte_extra_latency,
         })
     }
 }
@@ -367,6 +384,43 @@ impl Observer for OtelObserver {
 
                 self.errors.add(1, &[KeyValue::new("component", component.clone())]);
             }
+            ObserverEvent::CteRun {
+                branch_count,
+                chosen_branch,
+                chosen_label,
+                extra_latency_ms,
+                commit_succeeded,
+                circuit_breaker_tripped,
+            } => {
+                let attrs = [
+                    KeyValue::new("commit_succeeded", commit_succeeded.to_string()),
+                    KeyValue::new("circuit_breaker_tripped", circuit_breaker_tripped.to_string()),
+                ];
+                self.cte_runs.add(1, &attrs);
+                // Latency is recorded via record_metric(CteExtraLatency) to avoid double-counting.
+
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("cte.run")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("cte.branch_count", *branch_count as i64),
+                            KeyValue::new("cte.chosen_branch", chosen_branch.clone()),
+                            KeyValue::new("cte.chosen_label", chosen_label.clone()),
+                            KeyValue::new("cte.extra_latency_ms", *extra_latency_ms as i64),
+                            KeyValue::new("cte.commit_succeeded", *commit_succeeded),
+                            KeyValue::new(
+                                "cte.circuit_breaker_tripped",
+                                *circuit_breaker_tripped,
+                            ),
+                        ]),
+                );
+                if *commit_succeeded {
+                    span.set_status(Status::Ok);
+                } else {
+                    span.set_status(Status::error("CTE pipeline failed or no branch qualified"));
+                }
+                span.end();
+            }
         }
     }
 
@@ -383,6 +437,9 @@ impl Observer for OtelObserver {
             }
             ObserverMetric::QueueDepth(d) => {
                 self.queue_depth.record(*d as u64, &[]);
+            }
+            ObserverMetric::CteExtraLatency(d) => {
+                self.cte_extra_latency.record(d.as_secs_f64(), &[]);
             }
         }
     }
@@ -505,6 +562,28 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(0));
         obs.record_metric(&ObserverMetric::ActiveSessions(3));
         obs.record_metric(&ObserverMetric::QueueDepth(42));
+        obs.record_metric(&ObserverMetric::CteExtraLatency(Duration::from_millis(45)));
+    }
+
+    #[test]
+    fn records_cte_events_without_panic() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::CteRun {
+            branch_count: 3,
+            chosen_branch: "branch-abc".into(),
+            chosen_label: "DirectAnswer".into(),
+            extra_latency_ms: 42,
+            commit_succeeded: true,
+            circuit_breaker_tripped: false,
+        });
+        obs.record_event(&ObserverEvent::CteRun {
+            branch_count: 0,
+            chosen_branch: String::new(),
+            chosen_label: String::new(),
+            extra_latency_ms: 0,
+            commit_succeeded: false,
+            circuit_breaker_tripped: true,
+        });
     }
 
     #[test]

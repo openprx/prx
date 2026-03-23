@@ -105,6 +105,24 @@ impl Observer for LogObserver {
                     "llm.response"
                 );
             }
+            ObserverEvent::CteRun {
+                branch_count,
+                chosen_branch,
+                chosen_label,
+                extra_latency_ms,
+                commit_succeeded,
+                circuit_breaker_tripped,
+            } => {
+                info!(
+                    branch_count = branch_count,
+                    chosen_branch = %chosen_branch,
+                    chosen_label = %chosen_label,
+                    extra_latency_ms = extra_latency_ms,
+                    commit_succeeded = commit_succeeded,
+                    circuit_breaker_tripped = circuit_breaker_tripped,
+                    "cte.run"
+                );
+            }
         }
     }
 
@@ -122,6 +140,10 @@ impl Observer for LogObserver {
             }
             ObserverMetric::QueueDepth(d) => {
                 info!(depth = d, "metric.queue_depth");
+            }
+            ObserverMetric::CteExtraLatency(d) => {
+                let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+                info!(latency_ms = ms, "metric.cte_extra_latency");
             }
         }
     }

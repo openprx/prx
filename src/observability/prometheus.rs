@@ -26,6 +26,10 @@ pub struct PrometheusObserver {
     tokens_used: prometheus::IntGauge,
     active_sessions: GaugeVec,
     queue_depth: GaugeVec,
+
+    // CTE metrics
+    cte_runs: IntCounterVec,
+    cte_extra_latency: Histogram,
 }
 
 impl PrometheusObserver {
@@ -116,7 +120,24 @@ impl PrometheusObserver {
         let queue_depth = GaugeVec::new(prometheus::Opts::new("prx_queue_depth", "Message queue depth"), &[])
             .map_err(|e| anyhow::anyhow!("failed to create queue_depth metric: {e}"))?;
 
+        let cte_runs = IntCounterVec::new(
+            prometheus::Opts::new("prx_cte_runs_total", "Total CTE pipeline runs"),
+            &["commit_succeeded", "circuit_breaker_tripped"],
+        )
+        .expect("valid metric");
+
+        let cte_extra_latency = Histogram::with_opts(
+            HistogramOpts::new(
+                "prx_cte_extra_latency_seconds",
+                "Extra latency from CTE pipeline in seconds",
+            )
+            .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]),
+        )
+        .expect("valid metric");
+
         // Register all metrics
+        registry.register(Box::new(cte_runs.clone())).ok();
+        registry.register(Box::new(cte_extra_latency.clone())).ok();
         registry.register(Box::new(agent_starts.clone())).ok();
         registry.register(Box::new(tool_calls.clone())).ok();
         registry.register(Box::new(tool_batches.clone())).ok();
@@ -152,6 +173,8 @@ impl PrometheusObserver {
             tokens_used,
             active_sessions,
             queue_depth,
+            cte_runs,
+            cte_extra_latency,
         })
     }
 
@@ -232,6 +255,22 @@ impl Observer for PrometheusObserver {
             ObserverEvent::Error { component, message: _ } => {
                 self.errors.with_label_values(&[component]).inc();
             }
+            ObserverEvent::CteRun {
+                commit_succeeded,
+                circuit_breaker_tripped,
+                ..
+            } => {
+                let committed = if *commit_succeeded { "true" } else { "false" };
+                let cb_tripped = if *circuit_breaker_tripped {
+                    "true"
+                } else {
+                    "false"
+                };
+                self.cte_runs
+                    .with_label_values(&[committed, cb_tripped])
+                    .inc();
+                // Latency is recorded via record_metric(CteExtraLatency) to avoid double-counting.
+            }
         }
     }
 
@@ -248,6 +287,9 @@ impl Observer for PrometheusObserver {
             }
             ObserverMetric::QueueDepth(d) => {
                 self.queue_depth.with_label_values(&[] as &[&str]).set(*d as f64);
+            }
+            ObserverMetric::CteExtraLatency(d) => {
+                self.cte_extra_latency.observe(d.as_secs_f64());
             }
         }
     }

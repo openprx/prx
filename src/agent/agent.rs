@@ -356,6 +356,7 @@ impl Agent {
             config.router.validate()?;
         }
 
+        let cte_observer = observer.clone();
         #[cfg(feature = "llm-router")]
         let mut builder = Self::builder()
             .provider(provider)
@@ -424,6 +425,7 @@ impl Agent {
                 Arc::new(crate::causal_tree::scorer::DefaultBranchScorer::new()),
                 Arc::new(crate::causal_tree::selector::DefaultPathSelector::new()),
                 Arc::new(crate::causal_tree::feedback::LogFeedbackWriter::new()),
+                cte_observer.clone(),
                 config.causal_tree.clone(),
             );
             builder = builder.cte(cte);
