@@ -57,7 +57,7 @@ pub struct RunObservation {
 
 impl CausalTreeMetrics {
     /// Record a single CTE run observation.
-    pub fn record(&mut self, obs: &RunObservation) {
+    pub const fn record(&mut self, obs: &RunObservation) {
         self.total_runs += 1;
         if obs.hit_at_1 {
             self.hits_at_1 += 1;
@@ -78,7 +78,7 @@ impl CausalTreeMetrics {
     }
 
     /// Record a circuit breaker trip event.
-    pub fn record_circuit_breaker_trip(&mut self) {
+    pub const fn record_circuit_breaker_trip(&mut self) {
         self.circuit_breaker_trips += 1;
     }
 
@@ -138,6 +138,7 @@ impl CausalTreeMetrics {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

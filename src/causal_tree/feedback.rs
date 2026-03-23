@@ -77,7 +77,7 @@ pub struct LogFeedbackWriter;
 
 impl LogFeedbackWriter {
     /// Create a new [`LogFeedbackWriter`].
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -123,7 +123,7 @@ pub struct NoopFeedbackWriter;
 
 impl NoopFeedbackWriter {
     /// Create a new [`NoopFeedbackWriter`].
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -145,6 +145,7 @@ impl FeedbackWriter for NoopFeedbackWriter {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::causal_tree::branch::{BranchLabel, CausalBranch, CommitPolicy, CostEstimate, RehearsalLevel};

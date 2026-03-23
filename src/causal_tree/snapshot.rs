@@ -27,7 +27,7 @@ fn truncate_to_chars(s: &str, max_chars: usize) -> &str {
 }
 
 /// Map the classified [`TaskIntent`] to a human-readable intent string.
-fn intent_label(intent: TaskIntent) -> &'static str {
+const fn intent_label(intent: TaskIntent) -> &'static str {
     match intent {
         TaskIntent::Simple => "simple",
         TaskIntent::Delegate => "delegate",
@@ -86,17 +86,17 @@ fn tool_result_to_artifact(_tool_call_id: &str, content: &str, index: usize) -> 
 ///
 /// # Parameters
 ///
-/// - `session_id`        — Stable session identifier (passed through).
-/// - `user_message`      — Raw user message; truncated to [`GOAL_MAX_CHARS`]
-///                         chars for the `goal` field.
-/// - `classify_result`   — Output of the task classifier; drives `user_intent`.
-/// - `history`           — Full conversation history for the current session.
+/// - `session_id`       — Stable session identifier (passed through).
+/// - `user_message`     — Raw user message; truncated to [`GOAL_MAX_CHARS`]
+///   chars for the `goal` field.
+/// - `classify_result`  — Output of the task classifier; drives `user_intent`.
+/// - `history`          — Full conversation history for the current session.
 ///   - `Chat` messages with `role == "assistant"` become completed
 ///     [`StepRecord`]s.
 ///   - `ToolResults` entries become [`ArtifactRef`]s.
-/// - `side_effect_mode`  — Current permission mode; controls `active_constraints`.
-/// - `policy`            — Active [`CausalPolicy`]; used to set the
-///                         [`BudgetState`].
+/// - `side_effect_mode` — Current permission mode; controls `active_constraints`.
+/// - `policy`           — Active [`CausalPolicy`]; used to set the
+///   [`BudgetState`].
 pub fn build_causal_state(
     session_id: &str,
     user_message: &str,
@@ -168,6 +168,7 @@ pub fn build_causal_state(
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::super::policy::CausalPolicy;
     use super::*;

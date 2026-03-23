@@ -124,7 +124,7 @@ impl PrometheusObserver {
             prometheus::Opts::new("prx_cte_runs_total", "Total CTE pipeline runs"),
             &["commit_succeeded", "circuit_breaker_tripped"],
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create cte_runs metric: {e}"))?;
 
         let cte_extra_latency = Histogram::with_opts(
             HistogramOpts::new(
@@ -133,7 +133,7 @@ impl PrometheusObserver {
             )
             .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]),
         )
-        .expect("valid metric");
+        .map_err(|e| anyhow::anyhow!("failed to create cte_extra_latency metric: {e}"))?;
 
         // Register all metrics
         registry.register(Box::new(cte_runs.clone())).ok();
@@ -298,6 +298,7 @@ impl Observer for PrometheusObserver {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::time::Duration;

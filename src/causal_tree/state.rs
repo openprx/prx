@@ -44,22 +44,22 @@ impl Default for BudgetState {
 
 impl BudgetState {
     /// Returns `true` if the token budget has been exhausted.
-    pub fn tokens_exhausted(&self) -> bool {
+    pub const fn tokens_exhausted(&self) -> bool {
         self.tokens_used >= self.extra_token_limit
     }
 
     /// Returns `true` if the latency budget has been exhausted.
-    pub fn latency_exhausted(&self) -> bool {
+    pub const fn latency_exhausted(&self) -> bool {
         self.latency_used_ms >= self.extra_latency_budget_ms
     }
 
     /// Remaining token headroom.
-    pub fn remaining_tokens(&self) -> u64 {
+    pub const fn remaining_tokens(&self) -> u64 {
         self.extra_token_limit.saturating_sub(self.tokens_used)
     }
 
     /// Remaining latency headroom in milliseconds.
-    pub fn remaining_latency_ms(&self) -> u64 {
+    pub const fn remaining_latency_ms(&self) -> u64 {
         self.extra_latency_budget_ms.saturating_sub(self.latency_used_ms)
     }
 }
@@ -182,6 +182,7 @@ impl CausalState {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

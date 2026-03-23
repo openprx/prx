@@ -140,7 +140,7 @@ pub struct DefaultRehearsalEngine;
 
 impl DefaultRehearsalEngine {
     /// Create a new [`DefaultRehearsalEngine`].
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 
@@ -247,6 +247,7 @@ impl RehearsalEngine for DefaultRehearsalEngine {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::causal_tree::{
