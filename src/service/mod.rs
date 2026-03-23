@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use crate::config::Config;
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -457,9 +459,14 @@ fn check_openprx_user() -> Result<()> {
             let passwd_entry = String::from_utf8_lossy(&output.stdout);
             let parts: Vec<&str> = passwd_entry.split(':').collect();
             if parts.len() >= 7 {
+                // SAFETY: bounds checked above (len >= 7)
+                #[allow(clippy::indexing_slicing)]
                 let uid = parts[2];
+                #[allow(clippy::indexing_slicing)]
                 let gid = parts[3];
+                #[allow(clippy::indexing_slicing)]
                 let home = parts[5];
+                #[allow(clippy::indexing_slicing)]
                 let shell = parts[6];
 
                 if uid.parse::<u32>().unwrap_or(999) >= 1000 {
@@ -651,6 +658,8 @@ fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
                 let entry = String::from_utf8_lossy(&output.stdout);
                 let fields: Vec<&str> = entry.trim().split(':').collect();
                 if fields.len() >= 6 {
+                    // SAFETY: bounds checked above (len >= 6)
+                    #[allow(clippy::indexing_slicing)]
                     return Some(preferred_user_config_dir(PathBuf::from(fields[5])));
                 }
             }

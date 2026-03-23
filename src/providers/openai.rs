@@ -447,6 +447,7 @@ impl Provider for OpenAiProvider {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -577,6 +577,7 @@ impl Observer for NoopObserver {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

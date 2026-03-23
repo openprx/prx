@@ -632,6 +632,7 @@ fn ensure_memory_schema(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

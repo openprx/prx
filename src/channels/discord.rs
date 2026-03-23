@@ -147,7 +147,9 @@ fn normalize_incoming_content(content: &str, mention_only: bool, bot_user_id: &s
 }
 
 /// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
-#[allow(clippy::cast_possible_truncation)]
+// SAFETY: chunk.len() < 4 breaks the loop, so chunk[2]/[3] are always valid;
+// v is a fixed-size [0usize; 4] array so v[0..3] are always valid.
+#[allow(clippy::cast_possible_truncation, clippy::indexing_slicing)]
 fn base64_decode(input: &str) -> Option<String> {
     let padded = match input.len() % 4 {
         2 => format!("{input}=="),
@@ -488,6 +490,7 @@ impl Channel for DiscordChannel {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

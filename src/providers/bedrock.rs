@@ -83,17 +83,18 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
+fn hmac_sha256(key: &[u8], data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).map_err(|e| anyhow::anyhow!("HMAC key initialization failed: {e}"))?;
     mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 /// Derive the SigV4 signing key via HMAC chain.
-fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
+fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> anyhow::Result<Vec<u8>> {
+    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes())?;
+    let k_region = hmac_sha256(&k_date, region.as_bytes())?;
+    let k_service = hmac_sha256(&k_region, service.as_bytes())?;
     hmac_sha256(&k_service, b"aws4_request")
 }
 
@@ -108,7 +109,7 @@ fn build_authorization_header(
     headers: &[(String, String)],
     payload: &[u8],
     timestamp: &chrono::DateTime<chrono::Utc>,
-) -> String {
+) -> anyhow::Result<String> {
     let date_stamp = timestamp.format("%Y%m%d").to_string();
     let amz_date = timestamp.format("%Y%m%dT%H%M%SZ").to_string();
 
@@ -139,14 +140,14 @@ fn build_authorization_header(
         &date_stamp,
         &credentials.region,
         SIGNING_SERVICE,
-    );
+    )?;
 
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
 
-    format!(
+    Ok(format!(
         "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
         credentials.access_key_id
-    )
+    ))
 }
 
 // ── Converse API Types (Request) ────────────────────────────────
@@ -604,7 +605,7 @@ impl BedrockProvider {
             &headers_to_sign,
             &payload,
             &now,
-        );
+        )?;
 
         let mut request = self
             .http_client()
@@ -762,6 +763,7 @@ impl Provider for BedrockProvider {
 
 // ── Tests ───────────────────────────────────────────────────────
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,7 +795,7 @@ mod tests {
     #[test]
     fn hmac_sha256_known_input() {
         let test_key: &[u8] = b"key";
-        let result = hmac_sha256(test_key, b"message");
+        let result = hmac_sha256(test_key, b"message").unwrap();
         assert_eq!(
             hex::encode(&result),
             "6e9ef29b75fffc5b7abae527d58fdadb2fe42e7219011976917343065f58ed4a"
@@ -803,14 +805,14 @@ mod tests {
     #[test]
     fn derive_signing_key_structure() {
         // Verify the key derivation produces a 32-byte key (SHA-256 output).
-        let key = derive_signing_key(TEST_VECTOR_SECRET, "20150830", "us-east-1", "iam");
+        let key = derive_signing_key(TEST_VECTOR_SECRET, "20150830", "us-east-1", "iam").unwrap();
         assert_eq!(key.len(), 32);
     }
 
     #[test]
     fn derive_signing_key_known_test_vector() {
         // AWS SigV4 test vector from documentation.
-        let key = derive_signing_key(TEST_VECTOR_SECRET, "20150830", "us-east-1", "iam");
+        let key = derive_signing_key(TEST_VECTOR_SECRET, "20150830", "us-east-1", "iam").unwrap();
         assert_eq!(
             hex::encode(&key),
             "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
@@ -847,7 +849,8 @@ mod tests {
             &headers,
             b"{}",
             &timestamp,
-        );
+        )
+        .unwrap();
 
         // Verify structure
         assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/"));
@@ -887,7 +890,8 @@ mod tests {
             &headers,
             b"{}",
             &timestamp,
-        );
+        )
+        .unwrap();
 
         assert!(auth.contains("x-amz-security-token"));
     }

@@ -258,6 +258,7 @@ pub fn verify_nextcloud_talk_signature(secret: &str, random: &str, body: &str, s
     mac.verify_slice(&provided).is_ok()
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

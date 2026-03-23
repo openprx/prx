@@ -1,5 +1,8 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(
+    // CLI binary: println!/eprintln! are intentional user-facing output in this binary's main()
+    clippy::print_stdout,
+    clippy::print_stderr,
     clippy::assigning_clones,
     clippy::bool_to_int_with_if,
     clippy::case_sensitive_file_extension_comparisons,
@@ -896,9 +899,9 @@ async fn main() -> Result<()> {
     config.apply_env_overrides();
 
     match cli.command {
-        Commands::Onboard { .. } => unreachable!(),
-        Commands::Completions { .. } => unreachable!(),
-        Commands::SessionWorker { .. } => unreachable!(),
+        Commands::Onboard { .. } => anyhow::bail!("BUG: Onboard command should have been handled earlier"),
+        Commands::Completions { .. } => anyhow::bail!("BUG: Completions command should have been handled earlier"),
+        Commands::SessionWorker { .. } => anyhow::bail!("BUG: SessionWorker command should have been handled earlier"),
 
         Commands::Agent {
             message,

@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use anyhow::Result;
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
@@ -114,7 +116,11 @@ pub async fn hydrate_skill_embeddings(
     let embeddings = embedder.embed(&descriptions).await?;
 
     for ((idx, _), embedding) in pending.into_iter().zip(embeddings.into_iter()) {
-        skills[idx].embedding = Some(embedding);
+        // SAFETY: idx was derived from skills.iter().enumerate(), so it is always valid
+        #[allow(clippy::indexing_slicing)]
+        {
+            skills[idx].embedding = Some(embedding);
+        }
     }
 
     Ok(())
@@ -159,12 +165,16 @@ pub async fn select_skills_by_relevance(
         return lexical_skill_selection(query, skills, top_k);
     }
 
+    // SAFETY: a.1 and b.1 are indices from skills.iter().enumerate(), always valid
+    #[allow(clippy::indexing_slicing)]
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| skills[a.1].name.cmp(&skills[b.1].name))
     });
 
+    // SAFETY: idx is from skills.iter().enumerate(), always a valid index
+    #[allow(clippy::indexing_slicing)]
     scored
         .into_iter()
         .take(top_k)
@@ -198,7 +208,11 @@ fn lexical_skill_selection(query: &str, skills: &[Skill], top_k: usize) -> Vec<S
         })
         .collect();
 
+    // SAFETY: a.1 and b.1 come from skills.iter().enumerate(), always valid indices
+    #[allow(clippy::indexing_slicing)]
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| skills[a.1].name.cmp(&skills[b.1].name)));
+    // SAFETY: idx comes from skills.iter().enumerate(), always a valid index
+    #[allow(clippy::indexing_slicing)]
     scored
         .into_iter()
         .take(top_k)

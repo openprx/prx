@@ -4,6 +4,8 @@
 //! through a single `UiActor` task to prevent output corruption from concurrent writes.
 //! The existing `CliChannel` is preserved as a non-TTY / CI fallback.
 
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use super::traits::{Channel, ChannelCapabilities, ChannelMessage, SendMessage};
 use anyhow::Result;
 use async_trait::async_trait;

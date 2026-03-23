@@ -225,7 +225,7 @@ impl Tool for MessageSendTool {
             });
         }
 
-        let action = args["action"].as_str().unwrap_or("send");
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("send");
 
         // Resolve the active channel (updated per-message via set_active_channel so that
         // replies are routed on the same channel the incoming message arrived on).
@@ -233,7 +233,11 @@ impl Tool for MessageSendTool {
 
         // Resolve recipient: explicit arg takes priority, then default_recipient
         let default = self.default_recipient.read().await.clone();
-        let target = args["target"].as_str().map(str::to_owned).or(default);
+        let target = args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or(default);
 
         match action {
             "send" => {
@@ -252,8 +256,8 @@ impl Tool for MessageSendTool {
                     }
                 };
 
-                let raw_content = args["message"].as_str().unwrap_or("").to_owned();
-                let as_voice = args["as_voice"].as_bool().unwrap_or(false);
+                let raw_content = args.get("message").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+                let as_voice = args.get("as_voice").and_then(|v| v.as_bool()).unwrap_or(false);
 
                 // Auto-TTS: when as_voice=true and the message is plain text (no [VOICE:] marker
                 // already embedded), generate a voice file automatically so the LLM only needs
@@ -282,10 +286,10 @@ impl Tool for MessageSendTool {
 
                 let mut msg = SendMessage::new(content, &recipient);
 
-                if let Some(ts) = args["quote_timestamp"].as_u64() {
+                if let Some(ts) = args.get("quote_timestamp").and_then(|v| v.as_u64()) {
                     msg.quote_timestamp = Some(ts);
                 }
-                if let Some(author) = args["quote_author"].as_str() {
+                if let Some(author) = args.get("quote_author").and_then(|v| v.as_str()) {
                     msg.quote_author = Some(author.to_owned());
                 }
 
@@ -328,7 +332,7 @@ impl Tool for MessageSendTool {
                     }
                 };
 
-                let emoji = match args["emoji"].as_str() {
+                let emoji = match args.get("emoji").and_then(|v| v.as_str()) {
                     Some(e) if !e.is_empty() => e.to_owned(),
                     _ => {
                         return Ok(ToolResult {
@@ -339,7 +343,7 @@ impl Tool for MessageSendTool {
                     }
                 };
 
-                let target_author = match args["target_author"].as_str() {
+                let target_author = match args.get("target_author").and_then(|v| v.as_str()) {
                     Some(a) if !a.is_empty() => a.to_owned(),
                     _ => {
                         return Ok(ToolResult {
@@ -350,7 +354,7 @@ impl Tool for MessageSendTool {
                     }
                 };
 
-                let target_timestamp = match args["target_timestamp"].as_u64() {
+                let target_timestamp = match args.get("target_timestamp").and_then(|v| v.as_u64()) {
                     Some(ts) => ts,
                     None => {
                         return Ok(ToolResult {
@@ -402,7 +406,7 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                let message_id = match args["message_id"].as_str() {
+                let message_id = match args.get("message_id").and_then(|v| v.as_str()) {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => {
                         return Ok(ToolResult {
@@ -412,7 +416,7 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                let new_text = args["message"].as_str().unwrap_or("");
+                let new_text = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 match channel.edit_message(&recipient, &message_id, new_text).await {
                     Ok(()) => Ok(ToolResult {
                         success: true,
@@ -439,7 +443,7 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                let message_id = match args["message_id"].as_str() {
+                let message_id = match args.get("message_id").and_then(|v| v.as_str()) {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => {
                         return Ok(ToolResult {
@@ -475,7 +479,7 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                let thread_id = match args["thread_id"].as_str() {
+                let thread_id = match args.get("thread_id").and_then(|v| v.as_str()) {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => {
                         return Ok(ToolResult {
@@ -485,7 +489,7 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
-                let message = args["message"].as_str().unwrap_or("");
+                let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 match channel.send_thread_reply(&recipient, &thread_id, message).await {
                     Ok(()) => Ok(ToolResult {
                         success: true,
@@ -511,6 +515,7 @@ impl Tool for MessageSendTool {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

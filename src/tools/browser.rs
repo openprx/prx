@@ -1195,9 +1195,14 @@ mod native_backend {
                         tokio::fs::write(&path_str, &png)
                             .await
                             .with_context(|| format!("Failed to write screenshot to {path_str}"))?;
-                        payload["path"] = Value::String(path_str);
-                    } else {
-                        payload["png_base64"] = Value::String(base64::engine::general_purpose::STANDARD.encode(&png));
+                        if let Some(obj) = payload.as_object_mut() {
+                            obj.insert("path".to_string(), Value::String(path_str));
+                        }
+                    } else if let Some(obj) = payload.as_object_mut() {
+                        obj.insert(
+                            "png_base64".to_string(),
+                            Value::String(base64::engine::general_purpose::STANDARD.encode(&png)),
+                        );
                     }
 
                     Ok(payload)

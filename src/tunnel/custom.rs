@@ -48,6 +48,8 @@ impl Tunnel for CustomTunnel {
             bail!("Custom tunnel start_command is empty");
         }
 
+        // SAFETY: parts is non-empty (checked above), so parts[0] and parts[1..] are valid
+        #[allow(clippy::indexing_slicing)]
         let mut child = Command::new(parts[0])
             .args(&parts[1..])
             .stdout(std::process::Stdio::piped())

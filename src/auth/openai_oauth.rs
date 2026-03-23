@@ -249,6 +249,8 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
         .await
         .context("Failed to read callback request")?;
 
+    // SAFETY: bytes_read <= buffer.len() because it is the return value of stream.read(&mut buffer)
+    #[allow(clippy::indexing_slicing)]
     let request = String::from_utf8_lossy(&buffer[..bytes_read]);
     let first_line = request
         .lines()
@@ -414,6 +416,10 @@ fn url_encode(input: &str) -> String {
         .collect::<String>()
 }
 
+// SAFETY: All byte accesses in url_decode are guarded:
+// - bytes[i] is under `while i < bytes.len()`
+// - bytes[i+1] and bytes[i+2] are under `i + 2 < bytes.len()`
+#[allow(clippy::indexing_slicing)]
 fn url_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

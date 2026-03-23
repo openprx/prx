@@ -577,6 +577,8 @@ async fn handle_read_file(state: &AppState, params: ReadFileParams) -> Result<Re
 
     let limit = params.limit.unwrap_or(64 * 1024) as usize;
     let end = offset.saturating_add(limit).min(data.len());
+    // SAFETY: offset <= data.len() (checked above) and end <= data.len() (by .min())
+    #[allow(clippy::indexing_slicing)]
     let slice = &data[offset..end];
 
     Ok(ReadFileResult {
@@ -755,6 +757,8 @@ fn parse_command(command: &str) -> Result<ParsedCommand> {
         bail!("cmd cannot be empty");
     }
 
+    // SAFETY: tokens is non-empty (checked above)
+    #[allow(clippy::indexing_slicing)]
     let program = tokens[0].clone();
     let args = tokens.into_iter().skip(1).collect::<Vec<_>>();
     Ok(ParsedCommand { program, args })
@@ -801,6 +805,8 @@ fn cap_output(stdout: &[u8], stderr: &[u8], max_bytes: usize) -> (String, String
     let stderr_take = stderr.len().min(remaining);
     let truncated = stdout_take < stdout.len() || stderr_take < stderr.len();
 
+    // SAFETY: stdout_take <= stdout.len() and stderr_take <= stderr.len() by .min()
+    #[allow(clippy::indexing_slicing)]
     (
         String::from_utf8_lossy(&stdout[..stdout_take]).to_string(),
         String::from_utf8_lossy(&stderr[..stderr_take]).to_string(),

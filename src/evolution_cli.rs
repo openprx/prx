@@ -1,3 +1,6 @@
+// Evolution CLI: all functions in this module print user-facing status/history output.
+#![allow(clippy::print_stdout)]
+
 use crate::config::Config;
 use crate::self_system::evolution::{
     AsyncJsonlWriter, CircuitBreakerState, EvolutionAnalyzer, EvolutionConfig, EvolutionLayer, EvolutionLog,

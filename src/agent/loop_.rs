@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
@@ -104,10 +106,12 @@ const PRE_TURN_FLUSH_THRESHOLD: f64 = 0.85;
 /// and no compaction config is available, trim back to `DEFAULT_MAX_HISTORY_MESSAGES`.
 const HISTORY_SAFETY_NET_LIMIT: usize = 200;
 
+#[allow(clippy::expect_used)]
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).expect("compile regex: sensitive key-value pair pattern")
 });
 
+#[allow(clippy::expect_used)]
 static SENSITIVE_LOG_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?i)(["']?\b(?:token|api[_-]?key|password|secret|user[_-]?key|credential|key)\b["']?\s*[:=]\s*)(?:"[^"]{8,}"|'[^']{8,}'|[^\s,;}{]{8,})"#,
@@ -115,6 +119,7 @@ static SENSITIVE_LOG_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     .expect("compile regex: sensitive log key-value pattern")
 });
 
+#[allow(clippy::expect_used)]
 static SENSITIVE_BEARER_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}"#).expect("compile regex: bearer token pattern"));
 
@@ -171,6 +176,7 @@ fn sanitize_tool_parse_log_preview(input: &str) -> String {
 }
 
 /// Sensitive JSON field names whose values are redacted in tool argument logging.
+#[allow(clippy::expect_used)]
 static SENSITIVE_JSON_KEYS: LazyLock<regex::RegexSet> = LazyLock::new(|| {
     regex::RegexSet::new([
         r"(?i)^(api[_-]?key|apikey)$",
@@ -372,7 +378,7 @@ async fn apply_configurable_compaction(
         return Ok(false);
     }
     let compact_end = start + compact_count;
-    let to_compact = history[start..compact_end].to_vec();
+    let to_compact = history.get(start..compact_end).map(|s| s.to_vec()).unwrap_or_default();
     let timestamp = chrono::Utc::now().to_rfc3339();
 
     if config.memory_flush {
@@ -586,7 +592,7 @@ async fn auto_compact_history(
     }
 
     let compact_end = start + compact_count;
-    let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
+    let to_compact: Vec<ChatMessage> = history.get(start..compact_end).map(|s| s.to_vec()).unwrap_or_default();
 
     // Pre-compaction flush: extract and persist key facts before they are lost.
     pre_compaction_flush(&to_compact, mem, provider, model).await.ok(); // soft failure — never block compaction
@@ -896,8 +902,7 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
 
     let char_positions: Vec<(usize, char)> = trimmed.char_indices().collect();
     let mut idx = 0;
-    while idx < char_positions.len() {
-        let (byte_idx, ch) = char_positions[idx];
+    while let Some(&(byte_idx, ch)) = char_positions.get(idx) {
         if ch == '{' || ch == '[' {
             let slice = &trimmed[byte_idx..];
             let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
@@ -906,7 +911,7 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
                 if consumed > 0 {
                     values.push(value);
                     let next_byte = byte_idx + consumed;
-                    while idx < char_positions.len() && char_positions[idx].0 < next_byte {
+                    while char_positions.get(idx).is_some_and(|&(pos, _)| pos < next_byte) {
                         idx += 1;
                     }
                     continue;
@@ -1110,6 +1115,7 @@ fn parse_recipient_tool_calls(recipient: &str, body: &str) -> Vec<ParsedToolCall
 }
 
 fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
+    #[allow(clippy::expect_used)]
     static CODEX_TO_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)^\s*(?:assistant\s+)?to=([a-zA-Z0-9_.-]+)\s+code\s*$"#)
             .expect("compile regex: codex to=recipient header")
@@ -1161,9 +1167,11 @@ fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) 
 }
 
 fn parse_assistant_recipient_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
+    #[allow(clippy::expect_used)]
     static ASSISTANT_RECIPIENT_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#).expect("compile regex: assistant XML tag pattern")
     });
+    #[allow(clippy::expect_used)]
     static RECIPIENT_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)\brecipient\s*=\s*["']?([a-zA-Z0-9_.-]+)["']?"#)
             .expect("compile regex: recipient attribute pattern")
@@ -1206,6 +1214,7 @@ fn parse_assistant_recipient_tool_calls(text: &str) -> (String, Vec<ParsedToolCa
 }
 
 fn looks_like_unparsed_tool_call_syntax(text: &str) -> bool {
+    #[allow(clippy::expect_used)]
     static COMPLETE_TOOL_SYNTAX: LazyLock<RegexSet> = LazyLock::new(|| {
         RegexSet::new([
             r"(?is)<tool[_-]?call\b[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\])\s*</tool[_-]?call>",
@@ -1324,6 +1333,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Models behind OpenRouter sometimes output ```tool_call ... ``` or hybrid
     // ```tool_call ... </tool_call> instead of structured API calls or XML tags.
     if calls.is_empty() {
+        #[allow(clippy::expect_used)]
         static MD_TOOL_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(
                 r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</tool_use>|</invoke>)",
@@ -1334,18 +1344,20 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let mut last_end = 0;
 
         for cap in MD_TOOL_CALL_RE.captures_iter(response) {
-            let full_match = cap.get(0).expect("regex capture group 0 always exists");
-            let before = &response[last_end..full_match.start()];
-            if !before.trim().is_empty() {
-                md_text_parts.push(before.trim().to_string());
+            // cap.get(0) is the full match, always present for captures_iter results
+            if let Some(full_match) = cap.get(0) {
+                let before = &response[last_end..full_match.start()];
+                if !before.trim().is_empty() {
+                    md_text_parts.push(before.trim().to_string());
+                }
+                let inner = &cap[1];
+                let json_values = extract_json_values(inner);
+                for value in json_values {
+                    let parsed_calls = parse_tool_calls_from_json_value(&value);
+                    calls.extend(parsed_calls);
+                }
+                last_end = full_match.end();
             }
-            let inner = &cap[1];
-            let json_values = extract_json_values(inner);
-            for value in json_values {
-                let parsed_calls = parse_tool_calls_from_json_value(&value);
-                calls.extend(parsed_calls);
-            }
-            last_end = full_match.end();
         }
 
         if !calls.is_empty() {
@@ -2024,6 +2036,11 @@ async fn execute_read_only_batch(
     })
 }
 
+// SAFETY: All indexing in this function is guarded:
+// - ordered_indices[cursor] is under `while cursor < ordered_indices.len()`
+// - tool_calls[index] where index comes from 0..tool_calls.len()
+// - results_by_original[index] where index is a valid tool_calls index
+#[allow(clippy::indexing_slicing)]
 async fn execute_tools_with_policy(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
@@ -3072,8 +3089,8 @@ pub async fn run(
             );
             if history.is_empty() {
                 history.push(ChatMessage::system(system_prompt));
-            } else {
-                history[0] = ChatMessage::system(system_prompt);
+            } else if let Some(first) = history.first_mut() {
+                *first = ChatMessage::system(system_prompt);
             }
             history.push(ChatMessage::user(&enriched));
 

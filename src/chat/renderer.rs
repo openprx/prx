@@ -24,6 +24,9 @@ pub fn highlight_code_block(code: &str, language: Option<&str>) -> String {
         .and_then(|lang| SYNTAX_SET.find_syntax_by_token(lang))
         .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
 
+    // Fallback chain: configured theme → first available → hardcoded built-in.
+    // syntect's ThemeSet always ships base16-ocean.dark, so indexing is safe.
+    #[allow(clippy::indexing_slicing)]
     let theme = THEME_SET.themes.get(DEFAULT_THEME).unwrap_or_else(|| {
         THEME_SET
             .themes

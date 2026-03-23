@@ -3,8 +3,26 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+#[allow(clippy::expect_used)]
+static RE_SCRIPT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?si)<script[^>]*>.*?</script>").expect("BUG: invalid hardcoded script tag regex"));
+#[allow(clippy::expect_used)]
+static RE_STYLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?si)<style[^>]*>.*?</style>").expect("BUG: invalid hardcoded style tag regex"));
+#[allow(clippy::expect_used)]
+static RE_HEAD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?si)<head[^>]*>.*?</head>").expect("BUG: invalid hardcoded head tag regex"));
+#[allow(clippy::expect_used)]
+static RE_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)<(br\s*/?|p|div|h[1-6]|li|tr|article|section|header|footer)[^>]*>")
+        .expect("BUG: invalid hardcoded block element regex")
+});
+#[allow(clippy::expect_used)]
+static RE_TAGS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<[^>]+>").expect("BUG: invalid hardcoded strip-tags regex"));
 
 /// Web fetch tool — fetches a URL and returns clean readable text.
 pub struct WebFetchTool {
@@ -34,21 +52,15 @@ impl WebFetchTool {
         // Remove script/style/head blocks (case-insensitive, multiline).
         // Rust's regex crate does not support backreferences, so use three
         // separate patterns instead of the combined `(?si)<(script|style|head)[^>]*>.*?</\1>`.
-        let re_script = Regex::new(r"(?si)<script[^>]*>.*?</script>").expect("compile regex: strip script tags");
-        let text = re_script.replace_all(html, "");
-        let re_style = Regex::new(r"(?si)<style[^>]*>.*?</style>").expect("compile regex: strip style tags");
-        let text = re_style.replace_all(&text, "");
-        let re_head = Regex::new(r"(?si)<head[^>]*>.*?</head>").expect("compile regex: strip head tags");
-        let text = re_head.replace_all(&text, "");
+        let text = RE_SCRIPT.replace_all(html, "");
+        let text = RE_STYLE.replace_all(&text, "");
+        let text = RE_HEAD.replace_all(&text, "");
 
         // Replace block-level elements with newlines so paragraphs separate cleanly
-        let re_block = Regex::new(r"(?i)<(br\s*/?|p|div|h[1-6]|li|tr|article|section|header|footer)[^>]*>")
-            .expect("compile regex: block-level HTML elements");
-        let text = re_block.replace_all(&text, "\n");
+        let text = RE_BLOCK.replace_all(&text, "\n");
 
         // Strip all remaining tags
-        let re_tags = Regex::new(r"<[^>]+>").expect("compile regex: strip remaining HTML tags");
-        let text = re_tags.replace_all(&text, "");
+        let text = RE_TAGS.replace_all(&text, "");
 
         // Decode common HTML entities
         let text = text
@@ -434,6 +446,7 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

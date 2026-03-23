@@ -458,6 +458,8 @@ fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<S
 
         // Skip leading env assignments and executable token.
         let mut idx = 0;
+        // SAFETY: idx < tokens.len() is the loop guard
+        #[allow(clippy::indexing_slicing)]
         while idx < tokens.len() && is_env_assignment(tokens[idx]) {
             idx += 1;
         }
@@ -466,7 +468,7 @@ fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<S
         }
         idx += 1;
 
-        for token in &tokens[idx..] {
+        for token in tokens.get(idx..).unwrap_or_default() {
             let candidate = strip_wrapping_quotes(token);
             if candidate.is_empty() || candidate.starts_with('-') || candidate.contains("://") {
                 continue;
@@ -554,6 +556,7 @@ async fn run_job_command_with_timeout(
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -459,6 +459,7 @@ fn collect_hydration_entries(workspace_dir: &Path) -> Result<Vec<(String, String
     Ok(hydrated)
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

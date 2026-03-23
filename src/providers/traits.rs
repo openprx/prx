@@ -428,10 +428,10 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools {
-        writeln!(&mut instructions, "**{}**: {}", tool.name, tool.description).expect("writing to String cannot fail");
+        let _ = writeln!(&mut instructions, "**{}**: {}", tool.name, tool.description);
 
         let parameters = serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_string());
-        writeln!(&mut instructions, "Parameters: `{parameters}`").expect("writing to String cannot fail");
+        let _ = writeln!(&mut instructions, "Parameters: `{parameters}`");
         instructions.push('\n');
     }
 

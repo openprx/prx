@@ -276,6 +276,7 @@ impl AuditLogger {
 /// Replaces values that look like API keys, tokens, passwords, and credential
 /// URLs with `[REDACTED]` to prevent accidental secret exposure in logs.
 fn redact_secrets(command: &str) -> String {
+    #[allow(clippy::expect_used)]
     static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         vec![
             // key=value and key:value patterns for known secret names

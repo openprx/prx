@@ -162,7 +162,9 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     }
 
     let mut chars = value.chars();
-    let first = chars.next().expect("BUG: checked non-empty above");
+    let Some(first) = chars.next() else {
+        anyhow::bail!("{field_name} must not be empty");
+    };
 
     if !(first.is_ascii_alphabetic() || first == '_') {
         anyhow::bail!("{field_name} must start with an ASCII letter or underscore; got '{value}'");

@@ -50,7 +50,7 @@ pub fn truncate_large_output(content: &str) -> String {
         let mut hasher = sha2::Sha256::new();
         hasher.update(content.as_bytes());
         let result = hasher.finalize();
-        hex::encode(&result[..8])
+        hex::encode(result.get(..8).unwrap_or(result.as_slice()))
     };
     // Floor to a valid UTF-8 char boundary to avoid panic on multi-byte chars
     let mut end = MAX_TOOL_OUTPUT_BYTES;

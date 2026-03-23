@@ -873,6 +873,7 @@ impl Provider for OpenAiCodexProvider {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

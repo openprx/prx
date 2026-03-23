@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use crate::config::schema::{
     DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
 };
@@ -1663,6 +1665,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         .default(0)
         .interact()?;
 
+    // SAFETY: dialoguer Select guarantees provider_idx < providers.len()
+    #[allow(clippy::indexing_slicing)]
     let provider_name = providers[provider_idx].0;
 
     // ── API key / endpoint ──
@@ -2061,6 +2065,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
         .default(0)
         .interact()?;
 
+    // SAFETY: dialoguer Select guarantees model_idx < model_options.len()
+    #[allow(clippy::indexing_slicing)]
     let selected_model = model_options[model_idx].0.clone();
     let model = if selected_model == CUSTOM_MODEL_SENTINEL {
         Input::new()
@@ -2252,6 +2258,8 @@ fn setup_project_context() -> Result<ProjectContext> {
             .interact_text()?
     } else {
         // Extract the short label before the parenthetical
+        // SAFETY: dialoguer Select guarantees tz_idx < tz_options.len()
+        #[allow(clippy::indexing_slicing)]
         tz_options[tz_idx].split('(').next().unwrap_or("UTC").trim().to_string()
     };
 

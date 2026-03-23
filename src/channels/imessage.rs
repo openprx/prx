@@ -2,6 +2,7 @@ use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 use std::path::Path;
 use tokio::sync::mpsc;
@@ -251,6 +252,7 @@ end tell"#
 
 /// Get the current max ROWID from the messages table.
 /// Uses rusqlite with parameterized queries for security (CWE-89 prevention).
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 async fn get_max_rowid(db_path: &Path) -> anyhow::Result<i64> {
     let path = db_path.to_path_buf();
@@ -270,6 +272,7 @@ async fn get_max_rowid(db_path: &Path) -> anyhow::Result<i64> {
 /// Fetch messages newer than `since_rowid`.
 /// Uses rusqlite with parameterized queries for security (CWE-89 prevention).
 /// The `since_rowid` parameter is bound safely, preventing SQL injection.
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 async fn fetch_new_messages(db_path: &Path, since_rowid: i64) -> anyhow::Result<Vec<(i64, String, String)>> {
     let path = db_path.to_path_buf();
@@ -301,6 +304,7 @@ async fn fetch_new_messages(db_path: &Path, since_rowid: i64) -> anyhow::Result<
     Ok(results)
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

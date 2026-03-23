@@ -23,6 +23,8 @@
 //!  18. Conversation history fidelity (tool call → tool result → assistant)
 //!  19. Builder validation (missing required fields)
 //!  20. Idempotent system prompt insertion
+// Test module: JSON indexing and vector indexing in assertions are intentional.
+#![allow(clippy::indexing_slicing)]
 
 use crate::agent::agent::Agent;
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher};

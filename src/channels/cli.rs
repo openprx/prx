@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use tokio::io::{self, AsyncBufReadExt, BufReader};

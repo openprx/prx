@@ -365,6 +365,7 @@ pub fn payload_error(component: &str, message: &str) -> serde_json::Value {
     })
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

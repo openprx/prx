@@ -726,6 +726,8 @@ impl SqliteMemory {
         // First 16 bytes → 32 hex chars. 128-bit hash reduces collision risk
         // to negligible levels (~2^-64 birthday bound vs ~2^-32 with 64-bit).
         let mut hex = String::with_capacity(32);
+        // SAFETY: SHA-256 output is always 32 bytes, so ..16 is always valid
+        #[allow(clippy::indexing_slicing)]
         for byte in &hash[..16] {
             use std::fmt::Write;
             let _ = write!(hex, "{byte:02x}");

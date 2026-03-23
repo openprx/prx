@@ -1,6 +1,7 @@
 //! Head-to-head comparison: SQLite vs Markdown memory backends
 //!
 //! Run with: cargo test --test memory_comparison -- --nocapture
+#![allow(clippy::print_stdout, clippy::expect_used)]
 
 use std::time::Instant;
 use tempfile::TempDir;

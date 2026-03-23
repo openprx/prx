@@ -3,6 +3,8 @@
 //! Wires up the full agent pipeline (memory, tools, providers, security, hooks,
 //! observability) and uses [`TerminalChannel`] for streaming I/O through the
 //! event-driven UI Actor.
+// Chat module: println!/eprintln! are intentional user-facing output (banners, status, errors).
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod commands;
 pub mod sanitize;
@@ -97,15 +99,16 @@ fn compact_chat_history(history: &mut Vec<ChatMessage>) {
     }
 
     // Truncate individual messages
-    for msg in &mut history[start..] {
+    for msg in history.iter_mut().skip(start) {
         if msg.content.chars().count() > COMPACT_CONTENT_CHARS {
             msg.content = truncate_with_ellipsis(&msg.content, COMPACT_CONTENT_CHARS);
         }
     }
 
     // Enforce total character budget (drop oldest turns first)
-    while history[start..]
+    while history
         .iter()
+        .skip(start)
         .map(|m| m.content.chars().count())
         .sum::<usize>()
         > COMPACT_TOTAL_CHARS
@@ -476,8 +479,8 @@ pub async fn run(
         );
         if history.is_empty() {
             history.push(ChatMessage::system(system_prompt));
-        } else {
-            history[0] = ChatMessage::system(system_prompt);
+        } else if let Some(first) = history.first_mut() {
+            *first = ChatMessage::system(system_prompt);
         }
         history.push(ChatMessage::user(&enriched));
 

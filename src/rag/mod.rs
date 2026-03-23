@@ -62,7 +62,10 @@ fn parse_pin_aliases(content: &str) -> PinAliases {
         if line.starts_with('|') {
             let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
             if parts.len() >= 3 {
+                // SAFETY: bounds checked above (len >= 3)
+                #[allow(clippy::indexing_slicing)]
                 let alias = parts[1].trim().to_lowercase().replace(' ', "_");
+                #[allow(clippy::indexing_slicing)]
                 let pin_str = parts[2].trim();
                 // Skip header row and separator (|---|)
                 if alias.eq("alias")

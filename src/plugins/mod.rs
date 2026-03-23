@@ -60,17 +60,20 @@ pub struct PluginMetrics {
 }
 
 impl PluginMetrics {
+    #[allow(clippy::indexing_slicing)]
     #[cfg(test)]
     fn record_compilation(&self, compile_ms: u64) {
         self.compilations.fetch_add(1, Ordering::Relaxed);
         self.total_compile_ms.fetch_add(compile_ms, Ordering::Relaxed);
     }
 
+    #[allow(clippy::indexing_slicing)]
     #[cfg(test)]
     fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[allow(clippy::indexing_slicing)]
     #[cfg(test)]
     fn record_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
@@ -789,6 +792,7 @@ pub async fn init_plugin_manager(workspace_dir: &Path) -> Option<Arc<PluginManag
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

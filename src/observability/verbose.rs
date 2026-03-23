@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use std::any::Any;
 

@@ -11,6 +11,8 @@
 //! GitHub could change or revoke this at any time, which would break all
 //! third-party integrations simultaneously.
 
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
     ToolCall as ProviderToolCall,

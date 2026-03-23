@@ -452,6 +452,7 @@ fn clamp_0_1(value: f64) -> f64 {
     value.clamp(0.0, 1.0)
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

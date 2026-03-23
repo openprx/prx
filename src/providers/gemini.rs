@@ -497,6 +497,7 @@ impl Provider for GeminiProvider {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

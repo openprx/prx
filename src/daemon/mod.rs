@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use crate::config::{Config, HotReloadManager, new_shared};
 use crate::self_system::evolution::{
     AsyncJsonlWriter, EvolutionAnalyzer, EvolutionConfig, EvolutionPipeline, EvolutionRetentionConfig,
@@ -514,6 +516,7 @@ fn has_supervised_channels(config: &Config) -> bool {
         || qq.is_some()
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

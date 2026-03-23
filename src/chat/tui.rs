@@ -133,19 +133,23 @@ pub fn render(frame: &mut Frame, state: &mut TuiState) {
         ])
         .split(area);
 
-    state.viewport_height = chunks[1].height;
+    // Layout::split always returns exactly as many chunks as constraints (4 here).
+    #[allow(clippy::indexing_slicing)]
+    {
+        state.viewport_height = chunks[1].height;
 
-    // ── Status bar ──
-    render_status_bar(frame, chunks[0], state);
+        // ── Status bar ──
+        render_status_bar(frame, chunks[0], state);
 
-    // ── Output area ──
-    render_output(frame, chunks[1], state);
+        // ── Output area ──
+        render_output(frame, chunks[1], state);
 
-    // ── Input area ──
-    render_input(frame, chunks[2], state);
+        // ── Input area ──
+        render_input(frame, chunks[2], state);
 
-    // ── Footer ──
-    render_footer(frame, chunks[3]);
+        // ── Footer ──
+        render_footer(frame, chunks[3]);
+    }
 }
 
 fn render_status_bar(frame: &mut Frame, area: Rect, state: &TuiState) {

@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use crate::config::Config;
 use crate::security::SecurityPolicy;
 use anyhow::{Result, bail};

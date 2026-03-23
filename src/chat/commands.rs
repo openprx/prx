@@ -2,6 +2,8 @@
 //!
 //! Each command is a pure function that prints output and returns a
 //! [`CommandResult`] so the caller knows whether to `continue` the loop.
+// Chat commands: println! calls are intentional user-facing slash-command output.
+#![allow(clippy::print_stdout)]
 
 use super::session;
 use crate::memory::{Memory, MemoryCategory};

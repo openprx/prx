@@ -3,6 +3,8 @@
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" allowlists and audit logging.
 
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use crate::config::AutonomyConfig;
 use crate::security::AutonomyLevel;
 use chrono::Utc;
@@ -225,6 +227,7 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
 
 // ── Tests ────────────────────────────────────────────────────────
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

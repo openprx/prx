@@ -393,8 +393,10 @@ fn map_topic(row: &rusqlite::Row<'_>) -> rusqlite::Result<Topic> {
     })
 }
 
+#[allow(clippy::expect_used)]
 static EXTERNAL_URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"https?://[^\s]+/(pull|issues)/\d+").expect("external url regex must compile"));
+#[allow(clippy::expect_used)]
 static EXTERNAL_TICKET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(openpr|pr|issue|mr|ticket)[#:\-\s]*\d+\b").expect("external id regex must compile")
 });
@@ -423,6 +425,7 @@ pub fn merge_topic_memories(memories: Vec<TopicMemory>) -> Vec<TopicMemory> {
     merged.into_values().collect()
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

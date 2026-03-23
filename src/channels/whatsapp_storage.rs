@@ -1014,16 +1014,20 @@ impl DeviceStoreTrait for RusqliteStore {
 
             use wa_rs_core::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
 
+            // Length validated as 64 above; slicing is safe.
+            #[allow(clippy::indexing_slicing)]
             let noise_key = KeyPair::new(
                 PublicKey::from_djb_public_key_bytes(&noise_key_bytes[32..64]).map_err(to_rusqlite_err)?,
                 PrivateKey::deserialize(&noise_key_bytes[0..32]).map_err(to_rusqlite_err)?,
             );
 
+            #[allow(clippy::indexing_slicing)]
             let identity_key = KeyPair::new(
                 PublicKey::from_djb_public_key_bytes(&identity_key_bytes[32..64]).map_err(to_rusqlite_err)?,
                 PrivateKey::deserialize(&identity_key_bytes[0..32]).map_err(to_rusqlite_err)?,
             );
 
+            #[allow(clippy::indexing_slicing)]
             let signed_pre_key = KeyPair::new(
                 PublicKey::from_djb_public_key_bytes(&signed_pre_key_bytes[32..64]).map_err(to_rusqlite_err)?,
                 PrivateKey::deserialize(&signed_pre_key_bytes[0..32]).map_err(to_rusqlite_err)?,

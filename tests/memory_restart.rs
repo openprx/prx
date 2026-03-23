@@ -5,6 +5,7 @@
 //!
 //! Tests SqliteMemory deduplication on restart, session scoping, concurrent
 //! message ordering, and recall behavior after re-initialization.
+#![allow(clippy::indexing_slicing)]
 
 use openprx::memory::sqlite::SqliteMemory;
 use openprx::memory::traits::{Memory, MemoryCategory};

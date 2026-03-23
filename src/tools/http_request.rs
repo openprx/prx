@@ -90,6 +90,7 @@ impl HttpRequestTool {
         result
     }
 
+    #[allow(clippy::indexing_slicing)]
     #[cfg(test)]
     fn redact_headers_for_display(headers: &[(String, String)]) -> Vec<(String, String)> {
         headers
@@ -447,6 +448,7 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

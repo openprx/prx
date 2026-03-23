@@ -346,6 +346,8 @@ impl ReliableProvider {
             return None;
         }
         let idx = self.key_index.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
+        // SAFETY: idx = N % api_keys.len() is always < api_keys.len(), which is non-empty
+        #[allow(clippy::indexing_slicing)]
         Some(&self.api_keys[idx])
     }
 

@@ -128,6 +128,7 @@ pub fn hybrid_merge(
     results
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 #[allow(
     clippy::float_cmp,

@@ -441,6 +441,7 @@ fn is_acl_enforced_for_role(role: &Role) -> bool {
     }
 }
 
+#[allow(clippy::expect_used)]
 static SENSITIVE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"\bssh\b").expect("compile regex: ssh keyword"),
@@ -455,9 +456,11 @@ static SENSITIVE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     ]
 });
 
+#[allow(clippy::expect_used)]
 static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b").expect("compile regex: email address pattern")
 });
+#[allow(clippy::expect_used)]
 static IPV4_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").expect("compile regex: IPv4 address pattern"));
 

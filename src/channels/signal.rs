@@ -2007,13 +2007,17 @@ impl Channel for SignalChannel {
             };
 
             if !file_attachments.is_empty() {
-                params["attachment"] = serde_json::json!(file_attachments);
+                params
+                    .as_object_mut()
+                    .map(|m| m.insert("attachment".to_string(), serde_json::json!(file_attachments)));
             }
 
             // Quote/reply support
             if let (Some(ts), Some(author)) = (&message.quote_timestamp, &message.quote_author) {
-                params["quoteTimestamp"] = serde_json::json!(ts);
-                params["quoteAuthor"] = serde_json::json!(author);
+                if let Some(m) = params.as_object_mut() {
+                    m.insert("quoteTimestamp".to_string(), serde_json::json!(ts));
+                    m.insert("quoteAuthor".to_string(), serde_json::json!(author));
+                }
             }
 
             self.rpc_request("send", params).await?;
@@ -2057,20 +2061,25 @@ impl Channel for SignalChannel {
         };
 
         // Only include message field if there's text to send
-        if !clean_text.is_empty() {
-            body["message"] = serde_json::Value::String(clean_text.clone());
-        } else if base64_attachments.is_empty() {
-            body["message"] = serde_json::Value::String(message.content.clone());
-        }
+        if let Some(m) = body.as_object_mut() {
+            if !clean_text.is_empty() {
+                m.insert("message".to_string(), serde_json::Value::String(clean_text.clone()));
+            } else if base64_attachments.is_empty() {
+                m.insert(
+                    "message".to_string(),
+                    serde_json::Value::String(message.content.clone()),
+                );
+            }
 
-        if !base64_attachments.is_empty() {
-            body["base64_attachments"] = serde_json::json!(base64_attachments);
-        }
+            if !base64_attachments.is_empty() {
+                m.insert("base64_attachments".to_string(), serde_json::json!(base64_attachments));
+            }
 
-        // Add quote/reply fields if reply context is present
-        if let (Some(ts), Some(author)) = (&message.quote_timestamp, &message.quote_author) {
-            body["quote_timestamp"] = serde_json::json!(ts);
-            body["quote_author"] = serde_json::json!(author);
+            // Add quote/reply fields if reply context is present
+            if let (Some(ts), Some(author)) = (&message.quote_timestamp, &message.quote_author) {
+                m.insert("quote_timestamp".to_string(), serde_json::json!(ts));
+                m.insert("quote_author".to_string(), serde_json::json!(author));
+            }
         }
 
         let mut rest_sent = false;

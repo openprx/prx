@@ -245,6 +245,8 @@ fn xor_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
     if key.is_empty() {
         return data.to_vec();
     }
+    // SAFETY: (i % key.len()) is always < key.len(), and key is non-empty (checked above)
+    #[allow(clippy::indexing_slicing)]
     data.iter().enumerate().map(|(i, &b)| b ^ key[i % key.len()]).collect()
 }
 
@@ -291,6 +293,7 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

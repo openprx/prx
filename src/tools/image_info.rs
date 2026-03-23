@@ -33,8 +33,10 @@ impl ImageInfoTool {
             "jpeg"
         } else if bytes.starts_with(b"GIF8") {
             "gif"
-        } else if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
-            "webp"
+        } else if bytes.starts_with(b"RIFF") && bytes.len() >= 12 {
+            // SAFETY: bounds checked above (len >= 12)
+            #[allow(clippy::indexing_slicing)]
+            if &bytes[8..12] == b"WEBP" { "webp" } else { "unknown" }
         } else if bytes.starts_with(b"BM") {
             "bmp"
         } else {
@@ -44,6 +46,8 @@ impl ImageInfoTool {
 
     /// Try to extract dimensions from image header bytes.
     /// Returns (width, height) if detectable.
+    // SAFETY: all array indexing below is guarded by the len checks in each branch
+    #[allow(clippy::indexing_slicing)]
     fn extract_dimensions(bytes: &[u8], format: &str) -> Option<(u32, u32)> {
         match format {
             "png" => {
@@ -83,6 +87,8 @@ impl ImageInfoTool {
     }
 
     /// Parse JPEG SOF markers to extract dimensions.
+    // SAFETY: all byte indexing is guarded by i+N < bytes.len() conditions
+    #[allow(clippy::indexing_slicing)]
     fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         let mut i = 2; // skip SOI marker
         while i + 1 < bytes.len() {
@@ -237,6 +243,7 @@ impl Tool for ImageInfoTool {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;

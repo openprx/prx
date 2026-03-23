@@ -1,3 +1,5 @@
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use anyhow::{Context, Result, bail};
@@ -384,6 +386,7 @@ fn backup_target_memory(workspace_dir: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;
