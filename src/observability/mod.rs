@@ -10,7 +10,7 @@ pub use self::log::LogObserver;
 pub use noop::NoopObserver;
 pub use otel::OtelObserver;
 pub use prometheus::PrometheusObserver;
-pub use traits::{Observer, ObserverEvent};
+pub use traits::{Observer, ObserverEvent, ObserverMetric};
 
 use crate::config::ObservabilityConfig;
 

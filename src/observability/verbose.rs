@@ -60,6 +60,17 @@ impl Observer for VerboseObserver {
             ObserverEvent::TurnComplete => {
                 eprintln!("< Complete");
             }
+            ObserverEvent::CteRun {
+                chosen_label,
+                extra_latency_ms,
+                commit_succeeded,
+                circuit_breaker_tripped,
+                ..
+            } => {
+                eprintln!(
+                    "< CTE label={chosen_label} latency_ms={extra_latency_ms} commit={commit_succeeded} cb_tripped={circuit_breaker_tripped}"
+                );
+            }
             _ => {}
         }
     }
@@ -108,5 +119,19 @@ mod tests {
             success: true,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
+        obs.record_event(&ObserverEvent::CteRun {
+            branch_count: 2,
+            chosen_branch: "branch-xyz".into(),
+            chosen_label: "RetrieveThenAnswer".into(),
+            extra_latency_ms: 55,
+            commit_succeeded: true,
+            circuit_breaker_tripped: false,
+        });
+    }
+
+    #[test]
+    fn verbose_cte_metric_no_panic() {
+        let obs = VerboseObserver::new();
+        obs.record_metric(&ObserverMetric::CteExtraLatency(Duration::from_millis(10)));
     }
 }

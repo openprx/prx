@@ -31,6 +31,7 @@ use super::rehearsal::RehearsalEngine;
 use super::scorer::BranchScorer;
 use super::selector::PathSelector;
 use super::state::CausalState;
+use crate::observability::{Observer, ObserverEvent, ObserverMetric};
 
 /// The top-level CTE pipeline orchestrator.
 ///
@@ -42,6 +43,7 @@ pub struct CausalTreeEngine {
     scorer: Arc<dyn BranchScorer>,
     selector: Arc<dyn PathSelector>,
     feedback: Arc<dyn FeedbackWriter>,
+    observer: Arc<dyn Observer>,
     config: CausalTreeConfig,
     circuit_breaker: Mutex<CircuitBreakerState>,
     metrics: Mutex<CausalTreeMetrics>,
@@ -55,6 +57,7 @@ impl CausalTreeEngine {
         scorer: Arc<dyn BranchScorer>,
         selector: Arc<dyn PathSelector>,
         feedback: Arc<dyn FeedbackWriter>,
+        observer: Arc<dyn Observer>,
         config: CausalTreeConfig,
     ) -> Self {
         Self {
@@ -63,6 +66,7 @@ impl CausalTreeEngine {
             scorer,
             selector,
             feedback,
+            observer,
             config,
             circuit_breaker: Mutex::new(CircuitBreakerState::default()),
             metrics: Mutex::new(CausalTreeMetrics::default()),
@@ -112,6 +116,15 @@ impl CausalTreeEngine {
         };
         if let Some(consecutive_failures) = cb_open_info {
             self.metrics.lock().record_circuit_breaker_trip();
+            let elapsed_ms = pipeline_start.elapsed().as_millis() as u64;
+            self.observer.record_event(&ObserverEvent::CteRun {
+                branch_count: 0,
+                chosen_branch: String::new(),
+                chosen_label: String::new(),
+                extra_latency_ms: elapsed_ms,
+                commit_succeeded: false,
+                circuit_breaker_tripped: true,
+            });
             return Err(CausalTreeError::CircuitBreakerOpen {
                 consecutive_failures,
             });
@@ -132,6 +145,36 @@ impl CausalTreeEngine {
                 cb.maybe_open(policy);
             }
         }
+
+        // Emit observer event and metric for the pipeline run.
+        let elapsed = pipeline_start.elapsed();
+        let elapsed_ms = elapsed.as_millis() as u64;
+        match &result {
+            Ok((decision, branch)) => {
+                self.observer.record_event(&ObserverEvent::CteRun {
+                    branch_count: decision.fallback_branch_ids.len()
+                        + decision.rejected_branch_ids.len()
+                        + 1,
+                    chosen_branch: decision.chosen_branch_id.clone(),
+                    chosen_label: branch.label.as_str().to_string(),
+                    extra_latency_ms: elapsed_ms,
+                    commit_succeeded: true,
+                    circuit_breaker_tripped: false,
+                });
+            }
+            Err(_) => {
+                self.observer.record_event(&ObserverEvent::CteRun {
+                    branch_count: 0,
+                    chosen_branch: String::new(),
+                    chosen_label: String::new(),
+                    extra_latency_ms: elapsed_ms,
+                    commit_succeeded: false,
+                    circuit_breaker_tripped: false,
+                });
+            }
+        }
+        self.observer
+            .record_metric(&ObserverMetric::CteExtraLatency(elapsed));
 
         result
     }
@@ -268,6 +311,7 @@ mod tests {
     use crate::causal_tree::scorer::DefaultBranchScorer;
     use crate::causal_tree::selector::DefaultPathSelector;
     use crate::causal_tree::state::{BudgetState, SideEffectMode};
+    use crate::observability::noop::NoopObserver;
 
     fn make_state(intent: &str) -> CausalState {
         CausalState {
@@ -306,6 +350,7 @@ mod tests {
             Arc::new(DefaultBranchScorer::new()),
             Arc::new(DefaultPathSelector::new()),
             Arc::new(NoopFeedbackWriter::new()),
+            Arc::new(NoopObserver),
             config,
         )
     }
@@ -354,6 +399,7 @@ mod tests {
             Arc::new(DefaultBranchScorer::new()),
             Arc::new(DefaultPathSelector::new()),
             Arc::new(NoopFeedbackWriter::new()),
+            Arc::new(NoopObserver),
             config,
         );
         let state = make_state("hello");
