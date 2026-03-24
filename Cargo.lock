@@ -4441,6 +4441,7 @@ dependencies = [
  "sha2",
  "shellexpand",
  "skillratings",
+ "strsim",
  "subtle",
  "syntect",
  "tempfile",

@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -294,6 +294,14 @@ impl Tool for HttpRequestTool {
                 error: Some(format!("HTTP request failed: {e}")),
             }),
         }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Standard
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::WebBrowsing]
     }
 }
 

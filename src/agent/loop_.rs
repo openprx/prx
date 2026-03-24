@@ -31,7 +31,13 @@ pub(crate) enum ToolCallNotification {
     /// A tool call is about to be executed.
     Started { name: String, args_summary: String },
     /// A tool call has finished executing.
-    Finished { name: String, success: bool },
+    Finished {
+        name: String,
+        success: bool,
+        duration_ms: u64,
+    },
+    /// Progress indication for multi-iteration tool loops.
+    Progress { iteration: usize, max_iterations: usize },
 }
 
 /// Context for scope-based tool access control.
@@ -1599,7 +1605,13 @@ async fn execute_one_tool(
     scope_ctx: Option<&ScopeContext<'_>>,
 ) -> Result<String> {
     let Some(tool) = find_tool(tools_registry, call_name) else {
-        return Ok(format!("Unknown tool: {call_name}"));
+        let available_names: Vec<&str> = tools_registry.iter().map(|t| t.name()).collect();
+        let suggestion = crate::tools::error_hints::suggest_tool_name(call_name, &available_names);
+        let hint = suggestion.map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default();
+        return Ok(format!(
+            "Error: unknown tool '{call_name}'.{hint}\nAvailable tools: {}",
+            available_names.join(", ")
+        ));
     };
 
     let root = call_arguments
@@ -1639,9 +1651,8 @@ async fn execute_one_tool(
                 .filter(|key| !args_obj.contains_key(*key))
                 .collect();
             if !missing.is_empty() {
-                return Ok(format!(
-                    "Error: missing required argument(s) for tool '{call_name}': {}",
-                    missing.join(", ")
+                return Ok(crate::tools::error_hints::format_missing_params(
+                    call_name, &missing, &schema,
                 ));
             }
         }
@@ -1672,7 +1683,13 @@ async fn execute_one_tool(
             if r.success {
                 Ok(scrub_credentials(&r.output))
             } else {
-                Ok(format!("Error: {}", r.error.unwrap_or_else(|| r.output)))
+                let error_text = r.error.unwrap_or_else(|| r.output);
+                let hint = crate::tools::error_hints::recovery_hint(call_name, &error_text);
+                if hint.is_empty() {
+                    Ok(format!("Error: {error_text}"))
+                } else {
+                    Ok(format!("Error: {error_text}\n{hint}"))
+                }
             }
         }
         Err(e) => {
@@ -1681,7 +1698,13 @@ async fn execute_one_tool(
                 duration: start.elapsed(),
                 success: false,
             });
-            Ok(format!("Error executing {call_name}: {e}"))
+            let error_str = e.to_string();
+            let hint = crate::tools::error_hints::recovery_hint(call_name, &error_str);
+            if hint.is_empty() {
+                Ok(format!("Error executing {call_name}: {error_str}"))
+            } else {
+                Ok(format!("Error executing {call_name}: {error_str}\n{hint}"))
+            }
         }
     }
 }
@@ -2280,8 +2303,19 @@ pub(crate) async fn run_tool_call_loop(
     }
 
     let mut overflow_retries: usize = 0;
+    let mut consecutive_failures: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
-    for _iteration in 0..max_iterations {
+    for iteration in 0..max_iterations {
+        // Notify progress for multi-iteration tool loops (skip the first iteration).
+        if iteration > 0 {
+            if let Some(ref tx) = on_tool_call {
+                let _ = tx.try_send(ToolCallNotification::Progress {
+                    iteration: iteration + 1,
+                    max_iterations,
+                });
+            }
+        }
+
         if cancellation_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return Err(ToolLoopCancelled.into());
         }
@@ -2573,6 +2607,7 @@ pub(crate) async fn run_tool_call_loop(
             }
         }
 
+        let tools_started_at = Instant::now();
         let individual_results = execute_tools_with_policy(
             &tool_calls,
             tools_registry,
@@ -2584,6 +2619,7 @@ pub(crate) async fn run_tool_call_loop(
             scope_ctx,
         )
         .await?;
+        let tools_elapsed_ms = tools_started_at.elapsed().as_millis() as u64;
 
         for (call, result) in tool_calls.iter().zip(individual_results.iter()) {
             let success = !result.starts_with("Error");
@@ -2602,18 +2638,37 @@ pub(crate) async fn run_tool_call_loop(
                     .send(ToolCallNotification::Finished {
                         name: call.name.clone(),
                         success,
+                        duration_ms: tools_elapsed_ms,
                     })
                     .await;
             }
             if !success {
                 hooks.emit(HookEvent::Error, payload_error("tool", result)).await;
             }
+
+            // Track consecutive failures per tool for repeated-failure hints.
+            let repeated_hint = if success {
+                consecutive_failures.remove(&call.name);
+                String::new()
+            } else {
+                let count = consecutive_failures.entry(call.name.clone()).or_insert(0);
+                *count += 1;
+                if *count >= 2 {
+                    format!(
+                        "\n[System: tool '{}' has failed {} times consecutively. Consider a different approach or tool.]",
+                        call.name, count
+                    )
+                } else {
+                    String::new()
+                }
+            };
+
             // P0-2: Truncate oversized tool results before inserting into history.
             let truncated_result = truncate_tool_result_if_needed(result, MAX_TOOL_RESULT_CHARS);
             let _ = writeln!(
                 tool_results,
-                "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                call.name, truncated_result
+                "<tool_result name=\"{}\">\n{}{}\n</tool_result>",
+                call.name, truncated_result, repeated_hint
             );
         }
 

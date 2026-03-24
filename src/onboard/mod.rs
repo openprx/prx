@@ -1,3 +1,4 @@
+pub mod auto_detect;
 pub mod wizard;
 
 pub use wizard::run_models_refresh;

@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -68,6 +68,9 @@ fantoccini = { version = "0.22.0", optional = true, default-features = false, fe
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
+
+# String similarity for tool name suggestions
+strsim = "0.11"
 
 # UUID generation
 uuid = { version = "1.11", default-features = false, features = ["v4", "v7", "std"] }
@@ -177,6 +180,9 @@ probe-rs = { version = "0.31", optional = true }
 pdf-extract = { version = "0.10", optional = true }
 tokio-stream = { version = "0.1.18", features = ["full"] }
 
+# Temporary directory for zero-config `prx go` workspace
+tempfile = "3.14"
+
 # WhatsApp Web client (wa-rs) — optional, enable with --features whatsapp-web
 # Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.
 wa-rs = { version = "0.2", optional = true, default-features = false }
@@ -247,7 +253,6 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
-tempfile = "3.14"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

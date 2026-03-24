@@ -539,8 +539,20 @@ pub async fn run(
                     ToolCallNotification::Started { name, args_summary } => {
                         terminal_for_tools.notify_tool_started(&name, &args_summary).await;
                     }
-                    ToolCallNotification::Finished { name, success } => {
-                        terminal_for_tools.notify_tool_finished(&name, success).await;
+                    ToolCallNotification::Finished {
+                        name,
+                        success,
+                        duration_ms,
+                    } => {
+                        terminal_for_tools
+                            .notify_tool_finished(&name, success, duration_ms)
+                            .await;
+                    }
+                    ToolCallNotification::Progress {
+                        iteration,
+                        max_iterations,
+                    } => {
+                        terminal_for_tools.notify_progress(iteration, max_iterations).await;
                     }
                 }
             }

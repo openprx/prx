@@ -5,7 +5,7 @@
 //! conversion, and delivery to the current conversation sender automatically.
 
 use super::message_send::auto_generate_voice;
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::channels::traits::{Channel, SendMessage};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -196,6 +196,13 @@ impl Tool for TtsTool {
                 error: Some(format!("Failed to send voice message: {e}")),
             }),
         }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Communication, ToolCategory::Media]
     }
 }
 

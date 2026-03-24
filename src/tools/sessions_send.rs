@@ -6,7 +6,7 @@
 //! the 'steer' action in sessions_spawn.
 
 use super::sessions_spawn::{SubAgentRun, SubAgentStatus};
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -114,6 +114,13 @@ impl Tool for SessionsSendTool {
                 error: Some(format!("Session `{run_id}` already failed ({e}); cannot send message.")),
             }),
         }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
     }
 }
 

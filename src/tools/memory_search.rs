@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::memory::Memory;
 use crate::memory::principal::{
     ChatType, MemoryWriteContext, Principal, Role, Visibility, log_access, post_filter, resolve_principal,
@@ -555,6 +555,14 @@ impl Tool for MemorySearchTool {
         );
 
         Ok(render_search_result(trimmed_query, all_rows))
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Standard
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Memory]
     }
 }
 

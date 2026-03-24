@@ -19,6 +19,37 @@ pub struct ToolSpec {
     pub parameters: serde_json::Value,
 }
 
+/// Tool activation tier — controls when the tool is included in the LLM context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolTier {
+    /// Always included in every request.
+    Core,
+    /// Included when user intent matches a category keyword.
+    Standard,
+    /// Only included when explicitly activated by keyword match.
+    Extended,
+}
+
+impl Default for ToolTier {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+/// Semantic categories for intent-based tool activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ToolCategory {
+    FileSystem,
+    Memory,
+    WebBrowsing,
+    Communication,
+    Scheduling,
+    Automation,
+    DevOps,
+    Media,
+    System,
+}
+
 /// Core tool trait — implement for any capability
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -69,6 +100,16 @@ pub trait Tool: Send + Sync {
     /// Optional multi-spec export for dynamic tools.
     fn specs(&self) -> Vec<ToolSpec> {
         vec![self.spec()]
+    }
+
+    /// Tool tier for intelligent context management. Default: Standard.
+    fn tier(&self) -> ToolTier {
+        ToolTier::Standard
+    }
+
+    /// Semantic categories for intent matching. Default: empty (always matched in Standard tier).
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[]
     }
 
     /// Execute by public tool name. Default maps to `execute`.

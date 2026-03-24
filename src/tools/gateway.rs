@@ -10,7 +10,7 @@
 //!
 //! Designed to align with OpenClaw's `gateway` tool interface.
 
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -388,6 +388,13 @@ impl Tool for GatewayTool {
                 )),
             }),
         }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::System]
     }
 }
 

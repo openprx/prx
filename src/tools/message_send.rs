@@ -6,7 +6,7 @@
 //! - Send emoji reactions (Signal-specific, falls back to error on unsupported channels)
 //! - Quote reply to specific messages
 
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::channels::SignalChannel;
 use crate::channels::traits::{Channel, SendMessage};
 use crate::security::SecurityPolicy;
@@ -512,6 +512,14 @@ impl Tool for MessageSendTool {
                 )),
             }),
         }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Standard
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Communication]
     }
 }
 

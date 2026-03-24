@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::SharedConfig;
 use crate::cron;
 use crate::security::SecurityPolicy;
@@ -102,6 +102,13 @@ impl Tool for CronRemoveTool {
                 error: Some(e.to_string()),
             }),
         }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Scheduling]
     }
 }
 

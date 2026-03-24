@@ -6,7 +6,7 @@
 //!
 //! Aligns with OpenClaw's `agents_list` tool.
 
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::DelegateAgentConfig;
 use async_trait::async_trait;
 use serde_json::json;
@@ -88,6 +88,13 @@ impl Tool for AgentsListTool {
             ),
             error: None,
         })
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
     }
 }
 

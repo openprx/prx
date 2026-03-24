@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::SharedConfig;
 use crate::cron::{self, JobType};
 use crate::security::SecurityPolicy;
@@ -144,6 +144,13 @@ impl Tool for CronRunTool {
                 Some("cron job execution failed".to_string())
             },
         })
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Scheduling]
     }
 }
 

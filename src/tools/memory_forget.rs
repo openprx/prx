@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::memory::Memory;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -75,6 +75,14 @@ impl Tool for MemoryForgetTool {
                 error: Some(format!("Failed to forget memory: {e}")),
             }),
         }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Standard
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Memory]
     }
 }
 

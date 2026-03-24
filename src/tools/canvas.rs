@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -250,6 +250,13 @@ impl Tool for CanvasTool {
                 )),
             }),
         }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Media]
     }
 }
 

@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{RemoteNodeConfig, SharedConfig};
 use crate::nodes::client::RemoteNodeClient;
 use crate::nodes::transport::H2Transport;
@@ -294,6 +294,13 @@ impl Tool for NodesTool {
                 bail!("Unknown action '{other}'. Use: list, status, exec, read, write, cancel")
             }
         }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::DevOps]
     }
 }
 

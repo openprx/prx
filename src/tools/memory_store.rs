@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::memory::{Memory, MemoryCategory};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -95,6 +95,14 @@ impl Tool for MemoryStoreTool {
                 error: Some(format!("Failed to store memory: {e}")),
             }),
         }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Standard
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Memory]
     }
 }
 
