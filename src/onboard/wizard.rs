@@ -189,6 +189,7 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
         causal_tree: crate::causal_tree::CausalTreeConfig::default(),
         security: crate::config::SecurityConfig::default(),
         modules: crate::config::schema::ModulesConfig::default(),
+        tool_tiering: crate::config::ToolTieringConfig::default(),
     };
 
     // ── Detect Spec from wizard choices ──────────────────────────
@@ -471,6 +472,7 @@ async fn run_quick_setup_with_home(
         causal_tree: crate::causal_tree::CausalTreeConfig::default(),
         security: crate::config::SecurityConfig::default(),
         modules: crate::config::schema::ModulesConfig::default(),
+        tool_tiering: crate::config::ToolTieringConfig::default(),
     };
 
     config.save().await?;

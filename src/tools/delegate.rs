@@ -502,6 +502,7 @@ impl DelegateTool {
                 None,
                 scope_ctx.as_ref(),
                 None,
+                None, // delegate sub-agents do not use tool tiering
             ),
         )
         .await;

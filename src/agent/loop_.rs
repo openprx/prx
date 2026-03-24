@@ -1592,6 +1592,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -2240,6 +2241,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     scope_ctx: Option<&ScopeContext<'_>>,
     on_tool_call: Option<tokio::sync::mpsc::Sender<ToolCallNotification>>,
+    tool_tiering: Option<&crate::config::ToolTieringConfig>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2247,7 +2249,33 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations.min(MAX_TOOL_ITERATIONS_CAP)
     };
 
-    let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry.iter().flat_map(|tool| tool.specs()).collect();
+    let tool_specs: Vec<crate::tools::ToolSpec> = tool_tiering.filter(|c| c.enabled).map_or_else(
+        || tools_registry.iter().flat_map(|tool| tool.specs()).collect(),
+        |cfg| {
+            let last_user_msg = history
+                .iter()
+                .rev()
+                .find(|m| {
+                    m.role == "user"
+                        && !m.content.is_empty()
+                        && !m.content.starts_with("[Tool")
+                })
+                .map(|m| m.content.as_str())
+                .unwrap_or_default();
+            let filtered = crate::tools::intent::select_tools_for_intent(
+                tools_registry,
+                last_user_msg,
+                &cfg.always_include,
+                &cfg.always_exclude,
+            );
+            tracing::debug!(
+                total = tools_registry.len(),
+                filtered = filtered.len(),
+                "tool tiering applied"
+            );
+            filtered.iter().flat_map(|tool| tool.specs()).collect()
+        },
+    );
     let rollout = resolve_rollout_decision(parallel_tools_enabled, &concurrency_governance, channel_name, scope_ctx);
     tracing::info!(
         channel = channel_name,
@@ -2999,6 +3027,7 @@ pub async fn run(
             None,
             None,
             None,
+            Some(&config.tool_tiering),
         )
         .await?;
         increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
@@ -3176,6 +3205,7 @@ pub async fn run(
                 None,
                 None,
                 None,
+                Some(&config.tool_tiering),
             )
             .await
             {
@@ -3666,6 +3696,7 @@ mod tests {
             None,
             None, // no scope context
             None,
+            None, // no tool tiering
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3720,6 +3751,7 @@ mod tests {
             None,
             None, // no scope context
             None,
+            None, // no tool tiering
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3766,6 +3798,7 @@ mod tests {
             None,
             None, // no scope context
             None,
+            None, // no tool tiering
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3944,6 +3977,7 @@ mod tests {
             None,
             None, // no scope context
             None,
+            None, // no tool tiering
         )
         .await
         .expect("read-only parallel execution should complete");
@@ -4044,6 +4078,7 @@ mod tests {
             None,
             None, // no scope context
             None,
+            None, // no tool tiering
         )
         .await
         .expect("stateful serial execution should complete");
