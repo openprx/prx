@@ -810,9 +810,10 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
 
 async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     let path = path.to_path_buf();
-    let fingerprint = tokio::task::spawn_blocking(move || crate::config::files::compute_config_fingerprint(&path).ok())
-        .await
-        .ok()??;
+    let fingerprint =
+        tokio::task::spawn_blocking(move || crate::config::files::compute_config_fingerprint_gated(&path).ok())
+            .await
+            .ok()??;
     Some(ConfigFileStamp { fingerprint })
 }
 
@@ -3254,12 +3255,15 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 if wa.is_web_config() {
                     channels.push((
                         "WhatsApp",
-                        Arc::new(WhatsAppWebChannel::new(
-                            wa.session_path.clone().unwrap_or_default(),
-                            wa.pair_phone.clone(),
-                            wa.pair_code.clone(),
-                            wa.allowed_numbers.clone(),
-                        )),
+                        Arc::new(
+                            WhatsAppWebChannel::new(
+                                wa.session_path.clone().unwrap_or_default(),
+                                wa.pair_phone.clone(),
+                                wa.pair_code.clone(),
+                                wa.allowed_numbers.clone(),
+                            )
+                            .with_ws_url(wa.ws_url.clone()),
+                        ),
                     ));
                 } else {
                     tracing::warn!("WhatsApp Web configured but session_path not set");
@@ -3401,6 +3405,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
         codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
+        codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
     };
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         &provider_name,
@@ -3719,12 +3725,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 // Web mode: requires session_path
                 #[cfg(feature = "whatsapp-web")]
                 if wa.is_web_config() {
-                    channels.push(Arc::new(WhatsAppWebChannel::new(
-                        wa.session_path.clone().unwrap_or_default(),
-                        wa.pair_phone.clone(),
-                        wa.pair_code.clone(),
-                        wa.allowed_numbers.clone(),
-                    )));
+                    channels.push(Arc::new(
+                        WhatsAppWebChannel::new(
+                            wa.session_path.clone().unwrap_or_default(),
+                            wa.pair_phone.clone(),
+                            wa.pair_code.clone(),
+                            wa.allowed_numbers.clone(),
+                        )
+                        .with_ws_url(wa.ws_url.clone()),
+                    ));
                 } else {
                     tracing::warn!("WhatsApp Web configured but session_path not set");
                 }
@@ -5668,11 +5677,11 @@ BTC is currently around $65,000 based on latest tool output."#
 
         std::fs::write(
             &config_path,
-            "default_provider = \"openrouter\"\ndefault_model = \"base-model\"\n",
+            "default_provider = \"openrouter\"\ndefault_model = \"base-model\"\ndefault_temperature = 0.7\n",
         )
         .expect("write config.toml");
         std::fs::write(
-            config_dir.join("agents.toml"),
+            config_dir.join("agent.toml"),
             "default_model = \"fragment-model\"\ndefault_temperature = 0.42\n",
         )
         .expect("write fragment");

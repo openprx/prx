@@ -48,8 +48,6 @@ const MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT: &str = "https://api.minimax.io/oauth/
 const MINIMAX_OAUTH_CN_TOKEN_ENDPOINT: &str = "https://api.minimaxi.com/oauth/token";
 const MINIMAX_OAUTH_PLACEHOLDER: &str = "minimax-oauth";
 const MINIMAX_OAUTH_CN_PLACEHOLDER: &str = "minimax-oauth-cn";
-const MINIMAX_OAUTH_TOKEN_ENV: &str = "MINIMAX_OAUTH_TOKEN";
-const MINIMAX_API_KEY_ENV: &str = "MINIMAX_API_KEY";
 const MINIMAX_OAUTH_REFRESH_TOKEN_ENV: &str = "MINIMAX_OAUTH_REFRESH_TOKEN";
 const MINIMAX_OAUTH_REGION_ENV: &str = "MINIMAX_OAUTH_REGION";
 const MINIMAX_OAUTH_CLIENT_ID_ENV: &str = "MINIMAX_OAUTH_CLIENT_ID";
@@ -75,8 +73,6 @@ const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const CLAUDE_CODE_OAUTH_TOKEN_ENDPOINT: &str = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_CODE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_CODE_CREDENTIAL_FILE: &str = ".claude/.credentials.json";
-const CLAUDE_CODE_ACCESS_TOKEN_ENV: &str = "CLAUDE_CODE_ACCESS_TOKEN";
-const CLAUDE_CODE_REFRESH_TOKEN_ENV: &str = "CLAUDE_CODE_REFRESH_TOKEN";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 
@@ -837,78 +833,60 @@ fn resolve_claude_code_context(credential_override: Option<&str>) -> ClaudeCodeP
         }
     }
 
-    let env_access_token = read_non_empty_env(CLAUDE_CODE_ACCESS_TOKEN_ENV);
-    let env_refresh_token = read_non_empty_env(CLAUDE_CODE_REFRESH_TOKEN_ENV);
-    let mut cached = if env_access_token.is_some() || env_refresh_token.is_some() {
-        None
-    } else {
-        read_claude_code_cached_credentials()
-    };
+    // Only file-based credential reading: ~/.claude/.credentials.json
+    let mut cached = read_claude_code_cached_credentials();
 
-    if env_access_token.is_none() {
-        let refresh_token = env_refresh_token.clone().or_else(|| {
-            cached
-                .as_ref()
-                .and_then(|credentials| credentials.refresh_token.clone())
-        });
-        let should_refresh = cached.as_ref().is_some_and(claude_code_token_expired)
-            || cached
-                .as_ref()
-                .and_then(|credentials| credentials.access_token.as_deref())
-                .is_none_or(|token| token.trim().is_empty());
+    let refresh_token = cached
+        .as_ref()
+        .and_then(|credentials| credentials.refresh_token.clone());
+    let should_refresh = cached.as_ref().is_some_and(claude_code_token_expired)
+        || cached
+            .as_ref()
+            .and_then(|credentials| credentials.access_token.as_deref())
+            .is_none_or(|token| token.trim().is_empty());
 
-        if should_refresh {
-            if let Some(refresh_token) = refresh_token.as_deref() {
-                match refresh_claude_code_access_token(refresh_token) {
-                    Ok(mut refreshed) => {
-                        if refreshed.refresh_token.is_none() {
-                            refreshed.refresh_token = Some(refresh_token.to_string());
-                        }
-                        if refreshed.subscription_type.is_none() {
-                            refreshed.subscription_type = cached
-                                .as_ref()
-                                .and_then(|credentials| credentials.subscription_type.clone());
-                        }
-                        if let Err(error) = write_claude_code_cached_credentials(&refreshed) {
-                            tracing::warn!(error = %error, "Failed to write Claude Code credentials");
-                        }
-                        cached = Some(refreshed);
+    if should_refresh {
+        if let Some(refresh_token) = refresh_token.as_deref() {
+            match refresh_claude_code_access_token(refresh_token) {
+                Ok(mut refreshed) => {
+                    if refreshed.refresh_token.is_none() {
+                        refreshed.refresh_token = Some(refresh_token.to_string());
                     }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "Claude Code OAuth refresh failed");
+                    if refreshed.subscription_type.is_none() {
+                        refreshed.subscription_type = cached
+                            .as_ref()
+                            .and_then(|credentials| credentials.subscription_type.clone());
                     }
+                    if let Err(error) = write_claude_code_cached_credentials(&refreshed) {
+                        tracing::warn!(error = %error, "Failed to write Claude Code credentials");
+                    }
+                    cached = Some(refreshed);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "Claude Code OAuth refresh failed");
                 }
             }
         }
     }
 
-    let credential = env_access_token
-        .or_else(|| cached.as_ref().and_then(|credentials| credentials.access_token.clone()))
+    let credential = cached
+        .as_ref()
+        .and_then(|credentials| credentials.access_token.clone())
         .as_deref()
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(ToString::to_string);
 
-    let refresh_token = env_refresh_token.or_else(|| {
-        cached
-            .as_ref()
-            .and_then(|credentials| credentials.refresh_token.clone())
-    });
+    let refresh_token = cached
+        .as_ref()
+        .and_then(|credentials| credentials.refresh_token.clone());
     let expires_at = cached.as_ref().and_then(|credentials| credentials.expires_at);
 
     ClaudeCodeProviderContext {
-        credential: if placeholder_requested {
-            credential
-        } else {
-            credential.or_else(|| read_non_empty_env("ANTHROPIC_OAUTH_TOKEN"))
-        },
+        credential,
         refresh_token,
         expires_at,
     }
-}
-
-fn resolve_minimax_static_credential() -> Option<String> {
-    read_non_empty_env(MINIMAX_OAUTH_TOKEN_ENV).or_else(|| read_non_empty_env(MINIMAX_API_KEY_ENV))
 }
 
 fn refresh_minimax_oauth_access_token(name: &str, refresh_token: &str) -> anyhow::Result<String> {
@@ -1075,6 +1053,8 @@ pub struct ProviderRuntimeOptions {
     pub codex_auth_json_path: Option<PathBuf>,
     pub codex_auth_json_auto_import: bool,
     pub reasoning_enabled: Option<bool>,
+    pub codex_stream_idle_timeout_secs: Option<u64>,
+    pub codex_reasoning_effort: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -1086,6 +1066,8 @@ impl Default for ProviderRuntimeOptions {
             codex_auth_json_path: None,
             codex_auth_json_auto_import: true,
             reasoning_enabled: None,
+            codex_stream_idle_timeout_secs: None,
+            codex_reasoning_effort: None,
         }
     }
 }
@@ -1167,112 +1149,32 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
     anyhow::anyhow!("{provider} API error ({status}): {sanitized}")
 }
 
-/// Resolve API key for a provider from config and environment variables.
+/// Resolve API key for a provider from explicit config only.
 ///
 /// Resolution order:
 /// 1. Explicitly provided `api_key` parameter (trimmed, filtered if empty)
-/// 2. Provider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
-/// 3. Generic fallback variables (`ZEROCLAW_API_KEY`, `API_KEY`)
+/// 2. For MiniMax OAuth placeholders: MiniMax OAuth refresh-token flow
 ///
-/// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
-/// followed by `ANTHROPIC_API_KEY` (for regular API keys).
-///
-/// For MiniMax, OAuth mode supports `api_key = "minimax-oauth"`, resolving credentials from
-/// `MINIMAX_OAUTH_TOKEN` first, then `MINIMAX_API_KEY`, and finally
-/// `MINIMAX_OAUTH_REFRESH_TOKEN` (automatic access-token refresh).
+/// Environment variables are NOT read here. All credentials must come from
+/// the config file or auth-profiles.json.
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
-    let mut minimax_oauth_placeholder_requested = false;
-
     if let Some(raw_override) = credential_override {
         let trimmed_override = raw_override.trim();
         if !trimmed_override.is_empty() {
             if is_minimax_alias(name) && is_minimax_oauth_placeholder(trimmed_override) {
-                minimax_oauth_placeholder_requested = true;
-                if let Some(credential) = resolve_minimax_static_credential() {
-                    return Some(credential);
-                }
                 if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
                     return Some(credential);
                 }
-            } else {
-                return Some(trimmed_override.to_owned());
+                return None;
             }
+            return Some(trimmed_override.to_owned());
         }
     }
 
-    let provider_env_candidates: Vec<&str> = match name {
-        "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
-        "openrouter" => vec!["OPENROUTER_API_KEY"],
-        "openai" => vec!["OPENAI_API_KEY"],
-        "ollama" => vec!["OLLAMA_API_KEY"],
-        "venice" => vec!["VENICE_API_KEY"],
-        "groq" => vec!["GROQ_API_KEY"],
-        "mistral" => vec!["MISTRAL_API_KEY"],
-        "deepseek" => vec!["DEEPSEEK_API_KEY"],
-        "xai" | "grok" => vec!["XAI_API_KEY"],
-        "together" | "together-ai" => vec!["TOGETHER_API_KEY"],
-        "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
-        "perplexity" => vec!["PERPLEXITY_API_KEY"],
-        "cohere" => vec!["COHERE_API_KEY"],
-        name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
-            vec!["KIMI_CODE_API_KEY", "MOONSHOT_API_KEY"]
-        }
-        name if is_glm_alias(name) => vec!["GLM_API_KEY"],
-        name if is_minimax_alias(name) => vec![MINIMAX_OAUTH_TOKEN_ENV, MINIMAX_API_KEY_ENV],
-        // Bedrock uses AWS AKSK from env vars (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY),
-        // not a single API key. Credential resolution happens inside BedrockProvider.
-        "bedrock" | "aws-bedrock" => return None,
-        name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
-        name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
-        name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
-        "synthetic" => vec!["SYNTHETIC_API_KEY"],
-        "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
-        "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
-        "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
-        "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
-        "astrai" => vec!["ASTRAI_API_KEY"],
-        "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
-        name if is_claude_code_alias(name) => {
-            vec![
-                CLAUDE_CODE_ACCESS_TOKEN_ENV,
-                "ANTHROPIC_OAUTH_TOKEN",
-                "ANTHROPIC_API_KEY",
-            ]
-        }
-        name if is_litellm_alias(name) => vec!["LITELLM_API_KEY"],
-        name if is_vllm_alias(name) => vec!["VLLM_API_KEY"],
-        name if is_huggingface_alias(name) => vec!["HF_TOKEN", "HUGGINGFACE_API_KEY"],
-        _ => vec![],
-    };
-
-    for env_var in provider_env_candidates {
-        if let Ok(value) = std::env::var(env_var) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-
-    if is_minimax_alias(name) {
-        if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
-            return Some(credential);
-        }
-    }
-
-    if minimax_oauth_placeholder_requested && is_minimax_alias(name) {
+    // Bedrock uses AWS AKSK credentials, not a single API key.
+    // Credential resolution happens inside BedrockProvider.
+    if matches!(name, "bedrock" | "aws-bedrock") {
         return None;
-    }
-
-    for env_var in ["ZEROCLAW_API_KEY", "API_KEY"] {
-        if let Ok(value) = std::env::var(env_var) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
     }
 
     None
@@ -1895,13 +1797,6 @@ fn is_openai_codex_alias(name: &str) -> bool {
 }
 
 fn default_openprx_state_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("OPENPRX_STATE_DIR") {
-        let trimmed = dir.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-
     directories::UserDirs::new().map_or_else(|| PathBuf::from(".openprx"), |dirs| dirs.home_dir().join(".openprx"))
 }
 
@@ -1996,8 +1891,14 @@ pub fn summarize_provider_availability(
             && resolve_provider_credential(provider, explicit_for_provider).is_none()
         {
             // For anthropic, also check Claude Code OAuth credentials from ~/.claude/.credentials.json
-            if provider == "anthropic"
-                && resolve_claude_code_context(None).credential.is_some()
+            if provider == "anthropic" && resolve_claude_code_context(None).credential.is_some() {
+                available.push(provider.clone());
+                continue;
+            }
+            // For Gemini, also check env vars (GEMINI_API_KEY / GOOGLE_API_KEY) and CLI OAuth tokens,
+            // because GeminiProvider::new() reads those independently of resolve_provider_credential().
+            if matches!(provider.as_str(), "gemini" | "google" | "google-gemini")
+                && gemini::GeminiProvider::has_any_auth()
             {
                 available.push(provider.clone());
                 continue;
@@ -2319,36 +2220,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_provider_credential_uses_minimax_oauth_env_for_placeholder() {
+    fn resolve_provider_credential_minimax_placeholder_without_refresh_returns_none() {
         let _env_lock = env_lock();
-        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, Some("oauth-token"));
-        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, Some("api-key"));
         let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
-
-        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
-
-        assert_eq!(resolved.as_deref(), Some("oauth-token"));
-    }
-
-    #[test]
-    fn resolve_provider_credential_falls_back_to_minimax_api_key_for_placeholder() {
-        let _env_lock = env_lock();
-        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, None);
-        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, Some("api-key"));
-        let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
-
-        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
-
-        assert_eq!(resolved.as_deref(), Some("api-key"));
-    }
-
-    #[test]
-    fn resolve_provider_credential_placeholder_ignores_generic_api_key_fallback() {
-        let _env_lock = env_lock();
-        let _oauth_guard = EnvGuard::set(MINIMAX_OAUTH_TOKEN_ENV, None);
-        let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, None);
-        let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
-        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
 
         let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
 
@@ -2356,47 +2230,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_provider_credential_bedrock_uses_internal_credential_path() {
-        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
-        let _override_guard = EnvGuard::set("OPENROUTER_API_KEY", Some("openrouter-key"));
-
-        assert_eq!(
-            resolve_provider_credential("bedrock", Some("explicit")),
-            Some("explicit".to_string())
-        );
+    fn resolve_provider_credential_bedrock_returns_none_without_explicit() {
         assert!(resolve_provider_credential("bedrock", None).is_none());
         assert!(resolve_provider_credential("aws-bedrock", None).is_none());
     }
 
     #[test]
-    fn resolve_provider_credential_supports_litellm_env() {
-        let _env_lock = env_lock();
-        let _litellm_guard = EnvGuard::set("LITELLM_API_KEY", Some("litellm-key"));
-        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
-
-        let resolved = resolve_provider_credential("litellm", None);
-        assert_eq!(resolved.as_deref(), Some("litellm-key"));
-    }
-
-    #[test]
-    fn resolve_provider_credential_supports_optional_vllm_env() {
-        let _env_lock = env_lock();
-        let _vllm_guard = EnvGuard::set("VLLM_API_KEY", Some("vllm-key"));
-        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
-
-        let resolved = resolve_provider_credential("vllm", None);
-        assert_eq!(resolved.as_deref(), Some("vllm-key"));
-    }
-
-    #[test]
-    fn resolve_provider_credential_huggingface_prefers_hf_token() {
-        let _env_lock = env_lock();
-        let _hf_token_guard = EnvGuard::set("HF_TOKEN", Some("hf-token"));
-        let _hf_api_key_guard = EnvGuard::set("HUGGINGFACE_API_KEY", Some("hf-api-key"));
-        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
-
-        let resolved = resolve_provider_credential("hf", None);
-        assert_eq!(resolved.as_deref(), Some("hf-token"));
+    fn resolve_provider_credential_returns_none_without_explicit_key() {
+        // Without explicit api_key, resolve_provider_credential returns None
+        // (env vars are no longer read).
+        assert!(resolve_provider_credential("litellm", None).is_none());
+        assert!(resolve_provider_credential("vllm", None).is_none());
+        assert!(resolve_provider_credential("hf", None).is_none());
     }
 
     #[test]
@@ -2474,30 +2319,8 @@ mod tests {
 
     #[test]
     fn resolve_claude_code_context_prefers_explicit_override() {
-        let _env_lock = env_lock();
-        let fake_home = format!("/tmp/openprx-claude-oauth-home-{}", std::process::id());
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
-        let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, Some("oauth-token"));
-        let _refresh_guard = EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, Some("oauth-refresh"));
-        let _anthropic_oauth_guard = EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
-
         let context = resolve_claude_code_context(Some("  explicit-claude-token  "));
-
         assert_eq!(context.credential.as_deref(), Some("explicit-claude-token"));
-    }
-
-    #[test]
-    fn resolve_claude_code_context_uses_env_access_token_before_file() {
-        let _env_lock = env_lock();
-        let fake_home = format!("/tmp/openprx-claude-oauth-home-{}-env", std::process::id());
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
-        let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, Some("env-access-token"));
-        let _refresh_guard = EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, Some("env-refresh-token"));
-        let _anthropic_oauth_guard = EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
-
-        let context = resolve_claude_code_context(Some("claude-code"));
-
-        assert_eq!(context.credential.as_deref(), Some("env-access-token"));
     }
 
     #[test]
@@ -2514,9 +2337,6 @@ mod tests {
         .unwrap();
 
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
-        let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, None);
-        let _refresh_guard = EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, None);
-        let _anthropic_oauth_guard = EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", None);
 
         let context = resolve_claude_code_context(Some("claude-code"));
 
@@ -2524,14 +2344,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_claude_code_context_placeholder_does_not_use_anthropic_oauth_fallback() {
+    fn resolve_claude_code_context_placeholder_without_file_returns_none() {
         let _env_lock = env_lock();
         let fake_home = format!("/tmp/openprx-claude-oauth-home-{}-placeholder", std::process::id());
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
-        let _access_guard = EnvGuard::set(CLAUDE_CODE_ACCESS_TOKEN_ENV, None);
-        let _refresh_guard = EnvGuard::set(CLAUDE_CODE_REFRESH_TOKEN_ENV, None);
-        let _anthropic_oauth_guard = EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", Some("anthropic-token"));
-        let _anthropic_api_guard = EnvGuard::set("ANTHROPIC_API_KEY", Some("anthropic-api-key"));
 
         let context = resolve_claude_code_context(Some("claude-code"));
 
@@ -2761,7 +2577,7 @@ mod tests {
 
     #[test]
     fn factory_bedrock() {
-        // Bedrock uses AWS env vars for credentials, not API key.
+        // Bedrock uses AWS config files for credentials, not API key.
         assert!(create_provider("bedrock", None).is_ok());
         assert!(create_provider("aws-bedrock", None).is_ok());
         // Passing an api_key is harmless (ignored).
@@ -3057,6 +2873,17 @@ mod tests {
 
     #[test]
     fn summarize_provider_availability_marks_degraded_when_only_primary_has_credentials() {
+        let _guard = provider_availability_env_lock().lock().unwrap();
+
+        // Isolate from host credentials: override HOME to an empty temp dir so
+        // resolve_claude_code_context cannot find ~/.claude/.credentials.json,
+        // and clear any ambient Anthropic env vars.
+        let iso_home = std::env::temp_dir().join(format!("openprx-provider-degrade-test-{}", std::process::id()));
+        std::fs::create_dir_all(&iso_home).unwrap();
+        let _home_guard = EnvGuard::set("HOME", Some(iso_home.to_str().unwrap()));
+        let _anthropic_key_guard = EnvGuard::set("ANTHROPIC_API_KEY", None);
+        let _anthropic_oauth_guard = EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", None);
+
         let reliability = crate::config::ReliabilityConfig {
             provider_retries: 1,
             provider_backoff_ms: 100,
@@ -3070,6 +2897,7 @@ mod tests {
         };
 
         let summary = summarize_provider_availability("openai", Some("sk-test"), &reliability);
+        let _ = std::fs::remove_dir_all(&iso_home);
         assert!(summary.degraded);
         assert_eq!(summary.available, vec!["openai"]);
         assert!(
@@ -3086,11 +2914,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn summarize_provider_availability_marks_openai_codex_available_with_auth_profile() {
         let _guard = provider_availability_env_lock().lock().unwrap();
 
-        let state_dir = std::env::temp_dir().join(format!(
+        let fake_home = std::env::temp_dir().join(format!(
             "openprx-provider-avail-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -3098,6 +2925,7 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ));
+        let state_dir = fake_home.join(".openprx");
         std::fs::create_dir_all(&state_dir).unwrap();
 
         let auth = crate::auth::AuthService::new(&state_dir, false);
@@ -3116,11 +2944,7 @@ mod tests {
         )
         .unwrap();
 
-        // SAFETY: Test-only env manipulation; tests using this are serialized
-        // via `provider_availability_env_lock()` to prevent data races.
-        unsafe {
-            std::env::set_var("OPENPRX_STATE_DIR", &state_dir);
-        }
+        let home_guard = EnvGuard::set("HOME", Some(&fake_home.to_string_lossy()));
         let summary = summarize_provider_availability(
             "openai",
             Some("sk-test"),
@@ -3136,36 +2960,27 @@ mod tests {
                 scheduler_retries: 2,
             },
         );
-        // SAFETY: Test-only env manipulation; tests using this are serialized
-        // via `provider_availability_env_lock()` to prevent data races.
-        unsafe {
-            std::env::remove_var("OPENPRX_STATE_DIR");
-        }
 
         assert!(summary.available.iter().any(|p| p == "openai-codex"));
-        let _ = std::fs::remove_dir_all(&state_dir);
+        drop(home_guard);
+        let _ = std::fs::remove_dir_all(&fake_home);
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn summarize_provider_availability_marks_openai_codex_unavailable_without_auth_profile() {
         let _guard = provider_availability_env_lock().lock().unwrap();
 
-        let state_dir = std::env::temp_dir().join(format!(
-            "openprx-provider-avail-test-{}-{}",
+        let fake_home = std::env::temp_dir().join(format!(
+            "openprx-provider-avail-noauth-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&fake_home).unwrap();
 
-        // SAFETY: Test-only env manipulation; tests using this are serialized
-        // via `provider_availability_env_lock()` to prevent data races.
-        unsafe {
-            std::env::set_var("OPENPRX_STATE_DIR", &state_dir);
-        }
+        let home_guard = EnvGuard::set("HOME", Some(&fake_home.to_string_lossy()));
         let summary = summarize_provider_availability(
             "openai",
             Some("sk-test"),
@@ -3181,11 +2996,6 @@ mod tests {
                 scheduler_retries: 2,
             },
         );
-        // SAFETY: Test-only env manipulation; tests using this are serialized
-        // via `provider_availability_env_lock()` to prevent data races.
-        unsafe {
-            std::env::remove_var("OPENPRX_STATE_DIR");
-        }
 
         assert!(
             summary
@@ -3193,7 +3003,8 @@ mod tests {
                 .iter()
                 .any(|(name, reason)| name == "openai-codex" && reason.contains("auth profile"))
         );
-        let _ = std::fs::remove_dir_all(&state_dir);
+        drop(home_guard);
+        let _ = std::fs::remove_dir_all(&fake_home);
     }
 
     #[test]
@@ -3202,8 +3013,8 @@ mod tests {
         assert!(!provider_matches_model_prefix("anthropic", "openai/gpt-4o"));
     }
 
-    /// Fallback providers resolve their own credentials via provider-specific
-    /// env vars rather than inheriting the primary provider's key.  A provider
+    /// Fallback providers resolve their own credentials independently
+    /// rather than inheriting the primary provider's key.  A provider
     /// that requires no key (e.g. lmstudio, ollama) must initialize
     /// successfully even when the primary uses a completely different key.
     #[test]

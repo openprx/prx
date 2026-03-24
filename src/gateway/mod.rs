@@ -408,6 +408,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
         codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
+        codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
     };
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         config.default_provider.as_deref().unwrap_or("openrouter"),
@@ -600,22 +602,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         handle.set(Arc::clone(&tools_registry)).ok();
     }
 
-    // WhatsApp app secret for webhook signature verification
-    // Priority: environment variable > config file
-    let whatsapp_app_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_WHATSAPP_APP_SECRET")
-        .ok()
-        .and_then(|secret| {
-            let secret = secret.trim();
-            (!secret.is_empty()).then(|| secret.to_owned())
-        })
-        .or_else(|| {
-            config.channels_config.whatsapp.as_ref().and_then(|wa| {
-                wa.app_secret
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|secret| !secret.is_empty())
-                    .map(ToOwned::to_owned)
-            })
+    // WhatsApp app secret for webhook signature verification (from config)
+    let whatsapp_app_secret: Option<Arc<str>> = config
+        .channels_config
+        .whatsapp
+        .as_ref()
+        .and_then(|wa| {
+            wa.app_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|secret| !secret.is_empty())
+                .map(ToOwned::to_owned)
         })
         .map(Arc::from);
 
@@ -628,22 +625,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         ))
     });
 
-    // Linq signing secret for webhook signature verification
-    // Priority: environment variable > config file
-    let linq_signing_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINQ_SIGNING_SECRET")
-        .ok()
-        .and_then(|secret| {
-            let secret = secret.trim();
-            (!secret.is_empty()).then(|| secret.to_owned())
-        })
-        .or_else(|| {
-            config.channels_config.linq.as_ref().and_then(|lq| {
-                lq.signing_secret
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|secret| !secret.is_empty())
-                    .map(ToOwned::to_owned)
-            })
+    // Linq signing secret for webhook signature verification (from config)
+    let linq_signing_secret: Option<Arc<str>> = config
+        .channels_config
+        .linq
+        .as_ref()
+        .and_then(|lq| {
+            lq.signing_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|secret| !secret.is_empty())
+                .map(ToOwned::to_owned)
         })
         .map(Arc::from);
 
@@ -657,22 +649,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             ))
         });
 
-    // Nextcloud Talk webhook secret for signature verification
-    // Priority: environment variable > config file
-    let nextcloud_talk_webhook_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
-        .ok()
-        .and_then(|secret| {
-            let secret = secret.trim();
-            (!secret.is_empty()).then(|| secret.to_owned())
-        })
-        .or_else(|| {
-            config.channels_config.nextcloud_talk.as_ref().and_then(|nc| {
-                nc.webhook_secret
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|secret| !secret.is_empty())
-                    .map(ToOwned::to_owned)
-            })
+    // Nextcloud Talk webhook secret for signature verification (from config)
+    let nextcloud_talk_webhook_secret: Option<Arc<str>> = config
+        .channels_config
+        .nextcloud_talk
+        .as_ref()
+        .and_then(|nc| {
+            nc.webhook_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|secret| !secret.is_empty())
+                .map(ToOwned::to_owned)
         })
         .map(Arc::from);
 

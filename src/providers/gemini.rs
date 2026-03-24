@@ -1,7 +1,6 @@
 //! Google Gemini provider with support for:
-//! - Direct API key (`GEMINI_API_KEY` env var or config)
+//! - Direct API key (from config or auth-profiles.json)
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
-//! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::providers::traits::{ChatMessage, Provider};
 use async_trait::async_trait;
@@ -21,10 +20,6 @@ pub struct GeminiProvider {
 enum GeminiAuth {
     /// Explicit API key from config: sent as `?key=` query parameter.
     ExplicitKey(String),
-    /// API key from `GEMINI_API_KEY` env var: sent as `?key=`.
-    EnvGeminiKey(String),
-    /// API key from `GOOGLE_API_KEY` env var: sent as `?key=`.
-    EnvGoogleKey(String),
     /// OAuth access token from Gemini CLI: sent as `Authorization: Bearer`.
     OAuthToken(String),
 }
@@ -32,10 +27,7 @@ enum GeminiAuth {
 impl GeminiAuth {
     /// Whether this credential is an API key (sent as `?key=` query param).
     const fn is_api_key(&self) -> bool {
-        matches!(
-            self,
-            Self::ExplicitKey(_) | Self::EnvGeminiKey(_) | Self::EnvGoogleKey(_)
-        )
+        matches!(self, Self::ExplicitKey(_))
     }
 
     /// Whether this credential is an OAuth token from Gemini CLI.
@@ -46,7 +38,7 @@ impl GeminiAuth {
     /// The raw credential string.
     fn credential(&self) -> &str {
         match self {
-            Self::ExplicitKey(s) | Self::EnvGeminiKey(s) | Self::EnvGoogleKey(s) | Self::OAuthToken(s) => s,
+            Self::ExplicitKey(s) | Self::OAuthToken(s) => s,
         }
     }
 }
@@ -167,19 +159,31 @@ impl GeminiProvider {
     /// Create a new Gemini provider.
     ///
     /// Authentication priority:
-    /// 1. Explicit API key passed in
-    /// 2. `GEMINI_API_KEY` environment variable
-    /// 3. `GOOGLE_API_KEY` environment variable
+    /// 1. Explicit API key passed in (from config or auth-profiles.json)
+    /// 2. `GEMINI_API_KEY` env var (standard Google env)
+    /// 3. `GOOGLE_API_KEY` env var (standard Google env)
     /// 4. Gemini CLI OAuth tokens (`~/.gemini/oauth_creds.json`)
     pub fn new(api_key: Option<&str>) -> Self {
         let resolved_auth = api_key
             .and_then(Self::normalize_non_empty)
             .map(GeminiAuth::ExplicitKey)
-            .or_else(|| Self::load_non_empty_env("GEMINI_API_KEY").map(GeminiAuth::EnvGeminiKey))
-            .or_else(|| Self::load_non_empty_env("GOOGLE_API_KEY").map(GeminiAuth::EnvGoogleKey))
+            .or_else(Self::try_env_var_key)
             .or_else(|| Self::try_load_gemini_cli_token().map(GeminiAuth::OAuthToken));
 
         Self { auth: resolved_auth }
+    }
+
+    /// Try standard Google API env vars: `GEMINI_API_KEY`, then `GOOGLE_API_KEY`.
+    fn try_env_var_key() -> Option<GeminiAuth> {
+        std::env::var("GEMINI_API_KEY")
+            .ok()
+            .and_then(|v| Self::normalize_non_empty(&v))
+            .or_else(|| {
+                std::env::var("GOOGLE_API_KEY")
+                    .ok()
+                    .and_then(|v| Self::normalize_non_empty(&v))
+            })
+            .map(GeminiAuth::ExplicitKey)
     }
 
     fn normalize_non_empty(value: &str) -> Option<String> {
@@ -189,12 +193,6 @@ impl GeminiProvider {
         } else {
             Some(trimmed.to_string())
         }
-    }
-
-    fn load_non_empty_env(name: &str) -> Option<String> {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| Self::normalize_non_empty(&value))
     }
 
     /// Try to load OAuth access token from Gemini CLI's cached credentials.
@@ -233,20 +231,15 @@ impl GeminiProvider {
         Self::try_load_gemini_cli_token().is_some()
     }
 
-    /// Check if any Gemini authentication is available
+    /// Check if any Gemini authentication is available (env vars or file-based).
     pub fn has_any_auth() -> bool {
-        Self::load_non_empty_env("GEMINI_API_KEY").is_some()
-            || Self::load_non_empty_env("GOOGLE_API_KEY").is_some()
-            || Self::has_cli_credentials()
+        Self::try_env_var_key().is_some() || Self::has_cli_credentials()
     }
 
     /// Get authentication source description for diagnostics.
-    /// Uses the stored enum variant — no env var re-reading at call time.
     pub const fn auth_source(&self) -> &'static str {
         match self.auth.as_ref() {
-            Some(GeminiAuth::ExplicitKey(_)) => "config",
-            Some(GeminiAuth::EnvGeminiKey(_)) => "GEMINI_API_KEY env var",
-            Some(GeminiAuth::EnvGoogleKey(_)) => "GOOGLE_API_KEY env var",
+            Some(GeminiAuth::ExplicitKey(_)) => "config/env",
             Some(GeminiAuth::OAuthToken(_)) => "Gemini CLI OAuth",
             None => "none",
         }
@@ -342,10 +335,11 @@ impl GeminiProvider {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Gemini API key not found. Options:\n\
-                 1. Set GEMINI_API_KEY env var\n\
-                 2. Run `gemini` CLI to authenticate (tokens will be reused)\n\
-                 3. Get an API key from https://aistudio.google.com/app/apikey\n\
-                 4. Run `prx onboard` to configure"
+                 1. Add api_key to your Gemini provider config\n\
+                 2. Set GEMINI_API_KEY or GOOGLE_API_KEY env var\n\
+                 3. Run `gemini` CLI to authenticate (tokens will be reused)\n\
+                 4. Get an API key from https://aistudio.google.com/app/apikey\n\
+                 5. Run `prx onboard` to configure"
             )
         })?;
 
@@ -544,7 +538,7 @@ mod tests {
         let provider = GeminiProvider {
             auth: Some(GeminiAuth::ExplicitKey("key".into())),
         };
-        assert_eq!(provider.auth_source(), "config");
+        assert_eq!(provider.auth_source(), "config/env");
     }
 
     #[test]

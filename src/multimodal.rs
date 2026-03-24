@@ -90,10 +90,6 @@ pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
-pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
-    count_image_markers(messages) > 0
-}
-
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     if image_ref.starts_with("data:") {
         let comma_idx = image_ref.find(',')?;

@@ -26,9 +26,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     );
 
     Json(StatusResponse {
-        version: std::env::var("OPENPRX_VERSION")
-            .or_else(|_| std::env::var("ZEROCLAW_VERSION"))
-            .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: state.start_time.elapsed().as_secs(),
         model,
         memory_backend: resolve_memory_backend(&config),

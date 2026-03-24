@@ -822,6 +822,47 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        #[allow(unsafe_code)]
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: test-only env manipulation; tests that use this must be serialized.
+            unsafe {
+                match value {
+                    Some(next) => std::env::set_var(key, next),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: test-only env manipulation; restoring previous value.
+            unsafe {
+                if let Some(original) = self.original.as_deref() {
+                    std::env::set_var(self.key, original);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn doctor_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("doctor env lock poisoned")
+    }
+
     #[test]
     fn provider_validation_checks_custom_url_shape() {
         assert!(provider_validation_error("openrouter").is_none());
@@ -952,6 +993,17 @@ mod tests {
 
     #[test]
     fn config_validation_warns_provider_resilience_degraded_with_single_available_provider() {
+        let _guard = doctor_env_lock();
+
+        // Isolate from host credentials: override HOME to an empty temp dir so
+        // resolve_claude_code_context cannot find ~/.claude/.credentials.json,
+        // and clear any ambient Anthropic env vars.
+        let iso_home = std::env::temp_dir().join(format!("openprx-doctor-degrade-test-{}", std::process::id()));
+        std::fs::create_dir_all(&iso_home).unwrap();
+        let _home_guard = EnvGuard::set("HOME", Some(iso_home.to_str().unwrap()));
+        let _anthropic_key_guard = EnvGuard::set("ANTHROPIC_API_KEY", None);
+        let _anthropic_oauth_guard = EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", None);
+
         let mut config = Config::default();
         config.default_provider = Some("openai".into());
         config.api_key = Some("sk-test".into());
@@ -960,6 +1012,7 @@ mod tests {
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
 
+        let _ = std::fs::remove_dir_all(&iso_home);
         let degraded = items.iter().find(|item| {
             item.message
                 .contains("provider resilience degraded: only 1 configured+available")

@@ -7,9 +7,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-const RAW_LOG_DEBUG_ENV: &str = "OPENPRX_EVOLUTION_DEBUG_RAW";
-const RAW_LOG_DEBUG_ENV_LEGACY: &str = "ZEROCLAW_EVOLUTION_DEBUG_RAW";
-
 /// Resolve and validate a workspace-relative path, rejecting traversal and escape.
 pub fn validate_path_in_workspace(workspace_root: &Path, target: &Path) -> Result<PathBuf> {
     if target.is_absolute() {
@@ -185,11 +182,10 @@ pub fn sha256_hex(input: &str) -> String {
 }
 
 /// Check whether raw debug logging is enabled for evolution internals.
-pub fn is_raw_debug_enabled() -> bool {
-    std::env::var(RAW_LOG_DEBUG_ENV)
-        .or_else(|_| std::env::var(RAW_LOG_DEBUG_ENV_LEGACY))
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+///
+/// The `enabled` flag should come from `config.self_system.evolution_debug_raw`.
+pub const fn is_raw_debug_enabled(enabled: bool) -> bool {
+    enabled
 }
 
 /// RAII lock-file guard used by JSONL mutation paths.

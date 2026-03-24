@@ -1,7 +1,7 @@
 //! AWS Bedrock provider using the Converse API.
 //!
 //! Authentication: AWS AKSK (Access Key ID + Secret Access Key)
-//! via environment variables. SigV4 signing is implemented manually
+//! from `~/.aws/credentials` file. SigV4 signing is implemented manually
 //! using hmac/sha2 crates — no AWS SDK dependency.
 
 use crate::providers::traits::{
@@ -33,21 +33,37 @@ struct AwsCredentials {
 }
 
 impl AwsCredentials {
-    /// Resolve credentials from environment variables.
+    /// Resolve credentials using the standard AWS credential resolution chain:
+    /// 1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+    ///    `AWS_SESSION_TOKEN`, `AWS_REGION` / `AWS_DEFAULT_REGION`)
+    /// 2. Shared credentials file (`~/.aws/credentials`) and config (`~/.aws/config`)
     ///
-    /// Required: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
-    /// Optional: `AWS_SESSION_TOKEN`, `AWS_REGION` / `AWS_DEFAULT_REGION`.
-    fn from_env() -> anyhow::Result<Self> {
-        let access_key_id = env_required("AWS_ACCESS_KEY_ID")?;
-        let secret_access_key = env_required("AWS_SECRET_ACCESS_KEY")?;
+    /// This mirrors the standard AWS SDK behavior used across the entire AWS
+    /// ecosystem (CI/CD, ECS tasks, Lambda, etc.).
+    fn resolve() -> Option<Self> {
+        Self::from_env_vars().or_else(Self::from_aws_config_files)
+    }
 
-        let session_token = env_optional("AWS_SESSION_TOKEN");
-
-        let region = env_optional("AWS_REGION")
-            .or_else(|| env_optional("AWS_DEFAULT_REGION"))
+    /// Try to resolve credentials from standard AWS environment variables.
+    fn from_env_vars() -> Option<Self> {
+        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        let session_token = std::env::var("AWS_SESSION_TOKEN").ok().filter(|s| !s.trim().is_empty());
+        let region = std::env::var("AWS_REGION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("AWS_DEFAULT_REGION")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
             .unwrap_or_else(|| DEFAULT_REGION.to_string());
 
-        Ok(Self {
+        Some(Self {
             access_key_id,
             secret_access_key,
             session_token,
@@ -55,24 +71,95 @@ impl AwsCredentials {
         })
     }
 
+    /// Resolve credentials from the standard AWS shared credentials file
+    /// (`~/.aws/credentials`) and config (`~/.aws/config`).
+    ///
+    /// Falls back to the `[default]` profile. Returns `None` if no valid
+    /// credentials can be resolved from config files.
+    fn from_aws_config_files() -> Option<Self> {
+        let home = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())?;
+        let creds_path = home.join(".aws").join("credentials");
+        let config_path = home.join(".aws").join("config");
+
+        let creds_content = std::fs::read_to_string(&creds_path).ok()?;
+        let (access_key_id, secret_access_key, session_token) = Self::parse_aws_credentials_file(&creds_content)?;
+
+        let region = std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|content| Self::parse_aws_config_region(&content))
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+
+        Some(Self {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            region,
+        })
+    }
+
+    /// Parse `~/.aws/credentials` INI for the `[default]` profile.
+    fn parse_aws_credentials_file(content: &str) -> Option<(String, String, Option<String>)> {
+        let mut in_default = false;
+        let mut access_key = None;
+        let mut secret_key = None;
+        let mut session_token = None;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_default = trimmed == "[default]";
+                continue;
+            }
+            if !in_default {
+                continue;
+            }
+            if let Some((key, value)) = trimmed.split_once('=') {
+                let key = key.trim();
+                let value = value.trim();
+                if value.is_empty() {
+                    continue;
+                }
+                match key {
+                    "aws_access_key_id" => access_key = Some(value.to_string()),
+                    "aws_secret_access_key" => secret_key = Some(value.to_string()),
+                    "aws_session_token" => session_token = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+        }
+
+        Some((access_key?, secret_key?, session_token))
+    }
+
+    /// Parse `~/.aws/config` INI for region in the `[default]` profile.
+    fn parse_aws_config_region(content: &str) -> Option<String> {
+        let mut in_default = false;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_default = trimmed == "[default]" || trimmed == "[profile default]";
+                continue;
+            }
+            if !in_default {
+                continue;
+            }
+            if let Some((key, value)) = trimmed.split_once('=') {
+                if key.trim() == "region" {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     fn host(&self) -> String {
         format!("{ENDPOINT_PREFIX}.{}.amazonaws.com", self.region)
     }
-}
-
-fn env_required(name: &str) -> anyhow::Result<String> {
-    std::env::var(name)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Environment variable {name} is required for Bedrock"))
-}
-
-fn env_optional(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
 }
 
 // ── AWS SigV4 Signing ───────────────────────────────────────────
@@ -338,7 +425,7 @@ pub struct BedrockProvider {
 impl BedrockProvider {
     pub fn new() -> Self {
         Self {
-            credentials: AwsCredentials::from_env().ok(),
+            credentials: AwsCredentials::resolve(),
         }
     }
 
@@ -374,8 +461,8 @@ impl BedrockProvider {
     fn require_credentials(&self) -> anyhow::Result<&AwsCredentials> {
         self.credentials.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "AWS Bedrock credentials not set. Set AWS_ACCESS_KEY_ID and \
-                 AWS_SECRET_ACCESS_KEY environment variables."
+                "AWS Bedrock credentials not found. Set AWS_ACCESS_KEY_ID + \
+                 AWS_SECRET_ACCESS_KEY env vars, or configure ~/.aws/credentials."
             )
         })
     }
@@ -909,11 +996,61 @@ mod tests {
         assert_eq!(creds.host(), "bedrock-runtime.us-west-2.amazonaws.com");
     }
 
+    // ── AWS config file parsing tests ─────────────────────────
+
+    #[test]
+    fn parse_aws_credentials_file_default_profile() {
+        let content = "[default]\naws_access_key_id = AKIA_TEST\naws_secret_access_key = secret123\n";
+        let (key_id, secret, token) = AwsCredentials::parse_aws_credentials_file(content).unwrap();
+        assert_eq!(key_id, "AKIA_TEST");
+        assert_eq!(secret, "secret123");
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn parse_aws_credentials_file_with_session_token() {
+        let content = "[default]\naws_access_key_id = AKIA_TEST\naws_secret_access_key = secret123\naws_session_token = sess_tok\n";
+        let (key_id, secret, token) = AwsCredentials::parse_aws_credentials_file(content).unwrap();
+        assert_eq!(key_id, "AKIA_TEST");
+        assert_eq!(secret, "secret123");
+        assert_eq!(token.as_deref(), Some("sess_tok"));
+    }
+
+    #[test]
+    fn parse_aws_credentials_file_ignores_other_profiles() {
+        let content = "[other]\naws_access_key_id = OTHER\naws_secret_access_key = OTHER_SECRET\n";
+        assert!(AwsCredentials::parse_aws_credentials_file(content).is_none());
+    }
+
+    #[test]
+    fn parse_aws_config_region_default_profile() {
+        let content = "[default]\nregion = eu-west-1\n";
+        assert_eq!(
+            AwsCredentials::parse_aws_config_region(content).as_deref(),
+            Some("eu-west-1")
+        );
+    }
+
+    #[test]
+    fn parse_aws_config_region_profile_default() {
+        let content = "[profile default]\nregion = ap-southeast-1\n";
+        assert_eq!(
+            AwsCredentials::parse_aws_config_region(content).as_deref(),
+            Some("ap-southeast-1")
+        );
+    }
+
+    #[test]
+    fn parse_aws_config_region_not_found() {
+        let content = "[profile other]\nregion = ap-northeast-1\n";
+        assert!(AwsCredentials::parse_aws_config_region(content).is_none());
+    }
+
     // ── Provider construction tests ─────────────────────────────
 
     #[test]
     fn creates_without_credentials() {
-        // Provider should construct even without env vars.
+        // Provider should construct even without AWS config files.
         let _provider = BedrockProvider::new();
     }
 
@@ -926,7 +1063,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("credentials not set"),
+            err.contains("credentials not found"),
             "Expected credentials error, got: {err}"
         );
     }

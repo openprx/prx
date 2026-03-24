@@ -5,13 +5,78 @@ use tokio::fs;
 use toml::{Value, map::Map};
 
 pub const SPLIT_FILE_LAYOUT: &[(&str, &[&str])] = &[
-    ("channels.toml", &["channels_config"]),
     ("memory.toml", &["memory", "storage"]),
-    ("security.toml", &["security", "autonomy"]),
-    ("agents.toml", &["agents", "sessions_spawn"]),
-    ("identity.toml", &["identity", "identity_bindings", "user_policies"]),
+    ("channels.toml", &["channels_config"]),
     ("network.toml", &["gateway", "tunnel", "proxy"]),
-    ("scheduler.toml", &["scheduler", "cron", "heartbeat"]),
+    ("security.toml", &["security", "autonomy", "secrets"]),
+    ("scheduler.toml", &["scheduler", "cron", "heartbeat", "xin"]),
+    (
+        "agent.toml",
+        &["agent", "sessions_spawn", "self_system", "causal_tree", "agents"],
+    ),
+    (
+        "identity.toml",
+        &["identity", "identity_bindings", "user_policies", "auth"],
+    ),
+    (
+        "routing.toml",
+        &[
+            "router",
+            "model_routes",
+            "embedding_routes",
+            "query_classification",
+            "task_routing",
+        ],
+    ),
+    (
+        "tools.toml",
+        &[
+            "browser",
+            "http_request",
+            "multimodal",
+            "web_search",
+            "media",
+            "skills",
+            "skill_rag",
+        ],
+    ),
+    ("integrations.toml", &["mcp", "composio", "webhook"]),
+    ("nodes.toml", &["nodes"]),
+    ("cost.toml", &["cost"]),
+    ("observability.toml", &["observability", "runtime", "reliability"]),
+];
+
+/// Maps known legacy fragment filenames (from older PRX versions) to their current equivalents.
+///
+/// When a user upgrades from an older version, their `config.d/` directory may still contain
+/// files with the old names.  These entries allow `should_skip_fragment()` to emit a clear,
+/// actionable migration message instead of a generic "unknown fragment" warning.
+const LEGACY_FRAGMENT_MAP: &[(&str, &str)] = &[
+    ("agents.toml", "agent.toml"),
+    ("00-memory.toml", "memory.toml"),
+    ("01-agent.toml", "agent.toml"),
+    ("02-network.toml", "network.toml"),
+    ("03-security.toml", "security.toml"),
+    ("04-channels.toml", "channels.toml"),
+    ("05-tools.toml", "tools.toml"),
+    ("06-integrations.toml", "integrations.toml"),
+];
+
+/// Maps module names (from [modules] section) to their config.d/ file names.
+pub const MODULE_FILE_MAP: &[(&str, &str)] = &[
+    ("memory", "memory.toml"),
+    ("channels", "channels.toml"),
+    ("network", "network.toml"),
+    ("security", "security.toml"),
+    ("scheduler", "scheduler.toml"),
+    ("agent", "agent.toml"),
+    ("identity", "identity.toml"),
+    ("routing", "routing.toml"),
+    ("tools", "tools.toml"),
+    ("integrations", "integrations.toml"),
+    ("nodes", "nodes.toml"),
+    ("cost", "cost.toml"),
+    ("observability", "observability.toml"),
 ];
 
 pub fn config_dir_path(config_path: &Path) -> PathBuf {
@@ -77,9 +142,49 @@ pub fn list_unmanaged_fragment_paths(config_path: &Path) -> Result<Vec<PathBuf>>
     Ok(unmanaged)
 }
 
-pub fn read_merged_toml(config_path: &Path) -> Result<Value> {
+/// Extract the [modules] section from an already-loaded TOML value.
+///
+/// When the [modules] key is absent entirely, returns `ModulesConfig::all_enabled()`
+/// and emits a warning so the operator knows the default is being applied.
+fn extract_modules_from_value(main_value: &Value) -> Result<crate::config::schema::ModulesConfig> {
+    match main_value.get("modules") {
+        Some(modules_value) => {
+            let modules: crate::config::schema::ModulesConfig = modules_value
+                .clone()
+                .try_into()
+                .context("Failed to deserialize [modules] section from config.toml")?;
+            Ok(modules)
+        }
+        None => {
+            tracing::warn!("No [modules] section in config.toml — all modules enabled by default");
+            Ok(crate::config::schema::ModulesConfig::all_enabled())
+        }
+    }
+}
+
+/// Two-pass config loader: reads [modules] from config.toml first,
+/// then merges only enabled module fragments from config.d/.
+///
+/// The main config file is read only once; the [modules] section is extracted
+/// from the already-loaded value to avoid a second disk read.
+pub fn read_merged_toml_with_gate(config_path: &Path) -> Result<Value> {
+    // Single read of main config; extract module gates from it directly.
     let mut merged = read_toml_file(config_path)?;
+    let modules = extract_modules_from_value(&merged)?;
+
+    // Merge enabled config.d/ fragments into the already-loaded base.
     for fragment in list_config_fragment_paths(config_path)? {
+        let file_name = match fragment.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name,
+            None => {
+                tracing::warn!(path = %fragment.display(), "Skipping config fragment with non-UTF-8 filename");
+                continue;
+            }
+        };
+        if should_skip_fragment(file_name, &modules) {
+            tracing::debug!(file = %fragment.display(), "Skipping disabled module config fragment");
+            continue;
+        }
         let value = read_toml_file(&fragment)?;
         deep_merge_toml(&mut merged, value);
     }
@@ -90,15 +195,85 @@ pub fn read_merged_toml(config_path: &Path) -> Result<Value> {
             config_path.display()
         );
     }
-
     Ok(merged)
 }
 
-pub fn compute_config_fingerprint(config_path: &Path) -> Result<Vec<u8>> {
+/// Determines whether a config.d/ fragment should be skipped based on module switches.
+///
+/// Fail-closed: fragments whose filename is not listed in MODULE_FILE_MAP are
+/// skipped with a warning rather than silently loaded.
+pub fn should_skip_fragment(file_name: &str, modules: &crate::config::schema::ModulesConfig) -> bool {
+    for (module_name, fragment_name) in MODULE_FILE_MAP {
+        if *fragment_name == file_name {
+            return modules.is_enabled(module_name).map_or_else(
+                || {
+                    tracing::warn!(
+                        module = module_name,
+                        file = file_name,
+                        "Unknown module in MODULE_FILE_MAP — skipping"
+                    );
+                    true
+                },
+                |enabled| !enabled,
+            );
+        }
+    }
+    // Check for known legacy names before emitting the generic unknown-fragment warning.
+    // This gives users a clear migration hint when upgrading from an older PRX version.
+    for (old_name, new_name) in LEGACY_FRAGMENT_MAP {
+        if *old_name == file_name {
+            tracing::warn!(
+                old_file = file_name,
+                new_file = new_name,
+                "Legacy config fragment detected — please rename to the new name. Skipping."
+            );
+            return true;
+        }
+    }
+
+    // Fail-closed: unknown fragments not listed in MODULE_FILE_MAP are skipped.
+    tracing::warn!(
+        file = file_name,
+        "Unknown config fragment not in MODULE_FILE_MAP — skipping. \
+         If this file was created by an older PRX version, check LEGACY_FRAGMENT_MAP for the correct new name."
+    );
+    true
+}
+
+/// Compute fingerprint only for enabled config layers (respects module gates).
+///
+/// The main config file is read only once; the [modules] section is extracted
+/// from the already-loaded value to avoid a second disk read.
+pub fn compute_config_fingerprint_gated(config_path: &Path) -> Result<Vec<u8>> {
+    // Read main config once; derive module gates from it directly.
+    let main_str = std::fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to read config layer: {}", config_path.display()))?;
+    let main_value: Value =
+        toml::from_str(&main_str).with_context(|| format!("Failed to parse TOML: {}", config_path.display()))?;
+    let modules = extract_modules_from_value(&main_value)?;
+
     let mut hasher = Sha256::new();
-    for path in config_layer_paths(config_path)? {
-        hasher.update(path.to_string_lossy().as_bytes());
-        let bytes = std::fs::read(&path).with_context(|| format!("Failed to read config layer: {}", path.display()))?;
+    // Always include the main config in the fingerprint.
+    hasher.update(config_path.to_string_lossy().as_bytes());
+    let main_bytes = main_str.as_bytes();
+    hasher.update((main_bytes.len() as u64).to_le_bytes());
+    hasher.update(main_bytes);
+
+    // Include only enabled fragment files.
+    for fragment in list_config_fragment_paths(config_path)? {
+        let file_name = match fragment.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name,
+            None => {
+                tracing::warn!(path = %fragment.display(), "Skipping config fragment with non-UTF-8 filename");
+                continue;
+            }
+        };
+        if should_skip_fragment(file_name, &modules) {
+            continue;
+        }
+        hasher.update(fragment.to_string_lossy().as_bytes());
+        let bytes =
+            std::fs::read(&fragment).with_context(|| format!("Failed to read config layer: {}", fragment.display()))?;
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     }
@@ -202,12 +377,6 @@ pub fn deep_merge_toml(target: &mut Value, overlay: Value) {
             *target_value = source_value;
         }
     }
-}
-
-fn config_layer_paths(config_path: &Path) -> Result<Vec<PathBuf>> {
-    let mut layers = vec![config_path.to_path_buf()];
-    layers.extend(list_config_fragment_paths(config_path)?);
-    Ok(layers)
 }
 
 async fn remove_stale_managed_fragment_files(config_dir: &Path, desired_names: &[&str]) -> Result<()> {
@@ -328,13 +497,19 @@ backend = "sqlite"
         assert_eq!(
             managed_fragment_names(),
             vec![
-                "channels.toml",
                 "memory.toml",
-                "security.toml",
-                "agents.toml",
-                "identity.toml",
+                "channels.toml",
                 "network.toml",
+                "security.toml",
                 "scheduler.toml",
+                "agent.toml",
+                "identity.toml",
+                "routing.toml",
+                "tools.toml",
+                "integrations.toml",
+                "nodes.toml",
+                "cost.toml",
+                "observability.toml",
             ]
         );
     }

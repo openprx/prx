@@ -21,58 +21,31 @@ pub mod strategy_evolution;
 pub mod trace;
 
 #[allow(unused_imports)]
-pub use analyzer::{
-    CandidatePriority, ConfigEfficiencyIssue, DailyDigest, EvolutionAnalyzer, EvolutionCandidate, MetricShift,
-    NoiseMemoryPattern, TaskTypeDigest, TaskTypeWeakness, TrendAnalysis, UserCorrectionCluster,
-};
-#[allow(unused_imports)]
+pub use analyzer::{CandidatePriority, EvolutionAnalyzer, EvolutionCandidate, TrendAnalysis};
 pub use config::{
-    DataThresholds, EvolutionConfig, EvolutionGateConfig, EvolutionMode, EvolutionRetentionConfig,
-    EvolutionRuntimeConfig, EvolutionRuntimeConfigManager, MemoryEvolutionConfig, PromptEvolutionConfig,
-    RetrievalFusionWeights, RollbackConfig, StrategyEvolutionConfig,
+    EvolutionConfig, EvolutionMode, EvolutionRetentionConfig, EvolutionRuntimeConfig, SharedEvolutionConfig,
+    new_shared_evolution_config,
 };
-#[allow(unused_imports)]
-pub use config::{EvolutionRetrievalConfig, RetrievalScoreWeights, SharedEvolutionConfig, new_shared_evolution_config};
 pub use cycle_types::{
     ChangeOperation, ChangeTarget, CycleOutcome, EvolutionCycle, EvolutionProposal, EvolutionSignals,
     EvolutionValidation, FitnessTrend, RiskLevel, ValidationStatus,
 };
 #[allow(unused_imports)]
 pub use engine::{CycleResult, EngineCycleInput, EvolutionEngine, run_engine_cycle};
-#[allow(unused_imports)]
-pub use gate::{EvolutionGate, GateMetrics, GateRejection, GateResult};
-#[allow(unused_imports)]
-pub use judge::{
-    JudgeConfig, JudgeDriftAlert, JudgeEngine, JudgeHealthMonitor, JudgeHealthReport, JudgeResult, JudgeScoringModel,
-    MockJudgeModel, StructuredScores,
-};
-#[allow(unused_imports)]
-pub use memory_compressor::{
-    CompressionLimits, CompressionResult, EmbeddingSimilarityDetector, FidelityReport, MemoryCompressor,
-    SimilarityDetector,
-};
 pub use memory_evolution::MemoryEvolutionEngine;
 #[allow(unused_imports)]
-pub use memory_retrieval::{EvolutionAwareRetrieval, EvolutionMemoryRetriever};
-#[allow(unused_imports)]
-pub use memory_safety::{
-    ConflictChecker, MemorySafetyFilter, SafetyCheckResult, SafetyIssue, SafetyIssueKind, SourceMetadata,
-};
-#[allow(unused_imports)]
+pub use memory_safety::{MemorySafetyFilter, SafetyIssueKind, SourceMetadata};
 pub use pipeline::{EvolutionPipeline, EvolutionTrigger, PipelineRunReport};
-#[allow(unused_imports)]
-pub use prompt_evolution::{PromptEvolutionEngine, PromptMutationType};
+pub use prompt_evolution::PromptEvolutionEngine;
 #[allow(unused_imports)]
 pub use record::{
-    Actor, AnnotationSource, ChangeType, DataBasis, DecisionLog, DecisionType, EvolutionLayer, EvolutionLog,
-    EvolutionResult, MemoryAccessLog, MemoryAction, Outcome, TaskType,
+    Actor, ChangeType, DataBasis, DecisionLog, DecisionType, EvolutionLayer, EvolutionLog, EvolutionResult,
+    MemoryAccessLog, MemoryAction, Outcome, TaskType,
 };
 #[allow(unused_imports)]
-pub use rollback::{CircuitBreaker, CircuitBreakerState, RollbackManager, VersionSnapshot};
-#[allow(unused_imports)]
-pub use scheduler::{EvolutionScheduler, SchedulerRunSummary, SchedulerState};
+pub use rollback::{CircuitBreaker, CircuitBreakerState, RollbackManager};
+pub use scheduler::EvolutionScheduler;
 pub use storage::{AsyncJsonlWriter, JsonlRetentionPolicy, JsonlStoragePaths};
+pub use strategy_evolution::StrategyEvolutionEngine;
 #[allow(unused_imports)]
-pub use strategy_evolution::{StrategyEvolutionEngine, TaskDailySummary};
-#[allow(unused_imports)]
-pub use trace::{TraceContext, current_trace, generate_experiment_id, generate_trace_id, with_trace};
+pub use trace::{TraceContext, current_trace, with_trace};

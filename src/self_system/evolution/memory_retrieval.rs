@@ -22,11 +22,23 @@ pub struct EvolutionMemoryRetriever {
     memory: Arc<dyn Memory>,
     config: SharedEvolutionConfig,
     writer: Option<Arc<AsyncJsonlWriter>>,
+    debug_raw: bool,
 }
 
 impl EvolutionMemoryRetriever {
     pub fn new(memory: Arc<dyn Memory>, config: SharedEvolutionConfig, writer: Option<Arc<AsyncJsonlWriter>>) -> Self {
-        Self { memory, config, writer }
+        Self {
+            memory,
+            config,
+            writer,
+            debug_raw: false,
+        }
+    }
+
+    /// Create a new retriever with the `evolution_debug_raw` flag from main config.
+    pub const fn with_debug_raw(mut self, debug_raw: bool) -> Self {
+        self.debug_raw = debug_raw;
+        self
     }
 
     async fn base_retrieval(&self, query: &str) -> Result<Vec<MemoryEntry>> {
@@ -95,7 +107,7 @@ impl EvolutionMemoryRetriever {
                 trace_id: trace.trace_id.clone(),
                 action: MemoryAction::Search,
                 memory_id: entry.id.clone(),
-                task_context: format_task_context(query, token_budget),
+                task_context: format_task_context(query, token_budget, self.debug_raw),
                 task_type: TaskType::Planning,
                 actor: Actor::Agent,
                 was_useful: None,
@@ -109,8 +121,8 @@ impl EvolutionMemoryRetriever {
     }
 }
 
-fn format_task_context(query: &str, token_budget: usize) -> String {
-    if is_raw_debug_enabled() {
+fn format_task_context(query: &str, token_budget: usize, debug_raw: bool) -> String {
+    if is_raw_debug_enabled(debug_raw) {
         return format!("query={query};budget={token_budget}");
     }
     format!(

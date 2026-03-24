@@ -265,6 +265,9 @@ pub fn all_tools_with_runtime_ext(
     // Create a sandbox from the security configuration for shell command isolation.
     let sandbox: Arc<dyn crate::security::traits::Sandbox> = crate::security::create_sandbox(&root_config.security);
 
+    let modules = &root_config.modules;
+
+    // Core tools — always registered regardless of module flags.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(
             security.clone(),
@@ -275,55 +278,93 @@ pub fn all_tools_with_runtime_ext(
         Arc::new(FileReadTool::new(security.clone(), config.memory.acl_enabled)),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(CanvasTool::new(security.clone())),
-        Arc::new(CronTool::new(shared_config.clone(), security.clone())),
-        Arc::new(CronAddTool::new(shared_config.clone(), security.clone())),
-        Arc::new(CronListTool::new(shared_config.clone())),
-        Arc::new(CronRemoveTool::new(shared_config.clone(), security.clone())),
-        Arc::new(CronUpdateTool::new(shared_config.clone(), security.clone())),
-        Arc::new(CronRunTool::new(shared_config.clone(), security.clone())),
-        Arc::new(CronRunsTool::new(shared_config.clone())),
-        Arc::new(XinTool::new(shared_config.clone(), security.clone())),
-        Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
-        Arc::new(MemorySearchTool::new(
-            workspace_dir.to_path_buf(),
-            memory.clone(),
-            config.memory.acl_enabled,
-        )),
-        Arc::new(MemoryGetTool::new(
-            workspace_dir.to_path_buf(),
-            memory.clone(),
-            config.memory.acl_enabled,
-        )),
         Arc::new(ScheduleTool::new(
             security.clone(),
             Arc::new(arc_swap::ArcSwap::from_pointee(root_config.clone())),
         )),
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
-        Arc::new(NodesTool::new(shared_config, security.clone())),
         Arc::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
     ];
 
-    if config.memory.acl_enabled {
-        tracing::warn!("memory_recall disabled because memory ACL is enabled; skipping tool registration");
+    // Vision tools are always available
+    tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
+    tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    // ── Scheduler module gates cron and xin tools ──
+    if modules.scheduler {
+        tool_arcs.push(Arc::new(CronTool::new(shared_config.clone(), security.clone())));
+        tool_arcs.push(Arc::new(CronAddTool::new(shared_config.clone(), security.clone())));
+        tool_arcs.push(Arc::new(CronListTool::new(shared_config.clone())));
+        tool_arcs.push(Arc::new(CronRemoveTool::new(shared_config.clone(), security.clone())));
+        tool_arcs.push(Arc::new(CronUpdateTool::new(shared_config.clone(), security.clone())));
+        tool_arcs.push(Arc::new(CronRunTool::new(shared_config.clone(), security.clone())));
+        tool_arcs.push(Arc::new(CronRunsTool::new(shared_config.clone())));
+        tool_arcs.push(Arc::new(XinTool::new(shared_config.clone(), security.clone())));
     } else {
-        tool_arcs.push(Arc::new(MemoryRecallTool::new(memory.clone(), false)));
+        tracing::debug!("Scheduler module disabled, skipping cron/xin tool registration");
     }
 
-    let mcp_tool_ref: Option<Arc<McpTool>> = if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        let mcp = Arc::new(McpTool::new(
-            security.clone(),
-            config.mcp.clone(),
+    // ── Memory module gates memory tools ──
+    if modules.memory {
+        tool_arcs.push(Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())));
+        tool_arcs.push(Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())));
+        tool_arcs.push(Arc::new(MemorySearchTool::new(
             workspace_dir.to_path_buf(),
-        ));
-        tool_arcs.push(mcp.clone());
-        Some(mcp)
-    } else {
-        None
-    };
+            memory.clone(),
+            config.memory.acl_enabled,
+        )));
+        tool_arcs.push(Arc::new(MemoryGetTool::new(
+            workspace_dir.to_path_buf(),
+            memory.clone(),
+            config.memory.acl_enabled,
+        )));
 
-    if browser_config.enabled {
+        if config.memory.acl_enabled {
+            tracing::warn!("memory_recall disabled because memory ACL is enabled; skipping tool registration");
+        } else {
+            tool_arcs.push(Arc::new(MemoryRecallTool::new(memory.clone(), false)));
+        }
+    } else {
+        tracing::debug!("Memory module disabled, skipping memory tool registration");
+    }
+
+    // ── Nodes module gates nodes tool ──
+    if modules.nodes {
+        tool_arcs.push(Arc::new(NodesTool::new(shared_config, security.clone())));
+    } else {
+        tracing::debug!("Nodes module disabled, skipping nodes tool registration");
+    }
+
+    // ── Integrations module gates MCP and Composio tools ──
+    let mcp_tool_ref: Option<Arc<McpTool>> =
+        if modules.integrations && config.mcp.enabled && !config.mcp.servers.is_empty() {
+            let mcp = Arc::new(McpTool::new(
+                security.clone(),
+                config.mcp.clone(),
+                workspace_dir.to_path_buf(),
+            ));
+            tool_arcs.push(mcp.clone());
+            Some(mcp)
+        } else {
+            if !modules.integrations {
+                tracing::debug!("Integrations module disabled, skipping MCP tool registration");
+            }
+            None
+        };
+
+    if modules.integrations {
+        if let Some(key) = composio_key {
+            if !key.is_empty() {
+                tool_arcs.push(Arc::new(ComposioTool::new(key, composio_entity_id, security.clone())));
+            }
+        }
+    } else {
+        tracing::debug!("Integrations module disabled, skipping Composio tool registration");
+    }
+
+    // ── Tools module gates browser, http_request, web_search, web_fetch ──
+    if modules.tools && browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
         tool_arcs.push(Arc::new(BrowserOpenTool::new(
             security.clone(),
@@ -348,19 +389,23 @@ pub fn all_tools_with_runtime_ext(
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
             },
         )));
+    } else if !modules.tools {
+        tracing::debug!("Tools module disabled, skipping browser tool registration");
     }
 
-    if http_config.enabled {
+    if modules.tools && http_config.enabled {
         tool_arcs.push(Arc::new(HttpRequestTool::new(
             security.clone(),
             http_config.allowed_domains.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
         )));
+    } else if !modules.tools {
+        tracing::debug!("Tools module disabled, skipping http_request tool registration");
     }
 
     // Web search tool (enabled by default for GLM and other models)
-    if root_config.web_search.enabled {
+    if modules.tools && root_config.web_search.enabled {
         let provider = root_config.web_search.provider.trim().to_ascii_lowercase();
         let brave_key = root_config
             .web_search
@@ -388,12 +433,14 @@ pub fn all_tools_with_runtime_ext(
                 root_config.web_search.provider
             );
         }
+    } else if !modules.tools {
+        tracing::debug!("Tools module disabled, skipping web_search tool registration");
     }
 
     // Web fetch tool — only register when both fetch_enabled AND allowed_domains
     // are configured.  Registering without domains would expose the tool to the
     // model while every call fails at runtime with a confusing error.
-    if root_config.web_search.fetch_enabled {
+    if modules.tools && root_config.web_search.fetch_enabled {
         if browser_config.allowed_domains.is_empty() {
             tracing::warn!(
                 "web_fetch is enabled but browser.allowed_domains is empty; \
@@ -407,16 +454,8 @@ pub fn all_tools_with_runtime_ext(
                 root_config.web_search.timeout_secs,
             )));
         }
-    }
-
-    // Vision tools are always available
-    tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
-    tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
-
-    if let Some(key) = composio_key {
-        if !key.is_empty() {
-            tool_arcs.push(Arc::new(ComposioTool::new(key, composio_entity_id, security.clone())));
-        }
+    } else if !modules.tools {
+        tracing::debug!("Tools module disabled, skipping web_fetch tool registration");
     }
 
     // Always register agents_list (shows what agents are available for delegation)
@@ -446,6 +485,8 @@ pub fn all_tools_with_runtime_ext(
                 codex_auth_json_path: Some(root_config.auth.codex_auth_json_path.clone()),
                 codex_auth_json_auto_import: root_config.auth.codex_auth_json_auto_import,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
+                codex_stream_idle_timeout_secs: root_config.runtime.codex_stream_idle_timeout_secs,
+                codex_reasoning_effort: root_config.runtime.codex_reasoning_effort.clone(),
             },
         )
         .with_parent_tools(parent_tools)
@@ -473,13 +514,17 @@ mod tests {
         clippy::unreadable_literal
     )]
     use super::*;
-    use crate::config::{BrowserConfig, Config, MemoryConfig};
+    use crate::config::{BrowserConfig, Config, MemoryConfig, ModulesConfig};
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
         Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
+            modules: ModulesConfig {
+                tools: true,
+                ..ModulesConfig::default()
+            },
             ..Config::default()
         }
     }

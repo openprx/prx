@@ -33,18 +33,10 @@ pub mod policy_pipeline;
 pub mod secrets;
 pub mod traits;
 
-#[allow(unused_imports)]
-pub use audit::{AuditEvent, AuditEventType, AuditLogger};
-#[allow(unused_imports)]
 pub use detect::create_sandbox;
-#[allow(unused_imports)]
-pub use pairing::PairingGuard;
 pub use policy::{AutonomyLevel, SecurityPolicy};
 pub use policy_pipeline::{EvalContext, PolicyPipeline};
-#[allow(unused_imports)]
 pub use secrets::SecretStore;
-#[allow(unused_imports)]
-pub use traits::{NoopSandbox, Sandbox};
 
 /// Redact sensitive values for safe logging. Shows first 4 chars + "***" suffix.
 /// This function intentionally breaks the data-flow taint chain for static analysis.
@@ -65,7 +57,7 @@ mod tests {
         let policy = SecurityPolicy::default();
         assert_eq!(policy.autonomy, AutonomyLevel::Supervised);
 
-        let guard = PairingGuard::new(false, &[]);
+        let guard = pairing::PairingGuard::new(false, &[]);
         assert!(!guard.require_pairing());
     }
 

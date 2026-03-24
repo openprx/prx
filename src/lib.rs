@@ -88,44 +88,49 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub mod approval;
 pub mod auth;
-pub mod causal_tree;
+pub(crate) mod causal_tree;
 pub mod channels;
 pub mod config;
 pub mod cost;
 pub mod cron;
 pub mod daemon;
-pub mod doctor;
 pub mod gateway;
-pub mod health;
+pub(crate) mod health;
 pub mod heartbeat;
-pub mod hooks;
+pub(crate) mod hooks;
 pub mod identity;
-pub mod integrations;
 pub mod media;
 pub mod memory;
-pub mod migration;
-pub mod multimodal;
+pub(crate) mod multimodal;
 pub mod nodes;
 pub mod observability;
 pub mod onboard;
 #[cfg(feature = "wasm-plugins")]
 pub mod plugins;
 pub mod providers;
-pub mod rag;
 #[cfg(feature = "llm-router")]
 pub mod router;
 pub mod runtime;
 pub mod security;
 pub mod self_system;
-pub mod service;
-pub mod session_worker;
-pub mod skillforge;
+// In the library crate, only the protocol types are needed (used by tools/sessions_spawn).
+// The runner module is a binary-only concern — main.rs loads the full session_worker module tree.
+pub(crate) mod session_worker {
+    #[path = "protocol.rs"]
+    pub mod protocol;
+}
+// In the library crate, only the scout module is needed (used by gateway/api/skills).
+// The evaluate/integrate pipeline and SkillForge orchestrator are binary-only concerns.
+pub(crate) mod skillforge {
+    #[path = "scout.rs"]
+    pub mod scout;
+}
 pub mod skills;
 pub mod tools;
 pub mod tunnel;
-pub mod util;
+pub(crate) mod util;
 pub mod webhook;
-pub mod xin;
+pub(crate) mod xin;
 
 pub use config::Config;
 

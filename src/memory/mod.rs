@@ -42,6 +42,7 @@ use uuid::Uuid;
 fn create_memory_with_builders<F, G>(
     backend_name: &str,
     workspace_dir: &Path,
+    memory_config: &MemoryConfig,
     mut sqlite_builder: F,
     mut postgres_builder: G,
     unknown_context: &str,
@@ -54,7 +55,7 @@ where
         MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
-            Ok(Box::new(LucidMemory::new(workspace_dir, local)))
+            Ok(Box::new(LucidMemory::new(workspace_dir, local, memory_config)))
         }
         MemoryBackendKind::Postgres => Ok(Box::new(postgres_builder()?)),
         MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
@@ -308,6 +309,7 @@ pub fn create_memory_with_storage_and_routes_with_acl(
     let memory = create_memory_with_builders(
         &backend_name,
         workspace_dir,
+        config,
         || build_sqlite_memory(config, workspace_dir, &resolved_embedding),
         || build_postgres_memory(storage_provider),
         "",
@@ -395,9 +397,11 @@ pub fn create_memory_for_migration(backend: &str, workspace_dir: &Path) -> anyho
         anyhow::bail!("memory migration for backend 'postgres' is unsupported; migrate with sqlite or markdown first");
     }
 
+    let default_config = MemoryConfig::default();
     create_memory_with_builders(
         backend,
         workspace_dir,
+        &default_config,
         || SqliteMemory::new(workspace_dir),
         || anyhow::bail!("postgres backend is not available in migration context"),
         " during migration",

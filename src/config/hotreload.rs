@@ -16,6 +16,7 @@
 //!   changes and reload succeeds.
 
 use super::{files, schema::Config};
+use crate::config::files::compute_config_fingerprint_gated;
 use arc_swap::ArcSwap;
 use std::{
     path::PathBuf,
@@ -85,7 +86,7 @@ fn run_watcher(config_path: PathBuf, shared: SharedConfig, reload_version: Arc<A
     let mut debouncer = new_debouncer(debounce_ms, tx)?;
     debouncer.watcher().watch(&watch_root, RecursiveMode::Recursive)?;
 
-    let mut last_content_hash = files::compute_config_fingerprint(&config_path).ok();
+    let mut last_content_hash = compute_config_fingerprint_gated(&config_path).ok();
 
     tracing::info!(
         path = %config_path.display(),
@@ -104,7 +105,7 @@ fn run_watcher(config_path: PathBuf, shared: SharedConfig, reload_version: Arc<A
                     continue;
                 }
 
-                let content_hash = match files::compute_config_fingerprint(&config_path) {
+                let content_hash = match compute_config_fingerprint_gated(&config_path) {
                     Ok(hash) => hash,
                     Err(e) => {
                         tracing::warn!(
@@ -167,6 +168,11 @@ fn try_reload(config_path: &std::path::Path, shared: &SharedConfig) -> anyhow::R
         fresh.memory.acl_enabled = old.memory.acl_enabled;
     }
 
+    // Check if modules config changed (requires restart)
+    if fresh.modules != old.modules {
+        tracing::warn!("Module configuration changed — restart required for changes to take effect");
+    }
+
     // Log diff of key hot-reloadable fields
     log_diff(&old, &fresh);
 
@@ -179,9 +185,9 @@ fn load_stable_config_snapshot(config_path: &std::path::Path, workspace_dir: Pat
     const MAX_ATTEMPTS: usize = 3;
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let before = files::compute_config_fingerprint(config_path)?;
+        let before = compute_config_fingerprint_gated(config_path)?;
         let fresh = Config::load_from_path(config_path, workspace_dir.clone())?;
-        let after = files::compute_config_fingerprint(config_path)?;
+        let after = compute_config_fingerprint_gated(config_path)?;
         if before == after {
             return Ok(fresh);
         }

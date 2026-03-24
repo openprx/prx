@@ -132,6 +132,47 @@ impl SecretStore {
         value.starts_with("enc:")
     }
 
+    /// Migrate all legacy `enc:` values in a mutable slice to the secure `enc2:` format.
+    ///
+    /// Each `Some(value)` that starts with `enc:` is decrypted with the legacy XOR cipher
+    /// and re-encrypted using ChaCha20-Poly1305. Values already using `enc2:` or that are
+    /// plaintext are left untouched.
+    ///
+    /// Failures on individual values are logged as warnings and skipped — the migration
+    /// continues and processes the remaining values. Returns the number of values that were
+    /// successfully migrated.
+    ///
+    /// Callers are responsible for persisting the updated values back to storage.
+    pub fn migrate_legacy_secrets(&self, values: &mut [Option<String>]) -> Result<usize> {
+        let mut migrated = 0usize;
+        for slot in values.iter_mut() {
+            let Some(ref raw) = *slot else {
+                continue;
+            };
+            if !Self::needs_migration(raw) {
+                continue;
+            }
+            match self.decrypt_and_migrate(raw) {
+                Ok((_, Some(new_enc2))) => {
+                    tracing::info!("Migrated legacy XOR-encrypted secret (enc:) to ChaCha20-Poly1305 (enc2:)");
+                    *slot = Some(new_enc2);
+                    migrated += 1;
+                }
+                Ok((_, None)) => {
+                    // decrypt_and_migrate on an enc: value always returns Some(new_enc2)
+                    // unless encrypt() returns plaintext (disabled store / empty value).
+                    // Count it as migrated only when a non-empty plaintext was produced.
+                    tracing::warn!("Legacy secret migrated to plaintext (encryption disabled or empty value)");
+                    migrated += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to migrate legacy secret — skipping");
+                }
+            }
+        }
+        Ok(migrated)
+    }
+
     /// Decrypt using ChaCha20-Poly1305 (current secure format).
     fn decrypt_chacha20(&self, hex_str: &str) -> Result<String> {
         let blob = hex_decode(hex_str).context("Failed to decode encrypted secret (corrupt hex)")?;
