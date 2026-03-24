@@ -135,8 +135,9 @@ impl CircuitBreakerState {
             return false;
         }
         // If open, check whether the cooldown has elapsed.
-        self.open_since
-            .map_or(true, |opened_at| opened_at.elapsed().as_secs() < policy.circuit_breaker_cooldown_secs)
+        self.open_since.map_or(true, |opened_at| {
+            opened_at.elapsed().as_secs() < policy.circuit_breaker_cooldown_secs
+        })
     }
 
     /// Transition to the open state if the threshold has been reached.
