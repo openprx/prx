@@ -8,7 +8,7 @@
 //! - `history` action: view the conversation log of any sub-agent run
 //! - `steer` action: inject a message into a running sub-agent's context
 
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::agent::loop_::{ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
 use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
@@ -926,6 +926,13 @@ impl Tool for SessionsSpawnTool {
             output: format!("Sub-agent spawned (run_id: {run_id}). Will announce result when complete."),
             error: None,
         })
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
     }
 }
 

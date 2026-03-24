@@ -16,7 +16,7 @@
 //!   - `memory`, `storage` backends
 //!   - `autonomy` / security policy
 
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
 use async_trait::async_trait;
 use serde_json::json;
@@ -307,6 +307,13 @@ impl Tool for ConfigReloadTool {
             output,
             error: None,
         })
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::System]
     }
 }
 

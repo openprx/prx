@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::memory::Memory;
 use async_trait::async_trait;
 use serde_json::json;
@@ -106,6 +106,14 @@ impl Tool for MemoryRecallTool {
                 error: Some(format!("Memory recall failed: {e}")),
             }),
         }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Core
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Memory]
     }
 }
 

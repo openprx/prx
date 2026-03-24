@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::agent::loop_::{ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
 use crate::config::DelegateAgentConfig;
 use crate::hooks::HookManager;
@@ -394,6 +394,14 @@ impl Tool for DelegateTool {
                 error: Some(format!("Agent '{agent_name}' failed: {e}",)),
             }),
         }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Standard
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
     }
 }
 

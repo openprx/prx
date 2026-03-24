@@ -6,7 +6,7 @@
 //! - steer: send a message to a running sub-agent
 
 use super::sessions_spawn::{SubAgentRun, SubAgentStatus};
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
@@ -244,6 +244,13 @@ impl Tool for SubagentsTool {
                 )),
             }),
         }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
     }
 }
 

@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult, ToolSpec};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier};
 use crate::config::{McpConfig, McpServerConfig, McpTransport};
 use crate::security::SecurityPolicy;
 use anyhow::bail;
@@ -899,6 +899,13 @@ impl Tool for McpTool {
                 error: Some(err.to_string()),
             }),
         }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
     }
 }
 

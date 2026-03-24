@@ -5,7 +5,7 @@
 //! Aligns with OpenClaw's `session_status` tool (📊 session_status).
 
 use super::sessions_spawn::{SubAgentRun, SubAgentStatus};
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -123,6 +123,13 @@ impl Tool for SessionStatusTool {
             output,
             error: None,
         })
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
     }
 }
 

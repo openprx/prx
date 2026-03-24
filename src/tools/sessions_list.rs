@@ -4,7 +4,7 @@
 //! exposing a dedicated tool that aligns with OpenClaw's `sessions_list`.
 
 use super::sessions_spawn::{SubAgentRun, SubAgentStatus};
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
@@ -107,6 +107,13 @@ impl Tool for SessionsListTool {
             ),
             error: None,
         })
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
     }
 }
 

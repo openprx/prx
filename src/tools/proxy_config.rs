@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, ProxyConfig, ProxyScope, SharedConfig, runtime_proxy_config, set_runtime_proxy_config};
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
@@ -424,6 +424,13 @@ impl Tool for ProxyConfigTool {
                 error: Some(error.to_string()),
             }),
         }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::System]
     }
 }
 

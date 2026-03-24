@@ -85,7 +85,7 @@
     clippy::too_long_first_doc_paragraph
 )]
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
@@ -228,6 +228,41 @@ enum Commands {
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
+    },
+
+    /// Instant start: provide an API key and chat immediately. No config files written.
+    #[command(long_about = "\
+Zero-configuration instant start.
+
+Detects credentials from multiple file-based sources without reading \
+environment variables. Provide an API key directly, or let PRX find \
+one from auth-profiles, config.toml, or Claude Code OAuth.
+
+No permanent files are written. A temporary workspace is used for \
+the session.
+
+Examples:
+  prx go -k sk-ant-api03-xxx           # Anthropic (auto-detected)
+  prx go -k sk-proj-xxx                # OpenAI (auto-detected)
+  prx go -k sk-ant-xxx -m claude-sonnet-4-20250514
+  prx go                               # use existing auth-profiles
+  prx go --message 'Summarize this'    # single-shot mode")]
+    Go {
+        /// API key (required on first use, or use existing auth-profiles)
+        #[arg(short = 'k', long = "key")]
+        api_key: Option<String>,
+
+        /// Provider (auto-detected from key prefix if omitted)
+        #[arg(short = 'p', long)]
+        provider: Option<String>,
+
+        /// Model (uses provider default if omitted)
+        #[arg(short = 'm', long)]
+        model: Option<String>,
+
+        /// Single message mode (non-interactive)
+        #[arg(long)]
+        message: Option<String>,
     },
 
     /// Start the AI agent loop
@@ -920,6 +955,59 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `prx go` — zero-config instant start. No permanent files written.
+    if let Commands::Go {
+        api_key,
+        provider,
+        model,
+        message,
+    } = &cli.command
+    {
+        let (detected_provider, detected_key, detected_model) = onboard::auto_detect::detect_credentials(
+            api_key.as_deref(),
+            provider.as_deref(),
+            model.as_deref(),
+        )
+        .context(
+            "No API key found. Run `prx auth paste-token --provider anthropic`, or use: prx go -k <your-api-key>",
+        )?;
+
+        let tmpdir = tempfile::tempdir().context("failed to create temporary workspace for `prx go`")?;
+
+        let mut config = Config::default();
+        config.default_provider = Some(detected_provider);
+        config.default_model = Some(detected_model);
+        config.api_key = Some(detected_key);
+        config.workspace_dir = tmpdir.path().to_path_buf();
+        config.config_path = tmpdir.path().join("config.toml");
+
+        if let Some(msg) = message {
+            let result = agent::run(
+                config,
+                Some(msg.clone()),
+                None, // provider already set in config
+                None, // model already set in config
+                0.7,
+            )
+            .await;
+            // Keep tmpdir alive until agent finishes, then drop
+            drop(tmpdir);
+            return result.map(|_| ());
+        }
+
+        let result = chat::run(
+            config, None, // provider already set in config
+            None, // model already set in config
+            0.7, false, // plain mode off
+            None,  // no session resume
+            false, // don't list sessions
+        )
+        .await;
+        // Keep tmpdir alive until chat finishes, then drop
+        drop(tmpdir);
+        return result;
+    }
+
     // All other commands need config loaded first
     let config = Config::load_or_init_with_config_dir(cli.config_dir.as_deref()).await?;
 
@@ -928,6 +1016,7 @@ async fn main() -> Result<()> {
         Commands::Onboard { .. } => anyhow::bail!("BUG: Onboard command should have been handled earlier"),
         Commands::Completions { .. } => anyhow::bail!("BUG: Completions command should have been handled earlier"),
         Commands::SessionWorker { .. } => anyhow::bail!("BUG: SessionWorker command should have been handled earlier"),
+        Commands::Go { .. } => anyhow::bail!("BUG: Go command should have been handled earlier"),
 
         Commands::Agent {
             message,

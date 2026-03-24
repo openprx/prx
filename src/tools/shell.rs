@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
@@ -198,6 +198,14 @@ impl Tool for ShellTool {
                 error: Some(format!("Command timed out after {SHELL_TIMEOUT_SECS}s and was killed")),
             }),
         }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Core
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::FileSystem, ToolCategory::System]
     }
 }
 

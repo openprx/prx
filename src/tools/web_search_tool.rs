@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
@@ -211,6 +211,14 @@ impl Tool for WebSearchTool {
             output: result,
             error: None,
         })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Standard
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::WebBrowsing]
     }
 }
 

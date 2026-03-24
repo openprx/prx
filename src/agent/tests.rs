@@ -523,12 +523,12 @@ async fn turn_handles_unknown_tool_gracefully() {
         "Expected non-empty response after unknown tool recovery"
     );
 
-    // Verify the tool result mentioned "Unknown tool"
+    // Verify the tool result mentioned "unknown tool"
     let has_tool_result = agent.history().iter().any(|msg| match msg {
-        ConversationMessage::ToolResults(results) => results.iter().any(|r| r.content.contains("Unknown tool")),
+        ConversationMessage::ToolResults(results) => results.iter().any(|r| r.content.contains("unknown tool")),
         _ => false,
     });
-    assert!(has_tool_result, "Expected tool result with 'Unknown tool' message");
+    assert!(has_tool_result, "Expected tool result with 'unknown tool' message");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

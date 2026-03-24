@@ -6,7 +6,7 @@
 //!
 //! Aligns with OpenClaw's `image` tool for multimodal understanding.
 
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::MultimodalConfig;
 use crate::multimodal;
 use crate::providers::{ChatMessage, ChatRequest, Provider};
@@ -230,6 +230,14 @@ impl Tool for ImageTool {
             output: text,
             error: None,
         })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Standard
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Media]
     }
 }
 

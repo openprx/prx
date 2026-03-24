@@ -29,6 +29,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod error_hints;
 pub mod file_read;
 pub mod file_write;
 pub mod gateway;
@@ -36,6 +37,7 @@ pub mod git_operations;
 pub mod http_request;
 pub mod image;
 pub mod image_info;
+pub mod intent;
 pub mod mcp;
 pub mod memory_forget;
 pub mod memory_get;
@@ -103,7 +105,7 @@ pub use sessions_spawn::SessionsSpawnTool;
 pub use shell::ShellTool;
 pub use subagents::SubagentsTool;
 pub use traits::Tool;
-pub use traits::{ToolResult, ToolSpec};
+pub use traits::{ToolCategory, ToolResult, ToolSpec, ToolTier};
 pub use tts::TtsTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
@@ -144,6 +146,14 @@ impl Tool for ArcDelegatingTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
+    }
+
+    fn tier(&self) -> ToolTier {
+        self.inner.tier()
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        self.inner.categories()
     }
 }
 

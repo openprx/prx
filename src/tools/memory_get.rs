@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::memory::Memory;
 use crate::memory::principal::{
     ChatType, MemoryWriteContext, Principal, Role, Visibility, log_access, post_filter, resolve_principal,
@@ -399,6 +399,14 @@ impl Tool for MemoryGetTool {
         }
 
         self.read_fallback_file(path, from, requested_lines)
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Core
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Memory]
     }
 }
 

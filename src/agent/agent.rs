@@ -519,12 +519,24 @@ impl Agent {
                     let output = if r.success {
                         r.output
                     } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
+                        let error_text = r.error.unwrap_or(r.output);
+                        let hint = crate::tools::error_hints::recovery_hint(&call.name, &error_text);
+                        if hint.is_empty() {
+                            format!("Error: {error_text}")
+                        } else {
+                            format!("Error: {error_text}\n{hint}")
+                        }
                     };
                     (output, actual_success)
                 }
                 Err(e) => {
-                    let message = format!("Error executing {}: {e}", call.name);
+                    let error_str = e.to_string();
+                    let hint = crate::tools::error_hints::recovery_hint(&call.name, &error_str);
+                    let message = if hint.is_empty() {
+                        format!("Error executing {}: {error_str}", call.name)
+                    } else {
+                        format!("Error executing {}: {error_str}\n{hint}", call.name)
+                    };
                     self.hooks.emit(HookEvent::Error, payload_error("tool", &message)).await;
                     self.observer.record_event(&ObserverEvent::ToolCall {
                         tool: call.name.clone(),
@@ -535,7 +547,14 @@ impl Agent {
                 }
             }
         } else {
-            let message = format!("Unknown tool: {}", call.name);
+            let available_names: Vec<&str> = self.tools.iter().map(|t| t.name()).collect();
+            let suggestion = crate::tools::error_hints::suggest_tool_name(&call.name, &available_names);
+            let hint = suggestion.map(|s| format!(" Did you mean '{s}'?")).unwrap_or_default();
+            let message = format!(
+                "Error: unknown tool '{}'.{hint}\nAvailable tools: {}",
+                call.name,
+                available_names.join(", ")
+            );
             self.hooks.emit(HookEvent::Error, payload_error("tool", &message)).await;
             (message, false)
         };

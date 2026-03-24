@@ -15,7 +15,7 @@
 //!  - pause / resume — enable/disable a job without removing it
 //!  - status — show cron subsystem status
 
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
 use crate::cron::{self, CronJobPatch, JobType, Schedule};
 use crate::security::SecurityPolicy;
@@ -712,6 +712,13 @@ impl Tool for CronTool {
                 )),
             }),
         }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Scheduling]
     }
 }
 

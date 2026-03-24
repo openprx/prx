@@ -2250,13 +2250,30 @@ async fn process_channel_message(
                         "Tool call started"
                     );
                 }
-                crate::agent::loop_::ToolCallNotification::Finished { name, success } => {
+                crate::agent::loop_::ToolCallNotification::Finished {
+                    name,
+                    success,
+                    duration_ms,
+                } => {
                     tracing::info!(
                         channel = %tool_event_channel_name,
                         sender = %tool_event_sender_name,
                         tool = %name,
                         success,
+                        duration_ms,
                         "Tool call finished"
+                    );
+                }
+                crate::agent::loop_::ToolCallNotification::Progress {
+                    iteration,
+                    max_iterations,
+                } => {
+                    tracing::info!(
+                        channel = %tool_event_channel_name,
+                        sender = %tool_event_sender_name,
+                        iteration,
+                        max_iterations,
+                        "Tool loop progress"
                     );
                 }
             }

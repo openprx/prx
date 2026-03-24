@@ -8,7 +8,7 @@
 //!  - pause / resume — disable/enable a task
 //!  - status — show xin subsystem status
 
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
 use crate::security::SecurityPolicy;
 use crate::xin::store;
@@ -475,5 +475,12 @@ impl Tool for XinTool {
                 )),
             }),
         }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Extended
+    }
+
+    fn categories(&self) -> &'static [ToolCategory] {
+        &[ToolCategory::Automation]
     }
 }

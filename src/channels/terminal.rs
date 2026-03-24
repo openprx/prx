@@ -97,17 +97,41 @@ fn sanitize_terminal_output(text: &str) -> String {
 #[derive(Debug)]
 enum UiEvent {
     // === Streaming events (with draft_id + seq for ordering) ===
-    DraftStarted { draft_id: String },
-    TokenDelta { draft_id: String, seq: u64, text: String },
-    DraftFinalized { draft_id: String, full_text: String },
-    DraftCancelled { draft_id: String },
+    DraftStarted {
+        draft_id: String,
+    },
+    TokenDelta {
+        draft_id: String,
+        seq: u64,
+        text: String,
+    },
+    DraftFinalized {
+        draft_id: String,
+        full_text: String,
+    },
+    DraftCancelled {
+        draft_id: String,
+    },
 
     // === Tool events ===
-    ToolCallStarted { name: String, args_summary: String },
-    ToolCallFinished { name: String, success: bool },
+    ToolCallStarted {
+        name: String,
+        args_summary: String,
+    },
+    ToolCallFinished {
+        name: String,
+        success: bool,
+        duration_ms: u64,
+    },
+    ToolProgress {
+        iteration: usize,
+        max_iterations: usize,
+    },
 
     // === Complete message (non-streaming fallback) ===
-    FinalMessage { text: String },
+    FinalMessage {
+        text: String,
+    },
 
     // === Typing indicator ===
     TypingStart,
@@ -148,6 +172,8 @@ struct UiActor {
     repaint_interval_ms: u64,
     /// Plain text mode (no ANSI escapes)
     plain_mode: bool,
+    /// Cancel sender for the spinner animation task
+    spinner_cancel: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl UiActor {
@@ -161,6 +187,7 @@ impl UiActor {
             last_repaint: Instant::now(),
             repaint_interval_ms: 33,
             plain_mode,
+            spinner_cancel: None,
         }
     }
 
@@ -181,15 +208,33 @@ impl UiActor {
                 self.active_draft_id = Some(draft_id);
                 self.draft_buffer.clear();
                 self.last_seq = 0;
-                // Show thinking indicator
+                // Start animated spinner (non-plain mode) or static indicator (plain mode)
                 if !self.plain_mode {
-                    let _ = execute!(
-                        io::stdout(),
-                        style::SetForegroundColor(style::Color::DarkGrey),
-                        style::Print("  Thinking..."),
-                        style::ResetColor
-                    );
-                    let _ = io::stdout().flush();
+                    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+                    self.spinner_cancel = Some(cancel_tx);
+                    tokio::spawn(async move {
+                        let frames = [
+                            '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}',
+                            '\u{2827}', '\u{2807}', '\u{280F}',
+                        ];
+                        let mut idx: usize = 0;
+                        loop {
+                            tokio::select! {
+                                () = tokio::time::sleep(std::time::Duration::from_millis(80)) => {
+                                    if let Some(frame) = frames.get(idx % frames.len()) {
+                                        eprint!("\r  {frame} Thinking...");
+                                    }
+                                    let _ = io::stderr().flush();
+                                    idx = idx.wrapping_add(1);
+                                }
+                                _ = cancel_rx.changed() => {
+                                    eprint!("\r                    \r");
+                                    let _ = io::stderr().flush();
+                                    break;
+                                }
+                            }
+                        }
+                    });
                 }
             }
 
@@ -206,8 +251,11 @@ impl UiActor {
                 }
                 self.last_seq = seq;
 
-                // On first token, clear the "Thinking..." indicator
+                // On first token, cancel spinner and clear the line
                 if self.draft_buffer.is_empty() {
+                    if let Some(cancel) = self.spinner_cancel.take() {
+                        let _ = cancel.send(true);
+                    }
                     print!("\r");
                     let _ = execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine));
                 }
@@ -239,6 +287,11 @@ impl UiActor {
             }
 
             UiEvent::DraftFinalized { draft_id, full_text } => {
+                // Cancel spinner if still running
+                if let Some(cancel) = self.spinner_cancel.take() {
+                    let _ = cancel.send(true);
+                }
+
                 if self.active_draft_id.as_deref() != Some(&draft_id) {
                     // Stale finalize — just print as a final message
                     if !full_text.is_empty() {
@@ -265,6 +318,11 @@ impl UiActor {
             }
 
             UiEvent::DraftCancelled { draft_id } => {
+                // Cancel spinner if still running
+                if let Some(cancel) = self.spinner_cancel.take() {
+                    let _ = cancel.send(true);
+                }
+
                 if self.active_draft_id.as_deref() == Some(&draft_id) {
                     // Clear current line
                     print!("\r");
@@ -297,13 +355,22 @@ impl UiActor {
                 }
             }
 
-            UiEvent::ToolCallFinished { name, success } => {
+            UiEvent::ToolCallFinished {
+                name,
+                success,
+                duration_ms,
+            } => {
+                let duration_str = if duration_ms >= 1000 {
+                    format!("{:.1}s", duration_ms as f64 / 1000.0)
+                } else {
+                    format!("{duration_ms}ms")
+                };
                 if success {
                     if !self.plain_mode {
                         let _ = execute!(
                             io::stdout(),
                             style::SetForegroundColor(style::Color::Green),
-                            style::Print(format!("  ✓ {name}\n")),
+                            style::Print(format!("  \u{2713} {name} ({duration_str})\n")),
                             style::ResetColor
                         );
                     }
@@ -311,11 +378,30 @@ impl UiActor {
                     let _ = execute!(
                         io::stdout(),
                         style::SetForegroundColor(style::Color::Red),
-                        style::Print(format!("  ✗ {name} (failed)\n")),
+                        style::Print(format!("  \u{2717} {name} (failed, {duration_str})\n")),
                         style::ResetColor
                     );
                 } else {
-                    println!("  [tool: {name}] {}", if success { "ok" } else { "failed" });
+                    let status = if success { "ok" } else { "failed" };
+                    println!("  [tool: {name}] {status} ({duration_str})");
+                }
+            }
+
+            UiEvent::ToolProgress {
+                iteration,
+                max_iterations,
+            } => {
+                if !self.plain_mode {
+                    let _ = execute!(
+                        io::stdout(),
+                        style::SetForegroundColor(style::Color::Cyan),
+                        style::Print(format!(
+                            "  \u{25B6} Step {iteration}/{max_iterations} \u{2014} continuing...\n"
+                        )),
+                        style::ResetColor
+                    );
+                } else {
+                    println!("  [step {iteration}/{max_iterations}] continuing...");
                 }
             }
 
@@ -517,12 +603,24 @@ impl TerminalChannel {
     }
 
     /// Send a tool-call-finished notification to the UI Actor.
-    pub async fn notify_tool_finished(&self, name: &str, success: bool) {
+    pub async fn notify_tool_finished(&self, name: &str, success: bool, duration_ms: u64) {
         let _ = self
             .ui_tx
             .send(UiEvent::ToolCallFinished {
                 name: name.to_string(),
                 success,
+                duration_ms,
+            })
+            .await;
+    }
+
+    /// Send a tool-loop progress notification to the UI Actor.
+    pub async fn notify_progress(&self, iteration: usize, max_iterations: usize) {
+        let _ = self
+            .ui_tx
+            .send(UiEvent::ToolProgress {
+                iteration,
+                max_iterations,
             })
             .await;
     }
