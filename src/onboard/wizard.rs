@@ -1,5 +1,6 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use crate::config::init::Spec;
 use crate::config::schema::{
     DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
 };
@@ -96,8 +97,7 @@ const fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
 
 // ── Main wizard entry point ──────────────────────────────────────
 
-#[allow(unsafe_code)]
-pub async fn run_wizard() -> Result<Config> {
+pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
     println!("{}", style(BANNER).cyan().bold());
 
     println!(
@@ -113,7 +113,7 @@ pub async fn run_wizard() -> Result<Config> {
     println!();
 
     print_step(1, 8, "Workspace Setup");
-    let (workspace_dir, config_path) = setup_workspace()?;
+    let (workspace_dir, config_path) = setup_workspace(config_dir)?;
 
     print_step(2, 8, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
@@ -188,7 +188,27 @@ pub async fn run_wizard() -> Result<Config> {
         media: crate::config::MediaConfig::default(),
         causal_tree: crate::causal_tree::CausalTreeConfig::default(),
         security: crate::config::SecurityConfig::default(),
+        modules: crate::config::schema::ModulesConfig::default(),
     };
+
+    // ── Detect Spec from wizard choices ──────────────────────────
+    // Full  → user configured messaging channels (Telegram, Discord, Slack, …)
+    // Server → user configured a tunnel (non-local gateway exposure)
+    // Minimal → local CLI only
+    let spec = if has_launchable_channels(&config.channels_config) {
+        Spec::Full
+    } else if config.tunnel.provider != "none" {
+        Spec::Server
+    } else {
+        Spec::Minimal
+    };
+
+    // Apply the spec's module flags so the saved config reflects what is
+    // actually enabled.  Channels flag is set explicitly from wizard state.
+    let mut modules = spec.modules();
+    modules.channels = has_launchable_channels(&config.channels_config);
+    let mut config = config;
+    config.modules = modules;
 
     println!(
         "  {} Security: {} | workspace-scoped",
@@ -201,8 +221,17 @@ pub async fn run_wizard() -> Result<Config> {
         style(&config.memory.backend).green(),
         if config.memory.auto_save { "on" } else { "off" }
     );
+    println!(
+        "  {} Config layout: {} ({})",
+        style("✓").green().bold(),
+        style("config.d/ split").green(),
+        style(spec.name()).cyan()
+    );
 
-    config.save().await?;
+    // Write config.toml (main) + config.d/ fragment files.
+    // This replaces the flat config.save() call so that the user's
+    // workspace is set up with the split layout from the start.
+    crate::config::files::write_split_config(&config, false).await?;
     persist_workspace_selection(&config.config_path).await?;
 
     // ── Final summary ────────────────────────────────────────────
@@ -210,6 +239,7 @@ pub async fn run_wizard() -> Result<Config> {
 
     // ── Offer to launch channels immediately ─────────────────────
     let has_channels = has_launchable_channels(&config.channels_config);
+    let mut autostart = false;
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -228,19 +258,15 @@ pub async fn run_wizard() -> Result<Config> {
                 style("Starting channel server...").white().bold()
             );
             println!();
-            // Signal to main.rs to call start_channels after wizard returns
-            // SAFETY: Wizard runs on a single interactive thread; no concurrent
-            // env readers exist at this point.
-            unsafe { std::env::set_var("OPENPRX_AUTOSTART_CHANNELS", "1") };
+            autostart = true;
         }
     }
 
-    Ok(config)
+    Ok((config, autostart))
 }
 
 /// Interactive repair flow: rerun channel setup only without redoing full onboarding.
-#[allow(unsafe_code)]
-pub async fn run_channels_repair_wizard() -> Result<Config> {
+pub async fn run_channels_repair_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
     println!("{}", style(BANNER).cyan().bold());
     println!(
         "  {}",
@@ -250,7 +276,7 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     );
     println!();
 
-    let mut config = Config::load_or_init().await?;
+    let mut config = Config::load_or_init_with_config_dir(config_dir).await?;
 
     print_step(1, 1, "Channels (How You Talk to OpenPRX)");
     config.channels_config = setup_channels()?;
@@ -265,6 +291,7 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     );
 
     let has_channels = has_launchable_channels(&config.channels_config);
+    let mut autostart = false;
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -283,14 +310,11 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
                 style("Starting channel server...").white().bold()
             );
             println!();
-            // Signal to main.rs to call start_channels after wizard returns
-            // SAFETY: Wizard runs on a single interactive thread; no concurrent
-            // env readers exist at this point.
-            unsafe { std::env::set_var("OPENPRX_AUTOSTART_CHANNELS", "1") };
+            autostart = true;
         }
     }
 
-    Ok(config)
+    Ok((config, autostart))
 }
 
 // ── Quick setup (zero prompts) ───────────────────────────────────
@@ -327,6 +351,12 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         snapshot_on_hygiene: false,
         auto_hydrate: true,
         sqlite_open_timeout_secs: None,
+        lucid_cmd: None,
+        lucid_budget: None,
+        lucid_recall_timeout_ms: 5000,
+        lucid_store_timeout_ms: 3000,
+        lucid_local_hit_threshold: 3,
+        lucid_failure_cooldown_ms: 60_000,
     }
 }
 
@@ -336,12 +366,21 @@ pub async fn run_quick_setup(
     provider: Option<&str>,
     model_override: Option<&str>,
     memory_backend: Option<&str>,
+    config_dir: Option<&str>,
 ) -> Result<Config> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
 
-    run_quick_setup_with_home(credential_override, provider, model_override, memory_backend, &home).await
+    run_quick_setup_with_home(
+        credential_override,
+        provider,
+        model_override,
+        memory_backend,
+        config_dir,
+        &home,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -350,6 +389,7 @@ async fn run_quick_setup_with_home(
     provider: Option<&str>,
     model_override: Option<&str>,
     memory_backend: Option<&str>,
+    config_dir: Option<&str>,
     home: &Path,
 ) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
@@ -361,7 +401,7 @@ async fn run_quick_setup_with_home(
     );
     println!();
 
-    let openprx_dir = default_user_config_dir(home);
+    let openprx_dir = config_dir.map_or_else(|| default_user_config_dir(home), PathBuf::from);
     let workspace_dir = openprx_dir.join("workspace");
     let config_path = openprx_dir.join("config.toml");
 
@@ -430,6 +470,7 @@ async fn run_quick_setup_with_home(
         media: crate::config::MediaConfig::default(),
         causal_tree: crate::causal_tree::CausalTreeConfig::default(),
         security: crate::config::SecurityConfig::default(),
+        modules: crate::config::schema::ModulesConfig::default(),
     };
 
     config.save().await?;
@@ -1489,25 +1530,29 @@ async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
 
 // ── Step 1: Workspace ────────────────────────────────────────────
 
-fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
-    let default_dir = default_user_config_dir(&home);
-
-    print_bullet(&format!("Default location: {}", style(default_dir.display()).green()));
-
-    let use_default = Confirm::new()
-        .with_prompt("  Use default workspace location?")
-        .default(true)
-        .interact()?;
-
-    let openprx_dir = if use_default {
-        default_dir
+fn setup_workspace(config_dir: Option<&str>) -> Result<(PathBuf, PathBuf)> {
+    let openprx_dir = if let Some(dir) = config_dir {
+        PathBuf::from(dir)
     } else {
-        let custom: String = Input::new().with_prompt("  Enter workspace path").interact_text()?;
-        let expanded = shellexpand::tilde(&custom).to_string();
-        PathBuf::from(expanded)
+        let home = directories::UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .context("Could not find home directory")?;
+        let default_dir = default_user_config_dir(&home);
+
+        print_bullet(&format!("Default location: {}", style(default_dir.display()).green()));
+
+        let use_default = Confirm::new()
+            .with_prompt("  Use default workspace location?")
+            .default(true)
+            .interact()?;
+
+        if use_default {
+            default_dir
+        } else {
+            let custom: String = Input::new().with_prompt("  Enter workspace path").interact_text()?;
+            let expanded = shellexpand::tilde(&custom).to_string();
+            PathBuf::from(expanded)
+        }
     };
 
     let workspace_dir = openprx_dir.join("workspace");
@@ -3016,6 +3061,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         group_policy: crate::config::schema::GroupPolicy::default(),
                         group_allow_from: Vec::new(),
                         mention_only: false,
+                        ws_url: None,
                     });
 
                     println!("  {} WhatsApp Web configuration saved.", style("✅").green().bold());
@@ -3094,7 +3140,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     access_token: Some(access_token.trim().to_string()),
                     phone_number_id: Some(phone_number_id.trim().to_string()),
                     verify_token: Some(verify_token.trim().to_string()),
-                    app_secret: None, // Can be set via OPENPRX_WHATSAPP_APP_SECRET env var
+                    app_secret: None,
                     session_path: None,
                     pair_phone: None,
                     pair_code: None,
@@ -3103,6 +3149,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     group_policy: crate::config::schema::GroupPolicy::default(),
                     group_allow_from: Vec::new(),
                     mention_only: false,
+                    ws_url: None,
                 });
             }
             ChannelMenuChoice::Linq => {
@@ -4356,6 +4403,7 @@ mod tests {
             Some("openrouter"),
             Some("custom-model-946"),
             Some("sqlite"),
+            None,
             tmp.path(),
         )
         .await
@@ -4375,10 +4423,16 @@ mod tests {
     async fn quick_setup_without_model_uses_provider_default_model() {
         let tmp = TempDir::new().unwrap();
 
-        let config =
-            run_quick_setup_with_home(Some("sk-issue946"), Some("anthropic"), None, Some("sqlite"), tmp.path())
-                .await
-                .unwrap();
+        let config = run_quick_setup_with_home(
+            Some("sk-issue946"),
+            Some("anthropic"),
+            None,
+            Some("sqlite"),
+            None,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
 
         let expected = default_model_for_provider("anthropic");
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));

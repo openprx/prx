@@ -246,7 +246,15 @@ impl Tool for HttpRequestTool {
                 let response_headers = response.headers().iter();
                 let headers_text = response_headers
                     .map(|(k, v)| {
-                        let is_sensitive = k.as_str().to_lowercase().contains("set-cookie");
+                        let lower = k.as_str().to_lowercase();
+                        let is_sensitive = lower.contains("cookie")
+                            || lower.contains("authorization")
+                            || lower.contains("x-api-key")
+                            || lower.contains("x-auth-token")
+                            || lower.contains("proxy-auth")
+                            || lower.contains("www-authenticate")
+                            || lower.contains("x-csrf")
+                            || lower.contains("x-xsrf");
                         if is_sensitive {
                             format!("{}: ***REDACTED***", k.as_str())
                         } else {

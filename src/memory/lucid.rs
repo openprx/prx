@@ -24,36 +24,25 @@ pub struct LucidMemory {
 impl LucidMemory {
     const DEFAULT_LUCID_CMD: &'static str = "lucid";
     const DEFAULT_TOKEN_BUDGET: usize = 200;
-    // Lucid CLI cold start can exceed 120ms on slower machines, which causes
-    // avoidable fallback to local-only memory and premature cooldown.
-    const DEFAULT_RECALL_TIMEOUT_MS: u64 = 500;
-    const DEFAULT_STORE_TIMEOUT_MS: u64 = 800;
-    const DEFAULT_LOCAL_HIT_THRESHOLD: usize = 3;
-    const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
 
-    pub fn new(workspace_dir: &Path, local: SqliteMemory) -> Self {
-        let lucid_cmd = std::env::var("ZEROCLAW_LUCID_CMD").unwrap_or_else(|_| Self::DEFAULT_LUCID_CMD.to_string());
+    pub fn new(workspace_dir: &Path, local: SqliteMemory, config: &crate::config::MemoryConfig) -> Self {
+        let lucid_cmd = config
+            .lucid_cmd
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(Self::DEFAULT_LUCID_CMD)
+            .to_string();
 
-        let token_budget = std::env::var("ZEROCLAW_LUCID_BUDGET")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+        let token_budget = config
+            .lucid_budget
+            .map(|v| v as usize)
             .filter(|v| *v > 0)
             .unwrap_or(Self::DEFAULT_TOKEN_BUDGET);
 
-        let recall_timeout =
-            Self::read_env_duration_ms("OPENPRX_LUCID_RECALL_TIMEOUT_MS", Self::DEFAULT_RECALL_TIMEOUT_MS, 20);
-        let store_timeout =
-            Self::read_env_duration_ms("OPENPRX_LUCID_STORE_TIMEOUT_MS", Self::DEFAULT_STORE_TIMEOUT_MS, 50);
-        let local_hit_threshold = Self::read_env_usize(
-            "OPENPRX_LUCID_LOCAL_HIT_THRESHOLD",
-            Self::DEFAULT_LOCAL_HIT_THRESHOLD,
-            1,
-        );
-        let failure_cooldown = Self::read_env_duration_ms(
-            "OPENPRX_LUCID_FAILURE_COOLDOWN_MS",
-            Self::DEFAULT_FAILURE_COOLDOWN_MS,
-            100,
-        );
+        let recall_timeout = Duration::from_millis(config.lucid_recall_timeout_ms.max(20));
+        let store_timeout = Duration::from_millis(config.lucid_store_timeout_ms.max(50));
+        let local_hit_threshold = config.lucid_local_hit_threshold.max(1);
+        let failure_cooldown = Duration::from_millis(config.lucid_failure_cooldown_ms.max(100));
 
         Self {
             local,
@@ -91,21 +80,6 @@ impl LucidMemory {
             failure_cooldown,
             last_failure_at: Mutex::new(None),
         }
-    }
-
-    fn read_env_usize(name: &str, default: usize, min: usize) -> usize {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map_or(default, |v| v.max(min))
-    }
-
-    fn read_env_duration_ms(name: &str, default_ms: u64, min_ms: u64) -> Duration {
-        let millis = std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map_or(default_ms, |v| v.max(min_ms));
-        Duration::from_millis(millis)
     }
 
     fn in_failure_cooldown(&self) -> bool {

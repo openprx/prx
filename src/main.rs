@@ -192,6 +192,19 @@ enum CompletionShell {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Initialize PRX workspace with preset configuration
+    Init {
+        /// Configuration preset
+        #[arg(long, value_enum, default_value = "minimal")]
+        spec: crate::config::init::Spec,
+        /// Target directory (default: ~/.openprx)
+        #[arg(long)]
+        dir: Option<String>,
+        /// Overwrite existing configuration
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Initialize your workspace and configuration
     Onboard {
         /// Run the full interactive wizard (default is quick setup)
@@ -807,9 +820,6 @@ async fn main() -> Result<()> {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
         }
-        // SAFETY: Called during single-threaded CLI argument parsing before any
-        // async runtime or worker threads are spawned.
-        unsafe { std::env::set_var("OPENPRX_CONFIG_DIR", config_dir) };
     }
 
     // session-worker must stay stdout-clean for IPC JSON.
@@ -837,6 +847,18 @@ async fn main() -> Result<()> {
         let mut stdout = std::io::stdout().lock();
         write_shell_completion(*shell, &mut stdout)?;
         return Ok(());
+    }
+
+    // Init generates a fresh workspace — no existing config needed.
+    if let Commands::Init { spec, dir, force } = &cli.command {
+        let target = match dir {
+            Some(d) => std::path::PathBuf::from(d),
+            None => directories::UserDirs::new()
+                .map(|u| u.home_dir().to_path_buf())
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
+                .join(".openprx"),
+        };
+        return spec.generate(&target, *force);
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
@@ -874,37 +896,35 @@ async fn main() -> Result<()> {
         if channels_only && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some()) {
             bail!("--channels-only does not accept --api-key, --provider, --model, or --memory");
         }
-        let config = if channels_only {
-            onboard::wizard::run_channels_repair_wizard().await
+        let config_dir = cli.config_dir.as_deref();
+        let autostart_config = if channels_only {
+            let (config, autostart) = onboard::wizard::run_channels_repair_wizard(config_dir).await?;
+            if autostart { Some(config) } else { None }
         } else if interactive {
-            onboard::wizard::run_wizard().await
+            let (config, autostart) = onboard::wizard::run_wizard(config_dir).await?;
+            if autostart { Some(config) } else { None }
         } else {
             onboard::wizard::run_quick_setup(
                 api_key.as_deref(),
                 provider.as_deref(),
                 model.as_deref(),
                 memory.as_deref(),
+                config_dir,
             )
-            .await
-        }?;
-        // Auto-start channels if user said yes during wizard
-        if std::env::var("OPENPRX_AUTOSTART_CHANNELS")
-            .or_else(|_| {
-                std::env::var("OPENPRX_AUTOSTART_CHANNELS").or_else(|_| std::env::var("ZEROCLAW_AUTOSTART_CHANNELS"))
-            })
-            .as_deref()
-            == Ok("1")
-        {
+            .await?;
+            None
+        };
+        if let Some(config) = autostart_config {
             channels::start_channels(config).await?;
         }
         return Ok(());
     }
 
     // All other commands need config loaded first
-    let mut config = Config::load_or_init().await?;
-    config.apply_env_overrides();
+    let config = Config::load_or_init_with_config_dir(cli.config_dir.as_deref()).await?;
 
     match cli.command {
+        Commands::Init { .. } => anyhow::bail!("BUG: Init command should have been handled earlier"),
         Commands::Onboard { .. } => anyhow::bail!("BUG: Onboard command should have been handled earlier"),
         Commands::Completions { .. } => anyhow::bail!("BUG: Completions command should have been handled earlier"),
         Commands::SessionWorker { .. } => anyhow::bail!("BUG: SessionWorker command should have been handled earlier"),

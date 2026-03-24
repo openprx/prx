@@ -323,37 +323,11 @@ fn load_open_skills(repo_dir: &Path) -> Vec<Skill> {
     skills
 }
 
-fn parse_open_skills_enabled(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn open_skills_enabled_from_sources(config_open_skills_enabled: Option<bool>, env_override: Option<&str>) -> bool {
-    if let Some(raw) = env_override {
-        if let Some(enabled) = parse_open_skills_enabled(&raw) {
-            return enabled;
-        }
-        if !raw.trim().is_empty() {
-            tracing::warn!("Ignoring invalid ZEROCLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)");
-        }
-    }
-
+fn open_skills_enabled(config_open_skills_enabled: Option<bool>) -> bool {
     config_open_skills_enabled.unwrap_or(false)
 }
 
-fn open_skills_enabled(config_open_skills_enabled: Option<bool>) -> bool {
-    let env_override = std::env::var("ZEROCLAW_OPEN_SKILLS_ENABLED").ok();
-    open_skills_enabled_from_sources(config_open_skills_enabled, env_override.as_deref())
-}
-
-fn resolve_open_skills_dir_from_sources(
-    env_dir: Option<&str>,
-    config_dir: Option<&str>,
-    home_dir: Option<&Path>,
-) -> Option<PathBuf> {
+fn resolve_open_skills_dir(config_open_skills_dir: Option<&str>) -> Option<PathBuf> {
     let parse_dir = |raw: &str| {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -363,19 +337,10 @@ fn resolve_open_skills_dir_from_sources(
         }
     };
 
-    if let Some(env_dir) = env_dir.and_then(parse_dir) {
-        return Some(env_dir);
-    }
-    if let Some(config_dir) = config_dir.and_then(parse_dir) {
+    if let Some(config_dir) = config_open_skills_dir.and_then(parse_dir) {
         return Some(config_dir);
     }
-    home_dir.map(|home| home.join("open-skills"))
-}
-
-fn resolve_open_skills_dir(config_open_skills_dir: Option<&str>) -> Option<PathBuf> {
-    let env_dir = std::env::var("ZEROCLAW_OPEN_SKILLS_DIR").ok();
-    let home_dir = UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
-    resolve_open_skills_dir_from_sources(env_dir.as_deref(), config_open_skills_dir, home_dir.as_deref())
+    UserDirs::new().map(|dirs| dirs.home_dir().join("open-skills"))
 }
 
 fn ensure_open_skills_repo(
@@ -560,7 +525,7 @@ fn extract_description(content: &str) -> String {
 }
 
 /// Resolve the local clone directory for the openclaw-skills repo.
-/// Priority: env var → config value → `~/.openprx/openclaw-skills/`
+/// Priority: config value → `~/.openprx/openclaw-skills/`
 fn resolve_openclaw_skills_dir(config_openclaw_skills_dir: Option<&str>) -> Option<PathBuf> {
     let parse_dir = |raw: &str| {
         let trimmed = raw.trim();
@@ -571,21 +536,12 @@ fn resolve_openclaw_skills_dir(config_openclaw_skills_dir: Option<&str>) -> Opti
         }
     };
 
-    // 1. Env var override
-    if let Some(env_dir) = std::env::var("ZEROCLAW_OPENCLAW_SKILLS_DIR")
-        .ok()
-        .as_deref()
-        .and_then(parse_dir)
-    {
-        return Some(env_dir);
-    }
-
-    // 2. Config value
+    // 1. Config value
     if let Some(config_dir) = config_openclaw_skills_dir.and_then(parse_dir) {
         return Some(config_dir);
     }
 
-    // 3. Default: ~/.openprx/openclaw-skills/
+    // 2. Default: ~/.openprx/openclaw-skills/
     UserDirs::new().map(|dirs| dirs.home_dir().join(".openprx/openclaw-skills"))
 }
 
@@ -595,18 +551,7 @@ fn ensure_openclaw_skills_repo(
     config_openclaw_skills_enabled: Option<bool>,
     config_openclaw_skills_dir: Option<&str>,
 ) -> Option<PathBuf> {
-    // Check enabled flag (env var takes priority over config)
-    let enabled = {
-        let env_override = std::env::var("ZEROCLAW_OPENCLAW_SKILLS_ENABLED").ok();
-        env_override.as_deref().map_or_else(
-            || config_openclaw_skills_enabled.unwrap_or(false),
-            |raw| match raw.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => true,
-                "0" | "false" | "no" | "off" => false,
-                _ => config_openclaw_skills_enabled.unwrap_or(false),
-            },
-        )
-    };
+    let enabled = config_openclaw_skills_enabled.unwrap_or(false);
 
     if !enabled {
         return None;
@@ -1175,42 +1120,6 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
-
-    fn open_skills_env_lock() -> &'static Mutex<()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn unset(key: &'static str) -> Self {
-            let original = std::env::var(key).ok();
-            // SAFETY: test-only, single-threaded test runner
-            unsafe { std::env::remove_var(key) };
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn drop(&mut self) {
-            // SAFETY: test-only, single-threaded test runner
-            unsafe {
-                if let Some(value) = &self.original {
-                    std::env::set_var(self.key, value);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
-
     #[test]
     fn load_empty_skills_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -1566,40 +1475,28 @@ description = "Bare minimum"
     }
 
     #[test]
-    fn open_skills_enabled_resolution_prefers_env_then_config_then_default_false() {
-        assert!(!open_skills_enabled_from_sources(None, None));
-        assert!(open_skills_enabled_from_sources(Some(true), None));
-        assert!(!open_skills_enabled_from_sources(Some(true), Some("0")));
-        assert!(open_skills_enabled_from_sources(Some(false), Some("yes")));
-        // Invalid env values should fall back to config.
-        assert!(open_skills_enabled_from_sources(Some(true), Some("invalid")));
-        assert!(!open_skills_enabled_from_sources(Some(false), Some("invalid")));
+    fn open_skills_enabled_uses_config_then_default_false() {
+        assert!(!open_skills_enabled(None));
+        assert!(open_skills_enabled(Some(true)));
+        assert!(!open_skills_enabled(Some(false)));
     }
 
     #[test]
-    fn resolve_open_skills_dir_resolution_prefers_env_then_config_then_home() {
-        let home = Path::new("/tmp/home-dir");
+    fn resolve_open_skills_dir_uses_config_then_home() {
         assert_eq!(
-            resolve_open_skills_dir_from_sources(Some("/tmp/env-skills"), Some("/tmp/config"), Some(home)),
-            Some(PathBuf::from("/tmp/env-skills"))
-        );
-        assert_eq!(
-            resolve_open_skills_dir_from_sources(Some("   "), Some("/tmp/config-skills"), Some(home)),
+            resolve_open_skills_dir(Some("/tmp/config-skills")),
             Some(PathBuf::from("/tmp/config-skills"))
         );
-        assert_eq!(
-            resolve_open_skills_dir_from_sources(None, None, Some(home)),
-            Some(PathBuf::from("/tmp/home-dir/open-skills"))
+        // Empty config falls back to home
+        let home_result = resolve_open_skills_dir(None);
+        assert!(
+            home_result.as_ref().map_or(false, |p| p.ends_with("open-skills")),
+            "default path should end with open-skills, got: {home_result:?}"
         );
-        assert_eq!(resolve_open_skills_dir_from_sources(None, None, None), None);
     }
 
     #[test]
     fn load_skills_with_config_reads_open_skills_dir_without_network() {
-        let _env_guard = open_skills_env_lock().lock().unwrap();
-        let _enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_ENABLED");
-        let _dir_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_DIR");
-
         let dir = tempfile::tempdir().unwrap();
         let workspace_dir = dir.path().join("workspace");
         fs::create_dir_all(workspace_dir.join("skills")).unwrap();
@@ -1706,11 +1603,8 @@ description = "Bare minimum"
     // --- resolve_openclaw_skills_dir ---
 
     #[test]
-    fn resolve_openclaw_skills_dir_prefers_env_then_config_then_default() {
-        // Temporarily clear env so we can test the logic in isolation.
-        let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
-
-        // Config value used when env is absent.
+    fn resolve_openclaw_skills_dir_prefers_config_then_default() {
+        // Config value used.
         let result = resolve_openclaw_skills_dir(Some("/tmp/my-openclaw-skills"));
         assert_eq!(result, Some(PathBuf::from("/tmp/my-openclaw-skills")));
 
@@ -1726,40 +1620,12 @@ description = "Bare minimum"
         );
     }
 
-    #[test]
-    #[allow(unsafe_code)]
-    fn resolve_openclaw_skills_dir_env_takes_priority_over_config() {
-        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
-        let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
-        // SAFETY: test-only, single-threaded test runner
-        unsafe { std::env::set_var("ZEROCLAW_OPENCLAW_SKILLS_DIR", "/tmp/env-openclaw") };
-
-        let result = resolve_openclaw_skills_dir(Some("/tmp/config-openclaw"));
-        assert_eq!(result, Some(PathBuf::from("/tmp/env-openclaw")));
-    }
-
     // --- ensure_openclaw_skills_repo (disabled) ---
 
     #[test]
     fn openclaw_skills_not_loaded_when_disabled_via_config() {
-        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
-        let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
-
         // Disabled in config — should return None without touching filesystem/network.
         let result = ensure_openclaw_skills_repo(Some(false), None);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    #[allow(unsafe_code)]
-    fn openclaw_skills_not_loaded_when_disabled_via_env() {
-        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
-        let _guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
-        // SAFETY: test-only, single-threaded test runner
-        unsafe { std::env::set_var("ZEROCLAW_OPENCLAW_SKILLS_ENABLED", "false") };
-
-        // Even if config says enabled, env override wins.
-        let result = ensure_openclaw_skills_repo(Some(true), None);
         assert!(result.is_none());
     }
 
@@ -1767,10 +1633,6 @@ description = "Bare minimum"
 
     #[test]
     fn openclaw_skills_disabled_returns_only_workspace_skills() {
-        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
-        let _env_enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
-        let _env_dir_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
-
         let dir = tempfile::tempdir().unwrap();
         let workspace_dir = dir.path().join("workspace");
         fs::create_dir_all(workspace_dir.join("skills")).unwrap();
@@ -1786,11 +1648,6 @@ description = "Bare minimum"
 
     #[test]
     fn openclaw_skills_loads_from_local_dir_via_config() {
-        let _env_lock = open_skills_env_lock().lock().unwrap_or_else(|p| p.into_inner());
-        let _env_enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_ENABLED");
-        let _env_dir_guard = EnvVarGuard::unset("ZEROCLAW_OPENCLAW_SKILLS_DIR");
-        let _open_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_ENABLED");
-
         let dir = tempfile::tempdir().unwrap();
         let workspace_dir = dir.path().join("workspace");
         fs::create_dir_all(workspace_dir.join("skills")).unwrap();

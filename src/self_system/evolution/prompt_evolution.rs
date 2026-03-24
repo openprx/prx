@@ -38,6 +38,7 @@ pub struct PromptEvolutionEngine {
     shared_config: SharedEvolutionConfig,
     workspace_root: PathBuf,
     writer: Option<Arc<AsyncJsonlWriter>>,
+    debug_raw: bool,
 }
 
 impl PromptEvolutionEngine {
@@ -50,7 +51,14 @@ impl PromptEvolutionEngine {
             shared_config,
             workspace_root: workspace_root.as_ref().to_path_buf(),
             writer,
+            debug_raw: false,
         }
+    }
+
+    /// Create a new engine with the `evolution_debug_raw` flag from main config.
+    pub const fn with_debug_raw(mut self, debug_raw: bool) -> Self {
+        self.debug_raw = debug_raw;
+        self
     }
 
     const fn select_mutation_type(candidate: Option<&EvolutionCandidate>) -> PromptMutationType {
@@ -120,8 +128,8 @@ impl PromptEvolutionEngine {
         }
     }
 
-    fn redact_evolution_content(before: &str, after: &str, diff: &str) -> (String, String, String) {
-        if is_raw_debug_enabled() {
+    fn redact_evolution_content(before: &str, after: &str, diff: &str, debug_raw: bool) -> (String, String, String) {
+        if is_raw_debug_enabled(debug_raw) {
             return (before.to_string(), after.to_string(), diff.to_string());
         }
 
@@ -274,7 +282,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
                 notes = "prompt mutation applied".to_string();
             }
         }
-        let (log_before, log_after, log_diff) = Self::redact_evolution_content(&before, &after, &diff);
+        let (log_before, log_after, log_diff) = Self::redact_evolution_content(&before, &after, &diff, self.debug_raw);
 
         let evolution_log = EvolutionLog {
             experiment_id: proposal.id.clone(),

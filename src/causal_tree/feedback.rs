@@ -10,7 +10,7 @@
 //! | Type | Behaviour |
 //! |------|-----------|
 //! | [`LogFeedbackWriter`] | Structured `tracing::info!` log; never blocks the caller. |
-//! | [`NoopFeedbackWriter`] | Silent no-op; intended for disabled CTE or unit tests. |
+//! | `NoopFeedbackWriter` (test-only) | Silent no-op; intended for unit tests. |
 
 use async_trait::async_trait;
 
@@ -112,15 +112,16 @@ impl FeedbackWriter for LogFeedbackWriter {
 // NoopFeedbackWriter
 // ---------------------------------------------------------------------------
 
-/// No-op feedback writer.
+/// No-op feedback writer for unit tests.
 ///
-/// Silently discards the decision without any I/O. Use this when:
-/// * The CTE is disabled (`CausalTreeConfig::enabled == false`).
-/// * Unit tests that do not care about feedback side-effects.
-/// * Any context where feedback overhead must be zero.
+/// Silently discards the decision without any I/O. Used in tests that
+/// need a `FeedbackWriter` implementation but do not care about feedback
+/// side-effects.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct NoopFeedbackWriter;
 
+#[cfg(test)]
 impl NoopFeedbackWriter {
     /// Create a new [`NoopFeedbackWriter`].
     pub const fn new() -> Self {
@@ -128,6 +129,7 @@ impl NoopFeedbackWriter {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl FeedbackWriter for NoopFeedbackWriter {
     async fn write_decision(

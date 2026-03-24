@@ -264,6 +264,11 @@ impl BrowserTool {
         cfg!(feature = "browser-native")
     }
 
+    // Not `const fn`: with `browser-native` feature the body calls non-const
+    // methods; without it the body is trivially const but clippy would flag
+    // the non-feature build as "could be const".  Suppress the lint to avoid
+    // the contradiction.
+    #[allow(clippy::missing_const_for_fn)]
     fn rust_native_available(&self) -> bool {
         #[cfg(feature = "browser-native")]
         {

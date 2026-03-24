@@ -405,7 +405,7 @@ async fn int_mm_02_lucid_delegates_to_sqlite() {
 
     let tmp = tempfile::TempDir::new().expect("test: create temp dir");
     let sqlite = SqliteMemory::new(tmp.path()).expect("test: create sqlite memory");
-    let lucid = LucidMemory::new(tmp.path(), sqlite);
+    let lucid = LucidMemory::new(tmp.path(), sqlite, &openprx::config::MemoryConfig::default());
 
     // Store through LucidMemory
     lucid

@@ -576,7 +576,23 @@ impl McpTool {
         match result {
             Ok(r) => {
                 let value = serde_json::to_value(r)?;
-                tracing::debug!(server = server_name, tool = tool_name, result = %value, "MCP call_stdio: result");
+                let result_type = if value.is_object() {
+                    "object"
+                } else if value.is_array() {
+                    "array"
+                } else if value.is_string() {
+                    "string"
+                } else {
+                    "other"
+                };
+                let result_bytes = value.to_string().len();
+                tracing::debug!(
+                    server = server_name,
+                    tool = tool_name,
+                    result_type,
+                    result_bytes,
+                    "MCP call_stdio: result received"
+                );
                 Ok(Self::extract_call_success_and_output(&value))
             }
             Err(e) => {

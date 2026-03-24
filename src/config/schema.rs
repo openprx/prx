@@ -1,6 +1,5 @@
 use crate::auth::codex_auth::default_codex_auth_json_path;
-use crate::config::files::{build_split_tables, read_merged_toml};
-use crate::providers::{is_glm_alias, is_zai_alias};
+use crate::config::files::{build_split_tables, read_merged_toml_with_gate};
 use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -53,6 +52,136 @@ static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> = OnceLock::new();
 
 // ── Top-level config ──────────────────────────────────────────────
+
+// ── Module switches ─────────────────────────────────────────────
+
+/// Controls which config.d/ module files are loaded and which subsystems are active.
+/// When a module is disabled, its config.d/ file is skipped during config loading.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ModulesConfig {
+    /// Memory and persistent storage module (config.d/memory.toml)
+    #[serde(default = "default_true")]
+    pub memory: bool,
+    /// Messaging channels: Telegram, Discord, Signal, etc. (config.d/channels.toml)
+    #[serde(default)]
+    pub channels: bool,
+    /// Gateway, tunnel, and proxy networking (config.d/network.toml)
+    #[serde(default = "default_true")]
+    pub network: bool,
+    /// Security, autonomy, and secrets (config.d/security.toml)
+    #[serde(default = "default_true")]
+    pub security: bool,
+    /// Scheduler, cron, heartbeat, and Xin engine (config.d/scheduler.toml)
+    #[serde(default)]
+    pub scheduler: bool,
+    /// Agent engine, sessions, self-system, and causal tree (config.d/agent.toml)
+    #[serde(default = "default_true")]
+    pub agent: bool,
+    /// Identity, user policies, and auth (config.d/identity.toml)
+    #[serde(default)]
+    pub identity: bool,
+    /// LLM router, model/embedding routes, classification (config.d/routing.toml)
+    #[serde(default)]
+    pub routing: bool,
+    /// Browser, HTTP, search, media, and skills tools (config.d/tools.toml)
+    #[serde(default)]
+    pub tools: bool,
+    /// MCP, Composio, and webhook integrations (config.d/integrations.toml)
+    #[serde(default)]
+    pub integrations: bool,
+    /// Remote node proxy (config.d/nodes.toml)
+    #[serde(default)]
+    pub nodes: bool,
+    /// Cost tracking and budget enforcement (config.d/cost.toml)
+    #[serde(default)]
+    pub cost: bool,
+    /// Observability, runtime, and reliability (config.d/observability.toml)
+    #[serde(default)]
+    pub observability: bool,
+}
+
+impl Default for ModulesConfig {
+    fn default() -> Self {
+        Self {
+            memory: true,
+            channels: false,
+            network: true,
+            security: true,
+            scheduler: false,
+            agent: true,
+            identity: false,
+            routing: false,
+            tools: false,
+            integrations: false,
+            nodes: false,
+            cost: false,
+            observability: false,
+        }
+    }
+}
+
+impl ModulesConfig {
+    /// All modules enabled — used by `prx init --spec full`.
+    pub const fn all_enabled() -> Self {
+        Self {
+            memory: true,
+            channels: true,
+            network: true,
+            security: true,
+            scheduler: true,
+            agent: true,
+            identity: true,
+            routing: true,
+            tools: true,
+            integrations: true,
+            nodes: true,
+            cost: true,
+            observability: true,
+        }
+    }
+
+    /// Check if a named module is enabled.
+    ///
+    /// Returns `Some(bool)` for known module names, `None` for unknown names.
+    /// This eliminates the double-mapping between MODULE_FILE_MAP and internal match.
+    pub fn is_enabled(&self, module_name: &str) -> Option<bool> {
+        match module_name {
+            "memory" => Some(self.memory),
+            "channels" => Some(self.channels),
+            "network" => Some(self.network),
+            "security" => Some(self.security),
+            "scheduler" => Some(self.scheduler),
+            "agent" => Some(self.agent),
+            "identity" => Some(self.identity),
+            "routing" => Some(self.routing),
+            "tools" => Some(self.tools),
+            "integrations" => Some(self.integrations),
+            "nodes" => Some(self.nodes),
+            "cost" => Some(self.cost),
+            "observability" => Some(self.observability),
+            _ => None,
+        }
+    }
+
+    /// All modules disabled — base for building custom presets.
+    pub const fn all_disabled() -> Self {
+        Self {
+            memory: false,
+            channels: false,
+            network: false,
+            security: false,
+            scheduler: false,
+            agent: false,
+            identity: false,
+            routing: false,
+            tools: false,
+            integrations: false,
+            nodes: false,
+            cost: false,
+            observability: false,
+        }
+    }
+}
 
 /// Top-level OpenPRX configuration, loaded from `config.toml`.
 ///
@@ -246,6 +375,10 @@ pub struct Config {
     /// Security configuration: sandboxing, resource limits, audit, tool policy (`[security]`).
     #[serde(default)]
     pub security: SecurityConfig,
+
+    /// Module control switches — determines which config.d/ files are loaded (`[modules]`).
+    #[serde(default)]
+    pub modules: ModulesConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -300,6 +433,7 @@ impl std::fmt::Debug for Config {
             .field("media", &self.media)
             .field("causal_tree", &self.causal_tree)
             .field("security", &self.security)
+            .field("modules", &self.modules)
             .finish()
     }
 }
@@ -921,6 +1055,14 @@ pub struct SelfSystemConfig {
     /// Evolution scheduler interval in hours (daemon mode).
     #[serde(default = "default_self_system_evolution_interval_hours")]
     pub evolution_interval_hours: u32,
+
+    /// Path to evolution config file (replaces OPENPRX_EVOLUTION_CONFIG / ZEROCLAW_EVOLUTION_CONFIG)
+    #[serde(default)]
+    pub evolution_config_path: Option<String>,
+
+    /// Enable debug raw output for evolution (replaces OPENPRX_EVOLUTION_DEBUG_RAW / ZEROCLAW_EVOLUTION_DEBUG_RAW)
+    #[serde(default)]
+    pub evolution_debug_raw: bool,
 }
 
 const fn default_self_system_fitness_interval_hours() -> u64 {
@@ -938,6 +1080,8 @@ impl Default for SelfSystemConfig {
             fitness_interval_hours: default_self_system_fitness_interval_hours(),
             evolution_enabled: true,
             evolution_interval_hours: default_self_system_evolution_interval_hours(),
+            evolution_config_path: None,
+            evolution_debug_raw: false,
         }
     }
 }
@@ -2195,14 +2339,19 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
-        // SAFETY: Called during single-threaded config initialization (apply_env_overrides)
-        // before any concurrent HTTP clients read these variables.
+        // SAFETY: Called during single-threaded config initialization before any
+        // concurrent HTTP clients are created or read these env variables.
+        // `set_proxy_env_vars` is invoked from `Config::apply_to_env`, which is
+        // called only during startup before the async runtime spawns worker threads
+        // that could observe the environment. No concurrent readers exist at this
+        // point in the startup sequence.
         unsafe {
             std::env::set_var(key, &value);
             std::env::set_var(lowercase_key, value);
         }
     } else {
-        // SAFETY: Same single-threaded initialization context as set branch above.
+        // SAFETY: Same single-threaded initialization context as the set branch
+        // above — no concurrent readers of these env vars exist during startup.
         unsafe {
             std::env::remove_var(key);
             std::env::remove_var(lowercase_key);
@@ -2301,22 +2450,6 @@ pub fn build_runtime_proxy_client_with_timeouts(
     Ok(client)
 }
 
-fn parse_proxy_scope(raw: &str) -> Option<ProxyScope> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "environment" | "env" => Some(ProxyScope::Environment),
-        "prx" | "internal" | "core" => Some(ProxyScope::Zeroclaw),
-        "services" | "service" => Some(ProxyScope::Services),
-        _ => None,
-    }
-}
-
-fn parse_proxy_enabled(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
 // ── Memory ───────────────────────────────────────────────────
 
 /// Persistent storage configuration (`[storage]` section).
@@ -2451,6 +2584,32 @@ pub struct MemoryConfig {
     /// None = wait indefinitely (default). Recommended max: 300.
     #[serde(default)]
     pub sqlite_open_timeout_secs: Option<u64>,
+
+    // ── Lucid memory backend options ─────────────────────────────
+    /// Path to lucid binary (replaces ZEROCLAW_LUCID_CMD / OPENPRX_LUCID_CMD)
+    #[serde(default)]
+    pub lucid_cmd: Option<String>,
+
+    /// Token budget for lucid (replaces ZEROCLAW_LUCID_BUDGET / OPENPRX_LUCID_BUDGET)
+    #[serde(default)]
+    pub lucid_budget: Option<u32>,
+
+    /// Recall timeout in ms (replaces OPENPRX_LUCID_RECALL_TIMEOUT_MS)
+    #[serde(default = "default_lucid_recall_timeout_ms")]
+    pub lucid_recall_timeout_ms: u64,
+
+    /// Store timeout in ms (replaces OPENPRX_LUCID_STORE_TIMEOUT_MS)
+    #[serde(default = "default_lucid_store_timeout_ms")]
+    pub lucid_store_timeout_ms: u64,
+
+    /// Local hit threshold: minimum number of local results before skipping
+    /// remote Lucid recall. (replaces OPENPRX_LUCID_LOCAL_HIT_THRESHOLD)
+    #[serde(default = "default_lucid_local_hit_threshold")]
+    pub lucid_local_hit_threshold: usize,
+
+    /// Failure cooldown in ms (replaces OPENPRX_LUCID_FAILURE_COOLDOWN_MS)
+    #[serde(default = "default_lucid_failure_cooldown_ms")]
+    pub lucid_failure_cooldown_ms: u64,
 }
 
 fn default_embedding_provider() -> String {
@@ -2489,6 +2648,18 @@ const fn default_min_relevance_score() -> f64 {
 const fn default_cache_size() -> usize {
     10_000
 }
+const fn default_lucid_recall_timeout_ms() -> u64 {
+    5000
+}
+const fn default_lucid_store_timeout_ms() -> u64 {
+    3000
+}
+const fn default_lucid_local_hit_threshold() -> usize {
+    3
+}
+const fn default_lucid_failure_cooldown_ms() -> u64 {
+    60_000
+}
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -2512,6 +2683,12 @@ impl Default for MemoryConfig {
             snapshot_on_hygiene: false,
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
+            lucid_cmd: None,
+            lucid_budget: None,
+            lucid_recall_timeout_ms: default_lucid_recall_timeout_ms(),
+            lucid_store_timeout_ms: default_lucid_store_timeout_ms(),
+            lucid_local_hit_threshold: default_lucid_local_hit_threshold(),
+            lucid_failure_cooldown_ms: default_lucid_failure_cooldown_ms(),
         }
     }
 }
@@ -2756,6 +2933,14 @@ pub struct RuntimeConfig {
     /// - `Some(false)`: disable reasoning/thinking when supported
     #[serde(default)]
     pub reasoning_enabled: Option<bool>,
+
+    /// Codex stream idle timeout in seconds (replaces ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS)
+    #[serde(default)]
+    pub codex_stream_idle_timeout_secs: Option<u64>,
+
+    /// Codex reasoning effort (replaces ZEROCLAW_CODEX_REASONING_EFFORT)
+    #[serde(default)]
+    pub codex_reasoning_effort: Option<String>,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -2830,6 +3015,8 @@ impl Default for RuntimeConfig {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
             reasoning_enabled: None,
+            codex_stream_idle_timeout_secs: None,
+            codex_reasoning_effort: None,
         }
     }
 }
@@ -3686,6 +3873,10 @@ pub struct WhatsAppConfig {
     /// When true, only process group messages that mention the bot.
     #[serde(default)]
     pub mention_only: bool,
+
+    /// WebSocket URL override (replaces WHATSAPP_WS_URL)
+    #[serde(default)]
+    pub ws_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -4201,6 +4392,7 @@ impl Default for Config {
             media: MediaConfig::default(),
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
+            modules: ModulesConfig::default(),
         }
     }
 }
@@ -4391,7 +4583,21 @@ fn env_openprx(name_suffix: &str) -> std::result::Result<String, std::env::VarEr
 async fn resolve_runtime_config_dirs(
     default_openprx_dir: &Path,
     default_workspace_dir: &Path,
+    explicit_config_dir: Option<&str>,
 ) -> Result<(PathBuf, PathBuf, ConfigResolutionSource)> {
+    // CLI --config-dir takes highest priority
+    if let Some(dir) = explicit_config_dir {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            let openprx_dir = PathBuf::from(dir);
+            return Ok((
+                openprx_dir.clone(),
+                openprx_dir.join("workspace"),
+                ConfigResolutionSource::EnvConfigDir,
+            ));
+        }
+    }
+
     if let Ok(custom_config_dir) = env_openprx("CONFIG_DIR") {
         let custom_config_dir = custom_config_dir.trim();
         if !custom_config_dir.is_empty() {
@@ -4498,9 +4704,94 @@ fn decrypt_config_secrets(config: &mut Config, openprx_dir: &Path) -> Result<()>
     Ok(())
 }
 
+/// Scan all config secret fields for legacy `enc:` values and migrate them to the secure
+/// `enc2:` (ChaCha20-Poly1305) format in-place, then persist the updated config to disk.
+///
+/// This is called once at startup so that secrets which have never been accessed are
+/// upgraded eagerly instead of remaining in the vulnerable XOR-cipher format indefinitely.
+/// Individual failures are logged as warnings and do not abort the migration.
+pub(crate) async fn migrate_config_legacy_secrets(config: &Config) -> Result<()> {
+    let openprx_dir = config
+        .config_path
+        .parent()
+        .context("Config path must have a parent directory")?;
+    let store = crate::security::SecretStore::new(openprx_dir, config.secrets.encrypt);
+
+    // Re-read the raw TOML to obtain the still-encrypted forms of secrets (the loaded
+    // `config` struct already has them decrypted to plaintext).
+    let raw_toml = fs::read_to_string(&config.config_path).await.with_context(|| {
+        format!(
+            "Failed to read config for legacy-secret migration: {}",
+            config.config_path.display()
+        )
+    })?;
+
+    let mut raw_config: Config =
+        toml::from_str(&raw_toml).context("Failed to parse raw config for legacy-secret migration")?;
+    raw_config.config_path = config.config_path.clone();
+    raw_config.workspace_dir = config.workspace_dir.clone();
+
+    // Migrate the fixed (non-agent) secret fields.
+    let mut fixed: Vec<Option<String>> = vec![
+        raw_config.api_key.clone(),
+        raw_config.composio.api_key.clone(),
+        raw_config.browser.computer_use.api_key.clone(),
+        raw_config.web_search.brave_api_key.clone(),
+        raw_config.storage.provider.config.db_url.clone(),
+    ];
+    let mut total_migrated = store.migrate_legacy_secrets(&mut fixed)?;
+    raw_config.api_key = fixed.get(0).cloned().flatten();
+    raw_config.composio.api_key = fixed.get(1).cloned().flatten();
+    raw_config.browser.computer_use.api_key = fixed.get(2).cloned().flatten();
+    raw_config.web_search.brave_api_key = fixed.get(3).cloned().flatten();
+    raw_config.storage.provider.config.db_url = fixed.get(4).cloned().flatten();
+
+    // Migrate per-agent api_key fields.  Use a sorted key list to avoid relying on
+    // HashMap iteration order when mapping results back.
+    let agent_keys: Vec<String> = {
+        let mut keys: Vec<String> = raw_config.agents.keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    let mut agent_values: Vec<Option<String>> = agent_keys
+        .iter()
+        .filter_map(|k| raw_config.agents.get(k).map(|a| a.api_key.clone()))
+        .collect();
+
+    total_migrated += store.migrate_legacy_secrets(&mut agent_values)?;
+
+    for (key, new_val) in agent_keys.iter().zip(agent_values) {
+        if let Some(agent) = raw_config.agents.get_mut(key) {
+            agent.api_key = new_val;
+        }
+    }
+
+    if total_migrated == 0 {
+        tracing::debug!("No legacy enc: secrets found — skipping migration write");
+        return Ok(());
+    }
+
+    tracing::info!(
+        count = total_migrated,
+        "Migrated legacy XOR-encrypted secrets to ChaCha20-Poly1305; saving config"
+    );
+
+    // Serialize and persist.  The values are already in enc2: form so we must NOT
+    // call to_stored_toml_value() (which would double-encrypt them).  Serialize
+    // directly and write atomically.
+    let toml_str =
+        toml::to_string_pretty(&toml::Value::try_from(&raw_config).context("Failed to serialize migrated config")?)
+            .context("Failed to convert migrated config to TOML string")?;
+    write_toml_string_atomic(&config.config_path, &toml_str)
+        .await
+        .context("Failed to write migrated config")?;
+
+    Ok(())
+}
+
 impl Config {
     pub(crate) fn load_from_path(config_path: &Path, workspace_dir: PathBuf) -> Result<Self> {
-        let merged = read_merged_toml(config_path)?;
+        let merged = read_merged_toml_with_gate(config_path)?;
         let mut config: Self = merged.try_into().context("Failed to deserialize merged config")?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
@@ -4509,16 +4800,19 @@ impl Config {
             .parent()
             .context("Config path must have a parent directory")?;
         decrypt_config_secrets(&mut config, openprx_dir)?;
-        config.apply_env_overrides();
         config.validate()?;
         Ok(config)
     }
 
     pub async fn load_or_init() -> Result<Self> {
+        Self::load_or_init_with_config_dir(None).await
+    }
+
+    pub async fn load_or_init_with_config_dir(explicit_config_dir: Option<&str>) -> Result<Self> {
         let (default_openprx_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
         let (openprx_dir, workspace_dir, resolution_source) =
-            resolve_runtime_config_dirs(&default_openprx_dir, &default_workspace_dir).await?;
+            resolve_runtime_config_dirs(&default_openprx_dir, &default_workspace_dir, explicit_config_dir).await?;
 
         let config_path = openprx_dir.join("config.toml");
 
@@ -4555,6 +4849,11 @@ impl Config {
                 initialized = false,
                 "Config loaded"
             );
+            // Eagerly migrate any remaining legacy enc: secrets so they are upgraded
+            // even if they have never been accessed since the XOR-cipher era.
+            if let Err(e) = migrate_config_legacy_secrets(&config).await {
+                tracing::warn!(error = %e, "Legacy secret migration encountered an error");
+            }
             Ok(config)
         } else {
             let mut config = Self::default();
@@ -4569,7 +4868,6 @@ impl Config {
                 let _ = fs::set_permissions(&config_path, Permissions::from_mode(0o600)).await;
             }
 
-            config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
                 path = %config.config_path.display(),
@@ -4673,346 +4971,6 @@ impl Config {
         self.proxy.validate()?;
 
         Ok(())
-    }
-
-    /// Apply environment variable overrides to config
-    pub fn apply_env_overrides(&mut self) {
-        // API Key: OPENPRX_API_KEY / OPENPRX_API_KEY or API_KEY (generic)
-        if let Ok(key) = env_openprx("API_KEY").or_else(|_| std::env::var("API_KEY")) {
-            if !key.is_empty() {
-                self.api_key = Some(key);
-            }
-        }
-        // API Key: GLM_API_KEY overrides when provider is a GLM/Zhipu variant.
-        if self.default_provider.as_deref().is_some_and(is_glm_alias) {
-            if let Ok(key) = std::env::var("GLM_API_KEY") {
-                if !key.is_empty() {
-                    self.api_key = Some(key);
-                }
-            }
-        }
-
-        // API Key: ZAI_API_KEY overrides when provider is a Z.AI variant.
-        if self.default_provider.as_deref().is_some_and(is_zai_alias) {
-            if let Ok(key) = std::env::var("ZAI_API_KEY") {
-                if !key.is_empty() {
-                    self.api_key = Some(key);
-                }
-            }
-        }
-
-        // Provider override precedence:
-        // 1) OPENPRX_PROVIDER / OPENPRX_PROVIDER always wins when set.
-        // 2) Legacy PROVIDER is only honored when config still uses the
-        //    default provider (openrouter) or provider is unset. This prevents
-        //    container defaults from overriding explicit custom providers.
-        if let Ok(provider) = env_openprx("PROVIDER") {
-            if !provider.is_empty() {
-                self.default_provider = Some(provider);
-            }
-        } else if let Ok(provider) = std::env::var("PROVIDER") {
-            let should_apply_legacy_provider = self
-                .default_provider
-                .as_deref()
-                .map_or(true, |configured| configured.trim().eq_ignore_ascii_case("openrouter"));
-            if should_apply_legacy_provider && !provider.is_empty() {
-                self.default_provider = Some(provider);
-            }
-        }
-
-        // Model: OPENPRX_MODEL / OPENPRX_MODEL or MODEL
-        if let Ok(model) = env_openprx("MODEL").or_else(|_| std::env::var("MODEL")) {
-            if !model.is_empty() {
-                self.default_model = Some(model);
-            }
-        }
-
-        // Workspace directory: OPENPRX_WORKSPACE
-        if let Ok(workspace) = env_openprx("WORKSPACE") {
-            if !workspace.is_empty() {
-                let (_, workspace_dir) = resolve_config_dir_for_workspace(&PathBuf::from(workspace));
-                self.workspace_dir = workspace_dir;
-            }
-        }
-
-        // Open-skills opt-in flag: OPENPRX_OPEN_SKILLS_ENABLED
-        if let Ok(flag) = env_openprx("OPEN_SKILLS_ENABLED") {
-            if !flag.trim().is_empty() {
-                match flag.trim().to_ascii_lowercase().as_str() {
-                    "1" | "true" | "yes" | "on" => self.skills.open_skills_enabled = true,
-                    "0" | "false" | "no" | "off" => self.skills.open_skills_enabled = false,
-                    _ => tracing::warn!(
-                        "Ignoring invalid OPENPRX_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
-                    ),
-                }
-            }
-        }
-
-        // Open-skills directory override: OPENPRX_OPEN_SKILLS_DIR
-        if let Ok(path) = env_openprx("OPEN_SKILLS_DIR") {
-            let trimmed = path.trim();
-            if !trimmed.is_empty() {
-                self.skills.open_skills_dir = Some(trimmed.to_string());
-            }
-        }
-
-        // OpenClaw skills opt-in flag: OPENPRX_OPENCLAW_SKILLS_ENABLED
-        if let Ok(flag) = env_openprx("OPENCLAW_SKILLS_ENABLED") {
-            if !flag.trim().is_empty() {
-                match flag.trim().to_ascii_lowercase().as_str() {
-                    "1" | "true" | "yes" | "on" => self.skills.openclaw_skills_enabled = true,
-                    "0" | "false" | "no" | "off" => self.skills.openclaw_skills_enabled = false,
-                    _ => tracing::warn!(
-                        "Ignoring invalid OPENPRX_OPENCLAW_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
-                    ),
-                }
-            }
-        }
-
-        // OpenClaw skills directory override: OPENPRX_OPENCLAW_SKILLS_DIR
-        if let Ok(path) = env_openprx("OPENCLAW_SKILLS_DIR") {
-            let trimmed = path.trim();
-            if !trimmed.is_empty() {
-                self.skills.openclaw_skills_dir = Some(trimmed.to_string());
-            }
-        }
-
-        // Gateway port: OPENPRX_GATEWAY_PORT or PORT
-        if let Ok(port_str) = env_openprx("GATEWAY_PORT").or_else(|_| std::env::var("PORT")) {
-            if let Ok(port) = port_str.parse::<u16>() {
-                self.gateway.port = port;
-            }
-        }
-
-        // Gateway host: OPENPRX_GATEWAY_HOST or HOST
-        if let Ok(host) = env_openprx("GATEWAY_HOST").or_else(|_| std::env::var("HOST")) {
-            if !host.is_empty() {
-                self.gateway.host = host;
-            }
-        }
-
-        // Allow public bind: OPENPRX_ALLOW_PUBLIC_BIND
-        if let Ok(val) = env_openprx("ALLOW_PUBLIC_BIND") {
-            self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
-        }
-
-        // Temperature: OPENPRX_TEMPERATURE
-        if let Ok(temp_str) = env_openprx("TEMPERATURE") {
-            if let Ok(temp) = temp_str.parse::<f64>() {
-                if (0.0..=2.0).contains(&temp) {
-                    self.default_temperature = temp;
-                }
-            }
-        }
-
-        // Agent read-only tool scheduler tuning.
-        if let Ok(window) = env_openprx("READ_ONLY_TOOL_CONCURRENCY_WINDOW") {
-            if let Ok(window) = window.parse::<usize>() {
-                if window > 0 {
-                    self.agent.read_only_tool_concurrency_window = window;
-                }
-            }
-        }
-        if let Ok(timeout_secs) = env_openprx("READ_ONLY_TOOL_TIMEOUT_SECS") {
-            if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
-                if timeout_secs > 0 {
-                    self.agent.read_only_tool_timeout_secs = timeout_secs;
-                }
-            }
-        }
-        if let Ok(enabled) = env_openprx("PRIORITY_SCHEDULING_ENABLED") {
-            self.agent.priority_scheduling_enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
-        }
-        if let Ok(enabled) = env_openprx("CONCURRENCY_KILL_SWITCH_FORCE_SERIAL") {
-            self.agent.concurrency_kill_switch_force_serial = enabled == "1" || enabled.eq_ignore_ascii_case("true");
-        }
-        if let Ok(stage) = env_openprx("CONCURRENCY_ROLLOUT_STAGE") {
-            let stage = stage.trim().to_ascii_lowercase();
-            if matches!(stage.as_str(), "off" | "stage_a" | "stage_b" | "stage_c" | "full") {
-                self.agent.concurrency_rollout_stage = stage;
-            }
-        }
-        if let Ok(percent) = env_openprx("CONCURRENCY_ROLLOUT_SAMPLE_PERCENT") {
-            if let Ok(percent) = percent.parse::<u8>() {
-                self.agent.concurrency_rollout_sample_percent = percent;
-            }
-        }
-        if let Ok(channels) = env_openprx("CONCURRENCY_ROLLOUT_CHANNELS") {
-            let parsed = channels
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            self.agent.concurrency_rollout_channels = parsed;
-        }
-        if let Ok(enabled) = env_openprx("CONCURRENCY_AUTO_ROLLBACK_ENABLED") {
-            self.agent.concurrency_auto_rollback_enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
-        }
-        if let Ok(threshold) = env_openprx("CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD") {
-            if let Ok(threshold) = threshold.parse::<f64>() {
-                if (0.0..=1.0).contains(&threshold) {
-                    self.agent.concurrency_rollback_timeout_rate_threshold = threshold;
-                }
-            }
-        }
-        if let Ok(threshold) = env_openprx("CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD") {
-            if let Ok(threshold) = threshold.parse::<f64>() {
-                if (0.0..=1.0).contains(&threshold) {
-                    self.agent.concurrency_rollback_cancel_rate_threshold = threshold;
-                }
-            }
-        }
-        if let Ok(threshold) = env_openprx("CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD") {
-            if let Ok(threshold) = threshold.parse::<f64>() {
-                if (0.0..=1.0).contains(&threshold) {
-                    self.agent.concurrency_rollback_error_rate_threshold = threshold;
-                }
-            }
-        }
-
-        // Reasoning override: OPENPRX_REASONING_ENABLED or REASONING_ENABLED
-        if let Ok(flag) = env_openprx("REASONING_ENABLED").or_else(|_| std::env::var("REASONING_ENABLED")) {
-            let normalized = flag.trim().to_ascii_lowercase();
-            match normalized.as_str() {
-                "1" | "true" | "yes" | "on" => self.runtime.reasoning_enabled = Some(true),
-                "0" | "false" | "no" | "off" => self.runtime.reasoning_enabled = Some(false),
-                _ => {}
-            }
-        }
-
-        // Web search enabled: OPENPRX_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
-        if let Ok(enabled) = env_openprx("WEB_SEARCH_ENABLED").or_else(|_| std::env::var("WEB_SEARCH_ENABLED")) {
-            self.web_search.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
-        }
-
-        // Web search provider: OPENPRX_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
-        if let Ok(provider) = env_openprx("WEB_SEARCH_PROVIDER").or_else(|_| std::env::var("WEB_SEARCH_PROVIDER")) {
-            let provider = provider.trim();
-            if !provider.is_empty() {
-                self.web_search.provider = provider.to_string();
-            }
-        }
-
-        // Brave API key: OPENPRX_BRAVE_API_KEY or BRAVE_API_KEY
-        if let Ok(api_key) = env_openprx("BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY")) {
-            let api_key = api_key.trim();
-            if !api_key.is_empty() {
-                self.web_search.brave_api_key = Some(api_key.to_string());
-            }
-        }
-
-        // Web search max results: OPENPRX_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
-        if let Ok(max_results) =
-            env_openprx("WEB_SEARCH_MAX_RESULTS").or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
-        {
-            if let Ok(max_results) = max_results.parse::<usize>() {
-                if (1..=10).contains(&max_results) {
-                    self.web_search.max_results = max_results;
-                }
-            }
-        }
-
-        // Web search timeout: OPENPRX_WEB_SEARCH_TIMEOUT_SECS or WEB_SEARCH_TIMEOUT_SECS
-        if let Ok(timeout_secs) =
-            env_openprx("WEB_SEARCH_TIMEOUT_SECS").or_else(|_| std::env::var("WEB_SEARCH_TIMEOUT_SECS"))
-        {
-            if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
-                if timeout_secs > 0 {
-                    self.web_search.timeout_secs = timeout_secs;
-                }
-            }
-        }
-
-        // Storage provider key (optional backend override): OPENPRX_STORAGE_PROVIDER
-        if let Ok(provider) = env_openprx("STORAGE_PROVIDER") {
-            let provider = provider.trim();
-            if !provider.is_empty() {
-                self.storage.provider.config.provider = provider.to_string();
-            }
-        }
-
-        // Storage connection URL (for remote backends): OPENPRX_STORAGE_DB_URL
-        if let Ok(db_url) = env_openprx("STORAGE_DB_URL") {
-            let db_url = db_url.trim();
-            if !db_url.is_empty() {
-                self.storage.provider.config.db_url = Some(db_url.to_string());
-            }
-        }
-
-        // Storage connect timeout: OPENPRX_STORAGE_CONNECT_TIMEOUT_SECS
-        if let Ok(timeout_secs) = env_openprx("STORAGE_CONNECT_TIMEOUT_SECS") {
-            if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
-                if timeout_secs > 0 {
-                    self.storage.provider.config.connect_timeout_secs = Some(timeout_secs);
-                }
-            }
-        }
-        // Proxy enabled flag: OPENPRX_PROXY_ENABLED
-        let explicit_proxy_enabled = env_openprx("PROXY_ENABLED")
-            .ok()
-            .as_deref()
-            .and_then(parse_proxy_enabled);
-        if let Some(enabled) = explicit_proxy_enabled {
-            self.proxy.enabled = enabled;
-        }
-
-        // Proxy URLs: OPENPRX_* wins, then generic *PROXY vars.
-        let http_overridden = if let Ok(proxy_url) = env_openprx("HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
-        {
-            self.proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
-            true
-        } else {
-            false
-        };
-        let https_overridden =
-            if let Ok(proxy_url) = env_openprx("HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY")) {
-                self.proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
-                true
-            } else {
-                false
-            };
-        let all_overridden = if let Ok(proxy_url) = env_openprx("ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY")) {
-            self.proxy.all_proxy = normalize_proxy_url_option(Some(&proxy_url));
-            true
-        } else {
-            false
-        };
-        let proxy_url_overridden = http_overridden || https_overridden || all_overridden;
-        if let Ok(no_proxy) = env_openprx("NO_PROXY").or_else(|_| std::env::var("NO_PROXY")) {
-            self.proxy.no_proxy = normalize_no_proxy_list(vec![no_proxy]);
-        }
-
-        if explicit_proxy_enabled.is_none() && proxy_url_overridden && self.proxy.has_any_proxy_url() {
-            self.proxy.enabled = true;
-        }
-
-        // Proxy scope and service selectors.
-        if let Ok(scope_raw) = env_openprx("PROXY_SCOPE") {
-            if let Some(scope) = parse_proxy_scope(&scope_raw) {
-                self.proxy.scope = scope;
-            } else {
-                tracing::warn!(
-                    scope = %scope_raw,
-                    "Ignoring invalid OPENPRX_PROXY_SCOPE (valid: environment|prx|services)"
-                );
-            }
-        }
-
-        if let Ok(services_raw) = env_openprx("PROXY_SERVICES") {
-            self.proxy.services = normalize_service_list(vec![services_raw]);
-        }
-
-        if let Err(error) = self.proxy.validate() {
-            tracing::warn!("Invalid proxy configuration ignored: {error}");
-            self.proxy.enabled = false;
-        }
-
-        if self.proxy.enabled && self.proxy.scope == ProxyScope::Environment {
-            self.proxy.apply_to_process_env();
-        }
-
-        set_runtime_proxy_config(self.proxy.clone());
     }
 
     pub async fn save(&self) -> Result<()> {
@@ -5469,6 +5427,7 @@ default_temperature = 0.7
             media: MediaConfig::default(),
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
+            modules: ModulesConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5722,6 +5681,7 @@ concurrency_rollback_error_rate_threshold = 0.23
             media: MediaConfig::default(),
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
+            modules: ModulesConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -5809,7 +5769,7 @@ auto_hydrate = true
         .await
         .unwrap();
         fs::write(
-            config_dir.join("00-memory.toml"),
+            config_dir.join("memory.toml"),
             r#"
 [memory]
 embedding_provider = "override"
@@ -5818,7 +5778,7 @@ embedding_provider = "override"
         .await
         .unwrap();
         fs::write(
-            config_dir.join("10-routes.toml"),
+            config_dir.join("routing.toml"),
             r#"
 default_model = "fragment-model"
 
@@ -5863,6 +5823,10 @@ model = "override-beta"
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         // Keep test deterministic even if process env mutates proxy defaults elsewhere.
         config.proxy = ProxyConfig::default();
+        // All modules must be enabled so the roundtrip reload picks up every
+        // config.d/ fragment written by write_split_config (fail-closed gating
+        // skips fragments whose module is disabled).
+        config.modules = ModulesConfig::all_enabled();
         config.security.resources.max_cpu_time_seconds = 120;
         config.autonomy.max_actions_per_hour = 42;
         config.agents.insert(
@@ -6381,6 +6345,7 @@ channel_id = "C123"
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
             mention_only: false,
+            ws_url: None,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -6405,6 +6370,7 @@ channel_id = "C123"
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
             mention_only: false,
+            ws_url: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -6434,6 +6400,7 @@ channel_id = "C123"
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
             mention_only: false,
+            ws_url: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -6455,6 +6422,7 @@ channel_id = "C123"
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
             mention_only: false,
+            ws_url: None,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -6475,6 +6443,7 @@ channel_id = "C123"
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
             mention_only: false,
+            ws_url: None,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -6505,6 +6474,7 @@ channel_id = "C123"
                 group_policy: GroupPolicy::default(),
                 group_allow_from: vec![],
                 mention_only: false,
+                ws_url: None,
             }),
             wacli: None,
             linq: None,
@@ -6823,218 +6793,11 @@ default_temperature = 0.7
         assert!(parsed.browser.allowed_domains.is_empty());
     }
 
-    // ── Environment variable overrides (Docker support) ─────────
+    // ── Environment variable test helpers ─────────
 
     async fn env_override_lock() -> MutexGuard<'static, ()> {
         static ENV_OVERRIDE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
         ENV_OVERRIDE_TEST_LOCK.lock().await
-    }
-
-    fn clear_proxy_env_test_vars() {
-        for key in [
-            "OPENPRX_PROXY_ENABLED",
-            "OPENPRX_HTTP_PROXY",
-            "OPENPRX_HTTPS_PROXY",
-            "OPENPRX_ALL_PROXY",
-            "OPENPRX_NO_PROXY",
-            "OPENPRX_PROXY_SCOPE",
-            "OPENPRX_PROXY_SERVICES",
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-        ] {
-            test_remove_env(key);
-        }
-    }
-
-    #[test]
-    async fn env_override_api_key() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert!(config.api_key.is_none());
-
-        test_set_env("OPENPRX_API_KEY", "sk-test-env-key");
-        config.apply_env_overrides();
-        assert_eq!(config.api_key.as_deref(), Some("sk-test-env-key"));
-
-        test_remove_env("OPENPRX_API_KEY");
-    }
-
-    #[test]
-    async fn env_override_api_key_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_remove_env("OPENPRX_API_KEY");
-        test_set_env("API_KEY", "sk-fallback-key");
-        config.apply_env_overrides();
-        assert_eq!(config.api_key.as_deref(), Some("sk-fallback-key"));
-
-        test_remove_env("API_KEY");
-    }
-
-    #[test]
-    async fn env_override_provider() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_set_env("OPENPRX_PROVIDER", "anthropic");
-        config.apply_env_overrides();
-        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
-
-        test_remove_env("OPENPRX_PROVIDER");
-    }
-
-    #[test]
-    async fn env_override_open_skills_enabled_and_dir() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert!(!config.skills.open_skills_enabled);
-        assert!(config.skills.open_skills_dir.is_none());
-
-        test_set_env("OPENPRX_OPEN_SKILLS_ENABLED", "true");
-        test_set_env("OPENPRX_OPEN_SKILLS_DIR", "/tmp/open-skills");
-        config.apply_env_overrides();
-
-        assert!(config.skills.open_skills_enabled);
-        assert_eq!(config.skills.open_skills_dir.as_deref(), Some("/tmp/open-skills"));
-
-        test_remove_env("OPENPRX_OPEN_SKILLS_ENABLED");
-        test_remove_env("OPENPRX_OPEN_SKILLS_DIR");
-    }
-
-    #[test]
-    async fn env_override_open_skills_enabled_invalid_value_keeps_existing_value() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.skills.open_skills_enabled = true;
-
-        test_set_env("OPENPRX_OPEN_SKILLS_ENABLED", "maybe");
-        config.apply_env_overrides();
-
-        assert!(config.skills.open_skills_enabled);
-        test_remove_env("OPENPRX_OPEN_SKILLS_ENABLED");
-    }
-
-    #[test]
-    async fn env_override_provider_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_remove_env("OPENPRX_PROVIDER");
-        test_set_env("PROVIDER", "openai");
-        config.apply_env_overrides();
-        assert_eq!(config.default_provider.as_deref(), Some("openai"));
-
-        test_remove_env("PROVIDER");
-    }
-
-    #[test]
-    async fn env_override_provider_fallback_does_not_replace_non_default_provider() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config {
-            default_provider: Some("custom:https://proxy.example.com/v1".to_string()),
-            ..Config::default()
-        };
-
-        test_remove_env("OPENPRX_PROVIDER");
-        test_set_env("PROVIDER", "openrouter");
-        config.apply_env_overrides();
-        assert_eq!(
-            config.default_provider.as_deref(),
-            Some("custom:https://proxy.example.com/v1")
-        );
-
-        test_remove_env("PROVIDER");
-    }
-
-    #[test]
-    async fn env_override_zero_claw_provider_overrides_non_default_provider() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config {
-            default_provider: Some("custom:https://proxy.example.com/v1".to_string()),
-            ..Config::default()
-        };
-
-        test_set_env("OPENPRX_PROVIDER", "openrouter");
-        test_set_env("PROVIDER", "anthropic");
-        config.apply_env_overrides();
-        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
-
-        test_remove_env("OPENPRX_PROVIDER");
-        test_remove_env("PROVIDER");
-    }
-
-    #[test]
-    async fn env_override_glm_api_key_for_regional_aliases() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config {
-            default_provider: Some("glm-cn".to_string()),
-            ..Config::default()
-        };
-
-        test_set_env("GLM_API_KEY", "glm-regional-key");
-        config.apply_env_overrides();
-        assert_eq!(config.api_key.as_deref(), Some("glm-regional-key"));
-
-        test_remove_env("GLM_API_KEY");
-    }
-
-    #[test]
-    async fn env_override_zai_api_key_for_regional_aliases() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config {
-            default_provider: Some("zai-cn".to_string()),
-            ..Config::default()
-        };
-
-        test_set_env("ZAI_API_KEY", "zai-regional-key");
-        config.apply_env_overrides();
-        assert_eq!(config.api_key.as_deref(), Some("zai-regional-key"));
-
-        test_remove_env("ZAI_API_KEY");
-    }
-
-    #[test]
-    async fn env_override_model() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_set_env("OPENPRX_MODEL", "gpt-4o");
-        config.apply_env_overrides();
-        assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
-
-        test_remove_env("OPENPRX_MODEL");
-    }
-
-    #[test]
-    async fn env_override_model_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_remove_env("OPENPRX_MODEL");
-        test_set_env("MODEL", "anthropic/claude-3.5-sonnet");
-        config.apply_env_overrides();
-        assert_eq!(config.default_model.as_deref(), Some("anthropic/claude-3.5-sonnet"));
-
-        test_remove_env("MODEL");
-    }
-
-    #[test]
-    async fn env_override_workspace() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_set_env("OPENPRX_WORKSPACE", "/custom/workspace");
-        config.apply_env_overrides();
-        assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
-
-        test_remove_env("OPENPRX_WORKSPACE");
     }
 
     #[test]
@@ -7046,7 +6809,7 @@ default_temperature = 0.7
 
         test_set_env("OPENPRX_WORKSPACE", &workspace_dir);
         let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir, None)
                 .await
                 .unwrap();
 
@@ -7077,7 +6840,7 @@ default_temperature = 0.7
         test_remove_env("OPENPRX_WORKSPACE");
 
         let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir, None)
                 .await
                 .unwrap();
 
@@ -7105,7 +6868,7 @@ default_temperature = 0.7
         fs::write(&state_path, toml::to_string(&state).unwrap()).await.unwrap();
 
         let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir, None)
                 .await
                 .unwrap();
 
@@ -7124,7 +6887,7 @@ default_temperature = 0.7
 
         test_remove_env("OPENPRX_WORKSPACE");
         let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir, None)
                 .await
                 .unwrap();
 
@@ -7317,249 +7080,6 @@ default_model = "legacy-model"
     }
 
     #[test]
-    async fn env_override_empty_values_ignored() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        let original_provider = config.default_provider.clone();
-
-        test_set_env("OPENPRX_PROVIDER", "");
-        config.apply_env_overrides();
-        assert_eq!(config.default_provider, original_provider);
-
-        test_remove_env("OPENPRX_PROVIDER");
-    }
-
-    #[test]
-    async fn env_override_gateway_port() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert_eq!(config.gateway.port, 16830);
-
-        test_set_env("OPENPRX_GATEWAY_PORT", "8080");
-        config.apply_env_overrides();
-        assert_eq!(config.gateway.port, 8080);
-
-        test_remove_env("OPENPRX_GATEWAY_PORT");
-    }
-
-    #[test]
-    async fn env_override_port_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_remove_env("OPENPRX_GATEWAY_PORT");
-        test_set_env("PORT", "9000");
-        config.apply_env_overrides();
-        assert_eq!(config.gateway.port, 9000);
-
-        test_remove_env("PORT");
-    }
-
-    #[test]
-    async fn env_override_gateway_host() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert_eq!(config.gateway.host, "127.0.0.1");
-
-        test_set_env("OPENPRX_GATEWAY_HOST", "0.0.0.0");
-        config.apply_env_overrides();
-        assert_eq!(config.gateway.host, "0.0.0.0");
-
-        test_remove_env("OPENPRX_GATEWAY_HOST");
-    }
-
-    #[test]
-    async fn env_override_host_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_remove_env("OPENPRX_GATEWAY_HOST");
-        test_set_env("HOST", "0.0.0.0");
-        config.apply_env_overrides();
-        assert_eq!(config.gateway.host, "0.0.0.0");
-
-        test_remove_env("HOST");
-    }
-
-    #[test]
-    async fn env_override_temperature() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_set_env("OPENPRX_TEMPERATURE", "0.5");
-        config.apply_env_overrides();
-        assert!((config.default_temperature - 0.5).abs() < f64::EPSILON);
-
-        test_remove_env("OPENPRX_TEMPERATURE");
-    }
-
-    #[test]
-    async fn env_override_temperature_out_of_range_ignored() {
-        let _env_guard = env_override_lock().await;
-        // Clean up any leftover env vars from other tests
-        test_remove_env("OPENPRX_TEMPERATURE");
-
-        let mut config = Config::default();
-        let original_temp = config.default_temperature;
-
-        // Temperature > 2.0 should be ignored
-        test_set_env("OPENPRX_TEMPERATURE", "3.0");
-        config.apply_env_overrides();
-        assert!(
-            (config.default_temperature - original_temp).abs() < f64::EPSILON,
-            "Temperature 3.0 should be ignored (out of range)"
-        );
-
-        test_remove_env("OPENPRX_TEMPERATURE");
-    }
-
-    #[test]
-    async fn env_override_reasoning_enabled() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert_eq!(config.runtime.reasoning_enabled, None);
-
-        test_set_env("OPENPRX_REASONING_ENABLED", "false");
-        config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_enabled, Some(false));
-
-        test_set_env("OPENPRX_REASONING_ENABLED", "true");
-        config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_enabled, Some(true));
-
-        test_remove_env("OPENPRX_REASONING_ENABLED");
-    }
-
-    #[test]
-    async fn env_override_reasoning_invalid_value_ignored() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.runtime.reasoning_enabled = Some(false);
-
-        test_set_env("OPENPRX_REASONING_ENABLED", "maybe");
-        config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_enabled, Some(false));
-
-        test_remove_env("OPENPRX_REASONING_ENABLED");
-    }
-
-    #[test]
-    async fn env_override_invalid_port_ignored() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        let original_port = config.gateway.port;
-
-        test_set_env("PORT", "not_a_number");
-        config.apply_env_overrides();
-        assert_eq!(config.gateway.port, original_port);
-
-        test_remove_env("PORT");
-    }
-
-    #[test]
-    async fn env_override_web_search_config() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_set_env("WEB_SEARCH_ENABLED", "false");
-        test_set_env("WEB_SEARCH_PROVIDER", "brave");
-        test_set_env("WEB_SEARCH_MAX_RESULTS", "7");
-        test_set_env("WEB_SEARCH_TIMEOUT_SECS", "20");
-        test_set_env("BRAVE_API_KEY", "brave-test-key");
-
-        config.apply_env_overrides();
-
-        assert!(!config.web_search.enabled);
-        assert_eq!(config.web_search.provider, "brave");
-        assert_eq!(config.web_search.max_results, 7);
-        assert_eq!(config.web_search.timeout_secs, 20);
-        assert_eq!(config.web_search.brave_api_key.as_deref(), Some("brave-test-key"));
-
-        test_remove_env("WEB_SEARCH_ENABLED");
-        test_remove_env("WEB_SEARCH_PROVIDER");
-        test_remove_env("WEB_SEARCH_MAX_RESULTS");
-        test_remove_env("WEB_SEARCH_TIMEOUT_SECS");
-        test_remove_env("BRAVE_API_KEY");
-    }
-
-    #[test]
-    async fn env_override_web_search_invalid_values_ignored() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        let original_max_results = config.web_search.max_results;
-        let original_timeout = config.web_search.timeout_secs;
-
-        test_set_env("WEB_SEARCH_MAX_RESULTS", "99");
-        test_set_env("WEB_SEARCH_TIMEOUT_SECS", "0");
-
-        config.apply_env_overrides();
-
-        assert_eq!(config.web_search.max_results, original_max_results);
-        assert_eq!(config.web_search.timeout_secs, original_timeout);
-
-        test_remove_env("WEB_SEARCH_MAX_RESULTS");
-        test_remove_env("WEB_SEARCH_TIMEOUT_SECS");
-    }
-
-    #[test]
-    async fn env_override_storage_provider_config() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_set_env("OPENPRX_STORAGE_PROVIDER", "postgres");
-        test_set_env("OPENPRX_STORAGE_DB_URL", "postgres://example/db");
-        test_set_env("OPENPRX_STORAGE_CONNECT_TIMEOUT_SECS", "15");
-
-        config.apply_env_overrides();
-
-        assert_eq!(config.storage.provider.config.provider, "postgres");
-        assert_eq!(
-            config.storage.provider.config.db_url.as_deref(),
-            Some("postgres://example/db")
-        );
-        assert_eq!(config.storage.provider.config.connect_timeout_secs, Some(15));
-
-        test_remove_env("OPENPRX_STORAGE_PROVIDER");
-        test_remove_env("OPENPRX_STORAGE_DB_URL");
-        test_remove_env("OPENPRX_STORAGE_CONNECT_TIMEOUT_SECS");
-    }
-
-    #[test]
-    async fn env_override_agent_concurrency_controls() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        test_set_env("OPENPRX_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL", "true");
-        test_set_env("OPENPRX_CONCURRENCY_ROLLOUT_STAGE", "stage_c");
-        test_set_env("OPENPRX_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT", "40");
-        test_set_env("OPENPRX_CONCURRENCY_ROLLOUT_CHANNELS", "telegram,discord");
-        test_set_env("OPENPRX_CONCURRENCY_AUTO_ROLLBACK_ENABLED", "false");
-        test_set_env("OPENPRX_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD", "0.31");
-        test_set_env("OPENPRX_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD", "0.32");
-        test_set_env("OPENPRX_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD", "0.33");
-
-        config.apply_env_overrides();
-
-        assert!(config.agent.concurrency_kill_switch_force_serial);
-        assert_eq!(config.agent.concurrency_rollout_stage, "stage_c");
-        assert_eq!(config.agent.concurrency_rollout_sample_percent, 40);
-        assert_eq!(config.agent.concurrency_rollout_channels, vec!["telegram", "discord"]);
-        assert!(!config.agent.concurrency_auto_rollback_enabled);
-        assert!((config.agent.concurrency_rollback_timeout_rate_threshold - 0.31).abs() < 1e-9);
-        assert!((config.agent.concurrency_rollback_cancel_rate_threshold - 0.32).abs() < 1e-9);
-        assert!((config.agent.concurrency_rollback_error_rate_threshold - 0.33).abs() < 1e-9);
-
-        test_remove_env("OPENPRX_CONCURRENCY_KILL_SWITCH_FORCE_SERIAL");
-        test_remove_env("OPENPRX_CONCURRENCY_ROLLOUT_STAGE");
-        test_remove_env("OPENPRX_CONCURRENCY_ROLLOUT_SAMPLE_PERCENT");
-        test_remove_env("OPENPRX_CONCURRENCY_ROLLOUT_CHANNELS");
-        test_remove_env("OPENPRX_CONCURRENCY_AUTO_ROLLBACK_ENABLED");
-        test_remove_env("OPENPRX_CONCURRENCY_ROLLBACK_TIMEOUT_RATE_THRESHOLD");
-        test_remove_env("OPENPRX_CONCURRENCY_ROLLBACK_CANCEL_RATE_THRESHOLD");
-        test_remove_env("OPENPRX_CONCURRENCY_ROLLBACK_ERROR_RATE_THRESHOLD");
-    }
-
-    #[test]
     async fn proxy_config_scope_services_requires_entries_when_enabled() {
         let proxy = ProxyConfig {
             enabled: true,
@@ -7573,61 +7093,6 @@ default_model = "legacy-model"
 
         let error = proxy.validate().unwrap_err().to_string();
         assert!(error.contains("proxy.scope='services'"));
-    }
-
-    #[test]
-    async fn env_override_proxy_scope_services() {
-        let _env_guard = env_override_lock().await;
-        clear_proxy_env_test_vars();
-
-        let mut config = Config::default();
-        test_set_env("OPENPRX_PROXY_ENABLED", "true");
-        test_set_env("OPENPRX_HTTP_PROXY", "http://127.0.0.1:7890");
-        test_set_env("OPENPRX_PROXY_SERVICES", "provider.openai, tool.http_request");
-        test_set_env("OPENPRX_PROXY_SCOPE", "services");
-
-        config.apply_env_overrides();
-
-        assert!(config.proxy.enabled);
-        assert_eq!(config.proxy.scope, ProxyScope::Services);
-        assert_eq!(config.proxy.http_proxy.as_deref(), Some("http://127.0.0.1:7890"));
-        assert!(config.proxy.should_apply_to_service("provider.openai"));
-        assert!(config.proxy.should_apply_to_service("tool.http_request"));
-        assert!(!config.proxy.should_apply_to_service("provider.anthropic"));
-
-        clear_proxy_env_test_vars();
-    }
-
-    #[test]
-    async fn env_override_proxy_scope_environment_applies_process_env() {
-        let _env_guard = env_override_lock().await;
-        clear_proxy_env_test_vars();
-
-        let mut config = Config::default();
-        test_set_env("OPENPRX_PROXY_ENABLED", "true");
-        test_set_env("OPENPRX_PROXY_SCOPE", "environment");
-        test_set_env("OPENPRX_HTTP_PROXY", "http://127.0.0.1:7890");
-        test_set_env("OPENPRX_HTTPS_PROXY", "http://127.0.0.1:7891");
-        test_set_env("OPENPRX_NO_PROXY", "localhost,127.0.0.1");
-
-        config.apply_env_overrides();
-
-        assert_eq!(config.proxy.scope, ProxyScope::Environment);
-        assert_eq!(
-            std::env::var("HTTP_PROXY").ok().as_deref(),
-            Some("http://127.0.0.1:7890")
-        );
-        assert_eq!(
-            std::env::var("HTTPS_PROXY").ok().as_deref(),
-            Some("http://127.0.0.1:7891")
-        );
-        assert!(
-            std::env::var("NO_PROXY")
-                .ok()
-                .is_some_and(|value| value.contains("localhost"))
-        );
-
-        clear_proxy_env_test_vars();
     }
 
     #[test]

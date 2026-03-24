@@ -248,7 +248,6 @@ panic = "abort"
 
 [dev-dependencies]
 tempfile = "3.14"
-criterion = { version = "0.8", features = ["async_tokio"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -305,7 +305,8 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
                 .await?
         }
         EvolutionLayer::Prompt => {
-            let mut engine = PromptEvolutionEngine::new(shared, &config.workspace_dir, Some(writer_for_engine.clone()));
+            let mut engine = PromptEvolutionEngine::new(shared, &config.workspace_dir, Some(writer_for_engine.clone()))
+                .with_debug_raw(config.self_system.evolution_debug_raw);
             pipeline
                 .run_for_layer(
                     EvolutionTrigger::Manual,
@@ -382,7 +383,7 @@ async fn load_evolution_config(config: &Config) -> Result<(EvolutionConfig, Path
 }
 
 fn discover_evolution_config_path(config: &Config) -> PathBuf {
-    if let Ok(raw) = std::env::var("OPENPRX_EVOLUTION_CONFIG").or_else(|_| std::env::var("ZEROCLAW_EVOLUTION_CONFIG")) {
+    if let Some(raw) = config.self_system.evolution_config_path.as_deref() {
         let p = PathBuf::from(raw);
         if !p.as_os_str().is_empty() {
             return p;

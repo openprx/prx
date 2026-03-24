@@ -58,6 +58,8 @@ pub struct WhatsAppWebChannel {
     pair_code: Option<String>,
     /// Allowed phone numbers (E.164 format) or "*" for all
     allowed_numbers: Vec<String>,
+    /// WebSocket URL override (from config)
+    ws_url: Option<String>,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -87,10 +89,18 @@ impl WhatsAppWebChannel {
             pair_phone,
             pair_code,
             allowed_numbers,
+            ws_url: None,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Set the WebSocket URL override (from config `ws_url` field).
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_ws_url(mut self, ws_url: Option<String>) -> Self {
+        self.ws_url = ws_url;
+        self
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
@@ -212,8 +222,8 @@ impl Channel for WhatsAppWebChannel {
 
         // Create transport factory
         let mut transport_factory = TokioWebSocketTransportFactory::new();
-        if let Ok(ws_url) = std::env::var("WHATSAPP_WS_URL") {
-            transport_factory = transport_factory.with_url(ws_url);
+        if let Some(ws_url) = &self.ws_url {
+            transport_factory = transport_factory.with_url(ws_url.clone());
         }
 
         // Create HTTP client for media operations
@@ -412,6 +422,10 @@ impl WhatsAppWebChannel {
         _allowed_numbers: Vec<String>,
     ) -> Self {
         Self { _private: () }
+    }
+
+    pub fn with_ws_url(self, _ws_url: Option<String>) -> Self {
+        self
     }
 }
 

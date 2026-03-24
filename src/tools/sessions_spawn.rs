@@ -72,14 +72,14 @@ pub struct SubAgentRun {
 }
 
 #[derive(Debug, Clone)]
-struct SpawnExecutionContext {
-    run_id: String,
-    session_scope_key: String,
-    spawn_depth: usize,
+pub(crate) struct SpawnExecutionContext {
+    pub(crate) run_id: String,
+    pub(crate) session_scope_key: String,
+    pub(crate) spawn_depth: usize,
 }
 
 tokio::task_local! {
-    static SPAWN_EXECUTION_CONTEXT: SpawnExecutionContext;
+    pub(crate) static SPAWN_EXECUTION_CONTEXT: SpawnExecutionContext;
 }
 
 #[derive(Debug, Clone)]
@@ -135,32 +135,6 @@ fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
 
 fn current_spawn_execution_context() -> Option<SpawnExecutionContext> {
     SPAWN_EXECUTION_CONTEXT.try_with(|ctx| ctx.clone()).ok()
-}
-
-pub(crate) async fn with_spawn_execution_context<T, Fut>(
-    run_id: String,
-    session_scope_key: String,
-    spawn_depth: usize,
-    fut: Fut,
-) -> T
-where
-    Fut: std::future::Future<Output = T>,
-{
-    SPAWN_EXECUTION_CONTEXT
-        .scope(
-            SpawnExecutionContext {
-                run_id,
-                session_scope_key,
-                spawn_depth,
-            },
-            fut,
-        )
-        .await
-}
-
-#[cfg(test)]
-pub(crate) fn spawn_execution_context_snapshot() -> Option<(String, String, usize)> {
-    current_spawn_execution_context().map(|ctx| (ctx.run_id, ctx.session_scope_key, ctx.spawn_depth))
 }
 
 fn spawn_session_scope_key(parent_ctx: Option<&SpawnExecutionContext>, scope: Option<&SpawnScope>) -> String {
@@ -1635,25 +1609,47 @@ async fn run_sub_agent_process(
     }
 
     let parent_timeout = std::time::Duration::from_secs(timeout_secs.max(1));
-    let mut stdout_stream = child
+    let stdout_stream = child
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("session-worker stdout pipe was not configured"))?;
-    let mut stderr_stream = child
+    let stderr_stream = child
         .stderr
         .take()
         .ok_or_else(|| anyhow::anyhow!("session-worker stderr pipe was not configured"))?;
 
+    const MAX_SUBPROCESS_OUTPUT: u64 = 10 * 1024 * 1024; // 10 MB per stream
+
     let process_outcome = tokio::time::timeout(parent_timeout, async {
         let stdout_future = async {
-            let mut stdout = Vec::new();
-            stdout_stream.read_to_end(&mut stdout).await?;
-            Ok::<Vec<u8>, anyhow::Error>(stdout)
+            let mut stdout_buf = Vec::new();
+            let bytes_read = stdout_stream
+                .take(MAX_SUBPROCESS_OUTPUT)
+                .read_to_end(&mut stdout_buf)
+                .await?;
+            if bytes_read as u64 >= MAX_SUBPROCESS_OUTPUT {
+                tracing::warn!(
+                    limit_bytes = MAX_SUBPROCESS_OUTPUT,
+                    "session-worker stdout reached size limit; output truncated"
+                );
+                stdout_buf.extend_from_slice(b"\n[output truncated at 10MB]");
+            }
+            Ok::<Vec<u8>, anyhow::Error>(stdout_buf)
         };
         let stderr_future = async {
-            let mut stderr = Vec::new();
-            stderr_stream.read_to_end(&mut stderr).await?;
-            Ok::<Vec<u8>, anyhow::Error>(stderr)
+            let mut stderr_buf = Vec::new();
+            let bytes_read = stderr_stream
+                .take(MAX_SUBPROCESS_OUTPUT)
+                .read_to_end(&mut stderr_buf)
+                .await?;
+            if bytes_read as u64 >= MAX_SUBPROCESS_OUTPUT {
+                tracing::warn!(
+                    limit_bytes = MAX_SUBPROCESS_OUTPUT,
+                    "session-worker stderr reached size limit; output truncated"
+                );
+                stderr_buf.extend_from_slice(b"\n[output truncated at 10MB]");
+            }
+            Ok::<Vec<u8>, anyhow::Error>(stderr_buf)
         };
 
         let (status_result, stdout_result, stderr_result) = tokio::join!(

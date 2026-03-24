@@ -25,6 +25,7 @@ pub struct OpenAiCodexProvider {
     auth_profile_override: Option<String>,
     client: Client,
     stream_idle_timeout: Duration,
+    reasoning_effort_override: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,7 +122,8 @@ impl OpenAiCodexProvider {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
-            stream_idle_timeout: resolve_stream_idle_timeout(),
+            stream_idle_timeout: resolve_stream_idle_timeout(options.codex_stream_idle_timeout_secs),
+            reasoning_effort_override: options.codex_reasoning_effort.clone(),
         }
     }
 }
@@ -141,13 +143,8 @@ fn default_openprx_dir() -> PathBuf {
     )
 }
 
-fn resolve_stream_idle_timeout() -> Duration {
-    let secs = std::env::var("ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .map(|value| value.max(5))
-        .unwrap_or(DEFAULT_CODEX_STREAM_IDLE_TIMEOUT_SECS);
-    Duration::from_secs(secs)
+fn resolve_stream_idle_timeout(config_secs: Option<u64>) -> Duration {
+    Duration::from_secs(config_secs.unwrap_or(DEFAULT_CODEX_STREAM_IDLE_TIMEOUT_SECS).max(1))
 }
 
 fn first_nonempty(text: Option<&str>) -> Option<String> {
@@ -225,13 +222,22 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     effort.to_string()
 }
 
-fn resolve_reasoning_effort(model_id: &str) -> String {
-    let raw = std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT")
-        .ok()
-        .and_then(|value| first_nonempty(Some(&value)))
-        .unwrap_or_else(|| "xhigh".to_string())
-        .to_ascii_lowercase();
-    clamp_reasoning_effort(model_id, &raw)
+const VALID_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+
+fn resolve_reasoning_effort(model_id: &str, config_effort: Option<&str>) -> String {
+    let base = match config_effort {
+        None => "xhigh",
+        Some(effort) if VALID_REASONING_EFFORTS.contains(&effort) => effort,
+        Some(invalid) => {
+            tracing::warn!(
+                value = invalid,
+                valid = ?VALID_REASONING_EFFORTS,
+                "invalid reasoning_effort config value, falling back to default"
+            );
+            "xhigh"
+        }
+    };
+    clamp_reasoning_effort(model_id, base)
 }
 
 fn nonempty_preserve(text: Option<&str>) -> Option<String> {
@@ -746,7 +752,7 @@ impl OpenAiCodexProvider {
                 verbosity: "medium".to_string(),
             },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(normalized_model),
+                effort: resolve_reasoning_effort(normalized_model, self.reasoning_effort_override.as_deref()),
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],

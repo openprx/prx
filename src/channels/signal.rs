@@ -115,7 +115,7 @@ async fn extract_document_text(path: &str, content_type: &str, filename: &str) -
 
     // Plain text files — read directly
     if is_text_file(content_type, &ext) {
-        return std::fs::read_to_string(path).ok();
+        return tokio::fs::read_to_string(path).await.ok();
     }
 
     // PDF → pdftotext
@@ -1580,7 +1580,7 @@ impl SignalChannel {
                 return None;
             }
 
-            let bytes = std::fs::read(&path).ok()?;
+            let bytes = tokio::fs::read(&path).await.ok()?;
             // Copy to a temp path with a proper extension so media pipelines
             // can identify the format by filename.
             let id = attachment_id().unwrap_or_else(|| "0".to_string());
@@ -1591,7 +1591,7 @@ impl SignalChannel {
             } else {
                 format!("/tmp/openprx-att-{id}.{ext}")
             };
-            std::fs::write(&temp_path, &bytes).ok()?;
+            tokio::fs::write(&temp_path, &bytes).await.ok()?;
 
             tracing::info!(
                 "Signal native: attachment {file_path} ({} bytes) → {temp_path}",
@@ -1620,7 +1620,7 @@ impl SignalChannel {
         let bytes = response.bytes().await.ok()?;
         let ext = mime_to_extension(content_type);
         let temp_path = format!("/tmp/openprx-att-{id}.{ext}");
-        std::fs::write(&temp_path, &bytes).ok()?;
+        tokio::fs::write(&temp_path, &bytes).await.ok()?;
 
         tracing::info!(
             "Signal: downloaded attachment {id} ({} bytes) → {}",
@@ -2031,7 +2031,7 @@ impl Channel for SignalChannel {
         // Build base64 attachments from media markers
         let mut base64_attachments: Vec<String> = Vec::new();
         for (kind, path) in &media_items {
-            match std::fs::read(path) {
+            match tokio::fs::read(path).await {
                 Ok(bytes) => {
                     let mime: &str = match kind.as_str() {
                         "IMAGE" => guess_mime_from_path(path),

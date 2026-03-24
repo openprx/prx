@@ -39,13 +39,14 @@ pub trait BranchScorer: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// Scored result — returned by `rank_branches`
+// Scored result — returned by `rank_branches` (test utility)
 // ---------------------------------------------------------------------------
 
 /// A branch paired with its computed score.
 ///
 /// Produced by [`DefaultBranchScorer::rank_branches`] — branches that were
 /// disqualified by hard gates are excluded from the output.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct ScoredBranch<'a> {
     /// Reference to the original candidate branch.
@@ -105,6 +106,7 @@ impl DefaultBranchScorer {
     /// 4. `branch_id` lexicographic ascending
     ///
     /// This guarantees a stable, reproducible ranking.
+    #[cfg(test)]
     pub fn rank_branches<'a>(
         &self,
         state: &CausalState,

@@ -29,12 +29,14 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     crate::health::mark_component_ok("daemon");
 
-    if config.heartbeat.enabled {
+    if config.modules.scheduler && config.heartbeat.enabled {
         let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir).await;
     }
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
+    // Gateway always starts — modules.network only controls whether network.toml
+    // is loaded, not the gateway itself.
     {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
@@ -50,7 +52,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
-    {
+    if config.modules.channels {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
             handles.push(spawn_component_supervisor(
@@ -66,9 +68,12 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             crate::health::mark_component_ok("channels");
             tracing::info!("No real-time channels configured; channel supervisor disabled");
         }
+    } else {
+        crate::health::mark_component_ok("channels");
+        tracing::debug!("Channels module disabled, skipping channel supervisor startup");
     }
 
-    if config.heartbeat.enabled {
+    if config.modules.scheduler && config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "heartbeat",
@@ -79,9 +84,12 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 async move { run_heartbeat_worker(cfg).await }
             },
         ));
+    } else if !config.modules.scheduler {
+        crate::health::mark_component_ok("heartbeat");
+        tracing::debug!("Scheduler module disabled, skipping heartbeat startup");
     }
 
-    if config.cron.enabled {
+    if config.modules.scheduler && config.cron.enabled {
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
@@ -94,11 +102,15 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     } else {
         crate::health::mark_component_ok("scheduler");
-        tracing::info!("Cron disabled; scheduler supervisor not started");
+        if !config.modules.scheduler {
+            tracing::debug!("Scheduler module disabled, skipping cron startup");
+        } else {
+            tracing::info!("Cron disabled; scheduler supervisor not started");
+        }
     }
 
     // ── Xin (心) autonomous task engine ──
-    if config.xin.enabled {
+    if config.modules.scheduler && config.xin.enabled {
         let xin_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "xin",
@@ -111,7 +123,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     } else {
         crate::health::mark_component_ok("xin");
-        tracing::info!("Xin disabled; xin supervisor not started");
+        if !config.modules.scheduler {
+            tracing::debug!("Scheduler module disabled, skipping xin startup");
+        } else {
+            tracing::info!("Xin disabled; xin supervisor not started");
+        }
     }
 
     // ── Self-system fitness ──
@@ -119,7 +135,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     // xin.enabled + xin.builtin_tasks + xin.evolution_integration.
     // If builtin_tasks is false, xin won't register the fitness task, so
     // the standalone worker must still run.
-    let xin_manages_evolution = config.xin.enabled && config.xin.builtin_tasks && config.xin.evolution_integration;
+    // Note: xin_manages_evolution requires scheduler module for xin to run.
+    let xin_manages_evolution =
+        config.modules.scheduler && config.xin.enabled && config.xin.builtin_tasks && config.xin.evolution_integration;
     let spawn_fitness = config.self_system.enabled && !xin_manages_evolution;
     if spawn_fitness {
         let fitness_cfg = config.clone();
@@ -164,7 +182,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         }
     }
 
-    if config.webhook.enabled {
+    if config.modules.integrations && config.webhook.enabled {
         let webhook_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "webhook_receiver",
@@ -183,7 +201,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     } else {
         crate::health::mark_component_ok("webhook_receiver");
-        tracing::info!("Webhook receiver disabled; webhook supervisor not started");
+        if !config.modules.integrations {
+            tracing::debug!("Integrations module disabled, skipping webhook receiver startup");
+        } else {
+            tracing::info!("Webhook receiver disabled; webhook supervisor not started");
+        }
     }
 
     println!("🧠 OpenPRX daemon started");
@@ -397,11 +419,10 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
         MemoryEvolutionEngine::new(shared.clone(), &cfg_path, Some(writer.clone()))
             .with_context(|| format!("failed to initialize memory evolution engine: {}", cfg_path.display()))?,
     );
-    let prompt_engine = Box::new(PromptEvolutionEngine::new(
-        shared.clone(),
-        &config.workspace_dir,
-        Some(writer.clone()),
-    ));
+    let prompt_engine = Box::new(
+        PromptEvolutionEngine::new(shared.clone(), &config.workspace_dir, Some(writer.clone()))
+            .with_debug_raw(config.self_system.evolution_debug_raw),
+    );
     let strategy_engine = Box::new(StrategyEvolutionEngine::new(
         shared.clone(),
         &config.workspace_dir,
@@ -434,9 +455,7 @@ async fn load_evolution_config(config: &Config) -> Result<(EvolutionConfig, Path
 }
 
 fn discover_evolution_config_path(config: &Config) -> PathBuf {
-    if let Ok(raw) = std::env::var("OPENPRX_EVOLUTION_CONFIG")
-        .or_else(|_| std::env::var("OPENPRX_EVOLUTION_CONFIG").or_else(|_| std::env::var("ZEROCLAW_EVOLUTION_CONFIG")))
-    {
+    if let Some(raw) = config.self_system.evolution_config_path.as_deref() {
         let path = PathBuf::from(raw);
         if !path.as_os_str().is_empty() {
             return path;

@@ -8,7 +8,7 @@ use crate::providers::{ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::session_worker::protocol::{WorkerManifest, WorkerResult};
-use crate::tools::sessions_spawn::with_spawn_execution_context;
+use crate::tools::sessions_spawn::{SPAWN_EXECUTION_CONTEXT, SpawnExecutionContext};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use std::future::Future;
@@ -87,7 +87,6 @@ fn parse_tools_override(tools_json: &str) -> Result<Vec<String>> {
 
 async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
     let mut config = Config::load_or_init().await?;
-    config.apply_env_overrides();
     config.workspace_dir = manifest.workspace_dir.clone();
 
     let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
@@ -97,6 +96,8 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
         codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
         codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
+        codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
     };
 
     let provider: Arc<dyn Provider> = Arc::from(crate::providers::create_resilient_provider_with_options(
@@ -249,13 +250,16 @@ where
     Fut: Future<Output = T>,
 {
     if !manifest.session_scope_key.trim().is_empty() {
-        with_spawn_execution_context(
-            manifest.run_id.clone(),
-            manifest.session_scope_key.clone(),
-            manifest.spawn_depth,
-            fut,
-        )
-        .await
+        SPAWN_EXECUTION_CONTEXT
+            .scope(
+                SpawnExecutionContext {
+                    run_id: manifest.run_id.clone(),
+                    session_scope_key: manifest.session_scope_key.clone(),
+                    spawn_depth: manifest.spawn_depth,
+                },
+                fut,
+            )
+            .await
     } else {
         fut.await
     }
@@ -357,7 +361,9 @@ mod tests {
         };
 
         let snapshot = with_manifest_spawn_context(&manifest, async {
-            crate::tools::sessions_spawn::spawn_execution_context_snapshot()
+            crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                .try_with(|ctx| (ctx.run_id.clone(), ctx.session_scope_key.clone(), ctx.spawn_depth))
+                .ok()
         })
         .await;
         assert_eq!(
