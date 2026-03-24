@@ -199,10 +199,7 @@ impl DefaultTreeExpander {
         if state.side_effect_mode == SideEffectMode::ReadOnly {
             return false;
         }
-        matches!(
-            state.max_risk_level(),
-            Some(RiskLevel::High | RiskLevel::Critical)
-        )
+        matches!(state.max_risk_level(), Some(RiskLevel::High | RiskLevel::Critical))
     }
 }
 
@@ -327,7 +324,12 @@ impl TreeExpander for DefaultTreeExpander {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::needless_collect)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::needless_collect
+)]
 mod tests {
     use super::*;
     use crate::causal_tree::state::{BudgetState, RiskFlag};
