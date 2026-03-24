@@ -1995,6 +1995,13 @@ pub fn summarize_provider_availability(
         if provider_requires_explicit_credential(provider)
             && resolve_provider_credential(provider, explicit_for_provider).is_none()
         {
+            // For anthropic, also check Claude Code OAuth credentials from ~/.claude/.credentials.json
+            if provider == "anthropic"
+                && resolve_claude_code_context(None).credential.is_some()
+            {
+                available.push(provider.clone());
+                continue;
+            }
             unavailable.push((provider.clone(), "missing credential/api key".to_string()));
             continue;
         }
