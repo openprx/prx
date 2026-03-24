@@ -1,11 +1,11 @@
-# AGENTS.md — ZeroClaw Agent Engineering Protocol
+# AGENTS.md — PRX Agent Engineering Protocol
 
 This file defines the default working protocol for coding agents in this repository.
 Scope: entire repository.
 
 ## 1) Project Snapshot (Read First)
 
-ZeroClaw is a Rust-first autonomous agent runtime optimized for:
+PRX is a Rust-first autonomous agent runtime optimized for:
 
 - high performance
 - high efficiency
@@ -243,7 +243,7 @@ Apply these naming rules for all code changes unless a subsystem has a stronger 
 - Keep trait implementer naming explicit and predictable: `<ProviderName>Provider`, `<ChannelName>Channel`, `<ToolName>Tool`, `<BackendName>Memory`.
 - Keep factory registration keys stable, lowercase, and user-facing (for example `"openai"`, `"discord"`, `"shell"`), and avoid alias sprawl without migration need.
 - Name tests by behavior/outcome (`<subject>_<expected_behavior>`) and keep fixture identifiers neutral/project-scoped.
-- If identity-like naming is required in tests/examples, use ZeroClaw-native labels only (`ZeroClawAgent`, `zeroclaw_user`, `zeroclaw_node`).
+- If identity-like naming is required in tests/examples, use PRX-native labels only (`PRXAgent`, `prx_user`, `prx_node`).
 
 ### 6.4 Architecture Boundary Contract (Required)
 
@@ -348,11 +348,11 @@ Treat privacy and neutrality as merge gates, not best-effort guidelines.
 - Prohibited data includes (non-exhaustive): real names, personal emails, phone numbers, addresses, access tokens, API keys, credentials, IDs, and private URLs.
 - Use neutral project-scoped placeholders (for example: `user_a`, `test_user`, `project_bot`, `example.com`) instead of real identity data.
 - Test names/messages/fixtures must be impersonal and system-focused; avoid first-person or identity-specific language.
-- If identity-like context is unavoidable, use ZeroClaw-scoped roles/labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`) and avoid real-world personas.
+- If identity-like context is unavoidable, use PRX-scoped roles/labels only (for example: `PRXAgent`, `PRXOperator`, `prx_user`) and avoid real-world personas.
 - Recommended identity-safe naming palette (use when identity-like context is required):
-    - actor labels: `ZeroClawAgent`, `ZeroClawOperator`, `ZeroClawMaintainer`, `zeroclaw_user`
-    - service/runtime labels: `zeroclaw_bot`, `zeroclaw_service`, `zeroclaw_runtime`, `zeroclaw_node`
-    - environment labels: `zeroclaw_project`, `zeroclaw_workspace`, `zeroclaw_channel`
+    - actor labels: `PRXAgent`, `PRXOperator`, `PRXMaintainer`, `prx_user`
+    - service/runtime labels: `prx_bot`, `prx_service`, `prx_runtime`, `prx_node`
+    - environment labels: `prx_project`, `prx_workspace`, `prx_channel`
 - If reproducing external incidents, redact and anonymize all payloads before committing.
 - Before push, review `git diff --cached` specifically for accidental sensitive strings and identity leakage.
 
