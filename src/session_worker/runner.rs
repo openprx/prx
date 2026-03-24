@@ -205,6 +205,7 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
             None,
             scope_ctx.as_ref(),
             None,
+            Some(&config.tool_tiering),
         )
         .await
     };

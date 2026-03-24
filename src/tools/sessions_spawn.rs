@@ -1417,6 +1417,7 @@ async fn run_sub_agent_task(
                 None, // no streaming sender
                 scope_ctx.as_ref(),
                 None,
+                None, // spawned sessions do not use tool tiering
             )
             .await;
             (task_history, result)

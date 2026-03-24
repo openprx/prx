@@ -629,6 +629,7 @@ pub async fn run(
                     Some(delta_tx.clone()),
                     Some(&scope_ctx),
                     Some(tool_event_tx.clone()),
+                    Some(&config.tool_tiering),
                 ),
             )
             .await;

@@ -49,6 +49,7 @@ pub struct Agent {
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     task_routing_config: crate::config::TaskRoutingConfig,
+    tool_tiering: crate::config::ToolTieringConfig,
     available_hints: Vec<String>,
     #[cfg(feature = "llm-router")]
     model_routes: Vec<crate::config::ModelRouteConfig>,
@@ -78,6 +79,7 @@ pub struct AgentBuilder {
     auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     task_routing_config: Option<crate::config::TaskRoutingConfig>,
+    tool_tiering: Option<crate::config::ToolTieringConfig>,
     available_hints: Option<Vec<String>>,
     #[cfg(feature = "llm-router")]
     model_routes: Option<Vec<crate::config::ModelRouteConfig>>,
@@ -107,6 +109,7 @@ impl AgentBuilder {
             auto_save: None,
             classification_config: None,
             task_routing_config: None,
+            tool_tiering: None,
             available_hints: None,
             #[cfg(feature = "llm-router")]
             model_routes: None,
@@ -213,6 +216,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn tool_tiering(mut self, tool_tiering: crate::config::ToolTieringConfig) -> Self {
+        self.tool_tiering = Some(tool_tiering);
+        self
+    }
+
     #[cfg(feature = "llm-router")]
     pub fn router(mut self, router: RouterEngine) -> Self {
         self.router = Some(router);
@@ -257,6 +265,7 @@ impl AgentBuilder {
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             task_routing_config: self.task_routing_config.unwrap_or_default(),
+            tool_tiering: self.tool_tiering.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             #[cfg(feature = "llm-router")]
             model_routes: self.model_routes.unwrap_or_default(),
@@ -373,6 +382,7 @@ impl Agent {
             .workspace_dir(config.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .task_routing_config(config.task_routing.clone())
+            .tool_tiering(config.tool_tiering.clone())
             .available_hints(available_hints)
             .model_routes(config.model_routes.clone())
             .identity_config(config.identity.clone())
@@ -395,6 +405,7 @@ impl Agent {
             .workspace_dir(config.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .task_routing_config(config.task_routing.clone())
+            .tool_tiering(config.tool_tiering.clone())
             .available_hints(available_hints)
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills_with_config(&config.workspace_dir, config))
@@ -912,7 +923,33 @@ impl Agent {
                     }),
                 )
                 .await;
-            let dynamic_tool_specs = self.tools.iter().flat_map(|tool| tool.specs()).collect::<Vec<_>>();
+            let dynamic_tool_specs: Vec<_> = if self.tool_tiering.enabled {
+                // Extract last user message for intent classification
+                let last_user_msg = self
+                    .history
+                    .iter()
+                    .rev()
+                    .find_map(|m| match m {
+                        ConversationMessage::Chat(cm)
+                            if cm.role == "user"
+                                && !cm.content.is_empty()
+                                && !cm.content.starts_with("[Tool") =>
+                        {
+                            Some(cm.content.as_str())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let filtered = crate::tools::intent::select_tools_for_intent(
+                    &self.tools,
+                    last_user_msg,
+                    &self.tool_tiering.always_include,
+                    &self.tool_tiering.always_exclude,
+                );
+                filtered.iter().flat_map(|tool| tool.specs()).collect()
+            } else {
+                self.tools.iter().flat_map(|tool| tool.specs()).collect()
+            };
             #[allow(unused_mut)]
             let mut response = match self
                 .provider

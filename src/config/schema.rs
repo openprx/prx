@@ -379,6 +379,10 @@ pub struct Config {
     /// Module control switches — determines which config.d/ files are loaded (`[modules]`).
     #[serde(default)]
     pub modules: ModulesConfig,
+
+    /// Tool tiering configuration — controls which tools are exposed based on intent (`[tool_tiering]`).
+    #[serde(default)]
+    pub tool_tiering: ToolTieringConfig,
 }
 
 impl std::fmt::Debug for Config {
@@ -434,6 +438,7 @@ impl std::fmt::Debug for Config {
             .field("causal_tree", &self.causal_tree)
             .field("security", &self.security)
             .field("modules", &self.modules)
+            .field("tool_tiering", &self.tool_tiering)
             .finish()
     }
 }
@@ -4170,6 +4175,31 @@ pub struct SecurityConfig {
     pub tool_policy: ToolPolicyConfig,
 }
 
+/// Tool tiering configuration — controls which tools are surfaced to the LLM based on intent.
+///
+/// When `enabled = true`, the agent narrows the tool list before each LLM call using the
+/// intent classifier result. `always_include` / `always_exclude` act as permanent overrides.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct ToolTieringConfig {
+    /// Whether tool tiering is enabled. When false, all tools are shown.
+    pub enabled: bool,
+    /// Tool names to always include regardless of intent classification.
+    pub always_include: Vec<String>,
+    /// Tool names to always exclude regardless of intent classification.
+    pub always_exclude: Vec<String>,
+}
+
+impl Default for ToolTieringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false, // opt-in, not opt-out; preserves backward compatibility
+            always_include: Vec::new(),
+            always_exclude: Vec::new(),
+        }
+    }
+}
+
 /// Sandbox configuration for OS-level isolation
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxConfig {
@@ -4393,6 +4423,7 @@ impl Default for Config {
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
             modules: ModulesConfig::default(),
+            tool_tiering: ToolTieringConfig::default(),
         }
     }
 }
@@ -5428,6 +5459,7 @@ default_temperature = 0.7
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
             modules: ModulesConfig::default(),
+            tool_tiering: ToolTieringConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5682,6 +5714,7 @@ concurrency_rollback_error_rate_threshold = 0.23
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
             modules: ModulesConfig::default(),
+            tool_tiering: ToolTieringConfig::default(),
         };
 
         config.save().await.unwrap();
