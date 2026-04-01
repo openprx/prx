@@ -20,9 +20,9 @@ RUN mkdir -p src benches crates/robot-kit/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "pub fn placeholder() {}" > crates/robot-kit/src/lib.rs
-RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+RUN --mount=type=cache,id=prx-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=prx-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=prx-target,target=/app/target,sharing=locked \
     cargo build --release --locked
 RUN rm -rf src benches crates/robot-kit/src
 
@@ -31,19 +31,19 @@ COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
 COPY firmware/ firmware/
-RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+RUN --mount=type=cache,id=prx-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=prx-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=prx-target,target=/app/target,sharing=locked \
     cargo build --release --locked && \
-    cp target/release/zeroclaw /app/zeroclaw && \
-    strip /app/zeroclaw
+    cp target/release/prx /app/prx && \
+    strip /app/prx
 
 # Prepare runtime directory structure and default config inline (no extra stage)
-RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
-    cat > /zeroclaw-data/.zeroclaw/config.toml <<EOF && \
-    chown -R 65534:65534 /zeroclaw-data
-workspace_dir = "/zeroclaw-data/workspace"
-config_path = "/zeroclaw-data/.zeroclaw/config.toml"
+RUN mkdir -p /prx-data/.prx /prx-data/workspace && \
+    cat > /prx-data/.prx/config.toml <<EOF && \
+    chown -R 65534:65534 /prx-data
+workspace_dir = "/prx-data/workspace"
+config_path = "/prx-data/.prx/config.toml"
 api_key = ""
 default_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4-20250514"
@@ -64,49 +64,49 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /zeroclaw-data /zeroclaw-data
-COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
+COPY --from=builder /prx-data /prx-data
+COPY --from=builder /app/prx /usr/local/bin/prx
 
 # Overwrite minimal config with DEV template (Ollama defaults)
-COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
-RUN chown 65534:65534 /zeroclaw-data/.zeroclaw/config.toml
+COPY dev/config.template.toml /prx-data/.prx/config.toml
+RUN chown 65534:65534 /prx-data/.prx/config.toml
 
 # Environment setup
 # Use consistent workspace path
-ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
-ENV HOME=/zeroclaw-data
+ENV PRX_WORKSPACE=/prx-data/workspace
+ENV HOME=/prx-data
 # Defaults for local dev (Ollama) - matches config.template.toml
 ENV PROVIDER="ollama"
-ENV ZEROCLAW_MODEL="llama3.2"
-ENV ZEROCLAW_GATEWAY_PORT=3000
+ENV PRX_MODEL="llama3.2"
+ENV PRX_GATEWAY_PORT=3000
 
 # Note: API_KEY is intentionally NOT set here to avoid confusion.
 # It is set in config.toml as the Ollama URL.
 
-WORKDIR /zeroclaw-data
+WORKDIR /prx-data
 USER 65534:65534
 EXPOSE 3000
-ENTRYPOINT ["zeroclaw"]
+ENTRYPOINT ["prx"]
 CMD ["gateway"]
 
 # ── Stage 3: Production Runtime (Distroless) ─────────────────
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
 
-COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
-COPY --from=builder /zeroclaw-data /zeroclaw-data
+COPY --from=builder /app/prx /usr/local/bin/prx
+COPY --from=builder /prx-data /prx-data
 
 # Environment setup
-ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
-ENV HOME=/zeroclaw-data
+ENV PRX_WORKSPACE=/prx-data/workspace
+ENV HOME=/prx-data
 # Default provider (model is set in config.toml, not here,
 # so config file edits are not silently overridden)
 ENV PROVIDER="openrouter"
-ENV ZEROCLAW_GATEWAY_PORT=3000
+ENV PRX_GATEWAY_PORT=3000
 
 # API_KEY must be provided at runtime!
 
-WORKDIR /zeroclaw-data
+WORKDIR /prx-data
 USER 65534:65534
 EXPOSE 3000
-ENTRYPOINT ["zeroclaw"]
+ENTRYPOINT ["prx"]
 CMD ["gateway"]
