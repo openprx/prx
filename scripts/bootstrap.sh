@@ -15,14 +15,14 @@ error() {
 
 usage() {
   cat <<'USAGE'
-ZeroClaw installer bootstrap engine
+PRX installer bootstrap engine
 
 Usage:
-  ./zeroclaw_install.sh [options]
+  ./prx_install.sh [options]
   ./bootstrap.sh [options]         # compatibility entrypoint
 
 Modes:
-  Default mode installs/builds ZeroClaw only (requires existing Rust toolchain).
+  Default mode installs/builds PRX only (requires existing Rust toolchain).
   Guided mode asks setup questions and configures options interactively.
   Optional bootstrap mode can also install system dependencies and Rust.
 
@@ -46,29 +46,29 @@ Options:
   -h, --help                 Show help
 
 Examples:
-  ./zeroclaw_install.sh
-  ./zeroclaw_install.sh --guided
-  ./zeroclaw_install.sh --install-system-deps --install-rust
-  ./zeroclaw_install.sh --prefer-prebuilt
-  ./zeroclaw_install.sh --prebuilt-only
-  ./zeroclaw_install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
-  ./zeroclaw_install.sh --interactive-onboard
+  ./prx_install.sh
+  ./prx_install.sh --guided
+  ./prx_install.sh --install-system-deps --install-rust
+  ./prx_install.sh --prefer-prebuilt
+  ./prx_install.sh --prebuilt-only
+  ./prx_install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+  ./prx_install.sh --interactive-onboard
 
   # Compatibility entrypoint:
   ./bootstrap.sh --docker
 
   # Remote one-liner
-  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/openprx/prx/main/scripts/bootstrap.sh | bash
 
 Environment:
-  ZEROCLAW_DOCKER_DATA_DIR   Host path for Docker config/workspace persistence
-  ZEROCLAW_DOCKER_IMAGE      Docker image tag to build/run (default: zeroclaw-bootstrap:local)
-  ZEROCLAW_API_KEY           Used when --api-key is not provided
-  ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
-  ZEROCLAW_MODEL             Used when --model is not provided
-  ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
-  ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
-  ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS
+  PRX_DOCKER_DATA_DIR   Host path for Docker config/workspace persistence
+  PRX_DOCKER_IMAGE      Docker image tag to build/run (default: prx-bootstrap:local)
+  PRX_API_KEY           Used when --api-key is not provided
+  PRX_PROVIDER          Used when --provider is not provided (default: openrouter)
+  PRX_MODEL             Used when --model is not provided
+  PRX_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
+  PRX_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
+  PRX_DISABLE_ALPINE_AUTO_DEPS
                             Set to 1 to disable Alpine auto-install of missing prerequisites
 USAGE
 }
@@ -188,8 +188,8 @@ should_attempt_prebuilt_for_resources() {
   local workspace="${1:-.}"
   local min_ram_mb min_disk_mb total_ram_mb free_disk_mb low_resource
 
-  min_ram_mb="${ZEROCLAW_BOOTSTRAP_MIN_RAM_MB:-2048}"
-  min_disk_mb="${ZEROCLAW_BOOTSTRAP_MIN_DISK_MB:-6144}"
+  min_ram_mb="${PRX_BOOTSTRAP_MIN_RAM_MB:-2048}"
+  min_disk_mb="${PRX_BOOTSTRAP_MIN_DISK_MB:-6144}"
   total_ram_mb="$(get_total_memory_mb || true)"
   free_disk_mb="$(get_available_disk_mb "$workspace" || true)"
   low_resource=false
@@ -237,10 +237,10 @@ install_prebuilt_binary() {
     return 1
   fi
 
-  archive_url="https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-${target}.tar.gz"
+  archive_url="https://github.com/openprx/prx/releases/latest/download/prx-${target}.tar.gz"
   local checksum_url="${archive_url}.sha256"
-  temp_dir="$(mktemp -d -t zeroclaw-prebuilt-XXXXXX)"
-  archive_path="$temp_dir/zeroclaw-${target}.tar.gz"
+  temp_dir="$(mktemp -d -t prx-prebuilt-XXXXXX)"
+  archive_path="$temp_dir/prx-${target}.tar.gz"
   local checksum_path="${archive_path}.sha256"
 
   info "Attempting pre-built binary install for target: $target"
@@ -270,22 +270,22 @@ install_prebuilt_binary() {
     return 1
   fi
 
-  extracted_bin="$temp_dir/zeroclaw"
+  extracted_bin="$temp_dir/prx"
   if [[ ! -x "$extracted_bin" ]]; then
-    extracted_bin="$(find "$temp_dir" -maxdepth 2 -type f -name zeroclaw -perm -u+x | head -n 1 || true)"
+    extracted_bin="$(find "$temp_dir" -maxdepth 2 -type f -name prx -perm -u+x | head -n 1 || true)"
   fi
   if [[ -z "$extracted_bin" || ! -x "$extracted_bin" ]]; then
-    warn "Archive did not contain an executable zeroclaw binary."
+    warn "Archive did not contain an executable prx binary."
     rm -rf "$temp_dir"
     return 1
   fi
 
   install_dir="$HOME/.cargo/bin"
   mkdir -p "$install_dir"
-  install -m 0755 "$extracted_bin" "$install_dir/zeroclaw"
+  install -m 0755 "$extracted_bin" "$install_dir/prx"
   rm -rf "$temp_dir"
 
-  info "Installed pre-built binary to $install_dir/zeroclaw"
+  info "Installed pre-built binary to $install_dir/prx"
   if [[ ":$PATH:" != *":$install_dir:"* ]]; then
     warn "$install_dir is not in PATH for this shell."
     warn "Run: export PATH=\"$install_dir:\$PATH\""
@@ -330,7 +330,7 @@ run_pacman() {
 
   local pacman_cfg_tmp=""
   local pacman_rc=0
-  pacman_cfg_tmp="$(mktemp /tmp/zeroclaw-pacman.XXXXXX.conf)"
+  pacman_cfg_tmp="$(mktemp /tmp/prx-pacman.XXXXXX.conf)"
   cp /etc/pacman.conf "$pacman_cfg_tmp"
   if ! grep -Eq '^[[:space:]]*DisableSandboxSyscalls([[:space:]]|$)' "$pacman_cfg_tmp"; then
     printf '\nDisableSandboxSyscalls\n' >> "$pacman_cfg_tmp"
@@ -550,7 +550,7 @@ run_guided_installer() {
   local api_key_input=""
 
   echo
-  echo "ZeroClaw guided installer"
+  echo "PRX guided installer"
   echo "Answer a few questions, then the installer will run automatically."
   echo
 
@@ -578,7 +578,7 @@ run_guided_installer() {
     SKIP_BUILD=true
   fi
 
-  if prompt_yes_no "Install zeroclaw into cargo bin now?" "yes"; then
+  if prompt_yes_no "Install prx into cargo bin now?" "yes"; then
     SKIP_INSTALL=false
   else
     SKIP_INSTALL=true
@@ -661,7 +661,7 @@ ensure_docker_ready() {
     error "docker is not installed."
     cat <<'MSG' >&2
 Install Docker first, then re-run with:
-  ./zeroclaw_install.sh --docker
+  ./prx_install.sh --docker
 MSG
     exit 1
   fi
@@ -675,16 +675,16 @@ MSG
 
 run_docker_bootstrap() {
   local docker_image docker_data_dir default_data_dir
-  docker_image="${ZEROCLAW_DOCKER_IMAGE:-zeroclaw-bootstrap:local}"
+  docker_image="${PRX_DOCKER_IMAGE:-prx-bootstrap:local}"
   if [[ "$TEMP_CLONE" == true ]]; then
-    default_data_dir="$HOME/.zeroclaw-docker"
+    default_data_dir="$HOME/.prx-docker"
   else
-    default_data_dir="$WORK_DIR/.zeroclaw-docker"
+    default_data_dir="$WORK_DIR/.prx-docker"
   fi
-  docker_data_dir="${ZEROCLAW_DOCKER_DATA_DIR:-$default_data_dir}"
+  docker_data_dir="${PRX_DOCKER_DATA_DIR:-$default_data_dir}"
   DOCKER_DATA_DIR="$docker_data_dir"
 
-  mkdir -p "$docker_data_dir/.zeroclaw" "$docker_data_dir/workspace"
+  mkdir -p "$docker_data_dir/.prx" "$docker_data_dir/workspace"
 
   if [[ "$SKIP_INSTALL" == true ]]; then
     warn "--skip-install has no effect with --docker."
@@ -710,9 +710,9 @@ run_docker_bootstrap() {
 Use either:
   --api-key "sk-..."
 or:
-  ZEROCLAW_API_KEY="sk-..." ./zeroclaw_install.sh --docker
+  PRX_API_KEY="sk-..." ./prx_install.sh --docker
 or run interactive:
-  ./zeroclaw_install.sh --docker --interactive-onboard
+  ./prx_install.sh --docker --interactive-onboard
 MSG
       exit 1
     fi
@@ -729,10 +729,10 @@ MSG
 
   docker run --rm -it \
     --user "$(id -u):$(id -g)" \
-    -e HOME=/zeroclaw-data \
-    -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
-    -v "$docker_data_dir/.zeroclaw:/zeroclaw-data/.zeroclaw" \
-    -v "$docker_data_dir/workspace:/zeroclaw-data/workspace" \
+    -e HOME=/prx-data \
+    -e PRX_WORKSPACE=/prx-data/workspace \
+    -v "$docker_data_dir/.prx:/prx-data/.prx" \
+    -v "$docker_data_dir/workspace:/prx-data/workspace" \
     "$docker_image" \
     "${onboard_cmd[@]}"
 }
@@ -740,7 +740,7 @@ MSG
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd || pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd || pwd)"
-REPO_URL="https://github.com/zeroclaw-labs/zeroclaw.git"
+REPO_URL="https://github.com/openprx/prx.git"
 ORIGINAL_ARG_COUNT=$#
 GUIDED_MODE="auto"
 
@@ -755,9 +755,9 @@ INTERACTIVE_ONBOARD=false
 SKIP_BUILD=false
 SKIP_INSTALL=false
 PREBUILT_INSTALLED=false
-API_KEY="${ZEROCLAW_API_KEY:-}"
-PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
-MODEL="${ZEROCLAW_MODEL:-}"
+API_KEY="${PRX_API_KEY:-}"
+PROVIDER="${PRX_PROVIDER:-openrouter}"
+MODEL="${PRX_MODEL:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -877,11 +877,11 @@ if [[ "$DOCKER_MODE" == true ]]; then
       warn "--install-rust is ignored with --docker."
   fi
 else
-  if [[ "$OS_NAME" == "Linux" && -z "${ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS:-}" ]] && have_cmd apk; then
+  if [[ "$OS_NAME" == "Linux" && -z "${PRX_DISABLE_ALPINE_AUTO_DEPS:-}" ]] && have_cmd apk; then
     find_missing_alpine_prereqs
     if [[ ${#ALPINE_MISSING_PKGS[@]} -gt 0 && "$INSTALL_SYSTEM_DEPS" == false ]]; then
       info "Detected Alpine with missing prerequisites: ${ALPINE_MISSING_PKGS[*]}"
-      info "Auto-enabling system dependency installation (set ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS=1 to disable)."
+      info "Auto-enabling system dependency installation (set PRX_DISABLE_ALPINE_AUTO_DEPS=1 to disable)."
       INSTALL_SYSTEM_DEPS=true
     fi
   fi
@@ -922,7 +922,7 @@ if [[ ! -f "$WORK_DIR/Cargo.toml" ]]; then
       exit 1
     fi
 
-    TEMP_DIR="$(mktemp -d -t zeroclaw-bootstrap-XXXXXX)"
+    TEMP_DIR="$(mktemp -d -t prx-bootstrap-XXXXXX)"
     info "No local repository detected; cloning latest main branch"
     git clone --depth 1 "$REPO_URL" "$TEMP_DIR"
     WORK_DIR="$TEMP_DIR"
@@ -930,7 +930,7 @@ if [[ ! -f "$WORK_DIR/Cargo.toml" ]]; then
   fi
 fi
 
-info "ZeroClaw bootstrap"
+info "PRX bootstrap"
 echo "    workspace: $WORK_DIR"
 
 cd "$WORK_DIR"
@@ -957,14 +957,14 @@ if [[ "$DOCKER_MODE" == true ]]; then
 
 ✅ Docker bootstrap complete.
 
-Your containerized ZeroClaw data is persisted under:
+Your containerized PRX data is persisted under:
 DONE
   echo "  $DOCKER_DATA_DIR"
   cat <<'DONE'
 
 Next steps:
-  ./zeroclaw_install.sh --docker --interactive-onboard
-  ./zeroclaw_install.sh --docker --api-key "sk-..." --provider openrouter
+  ./prx_install.sh --docker --interactive-onboard
+  ./prx_install.sh --docker --api-key "sk-..." --provider openrouter
 DONE
   exit 0
 fi
@@ -997,7 +997,7 @@ if [[ "$PREBUILT_INSTALLED" == false && ( "$SKIP_BUILD" == false || "$SKIP_INSTA
   cat <<'MSG' >&2
 Install Rust first: https://rustup.rs/
 or re-run with:
-  ./zeroclaw_install.sh --install-rust
+  ./prx_install.sh --install-rust
 MSG
   exit 1
 fi
@@ -1010,31 +1010,31 @@ else
 fi
 
 if [[ "$SKIP_INSTALL" == false ]]; then
-  info "Installing zeroclaw to cargo bin"
+  info "Installing prx to cargo bin"
   cargo install --path "$WORK_DIR" --force --locked
 else
   info "Skipping install"
 fi
 
-ZEROCLAW_BIN=""
-if have_cmd zeroclaw; then
-  ZEROCLAW_BIN="zeroclaw"
-elif [[ -x "$HOME/.cargo/bin/zeroclaw" ]]; then
-  ZEROCLAW_BIN="$HOME/.cargo/bin/zeroclaw"
-elif [[ -x "$WORK_DIR/target/release/zeroclaw" ]]; then
-  ZEROCLAW_BIN="$WORK_DIR/target/release/zeroclaw"
+PRX_BIN=""
+if have_cmd prx; then
+  PRX_BIN="prx"
+elif [[ -x "$HOME/.cargo/bin/prx" ]]; then
+  PRX_BIN="$HOME/.cargo/bin/prx"
+elif [[ -x "$WORK_DIR/target/release/prx" ]]; then
+  PRX_BIN="$WORK_DIR/target/release/prx"
 fi
 
 if [[ "$RUN_ONBOARD" == true ]]; then
-  if [[ -z "$ZEROCLAW_BIN" ]]; then
-    error "onboarding requested but zeroclaw binary is not available."
-    error "Run without --skip-install, or ensure zeroclaw is in PATH."
+  if [[ -z "$PRX_BIN" ]]; then
+    error "onboarding requested but prx binary is not available."
+    error "Run without --skip-install, or ensure prx is in PATH."
     exit 1
   fi
 
   if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
     info "Running interactive onboarding"
-    "$ZEROCLAW_BIN" onboard --interactive
+    "$PRX_BIN" onboard --interactive
   else
     if [[ -z "$API_KEY" ]]; then
       cat <<'MSG'
@@ -1042,9 +1042,9 @@ if [[ "$RUN_ONBOARD" == true ]]; then
 Use either:
   --api-key "sk-..."
 or:
-  ZEROCLAW_API_KEY="sk-..." ./zeroclaw_install.sh --onboard
+  PRX_API_KEY="sk-..." ./prx_install.sh --onboard
 or run interactive:
-  ./zeroclaw_install.sh --interactive-onboard
+  ./prx_install.sh --interactive-onboard
 MSG
       exit 1
     fi
@@ -1053,7 +1053,7 @@ MSG
     else
       info "Running quick onboarding (provider: $PROVIDER)"
     fi
-    ONBOARD_CMD=("$ZEROCLAW_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
+    ONBOARD_CMD=("$PRX_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
     if [[ -n "$MODEL" ]]; then
       ONBOARD_CMD+=(--model "$MODEL")
     fi
@@ -1066,7 +1066,7 @@ cat <<'DONE'
 ✅ Bootstrap complete.
 
 Next steps:
-  zeroclaw status
-  zeroclaw agent -m "Hello, ZeroClaw!"
-  zeroclaw gateway
+  prx status
+  prx agent -m "Hello, PRX!"
+  prx gateway
 DONE
