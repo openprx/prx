@@ -1449,7 +1449,7 @@ fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
 /// Build assistant history entry in JSON format for native tool-call APIs.
 /// `convert_messages` in the OpenRouter provider parses this JSON to reconstruct
 /// the proper `NativeMessage` with structured `tool_calls`.
-fn build_native_assistant_history(text: &str, tool_calls: &[ToolCall]) -> String {
+fn build_native_assistant_history(text: &str, tool_calls: &[ToolCall], reasoning_content: Option<&str>) -> String {
     let calls_json: Vec<serde_json::Value> = tool_calls
         .iter()
         .map(|tc| {
@@ -1467,11 +1467,19 @@ fn build_native_assistant_history(text: &str, tool_calls: &[ToolCall]) -> String
         serde_json::Value::String(text.trim().to_string())
     };
 
-    serde_json::json!({
+    let mut obj = serde_json::json!({
         "content": content,
         "tool_calls": calls_json,
-    })
-    .to_string()
+    });
+    if let Some(rc) = reasoning_content {
+        if let Some(map) = obj.as_object_mut() {
+            map.insert(
+                "reasoning_content".to_string(),
+                serde_json::Value::String(rc.to_string()),
+            );
+        }
+    }
+    obj.to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -2255,11 +2263,7 @@ pub(crate) async fn run_tool_call_loop(
             let last_user_msg = history
                 .iter()
                 .rev()
-                .find(|m| {
-                    m.role == "user"
-                        && !m.content.is_empty()
-                        && !m.content.starts_with("[Tool")
-                })
+                .find(|m| m.role == "user" && !m.content.is_empty() && !m.content.starts_with("[Tool"))
                 .map(|m| m.content.as_str())
                 .unwrap_or_default();
             let filtered = crate::tools::intent::select_tools_for_intent(
@@ -2497,7 +2501,7 @@ pub(crate) async fn run_tool_call_loop(
                 let assistant_history_content = if resp.tool_calls.is_empty() {
                     response_text.clone()
                 } else {
-                    build_native_assistant_history(&response_text, &resp.tool_calls)
+                    build_native_assistant_history(&response_text, &resp.tool_calls, resp.reasoning_content.as_deref())
                 };
 
                 let native_calls = resp.tool_calls;
@@ -3550,6 +3554,7 @@ mod tests {
             Ok(ChatResponse {
                 text: Some("vision-ok".to_string()),
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             })
         }
     }
@@ -3565,6 +3570,7 @@ mod tests {
                 .map(|text| ChatResponse {
                     text: Some(text.to_string()),
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 })
                 .collect();
             Self {

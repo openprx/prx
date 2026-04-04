@@ -931,9 +931,7 @@ impl Agent {
                     .rev()
                     .find_map(|m| match m {
                         ConversationMessage::Chat(cm)
-                            if cm.role == "user"
-                                && !cm.content.is_empty()
-                                && !cm.content.starts_with("[Tool") =>
+                            if cm.role == "user" && !cm.content.is_empty() && !cm.content.starts_with("[Tool") =>
                         {
                             Some(cm.content.as_str())
                         }
@@ -1355,6 +1353,7 @@ mod tests {
                 return Ok(crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
+                    reasoning_content: None,
                 });
             }
             Ok(guard.remove(0))
@@ -1392,6 +1391,7 @@ mod tests {
             responses: Mutex::new(vec![crate::providers::ChatResponse {
                 text: Some("hello".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
             }]),
         });
 
@@ -1430,10 +1430,12 @@ mod tests {
                         name: "echo".into(),
                         arguments: "{}".into(),
                     }],
+                    reasoning_content: None,
                 },
                 crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
+                    reasoning_content: None,
                 },
             ]),
         });
@@ -1584,6 +1586,7 @@ mod tests {
             Ok(crate::providers::ChatResponse {
                 text: Some(text),
                 tool_calls: vec![],
+                reasoning_content: None,
             })
         }
     }

@@ -355,15 +355,15 @@ impl Tool for ProxyConfigTool {
                     "description": "Proxy scope: environment | prx | services"
                 },
                 "http_proxy": {
-                    "type": ["string", "null"],
+                    "type": "string",
                     "description": "HTTP proxy URL"
                 },
                 "https_proxy": {
-                    "type": ["string", "null"],
+                    "type": "string",
                     "description": "HTTPS proxy URL"
                 },
                 "all_proxy": {
-                    "type": ["string", "null"],
+                    "type": "string",
                     "description": "Fallback proxy URL for all protocols"
                 },
                 "no_proxy": {

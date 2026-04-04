@@ -598,10 +598,13 @@ impl SecurityPolicy {
                 return false;
             }
 
-            // Validate arguments for the command
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
-            if !self.is_args_safe(base_cmd, &args) {
-                return false;
+            // Validate arguments for the command unless full autonomy is selected.
+            // In full mode, argument-level safety gates are intentionally disabled.
+            if self.autonomy != AutonomyLevel::Full {
+                let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+                if !self.is_args_safe(base_cmd, &args) {
+                    return false;
+                }
             }
         }
 
@@ -702,6 +705,10 @@ impl SecurityPolicy {
     /// Validate that a resolved path is still inside the workspace.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        if !self.workspace_only {
+            return true;
+        }
+
         // Must be under workspace_dir (prevents symlink escapes).
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
@@ -949,6 +956,17 @@ mod tests {
         let p = full_policy();
         assert!(p.is_command_allowed("ls"));
         assert!(!p.is_command_allowed("rm -rf /"));
+    }
+
+    #[test]
+    fn full_autonomy_skips_argument_safety_filters() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["git".into(), "find".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("git config user.name test"));
+        assert!(p.is_command_allowed("find . -exec ls {} \\;"));
     }
 
     #[test]
@@ -1782,6 +1800,17 @@ mod tests {
         assert!(!p.is_resolved_path_allowed(Path::new("/home/user/other_project/file")));
         // Root — blocked
         assert!(!p.is_resolved_path_allowed(Path::new("/")));
+    }
+
+    #[test]
+    fn resolved_path_check_disabled_when_workspace_only_is_false() {
+        let p = SecurityPolicy {
+            workspace_only: false,
+            workspace_dir: PathBuf::from("/home/user/project"),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_resolved_path_allowed(Path::new("/etc/passwd")));
+        assert!(p.is_resolved_path_allowed(Path::new("/home/user/other_project/file")));
     }
 
     #[test]

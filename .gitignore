@@ -32,3 +32,4 @@ credentials.json
 # Console UI build output
 console/dist/
 pdk/rust/examples/voice-talk-realtime/target/
+*.log

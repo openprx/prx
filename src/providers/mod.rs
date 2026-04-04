@@ -35,6 +35,7 @@ pub use traits::{
     ProviderCapabilityError, ToolCall, ToolResultMessage,
 };
 
+use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 use serde::{Deserialize, Serialize};
@@ -1287,7 +1288,16 @@ fn create_provider_with_url_and_options(
                     )));
                 }
             }
-            Ok(Box::new(anthropic::AnthropicProvider::new(key)))
+            // OAuth setup tokens (sk-ant-oat01-) require Bearer auth + refresh_token.
+            // Without a refresh_token they cannot be used as plain x-api-key credentials.
+            let effective_key = key.filter(|k| !is_claude_code_oauth_setup_token(k));
+            if key.is_some() && effective_key.is_none() {
+                tracing::warn!(
+                    "Ignoring Claude Code OAuth setup token for anthropic provider \
+                     (no refresh_token available; token cannot be used as plain API key)"
+                );
+            }
+            Ok(Box::new(anthropic::AnthropicProvider::new(effective_key)))
         }
         name if is_claude_code_alias(name) => {
             if let Some(ctx) = claude_code_context.as_ref() {
@@ -1299,7 +1309,15 @@ fn create_provider_with_url_and_options(
                     )));
                 }
             }
-            Ok(Box::new(anthropic::AnthropicProvider::new(key)))
+            // Same guard as the "anthropic" arm above.
+            let effective_key = key.filter(|k| !is_claude_code_oauth_setup_token(k));
+            if key.is_some() && effective_key.is_none() {
+                tracing::warn!(
+                    "Ignoring Claude Code OAuth setup token for claude-code provider \
+                     (no refresh_token available; token cannot be used as plain API key)"
+                );
+            }
+            Ok(Box::new(anthropic::AnthropicProvider::new(effective_key)))
         }
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
@@ -1760,6 +1778,11 @@ pub struct ProviderInfo {
     pub aliases: &'static [&'static str],
     /// Whether the provider runs locally (no API key required)
     pub local: bool,
+    /// Whether this provider is a model aggregator that accepts any model ID
+    /// regardless of the org-prefix in `org/model` format.
+    /// Example: OpenRouter routes `mistralai/mistral-7b` even though its own
+    /// canonical name is `"openrouter"`, not `"mistralai"`.
+    pub accepts_any_model: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1845,6 +1868,14 @@ pub fn provider_matches_model_prefix(provider_name: &str, model: &str) -> bool {
                 .iter()
                 .any(|alias| alias.eq_ignore_ascii_case(&provider_name))
         {
+            // Aggregator providers accept any model regardless of the org-prefix.
+            // OpenRouter routes to hundreds of models whose IDs use `org/model`
+            // format (e.g. "mistralai/mistral-7b", "anthropic/claude-3-opus").
+            // The prefix is the upstream org, not "openrouter" itself.
+            if info.accepts_any_model {
+                return true;
+            }
+
             if info.name.eq_ignore_ascii_case(&prefix)
                 || info.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(&prefix))
             {
@@ -1890,10 +1921,20 @@ pub fn summarize_provider_availability(
         if provider_requires_explicit_credential(provider)
             && resolve_provider_credential(provider, explicit_for_provider).is_none()
         {
-            // For anthropic, also check Claude Code OAuth credentials from ~/.claude/.credentials.json
-            if provider == "anthropic" && resolve_claude_code_context(None).credential.is_some() {
-                available.push(provider.clone());
-                continue;
+            // For anthropic (and its claude-code / claude-cli aliases), also check Claude Code
+            // OAuth credentials from ~/.claude/.credentials.json.
+            // OAuth setup tokens (sk-ant-oat01-) are only usable when paired with a refresh_token
+            // for the full OAuth flow; without one they cannot serve as a plain API key.
+            if provider == "anthropic" || is_claude_code_alias(provider) {
+                let ctx = resolve_claude_code_context(None);
+                let has_usable_credential = ctx
+                    .credential
+                    .as_deref()
+                    .is_some_and(|token| !is_claude_code_oauth_setup_token(token) || ctx.refresh_token.is_some());
+                if has_usable_credential {
+                    available.push(provider.clone());
+                    continue;
+                }
             }
             // For Gemini, also check env vars (GEMINI_API_KEY / GOOGLE_API_KEY) and CLI OAuth tokens,
             // because GeminiProvider::new() reads those independently of resolve_provider_credential().
@@ -1930,36 +1971,46 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "OpenRouter",
             aliases: &[],
             local: false,
+            // OpenRouter is a model aggregator: it routes requests to hundreds of
+            // upstream models whose IDs use `org/model` format (e.g.
+            // "mistralai/mistral-7b", "anthropic/claude-3-opus").  The prefix is
+            // the upstream vendor, not "openrouter", so any model name is valid.
+            accepts_any_model: true,
         },
         ProviderInfo {
             name: "anthropic",
             display_name: "Anthropic",
             aliases: &["claude-code", "claude-cli"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "openai",
             display_name: "OpenAI",
             aliases: &[],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "openai-codex",
             display_name: "OpenAI Codex (OAuth)",
             aliases: &["openai_codex", "codex"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "ollama",
             display_name: "Ollama",
             aliases: &[],
             local: true,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "gemini",
             display_name: "Google Gemini",
             aliases: &["google", "google-gemini"],
             local: false,
+            accepts_any_model: false,
         },
         // ── OpenAI-compatible providers ──────────────────────
         ProviderInfo {
@@ -1967,54 +2018,63 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "Venice",
             aliases: &[],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "vercel",
             display_name: "Vercel AI Gateway",
             aliases: &["vercel-ai"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "cloudflare",
             display_name: "Cloudflare AI",
             aliases: &["cloudflare-ai"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "moonshot",
             display_name: "Moonshot",
             aliases: &["kimi"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "kimi-code",
             display_name: "Kimi Code",
             aliases: &["kimi_coding", "kimi_for_coding"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "synthetic",
             display_name: "Synthetic",
             aliases: &[],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "opencode",
             display_name: "OpenCode Zen",
             aliases: &["opencode-zen"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "zai",
             display_name: "Z.AI",
             aliases: &["z.ai"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "glm",
             display_name: "GLM (Zhipu)",
             aliases: &["zhipu"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "minimax",
@@ -2031,18 +2091,21 @@ pub fn list_providers() -> Vec<ProviderInfo> {
                 "minimax-portal-cn",
             ],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "bedrock",
             display_name: "Amazon Bedrock",
             aliases: &["aws-bedrock"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "qianfan",
             display_name: "Qianfan (Baidu)",
             aliases: &["baidu"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "qwen",
@@ -2058,102 +2121,119 @@ pub fn list_providers() -> Vec<ProviderInfo> {
                 "qwen_oauth",
             ],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "groq",
             display_name: "Groq",
             aliases: &[],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "mistral",
             display_name: "Mistral",
             aliases: &[],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "xai",
             display_name: "xAI (Grok)",
             aliases: &["grok"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "deepseek",
             display_name: "DeepSeek",
             aliases: &[],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "together",
             display_name: "Together AI",
             aliases: &["together-ai"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "fireworks",
             display_name: "Fireworks AI",
             aliases: &["fireworks-ai"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "perplexity",
             display_name: "Perplexity",
             aliases: &[],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "cohere",
             display_name: "Cohere",
             aliases: &[],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "copilot",
             display_name: "GitHub Copilot",
             aliases: &["github-copilot"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "lmstudio",
             display_name: "LM Studio",
             aliases: &["lm-studio"],
             local: true,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "llamacpp",
             display_name: "llama.cpp server",
             aliases: &["llama.cpp"],
             local: true,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "litellm",
             display_name: "LiteLLM",
             aliases: &["lite-llm"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "vllm",
             display_name: "vLLM",
             aliases: &["v-llm"],
             local: true,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "huggingface",
             display_name: "Hugging Face Inference",
             aliases: &["hf", "hf-inference"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "nvidia",
             display_name: "NVIDIA NIM",
             aliases: &["nvidia-nim", "build.nvidia.com"],
             local: false,
+            accepts_any_model: false,
         },
         ProviderInfo {
             name: "ovhcloud",
             display_name: "OVHcloud AI Endpoints",
             aliases: &["ovh"],
             local: false,
+            accepts_any_model: false,
         },
     ]
 }
@@ -3011,6 +3091,29 @@ mod tests {
     fn provider_model_prefix_matching_rejects_cross_provider_mismatch() {
         assert!(provider_matches_model_prefix("openai", "openai/gpt-4o"));
         assert!(!provider_matches_model_prefix("anthropic", "openai/gpt-4o"));
+    }
+
+    /// OpenRouter is a model aggregator: it must accept any `org/model` style
+    /// model ID even when the prefix does not match "openrouter".
+    /// Regression test for: `prx go -p openrouter -m "mistralai/mistral-7b"`
+    /// previously returning "not compatible with provider".
+    #[test]
+    fn openrouter_accepts_any_org_prefixed_model() {
+        // Standard org/model format used by most OpenRouter models
+        assert!(provider_matches_model_prefix("openrouter", "mistralai/mistral-7b"));
+        assert!(provider_matches_model_prefix("openrouter", "anthropic/claude-3-opus"));
+        assert!(provider_matches_model_prefix(
+            "openrouter",
+            "meta-llama/llama-3-70b-instruct"
+        ));
+        assert!(provider_matches_model_prefix("openrouter", "google/gemma-2-9b-it"));
+        // Mixed-case provider name must also work
+        assert!(provider_matches_model_prefix("OpenRouter", "mistralai/mistral-7b"));
+        // Models without a slash (plain names) already returned true for everyone
+        assert!(provider_matches_model_prefix("openrouter", "gpt-4o"));
+        // Other providers must NOT accept cross-vendor prefixed models
+        assert!(!provider_matches_model_prefix("anthropic", "mistralai/mistral-7b"));
+        assert!(!provider_matches_model_prefix("openai", "mistralai/mistral-7b"));
     }
 
     /// Fallback providers resolve their own credentials independently

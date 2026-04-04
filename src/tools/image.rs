@@ -288,6 +288,7 @@ mod tests {
             Ok(crate::providers::ChatResponse {
                 text: Some(self.response.clone()),
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             })
         }
 

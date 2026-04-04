@@ -209,6 +209,7 @@ impl WasmProvider {
                 Ok(None) => Ok(ChatResponse {
                     text: None,
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 }),
                 Err(Some(inner_err)) => match inner_err.as_ref() {
                     wasmtime::component::Val::String(e) => Err(PluginError::Runtime(format!(
@@ -266,7 +267,11 @@ impl WasmProvider {
             })
             .unwrap_or_default();
 
-        Ok(ChatResponse { text, tool_calls })
+        Ok(ChatResponse {
+            text,
+            tool_calls,
+            reasoning_content: None,
+        })
     }
 
     /// Parse a single `tool-call` record value.

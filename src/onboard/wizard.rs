@@ -10,6 +10,7 @@ use crate::config::{
     SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
 };
 use crate::memory::{default_memory_backend_key, memory_backend_profile, selectable_memory_backends};
+use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
 use crate::providers::{
     canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias, is_moonshot_alias,
     is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias, is_zai_cn_alias,
@@ -281,7 +282,17 @@ pub async fn run_channels_repair_wizard(config_dir: Option<&str>) -> Result<(Con
 
     print_step(1, 1, "Channels (How You Talk to OpenPRX)");
     config.channels_config = setup_channels()?;
-    config.save().await?;
+
+    let config_d_dir = config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("config.d");
+    if config_d_dir.is_dir() {
+        crate::config::files::write_split_config(&config, false).await?;
+    } else {
+        config.save().await?;
+    }
     persist_workspace_selection(&config.config_path).await?;
 
     println!();
@@ -475,7 +486,16 @@ async fn run_quick_setup_with_home(
         tool_tiering: crate::config::ToolTieringConfig::default(),
     };
 
-    config.save().await?;
+    let config_d_dir = config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("config.d");
+    if config_d_dir.is_dir() {
+        crate::config::files::write_split_config(&config, false).await?;
+    } else {
+        config.save().await?;
+    }
     persist_workspace_selection(&config.config_path).await?;
 
     // Scaffold minimal workspace files
@@ -1149,7 +1169,7 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
         .get("https://api.anthropic.com/v1/models")
         .header("anthropic-version", "2023-06-01");
 
-    if api_key.starts_with("sk-ant-oat01-") {
+    if is_claude_code_oauth_setup_token(api_key) {
         request = request
             .header("Authorization", format!("Bearer {api_key}"))
             .header("anthropic-beta", "oauth-2025-04-20");
@@ -1572,15 +1592,7 @@ fn setup_workspace(config_dir: Option<&str>) -> Result<(PathBuf, PathBuf)> {
 }
 
 fn default_user_config_dir(home: &Path) -> PathBuf {
-    let primary = home.join(".openprx");
-    if primary.exists() {
-        return primary;
-    }
-    let legacy = home.join(".openprx");
-    if legacy.exists() {
-        return legacy;
-    }
-    primary
+    home.join(".openprx")
 }
 
 // ── Step 2: Provider & API Key ───────────────────────────────────
@@ -4118,6 +4130,35 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
          ## Open Loops\n\
          (Track unfinished tasks and follow-ups here)\n";
 
+    let thinking = format!(
+        "# THINKING.md — Cognitive Framework\n\n\
+         *How {agent} reasons, decides, and solves problems.*\n\n\
+         ## Reasoning Strategy\n\n\
+         - **Default:** Think step-by-step. Break complex problems into smaller pieces.\n\
+         - **Quick tasks:** Act immediately — don't over-analyze simple requests.\n\
+         - **Hard problems:** Slow down. List assumptions. Consider alternatives.\n\
+         - **Uncertainty:** Say so. \"I'm not sure\" beats a confident wrong answer.\n\n\
+         ## Decision Framework\n\n\
+         When choosing between options:\n\n\
+         1. **Correctness** — Does it work? Is it right?\n\
+         2. **Simplicity** — Is there a simpler way?\n\
+         3. **Reversibility** — Can we undo this if it's wrong?\n\
+         4. **User intent** — What did they actually mean, not just what they said?\n\n\
+         ## Problem Decomposition\n\n\
+         - Identify the actual goal (not just the stated task)\n\
+         - List what you know vs. what you need to find out\n\
+         - Start with the smallest useful step\n\
+         - Verify each step before moving to the next\n\n\
+         ## Self-Check\n\n\
+         Before delivering a result, ask:\n\n\
+         - Did I answer what was asked?\n\
+         - Did I make any assumptions I should state?\n\
+         - Is there a simpler solution I missed?\n\
+         - Would I be confident explaining this to the user?\n\n\
+         ---\n\n\
+         *Update this as you develop your own reasoning patterns and heuristics.*\n"
+    );
+
     let files: Vec<(&str, String)> = vec![
         ("IDENTITY.md", identity),
         ("AGENTS.md", agents),
@@ -4127,6 +4168,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
         ("TOOLS.md", tools.to_string()),
         ("BOOTSTRAP.md", bootstrap),
         ("MEMORY.md", memory.to_string()),
+        ("THINKING.md", thinking),
     ];
 
     // Create subdirectories
@@ -4458,6 +4500,7 @@ mod tests {
             "TOOLS.md",
             "BOOTSTRAP.md",
             "MEMORY.md",
+            "THINKING.md",
         ];
         for f in &expected {
             assert!(tmp.path().join(f).exists(), "missing file: {f}");
@@ -4679,6 +4722,7 @@ mod tests {
             "TOOLS.md",
             "BOOTSTRAP.md",
             "MEMORY.md",
+            "THINKING.md",
         ] {
             let content = tokio::fs::read_to_string(tmp.path().join(f)).await.unwrap();
             assert!(!content.trim().is_empty(), "{f} should not be empty");

@@ -2659,7 +2659,7 @@ fn load_openclaw_bootstrap_files(prompt: &mut String, workspace_dir: &std::path:
 
 /// Build identity prompt content from workspace identity files.
 ///
-/// Loads (if present): SOUL.md, AGENTS.md, IDENTITY.md, USER.md, TOOLS.md, MEMORY.md.
+/// Loads (if present): SOUL.md, AGENTS.md, IDENTITY.md, USER.md, TOOLS.md, MEMORY.md, THINKING.md, HEARTBEAT.md.
 /// Missing files are skipped.
 pub fn build_identity_prompt(workspace_dir: &Path) -> String {
     build_identity_prompt_with_limit(workspace_dir, BOOTSTRAP_MAX_CHARS)

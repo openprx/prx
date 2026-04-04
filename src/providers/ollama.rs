@@ -599,7 +599,11 @@ impl Provider for OllamaProvider {
             } else {
                 Some(response.message.content)
             };
-            return Ok(ChatResponse { text, tool_calls });
+            return Ok(ChatResponse {
+                text,
+                tool_calls,
+                reasoning_content: None,
+            });
         }
 
         // Plain text response.
@@ -624,6 +628,7 @@ impl Provider for OllamaProvider {
                         }
                     )),
                     tool_calls: vec![],
+                    reasoning_content: None,
                 });
             }
             tracing::warn!("Ollama returned empty content with no tool calls");
@@ -631,6 +636,7 @@ impl Provider for OllamaProvider {
         Ok(ChatResponse {
             text: Some(content),
             tool_calls: vec![],
+            reasoning_content: None,
         })
     }
 

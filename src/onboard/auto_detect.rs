@@ -237,6 +237,12 @@ fn try_config_toml_with_decryption(config_dir: &Path, config_path: &Path) -> Opt
 }
 
 /// Try reading Claude Code OAuth credentials from ~/.claude/.credentials.json.
+///
+/// Only returns tokens that can be used as plain API keys (e.g. `sk-ant-api03-`).
+/// OAuth setup tokens (`sk-ant-oat01-`) require a full OAuth flow with refresh_token
+/// and Bearer auth, which the `detect_credentials` caller does not support.
+/// Those tokens are handled separately by `resolve_claude_code_context` in the
+/// provider layer when the provider is explicitly set to "claude-code".
 fn try_claude_code_oauth() -> Option<String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -257,7 +263,26 @@ fn try_claude_code_oauth() -> Option<String> {
         .map(str::trim)
         .filter(|t| !t.is_empty())?;
 
+    // OAuth setup tokens (sk-ant-oat01-) cannot be used as plain API keys.
+    // They require Bearer auth + refresh_token flow, which is only supported
+    // via the claude-code provider path (resolve_claude_code_context).
+    // Passing them as a plain credential to the anthropic provider would send
+    // them via x-api-key header, resulting in 400/401 errors.
+    if is_claude_code_oauth_setup_token(access_token) {
+        tracing::debug!(
+            "Skipping Claude Code OAuth setup token from credentials.json \
+             (not usable as plain API key)"
+        );
+        return None;
+    }
+
     Some(access_token.to_string())
+}
+
+/// Returns `true` if the token is a Claude Code OAuth setup token that cannot
+/// be used as a plain Anthropic API key.
+pub(crate) fn is_claude_code_oauth_setup_token(token: &str) -> bool {
+    token.starts_with("sk-ant-oat01-")
 }
 
 #[cfg(test)]
@@ -315,5 +340,19 @@ mod tests {
         if let Ok((_, key, _)) = &result {
             assert!(!key.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn oauth_setup_token_detected() {
+        assert!(is_claude_code_oauth_setup_token("sk-ant-oat01-abcdef123"));
+        assert!(is_claude_code_oauth_setup_token("sk-ant-oat01-"));
+    }
+
+    #[test]
+    fn regular_api_key_not_flagged_as_setup_token() {
+        assert!(!is_claude_code_oauth_setup_token("sk-ant-api03-xyz"));
+        assert!(!is_claude_code_oauth_setup_token("sk-proj-abc"));
+        assert!(!is_claude_code_oauth_setup_token("or-v1-something"));
+        assert!(!is_claude_code_oauth_setup_token(""));
     }
 }
