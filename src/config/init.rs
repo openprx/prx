@@ -178,6 +178,16 @@ impl Spec {
 // ── File I/O helpers ────────────────────────────────────────────
 
 fn write_config_file(path: &Path, content: &str) -> Result<()> {
+    // Backup existing file before overwriting
+    if path.exists() {
+        let bak = path.with_extension(format!(
+            "{}.bak",
+            path.extension().map(|e| e.to_string_lossy()).unwrap_or_default()
+        ));
+        if let Err(e) = std::fs::rename(path, &bak) {
+            tracing::warn!("Failed to backup {}: {e}", path.display());
+        }
+    }
     std::fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))?;
     #[cfg(unix)]
     {
@@ -631,6 +641,16 @@ fn channels_template(spec: Spec) -> String {
 # app_secret = ""
 # receive_mode = "websocket"
 # mention_only = false
+
+# [channels_config.signal]
+# account = "+1234567890"           # E.164 phone number (required)
+# mode = "rest"                     # "rest" (signal-cli REST daemon) or "native" (spawn signal-cli)
+# http_url = "http://127.0.0.1:16866"  # signal-cli REST API URL
+# allowed_from = ["*"]              # allowed sender phone numbers, or "*" for all
+# group_id = ""                     # filter by group ID, or empty for DM only
+# mention_only = false
+# ignore_attachments = false
+# ignore_stories = false
 "#
         .into(),
     }
