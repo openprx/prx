@@ -953,18 +953,61 @@ impl OpenAiCompatibleProvider {
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
-        // Detect vision support from model name or base URL
+        // Vision support detection for OpenAI-compatible providers.
+        // Most frontier models in 2026 support vision natively.
         let model_lower = self.name.to_lowercase();
         let base_lower = self.base_url.to_lowercase();
-        let has_vision = model_lower.contains("vision")
-            || model_lower.contains("grok-4")
+        let has_vision =
+            // Explicit vision/multimodal keyword
+            model_lower.contains("vision")
+            || model_lower.contains("multimodal")
+            // OpenAI models
             || model_lower.contains("gpt-4o")
             || model_lower.contains("gpt-4-turbo")
+            || model_lower.contains("gpt-4.1")
             || model_lower.contains("gpt-5")
+            // Google
             || model_lower.contains("gemini")
+            || model_lower.contains("gemma-3")
+            || model_lower.contains("gemma-4")
+            // xAI / Grok
+            || model_lower.contains("grok")
+            // Mistral
+            || model_lower.contains("pixtral")
+            || model_lower.contains("mistral-large")
+            || model_lower.contains("mistral-medium")
+            || model_lower.contains("ministral")
+            || model_lower.contains("magistral")
+            // Kimi / Moonshot
+            || model_lower.contains("kimi")
+            || model_lower.contains("moonshot")
+            // Qwen (Alibaba) — only VL vision variants
+            || model_lower.contains("qwen-vl")
+            || model_lower.contains("qwen2-vl")
+            || model_lower.contains("qwen2.5-vl")
+            || model_lower.contains("qwen3-vl")
+            // Meta Llama 4 (native multimodal) and explicit vision variants
+            || model_lower.contains("llama-4")
+            || model_lower.contains("llama4")
+            // DeepSeek VL
+            || model_lower.contains("deepseek-vl")
+            // Cohere vision variant
+            || model_lower.contains("command-a-vision")
+            // Amazon Nova vision-capable tiers
+            || model_lower.contains("nova-pro")
+            || model_lower.contains("nova-lite")
+            || model_lower.contains("nova-premier")
+            || model_lower.contains("nova-omni")
+            // Chinese frontier models
+            || model_lower.contains("ernie")
+            || model_lower.contains("glm-4")
+            || model_lower.contains("internvl")
+            // Base URL detection (provider-level fallback)
             || base_lower.contains("x.ai")
             || base_lower.contains("xai")
-            || base_lower.contains("openai");
+            || base_lower.contains("openai")
+            || base_lower.contains("kimi.com")
+            || base_lower.contains("moonshot");
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: true,
             vision: has_vision,
