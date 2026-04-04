@@ -83,6 +83,7 @@ impl Provider for MockProvider {
             return Ok(ChatResponse {
                 text: Some("done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
             });
         }
         Ok(guard.remove(0))
@@ -130,6 +131,7 @@ impl Provider for HangingProvider {
             return Ok(ChatResponse {
                 text: Some("done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
             });
         }
         Ok(guard.remove(0))
@@ -285,13 +287,16 @@ fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
         text: Some(text.into()),
         tool_calls: vec![],
+        reasoning_content: None,
     }
 }
 
-const fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
+#[allow(clippy::missing_const_for_fn)]
+fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
         text: Some(String::new()),
         tool_calls: calls,
+        reasoning_content: None,
     }
 }
 
@@ -906,6 +911,7 @@ async fn int_agent_gateway_ap04_empty_provider_response() {
     let provider = Box::new(MockProvider::new(vec![ChatResponse {
         text: None,
         tool_calls: vec![],
+        reasoning_content: None,
     }]));
 
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
