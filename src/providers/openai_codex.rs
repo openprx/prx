@@ -846,6 +846,7 @@ impl Provider for OpenAiCodexProvider {
         Ok(ProviderChatResponse {
             text: extract_responses_text(&parsed),
             tool_calls: extract_tool_calls(&parsed, &tool_name_map),
+            reasoning_content: None,
         })
     }
 
@@ -875,6 +876,7 @@ impl Provider for OpenAiCodexProvider {
         Ok(ProviderChatResponse {
             text: extract_responses_text(&parsed),
             tool_calls: extract_tool_calls(&parsed, &tool_name_map),
+            reasoning_content: None,
         })
     }
 }

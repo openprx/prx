@@ -390,6 +390,8 @@ struct NativeMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<NativeMessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
@@ -783,9 +785,19 @@ impl OpenAiCompatibleProvider {
                                     .and_then(serde_json::Value::as_str)
                                     .map(|content| NativeMessageContent::Text(content.to_string()));
 
+                                // Thinking-mode providers (e.g. Kimi Code) require
+                                // `reasoning_content` on every assistant message that
+                                // carries tool_calls. Preserve the actual value from
+                                // history so it can be re-sent to the provider.
+                                let reasoning_content = value
+                                    .get("reasoning_content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|s| s.to_string());
+
                                 return NativeMessage {
                                     role: "assistant".to_string(),
                                     content,
+                                    reasoning_content,
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
                                 };
@@ -809,6 +821,7 @@ impl OpenAiCompatibleProvider {
                         return NativeMessage {
                             role: "tool".to_string(),
                             content,
+                            reasoning_content: None,
                             tool_call_id,
                             tool_calls: None,
                         };
@@ -820,6 +833,7 @@ impl OpenAiCompatibleProvider {
                     return NativeMessage {
                         role: "user".to_string(),
                         content: Some(content),
+                        reasoning_content: None,
                         tool_call_id: None,
                         tool_calls: None,
                     };
@@ -828,6 +842,7 @@ impl OpenAiCompatibleProvider {
                 NativeMessage {
                     role: message.role.clone(),
                     content: Some(NativeMessageContent::Text(message.content.clone())),
+                    reasoning_content: None,
                     tool_call_id: None,
                     tool_calls: None,
                 }
@@ -909,6 +924,7 @@ impl OpenAiCompatibleProvider {
         ProviderChatResponse {
             text: message.content,
             tool_calls,
+            reasoning_content: message.reasoning_content,
         }
     }
 
@@ -1231,6 +1247,7 @@ impl Provider for OpenAiCompatibleProvider {
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
+                    reasoning_content: None,
                 });
             }
         };
@@ -1265,7 +1282,11 @@ impl Provider for OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
-        Ok(ProviderChatResponse { text, tool_calls })
+        Ok(ProviderChatResponse {
+            text,
+            tool_calls,
+            reasoning_content: None,
+        })
     }
 
     async fn chat(
@@ -1287,9 +1308,11 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             request.messages.to_vec()
         };
+        let native_messages = Self::convert_messages_for_native(&effective_messages);
+
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages_for_native(&effective_messages),
+            messages: native_messages,
             temperature,
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
@@ -1312,6 +1335,7 @@ impl Provider for OpenAiCompatibleProvider {
                         .map(|text| ProviderChatResponse {
                             text: Some(text),
                             tool_calls: vec![],
+                            reasoning_content: None,
                         })
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
@@ -1344,6 +1368,7 @@ impl Provider for OpenAiCompatibleProvider {
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
+                    reasoning_content: None,
                 });
             }
 
@@ -1354,6 +1379,7 @@ impl Provider for OpenAiCompatibleProvider {
                     .map(|text| ProviderChatResponse {
                         text: Some(text),
                         tool_calls: vec![],
+                        reasoning_content: None,
                     })
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
@@ -1884,6 +1910,7 @@ mod tests {
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert!(parsed.reasoning_content.is_none());
     }
 
     #[test]

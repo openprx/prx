@@ -235,6 +235,7 @@ mod tests {
                 "Checking\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>".into(),
             ),
             tool_calls: vec![],
+            reasoning_content: None,
         };
         let dispatcher = XmlToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);
@@ -251,6 +252,7 @@ mod tests {
                 name: "file_read".into(),
                 arguments: "{\"path\":\"a.txt\"}".into(),
             }],
+            reasoning_content: None,
         };
         let dispatcher = NativeToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);

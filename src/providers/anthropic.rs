@@ -1,9 +1,11 @@
 use crate::multimodal;
+use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
     ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
+use crate::tools::schema::SchemaCleanr;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use parking_lot::Mutex;
@@ -109,7 +111,7 @@ struct NativeImageSource {
 struct NativeToolSpec<'a> {
     name: &'a str,
     description: &'a str,
-    input_schema: &'a serde_json::Value,
+    input_schema: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
 }
@@ -305,7 +307,7 @@ impl AnthropicProvider {
     }
 
     fn is_setup_token(token: &str) -> bool {
-        token.starts_with("sk-ant-oat01-")
+        is_claude_code_oauth_setup_token(token)
     }
 
     fn apply_auth(&self, request: reqwest::RequestBuilder, credential: &str) -> reqwest::RequestBuilder {
@@ -451,7 +453,7 @@ impl AnthropicProvider {
             .map(|tool| NativeToolSpec {
                 name: &tool.name,
                 description: &tool.description,
-                input_schema: &tool.parameters,
+                input_schema: SchemaCleanr::clean_for_anthropic(tool.parameters.clone()),
                 cache_control: None,
             })
             .collect();
@@ -628,6 +630,7 @@ impl AnthropicProvider {
                 Some(text_parts.join("\n"))
             },
             tool_calls,
+            reasoning_content: None,
         }
     }
 
@@ -1143,7 +1146,7 @@ mod tests {
         let tool = NativeToolSpec {
             name: "get_weather",
             description: "Get weather info",
-            input_schema: &schema,
+            input_schema: schema,
             cache_control: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -1157,7 +1160,7 @@ mod tests {
         let tool = NativeToolSpec {
             name: "get_weather",
             description: "Get weather info",
-            input_schema: &schema,
+            input_schema: schema,
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&tool).unwrap();

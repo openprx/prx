@@ -1101,6 +1101,15 @@ async fn main() -> Result<()> {
                 "  Max cost/day:      ${:.2}",
                 f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
             );
+            println!(
+                "  Audit logging:     {}",
+                if config.security.audit.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!("  Audit log path:    {}", config.security.audit.log_path);
             println!();
             println!("Channels:");
             println!("  CLI:      ✅ always");

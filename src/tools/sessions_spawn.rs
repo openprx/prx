@@ -1794,6 +1794,7 @@ mod tests {
             Ok(crate::providers::ChatResponse {
                 text: Some(self.response.clone()),
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             })
         }
     }
@@ -1846,6 +1847,7 @@ mod tests {
             Ok(crate::providers::ChatResponse {
                 text: Some(String::new()),
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             })
         }
     }

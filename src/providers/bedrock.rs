@@ -656,6 +656,7 @@ impl BedrockProvider {
                 Some(text_parts.join("\n"))
             },
             tool_calls,
+            reasoning_content: None,
         }
     }
 
