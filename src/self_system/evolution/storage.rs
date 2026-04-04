@@ -426,8 +426,12 @@ mod tests {
         .await
         .unwrap();
 
+        let today = Utc::now();
+        let today_str = today.format("%Y-%m-%dT00:00:00Z").to_string();
+        let today_date = today.format("%Y-%m-%d").to_string();
+
         let log = DecisionLog::new(
-            "2026-02-24T00:00:00Z".into(),
+            today_str,
             "exp".into(),
             "trace".into(),
             DecisionType::ToolSelection,
@@ -445,7 +449,11 @@ mod tests {
         writer.append_decision(&log).await.unwrap();
         writer.flush().await.unwrap();
 
-        let path = dir.path().join("decisions").join("hot").join("2026-02-24.jsonl");
+        let path = dir
+            .path()
+            .join("decisions")
+            .join("hot")
+            .join(format!("{today_date}.jsonl"));
         let contents = fs::read_to_string(path).await.unwrap();
         let first_line = contents.lines().next().unwrap();
         let stored: DecisionLog = serde_json::from_str(first_line).unwrap();
@@ -487,9 +495,13 @@ mod tests {
         .await
         .unwrap();
 
+        let today = Utc::now();
+        let today_str = today.format("%Y-%m-%dT00:00:00Z").to_string();
+        let today_date = today.format("%Y-%m-%d").to_string();
+
         writer
             .append_memory_access(&MemoryAccessLog {
-                timestamp: "2026-02-24T00:00:00Z".into(),
+                timestamp: today_str.clone(),
                 experiment_id: "exp".into(),
                 trace_id: "trace".into(),
                 action: MemoryAction::Read,
@@ -508,7 +520,7 @@ mod tests {
         writer
             .append_evolution(&EvolutionLog {
                 experiment_id: "exp".into(),
-                timestamp: "2026-02-24T00:00:00Z".into(),
+                timestamp: today_str,
                 layer: EvolutionLayer::Policy,
                 change_type: crate::self_system::evolution::record::ChangeType::Update,
                 before_value: "{}".into(),
@@ -527,14 +539,24 @@ mod tests {
         writer.flush().await.unwrap();
 
         assert!(
-            path_exists(&dir.path().join("memory_access").join("hot").join("2026-02-24.jsonl"))
-                .await
-                .unwrap()
+            path_exists(
+                &dir.path()
+                    .join("memory_access")
+                    .join("hot")
+                    .join(format!("{today_date}.jsonl"))
+            )
+            .await
+            .unwrap()
         );
         assert!(
-            path_exists(&dir.path().join("evolution").join("hot").join("2026-02-24.jsonl"))
-                .await
-                .unwrap()
+            path_exists(
+                &dir.path()
+                    .join("evolution")
+                    .join("hot")
+                    .join(format!("{today_date}.jsonl"))
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -549,9 +571,19 @@ mod tests {
         .await
         .unwrap();
 
+        let today = Utc::now();
+        let yesterday = today - chrono::Duration::days(1);
+        let yesterday_str = yesterday.format("%Y-%m-%dT00:00:00Z").to_string();
+        let today_str = today.format("%Y-%m-%dT10:00:00Z").to_string();
+        let today_midnight = today
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+
         writer
             .append_memory_access(&MemoryAccessLog {
-                timestamp: "2026-02-23T00:00:00Z".into(),
+                timestamp: yesterday_str,
                 experiment_id: "exp-1".into(),
                 trace_id: "trace-1".into(),
                 action: MemoryAction::Read,
@@ -569,7 +601,7 @@ mod tests {
 
         writer
             .append_memory_access(&MemoryAccessLog {
-                timestamp: "2026-02-24T10:00:00Z".into(),
+                timestamp: today_str,
                 experiment_id: "exp-2".into(),
                 trace_id: "trace-2".into(),
                 action: MemoryAction::Read,
@@ -586,9 +618,7 @@ mod tests {
             .unwrap();
         writer.flush().await.unwrap();
 
-        let since = chrono::DateTime::parse_from_rfc3339("2026-02-24T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let since = today_midnight;
         let items = writer.read_memory_access_since(since).await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].memory_id, "m-new");
@@ -607,13 +637,18 @@ mod tests {
             .unwrap(),
         );
 
+        let today = Utc::now();
+        let today_ts = today.format("%Y-%m-%dT12:00:00Z").to_string();
+        let today_date = today.format("%Y-%m-%d").to_string();
+
         let mut tasks = Vec::new();
         for idx in 0..20usize {
             let writer = writer.clone();
+            let ts = today_ts.clone();
             tasks.push(tokio::spawn(async move {
                 writer
                     .append_memory_access(&MemoryAccessLog {
-                        timestamp: "2026-02-24T12:00:00Z".into(),
+                        timestamp: ts,
                         experiment_id: format!("exp-{idx}"),
                         trace_id: format!("trace-{idx}"),
                         action: MemoryAction::Read,
@@ -636,7 +671,11 @@ mod tests {
         }
         writer.flush().await.unwrap();
 
-        let path = dir.path().join("memory_access").join("hot").join("2026-02-24.jsonl");
+        let path = dir
+            .path()
+            .join("memory_access")
+            .join("hot")
+            .join(format!("{today_date}.jsonl"));
         let raw = fs::read_to_string(path).await.unwrap();
         let lines = raw.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>();
         assert_eq!(lines.len(), 20);
