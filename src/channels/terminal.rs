@@ -10,7 +10,7 @@ use super::traits::{Channel, ChannelCapabilities, ChannelMessage, SendMessage};
 use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::{execute, style, terminal};
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal as _, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -644,6 +644,48 @@ async fn terminal_input_loop(tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
 
     // Run reedline on a blocking thread since it blocks on stdin
     let handle = tokio::task::spawn_blocking(move || -> Result<()> {
+        // Non-TTY fallback: read lines from stdin via BufRead when not attached to a terminal.
+        // Reedline requires a real TTY; on pipes/heredocs it immediately returns Err and the
+        // entire input loop would silently break before processing any user input.
+        if !io::stdin().is_terminal() {
+            use std::io::BufRead as _;
+            let stdin = io::stdin();
+            for line_result in stdin.lock().lines() {
+                let line = match line_result {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed == "/quit" || trimmed == "/exit" {
+                    break;
+                }
+
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let msg = ChannelMessage {
+                    id: Uuid::new_v4().to_string(),
+                    sender: "user".to_string(),
+                    reply_target: "user".to_string(),
+                    content: trimmed,
+                    channel: "terminal".to_string(),
+                    timestamp,
+                    thread_ts: None,
+                    mentioned_uuids: vec![],
+                };
+
+                if tx.blocking_send(msg).is_err() {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+
         // Set up file-backed input history
         let history_path = directories::ProjectDirs::from("dev", "openprx", "prx")
             .map(|dirs| dirs.data_dir().join("chat_history"))
