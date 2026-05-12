@@ -1,4 +1,5 @@
-//! Config hot-reload tool — re-reads config.toml and updates runtime-mutable settings.
+//! Config hot-reload tool — re-reads config.toml + enabled config.d fragments
+//! and updates runtime-mutable settings.
 //!
 //! Hot-reloadable fields (take effect immediately):
 //!   - `default_temperature`
@@ -22,7 +23,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-/// Tool that hot-reloads the configuration from `config.toml` at runtime.
+/// Tool that hot-reloads the merged configuration at runtime.
 ///
 /// Accepts a [`SharedConfig`] (ArcSwap-backed) and atomically stores the new
 /// config after validation — no Mutex required.
@@ -44,7 +45,7 @@ impl Tool for ConfigReloadTool {
     }
 
     fn description(&self) -> &str {
-        "Reload configuration from config.toml without restarting the daemon. \
+        "Reload merged configuration (config.toml + enabled config.d files) without restarting the daemon. \
          Hot-reloads: temperature, agent settings (max iterations/history, concurrency, priority), \
          heartbeat, cron, and web_search settings. \
          Provider, model, channels, memory, and security require a full restart."
@@ -60,8 +61,10 @@ impl Tool for ConfigReloadTool {
     }
 
     async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // 1. Read the config path from the current config (lock-free)
-        let config_path = self.config.load_full().config_path.clone();
+        // 1. Read runtime config locations from current config (lock-free)
+        let current = self.config.load_full();
+        let config_path = current.config_path.clone();
+        let workspace_dir = current.workspace_dir.clone();
 
         if config_path.as_os_str().is_empty() {
             return Ok(ToolResult {
@@ -71,25 +74,17 @@ impl Tool for ConfigReloadTool {
             });
         }
 
-        // 2. Read and parse the config file (async I/O, no lock held)
-        let contents = match tokio::fs::read_to_string(&config_path).await {
-            Ok(s) => s,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to read config file {}: {e}", config_path.display())),
-                });
-            }
-        };
-
-        let fresh: Config = match toml::from_str(&contents) {
+        // 2. Load merged config (config.toml + enabled config.d/*.toml) and validate.
+        let fresh: Config = match Config::load_from_path(&config_path, workspace_dir) {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Config parse error: {e}")),
+                    error: Some(format!(
+                        "Failed to load merged config from {} (including config.d): {e}",
+                        config_path.display()
+                    )),
                 });
             }
         };
@@ -361,7 +356,7 @@ mod tests {
         let tool = make_tool_with_config(cfg);
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Failed to read config file"));
+        assert!(result.error.unwrap().contains("Failed to load merged config"));
     }
 
     #[tokio::test]
@@ -411,5 +406,66 @@ mod tests {
             "Expected no-change message: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn reload_reads_enabled_config_d_fragments() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let config_path = tmpdir.path().join("config.toml");
+        let config_d = tmpdir.path().join("config.d");
+        tokio::fs::create_dir_all(&config_d).await.unwrap();
+
+        tokio::fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+
+[modules]
+memory = false
+channels = false
+network = false
+security = false
+scheduler = false
+agent = true
+identity = false
+routing = false
+tools = false
+integrations = false
+nodes = false
+cost = false
+observability = false
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            config_d.join("agent.toml"),
+            r#"
+[agent]
+max_history_messages = 123
+"#,
+        )
+        .await
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.config_path = config_path;
+        cfg.workspace_dir = tmpdir.path().join("workspace");
+        cfg.agent.max_history_messages = 50;
+        tokio::fs::create_dir_all(&cfg.workspace_dir).await.unwrap();
+
+        let shared = new_shared(cfg);
+        let tool = ConfigReloadTool::new(Arc::clone(&shared));
+
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(result.success, "Expected success: {:?}", result.error);
+        assert!(
+            result.output.contains("agent.max_history_messages: 50 → 123"),
+            "Expected fragment-driven diff in output: {}",
+            result.output
+        );
+
+        let updated = shared.load_full();
+        assert_eq!(updated.agent.max_history_messages, 123);
     }
 }
