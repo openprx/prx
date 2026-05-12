@@ -575,11 +575,7 @@ mod tests {
         let yesterday = today - chrono::Duration::days(1);
         let yesterday_str = yesterday.format("%Y-%m-%dT00:00:00Z").to_string();
         let today_str = today.format("%Y-%m-%dT10:00:00Z").to_string();
-        let today_midnight = today
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc();
+        let today_midnight = today.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
 
         writer
             .append_memory_access(&MemoryAccessLog {
