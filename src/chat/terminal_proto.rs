@@ -1,8 +1,105 @@
-//! Terminal protocol utilities: inline image preview (kitty/iTerm2) and
-//! OSC 52 clipboard support for code block copying.
+//! Terminal protocol utilities: inline image preview (kitty/iTerm2),
+//! OSC 52 clipboard support for code block copying, and monotonic
+//! version tracking for streaming draft deltas (P1-6).
 
 use base64::Engine;
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ── Draft version protocol (P1-6) ───────────────────────────────────────────
+//
+// Streaming `update_draft` deltas flow through one or more mpsc channels.
+// Although a single tokio mpsc preserves order, the pipeline crosses several
+// channels (delta_tx → accumulator task → ui_tx → UiActor) and is interleaved
+// with other tasks. A late or duplicated delta could otherwise overwrite a
+// newer one and visually "rewind" the rendered text.
+//
+// `DraftVersionCounter` (sender side) stamps each delta with a strictly
+// monotonic `u64`. `DraftVersionTracker` (receiver side) records the highest
+// version seen per `draft_id` and rejects any later arrival whose version
+// is not strictly greater. Version sequences are independent per draft id;
+// `finalize` clears the tracked state for a draft.
+
+/// Monotonic version generator for outgoing draft deltas.
+///
+/// Each call to [`next`](Self::next) returns a strictly increasing `u64`
+/// starting at `1`. Safe to share across tasks via `Arc`.
+#[derive(Debug, Default)]
+pub struct DraftVersionCounter {
+    inner: AtomicU64,
+}
+
+impl DraftVersionCounter {
+    /// Create a fresh counter whose first issued version is `1`.
+    pub const fn new() -> Self {
+        Self {
+            inner: AtomicU64::new(0),
+        }
+    }
+
+    /// Allocate the next version. Versions are strictly monotonic across
+    /// concurrent callers; ties are impossible.
+    pub fn next(&self) -> u64 {
+        self.inner.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Current highest issued version (0 if none issued yet). For diagnostics.
+    pub fn current(&self) -> u64 {
+        self.inner.load(Ordering::Relaxed)
+    }
+}
+
+/// Receiver-side version watchdog: accepts only strictly newer versions
+/// for each `draft_id`, rejecting stale or duplicate arrivals.
+#[derive(Debug, Default)]
+pub struct DraftVersionTracker {
+    /// Map of `draft_id` → highest accepted version.
+    inner: Mutex<HashMap<String, u64>>,
+}
+
+impl DraftVersionTracker {
+    /// Create an empty tracker.
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Attempt to accept a delta for `draft_id` at `version`.
+    ///
+    /// Returns `true` if `version` is strictly greater than the previously
+    /// accepted version for this draft (in which case the tracker now stores
+    /// `version` as the new high-water mark) or if no version has been
+    /// accepted yet. Returns `false` for stale or duplicate arrivals — the
+    /// caller should drop the delta.
+    pub fn accept(&self, draft_id: &str, version: u64) -> bool {
+        let mut guard = self.inner.lock();
+        match guard.get(draft_id) {
+            Some(&prev) if version <= prev => false,
+            _ => {
+                guard.insert(draft_id.to_string(), version);
+                true
+            }
+        }
+    }
+
+    /// Forget version state for a draft (call on finalize/cancel).
+    pub fn clear(&self, draft_id: &str) {
+        self.inner.lock().remove(draft_id);
+    }
+
+    /// Current high-water version for a draft, if any.
+    pub fn current(&self, draft_id: &str) -> Option<u64> {
+        self.inner.lock().get(draft_id).copied()
+    }
+
+    /// Number of drafts currently tracked. For diagnostics/tests.
+    pub fn tracked_count(&self) -> usize {
+        self.inner.lock().len()
+    }
+}
 
 /// Detect if the terminal supports kitty graphics protocol.
 pub fn supports_kitty_graphics() -> bool {
@@ -187,5 +284,120 @@ mod tests {
     fn iterm2_detection() {
         let result = supports_iterm2_images();
         assert!(!result || result);
+    }
+
+    // ── Draft version protocol tests (P1-6) ─────────────────────────────────
+
+    #[test]
+    fn draft_version_counter_is_monotonic() {
+        let counter = DraftVersionCounter::new();
+        assert_eq!(counter.current(), 0);
+        assert_eq!(counter.next(), 1);
+        assert_eq!(counter.next(), 2);
+        assert_eq!(counter.next(), 3);
+        assert_eq!(counter.current(), 3);
+    }
+
+    #[test]
+    fn draft_version_counter_concurrent_unique() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let counter = Arc::new(DraftVersionCounter::new());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = Arc::clone(&counter);
+            handles.push(thread::spawn(move || (0..100).map(|_| c.next()).collect::<Vec<u64>>()));
+        }
+        let mut all: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect();
+        all.sort_unstable();
+        let dedup_len = {
+            let mut v = all.clone();
+            v.dedup();
+            v.len()
+        };
+        assert_eq!(all.len(), 800);
+        assert_eq!(dedup_len, 800, "versions must be unique across threads");
+        assert_eq!(counter.current(), 800);
+    }
+
+    #[test]
+    fn tracker_accepts_sequential_versions() {
+        let tracker = DraftVersionTracker::new();
+        assert!(tracker.accept("draft-a", 1));
+        assert!(tracker.accept("draft-a", 2));
+        assert!(tracker.accept("draft-a", 3));
+        assert_eq!(tracker.current("draft-a"), Some(3));
+    }
+
+    #[test]
+    fn tracker_rejects_stale_versions() {
+        let tracker = DraftVersionTracker::new();
+        assert!(tracker.accept("draft-a", 3));
+        // Out-of-order older arrival → drop
+        assert!(!tracker.accept("draft-a", 1));
+        // Exact duplicate → drop
+        assert!(!tracker.accept("draft-a", 3));
+        // Newer still accepted
+        assert!(tracker.accept("draft-a", 4));
+        assert_eq!(tracker.current("draft-a"), Some(4));
+    }
+
+    #[test]
+    fn tracker_per_draft_id_independent() {
+        let tracker = DraftVersionTracker::new();
+        assert!(tracker.accept("draft-a", 5));
+        // A new draft id starts from scratch — version 1 is fresh.
+        assert!(tracker.accept("draft-b", 1));
+        assert!(tracker.accept("draft-b", 2));
+        // draft-a still rejects anything ≤ 5
+        assert!(!tracker.accept("draft-a", 5));
+        assert!(tracker.accept("draft-a", 6));
+        assert_eq!(tracker.current("draft-a"), Some(6));
+        assert_eq!(tracker.current("draft-b"), Some(2));
+        assert_eq!(tracker.tracked_count(), 2);
+    }
+
+    #[test]
+    fn tracker_clear_releases_state() {
+        let tracker = DraftVersionTracker::new();
+        assert!(tracker.accept("draft-a", 10));
+        assert_eq!(tracker.tracked_count(), 1);
+        tracker.clear("draft-a");
+        assert_eq!(tracker.tracked_count(), 0);
+        assert_eq!(tracker.current("draft-a"), None);
+        // After clear, low versions are fresh again (new draft lifecycle).
+        assert!(tracker.accept("draft-a", 1));
+        assert_eq!(tracker.current("draft-a"), Some(1));
+    }
+
+    #[test]
+    fn tracker_out_of_order_keeps_newest() {
+        // Simulate cross-channel reordering: v1 → v3 → v2 → v4
+        let tracker = DraftVersionTracker::new();
+        let counter = DraftVersionCounter::new();
+        let v1 = counter.next();
+        let v2 = counter.next();
+        let v3 = counter.next();
+        let v4 = counter.next();
+
+        // Arrives out of order: v3 first, then stale v1, v2, then v4.
+        assert!(tracker.accept("d", v3));
+        assert!(!tracker.accept("d", v1), "v1 < v3 must be dropped");
+        assert!(!tracker.accept("d", v2), "v2 < v3 must be dropped");
+        assert!(tracker.accept("d", v4), "v4 > v3 must be accepted");
+        assert_eq!(tracker.current("d"), Some(v4));
+    }
+
+    #[test]
+    fn counter_and_tracker_compose_for_in_order_stream() {
+        let counter = DraftVersionCounter::new();
+        let tracker = DraftVersionTracker::new();
+        for expected in 1..=10u64 {
+            let v = counter.next();
+            assert_eq!(v, expected);
+            assert!(tracker.accept("draft-x", v));
+        }
+        assert_eq!(tracker.current("draft-x"), Some(10));
     }
 }
