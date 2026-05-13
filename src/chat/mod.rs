@@ -176,11 +176,17 @@ fn collect_reasoning_from_history_slice(slice: &[ChatMessage]) -> String {
 ///
 /// Sequence (reverse of entry):
 ///   1. `DisableBracketedPaste` (paired with `EnableBracketedPaste` in enter)
-///   2. Show cursor (explicit — we no longer Hide in enter, but a stray
-///      `frame.set_cursor_position` may have left the cursor hidden if a
-///      previous ratatui frame raced cleanup; Show is idempotent)
-///   3. `LeaveAlternateScreen`
-///   4. `disable_raw_mode`
+///   2. Show cursor (explicit — `Frame::set_cursor_position` may have
+///      left the cursor hidden if a panic happened mid-frame)
+///   3. `disable_raw_mode`
+///
+/// P3-inline note: we no longer toggle the alternate screen, so there is
+/// nothing to `LeaveAlternateScreen` here. Permanent chat output lives in
+/// the host terminal's main scrollback (pushed via
+/// `terminal.insert_before`); leaving raw mode is sufficient to give the
+/// shell a usable cursor back after exit. The previous fullscreen design
+/// wiped the screen on exit — the inline design intentionally preserves
+/// it so users can review the conversation.
 ///
 /// Every step swallows its error: by the time this runs we are already on the
 /// cleanup path (Drop or panic unwind) and there is no caller left to surface
@@ -188,17 +194,12 @@ fn collect_reasoning_from_history_slice(slice: &[ChatMessage]) -> String {
 /// avoided to keep this callable from a panic hook without re-entering the
 /// tracing machinery.
 fn restore_terminal_state() {
-    // 1. Disable bracketed paste before leaving alt screen so the host shell
-    //    is not left in a half-enabled state if anything afterwards fails.
+    // 1. Disable bracketed paste so the host shell is not left in a
+    //    half-enabled state.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-    // 2. Show cursor + leave alternate screen, written to stdout (matches
-    //    where we entered it). stderr is also valid but we keep parity with
-    //    `TerminalGuard::enter` which writes to stdout.
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::cursor::Show,
-        crossterm::terminal::LeaveAlternateScreen,
-    );
+    // 2. Show cursor (idempotent — defends against a panic interrupting
+    //    a frame that had hidden the cursor via `set_cursor_position`).
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
     // 3. Disable raw mode last so any escape sequences emitted above are
     //    interpreted by the terminal as expected.
     let _ = crossterm::terminal::disable_raw_mode();
@@ -206,43 +207,55 @@ fn restore_terminal_state() {
 
 /// RAII guard for the chat TUI terminal state.
 ///
-/// Owns the entry side-effects (`enable_raw_mode` + `EnterAlternateScreen` +
-/// hide cursor) and guarantees they are reversed exactly once on Drop —
-/// whether by normal return, `?` early-exit, or panic unwinding. The
-/// strengthened panic hook in [`install_chat_panic_hook`] provides
-/// defence-in-depth for non-unwind aborts and for panics that happen before a
-/// guard exists.
+/// Owns the entry side-effects (`enable_raw_mode` + bracketed paste) and
+/// guarantees they are reversed exactly once on Drop — whether by normal
+/// return, `?` early-exit, or panic unwinding. The strengthened panic
+/// hook in [`install_chat_panic_hook`] provides defence-in-depth for
+/// non-unwind aborts and for panics that happen before a guard exists.
 ///
-/// `enter()` is *transactional*: if either step (raw mode → alternate screen)
-/// fails, any already-applied step is rolled back before returning `Err`, so a
+/// **P3-inline change.** This guard no longer enters the alternate
+/// screen. Permanent conversation history is pushed to the host
+/// terminal's main scrollback via `terminal.insert_before` (driven by
+/// the unified TUI loop), and ratatui draws only a fixed-height inline
+/// viewport at the bottom. The benefits are:
+///   * the host terminal's native scroll (mouse wheel, Shift+PgUp,
+///     terminal search / copy / paste) works on chat history;
+///   * exiting prx leaves the conversation in the user's scrollback
+///     instead of wiping the screen.
+///
+/// `enter()` is *transactional*: if bracketed paste fails after raw mode
+/// succeeded, raw mode is rolled back before returning `Err`, so a
 /// failed enter never leaves the terminal in a half-modified state.
 ///
-/// Note: this type is defined ahead of the P3-3 ratatui draw loop wiring. It
-/// is intentionally **not** invoked from [`run`] yet — see the inline comment
-/// in `run` for the integration point.
+/// The `alt_screen_active` flag is retained for source compatibility
+/// with the existing teardown order (and to keep the unit tests
+/// stable) but now corresponds to "bracketed paste is currently on"
+/// rather than "alt screen is currently on".
 pub struct TerminalGuard {
     /// True while raw mode is currently enabled by *this* guard.
     raw_mode_active: std::sync::atomic::AtomicBool,
-    /// True while we are currently inside the alternate screen + hidden
-    /// cursor state owned by *this* guard.
+    /// True while bracketed paste + cursor-show state is currently owned
+    /// by *this* guard. (Pre-P3-inline this flag also tracked the
+    /// alternate screen; the field name is kept for source compat.)
     alt_screen_active: std::sync::atomic::AtomicBool,
 }
 
 impl TerminalGuard {
-    /// Enter raw mode + alternate screen + bracketed-paste mode.
+    /// Enter raw mode + bracketed-paste mode.
     ///
-    /// Note (P3 rearch): we deliberately do **not** `cursor::Hide` here.
-    /// ratatui's `Frame::set_cursor_position` controls cursor visibility per
-    /// frame; calling `Hide` ahead of time leaves `set_cursor_position` with
-    /// no visible cursor to position and breaks the user's ability to see
-    /// where their input is going. We also enable bracketed paste so CJK IME
-    /// committed strings arrive as a single `Event::Paste(s)` instead of
-    /// being shredded into per-byte `KeyEvent`s with garbage modifier bits.
+    /// Note (P3-inline): we do **not** `EnterAlternateScreen` and we do
+    /// **not** `cursor::Hide`. ratatui's `Frame::set_cursor_position`
+    /// controls cursor visibility per frame; calling `Hide` ahead of
+    /// time leaves `set_cursor_position` with no visible cursor to
+    /// position and breaks the user's ability to see where their input
+    /// is going. Bracketed paste is enabled so CJK IME committed strings
+    /// arrive as a single `Event::Paste(s)` instead of being shredded
+    /// into per-byte `KeyEvent`s with garbage modifier bits.
     ///
-    /// Transactional: on partial failure (e.g. raw mode succeeded but
-    /// alternate screen failed) the partially-applied state is rolled back
-    /// before returning `Err`, so callers never need to clean up after a
-    /// failed `enter`.
+    /// Transactional: on partial failure (raw mode succeeded but
+    /// bracketed paste failed) the partially-applied state is rolled
+    /// back before returning `Err`, so callers never need to clean up
+    /// after a failed `enter`.
     pub fn enter() -> Result<Self> {
         use std::sync::atomic::AtomicBool;
 
@@ -250,17 +263,13 @@ impl TerminalGuard {
         crossterm::terminal::enable_raw_mode()
             .map_err(|e| anyhow::anyhow!("failed to enable raw mode for chat TUI: {e}"))?;
 
-        // Step 2: alternate screen + bracketed paste. If this fails, roll
-        // back step 1 before propagating the error. We intentionally do not
-        // `cursor::Hide` — see doc comment.
-        if let Err(e) = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::EnableBracketedPaste,
-        ) {
+        // Step 2: bracketed paste. If this fails, roll back step 1
+        // before propagating the error. We intentionally do not enter
+        // the alternate screen — see doc comment.
+        if let Err(e) = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste) {
             // Best-effort rollback — already on error path, ignore failure.
             let _ = crossterm::terminal::disable_raw_mode();
-            return Err(anyhow::anyhow!("failed to enter alternate screen for chat TUI: {e}"));
+            return Err(anyhow::anyhow!("failed to enable bracketed paste for chat TUI: {e}"));
         }
 
         Ok(Self {
@@ -279,19 +288,17 @@ impl TerminalGuard {
     pub fn leave(&self) {
         use std::sync::atomic::Ordering;
 
-        // Order mirrors the reverse of entry: disable bracketed paste, then
-        // show cursor + leave alt screen, then raw mode last.
+        // Order mirrors the reverse of entry: disable bracketed paste +
+        // show cursor first, then raw mode last. Notably we do NOT
+        // clear the screen — the inline design leaves chat history in
+        // the user's main scrollback so they can review it after exit.
         if self
             .alt_screen_active
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::cursor::Show,
-                crossterm::terminal::LeaveAlternateScreen,
-            );
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
         }
         if self
             .raw_mode_active
@@ -1402,12 +1409,14 @@ pub async fn run(
     // state in case reedline or any helper left it dirty. Kept here as
     // belt-and-braces defence; do not remove without also auditing
     // every non-TUI exit path.
+    //
+    // P3-inline: no `LeaveAlternateScreen` — we never entered it. The
+    // inline viewport's content (status / streaming / input / footer)
+    // simply stops being redrawn; the host shell takes over on the row
+    // immediately below the last permanent message that was pushed via
+    // `terminal.insert_before`.
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(
-        std::io::stderr(),
-        crossterm::cursor::Show,
-        crossterm::terminal::LeaveAlternateScreen
-    );
+    let _ = crossterm::execute!(std::io::stderr(), crossterm::cursor::Show);
 
     // Final session save before exit
     if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
@@ -1522,6 +1531,15 @@ fn spawn_tui_unified_loop(
 }
 
 /// Inner body of [`spawn_tui_unified_loop`].
+///
+/// **P3-inline architecture.** ratatui owns only a fixed-height inline
+/// viewport at the bottom of the terminal — see [`tui::render_bottom_chrome`].
+/// Permanent conversation history is pushed up into the host terminal's
+/// main scrollback at the top of each loop iteration via
+/// `terminal.insert_before`. Once a [`tui::ConversationLine`] has been
+/// pushed it lives in the user's normal terminal scrollback, scrolled by
+/// mouse wheel / Shift+PgUp / terminal search like any other shell
+/// output — there is no app-level scrollbar or scroll state to manage.
 #[cfg(feature = "terminal-tui")]
 fn run_tui_unified_loop(
     input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
@@ -1533,11 +1551,29 @@ fn run_tui_unified_loop(
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
     use crossterm::event::{Event, KeyEventKind};
+    use ratatui::{TerminalOptions, Viewport};
 
     let stdout = std::io::stdout();
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal =
-        ratatui::Terminal::new(backend).map_err(|e| anyhow::anyhow!("ratatui Terminal::new failed: {e}"))?;
+
+    // Initial inline viewport height — sized for an idle state (status +
+    // 1-row input box + footer + small margin). The loop calls
+    // `terminal.draw` every iteration with the *current* required
+    // height; ratatui re-lays-out automatically. We start small so the
+    // banner appears just above the prompt rather than four rows up.
+    let initial_height = tui::bottom_chrome_height(&mirror.lock());
+    let mut terminal = ratatui::Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(initial_height),
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("ratatui Terminal::with_options failed: {e}"))?;
+
+    // Number of `conversation_lines` already flushed to the host
+    // scrollback via `insert_before`. New entries appear at indices
+    // `>= last_pushed_idx` and are pushed on the next loop iteration.
+    let mut last_pushed_idx: usize = 0;
 
     // 50 ms event poll → ~20 fps idle redraw cap. Streaming wakes via
     // `redraw_rx` so this is just a floor, not an upper bound.
@@ -1548,16 +1584,56 @@ fn run_tui_unified_loop(
             return Ok(());
         }
 
-        // Drain any pending redraw wakeups before drawing so a burst of
-        // streaming deltas collapses into a single frame. Then draw.
+        // ── 1. Flush newly-finalised conversation lines to scrollback ──
+        // We take the mirror lock briefly to snapshot the pending range
+        // and the ASCII fallback flag, then release it BEFORE calling
+        // `insert_before` (which performs blocking I/O). This avoids
+        // holding the lock across stdout writes — producers can keep
+        // pushing into `conversation_lines` while we drain.
+        let (pending, ascii_fallback) = {
+            let guard = mirror.lock();
+            let slice: Vec<tui::ConversationLine> = guard
+                .conversation_lines
+                .get(last_pushed_idx..)
+                .map(<[tui::ConversationLine]>::to_vec)
+                .unwrap_or_default();
+            (slice, guard.ascii_fallback)
+        };
+        let pending_count = pending.len();
+        let term_width = terminal.size().map(|s| s.width).unwrap_or(80).max(1);
+        for line in &pending {
+            let height = tui::estimate_message_height(term_width, line, ascii_fallback);
+            // `insert_before` is a no-op for `Viewport::Fullscreen` /
+            // `Fixed` — safe to call with any height; ratatui scrolls
+            // the host terminal up as needed.
+            let render_line = line.clone();
+            if let Err(e) = terminal.insert_before(height, move |buf| {
+                tui::render_message_for_insert(buf, &render_line, ascii_fallback);
+            }) {
+                tracing::warn!(error = %e, "insert_before failed; skipping line");
+            }
+        }
+        last_pushed_idx = last_pushed_idx.saturating_add(pending_count);
+
+        // ── 2. Resize the inline viewport if the input box or streaming
+        // preview changed required height ──────────────────────────────
+        let desired_height = tui::bottom_chrome_height(&mirror.lock());
+        if let Err(e) = terminal.resize(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: term_width,
+            height: desired_height,
+        }) {
+            tracing::trace!(error = %e, "terminal.resize (inline viewport) failed; continuing");
+        }
+
+        // ── 3. Drain coalesced redraw wakeups, then redraw the chrome ─
         while redraw_rx.try_recv().is_ok() {}
-        if let Err(e) = terminal.draw(|f| tui::render(f, &mut mirror.lock())) {
+        if let Err(e) = terminal.draw(|f| tui::render_bottom_chrome(f, &mirror.lock())) {
             tracing::warn!(error = %e, "TUI draw failed");
         }
 
-        // Block up to `poll` for the next event. `poll` is the *only* I/O
-        // primitive we use on this thread besides `terminal.draw`, so no
-        // stdout-writer can race the renderer.
+        // ── 4. Wait for the next input event, with a 50 ms floor ──────
         if !crossterm::event::poll(poll)? {
             continue;
         }
@@ -1646,13 +1722,6 @@ fn run_tui_unified_loop(
                             token.cancel();
                         }
                     }
-                    tui::KeyDispatch::Scroll(dir) => {
-                        let mut guard = mirror.lock();
-                        match dir {
-                            tui::ScrollDir::Up => guard.scroll_up(3),
-                            tui::ScrollDir::Down => guard.scroll_down(3),
-                        }
-                    }
                     tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed => {}
                 }
             }
@@ -1666,8 +1735,10 @@ fn run_tui_unified_loop(
                 mirror.lock().input.paste(&text);
             }
             Event::Resize(_w, _h) => {
-                // `frame.area()` reflects the new size on the next draw —
-                // no mutation required. The next loop top will redraw.
+                // `frame.area()` reflects the new size on the next draw.
+                // The width-aware `estimate_message_height` call at the
+                // top of the next iteration uses `terminal.size()` so
+                // long messages still wrap correctly after resize.
             }
             _ => {
                 // Focus / mouse / other events — ignore for now.

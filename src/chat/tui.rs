@@ -1,9 +1,20 @@
 //! TUI layout and rendering for `prx chat` using ratatui.
 //!
-//! Provides a three-area layout:
-//! - Status bar (top): provider/model, session info, turn count
-//! - Output area (middle): scrollable conversation display
-//! - Input area (bottom): prompt text
+//! Architecture (P3-inline): ratatui drives only the **bottom chrome**
+//! (status / streaming buffer / input / footer) inside a
+//! `Viewport::Inline(N)` viewport. Permanent conversation history is pushed
+//! into the host terminal's main scrollback via `terminal.insert_before`,
+//! which lets the terminal's native scroll (mouse wheel, Shift+PgUp,
+//! search, copy/paste) work without any app-level scroll bookkeeping.
+//!
+//! Public surface:
+//! - [`TuiState`] — shared state mirror (input buffer, conversation
+//!   history, in-flight streaming draft).
+//! - [`render_bottom_chrome`] — draws the fixed-height bottom region.
+//! - [`render_message_for_insert`] — renders one [`ConversationLine`]
+//!   into a ratatui `Buffer` for `terminal.insert_before`.
+//! - [`estimate_message_height`] — width-aware row count used to size
+//!   each `insert_before` call.
 //!
 //! Gated behind the `terminal-tui` feature.
 
@@ -11,10 +22,11 @@ use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use parking_lot::Mutex;
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use std::collections::HashMap;
 use unicode_width::UnicodeWidthStr;
 
@@ -49,6 +61,11 @@ pub struct StreamingDraft {
 }
 
 /// State for the TUI layout.
+///
+/// Permanent conversation rendering happens above the viewport via
+/// `terminal.insert_before` (see [`render_message_for_insert`]); only the
+/// bottom chrome is repainted every frame. There is no app-level scroll
+/// bookkeeping — the host terminal's scrollback owns history navigation.
 pub struct TuiState {
     /// Provider/model displayed in status bar
     pub provider: String,
@@ -57,23 +74,23 @@ pub struct TuiState {
     pub session_title: String,
     /// Number of conversation turns
     pub turn_count: usize,
-    /// Rendered conversation lines
+    /// Rendered conversation lines. The unified loop tracks how many of
+    /// these have already been pushed to the main screen via
+    /// `insert_before`; new entries are flushed on the next iteration.
     pub conversation_lines: Vec<ConversationLine>,
-    /// Current scroll offset (0 = bottom, latest)
-    pub scroll_offset: usize,
     /// Multi-line input buffer + history (P2-10).
     pub input: TuiInput,
-    /// Viewport height for the output area (updated on render)
-    pub viewport_height: u16,
     /// Render ASCII-only icons instead of unicode glyphs (for non-UTF-8 terms).
     pub ascii_fallback: bool,
     /// In-flight streaming-assistant draft (P3-5). `None` between turns.
     ///
-    /// When `Some`, [`render_output`] appends a transient
-    /// [`ConversationLine::StreamingAssistant`]-shaped block beneath the
-    /// finalized history. The streaming buffer is intentionally kept
-    /// separate from `conversation_lines` so a stale or cancelled delta
-    /// can never corrupt persisted history.
+    /// When `Some`, [`render_bottom_chrome`] paints a transient streaming
+    /// block inside the inline viewport. The streaming buffer is
+    /// intentionally kept separate from `conversation_lines` so a stale
+    /// or cancelled delta can never corrupt persisted history. On
+    /// `finalize_stream` the text is lifted into `conversation_lines`
+    /// and the next loop iteration scrolls it permanently into the main
+    /// terminal scrollback.
     pub streaming: Option<StreamingDraft>,
 }
 
@@ -192,6 +209,12 @@ pub const INPUT_HISTORY_CAPACITY: usize = 200;
 ///
 /// Designed so the surrounding event loop can react with a single match
 /// without inspecting `TuiInput` internals.
+///
+/// Note (P3-inline): there is no longer an in-app scroll outcome. With the
+/// inline viewport, history scrolling is handled by the host terminal
+/// natively (mouse wheel, Shift+PgUp, terminal search). PageUp / PageDown
+/// fall through as [`InputOutcome::Unhandled`] so the terminal can
+/// interpret them itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputOutcome {
     /// Key was consumed; no externally observable change beyond the buffer.
@@ -201,20 +224,9 @@ pub enum InputOutcome {
     Submitted(String),
     /// User requested cancellation (Esc). Buffer was cleared if non-empty.
     Cancelled,
-    /// User pressed PageUp / PageDown — caller may scroll the output area.
-    ScrollUp,
-    /// See [`InputOutcome::ScrollUp`].
-    ScrollDown,
     /// Key was not handled by the input subsystem; caller should fall through
     /// to higher-level shortcuts (`Tab`, `Ctrl+C`, `Ctrl+D`, etc.).
     Unhandled,
-}
-
-/// Scroll direction emitted by [`KeyDispatch::Scroll`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScrollDir {
-    Up,
-    Down,
 }
 
 /// Top-level dispatch outcome for a single [`KeyEvent`] when it is fed into
@@ -227,7 +239,7 @@ pub enum ScrollDir {
 ///   * `Ctrl+C`  → interrupt the current turn (caller cancels in-flight work)
 ///   * `Ctrl+D`  → EOF when the input buffer is logically empty
 ///   * everything else → forwarded to the input box; submissions surface as
-///     `Submitted(text)` and scroll intents as `Scroll(dir)`.
+///     `Submitted(text)`.
 ///
 /// Keeping the dispatch separate from the actual I/O loop lets us unit-test
 /// the keybindings without spinning up a terminal.
@@ -247,8 +259,6 @@ pub enum KeyDispatch {
     InterruptTurn,
     /// EOF (`Ctrl+D` on an empty buffer) — the event loop should exit.
     Exit,
-    /// PageUp / PageDown — caller may scroll the output viewport.
-    Scroll(ScrollDir),
 }
 
 /// Resolve a [`KeyEvent`] against the global shortcut table layered above the
@@ -302,8 +312,6 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     match state.handle_input_key(key) {
         InputOutcome::Submitted(text) => KeyDispatch::Submitted(text),
         InputOutcome::Cancelled => KeyDispatch::Cancelled,
-        InputOutcome::ScrollUp => KeyDispatch::Scroll(ScrollDir::Up),
-        InputOutcome::ScrollDown => KeyDispatch::Scroll(ScrollDir::Down),
         InputOutcome::Consumed | InputOutcome::Unhandled => KeyDispatch::Consumed,
     }
 }
@@ -732,8 +740,10 @@ impl TuiInput {
                     InputOutcome::Unhandled
                 }
             }
-            KeyCode::PageUp => InputOutcome::ScrollUp,
-            KeyCode::PageDown => InputOutcome::ScrollDown,
+            // P3-inline: scrolling history is the host terminal's job
+            // (mouse wheel, Shift+PgUp). We deliberately do NOT consume
+            // PgUp/PgDn so the terminal can interpret them natively.
+            KeyCode::PageUp | KeyCode::PageDown => InputOutcome::Unhandled,
             KeyCode::Esc => {
                 if !self.is_empty() {
                     self.clear();
@@ -770,9 +780,7 @@ impl TuiState {
             session_title: String::new(),
             turn_count: 0,
             conversation_lines: Vec::new(),
-            scroll_offset: 0,
             input: TuiInput::new(),
-            viewport_height: 0,
             ascii_fallback: false,
             streaming: None,
         }
@@ -799,7 +807,6 @@ impl TuiState {
             accumulated: String::new(),
             version: 0,
         });
-        self.scroll_to_bottom();
         0
     }
 
@@ -827,7 +834,6 @@ impl TuiState {
         draft.accumulated.clear();
         draft.accumulated.push_str(accumulated);
         draft.version = version;
-        self.scroll_to_bottom();
         true
     }
 
@@ -850,7 +856,6 @@ impl TuiState {
                 content: final_text.to_string(),
             });
         }
-        self.scroll_to_bottom();
     }
 
     /// Discard an in-flight streaming draft without surfacing any text in
@@ -858,7 +863,6 @@ impl TuiState {
     pub fn cancel_stream(&mut self, draft_id: &str) {
         if self.streaming.as_ref().is_some_and(|d| d.draft_id == draft_id) {
             self.streaming = None;
-            self.scroll_to_bottom();
         }
     }
 
@@ -881,7 +885,6 @@ impl TuiState {
             content: content.to_string(),
         });
         self.turn_count += 1;
-        self.scroll_to_bottom();
     }
 
     /// Add an assistant message to the conversation display.
@@ -889,7 +892,6 @@ impl TuiState {
         self.conversation_lines.push(ConversationLine::Assistant {
             content: content.to_string(),
         });
-        self.scroll_to_bottom();
     }
 
     /// Add a system / status message.
@@ -897,7 +899,6 @@ impl TuiState {
         self.conversation_lines.push(ConversationLine::System {
             content: content.to_string(),
         });
-        self.scroll_to_bottom();
     }
 
     /// Add a legacy single-line tool call indicator.
@@ -929,7 +930,6 @@ impl TuiState {
             elapsed_ms: None,
             folded: true,
         });
-        self.scroll_to_bottom();
     }
 
     /// Find the most recent `Running` tool card whose name matches and update
@@ -1004,7 +1004,6 @@ impl TuiState {
             char_count,
             folded: true,
         });
-        self.scroll_to_bottom();
         true
     }
 
@@ -1031,24 +1030,14 @@ impl TuiState {
         self.conversation_lines.iter().rposition(ConversationLine::is_reasoning)
     }
 
-    /// Scroll to the bottom of the conversation.
-    pub const fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = 0;
-    }
-
-    /// Scroll up by n lines.
-    pub const fn scroll_up(&mut self, n: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_add(n);
-    }
-
-    /// Scroll down by n lines.
-    pub const fn scroll_down(&mut self, n: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(n);
-    }
-
-    /// Total content lines (estimated). Used for scrollbar sizing.
+    /// Total content lines (estimated). Used by tests to compare folded vs
+    /// expanded card row counts.
+    #[cfg(test)]
     fn total_content_lines(&self) -> usize {
-        self.conversation_lines.iter().map(estimate_line_height).sum()
+        self.conversation_lines
+            .iter()
+            .map(|l| estimate_line_height(l) as usize)
+            .sum()
     }
 }
 
@@ -1103,10 +1092,14 @@ impl crate::channels::terminal::TuiMirrorSink for TuiStateMirrorSink {
     }
 }
 
-/// Estimate the number of terminal rows a single `ConversationLine` will
-/// occupy in the output area. Always >= 1.
-fn estimate_line_height(line: &ConversationLine) -> usize {
-    match line {
+/// Logical row count for a [`ConversationLine`], **before** soft-wrap.
+///
+/// This is the floor used by [`estimate_message_height`]; the real
+/// `insert_before` height is bumped up by hard wrapping at the terminal
+/// width so long User / Assistant / System messages don't get clipped.
+/// Always returns >= 1.
+fn estimate_line_height(line: &ConversationLine) -> u16 {
+    let rows = match line {
         ConversationLine::User { content } => {
             // First content line shares the row with the `> ` prompt; further
             // rows render as continuations. Trailing blank separator.
@@ -1146,7 +1139,60 @@ fn estimate_line_height(line: &ConversationLine) -> usize {
                 1 + content.lines().count().max(1)
             }
         }
+    };
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// Width-aware row count used by the unified TUI loop to size each
+/// `terminal.insert_before(height, …)` call.
+///
+/// Builds the same `Line<'_>` vec that [`render_message_for_insert`]
+/// will emit, then counts the rows each `Line` will consume at the
+/// given terminal width using a simple `ceil(display_width / width)`
+/// estimate. This matches the soft-wrap behaviour of
+/// `Paragraph::wrap(Wrap { trim: false })` closely enough for sizing
+/// `insert_before` calls — the goal is to never *clip* a long message,
+/// not to count rows down to the cell. `width` should be the current
+/// terminal column count; zero is treated as 1.
+pub fn estimate_message_height(width: u16, line: &ConversationLine, ascii: bool) -> u16 {
+    let safe_width = width.max(1);
+    let mut sink: Vec<Line<'_>> = Vec::new();
+    render_conversation_line(&mut sink, line, ascii);
+    let wrapped = wrapped_rows_for_lines(&sink, safe_width);
+    wrapped.max(estimate_line_height(line)).max(1)
+}
+
+/// Count the visible rows a `Vec<Line>` will consume at the given
+/// width, assuming `Paragraph::wrap(Wrap { trim: false })` semantics:
+/// each `Line` takes `ceil(display_width / width)` rows, or `1` if
+/// empty. Saturates at `u16::MAX`.
+fn wrapped_rows_for_lines(lines: &[Line<'_>], width: u16) -> u16 {
+    let w = usize::from(width.max(1));
+    let mut total: usize = 0;
+    for line in lines {
+        let display_width: usize = line
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        let rows = if display_width == 0 {
+            1
+        } else {
+            display_width.div_ceil(w)
+        };
+        total = total.saturating_add(rows);
     }
+    u16::try_from(total).unwrap_or(u16::MAX)
+}
+
+/// Render one [`ConversationLine`] directly into a ratatui [`Buffer`] for
+/// `terminal.insert_before`. The buffer's full area is consumed; the
+/// caller is responsible for sizing it via [`estimate_message_height`].
+pub fn render_message_for_insert(buf: &mut Buffer, line: &ConversationLine, ascii: bool) {
+    let mut sink: Vec<Line<'_>> = Vec::new();
+    render_conversation_line(&mut sink, line, ascii);
+    let paragraph = Paragraph::new(Text::from(sink)).wrap(Wrap { trim: false });
+    let area = buf.area;
+    paragraph.render(area, buf);
 }
 
 /// Build a single-line preview of a raw args string, truncated to `max_chars`
@@ -1164,41 +1210,87 @@ fn build_args_preview(raw: &str, max_chars: usize, ellipsis: &str) -> String {
     format!("{truncated}{ellipsis}")
 }
 
-/// Render the TUI layout to a ratatui frame.
-pub fn render(frame: &mut Frame, state: &mut TuiState) {
-    let area = frame.area();
+/// Minimum height (rows) of the inline viewport. Reserves space for
+/// 1 status line + 1 input row + 1 footer. The unified loop bumps this
+/// up dynamically to accommodate multi-line input and streaming buffers.
+pub const BOTTOM_CHROME_MIN_HEIGHT: u16 = 3;
 
-    // Three-area layout: status bar (1 line) + output (flex) + input (dynamic) + footer (1 line)
-    //
-    // Input box height = 1 (top border) + min(lines.len(), INPUT_MAX_VISIBLE_ROWS),
-    // clamped to at least 2 (border + 1 row) so an empty buffer is still visible.
+/// Hard upper bound on the inline viewport height. Streaming + a 12-row
+/// input box + status + footer is the largest reasonable layout; beyond
+/// that the user's main scrollback starts losing valuable rows.
+pub const BOTTOM_CHROME_MAX_HEIGHT: u16 = 24;
+
+/// Maximum number of streaming-assistant rows to show inside the inline
+/// viewport while a turn is in flight. Once the stream finalises, the
+/// finalised text is lifted into `conversation_lines` and pushed up to
+/// the host terminal's scrollback via `insert_before` on the next loop
+/// iteration.
+pub const STREAMING_VISIBLE_ROWS: u16 = 6;
+
+/// Compute the inline viewport height needed for the current state.
+///
+/// Layout, top to bottom:
+///   1 status row
+/// + optional streaming preview (up to [`STREAMING_VISIBLE_ROWS`])
+/// + 1 input-border row + visible input rows (1..=[`INPUT_MAX_VISIBLE_ROWS`])
+/// + 1 footer row
+///
+/// Clamped to [`BOTTOM_CHROME_MIN_HEIGHT`]..=[`BOTTOM_CHROME_MAX_HEIGHT`].
+pub fn bottom_chrome_height(state: &TuiState) -> u16 {
     let visible_input_rows = state.input.lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
+    let streaming_rows = if state.streaming.is_some() {
+        STREAMING_VISIBLE_ROWS
+    } else {
+        0
+    };
+    let total: u16 = 1u16 // status row
+        .saturating_add(streaming_rows)
+        .saturating_add(input_height)
+        .saturating_add(1); // footer row
+    total.clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT)
+}
+
+/// Render the **fixed-height inline viewport** at the bottom of the
+/// terminal. Permanent conversation lines are NOT drawn here — they are
+/// already in the host terminal's scrollback courtesy of
+/// `terminal.insert_before` (driven by the unified loop in
+/// `chat/mod.rs::run_tui_unified_loop`).
+///
+/// Layout (top to bottom):
+///   1. Status bar (1 row)
+///   2. Streaming preview (optional, up to [`STREAMING_VISIBLE_ROWS`])
+///   3. Input box (dynamic, border + 1..=[`INPUT_MAX_VISIBLE_ROWS`])
+///   4. Footer (1 row)
+pub fn render_bottom_chrome(frame: &mut Frame, state: &TuiState) {
+    let area = frame.area();
+
+    let visible_input_rows = state.input.lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
+    let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
+    let streaming_rows = if state.streaming.is_some() {
+        STREAMING_VISIBLE_ROWS
+    } else {
+        0
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),            // Status bar
-            Constraint::Min(5),               // Output area
-            Constraint::Length(input_height), // Input area (dynamic)
-            Constraint::Length(1),            // Footer
+            Constraint::Length(1),              // Status bar
+            Constraint::Length(streaming_rows), // Streaming preview (0 when idle)
+            Constraint::Length(input_height),   // Input area (dynamic)
+            Constraint::Length(1),              // Footer
         ])
         .split(area);
 
-    // Layout::split always returns exactly as many chunks as constraints (4 here).
+    // Layout::split always returns exactly 4 chunks here.
     #[allow(clippy::indexing_slicing)]
     {
-        state.viewport_height = chunks[1].height;
-
-        // ── Status bar ──
         render_status_bar(frame, chunks[0], state);
-
-        // ── Output area ──
-        render_output(frame, chunks[1], state);
-
-        // ── Input area ──
+        if streaming_rows > 0 {
+            render_streaming_preview(frame, chunks[1], state);
+        }
         render_input(frame, chunks[2], state);
-
-        // ── Footer ──
         render_footer(frame, chunks[3]);
     }
 }
@@ -1219,54 +1311,36 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.render_widget(status, area);
 }
 
-fn render_output(frame: &mut Frame, area: Rect, state: &TuiState) {
-    // P3-5: stage a transient `StreamingAssistant` line for the in-flight
-    // draft (if any) BEFORE building `lines`, so it outlives the `Line<'_>`
-    // borrows below. The transient is dropped at the end of this frame; it
-    // never enters `conversation_lines`, so a cancelled stream leaves no
-    // trace in history.
-    let transient_streaming: Option<ConversationLine> =
-        state.streaming.as_ref().map(|s| ConversationLine::StreamingAssistant {
-            content: s.accumulated.clone(),
-        });
+/// Render the in-flight streaming-assistant draft inside the inline
+/// viewport. Trimmed to the last [`STREAMING_VISIBLE_ROWS`] rows so the
+/// most recently arrived tokens stay visible.
+fn render_streaming_preview(frame: &mut Frame, area: Rect, state: &TuiState) {
+    let Some(draft) = state.streaming.as_ref() else {
+        return;
+    };
+    let transient = ConversationLine::StreamingAssistant {
+        content: draft.accumulated.clone(),
+    };
+    let mut sink: Vec<Line<'_>> = Vec::new();
+    render_conversation_line(&mut sink, &transient, state.ascii_fallback);
 
-    let mut lines: Vec<Line<'_>> = Vec::new();
+    // If the streaming body wraps beyond `area.height`, scroll the
+    // Paragraph so the trailing rows (newest tokens) are visible.
+    let total_rows: u16 = wrapped_rows_for_lines(&sink, area.width);
+    let scroll: u16 = total_rows.saturating_sub(area.height);
 
-    for conv_line in &state.conversation_lines {
-        render_conversation_line(&mut lines, conv_line, state.ascii_fallback);
-    }
-
-    if let Some(transient) = transient_streaming.as_ref() {
-        render_conversation_line(&mut lines, transient, state.ascii_fallback);
-    }
-
-    // Virtual scrolling: compute which lines are visible
-    let total_lines = lines.len();
-    let viewport = area.height as usize;
-    let max_scroll = total_lines.saturating_sub(viewport);
-    let effective_scroll = max_scroll.saturating_sub(state.scroll_offset);
-
-    let output = Paragraph::new(Text::from(lines))
+    let widget = Paragraph::new(Text::from(sink))
         .block(Block::default().borders(Borders::NONE))
         .wrap(Wrap { trim: false })
-        .scroll((effective_scroll as u16, 0));
-
-    frame.render_widget(output, area);
-
-    // Scrollbar
-    if total_lines > viewport {
-        let mut scrollbar_state = ScrollbarState::new(total_lines)
-            .position(effective_scroll)
-            .viewport_content_length(viewport);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
-    }
+        .scroll((scroll, 0));
+    frame.render_widget(widget, area);
 }
 
 /// Render a single conversation line into the ratatui `lines` buffer.
 ///
 /// Pure function (apart from the &mut push target) — kept outside
-/// [`render_output`] so unit tests can drive it with a `Vec<Line<'_>>` sink.
+/// [`render_message_for_insert`] / [`render_streaming_preview`] so unit
+/// tests can drive it with a `Vec<Line<'_>>` sink.
 fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a ConversationLine, ascii: bool) {
     match conv_line {
         ConversationLine::User { content } => {
@@ -1762,19 +1836,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tui_state_scroll() {
+    fn tui_state_turn_count_tracks_user_messages_only() {
+        // P3-inline: app-level scroll has been removed. The TuiState now
+        // just owns the conversation log and turn counter; history scroll
+        // is delegated to the host terminal. This pins the contract that
+        // `turn_count` advances on user submissions only.
         let mut state = TuiState::new("test", "model");
         state.push_user_message("hello");
         state.push_assistant_message("world");
-        assert_eq!(state.turn_count, 1); // only user messages count
-        assert_eq!(state.scroll_offset, 0);
-
-        state.scroll_up(5);
-        assert_eq!(state.scroll_offset, 5);
-        state.scroll_down(3);
-        assert_eq!(state.scroll_offset, 2);
-        state.scroll_to_bottom();
-        assert_eq!(state.scroll_offset, 0);
+        assert_eq!(state.turn_count, 1, "only user messages bump turn_count");
+        state.push_user_message("again");
+        assert_eq!(state.turn_count, 2);
     }
 
     // ── P3-5: streaming-draft API tests ────────────────────────────────
@@ -1933,11 +2005,14 @@ mod tests {
     }
 
     #[test]
-    fn render_output_appends_streaming_block_after_history() {
-        // Drive `render_conversation_line` over both the history and the
-        // staged transient line, mirroring what `render_output` does
-        // internally. Assert the streaming block lands AFTER the last
-        // Assistant line.
+    fn streaming_transient_renders_after_history_in_insert_pipeline() {
+        // P3-inline: drive `render_conversation_line` over both the
+        // history and the staged transient line. The history portion is
+        // what `render_message_for_insert` emits per message; the
+        // transient lands in the inline viewport's streaming preview
+        // (see `render_streaming_preview`). Either way the streaming
+        // block must contain the in-flight tokens and end with the
+        // cursor glyph.
         let mut state = TuiState::new("p", "m");
         state.push_assistant_message("first turn done");
         state.start_stream("d-live");
@@ -2818,10 +2893,14 @@ mod tests {
     }
 
     #[test]
-    fn p2_10_pageup_pagedown_return_scroll_intent() {
+    fn p3_inline_pageup_pagedown_fall_through_to_terminal() {
+        // P3-inline: PgUp/PgDn are intentionally NOT consumed so the host
+        // terminal can scroll the main scrollback natively (alongside
+        // mouse wheel and Shift+PgUp). The input subsystem must report
+        // them as Unhandled.
         let mut input = TuiInput::new();
-        assert_eq!(input.handle_key(key(KeyCode::PageUp)), InputOutcome::ScrollUp);
-        assert_eq!(input.handle_key(key(KeyCode::PageDown)), InputOutcome::ScrollDown);
+        assert_eq!(input.handle_key(key(KeyCode::PageUp)), InputOutcome::Unhandled);
+        assert_eq!(input.handle_key(key(KeyCode::PageDown)), InputOutcome::Unhandled);
     }
 
     #[test]
@@ -2951,12 +3030,19 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_pageup_pagedown_map_to_scroll_directives() {
+    fn dispatch_pageup_pagedown_are_consumed_without_scroll() {
+        // P3-inline: there is no app-level scrolling. PgUp/PgDn are not
+        // routed anywhere by the dispatcher — they surface as Consumed
+        // (the global dispatcher always returns *some* KeyDispatch) and
+        // leave the input buffer untouched. The host terminal handles
+        // history scroll natively, so users still get PgUp/PgDn behavior
+        // via the terminal emulator's own scrollback.
         let mut state = TuiState::new("p", "m");
         let out = dispatch_global_key(key(KeyCode::PageUp), &mut state);
-        assert_eq!(out, KeyDispatch::Scroll(ScrollDir::Up));
+        assert_eq!(out, KeyDispatch::Consumed);
         let out = dispatch_global_key(key(KeyCode::PageDown), &mut state);
-        assert_eq!(out, KeyDispatch::Scroll(ScrollDir::Down));
+        assert_eq!(out, KeyDispatch::Consumed);
+        assert!(state.input.is_empty(), "PgUp/PgDn must not leak into input");
     }
 
     #[test]
@@ -3057,5 +3143,87 @@ mod tests {
             assert_eq!(out, KeyDispatch::Consumed);
         }
         assert_eq!(state.input.text(), "你好");
+    }
+
+    // ── P3-inline: insert_before pipeline tests ──────────────────────────
+
+    #[test]
+    fn render_message_for_insert_paints_user_line_into_buffer() {
+        // The unified TUI loop hands `render_message_for_insert` a Buffer
+        // sized via `estimate_message_height` and expects the message to
+        // be visible in the scrollback after `insert_before` flushes.
+        // Render a short user message into a 4-row × 40-col buffer and
+        // verify the prompt + content land in row 0.
+        let line = ConversationLine::User {
+            content: "hello world".to_string(),
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
+        let mut buf = Buffer::empty(area);
+        render_message_for_insert(&mut buf, &line, false);
+        // Read row 0 cell-by-cell; it should contain "> hello world".
+        let mut row0 = String::new();
+        for x in 0..area.width {
+            if let Some(cell) = buf.cell((x, 0)) {
+                row0.push_str(cell.symbol());
+            }
+        }
+        let trimmed = row0.trim_end();
+        assert!(
+            trimmed.starts_with("> hello world"),
+            "row 0 should contain '> hello world', got {trimmed:?}"
+        );
+    }
+
+    #[test]
+    fn estimate_message_height_grows_with_narrower_terminal() {
+        // A long user message must consume more rows when the terminal
+        // is narrow — the unified loop relies on this to size each
+        // `insert_before` call so wrapped output is never clipped.
+        let long_text = "x".repeat(200);
+        let line = ConversationLine::User { content: long_text };
+        let wide = estimate_message_height(120, &line, false);
+        let narrow = estimate_message_height(40, &line, false);
+        assert!(
+            narrow > wide,
+            "narrow terminal must need more rows: narrow={narrow}, wide={wide}"
+        );
+        // Floor of 2 rows: content row + trailing blank separator.
+        assert!(wide >= 2, "user message always needs at least content + blank");
+    }
+
+    #[test]
+    fn bottom_chrome_height_expands_with_input_and_streaming() {
+        // Resting state: status (1) + input border (1) + input row (1) +
+        // footer (1) = 4. Streaming adds the preview block. A long
+        // multi-line input adds more rows up to the visible cap.
+        let mut state = TuiState::new("p", "m");
+        let idle = bottom_chrome_height(&state);
+        assert!(idle >= BOTTOM_CHROME_MIN_HEIGHT);
+        assert!(idle <= BOTTOM_CHROME_MAX_HEIGHT);
+
+        // Streaming should bump the height by `STREAMING_VISIBLE_ROWS`.
+        state.start_stream("d-live");
+        let streaming = bottom_chrome_height(&state);
+        assert!(
+            streaming > idle,
+            "streaming preview must add rows: streaming={streaming}, idle={idle}"
+        );
+
+        // Multi-line input drives growth too (until clamped).
+        state.cancel_stream("d-live");
+        for _ in 0..6 {
+            state.input.lines.push(String::new());
+        }
+        let tall = bottom_chrome_height(&state);
+        assert!(tall > idle, "multi-line input must add rows: tall={tall}, idle={idle}");
+        assert!(
+            tall <= BOTTOM_CHROME_MAX_HEIGHT,
+            "must be clamped to BOTTOM_CHROME_MAX_HEIGHT"
+        );
     }
 }
