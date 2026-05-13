@@ -103,10 +103,20 @@ pub enum ConversationMessage {
 }
 
 /// A chunk of content from a streaming response.
-#[derive(Debug, Clone)]
+///
+/// Reasoning/thinking content (Anthropic `thinking` blocks, OpenAI
+/// `reasoning_content`, Ollama `thinking`) is intentionally separated from the
+/// visible `delta` text so chat consumers can choose whether to render it.
+/// The default chat consumer drops reasoning from the live stream and only
+/// preserves the final aggregated text + reasoning in conversation history.
+#[derive(Debug, Clone, Default)]
 pub struct StreamChunk {
-    /// Text delta for this chunk.
+    /// Visible text delta for this chunk (assistant's "spoken" output).
     pub delta: String,
+    /// Reasoning/thinking delta for this chunk (model's internal monologue).
+    /// `None` for ordinary text chunks; `Some` only when the provider emits a
+    /// dedicated reasoning event.
+    pub reasoning: Option<String>,
     /// Whether this is the final chunk.
     pub is_final: bool,
     /// Approximate token count for this chunk (estimated).
@@ -114,10 +124,23 @@ pub struct StreamChunk {
 }
 
 impl StreamChunk {
-    /// Create a new non-final chunk.
+    /// Create a new non-final chunk carrying visible text.
     pub fn delta(text: impl Into<String>) -> Self {
         Self {
             delta: text.into(),
+            reasoning: None,
+            is_final: false,
+            token_count: 0,
+        }
+    }
+
+    /// Create a non-final chunk carrying reasoning/thinking content only.
+    /// The visible `delta` is left empty; consumers should not display this
+    /// as primary output.
+    pub fn reasoning_delta(text: impl Into<String>) -> Self {
+        Self {
+            delta: String::new(),
+            reasoning: Some(text.into()),
             is_final: false,
             token_count: 0,
         }
@@ -127,6 +150,7 @@ impl StreamChunk {
     pub const fn final_chunk() -> Self {
         Self {
             delta: String::new(),
+            reasoning: None,
             is_final: true,
             token_count: 0,
         }
@@ -136,14 +160,25 @@ impl StreamChunk {
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             delta: message.into(),
+            reasoning: None,
             is_final: true,
             token_count: 0,
         }
     }
 
+    /// True when this chunk carries only reasoning (no visible delta).
+    pub const fn is_reasoning_only(&self) -> bool {
+        self.delta.is_empty() && self.reasoning.is_some()
+    }
+
     /// Estimate tokens (rough approximation: ~4 chars per token).
+    /// Counts both visible delta and reasoning content.
     pub const fn with_token_estimate(mut self) -> Self {
-        self.token_count = self.delta.len().div_ceil(4);
+        let reasoning_len = match &self.reasoning {
+            Some(r) => r.len(),
+            None => 0,
+        };
+        self.token_count = (self.delta.len() + reasoning_len).div_ceil(4);
         self
     }
 }

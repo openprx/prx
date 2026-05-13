@@ -40,16 +40,23 @@ struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
     /// Reasoning/thinking models may return output in `reasoning_content`.
+    /// Kept separate from `content` so callers can route it independently.
     #[serde(default)]
     reasoning_content: Option<String>,
 }
 
 impl ResponseMessage {
-    fn effective_content(&self) -> String {
-        match &self.content {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => self.reasoning_content.clone().unwrap_or_default(),
-        }
+    /// Visible content only. Reasoning is intentionally not merged in.
+    fn visible_content(&self) -> String {
+        self.content.clone().unwrap_or_default()
+    }
+
+    /// Non-empty trimmed reasoning, if any.
+    fn reasoning(&self) -> Option<String> {
+        self.reasoning_content.as_ref().and_then(|r| {
+            let trimmed = r.trim();
+            if trimmed.is_empty() { None } else { Some(r.clone()) }
+        })
     }
 }
 
@@ -133,6 +140,7 @@ struct NativeResponseMessage {
     #[serde(default)]
     content: Option<String>,
     /// Reasoning/thinking models may return output in `reasoning_content`.
+    /// Surfaced separately via `reasoning()`; never merged into `content`.
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
@@ -140,11 +148,19 @@ struct NativeResponseMessage {
 }
 
 impl NativeResponseMessage {
-    fn effective_content(&self) -> Option<String> {
-        match &self.content {
-            Some(c) if !c.is_empty() => Some(c.clone()),
-            _ => self.reasoning_content.clone(),
-        }
+    /// Visible content only. Reasoning is exposed via [`Self::reasoning`].
+    fn visible_content(&self) -> Option<String> {
+        self.content
+            .as_ref()
+            .and_then(|c| if c.is_empty() { None } else { Some(c.clone()) })
+    }
+
+    /// Non-empty trimmed reasoning_content, if any.
+    fn reasoning(&self) -> Option<String> {
+        self.reasoning_content.as_ref().and_then(|r| {
+            let trimmed = r.trim();
+            if trimmed.is_empty() { None } else { Some(r.clone()) }
+        })
     }
 }
 
@@ -246,7 +262,11 @@ impl OpenAiProvider {
     }
 
     fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
-        let text = message.effective_content();
+        // Visible text and reasoning are split into separate fields. The
+        // chat consumer only renders `text`; `reasoning_content` is preserved
+        // for history reconstruction (see build_native_assistant_history).
+        let reasoning = message.reasoning();
+        let text = message.visible_content();
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -261,7 +281,7 @@ impl OpenAiProvider {
         ProviderChatResponse {
             text,
             tool_calls,
-            reasoning_content: None,
+            reasoning_content: reasoning,
         }
     }
 
@@ -330,12 +350,27 @@ impl Provider for OpenAiProvider {
 
         let chat_response: ChatResponse = response.json().await?;
 
-        chat_response
+        let message = chat_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.effective_content())
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))
+            .map(|c| c.message)
+            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
+
+        let visible = message.visible_content();
+        if visible.is_empty() {
+            if let Some(reasoning) = message.reasoning() {
+                // Reasoning-only response with no visible output: log and surface
+                // an empty string. The legacy chat_with_system path returns String
+                // only, so reasoning cannot be carried back to history here — the
+                // caller should prefer chat()/chat_with_tools() for full fidelity.
+                tracing::warn!(
+                    reasoning_chars = reasoning.chars().count(),
+                    "OpenAI returned reasoning_content only with no visible content; chat_with_system drops reasoning"
+                );
+            }
+        }
+        Ok(visible)
     }
 
     async fn chat(
@@ -531,7 +566,7 @@ mod tests {
         let json = r#"{"choices":[{"message":{"content":"Hi!"}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices.len(), 1);
-        assert_eq!(resp.choices[0].message.effective_content(), "Hi!");
+        assert_eq!(resp.choices[0].message.visible_content(), "Hi!");
     }
 
     #[test]
@@ -546,14 +581,14 @@ mod tests {
         let json = r#"{"choices":[{"message":{"content":"A"}},{"message":{"content":"B"}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices.len(), 2);
-        assert_eq!(resp.choices[0].message.effective_content(), "A");
+        assert_eq!(resp.choices[0].message.visible_content(), "A");
     }
 
     #[test]
     fn response_with_unicode() {
         let json = r#"{"choices":[{"message":{"content":"Hello \u03A9"}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.effective_content(), "Hello \u{03A9}");
+        assert_eq!(resp.choices[0].message.visible_content(), "Hello \u{03A9}");
     }
 
     #[test]
@@ -576,40 +611,72 @@ mod tests {
     // ----------------------------------------------------------
 
     #[test]
-    fn reasoning_content_fallback_empty_content() {
+    fn reasoning_content_not_merged_into_visible_when_content_empty() {
         let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Thinking..."}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.effective_content(), "Thinking...");
+        let msg = &resp.choices[0].message;
+        // Reasoning must stay in its own field — visible content remains empty.
+        assert_eq!(msg.visible_content(), "");
+        assert_eq!(msg.reasoning().as_deref(), Some("Thinking..."));
     }
 
     #[test]
-    fn reasoning_content_fallback_null_content() {
+    fn reasoning_content_not_merged_when_content_null() {
         let json = r#"{"choices":[{"message":{"content":null,"reasoning_content":"Thinking..."}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.effective_content(), "Thinking...");
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.visible_content(), "");
+        assert_eq!(msg.reasoning().as_deref(), Some("Thinking..."));
     }
 
     #[test]
-    fn reasoning_content_not_used_when_content_present() {
-        let json = r#"{"choices":[{"message":{"content":"Hello","reasoning_content":"Ignored"}}]}"#;
+    fn visible_content_preferred_when_present() {
+        let json = r#"{"choices":[{"message":{"content":"Hello","reasoning_content":"Sidebar"}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.effective_content(), "Hello");
+        let msg = &resp.choices[0].message;
+        // Both fields are separate; visible_content stays just the visible bit.
+        assert_eq!(msg.visible_content(), "Hello");
+        assert_eq!(msg.reasoning().as_deref(), Some("Sidebar"));
     }
 
     #[test]
-    fn native_response_reasoning_content_fallback() {
+    fn native_response_surfaces_reasoning_separately_when_content_empty() {
         let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Native thinking"}}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), Some("Native thinking".to_string()));
+        // Visible content stays empty; reasoning lives on its own.
+        assert_eq!(msg.visible_content(), None);
+        assert_eq!(msg.reasoning().as_deref(), Some("Native thinking"));
     }
 
     #[test]
-    fn native_response_reasoning_content_ignored_when_content_present() {
-        let json = r#"{"choices":[{"message":{"content":"Real answer","reasoning_content":"Ignored"}}]}"#;
+    fn native_response_keeps_visible_and_reasoning_apart() {
+        let json = r#"{"choices":[{"message":{"content":"Real answer","reasoning_content":"Sidebar"}}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), Some("Real answer".to_string()));
+        assert_eq!(msg.visible_content(), Some("Real answer".to_string()));
+        assert_eq!(msg.reasoning().as_deref(), Some("Sidebar"));
+    }
+
+    #[test]
+    fn parse_native_response_populates_reasoning_content_field() {
+        let json = r#"{"choices":[{"message":{"content":"Visible","reasoning_content":"Internal"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let msg = resp.choices.into_iter().next().expect("test: choice").message;
+        let chat_resp = OpenAiProvider::parse_native_response(msg);
+        // Visible text -> ProviderChatResponse.text. Reasoning -> reasoning_content.
+        assert_eq!(chat_resp.text.as_deref(), Some("Visible"));
+        assert_eq!(chat_resp.reasoning_content.as_deref(), Some("Internal"));
+    }
+
+    #[test]
+    fn parse_native_response_no_reasoning_content_when_absent() {
+        let json = r#"{"choices":[{"message":{"content":"Visible only"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let msg = resp.choices.into_iter().next().expect("test: choice").message;
+        let chat_resp = OpenAiProvider::parse_native_response(msg);
+        assert_eq!(chat_resp.text.as_deref(), Some("Visible only"));
+        assert_eq!(chat_resp.reasoning_content, None);
     }
 
     #[tokio::test]

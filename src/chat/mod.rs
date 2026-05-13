@@ -493,6 +493,15 @@ pub async fn run(
         }
 
         // ── Streaming pipeline setup ─────────────────────────────
+        //
+        // The delta channel carries ONLY visible assistant text — never the
+        // model's reasoning/thinking content. Reasoning is separated upstream
+        // at the provider parsing layer (see `parse_native_response` /
+        // `parse_sse_line` in providers/{anthropic,openai,ollama,compatible}.rs)
+        // and travels back via `ProviderChatResponse.reasoning_content`. The
+        // tool-call loop persists reasoning into conversation history through
+        // `build_native_assistant_history`; the live stream below renders text
+        // only, so the user never sees the model's internal monologue.
         let cancellation = CancellationToken::new();
         let (delta_tx, delta_rx) = mpsc::channel::<String>(DELTA_CHANNEL_CAPACITY);
 

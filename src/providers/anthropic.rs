@@ -164,6 +164,10 @@ struct NativeContentIn {
     name: Option<String>,
     #[serde(default)]
     input: Option<serde_json::Value>,
+    /// Anthropic "thinking" content blocks carry chain-of-thought in the
+    /// `thinking` field (extended thinking mode). Surfaced as reasoning.
+    #[serde(default)]
+    thinking: Option<String>,
 }
 
 impl AnthropicProvider {
@@ -593,7 +597,15 @@ impl AnthropicProvider {
     }
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
+        // Walk content blocks and route them by `type`:
+        //   - "text"     -> visible text_parts
+        //   - "thinking" -> reasoning_parts (extended thinking mode)
+        //   - "tool_use" -> tool_calls
+        // Thinking blocks are NEVER mixed into visible text — they travel back
+        // on `reasoning_content` so the chat consumer can drop them from the
+        // live stream while preserving them in history.
         let mut text_parts = Vec::new();
+        let mut reasoning_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
         for block in response.content {
@@ -602,6 +614,17 @@ impl AnthropicProvider {
                     if let Some(text) = block.text.map(|t| t.trim().to_string()) {
                         if !text.is_empty() {
                             text_parts.push(text);
+                        }
+                    }
+                }
+                "thinking" => {
+                    // Anthropic extended-thinking blocks: prefer the dedicated
+                    // `thinking` field, fall back to `text` for forward-compat.
+                    let raw = block.thinking.or(block.text);
+                    if let Some(t) = raw {
+                        let trimmed = t.trim();
+                        if !trimmed.is_empty() {
+                            reasoning_parts.push(trimmed.to_string());
                         }
                     }
                 }
@@ -630,7 +653,11 @@ impl AnthropicProvider {
                 Some(text_parts.join("\n"))
             },
             tool_calls,
-            reasoning_content: None,
+            reasoning_content: if reasoning_parts.is_empty() {
+                None
+            } else {
+                Some(reasoning_parts.join("\n"))
+            },
         }
     }
 
@@ -1607,5 +1634,75 @@ mod tests {
         assert!(api_tools[0]["input_schema"].is_object(), "Missing input_schema");
 
         server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------
+    // Reasoning/thinking block separation tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_native_response_routes_thinking_block_to_reasoning_field() {
+        // Anthropic extended-thinking returns a content block of type "thinking"
+        // with the chain-of-thought in the `thinking` field. It must NOT be
+        // mixed into the visible `text` payload.
+        let json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "Let me reason about this..."},
+                {"type": "text", "text": "Final answer."}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let parsed = AnthropicProvider::parse_native_response(resp);
+
+        // Visible text only — no thinking content leaks in.
+        assert_eq!(parsed.text.as_deref(), Some("Final answer."));
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("Let me reason about this..."));
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_native_response_handles_thinking_only_without_text() {
+        let json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "Internal monologue only."}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let parsed = AnthropicProvider::parse_native_response(resp);
+
+        // No visible text at all.
+        assert_eq!(parsed.text, None);
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("Internal monologue only."));
+    }
+
+    #[test]
+    fn parse_native_response_with_thinking_and_tool_use() {
+        let json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "I should call shell."},
+                {"type": "tool_use", "id": "tu_1", "name": "shell", "input": {"command": "ls"}}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let parsed = AnthropicProvider::parse_native_response(resp);
+
+        assert_eq!(parsed.text, None);
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("I should call shell."));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+    }
+
+    #[test]
+    fn parse_native_response_no_thinking_keeps_reasoning_none() {
+        let json = r#"{
+            "content": [
+                {"type": "text", "text": "Just an answer."}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let parsed = AnthropicProvider::parse_native_response(resp);
+
+        assert_eq!(parsed.text.as_deref(), Some("Just an answer."));
+        assert_eq!(parsed.reasoning_content, None);
     }
 }
