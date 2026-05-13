@@ -163,6 +163,94 @@ pub enum InputOutcome {
     Unhandled,
 }
 
+/// Scroll direction emitted by [`KeyDispatch::Scroll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollDir {
+    Up,
+    Down,
+}
+
+/// Top-level dispatch outcome for a single [`KeyEvent`] when it is fed into
+/// the chat event loop via [`dispatch_global_key`].
+///
+/// This is a pure-function projection over the global shortcut table layered
+/// on top of [`TuiState::handle_input_key`]:
+///   * `Tab`     → toggles the most recent tool-result card (fold/unfold)
+///   * `Ctrl+R`  → toggles the most recent reasoning card
+///   * `Ctrl+C`  → interrupt the current turn (caller cancels in-flight work)
+///   * `Ctrl+D`  → EOF when the input buffer is logically empty
+///   * everything else → forwarded to the input box; submissions surface as
+///     `Submitted(text)` and scroll intents as `Scroll(dir)`.
+///
+/// Keeping the dispatch separate from the actual I/O loop lets us unit-test
+/// the keybindings without spinning up a terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyDispatch {
+    /// Global shortcut handled or input-only change. The event loop should
+    /// re-render but otherwise continue waiting for input.
+    Consumed,
+    /// User pressed Enter on a non-empty buffer. The full multi-line text is
+    /// the value to deliver to the agent pipeline.
+    Submitted(String),
+    /// User requested cancellation of the current input (Esc).
+    Cancelled,
+    /// User requested cancellation of the in-flight LLM turn (`Ctrl+C`).
+    /// The caller is responsible for firing the `CancellationToken` and
+    /// keeping the input loop running so a new prompt can be entered.
+    InterruptTurn,
+    /// EOF (`Ctrl+D` on an empty buffer) — the event loop should exit.
+    Exit,
+    /// PageUp / PageDown — caller may scroll the output viewport.
+    Scroll(ScrollDir),
+}
+
+/// Resolve a [`KeyEvent`] against the global shortcut table layered above the
+/// input box. See [`KeyDispatch`] for the priority order. The function is
+/// pure: it consumes a mutable reference to [`TuiState`] only to forward the
+/// key into the input buffer and to flip fold flags on tool / reasoning cards.
+///
+/// Pure on its own, no I/O — kept here so unit tests can exercise the binding
+/// table without touching crossterm / ratatui terminals.
+pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
+    // Tab → toggle most recent tool-result card. If there is no tool card we
+    // still consume the key (per spec, Tab is never forwarded to input).
+    if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
+        let _ = state.toggle_last_tool_result_folded();
+        return KeyDispatch::Consumed;
+    }
+    // Ctrl+R → toggle most recent reasoning card. Never falls through.
+    if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
+        let _ = state.toggle_last_reasoning_folded();
+        return KeyDispatch::Consumed;
+    }
+    // Ctrl+C → interrupt active turn. We intentionally do NOT exit on a
+    // single press; the persistent ctrl_c() signal handler in chat/mod.rs
+    // already implements the double-press exit semantics.
+    if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+        return KeyDispatch::InterruptTurn;
+    }
+    // Ctrl+D → EOF when the input buffer is empty; otherwise treat as a
+    // forward-delete (delegated to the input box via Delete equivalence).
+    if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
+        if state.input.is_empty() {
+            return KeyDispatch::Exit;
+        }
+        // Non-empty: forward as a normal Delete keystroke so users can still
+        // use Ctrl+D as forward-delete inside the buffer.
+        let synthetic = KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
+        let _ = state.handle_input_key(synthetic);
+        return KeyDispatch::Consumed;
+    }
+    // All other keys → input box.
+    match state.handle_input_key(key) {
+        InputOutcome::Submitted(text) => KeyDispatch::Submitted(text),
+        InputOutcome::Cancelled => KeyDispatch::Cancelled,
+        InputOutcome::ScrollUp => KeyDispatch::Scroll(ScrollDir::Up),
+        InputOutcome::ScrollDown => KeyDispatch::Scroll(ScrollDir::Down),
+        InputOutcome::Consumed | InputOutcome::Unhandled => KeyDispatch::Consumed,
+    }
+}
+
 /// Multi-line text input with history navigation.
 ///
 /// Storage is a `Vec<String>` where each element is one logical line **without**
@@ -2202,5 +2290,138 @@ mod tests {
         assert_eq!(input.history.len(), INPUT_HISTORY_CAPACITY);
         // Oldest entry was dropped.
         assert!(!input.history.contains(&"e0".to_string()));
+    }
+
+    // ── P2-Integration: global key dispatch tests ────────────────────────────
+
+    #[test]
+    fn dispatch_tab_toggles_last_tool_result_card() {
+        let mut state = TuiState::new("p", "m");
+        // Without any tool card the Tab keystroke is still consumed (no-op).
+        let out = dispatch_global_key(key(KeyCode::Tab), &mut state);
+        assert_eq!(out, KeyDispatch::Consumed);
+
+        // Push a tool result and verify Tab flips its folded flag.
+        state.push_tool_result_started("shell", "{}");
+        let folded_before = match state.conversation_lines.last() {
+            Some(ConversationLine::ToolResult { folded, .. }) => *folded,
+            _ => panic!("test: expected ToolResult at end"),
+        };
+        let out = dispatch_global_key(key(KeyCode::Tab), &mut state);
+        assert_eq!(out, KeyDispatch::Consumed);
+        let folded_after = match state.conversation_lines.last() {
+            Some(ConversationLine::ToolResult { folded, .. }) => *folded,
+            _ => panic!("test: expected ToolResult at end"),
+        };
+        assert_ne!(folded_before, folded_after, "Tab must flip folded state");
+        // Tab is consumed by the dispatcher → input buffer untouched.
+        assert!(state.input.is_empty(), "Tab must not fall through to input box");
+    }
+
+    #[test]
+    fn dispatch_ctrl_r_toggles_last_reasoning_card() {
+        let mut state = TuiState::new("p", "m");
+        // No reasoning card yet — still consumed, no-op.
+        let out = dispatch_global_key(key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut state);
+        assert_eq!(out, KeyDispatch::Consumed);
+        assert!(state.input.is_empty(), "Ctrl+R never falls through to input");
+
+        // Push a reasoning card and verify Ctrl+R flips its folded flag.
+        assert!(state.push_reasoning("step 1\nstep 2"));
+        let folded_before = match state.conversation_lines.last() {
+            Some(ConversationLine::Reasoning { folded, .. }) => *folded,
+            _ => panic!("test: expected Reasoning at end"),
+        };
+        let out = dispatch_global_key(key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut state);
+        assert_eq!(out, KeyDispatch::Consumed);
+        let folded_after = match state.conversation_lines.last() {
+            Some(ConversationLine::Reasoning { folded, .. }) => *folded,
+            _ => panic!("test: expected Reasoning at end"),
+        };
+        assert_ne!(folded_before, folded_after, "Ctrl+R must flip folded state");
+    }
+
+    #[test]
+    fn dispatch_typing_and_enter_yields_submission() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "Hello".chars() {
+            let out = dispatch_global_key(key(KeyCode::Char(ch)), &mut state);
+            assert_eq!(out, KeyDispatch::Consumed);
+        }
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
+        assert_eq!(out, KeyDispatch::Submitted("Hello".to_string()));
+        assert!(state.input.is_empty(), "buffer cleared after submit");
+    }
+
+    #[test]
+    fn dispatch_ctrl_c_signals_interrupt_turn() {
+        let mut state = TuiState::new("p", "m");
+        let out = dispatch_global_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut state);
+        assert_eq!(out, KeyDispatch::InterruptTurn);
+    }
+
+    #[test]
+    fn dispatch_ctrl_d_on_empty_buffer_signals_exit() {
+        let mut state = TuiState::new("p", "m");
+        let out = dispatch_global_key(key_mod(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut state);
+        assert_eq!(out, KeyDispatch::Exit);
+    }
+
+    #[test]
+    fn dispatch_ctrl_d_on_non_empty_buffer_deletes_forward() {
+        let mut state = TuiState::new("p", "m");
+        // Type "abc" then move cursor to start.
+        for ch in "abc".chars() {
+            dispatch_global_key(key(KeyCode::Char(ch)), &mut state);
+        }
+        dispatch_global_key(key(KeyCode::Home), &mut state);
+        assert_eq!(state.input.text(), "abc");
+        // Ctrl+D should forward-delete 'a' instead of exiting.
+        let out = dispatch_global_key(key_mod(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut state);
+        assert_eq!(out, KeyDispatch::Consumed);
+        assert_eq!(state.input.text(), "bc");
+    }
+
+    #[test]
+    fn dispatch_pageup_pagedown_map_to_scroll_directives() {
+        let mut state = TuiState::new("p", "m");
+        let out = dispatch_global_key(key(KeyCode::PageUp), &mut state);
+        assert_eq!(out, KeyDispatch::Scroll(ScrollDir::Up));
+        let out = dispatch_global_key(key(KeyCode::PageDown), &mut state);
+        assert_eq!(out, KeyDispatch::Scroll(ScrollDir::Down));
+    }
+
+    #[test]
+    fn dispatch_esc_returns_cancelled() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "draft".chars() {
+            dispatch_global_key(key(KeyCode::Char(ch)), &mut state);
+        }
+        let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
+        assert_eq!(out, KeyDispatch::Cancelled);
+        assert!(state.input.is_empty(), "Esc clears the in-flight draft");
+    }
+
+    #[test]
+    fn dispatch_sequence_hello_enter_returns_submitted_text() {
+        // Full integration: simulate the canonical "type Hello + Enter" flow.
+        let mut state = TuiState::new("p", "m");
+        let seq = [
+            key(KeyCode::Char('H')),
+            key(KeyCode::Char('e')),
+            key(KeyCode::Char('l')),
+            key(KeyCode::Char('l')),
+            key(KeyCode::Char('o')),
+            key(KeyCode::Enter),
+        ];
+        let mut submitted: Option<String> = None;
+        for k in seq {
+            match dispatch_global_key(k, &mut state) {
+                KeyDispatch::Submitted(text) => submitted = Some(text),
+                KeyDispatch::Consumed => {}
+                other => panic!("test: unexpected dispatch {other:?}"),
+            }
+        }
+        assert_eq!(submitted, Some("Hello".to_string()));
     }
 }
