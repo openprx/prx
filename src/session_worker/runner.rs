@@ -206,6 +206,7 @@ async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
             scope_ctx.as_ref(),
             None,
             Some(&config.tool_tiering),
+            crate::agent::loop_::ChatMode::default(),
         )
         .await
     };

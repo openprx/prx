@@ -10,6 +10,11 @@ use crate::memory::{Memory, MemoryCategory};
 use crate::tools::Tool;
 use anyhow::Result;
 
+// Re-export `ChatMode` from the lib crate so the chat slash-command parser
+// and the tool-execution loop share the same type without crossing the
+// lib/bin module boundary.
+pub use crate::agent::loop_::ChatMode;
+
 /// Outcome of a slash-command dispatch.
 pub enum CommandResult {
     /// Command was handled — caller should `continue` (skip LLM turn).
@@ -18,6 +23,11 @@ pub enum CommandResult {
     NotACommand,
     /// /quit or /exit — break the loop.
     Quit,
+    /// /plan, /edit, /auto — caller should update session mode + print
+    /// confirmation, then `continue` (skip LLM turn). The mode change is
+    /// returned to the caller so [`ChatMode`] stays out of this module's
+    /// `CommandContext` (which only carries immutable borrows).
+    SetMode(ChatMode),
 }
 
 /// Context passed to command handlers (borrows from the main loop).
@@ -42,10 +52,16 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
             println!("  /memory <query>    Search memory");
             println!("  /cost              Show token usage estimate");
             println!("  /export [md|json]  Export conversation");
+            println!("  /plan              Switch to plan mode (read-only tools)");
+            println!("  /edit              Switch to edit mode (default)");
+            println!("  /auto              Switch to auto mode (no approval prompts)");
             println!("  /quit /exit        Exit chat\n");
             CommandResult::Handled
         }
         "/quit" | "/exit" => CommandResult::Quit,
+        "/plan" => CommandResult::SetMode(ChatMode::Plan),
+        "/edit" => CommandResult::SetMode(ChatMode::Edit),
+        "/auto" => CommandResult::SetMode(ChatMode::Auto),
         "/tools" => {
             println!("Available tools:\n");
             for tool in ctx.tools_registry {
@@ -202,4 +218,80 @@ fn export_session(session: &session::ChatSession, format: &str) -> Result<String
 
     std::fs::write(&filename, &content).map_err(|e| anyhow::anyhow!("write {filename}: {e}"))?;
     Ok(filename)
+}
+
+#[cfg(test)]
+mod mode_tests {
+    //! Parser-level coverage for `/plan` `/edit` `/auto`. The full dispatch
+    //! path needs a `CommandContext` (tools registry + memory backend) so
+    //! these tests exercise the pure mode-classification helpers, plus a
+    //! pattern-match shim that mirrors what `dispatch` returns for the three
+    //! mode-switching commands.
+    use super::{ChatMode, CommandResult};
+
+    /// Pure classification helper mirroring the `dispatch` match arms for the
+    /// mode-switching commands. Returns `Some(mode)` for `/plan|/edit|/auto`,
+    /// `None` otherwise. Keeps the test independent of async `dispatch`
+    /// machinery (memory backend, tools registry).
+    fn classify_mode_command(input: &str) -> Option<ChatMode> {
+        match input {
+            "/plan" => Some(ChatMode::Plan),
+            "/edit" => Some(ChatMode::Edit),
+            "/auto" => Some(ChatMode::Auto),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn plan_command_parses_to_plan_mode() {
+        assert_eq!(classify_mode_command("/plan"), Some(ChatMode::Plan));
+    }
+
+    #[test]
+    fn edit_command_parses_to_edit_mode() {
+        assert_eq!(classify_mode_command("/edit"), Some(ChatMode::Edit));
+    }
+
+    #[test]
+    fn auto_command_parses_to_auto_mode() {
+        assert_eq!(classify_mode_command("/auto"), Some(ChatMode::Auto));
+    }
+
+    #[test]
+    fn unknown_slash_command_does_not_match_mode() {
+        assert_eq!(classify_mode_command("/banana"), None);
+        assert_eq!(classify_mode_command("/help"), None);
+        assert_eq!(classify_mode_command("/planz"), None);
+        assert_eq!(classify_mode_command(""), None);
+    }
+
+    #[test]
+    fn default_mode_is_edit() {
+        assert_eq!(ChatMode::default(), ChatMode::Edit);
+    }
+
+    #[test]
+    fn mode_labels_are_stable() {
+        assert_eq!(ChatMode::Plan.label(), "plan");
+        assert_eq!(ChatMode::Edit.label(), "edit");
+        assert_eq!(ChatMode::Auto.label(), "auto");
+    }
+
+    #[test]
+    fn only_plan_intercepts_writes() {
+        assert!(ChatMode::Plan.intercepts_writes());
+        assert!(!ChatMode::Edit.intercepts_writes());
+        assert!(!ChatMode::Auto.intercepts_writes());
+    }
+
+    /// Guard: ensure `CommandResult::SetMode` is publicly constructible — this
+    /// prevents accidental loss of the variant during future refactors.
+    #[test]
+    fn set_mode_variant_is_constructible() {
+        let r = CommandResult::SetMode(ChatMode::Plan);
+        match r {
+            CommandResult::SetMode(m) => assert_eq!(m, ChatMode::Plan),
+            _ => panic!("expected SetMode variant"),
+        }
+    }
 }

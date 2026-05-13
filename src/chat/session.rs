@@ -3,6 +3,7 @@
 //! Each `ChatSession` captures a full conversation (turns, metadata, timestamps)
 //! and can be serialized/deserialized for persistence via the Memory backend.
 
+use crate::agent::loop_::ChatMode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -54,6 +55,11 @@ pub struct ChatSession {
     pub updated_at: DateTime<Utc>,
     /// Ordered conversation turns
     pub turns: Vec<ChatTurn>,
+    /// Active interaction mode (plan/edit/auto). Not persisted to JSON so
+    /// resumed sessions always start back in the default mode — the user
+    /// re-issues `/plan` if they want it.
+    #[serde(skip)]
+    pub mode: ChatMode,
 }
 
 impl ChatSession {
@@ -69,7 +75,13 @@ impl ChatSession {
             created_at: now,
             updated_at: now,
             turns: Vec::new(),
+            mode: ChatMode::default(),
         }
+    }
+
+    /// Update the interactive mode for this session.
+    pub const fn set_mode(&mut self, mode: ChatMode) {
+        self.mode = mode;
     }
 
     /// Add a user turn.

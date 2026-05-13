@@ -446,6 +446,21 @@ pub async fn run(
             match commands::dispatch(&user_input, &cmd_ctx).await {
                 commands::CommandResult::Handled => continue,
                 commands::CommandResult::Quit => break,
+                commands::CommandResult::SetMode(mode) => {
+                    chat_session.set_mode(mode);
+                    match mode {
+                        commands::ChatMode::Plan => println!(
+                            "✓ Switched to plan mode (read-only tools only — write/shell/git_commit will be simulated)\n"
+                        ),
+                        commands::ChatMode::Edit => {
+                            println!("✓ Switched to edit mode (default — write tools enabled)\n");
+                        }
+                        commands::ChatMode::Auto => {
+                            println!("✓ Switched to auto mode (all tools, no approval prompts)\n");
+                        }
+                    }
+                    continue;
+                }
                 commands::CommandResult::NotACommand => {}
             }
         }
@@ -665,6 +680,7 @@ pub async fn run(
                     Some(&scope_ctx),
                     Some(tool_event_tx.clone()),
                     Some(&config.tool_tiering),
+                    chat_session.mode,
                 ),
             )
             .await;

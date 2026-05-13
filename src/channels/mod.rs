@@ -2347,6 +2347,7 @@ async fn process_channel_message(
                     Some(&scope_ctx),
                     Some(tool_event_tx.clone()),
                     Some(&ctx.tool_tiering),
+                    crate::agent::loop_::ChatMode::default(),
                 ),
             ) => LlmExecutionResult::Completed(result),
         };

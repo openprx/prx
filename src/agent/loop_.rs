@@ -24,6 +24,48 @@ use uuid::Uuid;
 
 use crate::agent::stream_buffer::StreamBoundaryBuffer;
 
+/// Interactive chat operating mode. Aligned with codex CLI's `plan`/`edit`/`auto`
+/// concepts. Lives in the lib crate so non-chat callers (channels, gateway,
+/// delegate, sessions_spawn, …) can default it to [`ChatMode::Edit`].
+///
+/// - [`ChatMode::Plan`] — read-only: write/shell/git-mutating tools are
+///   intercepted by [`execute_one_tool`] before execution and a simulated
+///   "[plan mode] would call <tool>" result is fed back to the model. Read
+///   tools (file_read, grep, web_search, memory_recall, …) execute normally.
+/// - [`ChatMode::Edit`] — default. No filtering: all tools that pass the
+///   normal approval/policy pipeline run.
+/// - [`ChatMode::Auto`] — same tool set as `Edit`. Reserved for future
+///   "skip approval prompts" behaviour; today the chat-loop already does not
+///   block on interactive prompts, so the practical difference vs `Edit` is
+///   the user-visible label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatMode {
+    /// Plan-only: simulate write tools, run read tools normally.
+    Plan,
+    /// Default — all tools enabled, normal approval flow.
+    #[default]
+    Edit,
+    /// All tools, approval prompts suppressed.
+    Auto,
+}
+
+impl ChatMode {
+    /// Short label for status / confirmation messages.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Edit => "edit",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// Returns `true` when this mode should intercept write/mutating tools
+    /// and synthesize a simulated result instead of executing them.
+    pub const fn intercepts_writes(self) -> bool {
+        matches!(self, Self::Plan)
+    }
+}
+
 /// Lightweight notification for tool call progress (used by chat/TUI integration).
 #[derive(Debug, Clone)]
 pub(crate) enum ToolCallNotification {
@@ -1600,8 +1642,50 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
+        ChatMode::default(),
     )
     .await
+}
+
+/// Returns `true` when `name` belongs to the set of tools that **modify**
+/// state (filesystem, shell, git, memory writes, background sessions, etc.)
+/// and therefore must be intercepted when the chat session is in
+/// [`ChatMode::Plan`].
+///
+/// Unknown tool names are conservatively treated as writes — better to
+/// surface "[plan mode] would call X" than accidentally execute an opaque
+/// MCP/composio tool whose side-effects we can't classify.
+fn is_write_tool(name: &str) -> bool {
+    !matches!(
+        name,
+        // Read tools: safe to run in plan mode.
+        "file_read"
+            | "grep"
+            | "web_search"
+            | "web_search_tool"
+            | "web_fetch"
+            | "memory_recall"
+            | "memory_search"
+            | "memory_get"
+            | "cron_list"
+            | "cron_runs"
+            | "sessions_list"
+            | "sessions_history"
+            | "session_status"
+            | "agents_list"
+            | "image_info"
+            | "hardware_board_info"
+            | "hardware_memory_map"
+            | "hardware_memory_read"
+    )
+}
+
+/// Truncate a JSON value to a short preview string suitable for synthesized
+/// "would call" messages in plan mode. Keeps the message readable even when
+/// the original arguments are large (file contents, shell commands, …).
+fn preview_tool_arguments(args: &serde_json::Value) -> String {
+    let raw = args.to_string();
+    truncate_with_ellipsis(&raw, 160)
 }
 
 async fn execute_one_tool(
@@ -1611,7 +1695,17 @@ async fn execute_one_tool(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
+    chat_mode: ChatMode,
 ) -> Result<String> {
+    if chat_mode.intercepts_writes() && is_write_tool(call_name) {
+        let preview = preview_tool_arguments(&call_arguments);
+        observer.record_event(&ObserverEvent::ToolCall {
+            tool: call_name.to_string(),
+            duration: std::time::Duration::ZERO,
+            success: true,
+        });
+        return Ok(format!("[plan mode] would call {call_name} with {preview}"));
+    }
     let Some(tool) = find_tool(tools_registry, call_name) else {
         let available_names: Vec<&str> = tools_registry.iter().map(|t| t.name()).collect();
         let suggestion = crate::tools::error_hints::suggest_tool_name(call_name, &available_names);
@@ -1944,6 +2038,7 @@ async fn execute_tool_call_serial(
     channel_name: &str,
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
+    chat_mode: ChatMode,
 ) -> Result<String> {
     if let Some(denied) = scope_or_pipeline_denial(call, scope_ctx) {
         return Ok(denied);
@@ -1977,6 +2072,7 @@ async fn execute_tool_call_serial(
         observer,
         cancellation_token,
         scope_ctx,
+        chat_mode,
     )
     .await
 }
@@ -1988,6 +2084,7 @@ async fn execute_read_only_batch(
     schedule: ReadOnlyToolScheduleConfig,
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
+    chat_mode: ChatMode,
 ) -> Result<BatchExecutionOutcome> {
     use futures::stream::{self, StreamExt};
     use std::time::Duration;
@@ -2008,6 +2105,7 @@ async fn execute_read_only_batch(
                 observer,
                 cancellation_token,
                 scope_ctx,
+                chat_mode,
             );
 
             let bounded = async {
@@ -2072,6 +2170,7 @@ async fn execute_tools_with_policy(
     schedule: ReadOnlyToolScheduleConfig,
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
+    chat_mode: ChatMode,
 ) -> Result<Vec<String>> {
     let mut ordered_indices = Vec::with_capacity(tool_calls.len());
     if schedule.priority_enabled {
@@ -2125,6 +2224,7 @@ async fn execute_tools_with_policy(
                 schedule.clone(),
                 cancellation_token,
                 scope_ctx,
+                chat_mode,
             )
             .await?;
 
@@ -2196,6 +2296,7 @@ async fn execute_tools_with_policy(
             channel_name,
             cancellation_token,
             scope_ctx,
+            chat_mode,
         )
         .await?;
         results_by_original[index] = result;
@@ -2249,6 +2350,7 @@ pub(crate) async fn run_tool_call_loop(
     scope_ctx: Option<&ScopeContext<'_>>,
     on_tool_call: Option<tokio::sync::mpsc::Sender<ToolCallNotification>>,
     tool_tiering: Option<&crate::config::ToolTieringConfig>,
+    chat_mode: ChatMode,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2654,6 +2756,7 @@ pub(crate) async fn run_tool_call_loop(
             read_only_schedule.clone(),
             cancellation_token.as_ref(),
             scope_ctx,
+            chat_mode,
         )
         .await?;
         let tools_elapsed_ms = tools_started_at.elapsed().as_millis() as u64;
@@ -3037,6 +3140,7 @@ pub async fn run(
             None,
             None,
             Some(&config.tool_tiering),
+            ChatMode::default(),
         )
         .await?;
         increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
@@ -3215,6 +3319,7 @@ pub async fn run(
                 None,
                 None,
                 Some(&config.tool_tiering),
+                ChatMode::default(),
             )
             .await
             {
@@ -3708,6 +3813,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
+            ChatMode::default(),
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3763,6 +3869,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
+            ChatMode::default(),
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3810,6 +3917,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
+            ChatMode::default(),
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3989,6 +4097,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
+            ChatMode::default(),
         )
         .await
         .expect("read-only parallel execution should complete");
@@ -4090,6 +4199,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
+            ChatMode::default(),
         )
         .await
         .expect("stateful serial execution should complete");
@@ -4153,6 +4263,7 @@ mod tests {
             },
             None,
             None,
+            ChatMode::default(),
         )
         .await
         .expect("priority scheduling should execute successfully");
@@ -4220,6 +4331,7 @@ mod tests {
             },
             None,
             None,
+            ChatMode::default(),
         )
         .await
         .expect("scheduler should complete with rollback");
@@ -4255,6 +4367,7 @@ mod tests {
             &NoopObserver,
             None,
             None,
+            ChatMode::default(),
         );
         let second = execute_one_tool(
             "file_write",
@@ -4263,6 +4376,7 @@ mod tests {
             &NoopObserver,
             None,
             None,
+            ChatMode::default(),
         );
 
         let (_a, _b) = tokio::join!(first, second);
@@ -4271,6 +4385,237 @@ mod tests {
             1,
             "barrier should serialize concurrent file_write calls"
         );
+    }
+
+    // ── P2-8: /plan /edit /auto mode integration ─────────────────────────
+
+    #[test]
+    fn is_write_tool_classifies_read_tools_as_safe() {
+        for name in [
+            "file_read",
+            "grep",
+            "web_search",
+            "web_search_tool",
+            "web_fetch",
+            "memory_recall",
+            "memory_search",
+            "memory_get",
+            "cron_list",
+            "cron_runs",
+            "sessions_list",
+            "sessions_history",
+            "session_status",
+            "agents_list",
+            "image_info",
+            "hardware_board_info",
+            "hardware_memory_map",
+            "hardware_memory_read",
+        ] {
+            assert!(
+                !is_write_tool(name),
+                "expected `{name}` to be classified as read-only (plan mode should let it run)"
+            );
+        }
+    }
+
+    #[test]
+    fn is_write_tool_classifies_mutating_tools_as_writes() {
+        for name in [
+            "file_write",
+            "shell",
+            "git_operations",
+            "memory_store",
+            "memory_forget",
+            "sessions_spawn",
+            "sessions_send",
+            "delegate",
+            "subagents",
+            "cron_add",
+            "cron_update",
+            "cron_remove",
+            "cron_run",
+            "schedule",
+            "config_reload",
+            "proxy_config",
+            "browser_open",
+            "screenshot",
+            "http_request",
+            "tts",
+            "pushover",
+            "message_send",
+            "canvas",
+            "composio",
+            "mcp",
+        ] {
+            assert!(
+                is_write_tool(name),
+                "expected `{name}` to be classified as write (plan mode should intercept it)"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_tool_defaults_to_write_classification() {
+        assert!(
+            is_write_tool("unknown_third_party_tool_v2"),
+            "unknown tools must be conservatively treated as writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_in_plan_mode_intercepts_write_tools() {
+        // file_write is registered but plan mode should short-circuit before
+        // touching it. We confirm via the DelayTool counter that no execution
+        // happened.
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "file_write",
+            500,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let started = std::time::Instant::now();
+        let result = execute_one_tool(
+            "file_write",
+            serde_json::json!({"value": "x"}),
+            &tools_registry,
+            &NoopObserver,
+            None,
+            None,
+            ChatMode::Plan,
+        )
+        .await
+        .expect("plan-mode interception should succeed");
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.starts_with("[plan mode] would call file_write"),
+            "expected simulated result, got: {result}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "plan-mode short-circuit must NOT execute the real tool (elapsed={elapsed:?})"
+        );
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            0,
+            "real tool body must not have been invoked under plan mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_in_plan_mode_allows_read_tools() {
+        // file_read is in the read-only set — plan mode should let it run.
+        // We use a fake DelayTool named "file_read" and assert it ran (active
+        // counter ≥ 1 at peak).
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "file_read",
+            20,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let result = execute_one_tool(
+            "file_read",
+            serde_json::json!({"value": "x"}),
+            &tools_registry,
+            &NoopObserver,
+            None,
+            None,
+            ChatMode::Plan,
+        )
+        .await
+        .expect("read tool should execute normally in plan mode");
+
+        assert!(
+            !result.starts_with("[plan mode]"),
+            "read tool must not be intercepted in plan mode (got: {result})"
+        );
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "read tool body must have been executed once"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_in_edit_mode_runs_write_tools_normally() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "file_write",
+            20,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let result = execute_one_tool(
+            "file_write",
+            serde_json::json!({"value": "y"}),
+            &tools_registry,
+            &NoopObserver,
+            None,
+            None,
+            ChatMode::Edit,
+        )
+        .await
+        .expect("edit mode must allow file_write through");
+
+        assert!(
+            !result.starts_with("[plan mode]"),
+            "edit mode must never produce plan-mode synthesized output"
+        );
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "edit mode should execute the real tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_in_auto_mode_runs_write_tools_normally() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "shell",
+            20,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let result = execute_one_tool(
+            "shell",
+            serde_json::json!({"value": "echo hi"}),
+            &tools_registry,
+            &NoopObserver,
+            None,
+            None,
+            ChatMode::Auto,
+        )
+        .await
+        .expect("auto mode must allow shell through");
+
+        assert!(
+            !result.starts_with("[plan mode]"),
+            "auto mode must never produce plan-mode synthesized output"
+        );
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "auto mode should execute the real tool"
+        );
+    }
+
+    #[test]
+    fn preview_tool_arguments_truncates_long_payloads() {
+        let big = serde_json::json!({"content": "x".repeat(1024)});
+        let preview = preview_tool_arguments(&big);
+        // truncate_with_ellipsis caps at 160 chars and appends "..."
+        assert!(preview.chars().count() <= 163, "preview length unexpected: {preview}");
     }
 
     #[test]
