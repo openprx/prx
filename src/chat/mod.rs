@@ -690,8 +690,12 @@ pub async fn run(
     // chat::run exit (panic-safe via `install_chat_panic_hook` above). The
     // legacy path leaves `_terminal_guard = None`, so no entry side-effects
     // are applied.
+    // `redraw_tx_for_main` is `Some(sender)` only on the TUI path; the main
+    // loop uses it to nudge the renderer after mutating `chat_mirror` (e.g.
+    // echoing the user's submitted input so the conversation pane reflects
+    // it immediately rather than waiting for the next async event).
     #[cfg(feature = "terminal-tui")]
-    let _terminal_guard: Option<TerminalGuard> = {
+    let (_terminal_guard, redraw_tx_for_main): (Option<TerminalGuard>, Option<mpsc::Sender<()>>) = {
         use std::io::IsTerminal as _;
         // TUI is on by default in TTY. Opt out with PRX_TUI=0 (e.g. for
         // downstream scripts that scrape stdout, or to escape rendering
@@ -731,6 +735,10 @@ pub async fn run(
                     // crossterm events. No more spawn_render_task /
                     // spawn_redraw_tick_task / spawn_tui_input_task trio —
                     // they fought each other over the same stdout handle.
+                    // Hand a clone to the main loop so it can request a
+                    // redraw immediately after echoing the user's input
+                    // into `chat_mirror`.
+                    let redraw_tx_main = redraw_tx.clone();
                     spawn_tui_unified_loop(
                         input_tx,
                         Arc::clone(&chat_mirror),
@@ -739,7 +747,7 @@ pub async fn run(
                         Arc::clone(&last_ctrlc_ms),
                         Arc::clone(&active_cancel),
                     );
-                    Some(guard)
+                    (Some(guard), Some(redraw_tx_main))
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "TerminalGuard::enter failed; falling back to reedline input");
@@ -753,7 +761,7 @@ pub async fn run(
                             tracing::error!("Terminal input loop error: {e}");
                         }
                     });
-                    None
+                    (None, None)
                 }
             }
         } else {
@@ -768,7 +776,7 @@ pub async fn run(
                     tracing::error!("Terminal input loop error: {e}");
                 }
             });
-            None
+            (None, None)
         }
     };
     #[cfg(not(feature = "terminal-tui"))]
@@ -836,6 +844,27 @@ pub async fn run(
         _ = shutdown.cancelled() => None,
     } {
         let user_input = msg.content.clone();
+
+        // Echo the user's input into the TUI conversation pane.
+        //
+        // Why: in raw-mode TUI the input box clears on submit, so without
+        // this push the user has no visual confirmation of what they sent
+        // until the assistant streams its reply. We push BEFORE the slash
+        // command short-circuits below so that even `/quit`, `/clear`, etc.
+        // produce a visible record of what was typed.
+        //
+        // Non-TUI (`--plain`, piped stdin, reedline fallback) is unaffected:
+        // the terminal already echoes typed characters as cooked input, and
+        // `redraw_tx_for_main` is `None` on those paths.
+        #[cfg(feature = "terminal-tui")]
+        {
+            chat_mirror.lock().push_user_message(&user_input);
+            if let Some(tx) = redraw_tx_for_main.as_ref() {
+                // cap=1 + try_send: bursts coalesce into a single deferred
+                // redraw — the unified loop will pick up the latest state.
+                let _ = tx.try_send(());
+            }
+        }
 
         // Handle /quit and /exit immediately
         if matches!(user_input.as_str(), "/quit" | "/exit") {
@@ -1534,6 +1563,34 @@ fn run_tui_unified_loop(
             continue;
         }
         let ev = crossterm::event::read()?;
+        // [DIAG] log every raw crossterm event so we can observe what the
+        // terminal actually delivers (Chinese IME, paste, resize, etc.).
+        match &ev {
+            crossterm::event::Event::Key(k) => {
+                tracing::info!(
+                    event_type = "Key",
+                    code = ?k.code,
+                    modifiers = ?k.modifiers,
+                    kind = ?k.kind,
+                    "tui_input_event"
+                );
+            }
+            crossterm::event::Event::Paste(s) => {
+                tracing::info!(
+                    event_type = "Paste",
+                    chars_count = s.chars().count(),
+                    bytes_count = s.len(),
+                    first_8_chars = %s.chars().take(8).collect::<String>(),
+                    "tui_input_event"
+                );
+            }
+            crossterm::event::Event::Resize(w, h) => {
+                tracing::info!(event_type = "Resize", w, h, "tui_input_event");
+            }
+            other => {
+                tracing::info!(event_type = "Other", debug = ?other, "tui_input_event");
+            }
+        }
         match ev {
             Event::Key(key) => {
                 // Skip key-release events: terminals with
