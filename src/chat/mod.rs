@@ -745,10 +745,12 @@ pub async fn run(
                     // redraw immediately after echoing the user's input
                     // into `chat_mirror`.
                     let redraw_tx_main = redraw_tx.clone();
+                    let redraw_tx_loop = redraw_tx.clone();
                     spawn_tui_unified_loop(
                         input_tx,
                         Arc::clone(&chat_mirror),
                         redraw_rx,
+                        redraw_tx_loop,
                         shutdown.clone(),
                         Arc::clone(&last_ctrlc_ms),
                         Arc::clone(&active_cancel),
@@ -885,6 +887,12 @@ pub async fn run(
             #[cfg(feature = "terminal-tui")]
             {
                 chat_mirror.lock().push_system_message(text);
+                // Nudge the unified loop so the slash-command echo shows up
+                // immediately rather than waiting up to 50 ms for the next
+                // crossterm poll cycle. `try_send` + cap=1 coalesces bursts.
+                if let Some(tx) = redraw_tx_for_main.as_ref() {
+                    let _ = tx.try_send(());
+                }
             }
             #[cfg(not(feature = "terminal-tui"))]
             {
@@ -1079,16 +1087,18 @@ pub async fn run(
         // task and the input task hold.
         #[cfg(feature = "terminal-tui")]
         let tui_mirror: Arc<parking_lot::Mutex<tui::TuiState>> = Arc::clone(&chat_mirror);
-        #[cfg(feature = "terminal-tui")]
-        let tui_mirror_for_tools = Arc::clone(&tui_mirror);
+        // P0-5 fix: tool start/finish events now have a single mirror path.
+        // The UiActor in `channels/terminal.rs::handle_event_tui` is the sole
+        // writer of tool cards into `TuiState` (it sanitises name/args via
+        // `sanitize_terminal_output` and calls `notify_redraw()` on the same
+        // 1-slot channel as `redraw_tx_for_main`). The previous double-mirror
+        // here pushed a second card and could reorder Running/Done with the
+        // UiActor path under load — the forwarder now just relays the event
+        // to the UiActor and lets that path own the mirror mutation.
         let tool_event_forwarder = tokio::spawn(async move {
             while let Some(notif) = tool_event_rx.recv().await {
                 match notif {
                     ToolCallNotification::Started { name, args_summary } => {
-                        #[cfg(feature = "terminal-tui")]
-                        tui_mirror_for_tools
-                            .lock()
-                            .push_tool_result_started(&name, &args_summary);
                         terminal_for_tools.notify_tool_started(&name, &args_summary).await;
                     }
                     ToolCallNotification::Finished {
@@ -1096,10 +1106,6 @@ pub async fn run(
                         success,
                         duration_ms,
                     } => {
-                        #[cfg(feature = "terminal-tui")]
-                        tui_mirror_for_tools
-                            .lock()
-                            .mark_last_tool_result_finished(&name, success, duration_ms, None);
                         terminal_for_tools
                             .notify_tool_finished(&name, success, duration_ms)
                             .await;
@@ -1306,6 +1312,13 @@ pub async fn run(
             let aggregated = collect_reasoning_from_history_slice(turn_slice);
             if !aggregated.is_empty() {
                 tui_mirror.lock().push_reasoning(&aggregated);
+                // The reasoning card is a folded payload appended after the
+                // tool sequence but before the assistant draft is committed
+                // to scrollback; wake the unified loop so it materialises
+                // on the next iteration instead of after a 50 ms poll.
+                if let Some(tx) = redraw_tx_for_main.as_ref() {
+                    let _ = tx.try_send(());
+                }
             }
         }
 
@@ -1518,12 +1531,21 @@ fn spawn_tui_unified_loop(
     input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
     mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
     redraw_rx: mpsc::Receiver<()>,
+    redraw_tx: mpsc::Sender<()>,
     shutdown: CancellationToken,
     last_ctrlc_ms: Arc<AtomicU64>,
     active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
 ) {
     tokio::task::spawn_blocking(move || {
-        let result = run_tui_unified_loop(input_tx, mirror, redraw_rx, &shutdown, last_ctrlc_ms, active_cancel);
+        let result = run_tui_unified_loop(
+            input_tx,
+            mirror,
+            redraw_rx,
+            redraw_tx,
+            &shutdown,
+            last_ctrlc_ms,
+            active_cancel,
+        );
         if let Err(e) = result {
             tracing::error!("TUI unified loop error: {e}");
         }
@@ -1541,10 +1563,12 @@ fn spawn_tui_unified_loop(
 /// mouse wheel / Shift+PgUp / terminal search like any other shell
 /// output — there is no app-level scrollbar or scroll state to manage.
 #[cfg(feature = "terminal-tui")]
+#[allow(clippy::too_many_arguments)]
 fn run_tui_unified_loop(
     input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
     mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
     mut redraw_rx: mpsc::Receiver<()>,
+    redraw_tx: mpsc::Sender<()>,
     shutdown: &CancellationToken,
     last_ctrlc_ms: Arc<AtomicU64>,
     active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
@@ -1680,6 +1704,14 @@ fn run_tui_unified_loop(
                     continue;
                 }
                 let dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
+                // C1 fix: any consumed keystroke may have mutated visible
+                // state — typing in the input box, Tab folding a tool card,
+                // Ctrl+R folding a reasoning card, Esc clearing the buffer,
+                // history navigation. Nudge the loop so the change paints
+                // on the next iteration rather than waiting for the next
+                // crossterm event (worst case 50 ms idle poll). cap=1 +
+                // try_send coalesces, so this is cheap on key floods.
+                let _ = redraw_tx.try_send(());
                 match dispatch {
                     tui::KeyDispatch::Submitted(text) => {
                         let trimmed = text.trim().to_string();
@@ -1737,12 +1769,19 @@ fn run_tui_unified_loop(
                 // KeyEvents with random modifier bits that
                 // `dispatch_global_key` filters out.
                 mirror.lock().input.paste(&text);
+                // Paste mutates `input.lines` directly so the chrome must
+                // repaint; without this kick the next redraw is gated on
+                // the 50 ms poll.
+                let _ = redraw_tx.try_send(());
             }
             Event::Resize(_w, _h) => {
-                // `frame.area()` reflects the new size on the next draw.
-                // The width-aware `estimate_message_height` call at the
-                // top of the next iteration uses `terminal.size()` so
-                // long messages still wrap correctly after resize.
+                // crossterm forwards the new size to ratatui automatically
+                // on the next `draw()` call; we just nudge the loop so the
+                // redraw happens immediately rather than waiting up to
+                // 50 ms for the next poll. Especially relevant when the
+                // user drags a tmux/screen split and expects the chrome
+                // (status bar, input box) to reflow on the spot.
+                let _ = redraw_tx.try_send(());
             }
             _ => {
                 // Focus / mouse / other events — ignore for now.
