@@ -22,8 +22,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// Minimum characters per chunk when relaying LLM text to a streaming draft.
-const STREAM_CHUNK_MIN_CHARS: usize = 80;
+use crate::agent::stream_buffer::StreamBoundaryBuffer;
 
 /// Lightweight notification for tool call progress (used by chat/TUI integration).
 #[derive(Debug, Clone)]
@@ -2584,20 +2583,26 @@ pub(crate) async fn run_tool_call_loop(
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
-                // Split on whitespace boundaries, accumulating chunks of at least
-                // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
-                let mut chunk = String::new();
+                // Semantic-boundary chunking: only flush after closed XML tags
+                // (`<...>`) or closed JSON objects/arrays. See
+                // `stream_buffer::StreamBoundaryBuffer` for the state machine.
+                let mut sbuf = StreamBoundaryBuffer::new();
+                let mut receiver_alive = true;
+                // Feed deltas roughly word-sized so progressive flushes still happen
+                // inside long plain-text runs.
                 for word in display_text.split_inclusive(char::is_whitespace) {
                     if cancellation_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
                         return Err(ToolLoopCancelled.into());
                     }
-                    chunk.push_str(word);
-                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS && tx.send(std::mem::take(&mut chunk)).await.is_err() {
+                    if let Some(chunk) = sbuf.push(word)
+                        && tx.send(chunk).await.is_err()
+                    {
+                        receiver_alive = false;
                         break; // receiver dropped
                     }
                 }
-                if !chunk.is_empty() {
-                    let _ = tx.send(chunk).await;
+                if receiver_alive && let Some(tail) = sbuf.flush_all() {
+                    let _ = tx.send(tail).await;
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
