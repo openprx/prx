@@ -620,15 +620,14 @@ pub async fn run(
     // the shared `chat_mirror` after the guard is in place but before the
     // unified render loop spawns. The legacy fallback path (no TUI) prints
     // the banner the old way.
-    let banner = if chat_session.turn_count() > 0 {
-        format!(
-            "PRX Chat — {provider_name}/{model_name} — session: {} ({} turns)\nType /help for commands, /quit to exit.",
-            chat_session.title,
-            chat_session.turn_count()
-        )
-    } else {
-        format!("PRX Chat — {provider_name}/{model_name}\nType /help for commands, /quit to exit.")
-    };
+    // Claude-Code style single-line minimal banner: `prx <version> · provider/model`.
+    // The previous multi-line "PRX Chat — ... \n Type /help for commands"
+    // hint has moved to the persistent footer instead. `chat_session` is no
+    // longer queried for the banner but stays in scope for downstream use.
+    let banner = format!(
+        "prx {} \u{00B7} {provider_name}/{model_name}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // ── Conversation history ─────────────────────────────────────
     let mut history = if config.skill_rag.enabled {
