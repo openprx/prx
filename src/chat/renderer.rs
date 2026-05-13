@@ -18,6 +18,19 @@ const DEFAULT_THEME: &str = "base16-ocean.dark";
 /// ANSI Select Graphic Rendition reset sequence.
 const ANSI_RESET: &str = "\x1b[0m";
 
+// --- Unified diff ANSI palette ------------------------------------------------
+// Pure foreground colors keep contrast high without the harshness of full-line
+// background fills; matches the rendering used by `codex` and most terminal
+// pagers (less +F, git --color=always).
+/// Bold cyan — hunk headers (`@@ -a,b +c,d @@`).
+const ANSI_DIFF_HUNK: &str = "\x1b[1;36m";
+/// Bold white — file header lines (`--- a/path`, `+++ b/path`, `diff --git ...`).
+const ANSI_DIFF_FILE_HEADER: &str = "\x1b[1;37m";
+/// Green — additions (`+` lines that are not the `+++` file header).
+const ANSI_DIFF_ADD: &str = "\x1b[32m";
+/// Red — deletions (`-` lines that are not the `---` file header).
+const ANSI_DIFF_DEL: &str = "\x1b[31m";
+
 /// Tracks whether the previously written segment terminates the ANSI graphic state.
 ///
 /// `ends_with_reset == true` means a `\x1b[0m` is the last effective ANSI code in
@@ -123,6 +136,213 @@ pub fn highlight_code_block(code: &str, language: Option<&str>) -> String {
     output
 }
 
+/// Returns `true` when the given language tag denotes a unified-diff payload.
+///
+/// We accept the canonical `diff`, the broader `patch` (used by `git
+/// format-patch`-style fences), and the explicit `unified-diff` synonym. Case
+/// is normalised because LLMs frequently emit `Diff` or `DIFF`.
+fn is_diff_language(lang: &str) -> bool {
+    matches!(
+        lang.to_ascii_lowercase().as_str(),
+        "diff" | "patch" | "unified-diff" | "udiff"
+    )
+}
+
+/// Returns `true` when the line is a unified-diff hunk header:
+/// `@@ -<n>[,<m>] +<n>[,<m>] @@[ optional context]`.
+///
+/// Matched without regex to avoid pulling a dependency for a single shape:
+/// the prefix `@@ -` followed by digits, optional `,digits`, ` +`, digits,
+/// optional `,digits`, then ` @@`. Anything after `@@` (function context) is
+/// allowed.
+fn is_hunk_header(line: &str) -> bool {
+    let rest = match line.strip_prefix("@@ -") {
+        Some(r) => r,
+        None => return false,
+    };
+    // Parse first number
+    let (consumed, rest) = take_digits(rest);
+    if consumed == 0 {
+        return false;
+    }
+    // Optional ,digits
+    let rest = if let Some(r) = rest.strip_prefix(',') {
+        let (n, r) = take_digits(r);
+        if n == 0 {
+            return false;
+        }
+        r
+    } else {
+        rest
+    };
+    let rest = match rest.strip_prefix(" +") {
+        Some(r) => r,
+        None => return false,
+    };
+    let (consumed, rest) = take_digits(rest);
+    if consumed == 0 {
+        return false;
+    }
+    let rest = if let Some(r) = rest.strip_prefix(',') {
+        let (n, r) = take_digits(r);
+        if n == 0 {
+            return false;
+        }
+        r
+    } else {
+        rest
+    };
+    rest.starts_with(" @@")
+}
+
+/// Helper for [`is_hunk_header`]: returns the count of leading ASCII digits and
+/// the remainder of the input.
+fn take_digits(s: &str) -> (usize, &str) {
+    let end = s.bytes().take_while(u8::is_ascii_digit).count();
+    (end, &s[end..])
+}
+
+/// Heuristically detect whether a buffer of text is a unified diff.
+///
+/// Triggers when ANY of:
+/// - the explicit language tag is one of [`is_diff_language`]
+/// - the first non-empty line starts with `diff --git ` or `--- ` (file header)
+/// - the buffer contains at least one [`is_hunk_header`]
+///
+/// We intentionally do NOT trigger on the mere presence of `+`/`-` prefixes:
+/// regular markdown lists (`- item`, `+ item`) would falsely match.
+fn is_diff_block(buffer: &str, language: Option<&str>) -> bool {
+    if let Some(lang) = language
+        && is_diff_language(lang)
+    {
+        return true;
+    }
+    let mut saw_hunk = false;
+    let mut first_nonempty: Option<&str> = None;
+    for line in buffer.lines() {
+        if first_nonempty.is_none() && !line.is_empty() {
+            first_nonempty = Some(line);
+        }
+        if is_hunk_header(line) {
+            saw_hunk = true;
+            break;
+        }
+    }
+    if saw_hunk {
+        return true;
+    }
+    match first_nonempty {
+        Some(l) if l.starts_with("diff --git ") || l.starts_with("--- a/") || l.starts_with("--- /") => true,
+        _ => false,
+    }
+}
+
+/// Render a unified diff with per-line ANSI colouring.
+///
+/// Colour rules (foreground only; backgrounds reserved for selection in the
+/// host terminal):
+/// - `@@ ... @@` hunk headers — bold cyan
+/// - `--- ` / `+++ ` / `diff --git ` file headers — bold white
+/// - `+` additions (not `+++`) — green
+/// - `-` deletions (not `---`) — red
+/// - context and anything else — default terminal colour (no SGR emitted)
+///
+/// Each coloured line is closed with [`ANSI_RESET`] so the trailing newline
+/// renders in the default style. Lines without any SGR are emitted verbatim so
+/// callers tracking [`AnsiState`] see clean transitions.
+pub fn render_diff_block(diff: &str) -> String {
+    let mut out = String::with_capacity(diff.len() + 64);
+    let mut state = AnsiState::default();
+
+    for line in LinesWithEndings::from(diff) {
+        // Split the line into content + trailing newline(s) so the reset is
+        // emitted INSIDE the visible line (before \n), not after — otherwise
+        // the newline itself can be coloured on some terminals.
+        let (content, eol) = split_eol(line);
+        let prefix = classify_diff_line(content);
+        match prefix {
+            DiffLineKind::Hunk => {
+                state.push(&mut out, ANSI_DIFF_HUNK);
+                state.push(&mut out, content);
+                state.push_reset_if_needed(&mut out);
+            }
+            DiffLineKind::FileHeader => {
+                state.push(&mut out, ANSI_DIFF_FILE_HEADER);
+                state.push(&mut out, content);
+                state.push_reset_if_needed(&mut out);
+            }
+            DiffLineKind::Add => {
+                state.push(&mut out, ANSI_DIFF_ADD);
+                state.push(&mut out, content);
+                state.push_reset_if_needed(&mut out);
+            }
+            DiffLineKind::Del => {
+                state.push(&mut out, ANSI_DIFF_DEL);
+                state.push(&mut out, content);
+                state.push_reset_if_needed(&mut out);
+            }
+            DiffLineKind::Context => {
+                // Plain text — no SGR, AnsiState stays in whatever reset
+                // state it was previously in.
+                state.push(&mut out, content);
+            }
+        }
+        if !eol.is_empty() {
+            state.push(&mut out, eol);
+        }
+    }
+    // Belt-and-suspenders: callers stitch our output back into a larger buffer
+    // via the shared AnsiState, so leaving a non-reset trailing state would
+    // leak colour. push_reset_if_needed is a no-op when already reset.
+    state.push_reset_if_needed(&mut out);
+    out
+}
+
+/// Classification of a single line in a unified diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLineKind {
+    Hunk,
+    FileHeader,
+    Add,
+    Del,
+    Context,
+}
+
+/// Categorise `line` (content only, no trailing EOL) into a [`DiffLineKind`].
+///
+/// Order matters: the `+++` / `---` file headers must be checked BEFORE the
+/// generic `+` / `-` add/delete prefixes, otherwise the file-name lines would
+/// render as additions/deletions.
+fn classify_diff_line(line: &str) -> DiffLineKind {
+    if is_hunk_header(line) {
+        return DiffLineKind::Hunk;
+    }
+    if line.starts_with("+++ ") || line.starts_with("--- ") || line.starts_with("diff --git ") {
+        return DiffLineKind::FileHeader;
+    }
+    // Order: check the two-char `+++`/`---` first via the FileHeader branch
+    // above; here a leading `+`/`-` is an add/delete.
+    if let Some(b) = line.as_bytes().first() {
+        match b {
+            b'+' => return DiffLineKind::Add,
+            b'-' => return DiffLineKind::Del,
+            _ => {}
+        }
+    }
+    DiffLineKind::Context
+}
+
+/// Split `line` into `(content, eol)` where `eol` is `\n`, `\r\n`, or empty.
+fn split_eol(line: &str) -> (&str, &str) {
+    if let Some(stripped) = line.strip_suffix("\r\n") {
+        (stripped, "\r\n")
+    } else if let Some(stripped) = line.strip_suffix('\n') {
+        (stripped, "\n")
+    } else {
+        (line, "")
+    }
+}
+
 /// Render markdown text with code block highlighting.
 ///
 /// Detects fenced code blocks (``` or ~~~), highlights them, and returns
@@ -189,7 +409,15 @@ pub fn render_markdown_with_highlighting(text: &str) -> String {
 /// is never colored by the previous SGR; conversely, when already reset we
 /// skip the redundant code.
 fn emit_highlighted_block(result: &mut String, state: &mut AnsiState, code: &str, language: Option<&str>) {
-    let highlighted = highlight_code_block(code, language);
+    // Unified diff blocks bypass syntect (its `diff` syntax does highlight,
+    // but on a dark base16 theme `+`/`-` end up in muted shades). We use a
+    // dedicated line-level renderer that matches the convention used by
+    // `git diff --color` and codex.
+    let highlighted = if is_diff_block(code, language) {
+        render_diff_block(code)
+    } else {
+        highlight_code_block(code, language)
+    };
     for hl_line in highlighted.lines() {
         // Border prefix must render in the default terminal style — emit a
         // reset only when we're currently inside an SGR run.
@@ -485,5 +713,235 @@ mod tests {
         assert!(contains_sgr_after_last_reset("\x1b[31mred"));
         assert!(contains_sgr_after_last_reset("\x1b[0m\x1b[31m"));
         assert!(!contains_sgr_after_last_reset("plain text"));
+    }
+
+    // ---------------------------------------------------------------
+    // P2-9 Unified diff renderer tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn hunk_header_recognised() {
+        assert!(is_hunk_header("@@ -1,4 +1,5 @@"));
+        assert!(is_hunk_header("@@ -10 +12 @@"));
+        assert!(is_hunk_header("@@ -1,4 +1,5 @@ fn main() {"));
+        assert!(!is_hunk_header("@@ broken"));
+        assert!(!is_hunk_header("@ -1 +1 @"));
+        assert!(!is_hunk_header(""));
+        assert!(!is_hunk_header("plain @@ text"));
+    }
+
+    #[test]
+    fn diff_language_alias_detection() {
+        assert!(is_diff_language("diff"));
+        assert!(is_diff_language("DIFF"));
+        assert!(is_diff_language("Patch"));
+        assert!(is_diff_language("unified-diff"));
+        assert!(is_diff_language("udiff"));
+        assert!(!is_diff_language("rust"));
+        assert!(!is_diff_language(""));
+    }
+
+    #[test]
+    fn is_diff_block_triggers_on_lang_tag() {
+        let buf = "no hunks here\njust text";
+        assert!(is_diff_block(buf, Some("diff")));
+        assert!(is_diff_block(buf, Some("patch")));
+    }
+
+    #[test]
+    fn is_diff_block_triggers_on_hunk_header() {
+        let buf = "some context\n@@ -1,2 +1,3 @@\n+added\n";
+        assert!(is_diff_block(buf, None));
+    }
+
+    #[test]
+    fn is_diff_block_triggers_on_file_header() {
+        assert!(is_diff_block("--- a/foo.rs\n+++ b/foo.rs\n", None));
+        assert!(is_diff_block("diff --git a/x b/x\n", None));
+    }
+
+    #[test]
+    fn is_diff_block_rejects_plain_text_with_dashes() {
+        // Markdown list items must NOT be confused with diff lines.
+        let buf = "- item one\n- item two\n+ another";
+        assert!(!is_diff_block(buf, None));
+        assert!(!is_diff_block(buf, Some("markdown")));
+    }
+
+    #[test]
+    fn render_diff_block_colours_each_line_kind() {
+        let diff = "\
+--- a/foo.rs
++++ b/foo.rs
+@@ -1,3 +1,4 @@
+ context line
+-old line
++new line
+";
+        let out = render_diff_block(diff);
+        // Hunk header colour
+        assert!(out.contains(ANSI_DIFF_HUNK), "hunk header should be cyan");
+        assert!(out.contains("@@ -1,3 +1,4 @@"));
+        // File header colour
+        assert!(out.contains(ANSI_DIFF_FILE_HEADER), "file headers should be bold white");
+        // Add / Del colours
+        assert!(out.contains(ANSI_DIFF_ADD), "+ lines should be green");
+        assert!(out.contains(ANSI_DIFF_DEL), "- lines should be red");
+        // Context line stays uncoloured: no SGR introducer touches it.
+        // We verify by checking the substring " context line\n" appears
+        // directly (the leading space is the context marker).
+        assert!(out.contains(" context line"));
+        // Output must end cleanly (no dangling colour).
+        assert!(
+            out.ends_with(ANSI_RESET) || !out.contains(ANSI_DIFF_ADD) || {
+                // The last non-empty colour run must be followed by a reset.
+                let trimmed = out.trim_end_matches('\n');
+                trimmed.ends_with(ANSI_RESET)
+            }
+        );
+    }
+
+    #[test]
+    fn render_diff_block_file_header_takes_precedence_over_minus() {
+        let diff = "--- a/file.rs\n-deleted\n";
+        let out = render_diff_block(diff);
+        // The `--- a/...` line must be coloured as a file header (bold white),
+        // not as a deletion (red).
+        let header_pos = out.find("--- a/file.rs").expect("file header text must appear");
+        // Look backwards from header_pos for the most recent ANSI sequence.
+        let prefix = &out[..header_pos];
+        let last_sgr_start = prefix.rfind("\x1b[").expect("colour applied to header");
+        let last_sgr = &prefix[last_sgr_start..];
+        assert!(
+            last_sgr.starts_with(ANSI_DIFF_FILE_HEADER),
+            "file header should use bold-white SGR, got {last_sgr:?}"
+        );
+    }
+
+    #[test]
+    fn render_diff_block_empty_input_no_panic() {
+        let out = render_diff_block("");
+        // Mirrors `highlight_code_block("")`: the trailing reset is emitted by
+        // `AnsiState::push_reset_if_needed` because the default state is
+        // "needs reset". Acceptable values are `""` or a single bare reset.
+        assert!(out.is_empty() || out == ANSI_RESET);
+        // Critically: must not panic and must not contain colour codes.
+        assert!(!out.contains(ANSI_DIFF_ADD));
+        assert!(!out.contains(ANSI_DIFF_DEL));
+        assert!(!out.contains(ANSI_DIFF_HUNK));
+    }
+
+    #[test]
+    fn render_diff_block_handles_crlf_line_endings() {
+        let diff = "@@ -1 +1 @@\r\n+added\r\n";
+        let out = render_diff_block(diff);
+        assert!(out.contains("@@ -1 +1 @@"));
+        assert!(out.contains("+added"));
+        // CRLF preserved
+        assert!(out.contains("\r\n"));
+    }
+
+    #[test]
+    fn markdown_fenced_diff_block_uses_diff_renderer() {
+        // The `diff` language tag must route to render_diff_block, NOT syntect.
+        // syntect's diff syntax produces different SGR codes (24-bit base16
+        // theme), whereas our renderer uses the basic palette `\x1b[1;36m`
+        // etc. Presence of `\x1b[1;36m` (hunk header bold cyan) confirms the
+        // dispatch.
+        let md = "before\n```diff\n@@ -1 +1 @@\n+new\n-old\n```\nafter";
+        let out = render_markdown_with_highlighting(md);
+        assert!(out.contains(ANSI_DIFF_HUNK), "diff renderer should colour hunk header");
+        assert!(out.contains(ANSI_DIFF_ADD));
+        assert!(out.contains(ANSI_DIFF_DEL));
+    }
+
+    #[test]
+    fn fenced_block_without_diff_lang_and_no_hunks_does_not_route_to_diff() {
+        // A markdown list inside a fenced block should NOT be mis-detected as
+        // a diff just because it has `-` prefixes.
+        let md = "```\n- item\n+ plus\n```";
+        let out = render_markdown_with_highlighting(md);
+        // None of the diff-specific colours should appear.
+        assert!(!out.contains(ANSI_DIFF_ADD));
+        assert!(!out.contains(ANSI_DIFF_DEL));
+        assert!(!out.contains(ANSI_DIFF_HUNK));
+    }
+
+    #[test]
+    fn fenced_block_with_hunk_header_auto_detected_even_without_lang() {
+        let md = "```\n@@ -1,2 +1,3 @@\n+x\n-y\n```";
+        let out = render_markdown_with_highlighting(md);
+        assert!(out.contains(ANSI_DIFF_HUNK));
+        assert!(out.contains(ANSI_DIFF_ADD));
+        assert!(out.contains(ANSI_DIFF_DEL));
+    }
+
+    #[test]
+    fn adjacent_diff_blocks_share_reset() {
+        // Two consecutive diff fences must not produce \x1b[0m\x1b[0m at the
+        // junction — the AnsiState shared with the surrounding pipeline
+        // suppresses redundant resets.
+        let md = "```diff\n@@ -1 +1 @@\n+a\n```\n```diff\n@@ -1 +1 @@\n+b\n```";
+        let out = render_markdown_with_highlighting(md);
+        assert!(
+            !out.contains("\x1b[0m\x1b[0m"),
+            "redundant double-reset between diff blocks: {out:?}"
+        );
+    }
+
+    #[test]
+    fn diff_block_followed_by_plain_text_no_redundant_reset() {
+        // A diff block borders should still leave terminal in clean state and
+        // not insert a stray reset into the plain text after.
+        let md = "```diff\n@@ -1 +1 @@\n+x\n```\nplain trailing line";
+        let out = render_markdown_with_highlighting(md);
+        assert!(!out.contains("\x1b[0m\x1b[0m"));
+        assert!(out.contains("plain trailing line"));
+        // The plain text region should not be preceded by a colour escape.
+        let plain_idx = out.find("plain trailing line").expect("plain text present");
+        let before = &out[..plain_idx];
+        // The character immediately before "plain..." should be '\n', not 'm'
+        // (which would indicate an SGR code right before).
+        let prev_char = before.chars().next_back();
+        assert!(
+            matches!(prev_char, Some('\n')),
+            "plain text should follow a newline cleanly, got {prev_char:?}"
+        );
+    }
+
+    #[test]
+    fn diff_context_line_has_no_ansi_codes() {
+        // The " context" line (leading space) must be emitted verbatim with
+        // no SGR colouring around it. A trailing bare reset is acceptable
+        // (mirrors `highlight_code_block` behaviour for the empty/no-SGR
+        // case — the default `AnsiState` is "needs reset").
+        let diff = " context only line\n";
+        let out = render_diff_block(diff);
+        assert!(out.starts_with(" context only line\n"));
+        // No diff-specific colours leaked into a context line.
+        assert!(!out.contains(ANSI_DIFF_ADD));
+        assert!(!out.contains(ANSI_DIFF_DEL));
+        assert!(!out.contains(ANSI_DIFF_HUNK));
+        assert!(!out.contains(ANSI_DIFF_FILE_HEADER));
+    }
+
+    #[test]
+    fn classify_diff_line_ordering() {
+        assert_eq!(classify_diff_line("@@ -1 +1 @@"), DiffLineKind::Hunk);
+        assert_eq!(classify_diff_line("--- a/foo"), DiffLineKind::FileHeader);
+        assert_eq!(classify_diff_line("+++ b/foo"), DiffLineKind::FileHeader);
+        assert_eq!(classify_diff_line("diff --git a/x b/x"), DiffLineKind::FileHeader);
+        assert_eq!(classify_diff_line("+added"), DiffLineKind::Add);
+        assert_eq!(classify_diff_line("-deleted"), DiffLineKind::Del);
+        assert_eq!(classify_diff_line(" context"), DiffLineKind::Context);
+        assert_eq!(classify_diff_line(""), DiffLineKind::Context);
+    }
+
+    #[test]
+    fn split_eol_variants() {
+        assert_eq!(split_eol("abc\n"), ("abc", "\n"));
+        assert_eq!(split_eol("abc\r\n"), ("abc", "\r\n"));
+        assert_eq!(split_eol("abc"), ("abc", ""));
+        assert_eq!(split_eol(""), ("", ""));
     }
 }
