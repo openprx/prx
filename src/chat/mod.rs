@@ -388,7 +388,13 @@ pub async fn run(
     #[cfg(feature = "terminal-tui")]
     {
         use std::io::IsTerminal as _;
-        if std::io::stdin().is_terminal() {
+        // TUI mode is opt-in via PRX_TUI=1 until the ratatui rendering loop is
+        // wired up. The current spawn_tui_input_task only enables raw mode
+        // without an alternate screen or a frame draw loop, so terminal output
+        // collides with tracing and the user's keystrokes are not echoed.
+        // See P3 for the full renderer integration.
+        let tui_enabled = std::env::var("PRX_TUI").as_deref() == Ok("1") && std::io::stdin().is_terminal();
+        if tui_enabled {
             let mirror_for_input: Arc<parking_lot::Mutex<tui::TuiState>> =
                 Arc::new(parking_lot::Mutex::new(tui::TuiState::new(provider_name, model_name)));
             spawn_tui_input_task(
@@ -399,7 +405,8 @@ pub async fn run(
                 Arc::clone(&active_cancel),
             );
         } else {
-            // Non-TTY (pipe / heredoc) — keep the BufRead fallback path.
+            // Default path (TTY without PRX_TUI=1, or pipe/heredoc) — keep the
+            // legacy reedline + BufRead fallback via TerminalChannel.
             let terminal_for_listen = TerminalChannel::new(plain_mode);
             tokio::spawn(async move {
                 if let Err(e) = terminal_for_listen.listen(input_tx).await {
