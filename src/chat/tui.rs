@@ -922,6 +922,44 @@ impl TuiState {
     }
 }
 
+// ── P3-4: TuiMirrorSink adapter ─────────────────────────────────────────────
+
+/// Adapter that lets a shared `Arc<Mutex<TuiState>>` be plugged into the
+/// channel-side `UiActor` as a [`TuiMirrorSink`].
+///
+/// `channels::terminal` lives in the library crate and cannot name
+/// `TuiState` directly — see the trait doc for the seam design. This adapter
+/// is the binary-side glue: each trait method maps onto the corresponding
+/// `TuiState` mutator behind the existing parking_lot mutex. No new
+/// `ConversationLine` variant is introduced, so the renderer's existing
+/// view layer is untouched.
+pub struct TuiStateMirrorSink {
+    state: std::sync::Arc<Mutex<TuiState>>,
+}
+
+impl TuiStateMirrorSink {
+    pub const fn new(state: std::sync::Arc<Mutex<TuiState>>) -> Self {
+        Self { state }
+    }
+}
+
+impl crate::channels::terminal::TuiMirrorSink for TuiStateMirrorSink {
+    fn push_assistant(&self, content: &str) {
+        self.state.lock().push_assistant_message(content);
+    }
+    fn push_system(&self, content: &str) {
+        self.state.lock().push_system_message(content);
+    }
+    fn push_tool_started(&self, tool_name: &str, args_full: &str) {
+        self.state.lock().push_tool_result_started(tool_name, args_full);
+    }
+    fn mark_tool_finished(&self, tool_name: &str, success: bool, duration_ms: u64) -> bool {
+        self.state
+            .lock()
+            .mark_last_tool_result_finished(tool_name, success, duration_ms, None)
+    }
+}
+
 /// Estimate the number of terminal rows a single `ConversationLine` will
 /// occupy in the output area. Always >= 1.
 fn estimate_line_height(line: &ConversationLine) -> usize {

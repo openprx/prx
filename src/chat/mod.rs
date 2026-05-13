@@ -686,6 +686,14 @@ pub async fn run(
                     let (redraw_tx, redraw_rx) = mpsc::channel::<()>(1);
                     let _render_handle = spawn_render_task(Arc::clone(&chat_mirror), redraw_rx, shutdown.clone());
                     spawn_redraw_tick_task(redraw_tx.clone(), shutdown.clone());
+                    // P3-4: route every UiActor event into the shared TUI
+                    // mirror + ratatui redraw signal instead of writing to
+                    // stdout (which would tear the draw loop set up above).
+                    // Must run BEFORE any `UiEvent` is sent — the existing
+                    // `terminal` Arc is still pristine here (no draft/send
+                    // call has happened yet).
+                    let sink = Box::new(tui::TuiStateMirrorSink::new(Arc::clone(&chat_mirror)));
+                    terminal.with_tui_mirror(sink, redraw_tx.clone()).await;
                     spawn_tui_input_task(
                         input_tx,
                         Arc::clone(&chat_mirror),
@@ -1296,6 +1304,15 @@ pub async fn run(
     }
 
     // ── Graceful teardown: restore terminal state ────────────────
+    //
+    // On the TUI path (`terminal-tui` feature + `PRX_TUI=1`), terminal
+    // state is owned by `TerminalGuard` (entered above, dropped at end
+    // of scope) — the calls below are then redundant but idempotent
+    // and harmless. On the legacy reedline / non-TUI path no guard was
+    // ever created, so this is the only place that restores terminal
+    // state in case reedline or any helper left it dirty. Kept here as
+    // belt-and-braces defence; do not remove without also auditing
+    // every non-TUI exit path.
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(
         std::io::stderr(),
@@ -1525,7 +1542,26 @@ fn run_tui_input_loop(
             continue;
         }
         let ev = crossterm::event::read()?;
-        let Event::Key(key) = ev else { continue };
+        let key = match ev {
+            Event::Key(k) => k,
+            Event::Resize(_w, _h) => {
+                // P3-6: crossterm forwards terminal resize through the OS
+                // (the next ratatui `frame.area()` already reflects the new
+                // size). All we have to do is nudge the render task so the
+                // visible state catches up immediately instead of waiting
+                // for the next periodic redraw tick. `TuiState::viewport_height`
+                // is recomputed inside `tui::render` on every frame, so no
+                // mirror mutation is required here.
+                //
+                // Coalesce-style: try_send into a cap=1 channel — if a redraw
+                // is already pending, drop silently (`Full`); if the receiver
+                // is gone, the render task has exited (`Closed`), which is
+                // the normal shutdown path.
+                let _ = redraw_tx.try_send(());
+                continue;
+            }
+            _ => continue,
+        };
         // Skip key-release events: on terminals with KeyboardEnhancement
         // flags enabled (Kitty et al.), a single physical press fires both
         // Press and Release. Only Press / Repeat are authoritative input.
@@ -2004,6 +2040,40 @@ mod terminal_guard_tests {
         // Calling twice in a row must also be safe (idempotent at the
         // crossterm level — both calls swallow errors).
         restore_terminal_state();
+    }
+
+    /// P3-6: the Resize branch in `run_tui_input_loop` only does
+    /// `redraw_tx.try_send(()).ok();`. This test pins the coalescing
+    /// contract of the cap=1 channel: multiple sends in a row must not
+    /// block, they collapse into a single pending wakeup, and the receive
+    /// side observes exactly one redraw signal until the next try_send
+    /// after the recv. If this contract ever changes, the Resize handler
+    /// would silently start blocking the input loop — the test fails
+    /// loudly instead.
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn resize_redraw_signal_coalesces() {
+        use tokio::sync::mpsc;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: runtime builds");
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel::<()>(1);
+            // Burst of resize-equivalent signals: first one fills the
+            // buffer, the rest must fail with Full (non-blocking, no
+            // panic). This mirrors a user dragging the window border.
+            for _ in 0..16 {
+                let _ = tx.try_send(());
+            }
+            // Exactly one wakeup observable.
+            rx.recv().await.expect("test: receives first wakeup");
+            // Channel must be drained now.
+            assert!(rx.try_recv().is_err(), "expected coalescing to drain to one signal");
+            // After drain, the channel must accept a fresh send again.
+            tx.try_send(()).expect("test: send after drain succeeds");
+            rx.recv().await.expect("test: receives second wakeup");
+        });
     }
 
     #[test]
