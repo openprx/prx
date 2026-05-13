@@ -1263,7 +1263,18 @@ pub fn bottom_chrome_height(state: &TuiState) -> u16 {
 ///   3. Input box (dynamic, border + 1..=[`INPUT_MAX_VISIBLE_ROWS`])
 ///   4. Footer (1 row)
 pub fn render_bottom_chrome(frame: &mut Frame, state: &TuiState) {
-    let area = frame.area();
+    // The inline viewport reserves `BOTTOM_CHROME_MAX_HEIGHT` rows at the
+    // bottom of the host terminal. The dynamic chrome height is usually
+    // smaller, so align it to the bottom of the reserved frame so the
+    // input box always sits flush with the user's prompt line, with any
+    // unused rows blank above the status bar.
+    let frame_area = frame.area();
+    let height = bottom_chrome_height(state).min(frame_area.height);
+    let area = Rect {
+        y: frame_area.bottom().saturating_sub(height),
+        height,
+        ..frame_area
+    };
 
     let visible_input_rows = state.input.lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);

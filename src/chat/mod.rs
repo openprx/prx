@@ -1556,12 +1556,14 @@ fn run_tui_unified_loop(
     let stdout = std::io::stdout();
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
 
-    // Initial inline viewport height — sized for an idle state (status +
-    // 1-row input box + footer + small margin). The loop calls
-    // `terminal.draw` every iteration with the *current* required
-    // height; ratatui re-lays-out automatically. We start small so the
-    // banner appears just above the prompt rather than four rows up.
-    let initial_height = tui::bottom_chrome_height(&mirror.lock());
+    // Inline viewport height is fixed at creation time — ratatui does not
+    // support dynamically resizing an `Inline` viewport (see ratatui
+    // issue #984; `terminal.resize(Rect)` performs a full clear + viewport
+    // recompute and was the cause of the "blank chrome on entry" bug).
+    // We allocate the maximum possible chrome height up front and let
+    // `render_bottom_chrome` align the actual chrome to the bottom of the
+    // reserved area when the dynamic height is smaller.
+    let initial_height = tui::BOTTOM_CHROME_MAX_HEIGHT;
     let mut terminal = ratatui::Terminal::with_options(
         backend,
         TerminalOptions {
@@ -1569,6 +1571,13 @@ fn run_tui_unified_loop(
         },
     )
     .map_err(|e| anyhow::anyhow!("ratatui Terminal::with_options failed: {e}"))?;
+
+    // Materialise the inline viewport immediately so the chrome (status
+    // bar + input box + footer) is visible the moment the session opens,
+    // rather than only after the first event-loop iteration draws.
+    terminal
+        .draw(|f| tui::render_bottom_chrome(f, &mirror.lock()))
+        .map_err(|e| anyhow::anyhow!("initial TUI draw failed: {e}"))?;
 
     // Number of `conversation_lines` already flushed to the host
     // scrollback via `insert_before`. New entries appear at indices
@@ -1615,25 +1624,20 @@ fn run_tui_unified_loop(
         }
         last_pushed_idx = last_pushed_idx.saturating_add(pending_count);
 
-        // ── 2. Resize the inline viewport if the input box or streaming
-        // preview changed required height ──────────────────────────────
-        let desired_height = tui::bottom_chrome_height(&mirror.lock());
-        if let Err(e) = terminal.resize(ratatui::layout::Rect {
-            x: 0,
-            y: 0,
-            width: term_width,
-            height: desired_height,
-        }) {
-            tracing::trace!(error = %e, "terminal.resize (inline viewport) failed; continuing");
-        }
-
-        // ── 3. Drain coalesced redraw wakeups, then redraw the chrome ─
+        // ── 2. Drain coalesced redraw wakeups, then redraw the chrome ─
+        // Inline-viewport height is fixed at construction time
+        // (`BOTTOM_CHROME_MAX_HEIGHT`); calling `terminal.resize` here
+        // would trigger a full clear every iteration (ratatui issue
+        // #984), which is the bug that this rewrite removes.
+        // `render_bottom_chrome` aligns the actual chrome to the bottom
+        // of the reserved frame area, so unused rows above stay blank
+        // without disturbing scrollback.
         while redraw_rx.try_recv().is_ok() {}
         if let Err(e) = terminal.draw(|f| tui::render_bottom_chrome(f, &mirror.lock())) {
             tracing::warn!(error = %e, "TUI draw failed");
         }
 
-        // ── 4. Wait for the next input event, with a 50 ms floor ──────
+        // ── 3. Wait for the next input event, with a 50 ms floor ──────
         if !crossterm::event::poll(poll)? {
             continue;
         }
