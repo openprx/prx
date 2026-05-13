@@ -2884,4 +2884,70 @@ mod tests {
         }
         assert_eq!(submitted, Some("Hello".to_string()));
     }
+
+    // ── P3 chat TUI rearch tests (2026-05-13) ────────────────────────────
+    //
+    // These pin the contract relied on by the new unified TUI loop in
+    // `chat/mod.rs::run_tui_unified_loop`:
+    //   1. `TuiInput::paste` splits multi-line text into the `lines` Vec
+    //      and lands the cursor at the end of the last pasted row.
+    //   2. `push_system_message` appends a `ConversationLine::System` —
+    //      banner + slash-command output go through this on the TUI path.
+    //   3. `dispatch_global_key` accepts CJK characters via plain
+    //      `KeyCode::Char(_)` (bracketed-paste decodes them, but unicode
+    //      chars also flow through as KeyEvents on graphical terminals).
+
+    #[test]
+    fn paste_with_newline_splits_into_rows_and_lands_cursor_at_end() {
+        let mut input = TuiInput::new();
+        input.paste("hello\nworld");
+        assert_eq!(input.lines, vec!["hello".to_string(), "world".to_string()]);
+        // Cursor lands at the end of the last pasted row.
+        assert_eq!(input.cursor, (1, "world".len()));
+    }
+
+    #[test]
+    fn paste_into_existing_buffer_preserves_suffix() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "abXY");
+        // Move cursor between 'b' and 'X'.
+        input.handle_key(key(KeyCode::Left));
+        input.handle_key(key(KeyCode::Left));
+        assert_eq!(input.cursor, (0, 2));
+        input.paste("1\n2");
+        // After paste: row 0 = "ab1", row 1 = "2XY" (suffix moved down).
+        assert_eq!(input.lines, vec!["ab1".to_string(), "2XY".to_string()]);
+        // Cursor lands after "2", before "XY".
+        assert_eq!(input.cursor, (1, 1));
+    }
+
+    #[test]
+    fn push_system_message_appends_system_conversation_line() {
+        let mut state = TuiState::new("p", "m");
+        state.push_system_message("test banner");
+        let last = state
+            .conversation_lines
+            .last()
+            .expect("test: conversation_lines non-empty after push_system_message");
+        match last {
+            ConversationLine::System { content } => assert_eq!(content, "test banner"),
+            other => panic!("test: expected ConversationLine::System, got {other:?}"),
+        }
+        // Pushing system messages must not bump the *user* turn counter
+        // (that drives the status-bar "N turns" display).
+        assert_eq!(state.turn_count, 0);
+    }
+
+    #[test]
+    fn dispatch_cjk_character_lands_in_input_buffer() {
+        // Bracketed paste handles long IME commits, but graphical
+        // terminals also deliver single CJK chars as `KeyCode::Char(_)`
+        // KeyEvents. Verify the dispatcher does not swallow them.
+        let mut state = TuiState::new("p", "m");
+        for ch in "你好".chars() {
+            let out = dispatch_global_key(key(KeyCode::Char(ch)), &mut state);
+            assert_eq!(out, KeyDispatch::Consumed);
+        }
+        assert_eq!(state.input.text(), "你好");
+    }
 }
