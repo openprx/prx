@@ -37,21 +37,76 @@ pub struct TuiState {
     pub input_text: String,
     /// Viewport height for the output area (updated on render)
     pub viewport_height: u16,
+    /// Render ASCII-only icons instead of unicode glyphs (for non-UTF-8 terms).
+    pub ascii_fallback: bool,
+}
+
+/// Maximum width (in chars) for the args preview shown in folded tool cards.
+///
+/// Anything longer is truncated and ends with [`ARGS_PREVIEW_ELLIPSIS`]. The
+/// full text is preserved separately in [`ConversationLine::ToolResult::args_full`].
+pub const ARGS_PREVIEW_MAX_CHARS: usize = 80;
+
+/// Ellipsis appended to a truncated args preview. Single-char so we don't
+/// have to think about grapheme widths on the terminal.
+pub const ARGS_PREVIEW_ELLIPSIS: &str = "…";
+
+/// ASCII fallback for the ellipsis when the terminal is in non-UTF-8 mode.
+pub const ARGS_PREVIEW_ELLIPSIS_ASCII: &str = "...";
+
+/// Status of a tool call card.
+///
+/// `Running` means the tool was invoked but no result has been received yet;
+/// `Done` and `Error` are terminal states carrying the result string and a
+/// completion duration. The card is always rendered with the same shape — only
+/// the status icon and the trailing badge change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStatus {
+    Running,
+    Done,
+    Error,
 }
 
 /// A single line in the conversation display.
+///
+/// Variants other than [`ConversationLine::ToolResult`] correspond to plain
+/// text bubbles (user / assistant / system) and a legacy short tool-call
+/// indicator. `ToolResult` is the rich, foldable tool-invocation card
+/// introduced by P2-7.
 #[derive(Clone, Debug)]
-pub struct ConversationLine {
-    pub role: ConversationRole,
-    pub content: String,
+pub enum ConversationLine {
+    /// User-sent message.
+    User { content: String },
+    /// Assistant response (final, post-streaming).
+    Assistant { content: String },
+    /// System / status message (dimmed in render).
+    System { content: String },
+    /// Legacy single-line tool indicator (kept for back-compat with
+    /// [`TuiState::push_tool_call`]; new code should prefer `ToolResult`).
+    Tool { name: String, success: bool },
+    /// Tool invocation card with args + result, default folded.
+    ///
+    /// `args_preview` is a short, single-line summary; `args_full` keeps the
+    /// raw JSON so the expanded view can show it verbatim. `result` is
+    /// `None` while the tool is still running and `Some(_)` once finished.
+    ToolResult {
+        tool_name: String,
+        args_preview: String,
+        args_full: String,
+        result: Option<String>,
+        status: ToolStatus,
+        elapsed_ms: Option<u64>,
+        folded: bool,
+    },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConversationRole {
-    User,
-    Assistant,
-    System,
-    Tool { name: String, success: bool },
+impl ConversationLine {
+    /// True if this line is a `ToolResult` variant. Used by [`TuiState`] to
+    /// locate the most recent tool card for `Tab` toggling without exposing
+    /// pattern-matching to callers.
+    pub const fn is_tool_result(&self) -> bool {
+        matches!(self, Self::ToolResult { .. })
+    }
 }
 
 impl TuiState {
@@ -65,13 +120,18 @@ impl TuiState {
             scroll_offset: 0,
             input_text: String::new(),
             viewport_height: 0,
+            ascii_fallback: false,
         }
+    }
+
+    /// Toggle ASCII fallback mode for icons (`▸/▾` → `>/v`, `…` → `...`).
+    pub const fn set_ascii_fallback(&mut self, on: bool) {
+        self.ascii_fallback = on;
     }
 
     /// Add a user message to the conversation display.
     pub fn push_user_message(&mut self, content: &str) {
-        self.conversation_lines.push(ConversationLine {
-            role: ConversationRole::User,
+        self.conversation_lines.push(ConversationLine::User {
             content: content.to_string(),
         });
         self.turn_count += 1;
@@ -80,22 +140,104 @@ impl TuiState {
 
     /// Add an assistant message to the conversation display.
     pub fn push_assistant_message(&mut self, content: &str) {
-        self.conversation_lines.push(ConversationLine {
-            role: ConversationRole::Assistant,
+        self.conversation_lines.push(ConversationLine::Assistant {
             content: content.to_string(),
         });
         self.scroll_to_bottom();
     }
 
-    /// Add a tool call indicator.
-    pub fn push_tool_call(&mut self, name: &str, success: bool) {
-        self.conversation_lines.push(ConversationLine {
-            role: ConversationRole::Tool {
-                name: name.to_string(),
-                success,
-            },
-            content: String::new(),
+    /// Add a system / status message.
+    pub fn push_system_message(&mut self, content: &str) {
+        self.conversation_lines.push(ConversationLine::System {
+            content: content.to_string(),
         });
+        self.scroll_to_bottom();
+    }
+
+    /// Add a legacy single-line tool call indicator.
+    pub fn push_tool_call(&mut self, name: &str, success: bool) {
+        self.conversation_lines.push(ConversationLine::Tool {
+            name: name.to_string(),
+            success,
+        });
+    }
+
+    /// Push a new `ToolResult` card in the `Running` state.
+    ///
+    /// `args_full` is preserved verbatim for the expanded view; a truncated
+    /// preview is derived via [`build_args_preview`]. The card is folded by
+    /// default — call [`Self::toggle_last_tool_result_folded`] to expand.
+    pub fn push_tool_result_started(&mut self, tool_name: &str, args_full: &str) {
+        let preview_ellipsis = if self.ascii_fallback {
+            ARGS_PREVIEW_ELLIPSIS_ASCII
+        } else {
+            ARGS_PREVIEW_ELLIPSIS
+        };
+        let args_preview = build_args_preview(args_full, ARGS_PREVIEW_MAX_CHARS, preview_ellipsis);
+        self.conversation_lines.push(ConversationLine::ToolResult {
+            tool_name: tool_name.to_string(),
+            args_preview,
+            args_full: args_full.to_string(),
+            result: None,
+            status: ToolStatus::Running,
+            elapsed_ms: None,
+            folded: true,
+        });
+        self.scroll_to_bottom();
+    }
+
+    /// Find the most recent `Running` tool card whose name matches and update
+    /// it with the terminal status (`Done` / `Error`), the elapsed time, and
+    /// an optional result. If no such card exists this is a no-op.
+    ///
+    /// Returns `true` if a card was updated.
+    pub fn mark_last_tool_result_finished(
+        &mut self,
+        tool_name: &str,
+        success: bool,
+        duration_ms: u64,
+        result: Option<String>,
+    ) -> bool {
+        for line in self.conversation_lines.iter_mut().rev() {
+            if let ConversationLine::ToolResult {
+                tool_name: name,
+                status,
+                elapsed_ms,
+                result: r,
+                ..
+            } = line
+                && *status == ToolStatus::Running
+                && name == tool_name
+            {
+                *status = if success { ToolStatus::Done } else { ToolStatus::Error };
+                *elapsed_ms = Some(duration_ms);
+                *r = result;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Toggle the folded state of the last `ToolResult` line (if any).
+    ///
+    /// Returns the new `folded` value, or `None` if no `ToolResult` exists.
+    /// This implements the simplified Tab key path (no per-line selection).
+    pub fn toggle_last_tool_result_folded(&mut self) -> Option<bool> {
+        for line in self.conversation_lines.iter_mut().rev() {
+            if let ConversationLine::ToolResult { folded, .. } = line {
+                *folded = !*folded;
+                return Some(*folded);
+            }
+        }
+        None
+    }
+
+    /// Index of the most recent `ToolResult` line, if any. Exposed for tests
+    /// and future per-line selection logic.
+    pub fn last_tool_result_index(&self) -> Option<usize> {
+        self.conversation_lines
+            .iter()
+            .rposition(ConversationLine::is_tool_result)
     }
 
     /// Scroll to the bottom of the conversation.
@@ -113,16 +255,53 @@ impl TuiState {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
-    /// Total content lines (estimated).
+    /// Total content lines (estimated). Used for scrollbar sizing.
     fn total_content_lines(&self) -> usize {
-        self.conversation_lines
-            .iter()
-            .map(|line| {
-                // Rough estimate: each line of content plus blank line between turns
-                line.content.lines().count().max(1) + 1
-            })
-            .sum()
+        self.conversation_lines.iter().map(estimate_line_height).sum()
     }
+}
+
+/// Estimate the number of terminal rows a single `ConversationLine` will
+/// occupy in the output area. Always >= 1.
+fn estimate_line_height(line: &ConversationLine) -> usize {
+    match line {
+        ConversationLine::User { content } | ConversationLine::Assistant { content } => {
+            // header + body lines + trailing blank
+            content.lines().count().max(1) + 2
+        }
+        ConversationLine::System { content } => content.lines().count().max(1) + 1,
+        ConversationLine::Tool { .. } => 1,
+        ConversationLine::ToolResult {
+            folded,
+            args_full,
+            result,
+            ..
+        } => {
+            if *folded {
+                1
+            } else {
+                // header + "args:" line + args body + "result:" line + result body
+                let args_h = args_full.lines().count().max(1);
+                let result_h = result.as_deref().map(|r| r.lines().count().max(1)).unwrap_or(0);
+                1 + 1 + args_h + if result_h > 0 { 1 + result_h } else { 0 }
+            }
+        }
+    }
+}
+
+/// Build a single-line preview of a raw args string, truncated to `max_chars`
+/// characters with the supplied ellipsis. Newlines are collapsed to spaces so
+/// the preview stays on one row.
+fn build_args_preview(raw: &str, max_chars: usize, ellipsis: &str) -> String {
+    // Collapse whitespace runs (incl. newlines) so the preview is single-line.
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Char-count truncation (avoids splitting multi-byte chars).
+    let char_count = collapsed.chars().count();
+    if char_count <= max_chars {
+        return collapsed;
+    }
+    let truncated: String = collapsed.chars().take(max_chars).collect();
+    format!("{truncated}{ellipsis}")
 }
 
 /// Render the TUI layout to a ratatui frame.
@@ -179,45 +358,7 @@ fn render_output(frame: &mut Frame, area: Rect, state: &TuiState) {
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     for conv_line in &state.conversation_lines {
-        match &conv_line.role {
-            ConversationRole::User => {
-                lines.push(Line::from(vec![Span::styled(
-                    "You: ",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                )]));
-                for text_line in conv_line.content.lines() {
-                    lines.push(Line::from(format!("  {text_line}")));
-                }
-                lines.push(Line::from(""));
-            }
-            ConversationRole::Assistant => {
-                lines.push(Line::from(vec![Span::styled(
-                    "PRX: ",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )]));
-                for text_line in conv_line.content.lines() {
-                    lines.push(Line::from(format!("  {text_line}")));
-                }
-                lines.push(Line::from(""));
-            }
-            ConversationRole::System => {
-                for text_line in conv_line.content.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {text_line}"),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-                lines.push(Line::from(""));
-            }
-            ConversationRole::Tool { name, success } => {
-                let icon = if *success { "✓" } else { "✗" };
-                let color = if *success { Color::Green } else { Color::Red };
-                lines.push(Line::from(Span::styled(
-                    format!("  {icon} {name}"),
-                    Style::default().fg(color),
-                )));
-            }
-        }
+        render_conversation_line(&mut lines, conv_line, state.ascii_fallback);
     }
 
     // Virtual scrolling: compute which lines are visible
@@ -241,6 +382,154 @@ fn render_output(frame: &mut Frame, area: Rect, state: &TuiState) {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
     }
+}
+
+/// Render a single conversation line into the ratatui `lines` buffer.
+///
+/// Pure function (apart from the &mut push target) — kept outside
+/// [`render_output`] so unit tests can drive it with a `Vec<Line<'_>>` sink.
+fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a ConversationLine, ascii: bool) {
+    match conv_line {
+        ConversationLine::User { content } => {
+            lines.push(Line::from(vec![Span::styled(
+                "You: ",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )]));
+            for text_line in content.lines() {
+                lines.push(Line::from(format!("  {text_line}")));
+            }
+            lines.push(Line::from(""));
+        }
+        ConversationLine::Assistant { content } => {
+            lines.push(Line::from(vec![Span::styled(
+                "PRX: ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )]));
+            for text_line in content.lines() {
+                lines.push(Line::from(format!("  {text_line}")));
+            }
+            lines.push(Line::from(""));
+        }
+        ConversationLine::System { content } => {
+            for text_line in content.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {text_line}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+        ConversationLine::Tool { name, success } => {
+            let icon = if *success { "\u{2713}" } else { "\u{2717}" };
+            let color = if *success { Color::Green } else { Color::Red };
+            lines.push(Line::from(Span::styled(
+                format!("  {icon} {name}"),
+                Style::default().fg(color),
+            )));
+        }
+        ConversationLine::ToolResult {
+            tool_name,
+            args_preview,
+            args_full,
+            result,
+            status,
+            elapsed_ms,
+            folded,
+        } => render_tool_result(
+            lines,
+            tool_name,
+            args_preview,
+            args_full,
+            result.as_deref(),
+            *status,
+            *elapsed_ms,
+            *folded,
+            ascii,
+        ),
+    }
+}
+
+/// Render a `ToolResult` card. Folded → 1 line; expanded → header + args block
+/// + optional result block.
+#[allow(clippy::too_many_arguments)]
+fn render_tool_result<'a>(
+    lines: &mut Vec<Line<'a>>,
+    tool_name: &'a str,
+    args_preview: &'a str,
+    args_full: &'a str,
+    result: Option<&'a str>,
+    status: ToolStatus,
+    elapsed_ms: Option<u64>,
+    folded: bool,
+    ascii: bool,
+) {
+    let (fold_glyph, color) = tool_card_glyph_and_color(status, folded, ascii);
+    let header = tool_card_header_text(fold_glyph, tool_name, status, elapsed_ms);
+
+    if folded {
+        // Folded: header + short args preview (so the user sees enough to
+        // decide whether to expand).
+        let summary = if args_preview.is_empty() {
+            header
+        } else {
+            format!("{header} {args_preview}")
+        };
+        lines.push(Line::from(Span::styled(summary, Style::default().fg(color))));
+        return;
+    }
+
+    // Expanded view: header (bold), args block, result block.
+    lines.push(Line::from(Span::styled(
+        header,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  args:".to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+    for arg_line in args_full.lines() {
+        lines.push(Line::from(format!("    {arg_line}")));
+    }
+    if let Some(res) = result {
+        lines.push(Line::from(Span::styled(
+            "  result:".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+        for res_line in res.lines() {
+            lines.push(Line::from(format!("    {res_line}")));
+        }
+    }
+}
+
+/// Pick the fold glyph (▸/▾ or >/v) and status color for a tool card.
+const fn tool_card_glyph_and_color(status: ToolStatus, folded: bool, ascii: bool) -> (&'static str, Color) {
+    let glyph = match (folded, ascii) {
+        (true, false) => "\u{25B8}",  // ▸
+        (false, false) => "\u{25BE}", // ▾
+        (true, true) => ">",
+        (false, true) => "v",
+    };
+    let color = match status {
+        ToolStatus::Running => Color::Yellow,
+        ToolStatus::Done => Color::Green,
+        ToolStatus::Error => Color::Red,
+    };
+    (glyph, color)
+}
+
+/// Build the single-line header text shown on a tool card.
+///
+/// Example outputs:
+/// - `▸ [shell] running...`
+/// - `▾ [shell] done (234ms)`
+/// - `▸ [shell] error`
+fn tool_card_header_text(fold_glyph: &str, tool_name: &str, status: ToolStatus, elapsed_ms: Option<u64>) -> String {
+    let status_suffix = match status {
+        ToolStatus::Running => "running...".to_string(),
+        ToolStatus::Done => elapsed_ms.map_or_else(|| "done".to_string(), |ms| format!("done ({ms}ms)")),
+        ToolStatus::Error => elapsed_ms.map_or_else(|| "error".to_string(), |ms| format!("error ({ms}ms)")),
+    };
+    format!("{fold_glyph} [{tool_name}] {status_suffix}")
 }
 
 fn render_input(frame: &mut Frame, area: Rect, state: &TuiState) {
@@ -436,21 +725,264 @@ mod tests {
     }
 
     #[test]
-    fn conversation_line_roles() {
-        let user = ConversationLine {
-            role: ConversationRole::User,
+    fn conversation_line_variants() {
+        let user = ConversationLine::User {
             content: "test".to_string(),
         };
-        assert_eq!(user.role, ConversationRole::User);
+        assert!(matches!(user, ConversationLine::User { .. }));
 
-        let tool = ConversationLine {
-            role: ConversationRole::Tool {
-                name: "shell".to_string(),
-                success: true,
-            },
-            content: String::new(),
+        let tool = ConversationLine::Tool {
+            name: "shell".to_string(),
+            success: true,
         };
-        assert!(matches!(tool.role, ConversationRole::Tool { .. }));
+        assert!(matches!(tool, ConversationLine::Tool { .. }));
+        assert!(!tool.is_tool_result());
+
+        let tr = ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "ls".to_string(),
+            args_full: "{\"command\":\"ls\"}".to_string(),
+            result: None,
+            status: ToolStatus::Running,
+            elapsed_ms: None,
+            folded: true,
+        };
+        assert!(tr.is_tool_result());
+    }
+
+    // ── P2-7: ToolResult card tests ──────────────────────────────────────────
+
+    #[test]
+    fn push_tool_result_started_inserts_running_card() {
+        let mut state = TuiState::new("p", "m");
+        state.push_tool_result_started("shell", r#"{"command":"ls -la /tmp"}"#);
+        let idx = state.last_tool_result_index().expect("test: tool result exists");
+        let line = state.conversation_lines.get(idx).expect("test: idx valid");
+        match line {
+            ConversationLine::ToolResult {
+                tool_name,
+                args_full,
+                status,
+                result,
+                folded,
+                elapsed_ms,
+                args_preview,
+                ..
+            } => {
+                assert_eq!(tool_name, "shell");
+                assert_eq!(args_full, r#"{"command":"ls -la /tmp"}"#);
+                assert_eq!(*status, ToolStatus::Running);
+                assert!(result.is_none());
+                assert!(*folded, "default state is folded");
+                assert!(elapsed_ms.is_none());
+                // Short args fit in the preview verbatim (collapsed whitespace).
+                assert_eq!(args_preview, r#"{"command":"ls -la /tmp"}"#);
+            }
+            other => panic!("test: expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn args_preview_truncates_long_input_and_collapses_newlines() {
+        let raw = "x".repeat(150);
+        let prev = build_args_preview(&raw, ARGS_PREVIEW_MAX_CHARS, ARGS_PREVIEW_ELLIPSIS);
+        // 80 chars + 1-char unicode ellipsis → 81 chars total.
+        assert_eq!(prev.chars().count(), ARGS_PREVIEW_MAX_CHARS + 1);
+        assert!(prev.ends_with(ARGS_PREVIEW_ELLIPSIS));
+
+        let multiline = "line1\n  line2\nline3";
+        let prev2 = build_args_preview(multiline, ARGS_PREVIEW_MAX_CHARS, ARGS_PREVIEW_ELLIPSIS);
+        // Newlines collapsed → single line, no ellipsis (well under 80 chars).
+        assert_eq!(prev2, "line1 line2 line3");
+
+        // ASCII fallback ellipsis.
+        let prev3 = build_args_preview(&raw, 10, ARGS_PREVIEW_ELLIPSIS_ASCII);
+        assert!(prev3.ends_with("..."));
+        assert_eq!(prev3.chars().count(), 13); // 10 + "..."
+    }
+
+    #[test]
+    fn mark_last_tool_result_finished_transitions_status() {
+        let mut state = TuiState::new("p", "m");
+        state.push_tool_result_started("shell", "{}");
+        // Match a different name → no-op.
+        assert!(!state.mark_last_tool_result_finished("other", true, 100, None));
+        // Correct name → update.
+        assert!(state.mark_last_tool_result_finished("shell", true, 234, Some("ok".to_string())));
+        let idx = state.last_tool_result_index().expect("test: idx");
+        match state.conversation_lines.get(idx).expect("test: idx valid") {
+            ConversationLine::ToolResult {
+                status,
+                elapsed_ms,
+                result,
+                ..
+            } => {
+                assert_eq!(*status, ToolStatus::Done);
+                assert_eq!(*elapsed_ms, Some(234));
+                assert_eq!(result.as_deref(), Some("ok"));
+            }
+            other => panic!("test: expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mark_last_tool_result_finished_error_status() {
+        let mut state = TuiState::new("p", "m");
+        state.push_tool_result_started("write", "{}");
+        assert!(state.mark_last_tool_result_finished("write", false, 50, Some("oops".to_string())));
+        match state.conversation_lines.last().expect("test: last line present") {
+            ConversationLine::ToolResult { status, .. } => assert_eq!(*status, ToolStatus::Error),
+            other => panic!("test: expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_last_tool_result_folded_flips_state() {
+        let mut state = TuiState::new("p", "m");
+        // No ToolResult yet → returns None.
+        assert_eq!(state.toggle_last_tool_result_folded(), None);
+        state.push_tool_result_started("shell", "{}");
+        // Default folded=true → first toggle → expanded.
+        assert_eq!(state.toggle_last_tool_result_folded(), Some(false));
+        assert_eq!(state.toggle_last_tool_result_folded(), Some(true));
+    }
+
+    #[test]
+    fn render_folded_tool_card_shows_status_and_glyph() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let card = ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "ls".to_string(),
+            args_full: "ls".to_string(),
+            result: None,
+            status: ToolStatus::Running,
+            elapsed_ms: None,
+            folded: true,
+        };
+        render_conversation_line(&mut lines, &card, false);
+        assert_eq!(lines.len(), 1, "folded card renders to 1 line");
+        let rendered: String = lines
+            .first()
+            .expect("test: at least one line")
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(rendered.contains("\u{25B8}"), "uses ▸ glyph: {rendered}");
+        assert!(rendered.contains("[shell]"));
+        assert!(rendered.contains("running..."));
+    }
+
+    #[test]
+    fn render_expanded_tool_card_shows_args_and_result() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let card = ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "ls".to_string(),
+            args_full: "{\"command\":\"ls -la /tmp\"}".to_string(),
+            result: Some("total 24\ndrwxrwxrwt".to_string()),
+            status: ToolStatus::Done,
+            elapsed_ms: Some(234),
+            folded: false,
+        };
+        render_conversation_line(&mut lines, &card, false);
+        // header + "args:" + 1 args body + "result:" + 2 result body = 6
+        assert_eq!(lines.len(), 6, "expanded card line count: {}", lines.len());
+        let join = |i: usize| -> String {
+            lines
+                .get(i)
+                .expect("test: line idx")
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert!(join(0).contains("\u{25BE}"), "uses ▾ glyph");
+        assert!(join(0).contains("done (234ms)"));
+        assert!(join(1).contains("args:"));
+        assert!(join(2).contains("ls -la /tmp"));
+        assert!(join(3).contains("result:"));
+        assert!(join(4).contains("total 24"));
+    }
+
+    #[test]
+    fn render_tool_card_status_glyphs_and_colors() {
+        // Running → yellow + ▸
+        let (g, c) = tool_card_glyph_and_color(ToolStatus::Running, true, false);
+        assert_eq!(g, "\u{25B8}");
+        assert_eq!(c, Color::Yellow);
+        // Done → green + ▾ when expanded
+        let (g, c) = tool_card_glyph_and_color(ToolStatus::Done, false, false);
+        assert_eq!(g, "\u{25BE}");
+        assert_eq!(c, Color::Green);
+        // Error → red
+        let (_, c) = tool_card_glyph_and_color(ToolStatus::Error, true, false);
+        assert_eq!(c, Color::Red);
+    }
+
+    #[test]
+    fn render_tool_card_ascii_fallback_uses_plain_glyphs() {
+        let mut state = TuiState::new("p", "m");
+        state.set_ascii_fallback(true);
+        state.push_tool_result_started("shell", "x");
+        // ASCII state: ellipsis switches to "..." path; verify preview uses
+        // the ASCII ellipsis for over-long input.
+        state.push_tool_result_started("shell", &"y".repeat(200));
+        let last = state.conversation_lines.last().expect("test: last");
+        if let ConversationLine::ToolResult { args_preview, .. } = last {
+            assert!(args_preview.ends_with("..."), "ASCII ellipsis: {args_preview}");
+        } else {
+            panic!("test: expected ToolResult");
+        }
+        // Render in ASCII mode → glyph is ">"
+        let card = ConversationLine::ToolResult {
+            tool_name: "t".to_string(),
+            args_preview: String::new(),
+            args_full: "x".to_string(),
+            result: None,
+            status: ToolStatus::Running,
+            elapsed_ms: None,
+            folded: true,
+        };
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        render_conversation_line(&mut lines, &card, true);
+        let rendered: String = lines
+            .first()
+            .expect("test: first line")
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(rendered.starts_with('>'), "ASCII fold glyph: {rendered}");
+    }
+
+    #[test]
+    fn header_text_for_each_status() {
+        assert_eq!(
+            tool_card_header_text("\u{25B8}", "shell", ToolStatus::Running, None),
+            "\u{25B8} [shell] running..."
+        );
+        assert_eq!(
+            tool_card_header_text("\u{25BE}", "shell", ToolStatus::Done, Some(234)),
+            "\u{25BE} [shell] done (234ms)"
+        );
+        assert_eq!(
+            tool_card_header_text("\u{25B8}", "shell", ToolStatus::Error, None),
+            "\u{25B8} [shell] error"
+        );
+    }
+
+    #[test]
+    fn total_content_lines_counts_folded_vs_expanded() {
+        let mut state = TuiState::new("p", "m");
+        state.push_tool_result_started("shell", "x");
+        let folded_total = state.total_content_lines();
+        state.toggle_last_tool_result_folded();
+        let expanded_total = state.total_content_lines();
+        assert!(
+            expanded_total > folded_total,
+            "expanded card takes more rows: {expanded_total} vs {folded_total}"
+        );
     }
 
     // ── P2-11: DraftLineBuffer tests ─────────────────────────────────────────
