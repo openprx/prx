@@ -657,7 +657,7 @@ pub async fn run(
     let active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>> = Arc::new(parking_lot::Mutex::new(None));
 
     // Spawn the appropriate input loop:
-    //   - feature `terminal-tui` + TTY stdin + `PRX_TUI=1` → ratatui/crossterm
+    //   - feature `terminal-tui` + TTY stdin + (PRX_TUI != "0") → ratatui/crossterm
     //     KeyEvent loop driving `dispatch_global_key` against the shared
     //     `chat_mirror`, plus a `spawn_render_task` that owns the
     //     `ratatui::Terminal` and redraws on demand.
@@ -670,7 +670,12 @@ pub async fn run(
     #[cfg(feature = "terminal-tui")]
     let _terminal_guard: Option<TerminalGuard> = {
         use std::io::IsTerminal as _;
-        let tui_enabled = std::env::var("PRX_TUI").as_deref() == Ok("1") && std::io::stdin().is_terminal();
+        // TUI is on by default in TTY. Opt out with PRX_TUI=0 (e.g. for
+        // downstream scripts that scrape stdout, or to escape rendering
+        // glitches). Non-TTY stdin (pipe / heredoc / scripted) always falls
+        // through to the legacy reedline + BufRead path.
+        let tui_opt_out = std::env::var("PRX_TUI").as_deref() == Ok("0");
+        let tui_enabled = !tui_opt_out && std::io::stdin().is_terminal();
         if tui_enabled {
             // Order matters: `TerminalGuard::enter()` flips raw mode + alt
             // screen FIRST, then we create the ratatui `Terminal` (which the
@@ -716,8 +721,8 @@ pub async fn run(
                 }
             }
         } else {
-            // Default path (TTY without PRX_TUI=1, or pipe/heredoc) — keep the
-            // legacy reedline + BufRead fallback via TerminalChannel.
+            // Fallback path (PRX_TUI=0 opt-out, or non-TTY pipe/heredoc) — keep
+            // the legacy reedline + BufRead fallback via TerminalChannel.
             let terminal_for_listen = TerminalChannel::new(plain_mode);
             tokio::spawn(async move {
                 if let Err(e) = terminal_for_listen.listen(input_tx).await {
@@ -1305,7 +1310,7 @@ pub async fn run(
 
     // ── Graceful teardown: restore terminal state ────────────────
     //
-    // On the TUI path (`terminal-tui` feature + `PRX_TUI=1`), terminal
+    // On the TUI path (`terminal-tui` feature + TTY + PRX_TUI != "0"), terminal
     // state is owned by `TerminalGuard` (entered above, dropped at end
     // of scope) — the calls below are then redundant but idempotent
     // and harmless. On the legacy reedline / non-TUI path no guard was
