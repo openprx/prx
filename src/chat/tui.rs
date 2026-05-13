@@ -80,6 +80,18 @@ pub enum ConversationLine {
     User { content: String },
     /// Assistant response (final, post-streaming).
     Assistant { content: String },
+    /// Assistant message currently being streamed.
+    ///
+    /// Distinct from [`ConversationLine::Assistant`] so the renderer can
+    /// decorate the in-flight line (e.g. with a trailing cursor) and so the
+    /// P3-5 streaming bridge can call an `update_stream(text)` mutator
+    /// without touching finalized history. Once the stream completes the
+    /// caller is expected to convert the variant into `Assistant` in place.
+    StreamingAssistant {
+        /// Accumulated text so far. May be empty while waiting for the
+        /// provider's first delta.
+        content: String,
+    },
     /// System / status message (dimmed in render).
     System { content: String },
     /// Legacy single-line tool indicator (kept for back-compat with
@@ -914,7 +926,9 @@ impl TuiState {
 /// occupy in the output area. Always >= 1.
 fn estimate_line_height(line: &ConversationLine) -> usize {
     match line {
-        ConversationLine::User { content } | ConversationLine::Assistant { content } => {
+        ConversationLine::User { content }
+        | ConversationLine::Assistant { content }
+        | ConversationLine::StreamingAssistant { content } => {
             // header + body lines + trailing blank
             content.lines().count().max(1) + 2
         }
@@ -1069,6 +1083,30 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             )]));
             for text_line in content.lines() {
                 lines.push(Line::from(format!("  {text_line}")));
+            }
+            lines.push(Line::from(""));
+        }
+        ConversationLine::StreamingAssistant { content } => {
+            // Same shape as Assistant so the layout is stable when the stream
+            // finalizes; the trailing cursor glyph (`▌`) signals to the user
+            // that more bytes are still inbound. ASCII fallback uses `_`.
+            lines.push(Line::from(vec![Span::styled(
+                "PRX: ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )]));
+            let cursor = if ascii { "_" } else { "\u{258C}" }; // ▌
+            let mut body_lines: Vec<&str> = content.lines().collect();
+            if body_lines.is_empty() {
+                body_lines.push("");
+            }
+            let last_idx = body_lines.len().saturating_sub(1);
+            for (i, text_line) in body_lines.iter().enumerate() {
+                let formatted = if i == last_idx {
+                    format!("  {text_line}{cursor}")
+                } else {
+                    format!("  {text_line}")
+                };
+                lines.push(Line::from(formatted));
             }
             lines.push(Line::from(""));
         }
@@ -1480,6 +1518,45 @@ mod tests {
         assert_eq!(state.scroll_offset, 2);
         state.scroll_to_bottom();
         assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn streaming_assistant_variant_renders_with_cursor() {
+        let line = ConversationLine::StreamingAssistant {
+            content: "partial response".to_string(),
+        };
+        let mut sink: Vec<Line<'_>> = Vec::new();
+        render_conversation_line(&mut sink, &line, false);
+        // Header + body + trailing blank.
+        assert_eq!(sink.len(), 3, "streaming assistant renders 3 lines");
+        // Body must contain the content and end with the unicode cursor glyph.
+        let body_text: String = sink
+            .get(1)
+            .expect("test: body line present")
+            .iter()
+            .map(ratatui::text::Span::to_string)
+            .collect();
+        assert!(body_text.contains("partial response"), "body has content");
+        assert!(body_text.ends_with('\u{258C}'), "body ends with ▌ cursor");
+
+        // ASCII fallback uses '_' instead of '▌'.
+        let mut sink2: Vec<Line<'_>> = Vec::new();
+        render_conversation_line(&mut sink2, &line, true);
+        let body2: String = sink2
+            .get(1)
+            .expect("test: body line present")
+            .iter()
+            .map(ratatui::text::Span::to_string)
+            .collect();
+        assert!(body2.ends_with('_'), "ASCII fallback ends with '_'");
+    }
+
+    #[test]
+    fn streaming_assistant_empty_content_still_renders() {
+        let line = ConversationLine::StreamingAssistant { content: String::new() };
+        let mut sink: Vec<Line<'_>> = Vec::new();
+        render_conversation_line(&mut sink, &line, false);
+        assert_eq!(sink.len(), 3, "empty stream still produces header+body+blank");
     }
 
     #[test]
