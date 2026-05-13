@@ -134,6 +134,40 @@ fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}:{ts}")
 }
 
+/// Aggregate the model's reasoning/thinking content from the turn's history
+/// slice. The agent loop encodes assistant turns that carried reasoning as a
+/// JSON object containing `{"reasoning_content": "..."}` (see
+/// `build_native_assistant_history` in `agent/loop_.rs`). We pull those out
+/// and join them with blank-line separators so the TUI can render a single
+/// foldable card per turn.
+///
+/// Returns an empty string when no reasoning is present, signalling the
+/// caller to skip pushing a card.
+#[cfg(feature = "terminal-tui")]
+fn collect_reasoning_from_history_slice(slice: &[ChatMessage]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for msg in slice {
+        if msg.role != "assistant" {
+            continue;
+        }
+        // Fast pre-filter to skip plain-text assistant turns without paying
+        // the JSON parse cost.
+        if !msg.content.contains("reasoning_content") {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&msg.content) else {
+            continue;
+        };
+        if let Some(rc) = parsed.get("reasoning_content").and_then(serde_json::Value::as_str) {
+            let trimmed = rc.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
 /// Run the interactive chat session with rich terminal UI.
 #[allow(clippy::too_many_lines)]
 pub async fn run(
@@ -803,6 +837,25 @@ pub async fn run(
             TurnOutcome::Failed => continue,
         };
 
+        // ── P2-12: Mirror reasoning content into the TUI as a folded card. ──
+        //
+        // Reasoning is separated upstream at the provider layer (P0-2) and
+        // persisted into the assistant-history JSON via
+        // `build_native_assistant_history`. We scan the slice of history
+        // produced during this turn for `reasoning_content` fields, aggregate
+        // them, and push a single folded `Reasoning` card to the TUI mirror.
+        // Empty buffers are skipped by `push_reasoning`. This does NOT touch
+        // the visible delta stream — the user-facing assistant text remains
+        // the only thing rendered in the streaming draft.
+        #[cfg(feature = "terminal-tui")]
+        {
+            let turn_slice = history.get(history_len_before_tools..).unwrap_or(&[]);
+            let aggregated = collect_reasoning_from_history_slice(turn_slice);
+            if !aggregated.is_empty() {
+                tui_mirror.lock().push_reasoning(&aggregated);
+            }
+        }
+
         increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
 
         // ── Sanitize response: strip tool-call XML/JSON artifacts ──
@@ -1167,5 +1220,85 @@ mod finalize_draft_fallback_tests {
             0,
             "repeated finalize failures must remain idempotent (no resends)"
         );
+    }
+}
+
+#[cfg(all(test, feature = "terminal-tui"))]
+mod reasoning_extraction_tests {
+    //! Tests for `collect_reasoning_from_history_slice` — the P2-12 helper that
+    //! pulls reasoning content from the agent loop's history JSON and feeds it
+    //! to the TUI's foldable reasoning card.
+    use super::*;
+
+    fn assistant_json(content: Option<&str>, reasoning: Option<&str>) -> ChatMessage {
+        let mut obj = serde_json::json!({"content": content, "tool_calls": []});
+        if let Some(rc) = reasoning {
+            if let Some(map) = obj.as_object_mut() {
+                map.insert(
+                    "reasoning_content".to_string(),
+                    serde_json::Value::String(rc.to_string()),
+                );
+            }
+        }
+        ChatMessage::assistant(obj.to_string())
+    }
+
+    #[test]
+    fn empty_slice_returns_empty_string() {
+        assert_eq!(collect_reasoning_from_history_slice(&[]), "");
+    }
+
+    #[test]
+    fn plain_assistant_text_is_skipped() {
+        let history = vec![ChatMessage::assistant("Just a plain answer.")];
+        assert_eq!(collect_reasoning_from_history_slice(&history), "");
+    }
+
+    #[test]
+    fn extracts_single_reasoning_block() {
+        let history = vec![assistant_json(Some("ok"), Some("Step 1: think.\nStep 2: act."))];
+        let agg = collect_reasoning_from_history_slice(&history);
+        assert_eq!(agg, "Step 1: think.\nStep 2: act.");
+    }
+
+    #[test]
+    fn aggregates_multiple_reasoning_blocks_with_blank_line_separator() {
+        let history = vec![
+            assistant_json(Some("a"), Some("first thought")),
+            ChatMessage::user("user follow-up"),
+            assistant_json(Some("b"), Some("second thought")),
+        ];
+        let agg = collect_reasoning_from_history_slice(&history);
+        assert_eq!(agg, "first thought\n\nsecond thought");
+    }
+
+    #[test]
+    fn whitespace_only_reasoning_dropped() {
+        let history = vec![
+            assistant_json(Some("a"), Some("   \n\t  ")),
+            assistant_json(Some("b"), Some("real reasoning")),
+        ];
+        let agg = collect_reasoning_from_history_slice(&history);
+        assert_eq!(agg, "real reasoning");
+    }
+
+    #[test]
+    fn malformed_json_is_safely_skipped() {
+        // Pre-filter passes (contains "reasoning_content") but JSON parse fails.
+        let history = vec![ChatMessage::assistant(
+            "broken json with reasoning_content but not valid".to_string(),
+        )];
+        // Must not panic and must not surface anything.
+        assert_eq!(collect_reasoning_from_history_slice(&history), "");
+    }
+
+    #[test]
+    fn non_assistant_role_ignored_even_with_reasoning_content() {
+        // A user message that happens to contain the literal "reasoning_content"
+        // must never leak into the reasoning card.
+        let history = vec![ChatMessage::user(
+            "{\"reasoning_content\":\"shouldn't appear\"}".to_string(),
+        )];
+        assert_eq!(collect_reasoning_from_history_slice(&history), "");
     }
 }

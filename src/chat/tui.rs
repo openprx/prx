@@ -8,6 +8,7 @@
 //! Gated behind the `terminal-tui` feature.
 
 use async_trait::async_trait;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use parking_lot::Mutex;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -33,8 +34,8 @@ pub struct TuiState {
     pub conversation_lines: Vec<ConversationLine>,
     /// Current scroll offset (0 = bottom, latest)
     pub scroll_offset: usize,
-    /// Current input text
-    pub input_text: String,
+    /// Multi-line input buffer + history (P2-10).
+    pub input: TuiInput,
     /// Viewport height for the output area (updated on render)
     pub viewport_height: u16,
     /// Render ASCII-only icons instead of unicode glyphs (for non-UTF-8 terms).
@@ -98,6 +99,24 @@ pub enum ConversationLine {
         elapsed_ms: Option<u64>,
         folded: bool,
     },
+    /// Reasoning / thinking-content card from reasoning-capable models
+    /// (Anthropic `thinking`, OpenAI `reasoning_content`, Ollama `thinking`).
+    ///
+    /// Default folded — only a one-line summary is shown. `Ctrl+R` toggles
+    /// the most recent card to reveal the full text indented under the
+    /// header. `char_count` is cached so the summary can be rendered without
+    /// re-walking `content` on every frame.
+    Reasoning {
+        /// Aggregated reasoning text from this assistant turn. Never empty
+        /// (empty buffers are dropped before pushing — see
+        /// [`TuiState::push_reasoning`]).
+        content: String,
+        /// Cached `content.chars().count()` for the folded summary line.
+        char_count: usize,
+        /// Default `true`. Toggled via
+        /// [`TuiState::toggle_last_reasoning_folded`].
+        folded: bool,
+    },
 }
 
 impl ConversationLine {
@@ -107,6 +126,495 @@ impl ConversationLine {
     pub const fn is_tool_result(&self) -> bool {
         matches!(self, Self::ToolResult { .. })
     }
+
+    /// True if this line is a `Reasoning` variant. Used by [`TuiState`] to
+    /// locate the most recent reasoning card for `Ctrl+R` toggling.
+    pub const fn is_reasoning(&self) -> bool {
+        matches!(self, Self::Reasoning { .. })
+    }
+}
+
+/// Maximum number of input rows shown at once before the box stops growing.
+/// (Lines beyond this still exist in the buffer; future work can add scroll.)
+pub const INPUT_MAX_VISIBLE_ROWS: usize = 10;
+
+/// Maximum number of submitted entries kept in the history ring.
+pub const INPUT_HISTORY_CAPACITY: usize = 200;
+
+/// Outcome of [`TuiInput::handle_key`].
+///
+/// Designed so the surrounding event loop can react with a single match
+/// without inspecting `TuiInput` internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputOutcome {
+    /// Key was consumed; no externally observable change beyond the buffer.
+    Consumed,
+    /// User pressed Enter on a non-empty buffer. The full multi-line text is
+    /// returned, the buffer has been cleared, and history advanced.
+    Submitted(String),
+    /// User requested cancellation (Esc). Buffer was cleared if non-empty.
+    Cancelled,
+    /// User pressed PageUp / PageDown — caller may scroll the output area.
+    ScrollUp,
+    /// See [`InputOutcome::ScrollUp`].
+    ScrollDown,
+    /// Key was not handled by the input subsystem; caller should fall through
+    /// to higher-level shortcuts (`Tab`, `Ctrl+C`, `Ctrl+D`, etc.).
+    Unhandled,
+}
+
+/// Multi-line text input with history navigation.
+///
+/// Storage is a `Vec<String>` where each element is one logical line **without**
+/// the trailing newline. The cursor is a `(line_index, byte_offset)` pair;
+/// `byte_offset` always lies on a UTF-8 char boundary because all mutations go
+/// through the dedicated helpers below.
+///
+/// History is a FIFO ring capped at [`INPUT_HISTORY_CAPACITY`]. `history_pos`
+/// is `None` while the user is editing a fresh buffer; once they navigate up
+/// it becomes `Some(index)` pointing into `history`.
+#[derive(Debug, Clone)]
+pub struct TuiInput {
+    /// Each element is a logical line (no trailing '\n').
+    pub lines: Vec<String>,
+    /// Cursor: (line_index, byte_offset_into_line).
+    pub cursor: (usize, usize),
+    /// Submitted history, oldest at index 0.
+    pub history: Vec<String>,
+    /// Position when navigating history; `None` = editing fresh input.
+    pub history_pos: Option<usize>,
+    /// Snapshot of the in-flight buffer saved when entering history nav, so we
+    /// can restore it when the user scrolls past the end of history.
+    pending_draft: Option<Vec<String>>,
+}
+
+impl Default for TuiInput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TuiInput {
+    /// Create a fresh, empty input buffer.
+    pub fn new() -> Self {
+        Self {
+            lines: vec![String::new()],
+            cursor: (0, 0),
+            history: Vec::new(),
+            history_pos: None,
+            pending_draft: None,
+        }
+    }
+
+    /// Joined buffer contents (lines separated by '\n').
+    pub fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// True when the buffer is logically empty (single empty line).
+    pub fn is_empty(&self) -> bool {
+        self.lines.len() == 1 && self.lines.first().is_none_or(String::is_empty)
+    }
+
+    /// True if the user is currently editing a single logical line — used to
+    /// decide whether `↑/↓` should navigate history or move the cursor.
+    pub const fn is_single_line(&self) -> bool {
+        self.lines.len() <= 1
+    }
+
+    /// Replace the entire buffer (used by history navigation and paste).
+    fn set_text(&mut self, text: &str) {
+        // Strip a trailing '\n' so single-line history doesn't grow a blank
+        // second row when restored.
+        let trimmed = text.strip_suffix('\n').unwrap_or(text);
+        self.lines = if trimmed.is_empty() {
+            vec![String::new()]
+        } else {
+            trimmed.split('\n').map(str::to_owned).collect()
+        };
+        let last_line_idx = self.lines.len().saturating_sub(1);
+        let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
+        self.cursor = (last_line_idx, last_len);
+    }
+
+    /// Clear the buffer back to a single empty line.
+    pub fn clear(&mut self) {
+        self.lines = vec![String::new()];
+        self.cursor = (0, 0);
+        self.history_pos = None;
+        self.pending_draft = None;
+    }
+
+    /// Insert a single grapheme (`ch`) at the cursor.
+    fn insert_char(&mut self, ch: char) {
+        let (li, off) = self.cursor;
+        if let Some(line) = self.lines.get_mut(li) {
+            // `off` is always at a char boundary because we only ever advance
+            // by `ch.len_utf8()` from prior inserts and via `floor_char_boundary`.
+            let clamped = off.min(line.len());
+            line.insert(clamped, ch);
+            self.cursor = (li, clamped + ch.len_utf8());
+        }
+    }
+
+    /// Insert a literal string at the cursor. Newlines split into rows.
+    fn insert_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // Split by '\n' explicitly so a trailing newline produces an empty row.
+        let mut parts = text.split('\n');
+        if let Some(first) = parts.next() {
+            // Insert `first` at the cursor on the current line.
+            let (li, off) = self.cursor;
+            if let Some(line) = self.lines.get_mut(li) {
+                let clamped = off.min(line.len());
+                let suffix: String = line[clamped..].to_string();
+                line.truncate(clamped);
+                line.push_str(first);
+                let mut new_cursor = (li, line.len());
+
+                // Any remaining parts become new lines below the current one.
+                let mut insert_at = li + 1;
+                for part in parts {
+                    self.lines.insert(insert_at, part.to_string());
+                    new_cursor = (insert_at, self.lines.get(insert_at).map_or(0, String::len));
+                    insert_at += 1;
+                }
+
+                // Append the original suffix to whatever ended up as the
+                // cursor's line.
+                if let Some(last_line) = self.lines.get_mut(new_cursor.0) {
+                    last_line.push_str(&suffix);
+                }
+                self.cursor = new_cursor;
+            }
+        }
+    }
+
+    /// Split the current line at the cursor (`Shift+Enter`).
+    fn insert_newline(&mut self) {
+        let (li, off) = self.cursor;
+        if let Some(line) = self.lines.get_mut(li) {
+            let clamped = off.min(line.len());
+            let tail: String = line.split_off(clamped);
+            self.lines.insert(li + 1, tail);
+            self.cursor = (li + 1, 0);
+        }
+    }
+
+    /// Delete the character before the cursor; join with previous line if at
+    /// column 0.
+    fn backspace(&mut self) {
+        let (li, off) = self.cursor;
+        if off > 0 {
+            if let Some(line) = self.lines.get_mut(li) {
+                let new_off = floor_char_boundary(line, off.saturating_sub(1));
+                line.replace_range(new_off..off, "");
+                self.cursor = (li, new_off);
+            }
+        } else if li > 0 {
+            // Merge current line into previous.
+            let current = self.lines.remove(li);
+            let prev_idx = li - 1;
+            if let Some(prev) = self.lines.get_mut(prev_idx) {
+                let new_off = prev.len();
+                prev.push_str(&current);
+                self.cursor = (prev_idx, new_off);
+            }
+        }
+    }
+
+    /// Delete the character at the cursor; join next line if at end of line.
+    fn delete_forward(&mut self) {
+        let (li, off) = self.cursor;
+        let line_len = self.lines.get(li).map_or(0, String::len);
+        if off < line_len {
+            if let Some(line) = self.lines.get_mut(li) {
+                // Find end of the char starting at `off`.
+                let mut end = off + 1;
+                while end < line.len() && !line.is_char_boundary(end) {
+                    end += 1;
+                }
+                line.replace_range(off..end, "");
+            }
+        } else if li + 1 < self.lines.len() {
+            // Join next line into current.
+            let next = self.lines.remove(li + 1);
+            if let Some(line) = self.lines.get_mut(li) {
+                line.push_str(&next);
+            }
+        }
+    }
+
+    /// Move cursor one char left, possibly to previous line's end.
+    fn move_left(&mut self) {
+        let (li, off) = self.cursor;
+        if off > 0 {
+            if let Some(line) = self.lines.get(li) {
+                let new_off = floor_char_boundary(line, off.saturating_sub(1));
+                self.cursor = (li, new_off);
+            }
+        } else if li > 0 {
+            let prev_len = self.lines.get(li - 1).map_or(0, String::len);
+            self.cursor = (li - 1, prev_len);
+        }
+    }
+
+    /// Move cursor one char right, possibly to next line's start.
+    fn move_right(&mut self) {
+        let (li, off) = self.cursor;
+        let line_len = self.lines.get(li).map_or(0, String::len);
+        if off < line_len {
+            if let Some(line) = self.lines.get(li) {
+                let mut new_off = off + 1;
+                while new_off < line.len() && !line.is_char_boundary(new_off) {
+                    new_off += 1;
+                }
+                self.cursor = (li, new_off);
+            }
+        } else if li + 1 < self.lines.len() {
+            self.cursor = (li + 1, 0);
+        }
+    }
+
+    /// Move cursor to start of current line (Home / Ctrl+A).
+    const fn move_line_start(&mut self) {
+        self.cursor.1 = 0;
+    }
+
+    /// Move cursor to end of current line (End / Ctrl+E).
+    fn move_line_end(&mut self) {
+        let line_len = self.lines.get(self.cursor.0).map_or(0, String::len);
+        self.cursor.1 = line_len;
+    }
+
+    /// Move cursor up one row when multi-line; keep byte offset clamped.
+    fn move_cursor_up(&mut self) -> bool {
+        let (li, off) = self.cursor;
+        if li == 0 {
+            return false;
+        }
+        let new_li = li - 1;
+        let new_line_len = self.lines.get(new_li).map_or(0, String::len);
+        let target_off = off.min(new_line_len);
+        let safe_off = self
+            .lines
+            .get(new_li)
+            .map_or(target_off, |line| floor_char_boundary(line, target_off));
+        self.cursor = (new_li, safe_off);
+        true
+    }
+
+    /// Move cursor down one row when multi-line.
+    fn move_cursor_down(&mut self) -> bool {
+        let (li, off) = self.cursor;
+        if li + 1 >= self.lines.len() {
+            return false;
+        }
+        let new_li = li + 1;
+        let new_line_len = self.lines.get(new_li).map_or(0, String::len);
+        let target_off = off.min(new_line_len);
+        let safe_off = self
+            .lines
+            .get(new_li)
+            .map_or(target_off, |line| floor_char_boundary(line, target_off));
+        self.cursor = (new_li, safe_off);
+        true
+    }
+
+    /// Delete from start of current line up to cursor (`Ctrl+U`).
+    fn delete_to_line_start(&mut self) {
+        let (li, off) = self.cursor;
+        if let Some(line) = self.lines.get_mut(li) {
+            line.replace_range(0..off.min(line.len()), "");
+            self.cursor = (li, 0);
+        }
+    }
+
+    /// Push a finalized entry onto the history ring (dedups consecutive dupes).
+    fn record_history(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if self.history.last() == Some(&text) {
+            return;
+        }
+        if self.history.len() >= INPUT_HISTORY_CAPACITY {
+            self.history.remove(0);
+        }
+        self.history.push(text);
+    }
+
+    /// Navigate to the previous (older) entry. Saves the in-flight draft on
+    /// first call so it can be restored later.
+    fn history_prev(&mut self) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
+        let next_pos = match self.history_pos {
+            None => {
+                self.pending_draft = Some(self.lines.clone());
+                self.history.len().saturating_sub(1)
+            }
+            Some(0) => 0,
+            Some(p) => p - 1,
+        };
+        self.history_pos = Some(next_pos);
+        if let Some(entry) = self.history.get(next_pos) {
+            let entry_owned = entry.clone();
+            self.set_text(&entry_owned);
+        }
+        true
+    }
+
+    /// Navigate to the next (newer) entry, or back to the pending draft.
+    fn history_next(&mut self) -> bool {
+        let Some(pos) = self.history_pos else {
+            return false;
+        };
+        let next_pos = pos + 1;
+        if next_pos >= self.history.len() {
+            // Past the most recent entry → restore in-flight draft (if any).
+            self.history_pos = None;
+            if let Some(draft) = self.pending_draft.take() {
+                self.lines = if draft.is_empty() { vec![String::new()] } else { draft };
+            } else {
+                self.lines = vec![String::new()];
+            }
+            let last_line_idx = self.lines.len().saturating_sub(1);
+            let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
+            self.cursor = (last_line_idx, last_len);
+        } else {
+            self.history_pos = Some(next_pos);
+            if let Some(entry) = self.history.get(next_pos) {
+                let entry_owned = entry.clone();
+                self.set_text(&entry_owned);
+            }
+        }
+        true
+    }
+
+    /// Process a single key event. See [`InputOutcome`] for return semantics.
+    pub fn handle_key(&mut self, key: KeyEvent) -> InputOutcome {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        match key.code {
+            KeyCode::Enter => {
+                if shift || alt {
+                    self.insert_newline();
+                    return InputOutcome::Consumed;
+                }
+                if self.is_empty() {
+                    return InputOutcome::Consumed;
+                }
+                let text = self.text();
+                self.record_history(text.clone());
+                self.clear();
+                InputOutcome::Submitted(text)
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.delete_to_line_start();
+                InputOutcome::Consumed
+            }
+            KeyCode::Char('a') if ctrl => {
+                self.move_line_start();
+                InputOutcome::Consumed
+            }
+            KeyCode::Char('e') if ctrl => {
+                self.move_line_end();
+                InputOutcome::Consumed
+            }
+            KeyCode::Char('j') if ctrl => {
+                // Common terminal alternative for "newline without submit".
+                self.insert_newline();
+                InputOutcome::Consumed
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                self.insert_char(ch);
+                InputOutcome::Consumed
+            }
+            KeyCode::Backspace => {
+                self.backspace();
+                InputOutcome::Consumed
+            }
+            KeyCode::Delete => {
+                self.delete_forward();
+                InputOutcome::Consumed
+            }
+            KeyCode::Left => {
+                self.move_left();
+                InputOutcome::Consumed
+            }
+            KeyCode::Right => {
+                self.move_right();
+                InputOutcome::Consumed
+            }
+            KeyCode::Home => {
+                self.move_line_start();
+                InputOutcome::Consumed
+            }
+            KeyCode::End => {
+                self.move_line_end();
+                InputOutcome::Consumed
+            }
+            KeyCode::Up => {
+                // Single-line buffer → history; multi-line → cursor up.
+                if self.is_single_line() {
+                    if self.history_prev() {
+                        InputOutcome::Consumed
+                    } else {
+                        InputOutcome::Unhandled
+                    }
+                } else if self.move_cursor_up() {
+                    InputOutcome::Consumed
+                } else {
+                    InputOutcome::Unhandled
+                }
+            }
+            KeyCode::Down => {
+                if self.is_single_line() {
+                    if self.history_next() {
+                        InputOutcome::Consumed
+                    } else {
+                        InputOutcome::Unhandled
+                    }
+                } else if self.move_cursor_down() {
+                    InputOutcome::Consumed
+                } else {
+                    InputOutcome::Unhandled
+                }
+            }
+            KeyCode::PageUp => InputOutcome::ScrollUp,
+            KeyCode::PageDown => InputOutcome::ScrollDown,
+            KeyCode::Esc => {
+                if !self.is_empty() {
+                    self.clear();
+                }
+                InputOutcome::Cancelled
+            }
+            _ => InputOutcome::Unhandled,
+        }
+    }
+
+    /// Append pasted text verbatim. Newlines split into rows.
+    pub fn paste(&mut self, text: &str) {
+        self.insert_str(text);
+    }
+}
+
+/// Round `idx` down to the nearest UTF-8 char boundary in `s`. Saturates at 0.
+const fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    let max = s.len();
+    if idx > max {
+        idx = max;
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 impl TuiState {
@@ -118,10 +626,18 @@ impl TuiState {
             turn_count: 0,
             conversation_lines: Vec::new(),
             scroll_offset: 0,
-            input_text: String::new(),
+            input: TuiInput::new(),
             viewport_height: 0,
             ascii_fallback: false,
         }
+    }
+
+    /// Forward a `crossterm::event::KeyEvent` to the multi-line input buffer.
+    ///
+    /// Returns [`InputOutcome`] so the caller can react to submissions,
+    /// cancellations, or scrolling intents.
+    pub fn handle_input_key(&mut self, key: KeyEvent) -> InputOutcome {
+        self.input.handle_key(key)
     }
 
     /// Toggle ASCII fallback mode for icons (`▸/▾` → `>/v`, `…` → `...`).
@@ -240,6 +756,51 @@ impl TuiState {
             .rposition(ConversationLine::is_tool_result)
     }
 
+    /// Push a folded [`ConversationLine::Reasoning`] card carrying the model's
+    /// aggregated thinking content for the just-completed assistant turn.
+    ///
+    /// Empty / whitespace-only buffers are silently dropped — there is no
+    /// value in a `[thinking 0 chars]` card. Returns `true` if a card was
+    /// actually pushed, so callers can branch on observability.
+    pub fn push_reasoning(&mut self, content: &str) -> bool {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let owned = trimmed.to_string();
+        let char_count = owned.chars().count();
+        self.conversation_lines.push(ConversationLine::Reasoning {
+            content: owned,
+            char_count,
+            folded: true,
+        });
+        self.scroll_to_bottom();
+        true
+    }
+
+    /// Toggle the folded state of the most recent `Reasoning` line (if any).
+    ///
+    /// Returns the new `folded` value, or `None` if no `Reasoning` exists.
+    /// This implements the `Ctrl+R` keypath, mirroring the `Tab` key handler
+    /// for tool-result cards. Only the **last** reasoning card is touched;
+    /// older cards keep their previous state so the user can hop between
+    /// turns without losing context.
+    pub fn toggle_last_reasoning_folded(&mut self) -> Option<bool> {
+        for line in self.conversation_lines.iter_mut().rev() {
+            if let ConversationLine::Reasoning { folded, .. } = line {
+                *folded = !*folded;
+                return Some(*folded);
+            }
+        }
+        None
+    }
+
+    /// Index of the most recent `Reasoning` line, if any. Exposed for tests
+    /// and future per-line selection logic.
+    pub fn last_reasoning_index(&self) -> Option<usize> {
+        self.conversation_lines.iter().rposition(ConversationLine::is_reasoning)
+    }
+
     /// Scroll to the bottom of the conversation.
     pub const fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
@@ -286,6 +847,14 @@ fn estimate_line_height(line: &ConversationLine) -> usize {
                 1 + 1 + args_h + if result_h > 0 { 1 + result_h } else { 0 }
             }
         }
+        ConversationLine::Reasoning { folded, content, .. } => {
+            if *folded {
+                1
+            } else {
+                // header + content body (one row per logical line, min 1)
+                1 + content.lines().count().max(1)
+            }
+        }
     }
 }
 
@@ -308,14 +877,19 @@ fn build_args_preview(raw: &str, max_chars: usize, ellipsis: &str) -> String {
 pub fn render(frame: &mut Frame, state: &mut TuiState) {
     let area = frame.area();
 
-    // Three-area layout: status bar (1 line) + output (flex) + input (3 lines) + footer (1 line)
+    // Three-area layout: status bar (1 line) + output (flex) + input (dynamic) + footer (1 line)
+    //
+    // Input box height = 1 (top border) + min(lines.len(), INPUT_MAX_VISIBLE_ROWS),
+    // clamped to at least 2 (border + 1 row) so an empty buffer is still visible.
+    let visible_input_rows = state.input.lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
+    let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Status bar
-            Constraint::Min(5),    // Output area
-            Constraint::Length(3), // Input area
-            Constraint::Length(1), // Footer
+            Constraint::Length(1),            // Status bar
+            Constraint::Min(5),               // Output area
+            Constraint::Length(input_height), // Input area (dynamic)
+            Constraint::Length(1),            // Footer
         ])
         .split(area);
 
@@ -446,6 +1020,11 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             *folded,
             ascii,
         ),
+        ConversationLine::Reasoning {
+            content,
+            char_count,
+            folded,
+        } => render_reasoning_card(lines, content, *char_count, *folded, ascii),
     }
 }
 
@@ -501,6 +1080,59 @@ fn render_tool_result<'a>(
     }
 }
 
+/// Render a `Reasoning` card. Folded → 1 line summary; expanded → header
+/// followed by the indented body text.
+///
+/// The folded summary is `<icon> [thinking N chars <fold-glyph>]`:
+/// - icon: `💭` (UTF-8) or `~` (ASCII fallback)
+/// - fold glyph: `▾` (UTF-8, folded — caller may press `Ctrl+R` to expand) or
+///   `▴` (UTF-8, expanded). ASCII: `v` / `^`.
+///
+/// In the expanded form each content line is indented by two spaces. We do
+/// NOT apply markdown / syntax highlighting here — that interacts with the
+/// P1-5 ANSI state machine and P2-9 diff renderer in ways that would need
+/// dedicated isolation; reasoning text is dimmed plain text so the user can
+/// always read it without ANSI bleed.
+fn render_reasoning_card<'a>(
+    lines: &mut Vec<Line<'a>>,
+    content: &'a str,
+    char_count: usize,
+    folded: bool,
+    ascii: bool,
+) {
+    let (icon, fold_glyph) = reasoning_card_glyphs(folded, ascii);
+    let header = format!("{icon} [thinking {char_count} chars {fold_glyph}]");
+    let header_style = Style::default().fg(Color::Magenta).add_modifier(Modifier::ITALIC);
+    lines.push(Line::from(Span::styled(header, header_style)));
+
+    if folded {
+        return;
+    }
+
+    // Expanded: indent body 2 spaces, dimmed so the eye returns to the
+    // visible assistant text below.
+    for body_line in content.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {body_line}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+}
+
+/// Pick the leading icon (`💭` / `~`) and fold glyph (`▾▴` / `v^`) for a
+/// reasoning card. `folded=true` shows the "expand" hint (`▾` / `v`),
+/// `folded=false` shows the "collapse" hint (`▴` / `^`).
+const fn reasoning_card_glyphs(folded: bool, ascii: bool) -> (&'static str, &'static str) {
+    let icon = if ascii { "~" } else { "\u{1F4AD}" }; // 💭
+    let glyph = match (folded, ascii) {
+        (true, false) => "\u{25BE}",  // ▾ — folded, click to expand
+        (false, false) => "\u{25B4}", // ▴ — expanded, click to fold
+        (true, true) => "v",
+        (false, true) => "^",
+    };
+    (icon, glyph)
+}
+
 /// Pick the fold glyph (▸/▾ or >/v) and status color for a tool card.
 const fn tool_card_glyph_and_color(status: ToolStatus, folded: bool, ascii: bool) -> (&'static str, Color) {
     let glyph = match (folded, ascii) {
@@ -533,7 +1165,23 @@ fn tool_card_header_text(fold_glyph: &str, tool_name: &str, status: ToolStatus, 
 }
 
 fn render_input(frame: &mut Frame, area: Rect, state: &TuiState) {
-    let input = Paragraph::new(state.input_text.as_str())
+    // Compose prompt lines: first row gets "> ", continuation rows get "  ".
+    let rendered_lines: Vec<Line<'_>> = state
+        .input
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(idx, content)| {
+            let prefix = if idx == 0 {
+                Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw("  ")
+            };
+            Line::from(vec![prefix, Span::raw(content.as_str())])
+        })
+        .collect();
+
+    let input = Paragraph::new(Text::from(rendered_lines))
         .block(
             Block::default()
                 .borders(Borders::TOP)
@@ -542,6 +1190,28 @@ fn render_input(frame: &mut Frame, area: Rect, state: &TuiState) {
         )
         .style(Style::default().fg(Color::White));
     frame.render_widget(input, area);
+
+    // Place the terminal cursor at the visual cursor location inside the box.
+    // Borders::TOP consumes the first row of `area`, so the body starts at
+    // `area.y + 1` and the prompt prefix takes the first 2 columns.
+    let (cursor_line, cursor_offset) = state.input.cursor;
+    let max_visible_rows = area.height.saturating_sub(1) as usize;
+    if cursor_line < state.input.lines.len() && cursor_line < max_visible_rows {
+        let row_text = state.input.lines.get(cursor_line).map(String::as_str).unwrap_or("");
+        // Width-aware column: count display columns up to the byte offset.
+        let visual_col: usize = row_text
+            .get(..cursor_offset.min(row_text.len()))
+            .map_or(0, |slice| slice.chars().count());
+        let col_offset = u16::try_from(visual_col).unwrap_or(u16::MAX);
+        let prefix_cols: u16 = 2;
+        let row_offset = u16::try_from(cursor_line).unwrap_or(u16::MAX);
+        let cx = area.x.saturating_add(prefix_cols).saturating_add(col_offset);
+        let cy = area.y.saturating_add(1).saturating_add(row_offset);
+        // Only place cursor if it falls within the box bounds.
+        if cx < area.x.saturating_add(area.width) && cy < area.y.saturating_add(area.height) {
+            frame.set_cursor_position((cx, cy));
+        }
+    }
 }
 
 fn render_footer(frame: &mut Frame, area: Rect) {
@@ -1094,5 +1764,443 @@ mod tests {
             .await
             .expect("test: trait call");
         assert_eq!(buf.snapshot("d1"), Some(lines(&["a", "MID", "c"])));
+    }
+
+    // ── P2-12: Reasoning card tests ──────────────────────────────────────────
+
+    /// Collapse a rendered `Line` into a plain `String` by concatenating all
+    /// span contents. Used so assertions can grep for substrings without
+    /// caring about the ratatui Span structure.
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn reasoning_variant_construction_caches_char_count_and_defaults_folded() {
+        let r = ConversationLine::Reasoning {
+            content: "abc".to_string(),
+            char_count: 3,
+            folded: true,
+        };
+        assert!(r.is_reasoning());
+        assert!(!r.is_tool_result());
+        match r {
+            ConversationLine::Reasoning {
+                content,
+                char_count,
+                folded,
+            } => {
+                assert_eq!(content, "abc");
+                assert_eq!(char_count, 3);
+                assert!(folded);
+            }
+            other => panic!("test: expected Reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_reasoning_drops_empty_and_whitespace_only_inputs() {
+        let mut state = TuiState::new("p", "m");
+        assert!(!state.push_reasoning(""));
+        assert!(!state.push_reasoning("   \n\t"));
+        assert!(state.last_reasoning_index().is_none());
+        assert!(state.conversation_lines.is_empty());
+
+        // Real reasoning is accepted.
+        assert!(state.push_reasoning("  let me think...  "));
+        let idx = state.last_reasoning_index().expect("test: reasoning exists");
+        match state.conversation_lines.get(idx).expect("test: idx valid") {
+            ConversationLine::Reasoning {
+                content,
+                char_count,
+                folded,
+            } => {
+                // Trim is applied before storage.
+                assert_eq!(content, "let me think...");
+                assert_eq!(*char_count, "let me think...".chars().count());
+                assert!(*folded, "default state is folded");
+            }
+            other => panic!("test: expected Reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_last_reasoning_folded_flips_and_targets_last() {
+        let mut state = TuiState::new("p", "m");
+        // No card yet → None.
+        assert_eq!(state.toggle_last_reasoning_folded(), None);
+
+        state.push_reasoning("first thought");
+        state.push_reasoning("second thought");
+        // Default folded=true → toggling last (second) → false.
+        assert_eq!(state.toggle_last_reasoning_folded(), Some(false));
+
+        // First card untouched.
+        let first_idx = state
+            .conversation_lines
+            .iter()
+            .position(ConversationLine::is_reasoning)
+            .expect("test: first idx");
+        match state.conversation_lines.get(first_idx).expect("test: first idx valid") {
+            ConversationLine::Reasoning { folded, .. } => assert!(*folded, "first card untouched"),
+            other => panic!("test: expected Reasoning, got {other:?}"),
+        }
+
+        // Second toggle of last → back to folded.
+        assert_eq!(state.toggle_last_reasoning_folded(), Some(true));
+    }
+
+    #[test]
+    fn render_folded_reasoning_card_renders_single_summary_line() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let card = ConversationLine::Reasoning {
+            content: "Step 1: analyze the input\nStep 2: reason about it".to_string(),
+            char_count: 45,
+            folded: true,
+        };
+        render_conversation_line(&mut lines, &card, false);
+        assert_eq!(lines.len(), 1, "folded card is exactly one line");
+        let rendered = line_text(lines.first().expect("test: first line"));
+        assert!(rendered.contains("\u{1F4AD}"), "uses 💭 icon: {rendered}");
+        assert!(rendered.contains("[thinking 45 chars"), "shows char count: {rendered}");
+        assert!(rendered.contains("\u{25BE}"), "shows ▾ expand glyph: {rendered}");
+        // Folded summary must NOT leak the body text.
+        assert!(!rendered.contains("Step 1"), "body hidden when folded: {rendered}");
+    }
+
+    #[test]
+    fn render_expanded_reasoning_card_indents_body_two_spaces() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let body = "Let me reason step by step.\nFirst, I need to check the input.\nThen, decide the next action.";
+        let card = ConversationLine::Reasoning {
+            content: body.to_string(),
+            char_count: body.chars().count(),
+            folded: false,
+        };
+        render_conversation_line(&mut lines, &card, false);
+        // 1 header + 3 body rows = 4 lines.
+        assert_eq!(lines.len(), 4, "header + 3 body rows: {}", lines.len());
+        let header = line_text(lines.first().expect("test: header"));
+        assert!(header.contains("\u{25B4}"), "expanded shows ▴ collapse glyph: {header}");
+        // Each body row begins with "  " indent.
+        for (idx, original) in body.lines().enumerate() {
+            let rendered = line_text(lines.get(idx + 1).expect("test: body line"));
+            assert_eq!(rendered, format!("  {original}"), "body row {idx} indent");
+        }
+    }
+
+    #[test]
+    fn render_reasoning_card_ascii_fallback_uses_plain_glyphs() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let card = ConversationLine::Reasoning {
+            content: "thinking...".to_string(),
+            char_count: 11,
+            folded: true,
+        };
+        render_conversation_line(&mut lines, &card, true);
+        let rendered = line_text(lines.first().expect("test: first line"));
+        // ASCII icon and glyph.
+        assert!(rendered.starts_with("~ "), "ASCII icon ~: {rendered}");
+        assert!(rendered.contains(" v]"), "ASCII fold glyph v: {rendered}");
+        assert!(!rendered.contains("\u{1F4AD}"), "no 💭 in ASCII mode: {rendered}");
+        assert!(!rendered.contains("\u{25BE}"), "no ▾ in ASCII mode: {rendered}");
+
+        // Expanded ASCII shows ^.
+        let mut lines2: Vec<Line<'_>> = Vec::new();
+        let expanded = ConversationLine::Reasoning {
+            content: "x".to_string(),
+            char_count: 1,
+            folded: false,
+        };
+        render_conversation_line(&mut lines2, &expanded, true);
+        let header = line_text(lines2.first().expect("test: expanded header"));
+        assert!(header.contains(" ^]"), "ASCII expand glyph ^: {header}");
+    }
+
+    #[test]
+    fn estimate_line_height_reasoning_folded_vs_expanded() {
+        let folded = ConversationLine::Reasoning {
+            content: "a\nb\nc\nd".to_string(),
+            char_count: 7,
+            folded: true,
+        };
+        assert_eq!(estimate_line_height(&folded), 1);
+
+        let expanded = ConversationLine::Reasoning {
+            content: "a\nb\nc\nd".to_string(),
+            char_count: 7,
+            folded: false,
+        };
+        // 1 header + 4 body lines = 5
+        assert_eq!(estimate_line_height(&expanded), 5);
+    }
+
+    #[test]
+    fn reasoning_card_glyphs_table() {
+        // UTF-8.
+        assert_eq!(reasoning_card_glyphs(true, false), ("\u{1F4AD}", "\u{25BE}"));
+        assert_eq!(reasoning_card_glyphs(false, false), ("\u{1F4AD}", "\u{25B4}"));
+        // ASCII fallback.
+        assert_eq!(reasoning_card_glyphs(true, true), ("~", "v"));
+        assert_eq!(reasoning_card_glyphs(false, true), ("~", "^"));
+    }
+
+    // ── P2-10: TuiInput multi-line + history tests ───────────────────────────
+
+    /// Build a `KeyEvent` with no modifiers.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Build a `KeyEvent` with a single modifier.
+    fn key_mod(code: KeyCode, m: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, m)
+    }
+
+    /// Convenience: type each char in `s` into `input`.
+    fn type_str(input: &mut TuiInput, s: &str) {
+        for ch in s.chars() {
+            input.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
+
+    #[test]
+    fn p2_10_enter_submits_and_clears() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "hello");
+        assert_eq!(input.text(), "hello");
+        let out = input.handle_key(key(KeyCode::Enter));
+        assert_eq!(out, InputOutcome::Submitted("hello".to_string()));
+        assert!(input.is_empty(), "buffer cleared after submit");
+        // History got the entry.
+        assert_eq!(input.history, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn p2_10_enter_on_empty_buffer_is_consumed_no_submit() {
+        let mut input = TuiInput::new();
+        let out = input.handle_key(key(KeyCode::Enter));
+        assert_eq!(out, InputOutcome::Consumed);
+        assert!(input.history.is_empty(), "empty enter does not record");
+    }
+
+    #[test]
+    fn p2_10_shift_enter_inserts_newline() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "a");
+        let out = input.handle_key(key_mod(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(out, InputOutcome::Consumed);
+        type_str(&mut input, "b");
+        assert_eq!(input.text(), "a\nb");
+        assert_eq!(input.lines.len(), 2);
+        assert!(!input.is_single_line());
+    }
+
+    #[test]
+    fn p2_10_cursor_moves_across_line_boundaries() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "ab");
+        input.handle_key(key_mod(KeyCode::Enter, KeyModifiers::SHIFT));
+        type_str(&mut input, "cd");
+        // cursor at (1, 2). Move left twice → (1,0); once more → (0, 2).
+        assert_eq!(input.cursor, (1, 2));
+        input.handle_key(key(KeyCode::Left));
+        input.handle_key(key(KeyCode::Left));
+        assert_eq!(input.cursor, (1, 0));
+        input.handle_key(key(KeyCode::Left));
+        assert_eq!(input.cursor, (0, 2));
+        // Move right → (1, 0).
+        input.handle_key(key(KeyCode::Right));
+        assert_eq!(input.cursor, (1, 0));
+    }
+
+    #[test]
+    fn p2_10_history_up_recalls_last_submission() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "first");
+        input.handle_key(key(KeyCode::Enter));
+        type_str(&mut input, "second");
+        input.handle_key(key(KeyCode::Enter));
+        // Single-line buffer → Up walks history backward.
+        let out = input.handle_key(key(KeyCode::Up));
+        assert_eq!(out, InputOutcome::Consumed);
+        assert_eq!(input.text(), "second");
+        input.handle_key(key(KeyCode::Up));
+        assert_eq!(input.text(), "first");
+        // Down → second → fresh empty.
+        input.handle_key(key(KeyCode::Down));
+        assert_eq!(input.text(), "second");
+        input.handle_key(key(KeyCode::Down));
+        assert!(input.is_empty(), "back to fresh draft");
+    }
+
+    #[test]
+    fn p2_10_history_preserves_in_flight_draft() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "old");
+        input.handle_key(key(KeyCode::Enter));
+        // Start typing a new draft, then navigate up & back down.
+        type_str(&mut input, "wip");
+        input.handle_key(key(KeyCode::Up));
+        assert_eq!(input.text(), "old");
+        input.handle_key(key(KeyCode::Down));
+        assert_eq!(input.text(), "wip", "draft restored");
+    }
+
+    #[test]
+    fn p2_10_history_dedups_consecutive_duplicates() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "x");
+        input.handle_key(key(KeyCode::Enter));
+        type_str(&mut input, "x");
+        input.handle_key(key(KeyCode::Enter));
+        assert_eq!(input.history.len(), 1, "consecutive dupes collapsed");
+    }
+
+    #[test]
+    fn p2_10_backspace_at_line_start_merges_lines() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "ab");
+        input.handle_key(key_mod(KeyCode::Enter, KeyModifiers::SHIFT));
+        type_str(&mut input, "cd");
+        // cursor at (1, 2). Move to start of line 1.
+        input.handle_key(key(KeyCode::Home));
+        assert_eq!(input.cursor, (1, 0));
+        input.handle_key(key(KeyCode::Backspace));
+        assert_eq!(input.text(), "abcd");
+        assert_eq!(input.cursor, (0, 2), "cursor at original line-1 start");
+        assert!(input.is_single_line());
+    }
+
+    #[test]
+    fn p2_10_backspace_inside_line_removes_one_char() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "abc");
+        input.handle_key(key(KeyCode::Backspace));
+        assert_eq!(input.text(), "ab");
+        assert_eq!(input.cursor, (0, 2));
+    }
+
+    #[test]
+    fn p2_10_ctrl_u_kills_to_line_start() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "hello world");
+        // Move left 5 chars → cursor at index 6.
+        for _ in 0..5 {
+            input.handle_key(key(KeyCode::Left));
+        }
+        assert_eq!(input.cursor, (0, 6));
+        let out = input.handle_key(key_mod(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(out, InputOutcome::Consumed);
+        assert_eq!(input.text(), "world");
+        assert_eq!(input.cursor, (0, 0));
+    }
+
+    #[test]
+    fn p2_10_ctrl_a_and_ctrl_e_jump_line_endpoints() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "abc");
+        input.handle_key(key_mod(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(input.cursor, (0, 0));
+        input.handle_key(key_mod(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(input.cursor, (0, 3));
+    }
+
+    #[test]
+    fn p2_10_paste_with_newlines_creates_multiple_lines() {
+        let mut input = TuiInput::new();
+        input.paste("alpha\nbeta\ngamma");
+        assert_eq!(input.lines.len(), 3);
+        assert_eq!(input.text(), "alpha\nbeta\ngamma");
+        // Cursor lands at end of pasted content.
+        assert_eq!(input.cursor, (2, 5));
+        // Now ↑ should NOT recall history (we have a multi-line buffer).
+        let out = input.handle_key(key(KeyCode::Up));
+        assert_eq!(out, InputOutcome::Consumed);
+        // Cursor moved up one row, not to history.
+        assert_eq!(input.cursor.0, 1);
+    }
+
+    #[test]
+    fn p2_10_multi_line_up_down_moves_cursor_not_history() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "x");
+        input.handle_key(key(KeyCode::Enter)); // submits "x", history = ["x"]
+        type_str(&mut input, "row1");
+        input.handle_key(key_mod(KeyCode::Enter, KeyModifiers::SHIFT));
+        type_str(&mut input, "row2");
+        // Multi-line: ↑ should move cursor, not recall "x".
+        input.handle_key(key(KeyCode::Up));
+        assert_eq!(input.text(), "row1\nrow2", "still editing same draft");
+        assert_eq!(input.cursor.0, 0);
+    }
+
+    #[test]
+    fn p2_10_esc_clears_buffer_and_returns_cancelled() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "garbage");
+        let out = input.handle_key(key(KeyCode::Esc));
+        assert_eq!(out, InputOutcome::Cancelled);
+        assert!(input.is_empty());
+        // Esc on empty still returns Cancelled.
+        let out2 = input.handle_key(key(KeyCode::Esc));
+        assert_eq!(out2, InputOutcome::Cancelled);
+    }
+
+    #[test]
+    fn p2_10_delete_forward_joins_next_line() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "ab");
+        input.handle_key(key_mod(KeyCode::Enter, KeyModifiers::SHIFT));
+        type_str(&mut input, "cd");
+        input.handle_key(key(KeyCode::Up));
+        input.handle_key(key(KeyCode::End));
+        assert_eq!(input.cursor, (0, 2));
+        input.handle_key(key(KeyCode::Delete));
+        assert_eq!(input.text(), "abcd");
+        assert_eq!(input.lines.len(), 1);
+    }
+
+    #[test]
+    fn p2_10_pageup_pagedown_return_scroll_intent() {
+        let mut input = TuiInput::new();
+        assert_eq!(input.handle_key(key(KeyCode::PageUp)), InputOutcome::ScrollUp);
+        assert_eq!(input.handle_key(key(KeyCode::PageDown)), InputOutcome::ScrollDown);
+    }
+
+    #[test]
+    fn p2_10_utf8_grapheme_safe_backspace() {
+        let mut input = TuiInput::new();
+        // Three Chinese chars (3 bytes each in UTF-8).
+        type_str(&mut input, "你好吗");
+        assert_eq!(input.cursor, (0, 9));
+        input.handle_key(key(KeyCode::Backspace));
+        assert_eq!(input.text(), "你好");
+        assert_eq!(input.cursor, (0, 6));
+        // Move left then right: must land on char boundaries.
+        input.handle_key(key(KeyCode::Left));
+        assert_eq!(input.cursor, (0, 3));
+        input.handle_key(key(KeyCode::Right));
+        assert_eq!(input.cursor, (0, 6));
+    }
+
+    #[test]
+    fn p2_10_tui_state_routes_keys_to_input() {
+        let mut state = TuiState::new("p", "m");
+        let out = state.handle_input_key(key(KeyCode::Char('z')));
+        assert_eq!(out, InputOutcome::Consumed);
+        assert_eq!(state.input.text(), "z");
+    }
+
+    #[test]
+    fn p2_10_history_capped_at_capacity() {
+        let mut input = TuiInput::new();
+        for i in 0..(INPUT_HISTORY_CAPACITY + 5) {
+            type_str(&mut input, &format!("e{i}"));
+            input.handle_key(key(KeyCode::Enter));
+        }
+        assert_eq!(input.history.len(), INPUT_HISTORY_CAPACITY);
+        // Oldest entry was dropped.
+        assert!(!input.history.contains(&"e0".to_string()));
     }
 }
