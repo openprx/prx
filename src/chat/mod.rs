@@ -26,6 +26,7 @@ use crate::channels::{
     Channel, SendMessage, TerminalChannel, extract_tool_context_summary, is_context_window_overflow_error,
     sanitize_channel_response,
 };
+use crate::chat::terminal_proto::{DraftVersionCounter, DraftVersionTracker};
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
 use crate::memory::{self, Memory, MemoryCategory};
@@ -515,20 +516,45 @@ pub async fn run(
         };
 
         // Spawn background task: accumulate deltas → channel.update_draft()
-        // Follows the exact same pattern as process_channel_message in channels/mod.rs
+        // Follows the exact same pattern as process_channel_message in channels/mod.rs.
+        //
+        // P1-6 — Monotonic draft version protocol. Even though the delta mpsc itself
+        // is FIFO, the accumulated text is forwarded over additional channels inside
+        // the channel implementation (TerminalChannel → UiActor) where a late or
+        // duplicated message could otherwise visually rewind rendered text. The
+        // sender-side counter stamps each accumulated snapshot with a strictly
+        // monotonic `u64`; the receiver-side tracker drops any non-increasing
+        // arrival before issuing the `update_draft` call.
         let draft_updater = if let Some(ref d_id) = draft_id {
             let channel: Arc<TerminalChannel> = Arc::clone(&terminal);
             let reply_target = "user".to_string();
             let draft_id_owned = d_id.clone();
             let mut rx = delta_rx;
+            let version_counter = Arc::new(DraftVersionCounter::new());
+            let version_tracker = Arc::new(DraftVersionTracker::new());
             Some(tokio::spawn(async move {
                 let mut accumulated = String::new();
                 while let Some(delta) = rx.recv().await {
                     accumulated.push_str(&delta);
+                    let version = version_counter.next();
+                    if !version_tracker.accept(&draft_id_owned, version) {
+                        // Stale snapshot — drop to prevent visual rewind. In practice
+                        // unreachable here because counter is single-task monotonic,
+                        // but the guard is cheap and defends against future
+                        // re-architecting (e.g. parallel accumulator tasks).
+                        tracing::trace!(
+                            draft_id = %draft_id_owned,
+                            version,
+                            "dropping stale draft delta"
+                        );
+                        continue;
+                    }
                     if let Err(e) = channel.update_draft(&reply_target, &draft_id_owned, &accumulated).await {
                         tracing::debug!("Draft update failed: {e}");
                     }
                 }
+                // Stream ended — release per-draft version state.
+                version_tracker.clear(&draft_id_owned);
             }))
         } else {
             // No draft — consume delta_rx so the sender doesn't block
@@ -769,15 +795,35 @@ pub async fn run(
             &clean_response
         };
 
-        // Finalize the streaming draft with the full response
+        // Finalize the streaming draft with the full response.
+        //
+        // Idempotency contract (P1-4):
+        //   When a draft exists, the streamed deltas have already painted the
+        //   full response on screen via `update_draft`. `finalize_draft` is
+        //   only a structural close (locking in the final text for non-TTY
+        //   channels such as Telegram). On failure we therefore MUST NOT
+        //   re-send the whole message — that would duplicate output that the
+        //   user has already seen via the live stream. We log a warning and
+        //   carry on; the assistant turn is already in `history`, so the
+        //   conversation state remains consistent.
+        //
+        //   The "no draft" branch is the genuine first-send path (drafts were
+        //   never created, e.g. `send_draft` failed earlier and returned
+        //   `None`), so a normal `send` is correct and not a duplicate.
         if let Some(ref d_id) = draft_id {
             if let Err(e) = terminal.finalize_draft("user", d_id, display_response).await {
-                tracing::warn!("Failed to finalize draft: {e}");
-                let rendered = render_response(display_response);
-                let _ = terminal.send(&SendMessage::new(rendered, "user")).await;
+                if should_resend_on_finalize_failure(true) {
+                    let rendered = render_response(display_response);
+                    let _ = terminal.send(&SendMessage::new(rendered, "user")).await;
+                } else {
+                    tracing::warn!(
+                        error = %e,
+                        "finalize_draft failed; suppressing resend to preserve idempotency (user already saw streamed content)"
+                    );
+                }
             }
         } else {
-            // No draft was created — send as a complete message with highlighting
+            // No draft was created — send as a complete message with highlighting.
             let rendered = render_response(display_response);
             let _ = terminal.send(&SendMessage::new(rendered, "user")).await;
         }
@@ -822,6 +868,24 @@ pub async fn run(
 }
 
 // ── Response rendering ───────────────────────────────────────────────────
+
+/// Idempotency policy for the `finalize_draft` failure path.
+///
+/// Returns `true` if the caller should re-send the full response as a fresh
+/// message when `finalize_draft` returns `Err`. Today this is always `false`
+/// when a draft was active: streamed deltas have already painted the full
+/// text on screen via `update_draft`, so resending would duplicate the
+/// assistant turn (this was the P1-4 regression).
+///
+/// `had_active_draft = true` means a `send_draft` previously succeeded and
+/// the user has seen the streamed output. The function is intentionally a
+/// pure decision so it can be unit-tested without spinning up a channel.
+const fn should_resend_on_finalize_failure(had_active_draft: bool) -> bool {
+    // If a draft was active, the user already saw the streamed response —
+    // resending would duplicate it. The "no draft" path is handled by the
+    // caller directly (it is the genuine first send, not a fallback).
+    !had_active_draft
+}
 
 /// Apply markdown highlighting to a response (when terminal-tui feature is active).
 /// Falls back to plain formatting with newline wrapping.
@@ -898,4 +962,167 @@ async fn list_saved_sessions(mem: &dyn Memory) -> Result<()> {
     }
     println!("\nResume with: prx chat --session <ID>");
     Ok(())
+}
+
+#[cfg(test)]
+mod finalize_draft_fallback_tests {
+    //! Tests for the P1-4 idempotency contract: when `finalize_draft` fails
+    //! for an active draft, the chat loop must NOT re-send the full response
+    //! (the streamed deltas already delivered it). The "no draft" path is a
+    //! genuine first-send and is still allowed to call `send`.
+    use super::*;
+    use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Pure decision test: with an active draft, finalize failure must NOT trigger
+    /// a resend (would duplicate what the user already saw via stream).
+    #[test]
+    fn finalize_failure_with_active_draft_does_not_resend() {
+        assert!(
+            !should_resend_on_finalize_failure(true),
+            "active-draft finalize failure must be idempotent (no resend)"
+        );
+    }
+
+    /// Pure decision test: with no active draft, the caller still uses `send`
+    /// directly — that path is the first send, not a fallback resend.
+    /// `should_resend_on_finalize_failure(false)` returning `true` simply
+    /// documents that the "no draft" branch's normal send is allowed.
+    #[test]
+    fn no_active_draft_path_allows_send() {
+        assert!(
+            should_resend_on_finalize_failure(false),
+            "no-draft path must allow the normal send (this is a first send, not a duplicate)"
+        );
+    }
+
+    /// Mock channel that lets us script `finalize_draft` to fail and counts
+    /// every method call so we can assert no fallback resend occurs.
+    struct MockChannel {
+        finalize_should_fail: bool,
+        send_calls: AtomicUsize,
+        finalize_calls: AtomicUsize,
+    }
+
+    impl MockChannel {
+        fn new(finalize_should_fail: bool) -> Self {
+            Self {
+                finalize_should_fail,
+                send_calls: AtomicUsize::new(0),
+                finalize_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Channel for MockChannel {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+            Ok(Some("draft-1".to_string()))
+        }
+
+        async fn finalize_draft(&self, _recipient: &str, _message_id: &str, _text: &str) -> anyhow::Result<()> {
+            self.finalize_calls.fetch_add(1, Ordering::SeqCst);
+            if self.finalize_should_fail {
+                Err(anyhow::anyhow!("simulated finalize failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Replicates the production fallback control flow against a mock channel.
+    /// On finalize failure with an active draft, `send` must NOT be invoked.
+    async fn run_finalize_path(channel: Arc<MockChannel>, draft_id: Option<String>, display_response: &str) {
+        if let Some(ref d_id) = draft_id {
+            if let Err(e) = channel.finalize_draft("user", d_id, display_response).await {
+                if should_resend_on_finalize_failure(true) {
+                    let _ = channel.send(&SendMessage::new(display_response, "user")).await;
+                } else {
+                    tracing::warn!(error = %e, "finalize_draft failed; suppressing resend");
+                }
+            }
+        } else {
+            // First-send path (no draft was ever created)
+            let _ = channel.send(&SendMessage::new(display_response, "user")).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_failure_with_active_draft_suppresses_send() {
+        let ch = Arc::new(MockChannel::new(true));
+        run_finalize_path(Arc::clone(&ch), Some("draft-1".to_string()), "hello world").await;
+
+        assert_eq!(ch.finalize_calls.load(Ordering::SeqCst), 1, "finalize must run once");
+        assert_eq!(
+            ch.send_calls.load(Ordering::SeqCst),
+            0,
+            "finalize failure must NOT trigger a resend when a draft was active"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_success_does_not_resend() {
+        let ch = Arc::new(MockChannel::new(false));
+        run_finalize_path(Arc::clone(&ch), Some("draft-1".to_string()), "hello world").await;
+
+        assert_eq!(ch.finalize_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ch.send_calls.load(Ordering::SeqCst),
+            0,
+            "successful finalize must not produce any extra send"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_draft_path_sends_once() {
+        let ch = Arc::new(MockChannel::new(false));
+        run_finalize_path(Arc::clone(&ch), None, "hello world").await;
+
+        assert_eq!(
+            ch.finalize_calls.load(Ordering::SeqCst),
+            0,
+            "no-draft path must not call finalize"
+        );
+        assert_eq!(
+            ch.send_calls.load(Ordering::SeqCst),
+            1,
+            "no-draft path must send the response exactly once"
+        );
+    }
+
+    /// Regression guard: two consecutive turns where finalize fails on both
+    /// must produce zero extra `send` calls (the previous buggy behavior
+    /// resulted in 2 duplicate messages).
+    #[tokio::test]
+    async fn repeated_finalize_failures_never_resend() {
+        let ch = Arc::new(MockChannel::new(true));
+        run_finalize_path(Arc::clone(&ch), Some("draft-1".to_string()), "turn 1").await;
+        run_finalize_path(Arc::clone(&ch), Some("draft-2".to_string()), "turn 2").await;
+
+        assert_eq!(ch.finalize_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            ch.send_calls.load(Ordering::SeqCst),
+            0,
+            "repeated finalize failures must remain idempotent (no resends)"
+        );
+    }
 }
