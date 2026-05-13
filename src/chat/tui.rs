@@ -1107,11 +1107,14 @@ impl crate::channels::terminal::TuiMirrorSink for TuiStateMirrorSink {
 /// occupy in the output area. Always >= 1.
 fn estimate_line_height(line: &ConversationLine) -> usize {
     match line {
-        ConversationLine::User { content }
-        | ConversationLine::Assistant { content }
-        | ConversationLine::StreamingAssistant { content } => {
-            // header + body lines + trailing blank
-            content.lines().count().max(1) + 2
+        ConversationLine::User { content } => {
+            // First content line shares the row with the `> ` prompt; further
+            // rows render as continuations. Trailing blank separator.
+            content.lines().count().max(1) + 1
+        }
+        ConversationLine::Assistant { content } | ConversationLine::StreamingAssistant { content } => {
+            // No prefix row, just content + trailing blank.
+            content.lines().count().max(1) + 1
         }
         ConversationLine::System { content } => content.lines().count().max(1) + 1,
         ConversationLine::Tool { .. } => 1,
@@ -1119,15 +1122,20 @@ fn estimate_line_height(line: &ConversationLine) -> usize {
             folded,
             args_full,
             result,
+            status,
             ..
         } => {
-            if *folded {
+            // Claude-Code style: bullet header (1 row) + an optional follow-on
+            // block. While running there is no follow-on yet.
+            if matches!(status, ToolStatus::Running) {
                 1
+            } else if *folded {
+                // header + `⎿ Done (…)` summary row
+                2
             } else {
-                // header + "args:" line + args body + "result:" line + result body
-                let args_h = args_full.lines().count().max(1);
-                let result_h = result.as_deref().map(|r| r.lines().count().max(1)).unwrap_or(0);
-                1 + 1 + args_h + if result_h > 0 { 1 + result_h } else { 0 }
+                // header + first body row under hook + continuation rows
+                let body = result.as_deref().filter(|s| !s.is_empty()).unwrap_or(args_full);
+                1 + body.lines().count().max(1)
             }
         }
         ConversationLine::Reasoning { folded, content, .. } => {
@@ -1262,33 +1270,35 @@ fn render_output(frame: &mut Frame, area: Rect, state: &TuiState) {
 fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a ConversationLine, ascii: bool) {
     match conv_line {
         ConversationLine::User { content } => {
-            lines.push(Line::from(vec![Span::styled(
-                "> ",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            )]));
-            for text_line in content.lines() {
+            // Claude Code style: `> ` prompt in dim gray (no bold), content in
+            // default foreground on the same row when single-line; multi-line
+            // continuation rows are dedented two spaces to align under the
+            // first character after the `> ` prompt.
+            let mut iter = content.lines();
+            let first = iter.next().unwrap_or("");
+            lines.push(Line::from(vec![
+                Span::styled("> ", Style::default().fg(Color::DarkGray)),
+                Span::raw(first),
+            ]));
+            for text_line in iter {
                 lines.push(Line::from(format!("  {text_line}")));
             }
             lines.push(Line::from(""));
         }
         ConversationLine::Assistant { content } => {
-            lines.push(Line::from(vec![Span::styled(
-                "PRX: ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )]));
+            // Claude Code style: no prefix, no indicator. Content rendered at
+            // column 0 in the default terminal foreground, separated from the
+            // preceding user line by the trailing blank already pushed there.
             for text_line in content.lines() {
-                lines.push(Line::from(format!("  {text_line}")));
+                lines.push(Line::from(text_line));
             }
             lines.push(Line::from(""));
         }
         ConversationLine::StreamingAssistant { content } => {
-            // Same shape as Assistant so the layout is stable when the stream
-            // finalizes; the trailing cursor glyph (`▌`) signals to the user
-            // that more bytes are still inbound. ASCII fallback uses `_`.
-            lines.push(Line::from(vec![Span::styled(
-                "PRX: ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )]));
+            // Same shape as Assistant (no prefix). A trailing cursor glyph
+            // (`▌`, or `_` in ASCII mode) signals that more bytes are still
+            // inbound; once the stream finalises the variant becomes
+            // `Assistant` and the cursor disappears.
             let cursor = if ascii { "_" } else { "\u{258C}" }; // ▌
             let mut body_lines: Vec<&str> = content.lines().collect();
             if body_lines.is_empty() {
@@ -1297,30 +1307,33 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             let last_idx = body_lines.len().saturating_sub(1);
             for (i, text_line) in body_lines.iter().enumerate() {
                 let formatted = if i == last_idx {
-                    format!("  {text_line}{cursor}")
+                    format!("{text_line}{cursor}")
                 } else {
-                    format!("  {text_line}")
+                    (*text_line).to_string()
                 };
                 lines.push(Line::from(formatted));
             }
             lines.push(Line::from(""));
         }
         ConversationLine::System { content } => {
+            // Claude Code style: dim gray italic, no prefix or indent.
             for text_line in content.lines() {
                 lines.push(Line::from(Span::styled(
-                    format!("  {text_line}"),
-                    Style::default().fg(Color::DarkGray),
+                    text_line.to_string(),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                 )));
             }
             lines.push(Line::from(""));
         }
         ConversationLine::Tool { name, success } => {
-            let icon = if *success { "\u{2713}" } else { "\u{2717}" };
+            // Legacy single-line tool indicator. Same bullet shape as the
+            // richer ToolResult card so the two stay visually consistent.
+            let (bullet, _) = tool_card_glyphs(ascii);
             let color = if *success { Color::Green } else { Color::Red };
-            lines.push(Line::from(Span::styled(
-                format!("  {icon} {name}"),
-                Style::default().fg(color),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{bullet} "), Style::default().fg(color)),
+                Span::raw(name.as_str()),
+            ]));
         }
         ConversationLine::ToolResult {
             tool_name,
@@ -1349,8 +1362,19 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
     }
 }
 
-/// Render a `ToolResult` card. Folded → 1 line; expanded → header + args block
-/// + optional result block.
+/// Render a `ToolResult` card in Claude-Code style.
+///
+/// Folded layout (default):
+/// ```text
+/// ● Bash(ls /tmp)
+///   ⎿ Done (234ms · 12 lines)
+/// ```
+/// Expanded layout:
+/// ```text
+/// ● Bash(ls /tmp)
+///   ⎿ <result text, each line indented>
+/// ```
+/// While `Running` no follow-on row is shown — just the header `● Bash(ls /tmp)`.
 #[allow(clippy::too_many_arguments)]
 fn render_tool_result<'a>(
     lines: &mut Vec<Line<'a>>,
@@ -1363,126 +1387,154 @@ fn render_tool_result<'a>(
     folded: bool,
     ascii: bool,
 ) {
-    let (fold_glyph, color) = tool_card_glyph_and_color(status, folded, ascii);
-    let header = tool_card_header_text(fold_glyph, tool_name, status, elapsed_ms);
+    let (bullet, hook) = tool_card_glyphs(ascii);
+    let bullet_color = tool_bullet_color(status);
 
-    if folded {
-        // Folded: header + short args preview (so the user sees enough to
-        // decide whether to expand).
-        let summary = if args_preview.is_empty() {
-            header
-        } else {
-            format!("{header} {args_preview}")
-        };
-        lines.push(Line::from(Span::styled(summary, Style::default().fg(color))));
+    // Header: `● Tool(args_preview)` — bullet colored by status, name+args in
+    // default foreground.
+    let preview = if args_preview.is_empty() {
+        tool_name.to_string()
+    } else {
+        format!("{tool_name}({args_preview})")
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{bullet} "), Style::default().fg(bullet_color)),
+        Span::raw(preview),
+    ]));
+
+    // No follow-on row while still running — just the header is shown so the
+    // user sees an in-flight indicator. (The status bar / footer carry the
+    // spinner; the card itself reveals timing once we have it.)
+    if matches!(status, ToolStatus::Running) {
         return;
     }
 
-    // Expanded view: header (bold), args block, result block.
-    lines.push(Line::from(Span::styled(
-        header,
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(Span::styled(
-        "  args:".to_string(),
-        Style::default().fg(Color::DarkGray),
-    )));
-    for arg_line in args_full.lines() {
-        lines.push(Line::from(format!("    {arg_line}")));
+    if folded {
+        // Folded follow-on: `  ⎿ Done (234ms · 12 lines)` summary in dim gray.
+        let result_text = result.unwrap_or("");
+        let line_count = if result_text.is_empty() {
+            0
+        } else {
+            result_text.lines().count()
+        };
+        let status_word = match status {
+            ToolStatus::Running => "Running",
+            ToolStatus::Done => "Done",
+            ToolStatus::Error => "Error",
+        };
+        let mut parts: Vec<String> = vec![status_word.to_string()];
+        if let Some(ms) = elapsed_ms {
+            parts.push(format!("{ms}ms"));
+        }
+        if line_count > 0 {
+            parts.push(format!(
+                "{line_count} {}",
+                if line_count == 1 { "line" } else { "lines" }
+            ));
+        }
+        let summary = format!("  {hook} {}", parts.join(" \u{00B7} ")); // ·
+        lines.push(Line::from(Span::styled(summary, Style::default().fg(Color::DarkGray))));
+        return;
     }
+
+    // Expanded follow-on: result body indented under the hook glyph.
     if let Some(res) = result {
-        lines.push(Line::from(Span::styled(
-            "  result:".to_string(),
-            Style::default().fg(Color::DarkGray),
-        )));
-        for res_line in res.lines() {
-            lines.push(Line::from(format!("    {res_line}")));
+        let mut iter = res.lines();
+        if let Some(first) = iter.next() {
+            lines.push(Line::from(Span::styled(
+                format!("  {hook} {first}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+            for body in iter {
+                lines.push(Line::from(Span::styled(
+                    format!("    {body}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    } else {
+        // No result yet (Done with empty result, or Error with no payload).
+        // Fall back to args_full so the expanded view always has something.
+        let mut iter = args_full.lines();
+        if let Some(first) = iter.next() {
+            lines.push(Line::from(Span::styled(
+                format!("  {hook} {first}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+            for body in iter {
+                lines.push(Line::from(Span::styled(
+                    format!("    {body}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
         }
     }
 }
 
-/// Render a `Reasoning` card. Folded → 1 line summary; expanded → header
-/// followed by the indented body text.
+/// Render a `Reasoning` card in Claude-Code style.
 ///
-/// The folded summary is `<icon> [thinking N chars <fold-glyph>]`:
-/// - icon: `💭` (UTF-8) or `~` (ASCII fallback)
-/// - fold glyph: `▾` (UTF-8, folded — caller may press `Ctrl+R` to expand) or
-///   `▴` (UTF-8, expanded). ASCII: `v` / `^`.
+/// Folded → `✻ Thinking…` (or `* Thinking...` in ASCII), dim gray + italic.
+/// Expanded → header `✻ Thinking…` followed by the body, each line indented
+/// by two spaces and rendered in dim gray italic so the eye flows back to
+/// the visible assistant text below.
 ///
-/// In the expanded form each content line is indented by two spaces. We do
-/// NOT apply markdown / syntax highlighting here — that interacts with the
-/// P1-5 ANSI state machine and P2-9 diff renderer in ways that would need
-/// dedicated isolation; reasoning text is dimmed plain text so the user can
-/// always read it without ANSI bleed.
+/// We do NOT apply markdown / syntax highlighting here — that interacts with
+/// the P1-5 ANSI state machine and P2-9 diff renderer in ways that would
+/// need dedicated isolation; reasoning text is dimmed plain text so the user
+/// can always read it without ANSI bleed.
+///
+/// The `_char_count` parameter is retained for source compatibility with the
+/// `Reasoning` variant but no longer rendered — Claude Code keeps the folded
+/// summary minimal.
 fn render_reasoning_card<'a>(
     lines: &mut Vec<Line<'a>>,
     content: &'a str,
-    char_count: usize,
+    _char_count: usize,
     folded: bool,
     ascii: bool,
 ) {
-    let (icon, fold_glyph) = reasoning_card_glyphs(folded, ascii);
-    let header = format!("{icon} [thinking {char_count} chars {fold_glyph}]");
-    let header_style = Style::default().fg(Color::Magenta).add_modifier(Modifier::ITALIC);
+    let (icon, ellipsis) = reasoning_card_glyphs(ascii);
+    let header = format!("{icon} Thinking{ellipsis}");
+    let header_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
     lines.push(Line::from(Span::styled(header, header_style)));
 
     if folded {
         return;
     }
 
-    // Expanded: indent body 2 spaces, dimmed so the eye returns to the
-    // visible assistant text below.
+    let body_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
     for body_line in content.lines() {
-        lines.push(Line::from(Span::styled(
-            format!("  {body_line}"),
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled(format!("  {body_line}"), body_style)));
     }
 }
 
-/// Pick the leading icon (`💭` / `~`) and fold glyph (`▾▴` / `v^`) for a
-/// reasoning card. `folded=true` shows the "expand" hint (`▾` / `v`),
-/// `folded=false` shows the "collapse" hint (`▴` / `^`).
-const fn reasoning_card_glyphs(folded: bool, ascii: bool) -> (&'static str, &'static str) {
-    let icon = if ascii { "~" } else { "\u{1F4AD}" }; // 💭
-    let glyph = match (folded, ascii) {
-        (true, false) => "\u{25BE}",  // ▾ — folded, click to expand
-        (false, false) => "\u{25B4}", // ▴ — expanded, click to fold
-        (true, true) => "v",
-        (false, true) => "^",
-    };
-    (icon, glyph)
+/// Pick the leading sparkle icon (`✻` / `*`) and ellipsis (`…` / `...`) for
+/// a reasoning card. Claude Code uses the eight-pointed asterisk `✻` for the
+/// thinking indicator.
+const fn reasoning_card_glyphs(ascii: bool) -> (&'static str, &'static str) {
+    if ascii {
+        ("*", "...")
+    } else {
+        ("\u{273B}", "\u{2026}") // ✻ …
+    }
 }
 
-/// Pick the fold glyph (▸/▾ or >/v) and status color for a tool card.
-const fn tool_card_glyph_and_color(status: ToolStatus, folded: bool, ascii: bool) -> (&'static str, Color) {
-    let glyph = match (folded, ascii) {
-        (true, false) => "\u{25B8}",  // ▸
-        (false, false) => "\u{25BE}", // ▾
-        (true, true) => ">",
-        (false, true) => "v",
-    };
-    let color = match status {
+/// Pick the bullet (`●` / `*`) and hook glyph (`⎿` / `└`) used by tool cards.
+///
+/// Claude Code uses a single status-colored bullet for the header and a dim
+/// hook for the follow-on summary / body — far less visually noisy than the
+/// previous `[name] running...` header.
+const fn tool_card_glyphs(ascii: bool) -> (&'static str, &'static str) {
+    if ascii { ("*", "L") } else { ("\u{25CF}", "\u{23BF}") }
+}
+
+/// Status → bullet color: yellow while running, green on success, red on error.
+const fn tool_bullet_color(status: ToolStatus) -> Color {
+    match status {
         ToolStatus::Running => Color::Yellow,
         ToolStatus::Done => Color::Green,
         ToolStatus::Error => Color::Red,
-    };
-    (glyph, color)
-}
-
-/// Build the single-line header text shown on a tool card.
-///
-/// Example outputs:
-/// - `▸ [shell] running...`
-/// - `▾ [shell] done (234ms)`
-/// - `▸ [shell] error`
-fn tool_card_header_text(fold_glyph: &str, tool_name: &str, status: ToolStatus, elapsed_ms: Option<u64>) -> String {
-    let status_suffix = match status {
-        ToolStatus::Running => "running...".to_string(),
-        ToolStatus::Done => elapsed_ms.map_or_else(|| "done".to_string(), |ms| format!("done ({ms}ms)")),
-        ToolStatus::Error => elapsed_ms.map_or_else(|| "error".to_string(), |ms| format!("error ({ms}ms)")),
-    };
-    format!("{fold_glyph} [{tool_name}] {status_suffix}")
+    }
 }
 
 fn render_input(frame: &mut Frame, area: Rect, state: &TuiState) {
@@ -1494,7 +1546,9 @@ fn render_input(frame: &mut Frame, area: Rect, state: &TuiState) {
         .enumerate()
         .map(|(idx, content)| {
             let prefix = if idx == 0 {
-                Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                // Claude Code uses a dim cyan `> ` prompt (no bold) — calmer
+                // than the previous bright bold cyan.
+                Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM))
             } else {
                 Span::raw("  ")
             };
@@ -1540,8 +1594,12 @@ fn render_input(frame: &mut Frame, area: Rect, state: &TuiState) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect) {
-    let footer = Paragraph::new(" Ctrl+C cancel | Ctrl+D exit | /help commands | ↑↓ history ")
-        .style(Style::default().fg(Color::DarkGray));
+    // Claude Code style: dim gray, middle-dot separators, action-oriented
+    // hints rather than key/label pairs.
+    let footer = Paragraph::new(
+        " ! for bash \u{00B7} / for commands \u{00B7} Tab to fold \u{00B7} Ctrl+R to expand \u{00B7} Esc to cancel ",
+    )
+    .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
 }
 
@@ -1902,9 +1960,11 @@ mod tests {
         // The streaming body must contain the in-flight tokens AND end with
         // the streaming cursor glyph — confirms it routed through the
         // StreamingAssistant variant rather than the finalized Assistant one.
+        // With the Claude-Code-style header removed, the body now lands at
+        // `history_end` itself.
         let streaming_body: String = lines
-            .get(history_end + 1)
-            .expect("test: body line present after header")
+            .get(history_end)
+            .expect("test: body line present")
             .iter()
             .map(ratatui::text::Span::to_string)
             .collect();
@@ -1925,11 +1985,11 @@ mod tests {
         };
         let mut sink: Vec<Line<'_>> = Vec::new();
         render_conversation_line(&mut sink, &line, false);
-        // Header + body + trailing blank.
-        assert_eq!(sink.len(), 3, "streaming assistant renders 3 lines");
+        // Claude Code style: no `PRX:` header → body + trailing blank only.
+        assert_eq!(sink.len(), 2, "streaming assistant renders body+blank");
         // Body must contain the content and end with the unicode cursor glyph.
         let body_text: String = sink
-            .get(1)
+            .first()
             .expect("test: body line present")
             .iter()
             .map(ratatui::text::Span::to_string)
@@ -1941,7 +2001,7 @@ mod tests {
         let mut sink2: Vec<Line<'_>> = Vec::new();
         render_conversation_line(&mut sink2, &line, true);
         let body2: String = sink2
-            .get(1)
+            .first()
             .expect("test: body line present")
             .iter()
             .map(ratatui::text::Span::to_string)
@@ -1954,7 +2014,8 @@ mod tests {
         let line = ConversationLine::StreamingAssistant { content: String::new() };
         let mut sink: Vec<Line<'_>> = Vec::new();
         render_conversation_line(&mut sink, &line, false);
-        assert_eq!(sink.len(), 3, "empty stream still produces header+body+blank");
+        // Empty stream still produces 1 cursor row + 1 blank separator.
+        assert_eq!(sink.len(), 2, "empty stream still produces body+blank");
     }
 
     #[test]
@@ -2093,7 +2154,9 @@ mod tests {
             folded: true,
         };
         render_conversation_line(&mut lines, &card, false);
-        assert_eq!(lines.len(), 1, "folded card renders to 1 line");
+        // Claude-Code style: while running we render just the bullet header
+        // (`● shell(ls)`) with no follow-on summary row yet.
+        assert_eq!(lines.len(), 1, "running folded card renders to 1 line");
         let rendered: String = lines
             .first()
             .expect("test: at least one line")
@@ -2101,9 +2164,37 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(rendered.contains("\u{25B8}"), "uses ▸ glyph: {rendered}");
-        assert!(rendered.contains("[shell]"));
-        assert!(rendered.contains("running..."));
+        assert!(rendered.contains("\u{25CF}"), "uses ● bullet: {rendered}");
+        assert!(rendered.contains("shell(ls)"), "shows Tool(args) preview: {rendered}");
+    }
+
+    #[test]
+    fn render_folded_tool_card_done_shows_hook_summary() {
+        // Claude-Code style follow-on: `  ⎿ Done (234ms · 3 lines)` under the
+        // bullet header once the tool finishes.
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let card = ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "ls".to_string(),
+            args_full: "ls".to_string(),
+            result: Some("a\nb\nc".to_string()),
+            status: ToolStatus::Done,
+            elapsed_ms: Some(234),
+            folded: true,
+        };
+        render_conversation_line(&mut lines, &card, false);
+        assert_eq!(lines.len(), 2, "done folded card renders header + summary");
+        let summary: String = lines
+            .get(1)
+            .expect("test: summary line present")
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(summary.contains("\u{23BF}"), "uses ⎿ hook glyph: {summary}");
+        assert!(summary.contains("Done"), "shows status word: {summary}");
+        assert!(summary.contains("234ms"), "shows elapsed ms: {summary}");
+        assert!(summary.contains("3 lines"), "shows result line count: {summary}");
     }
 
     #[test]
@@ -2119,8 +2210,11 @@ mod tests {
             folded: false,
         };
         render_conversation_line(&mut lines, &card, false);
-        // header + "args:" + 1 args body + "result:" + 2 result body = 6
-        assert_eq!(lines.len(), 6, "expanded card line count: {}", lines.len());
+        // Claude-Code style expanded:
+        //   row 0  `● shell(ls)`               — bullet header
+        //   row 1  `  ⎿ total 24`              — first body row under hook
+        //   row 2  `    drwxrwxrwt`            — continuation
+        assert_eq!(lines.len(), 3, "expanded card line count: {}", lines.len());
         let join = |i: usize| -> String {
             lines
                 .get(i)
@@ -2130,27 +2224,27 @@ mod tests {
                 .map(|s| s.content.as_ref())
                 .collect()
         };
-        assert!(join(0).contains("\u{25BE}"), "uses ▾ glyph");
-        assert!(join(0).contains("done (234ms)"));
-        assert!(join(1).contains("args:"));
-        assert!(join(2).contains("ls -la /tmp"));
-        assert!(join(3).contains("result:"));
-        assert!(join(4).contains("total 24"));
+        assert!(join(0).contains("\u{25CF}"), "uses ● bullet: {}", join(0));
+        assert!(join(0).contains("shell(ls)"), "shows Tool(args): {}", join(0));
+        assert!(
+            join(1).contains("\u{23BF}"),
+            "uses ⎿ hook on first body row: {}",
+            join(1)
+        );
+        assert!(join(1).contains("total 24"), "first body row: {}", join(1));
+        assert!(join(2).contains("drwxrwxrwt"), "second body row: {}", join(2));
     }
 
     #[test]
     fn render_tool_card_status_glyphs_and_colors() {
-        // Running → yellow + ▸
-        let (g, c) = tool_card_glyph_and_color(ToolStatus::Running, true, false);
-        assert_eq!(g, "\u{25B8}");
-        assert_eq!(c, Color::Yellow);
-        // Done → green + ▾ when expanded
-        let (g, c) = tool_card_glyph_and_color(ToolStatus::Done, false, false);
-        assert_eq!(g, "\u{25BE}");
-        assert_eq!(c, Color::Green);
-        // Error → red
-        let (_, c) = tool_card_glyph_and_color(ToolStatus::Error, true, false);
-        assert_eq!(c, Color::Red);
+        // Bullet color tracks status — yellow while running, green on success,
+        // red on error. The bullet glyph itself does not change.
+        let (bullet, hook) = tool_card_glyphs(false);
+        assert_eq!(bullet, "\u{25CF}", "unicode bullet ●");
+        assert_eq!(hook, "\u{23BF}", "unicode hook ⎿");
+        assert_eq!(tool_bullet_color(ToolStatus::Running), Color::Yellow);
+        assert_eq!(tool_bullet_color(ToolStatus::Done), Color::Green);
+        assert_eq!(tool_bullet_color(ToolStatus::Error), Color::Red);
     }
 
     #[test]
@@ -2167,7 +2261,11 @@ mod tests {
         } else {
             panic!("test: expected ToolResult");
         }
-        // Render in ASCII mode → glyph is ">"
+        // Render in ASCII mode → bullet is `*`, hook is `L`.
+        let (bullet, hook) = tool_card_glyphs(true);
+        assert_eq!(bullet, "*", "ASCII bullet");
+        assert_eq!(hook, "L", "ASCII hook");
+
         let card = ConversationLine::ToolResult {
             tool_name: "t".to_string(),
             args_preview: String::new(),
@@ -2186,29 +2284,18 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(rendered.starts_with('>'), "ASCII fold glyph: {rendered}");
-    }
-
-    #[test]
-    fn header_text_for_each_status() {
-        assert_eq!(
-            tool_card_header_text("\u{25B8}", "shell", ToolStatus::Running, None),
-            "\u{25B8} [shell] running..."
-        );
-        assert_eq!(
-            tool_card_header_text("\u{25BE}", "shell", ToolStatus::Done, Some(234)),
-            "\u{25BE} [shell] done (234ms)"
-        );
-        assert_eq!(
-            tool_card_header_text("\u{25B8}", "shell", ToolStatus::Error, None),
-            "\u{25B8} [shell] error"
-        );
+        assert!(rendered.starts_with("* "), "ASCII bullet header: {rendered}");
     }
 
     #[test]
     fn total_content_lines_counts_folded_vs_expanded() {
+        // Claude-Code style cards only differ in row count *after* the tool
+        // has finished — while running, both folded and expanded views show
+        // just the bullet header. Mark the result done first so the folded
+        // view gets its `⎿ Done` summary and the expanded view gets the body.
         let mut state = TuiState::new("p", "m");
         state.push_tool_result_started("shell", "x");
+        state.mark_last_tool_result_finished("shell", true, 12, Some("line1\nline2\nline3".to_string()));
         let folded_total = state.total_content_lines();
         state.toggle_last_tool_result_folded();
         let expanded_total = state.total_content_lines();
@@ -2424,9 +2511,12 @@ mod tests {
         render_conversation_line(&mut lines, &card, false);
         assert_eq!(lines.len(), 1, "folded card is exactly one line");
         let rendered = line_text(lines.first().expect("test: first line"));
-        assert!(rendered.contains("\u{1F4AD}"), "uses 💭 icon: {rendered}");
-        assert!(rendered.contains("[thinking 45 chars"), "shows char count: {rendered}");
-        assert!(rendered.contains("\u{25BE}"), "shows ▾ expand glyph: {rendered}");
+        // Claude-Code style: `✻ Thinking…` — sparkle icon, no char count.
+        assert!(rendered.contains("\u{273B}"), "uses ✻ icon: {rendered}");
+        assert!(rendered.contains("Thinking"), "shows Thinking label: {rendered}");
+        assert!(rendered.contains("\u{2026}"), "ends with … ellipsis: {rendered}");
+        // Char count must NOT be exposed in the minimal Claude-Code summary.
+        assert!(!rendered.contains("45 chars"), "no char count: {rendered}");
         // Folded summary must NOT leak the body text.
         assert!(!rendered.contains("Step 1"), "body hidden when folded: {rendered}");
     }
@@ -2444,7 +2534,11 @@ mod tests {
         // 1 header + 3 body rows = 4 lines.
         assert_eq!(lines.len(), 4, "header + 3 body rows: {}", lines.len());
         let header = line_text(lines.first().expect("test: header"));
-        assert!(header.contains("\u{25B4}"), "expanded shows ▴ collapse glyph: {header}");
+        assert!(header.contains("\u{273B}"), "expanded header still shows ✻: {header}");
+        assert!(
+            header.contains("Thinking"),
+            "expanded header still says Thinking: {header}"
+        );
         // Each body row begins with "  " indent.
         for (idx, original) in body.lines().enumerate() {
             let rendered = line_text(lines.get(idx + 1).expect("test: body line"));
@@ -2462,13 +2556,13 @@ mod tests {
         };
         render_conversation_line(&mut lines, &card, true);
         let rendered = line_text(lines.first().expect("test: first line"));
-        // ASCII icon and glyph.
-        assert!(rendered.starts_with("~ "), "ASCII icon ~: {rendered}");
-        assert!(rendered.contains(" v]"), "ASCII fold glyph v: {rendered}");
-        assert!(!rendered.contains("\u{1F4AD}"), "no 💭 in ASCII mode: {rendered}");
-        assert!(!rendered.contains("\u{25BE}"), "no ▾ in ASCII mode: {rendered}");
+        // ASCII icon `*` and dot-dot-dot ellipsis.
+        assert!(rendered.starts_with("* "), "ASCII icon *: {rendered}");
+        assert!(rendered.contains("Thinking..."), "ASCII ellipsis ...: {rendered}");
+        assert!(!rendered.contains("\u{273B}"), "no ✻ in ASCII mode: {rendered}");
+        assert!(!rendered.contains("\u{2026}"), "no … in ASCII mode: {rendered}");
 
-        // Expanded ASCII shows ^.
+        // Expanded ASCII uses same header glyph (no separate collapse icon).
         let mut lines2: Vec<Line<'_>> = Vec::new();
         let expanded = ConversationLine::Reasoning {
             content: "x".to_string(),
@@ -2477,7 +2571,7 @@ mod tests {
         };
         render_conversation_line(&mut lines2, &expanded, true);
         let header = line_text(lines2.first().expect("test: expanded header"));
-        assert!(header.contains(" ^]"), "ASCII expand glyph ^: {header}");
+        assert!(header.starts_with("* Thinking..."), "ASCII expanded header: {header}");
     }
 
     #[test]
@@ -2500,12 +2594,11 @@ mod tests {
 
     #[test]
     fn reasoning_card_glyphs_table() {
-        // UTF-8.
-        assert_eq!(reasoning_card_glyphs(true, false), ("\u{1F4AD}", "\u{25BE}"));
-        assert_eq!(reasoning_card_glyphs(false, false), ("\u{1F4AD}", "\u{25B4}"));
-        // ASCII fallback.
-        assert_eq!(reasoning_card_glyphs(true, true), ("~", "v"));
-        assert_eq!(reasoning_card_glyphs(false, true), ("~", "^"));
+        // Claude-Code style: a sparkle (`✻` / `*`) plus an ellipsis (`…` /
+        // `...`). The fold state no longer changes the glyph — folded vs
+        // expanded is communicated by row count rather than icon swap.
+        assert_eq!(reasoning_card_glyphs(false), ("\u{273B}", "\u{2026}"));
+        assert_eq!(reasoning_card_glyphs(true), ("*", "..."));
     }
 
     // ── P2-10: TuiInput multi-line + history tests ───────────────────────────
