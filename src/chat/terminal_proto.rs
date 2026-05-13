@@ -1,7 +1,9 @@
 //! Terminal protocol utilities: inline image preview (kitty/iTerm2),
-//! OSC 52 clipboard support for code block copying, and monotonic
-//! version tracking for streaming draft deltas (P1-6).
+//! OSC 52 clipboard support for code block copying, monotonic version
+//! tracking for streaming draft deltas (P1-6), and the incremental
+//! inline-redraw protocol for fine-grained line-range replacement (P2-11).
 
+use async_trait::async_trait;
 use base64::Engine;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -98,6 +100,123 @@ impl DraftVersionTracker {
     /// Number of drafts currently tracked. For diagnostics/tests.
     pub fn tracked_count(&self) -> usize {
         self.inner.lock().len()
+    }
+}
+
+// ── Incremental inline-redraw protocol (P2-11) ──────────────────────────────
+//
+// The base `Channel::update_draft` protocol (in `crate::channels::traits`)
+// rewrites the entire accumulated draft text on every delta. This is correct
+// but expensive when the only thing changing is, e.g., the last line of a
+// progress bar or a single revised line in the middle of a long block.
+//
+// `InlineDraftProtocol` is a sibling capability trait: it lets a sender ask
+// the receiver to replace a contiguous range of lines inside an existing
+// draft, leaving the rest untouched. The default implementation declines
+// (`LineProtocolError::NotSupported`); senders should treat this as a signal
+// to fall back to `update_draft` with the full snapshot.
+//
+// Per draft id, line ranges are 0-indexed against the draft's current line
+// vector and `line_count == 0` means "insert at `start_line` without
+// removing anything". Stale or duplicate `version` values are rejected via
+// `DraftVersionTracker` so that out-of-order arrivals across the streaming
+// pipeline cannot visually "rewind" the rendered text.
+
+/// Typed errors for the incremental inline-redraw protocol.
+#[derive(Debug, thiserror::Error)]
+pub enum LineProtocolError {
+    /// The receiving channel does not implement fine-grained line redraw.
+    /// Callers should fall back to a full `update_draft` snapshot.
+    #[error("incremental line redraw not supported by this channel")]
+    NotSupported,
+
+    /// The arriving `version` is not strictly greater than the last accepted
+    /// version for this draft. The delta has been dropped.
+    #[error("stale draft version {got} (current high-water mark: {current})")]
+    StaleVersion { got: u64, current: u64 },
+
+    /// The requested `[start_line, start_line + line_count)` range exceeds the
+    /// current draft length. The buffer was not mutated.
+    #[error("line range out of bounds: start={start}, count={count}, current_len={current_len}")]
+    RangeOutOfBounds {
+        start: usize,
+        count: usize,
+        current_len: usize,
+    },
+
+    /// No draft with the given id is currently tracked.
+    #[error("unknown draft id `{0}`")]
+    UnknownDraft(String),
+}
+
+/// Apply a line-range replacement to an in-place `Vec<String>` buffer.
+///
+/// - `start` is the 0-indexed line at which the replacement begins.
+/// - `count` is the number of existing lines to remove. `count == 0` makes
+///   this an insertion at `start`.
+/// - `new_content` is split on `'\n'` and each segment becomes one line.
+///   An empty `new_content` inserts nothing.
+///
+/// Returns `RangeOutOfBounds` if `start + count` exceeds `lines.len()`.
+/// On error the buffer is left unmodified.
+pub fn apply_line_replacement(
+    lines: &mut Vec<String>,
+    start: usize,
+    count: usize,
+    new_content: &str,
+) -> Result<(), LineProtocolError> {
+    let end = start.checked_add(count).ok_or(LineProtocolError::RangeOutOfBounds {
+        start,
+        count,
+        current_len: lines.len(),
+    })?;
+    if end > lines.len() {
+        return Err(LineProtocolError::RangeOutOfBounds {
+            start,
+            count,
+            current_len: lines.len(),
+        });
+    }
+    // `new_content == ""` should insert zero lines (not a single empty line),
+    // matching the natural "delete N lines" semantics when count > 0.
+    let replacement: Vec<String> = if new_content.is_empty() {
+        Vec::new()
+    } else {
+        new_content.split('\n').map(str::to_owned).collect()
+    };
+    lines.splice(start..end, replacement);
+    Ok(())
+}
+
+/// Fine-grained inline-redraw capability: replace `[start_line, start_line + line_count)`
+/// inside an existing draft without rewriting the whole snapshot.
+///
+/// This is intentionally a **sibling** trait of `crate::channels::traits::Channel`
+/// rather than an extension of it. Implementations that don't need precise
+/// redraws simply don't implement this trait, and senders can detect the
+/// `LineProtocolError::NotSupported` default and fall back to `update_draft`.
+#[async_trait]
+pub trait InlineDraftProtocol: Send + Sync {
+    /// Replace lines `[start_line, start_line + line_count)` of `draft_id`
+    /// with `new_content` (split on `'\n'`).
+    ///
+    /// - `role` is the conversation role (e.g. `"assistant"`); implementations
+    ///   that don't distinguish may ignore it.
+    /// - `version` must come from a [`DraftVersionCounter`] shared with all
+    ///   producers writing into this draft. Stale arrivals are rejected.
+    ///
+    /// The default implementation rejects all calls with
+    /// [`LineProtocolError::NotSupported`].
+    async fn replace_lines(
+        &self,
+        _role: &str,
+        _draft_id: &str,
+        _start_line: usize,
+        _line_count: usize,
+        _new_content: &str,
+        _version: u64,
+    ) -> Result<(), LineProtocolError> {
+        Err(LineProtocolError::NotSupported)
     }
 }
 
@@ -399,5 +518,80 @@ mod tests {
             assert!(tracker.accept("draft-x", v));
         }
         assert_eq!(tracker.current("draft-x"), Some(10));
+    }
+
+    // ── Incremental inline-redraw protocol tests (P2-11) ────────────────────
+
+    fn lines_of(slice: &[&str]) -> Vec<String> {
+        slice.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn apply_line_replacement_replaces_middle_range() {
+        let mut buf = lines_of(&["a", "b", "c", "d", "e"]);
+        apply_line_replacement(&mut buf, 1, 3, "X\nY").expect("test: in-range replace");
+        assert_eq!(buf, lines_of(&["a", "X", "Y", "e"]));
+    }
+
+    #[test]
+    fn apply_line_replacement_with_zero_count_inserts() {
+        let mut buf = lines_of(&["a", "b", "c"]);
+        apply_line_replacement(&mut buf, 2, 0, "X\nY").expect("test: insert");
+        assert_eq!(buf, lines_of(&["a", "b", "X", "Y", "c"]));
+    }
+
+    #[test]
+    fn apply_line_replacement_empty_new_content_deletes_range() {
+        let mut buf = lines_of(&["a", "b", "c", "d"]);
+        apply_line_replacement(&mut buf, 1, 2, "").expect("test: delete-only");
+        assert_eq!(buf, lines_of(&["a", "d"]));
+    }
+
+    #[test]
+    fn apply_line_replacement_rejects_out_of_bounds() {
+        let mut buf = lines_of(&["a", "b"]);
+        let err = apply_line_replacement(&mut buf, 1, 5, "X").expect_err("test: must reject");
+        assert!(matches!(
+            err,
+            LineProtocolError::RangeOutOfBounds {
+                start: 1,
+                count: 5,
+                current_len: 2
+            }
+        ));
+        // Buffer must be untouched on error.
+        assert_eq!(buf, lines_of(&["a", "b"]));
+    }
+
+    #[test]
+    fn apply_line_replacement_rejects_overflow() {
+        let mut buf = lines_of(&["a"]);
+        let err = apply_line_replacement(&mut buf, usize::MAX, 1, "X").expect_err("test: overflow");
+        assert!(matches!(err, LineProtocolError::RangeOutOfBounds { .. }));
+        assert_eq!(buf, lines_of(&["a"]));
+    }
+
+    #[test]
+    fn apply_line_replacement_at_end_is_append() {
+        let mut buf = lines_of(&["a", "b"]);
+        apply_line_replacement(&mut buf, 2, 0, "c\nd").expect("test: append");
+        assert_eq!(buf, lines_of(&["a", "b", "c", "d"]));
+    }
+
+    /// Fixture exercising only the trait default impl (no override). Verifies
+    /// the not-supported fallback contract for channels that do not implement
+    /// fine-grained line redraw.
+    struct DefaultOnlyChannel;
+    #[async_trait]
+    impl InlineDraftProtocol for DefaultOnlyChannel {}
+
+    #[tokio::test]
+    async fn default_impl_returns_not_supported() {
+        let ch = DefaultOnlyChannel;
+        let err = ch
+            .replace_lines("assistant", "draft-1", 0, 1, "X", 1)
+            .await
+            .expect_err("test: default must decline");
+        assert!(matches!(err, LineProtocolError::NotSupported));
     }
 }
