@@ -231,10 +231,10 @@ fn is_diff_block(buffer: &str, language: Option<&str>) -> bool {
     if saw_hunk {
         return true;
     }
-    match first_nonempty {
-        Some(l) if l.starts_with("diff --git ") || l.starts_with("--- a/") || l.starts_with("--- /") => true,
-        _ => false,
-    }
+    matches!(
+        first_nonempty,
+        Some(l) if l.starts_with("diff --git ") || l.starts_with("--- a/") || l.starts_with("--- /")
+    )
 }
 
 /// Render a unified diff with per-line ANSI colouring.
@@ -334,13 +334,10 @@ fn classify_diff_line(line: &str) -> DiffLineKind {
 
 /// Split `line` into `(content, eol)` where `eol` is `\n`, `\r\n`, or empty.
 fn split_eol(line: &str) -> (&str, &str) {
-    if let Some(stripped) = line.strip_suffix("\r\n") {
-        (stripped, "\r\n")
-    } else if let Some(stripped) = line.strip_suffix('\n') {
-        (stripped, "\n")
-    } else {
-        (line, "")
-    }
+    line.strip_suffix("\r\n").map_or_else(
+        || line.strip_suffix('\n').map_or((line, ""), |stripped| (stripped, "\n")),
+        |stripped| (stripped, "\r\n"),
+    )
 }
 
 /// Render markdown text with code block highlighting.
