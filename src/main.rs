@@ -896,13 +896,25 @@ async fn main() -> Result<()> {
         return spec.generate(&target, *force);
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .finish();
-
-    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
-        eprintln!("failed to set default tracing subscriber: {e}");
+    // Initialize logging - respects RUST_LOG env var, defaults to INFO.
+    // For `chat` subcommand, force logs to stderr so that --plain mode stdout
+    // output (model replies) is never polluted by INFO/WARN/ERROR log lines.
+    let use_stderr = matches!(cli.command, Commands::Chat { .. });
+    if use_stderr {
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+            .with_writer(std::io::stderr)
+            .finish();
+        if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+            eprintln!("failed to set default tracing subscriber: {e}");
+        }
+    } else {
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+            .finish();
+        if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+            eprintln!("failed to set default tracing subscriber: {e}");
+        }
     }
 
     // Onboard runs quick setup by default, or the interactive wizard with --interactive.
