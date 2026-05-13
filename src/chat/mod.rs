@@ -168,6 +168,255 @@ fn collect_reasoning_from_history_slice(slice: &[ChatMessage]) -> String {
     parts.join("\n\n")
 }
 
+// ── P3-2: TerminalGuard RAII + strengthened panic hook ──────────────────────
+
+/// Best-effort terminal restoration used by both [`TerminalGuard`] (on Drop /
+/// manual `leave`) and the chat panic hook installed via
+/// [`install_chat_panic_hook`].
+///
+/// Sequence (reverse of entry):
+///   1. Show cursor
+///   2. `LeaveAlternateScreen`
+///   3. `disable_raw_mode`
+///
+/// Every step swallows its error: by the time this runs we are already on the
+/// cleanup path (Drop or panic unwind) and there is no caller left to surface
+/// the failure to. Errors are silently dropped — logging is intentionally
+/// avoided to keep this callable from a panic hook without re-entering the
+/// tracing machinery.
+fn restore_terminal_state() {
+    // 1. Show cursor + leave alternate screen, written to stdout (matches
+    //    where we entered it). stderr is also valid but we keep parity with
+    //    `TerminalGuard::enter` which writes to stdout.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::cursor::Show,
+        crossterm::terminal::LeaveAlternateScreen,
+    );
+    // 2. Disable raw mode last so any escape sequences emitted above are
+    //    interpreted by the terminal as expected.
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
+/// RAII guard for the chat TUI terminal state.
+///
+/// Owns the entry side-effects (`enable_raw_mode` + `EnterAlternateScreen` +
+/// hide cursor) and guarantees they are reversed exactly once on Drop —
+/// whether by normal return, `?` early-exit, or panic unwinding. The
+/// strengthened panic hook in [`install_chat_panic_hook`] provides
+/// defence-in-depth for non-unwind aborts and for panics that happen before a
+/// guard exists.
+///
+/// `enter()` is *transactional*: if either step (raw mode → alternate screen)
+/// fails, any already-applied step is rolled back before returning `Err`, so a
+/// failed enter never leaves the terminal in a half-modified state.
+///
+/// Note: this type is defined ahead of the P3-3 ratatui draw loop wiring. It
+/// is intentionally **not** invoked from [`run`] yet — see the inline comment
+/// in `run` for the integration point.
+pub struct TerminalGuard {
+    /// True while raw mode is currently enabled by *this* guard.
+    raw_mode_active: std::sync::atomic::AtomicBool,
+    /// True while we are currently inside the alternate screen + hidden
+    /// cursor state owned by *this* guard.
+    alt_screen_active: std::sync::atomic::AtomicBool,
+}
+
+impl TerminalGuard {
+    /// Enter raw mode + alternate screen + hide cursor.
+    ///
+    /// Transactional: on partial failure (e.g. raw mode succeeded but
+    /// alternate screen failed) the partially-applied state is rolled back
+    /// before returning `Err`, so callers never need to clean up after a
+    /// failed `enter`.
+    pub fn enter() -> Result<Self> {
+        use std::sync::atomic::AtomicBool;
+
+        // Step 1: raw mode.
+        crossterm::terminal::enable_raw_mode()
+            .map_err(|e| anyhow::anyhow!("failed to enable raw mode for chat TUI: {e}"))?;
+
+        // Step 2: alternate screen + hide cursor. If this fails, roll back
+        // step 1 before propagating the error.
+        if let Err(e) = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::cursor::Hide,
+        ) {
+            // Best-effort rollback — already on error path, ignore failure.
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(anyhow::anyhow!("failed to enter alternate screen for chat TUI: {e}"));
+        }
+
+        Ok(Self {
+            raw_mode_active: AtomicBool::new(true),
+            alt_screen_active: AtomicBool::new(true),
+        })
+    }
+
+    /// Manual early teardown (e.g. before spawning a child process that
+    /// needs a clean terminal). Idempotent — subsequent calls (including the
+    /// Drop hook) are a no-op.
+    ///
+    /// Uses two CAS operations so concurrent `leave()` / `drop()` from
+    /// different threads is safe: only the first caller to flip the flag
+    /// actually issues the crossterm calls.
+    pub fn leave(&self) {
+        use std::sync::atomic::Ordering;
+
+        // Order mirrors the reverse of entry: cursor + alt screen first,
+        // raw mode last.
+        if self
+            .alt_screen_active
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::cursor::Show,
+                crossterm::terminal::LeaveAlternateScreen,
+            );
+        }
+        if self
+            .raw_mode_active
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.leave();
+    }
+}
+
+/// Install the chat-specific panic hook.
+///
+/// The hook restores the terminal (show cursor, leave alternate screen,
+/// disable raw mode) **before** delegating to the previously installed hook
+/// — so backtraces print to a usable terminal instead of a "bricked" raw-mode
+/// alternate buffer.
+///
+/// A `OnceLock` guards against multiple concurrent panics each trying to run
+/// the restoration sequence: only the first panic actually issues the
+/// crossterm calls, subsequent panics skip straight to the chained backtrace
+/// printer. This avoids fighting with `TerminalGuard::leave` (which may also
+/// be running on the unwinding thread) and with each other.
+///
+/// Safe to call multiple times — only the first call installs the hook; later
+/// calls return without rewrapping (avoids unbounded nesting and the original
+/// hook being lost behind layers of restoration calls).
+fn install_chat_panic_hook() {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    if INSTALLED.set(()).is_err() {
+        // Already installed by a previous call — do not stack another layer.
+        return;
+    }
+
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Defence in depth: even if a `TerminalGuard` is unwinding through
+        // Drop on the panicking thread, this runs first (panic hook fires
+        // before stack unwind) so the terminal is usable when the chained
+        // hook prints the backtrace.
+        //
+        // A `OnceLock` ensures restoration runs at most once per process
+        // even if multiple threads panic concurrently — preventing
+        // interleaved escape sequences.
+        static RESTORED: OnceLock<()> = OnceLock::new();
+        if RESTORED.set(()).is_ok() {
+            restore_terminal_state();
+        }
+        original_hook(info);
+    }));
+}
+
+// ── P3-1: Redirect tracing to ~/.openprx/chat.log during chat ────────────
+
+/// RAII guard owning the `tracing_appender` non-blocking worker. When dropped
+/// it:
+///   1. swaps the global tracing writer back to stderr (best-effort), so
+///      any post-chat logs (e.g. shutdown errors) remain visible;
+///   2. drops `_worker_guard`, which flushes and joins the appender thread.
+///
+/// Held for the lifetime of `chat::run`. If construction fails we keep the
+/// existing stderr writer — no panics, no silent data loss.
+pub(crate) struct TracingChatGuard {
+    _worker_guard: tracing_appender::non_blocking::WorkerGuard,
+}
+
+impl Drop for TracingChatGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = crate::CHAT_TRACING_RELOAD.get() {
+            let stderr_writer = tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr);
+            let layer = tracing_subscriber::fmt::Layer::default().with_writer(stderr_writer);
+            if let Err(e) = handle.reload(layer) {
+                eprintln!("warning: failed to restore stderr tracing writer: {e}");
+            }
+        }
+        // _worker_guard drops next → tracing-appender flushes pending lines.
+    }
+}
+
+/// Compute `~/.openprx/` (or `$HOME/.openprx/`) for the chat log directory.
+fn resolve_chat_log_dir() -> Result<std::path::PathBuf> {
+    if let Some(dirs) = directories::UserDirs::new() {
+        return Ok(dirs.home_dir().join(".openprx"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(std::path::PathBuf::from(home).join(".openprx"));
+    }
+    anyhow::bail!("cannot determine home directory for chat.log")
+}
+
+/// Redirect the global `tracing` writer to `~/.openprx/chat.log` so
+/// `INFO`/`WARN`/`ERROR` lines never collide with the ratatui TUI.
+///
+/// Returns a guard that MUST be held for the lifetime of the chat session.
+/// On any failure (no HOME, dir not creatable, file not openable, no global
+/// reload handle) returns `Err` without panicking — callers fall back to the
+/// existing stderr writer.
+pub(crate) fn setup_chat_tracing_to_file() -> Result<TracingChatGuard> {
+    setup_chat_tracing_to_file_in(&resolve_chat_log_dir()?)
+}
+
+/// Test-friendly variant: redirects tracing to `<dir>/chat.log`. The directory
+/// is created with `create_dir_all` if missing; the file is opened in append
+/// mode so repeated chat invocations within one user session don't truncate
+/// earlier logs.
+pub(crate) fn setup_chat_tracing_to_file_in(dir: &std::path::Path) -> Result<TracingChatGuard> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("failed to create chat log directory {}: {e}", dir.display()))?;
+    let log_path = dir.join("chat.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| anyhow::anyhow!("failed to open {} for writing: {e}", log_path.display()))?;
+
+    let (non_blocking, worker_guard) = tracing_appender::non_blocking(file);
+    let file_writer = tracing_subscriber::fmt::writer::BoxMakeWriter::new(non_blocking);
+    // ANSI escape codes are useless (and noisy) inside a log file.
+    let layer = tracing_subscriber::fmt::Layer::default()
+        .with_writer(file_writer)
+        .with_ansi(false);
+
+    let handle = crate::CHAT_TRACING_RELOAD
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("tracing reload handle not initialized (non-chat command?)"))?;
+    handle
+        .reload(layer)
+        .map_err(|e| anyhow::anyhow!("failed to redirect tracing to chat.log: {e}"))?;
+
+    Ok(TracingChatGuard {
+        _worker_guard: worker_guard,
+    })
+}
+
 /// Run the interactive chat session with rich terminal UI.
 #[allow(clippy::too_many_lines)]
 pub async fn run(
@@ -179,20 +428,29 @@ pub async fn run(
     session_id: Option<String>,
     list_sessions: bool,
 ) -> Result<()> {
-    // ── Panic hook: restore terminal state on crash ────────────
-    // Must be sync-only (no async in panic hooks). Preserves the original
-    // hook so backtraces still print.
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // Best-effort terminal restoration — never panic inside the hook
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stderr(),
-            crossterm::cursor::Show,
-            crossterm::terminal::LeaveAlternateScreen
-        );
-        original_hook(info);
-    }));
+    // ── P3-1: Redirect tracing to ~/.openprx/chat.log ────────────────────
+    // Held for the rest of this function. On failure (no HOME, log dir
+    // unwritable, etc.) we fall back to the stderr writer that `main` set up
+    // and emit a warning. Never panics.
+    let _tracing_guard: Option<TracingChatGuard> = match setup_chat_tracing_to_file() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            tracing::warn!(error = %e, "P3-1: keeping tracing on stderr (chat.log unavailable)");
+            None
+        }
+    };
+
+    // ── Panic hook: restore terminal state on crash ─────────────────────
+    // Strengthened in P3-2: restoration runs before the chained hook so
+    // backtraces print to a usable terminal. Idempotent across multiple
+    // calls (OnceLock-guarded).
+    install_chat_panic_hook();
+
+    // P3-2 prep: `TerminalGuard::enter()` is intentionally NOT invoked from
+    // this function yet. It will be wired up in P3-3 once the ratatui draw
+    // loop replaces the reedline / UiActor path. The type is defined and the
+    // panic hook is strengthened ahead of time so P3-3 can plug in without
+    // any scaffolding changes — see `TerminalGuard` above.
 
     // ── Wire up subsystems (same as agent::run) ──────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -1476,5 +1734,228 @@ mod reasoning_extraction_tests {
             "{\"reasoning_content\":\"shouldn't appear\"}".to_string(),
         )];
         assert_eq!(collect_reasoning_from_history_slice(&history), "");
+    }
+}
+
+#[cfg(test)]
+mod terminal_guard_tests {
+    //! Tests for P3-2: `TerminalGuard` RAII + strengthened panic hook.
+    //!
+    //! These tests intentionally do NOT call `TerminalGuard::enter()` because
+    //! the test harness is not connected to a real TTY — `enable_raw_mode`
+    //! would fail on most CI runners. Instead we exercise:
+    //!
+    //!   * `leave()` idempotency on a guard constructed in the "inactive"
+    //!     state (no crossterm calls issued).
+    //!   * Concurrent `leave()` from multiple threads (Drop + manual).
+    //!   * `restore_terminal_state()` does not panic when invoked outside
+    //!     raw mode (the panic-hook fast path).
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Build a `TerminalGuard` in the inactive state (no real terminal
+    /// mutation), suitable for unit-testing the bookkeeping.
+    fn inactive_guard() -> TerminalGuard {
+        TerminalGuard {
+            raw_mode_active: AtomicBool::new(false),
+            alt_screen_active: AtomicBool::new(false),
+        }
+    }
+
+    /// Build a "fake-active" guard whose flags are set but no real terminal
+    /// state was touched. `leave()` will issue crossterm calls but they
+    /// no-op safely on a non-TTY test harness (raw mode was never on, so
+    /// `disable_raw_mode` is a cheap kernel call returning Ok or Err — both
+    /// are swallowed).
+    fn fake_active_guard() -> TerminalGuard {
+        TerminalGuard {
+            raw_mode_active: AtomicBool::new(true),
+            alt_screen_active: AtomicBool::new(true),
+        }
+    }
+
+    #[test]
+    fn leave_is_idempotent_on_inactive_guard() {
+        let guard = inactive_guard();
+        // Multiple calls must not panic and must not flip the flags.
+        guard.leave();
+        guard.leave();
+        guard.leave();
+        assert!(!guard.raw_mode_active.load(Ordering::Acquire));
+        assert!(!guard.alt_screen_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn leave_flips_flags_exactly_once() {
+        let guard = fake_active_guard();
+        assert!(guard.raw_mode_active.load(Ordering::Acquire));
+        assert!(guard.alt_screen_active.load(Ordering::Acquire));
+        guard.leave();
+        assert!(!guard.raw_mode_active.load(Ordering::Acquire));
+        assert!(!guard.alt_screen_active.load(Ordering::Acquire));
+        // Second leave is a no-op (CAS fails, no crossterm calls).
+        guard.leave();
+        assert!(!guard.raw_mode_active.load(Ordering::Acquire));
+        assert!(!guard.alt_screen_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn drop_after_manual_leave_is_safe() {
+        // Drop must not double-restore — the AtomicBool CAS in leave()
+        // ensures the cleanup runs at most once across leave() + drop().
+        let guard = fake_active_guard();
+        guard.leave();
+        // Implicit drop here — must be a no-op (no panic, no extra calls).
+    }
+
+    #[test]
+    fn concurrent_leave_from_multiple_threads_is_safe() {
+        // Simulate two threads racing to clean up the same guard
+        // (e.g. manual `leave()` on the main thread + Drop on a panicking
+        // background thread). Only one should win the CAS for each flag.
+        let guard = Arc::new(fake_active_guard());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let g = Arc::clone(&guard);
+            handles.push(std::thread::spawn(move || {
+                g.leave();
+            }));
+        }
+        for h in handles {
+            h.join().expect("test: worker thread should not panic");
+        }
+        // After the race both flags must be cleared exactly once.
+        assert!(!guard.raw_mode_active.load(Ordering::Acquire));
+        assert!(!guard.alt_screen_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn restore_terminal_state_is_safe_outside_raw_mode() {
+        // The panic hook calls this from arbitrary terminal states. It must
+        // never panic, even when raw mode was never enabled and we are not
+        // inside an alternate screen.
+        restore_terminal_state();
+        // Calling twice in a row must also be safe (idempotent at the
+        // crossterm level — both calls swallow errors).
+        restore_terminal_state();
+    }
+
+    #[test]
+    fn install_chat_panic_hook_is_idempotent() {
+        // Second + later calls must be no-ops (OnceLock-guarded). This test
+        // verifies the function does not panic when called repeatedly; the
+        // OnceLock state is process-wide so we cannot meaningfully assert
+        // which call performed the install — but the absence of panics +
+        // unbounded hook nesting is the contract.
+        install_chat_panic_hook();
+        install_chat_panic_hook();
+        install_chat_panic_hook();
+    }
+}
+
+#[cfg(test)]
+mod tracing_redirect_tests {
+    //! P3-1: tests for `setup_chat_tracing_to_file_in` and `TracingChatGuard`.
+    //!
+    //! The reload handle (`crate::CHAT_TRACING_RELOAD`) is a process-wide
+    //! `OnceLock` that `main()` initializes only for the `chat` subcommand,
+    //! so under `cargo test` it's empty. Happy-path tests cope with both
+    //! conditions: a successful redirect yields a guard, an absent reload
+    //! handle yields a clean `Err` (and no panic). What we strictly assert
+    //! is the I/O contract — directory creation, append-mode open,
+    //! non-panicking failure modes — which is what governs whether
+    //! `chat::run` can rely on this in production.
+    use super::*;
+
+    fn unique_tmpdir(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        base.join(format!("prx-p3-1-{tag}-{pid}-{nanos}"))
+    }
+
+    #[test]
+    fn setup_creates_directory_and_file() {
+        let dir = unique_tmpdir("create");
+        let log = dir.join("chat.log");
+        assert!(!dir.exists(), "precondition: tmp dir must not exist");
+        let result = setup_chat_tracing_to_file_in(&dir);
+        // Directory + file must be created regardless of whether the global
+        // reload handle is wired up (we open the file *before* reloading).
+        assert!(dir.is_dir(), "chat log dir should exist after setup");
+        assert!(log.is_file(), "chat.log should exist after setup");
+        // Result is Ok only when CHAT_TRACING_RELOAD is initialized (chat
+        // subcommand path in main). Either outcome is non-panicking.
+        match result {
+            Ok(_guard) => { /* worker guard drops here → flush */ }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("reload handle not initialized"),
+                    "unexpected error variant: {msg}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setup_appends_does_not_truncate_existing_log() {
+        let dir = unique_tmpdir("append");
+        std::fs::create_dir_all(&dir).expect("test: create_dir_all must succeed");
+        let log = dir.join("chat.log");
+        std::fs::write(&log, b"pre-existing\n").expect("test: seed write must succeed");
+
+        // Run setup; on Ok the guard drops immediately (flushing nothing
+        // since nothing was logged); on Err we just confirm file is intact.
+        let _ = setup_chat_tracing_to_file_in(&dir);
+
+        let contents = std::fs::read_to_string(&log).expect("test: read log");
+        assert!(
+            contents.starts_with("pre-existing"),
+            "OpenOptions::append must not truncate existing chat.log; got: {contents:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setup_returns_err_when_path_is_not_a_directory() {
+        // Point `dir` at an existing file → create_dir_all should fail with
+        // ENOTDIR / "Not a directory". Must return Err, must not panic.
+        let parent = unique_tmpdir("notdir-parent");
+        std::fs::create_dir_all(&parent).expect("test: create parent");
+        let file_as_dir = parent.join("not-a-dir");
+        std::fs::write(&file_as_dir, b"x").expect("test: seed file");
+
+        let result = setup_chat_tracing_to_file_in(&file_as_dir);
+        assert!(
+            result.is_err(),
+            "expected Err when target path is a regular file, got Ok"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn resolve_chat_log_dir_yields_an_absolute_path() {
+        // Should succeed via either UserDirs or HOME; on container runners
+        // without HOME the function bails — accept either outcome but never
+        // panic.
+        match resolve_chat_log_dir() {
+            Ok(p) => {
+                assert!(p.ends_with(".openprx"), "must point at ~/.openprx, got {p:?}");
+                assert!(p.is_absolute(), "chat log dir must be absolute, got {p:?}");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("cannot determine home directory"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
     }
 }
