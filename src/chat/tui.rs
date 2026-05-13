@@ -16,6 +16,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use std::collections::HashMap;
+use unicode_width::UnicodeWidthStr;
 
 use crate::chat::terminal_proto::{
     DraftVersionTracker, InlineDraftProtocol, LineProtocolError, apply_line_replacement,
@@ -258,6 +259,16 @@ pub enum KeyDispatch {
 /// Pure on its own, no I/O — kept here so unit tests can exercise the binding
 /// table without touching crossterm / ratatui terminals.
 pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
+    // [DIAG] trace every key that enters the dispatch function so we can
+    // correlate raw events (tui_input_event) with what the handler sees.
+    tracing::debug!(
+        code = ?key.code,
+        modifiers = ?key.modifiers,
+        kind = ?key.kind,
+        input_lines_before = state.input.lines.len(),
+        input_first_line_chars = state.input.lines.first().map(|s| s.chars().count()).unwrap_or(0),
+        "dispatch_global_key_entry"
+    );
     // Tab → toggle most recent tool-result card. If there is no tool card we
     // still consume the key (per spec, Tab is never forwarded to input).
     if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
@@ -1252,7 +1263,7 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
     match conv_line {
         ConversationLine::User { content } => {
             lines.push(Line::from(vec![Span::styled(
-                "You: ",
+                "> ",
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             )]));
             for text_line in content.lines() {
@@ -1508,10 +1519,14 @@ fn render_input(frame: &mut Frame, area: Rect, state: &TuiState) {
     let max_visible_rows = area.height.saturating_sub(1) as usize;
     if cursor_line < state.input.lines.len() && cursor_line < max_visible_rows {
         let row_text = state.input.lines.get(cursor_line).map(String::as_str).unwrap_or("");
-        // Width-aware column: count display columns up to the byte offset.
+        // Width-aware column: count *display* columns (not char count) up to
+        // the byte offset. CJK and wide East-Asian glyphs occupy 2 columns,
+        // so a `chars().count()` here would leave the cursor mid-glyph and
+        // give the impression that input is broken. `unicode-width` matches
+        // ratatui's own width algorithm for `Paragraph`.
         let visual_col: usize = row_text
             .get(..cursor_offset.min(row_text.len()))
-            .map_or(0, |slice| slice.chars().count());
+            .map_or(0, UnicodeWidthStr::width);
         let col_offset = u16::try_from(visual_col).unwrap_or(u16::MAX);
         let prefix_cols: u16 = 2;
         let row_offset = u16::try_from(cursor_line).unwrap_or(u16::MAX);
