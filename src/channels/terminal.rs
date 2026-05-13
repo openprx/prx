@@ -139,6 +139,76 @@ enum UiEvent {
 
     // === Control events (highest priority) ===
     Shutdown,
+
+    /// Install a [`TuiMirrorBridge`] on the running [`UiActor`].
+    ///
+    /// Sent once from [`TerminalChannel::with_tui_mirror`] after the actor has
+    /// already been spawned. While the bridge is installed, every subsequent
+    /// `UiEvent` is translated into a [`TuiState`] mutation + a non-blocking
+    /// redraw kick instead of writing to stdout.
+    ///
+    /// Feature-gated because [`TuiState`] only exists with `terminal-tui`.
+    #[cfg(feature = "terminal-tui")]
+    AttachMirror {
+        bridge: TuiMirrorBridge,
+    },
+}
+
+// ── TUI mirror bridge ───────────────────────────────────────────────────────
+
+/// Sink the [`UiActor`] talks to when it is in TUI translator mode.
+///
+/// `chat::tui::TuiState` lives in the binary crate (`main.rs`-rooted), so
+/// the channels module — which lives in the library — cannot name it
+/// directly. This trait is the seam: the binary implements it on top of its
+/// own `TuiState` and hands a boxed instance to the actor via
+/// [`TerminalChannel::with_tui_mirror`].
+///
+/// Each method corresponds to a single, already-sanitised translation of a
+/// [`UiEvent`]. Implementations are expected to be cheap (push one
+/// `ConversationLine`, hold the mutex briefly) and must never `.await` —
+/// the actor invokes them synchronously inside its event loop.
+#[cfg(feature = "terminal-tui")]
+pub trait TuiMirrorSink: Send {
+    /// Append an assistant message to the conversation.
+    fn push_assistant(&self, content: &str);
+    /// Append a dimmed system / status message to the conversation.
+    fn push_system(&self, content: &str);
+    /// Push a `Running` tool-result card.
+    fn push_tool_started(&self, tool_name: &str, args_full: &str);
+    /// Finalise the most recent `Running` card with the given name.
+    /// Returns `true` if a matching card was found and updated.
+    fn mark_tool_finished(&self, tool_name: &str, success: bool, duration_ms: u64) -> bool;
+}
+
+/// Routing handle that converts an actor running under [`UiActor::run`] from
+/// a stdout printer into an event translator for the ratatui draw loop set
+/// up by `chat::run` (P3-3).
+///
+/// Held in `Option<_>` so the same actor binary supports both rendering
+/// modes:
+///   * `None`  — legacy reedline path; events `print!` to stdout as before.
+///   * `Some`  — TUI path; every event hits the trait sink (which usually
+///     mutates a shared `TuiState` under a `parking_lot::Mutex`) and pokes
+///     the render task via a 1-slot coalescing mpsc.
+#[cfg(feature = "terminal-tui")]
+pub struct TuiMirrorBridge {
+    /// Sink that absorbs translated events. Concrete impl lives in the
+    /// binary (`chat::tui`); the lib only sees the trait.
+    pub sink: Box<dyn TuiMirrorSink>,
+    /// 1-slot coalescing redraw signal. Producers use `try_send(())`; a full
+    /// channel just means a redraw is already pending — drop silently.
+    pub redraw_tx: mpsc::Sender<()>,
+}
+
+#[cfg(feature = "terminal-tui")]
+impl std::fmt::Debug for TuiMirrorBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TuiMirrorBridge")
+            .field("sink", &"<dyn TuiMirrorSink>")
+            .field("redraw_tx", &"<mpsc::Sender<()>>")
+            .finish()
+    }
 }
 
 // ── UI State machine ────────────────────────────────────────────────────────
@@ -174,6 +244,12 @@ struct UiActor {
     plain_mode: bool,
     /// Cancel sender for the spinner animation task
     spinner_cancel: Option<tokio::sync::watch::Sender<bool>>,
+    /// Optional TUI mirror bridge — when `Some`, the actor stops writing to
+    /// stdout and instead translates every event into a [`TuiState`] mutation
+    /// plus a coalesced redraw kick. Installed via the [`UiEvent::AttachMirror`]
+    /// control event sent by [`TerminalChannel::with_tui_mirror`].
+    #[cfg(feature = "terminal-tui")]
+    mirror: Option<TuiMirrorBridge>,
 }
 
 impl UiActor {
@@ -188,6 +264,21 @@ impl UiActor {
             repaint_interval_ms: 33,
             plain_mode,
             spinner_cancel: None,
+            #[cfg(feature = "terminal-tui")]
+            mirror: None,
+        }
+    }
+
+    /// Send a coalesced redraw signal to the ratatui render task.
+    ///
+    /// Uses `try_send` so a full 1-slot channel (redraw already pending) is
+    /// not an error — that is the entire point of the coalescing design.
+    /// A dropped receiver is also silent because the render task has simply
+    /// exited (normal shutdown).
+    #[cfg(feature = "terminal-tui")]
+    fn notify_redraw(&self) {
+        if let Some(bridge) = &self.mirror {
+            let _ = bridge.redraw_tx.try_send(());
         }
     }
 
@@ -196,12 +287,35 @@ impl UiActor {
         while let Some(event) = self.event_rx.recv().await {
             match event {
                 UiEvent::Shutdown => break,
+                #[cfg(feature = "terminal-tui")]
+                UiEvent::AttachMirror { bridge } => {
+                    self.mirror = Some(bridge);
+                }
                 other => self.handle_event(other),
             }
         }
     }
 
     fn handle_event(&mut self, event: UiEvent) {
+        // ── TUI mirror path ───────────────────────────────────────
+        //
+        // When a `TuiMirrorBridge` is installed, every event is translated
+        // into a `TuiState` mutation + a coalesced redraw kick instead of
+        // being written to stdout (which would tear the ratatui draw loop
+        // from P3-3). The legacy print path below runs only when `mirror`
+        // is `None`.
+        //
+        // ANSI sanitisation is preserved verbatim: untrusted LLM/tool text
+        // is funnelled through `sanitize_terminal_output` before it lands
+        // in `TuiState`, so a malicious provider response cannot inject
+        // CSI/OSC escapes that the renderer would later repaint into the
+        // frame buffer.
+        #[cfg(feature = "terminal-tui")]
+        if self.mirror.is_some() {
+            self.handle_event_tui(event);
+            return;
+        }
+
         match event {
             UiEvent::DraftStarted { draft_id } => {
                 self.state = UiState::Streaming;
@@ -433,6 +547,147 @@ impl UiActor {
             UiEvent::Shutdown => {
                 // Handled in run() loop
             }
+
+            #[cfg(feature = "terminal-tui")]
+            UiEvent::AttachMirror { .. } => {
+                // Already intercepted in `run()`. Reaching this arm would be
+                // a state-machine bug; silent drop is the safe response.
+            }
+        }
+    }
+
+    /// Translate a [`UiEvent`] into [`TuiState`] mutations plus a coalesced
+    /// redraw signal, replacing the legacy stdout writes (P3-4).
+    ///
+    /// Called only while `self.mirror.is_some()`. Every textual payload from
+    /// untrusted sources (LLM, tool args, tool results) is first run through
+    /// [`sanitize_terminal_output`] so the renderer cannot repaint a CSI or
+    /// OSC escape from a malicious provider response into the frame.
+    ///
+    /// `TokenDelta` is intentionally dropped on this path — P3-5 will replace
+    /// this with streaming mutation of a `ConversationLine::StreamingAssistant`.
+    /// `DraftStarted` only flips internal bookkeeping (no spinner; the TUI
+    /// draws its own indicator). `DraftFinalized` is what surfaces the
+    /// assistant text into the conversation.
+    #[cfg(feature = "terminal-tui")]
+    fn handle_event_tui(&mut self, event: UiEvent) {
+        // Every branch below acquires the mirror lock for the shortest
+        // possible window (one push, then drop). The mutex is parking_lot,
+        // so no `.await` may appear inside its scope — and none does.
+        let Some(bridge) = self.mirror.as_ref() else {
+            // Defensive: caller guards with `mirror.is_some()`. If we ever
+            // reach here, dropping the event is strictly safer than panicking.
+            return;
+        };
+
+        match event {
+            UiEvent::DraftStarted { draft_id } => {
+                self.state = UiState::Streaming;
+                self.active_draft_id = Some(draft_id);
+                self.draft_buffer.clear();
+                self.last_seq = 0;
+                // No spinner under TUI; the render task draws its own status
+                // bar. Still notify so any state-derived indicator refreshes.
+                self.notify_redraw();
+            }
+
+            UiEvent::TokenDelta { draft_id, seq, .. } => {
+                // P3-5 will replace this with streaming TuiState mutation
+                // (push/update a `ConversationLine::StreamingAssistant`).
+                // For P3-4 we only advance the ordering metadata so a late
+                // out-of-order delta cannot rewind the sequence counter.
+                if self.state != UiState::Streaming {
+                    return;
+                }
+                if self.active_draft_id.as_deref() != Some(&draft_id) {
+                    return;
+                }
+                if seq > self.last_seq {
+                    self.last_seq = seq;
+                }
+                // Intentionally no redraw — the visible state has not changed.
+            }
+
+            UiEvent::DraftFinalized { draft_id, full_text } => {
+                let is_active = self.active_draft_id.as_deref() == Some(&draft_id);
+                self.state = UiState::Idle;
+                if is_active {
+                    self.active_draft_id = None;
+                    self.draft_buffer.clear();
+                    self.last_seq = 0;
+                }
+                if full_text.is_empty() {
+                    self.notify_redraw();
+                    return;
+                }
+                let safe = sanitize_terminal_output(&full_text);
+                bridge.sink.push_assistant(&safe);
+                self.notify_redraw();
+            }
+
+            UiEvent::DraftCancelled { draft_id } => {
+                if self.active_draft_id.as_deref() == Some(&draft_id) {
+                    self.active_draft_id = None;
+                    self.draft_buffer.clear();
+                    self.last_seq = 0;
+                    self.state = UiState::Idle;
+                    bridge.sink.push_system("(cancelled)");
+                    self.notify_redraw();
+                }
+            }
+
+            UiEvent::ToolCallStarted { name, args_summary } => {
+                // Tool args are echoed verbatim from the tool layer; sanitise
+                // both name and args before they reach the renderer.
+                let safe_name = sanitize_terminal_output(&name);
+                let safe_args = sanitize_terminal_output(&args_summary);
+                bridge.sink.push_tool_started(&safe_name, &safe_args);
+                self.notify_redraw();
+            }
+
+            UiEvent::ToolCallFinished {
+                name,
+                success,
+                duration_ms,
+            } => {
+                let safe_name = sanitize_terminal_output(&name);
+                // The tool-event forwarder in `chat::run` already mirrors
+                // tool start/finish events into the same `TuiState` (P2-7).
+                // The UiActor mirror call is a defensive duplicate: if a
+                // matching `Running` card exists we mark it Done/Error,
+                // otherwise the no-op return value is silently ignored.
+                let _updated = bridge.sink.mark_tool_finished(&safe_name, success, duration_ms);
+                self.notify_redraw();
+            }
+
+            UiEvent::ToolProgress {
+                iteration,
+                max_iterations,
+            } => {
+                let msg = format!("step {iteration}/{max_iterations}");
+                bridge.sink.push_system(&msg);
+                self.notify_redraw();
+            }
+
+            UiEvent::FinalMessage { text } => {
+                if text.is_empty() {
+                    return;
+                }
+                let safe = sanitize_terminal_output(&text);
+                bridge.sink.push_assistant(&safe);
+                self.notify_redraw();
+            }
+
+            UiEvent::TypingStart | UiEvent::TypingStop => {
+                // The TUI draws its own typing indicator from `TuiState`.
+                // The legacy event is a no-op here; mapping it to a
+                // dedicated `is_typing` flag is tracked under P3-5.
+            }
+
+            UiEvent::Shutdown | UiEvent::AttachMirror { .. } => {
+                // Both are intercepted in `run()`; reaching here would be a
+                // state-machine bug. Silent drop is the safe response.
+            }
         }
     }
 }
@@ -468,6 +723,31 @@ impl TerminalChannel {
             seq_counter: AtomicU64::new(0),
             active_draft_id: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// Attach a [`TuiMirrorBridge`] so the running [`UiActor`] stops writing
+    /// to stdout and instead translates every event into a [`TuiState`]
+    /// mutation + a coalesced redraw kick (P3-4).
+    ///
+    /// Should be called immediately after [`Self::new`] and before any
+    /// `UiEvent` is sent (i.e. before `listen()`, before
+    /// `send_draft`/`send`/tool-event mirror). Internally this issues a
+    /// one-shot [`UiEvent::AttachMirror`] control event; once delivered the
+    /// actor swaps the bridge in place and all subsequent events follow the
+    /// TUI translator path. Callers that never invoke this method keep the
+    /// legacy stdout path intact, preserving the non-TUI / CI fallback.
+    ///
+    /// On send failure (channel closed because the actor already exited)
+    /// the call is silently best-effort: the only realistic cause is
+    /// shutdown, where no further events will flow anyway.
+    #[cfg(feature = "terminal-tui")]
+    pub async fn with_tui_mirror(&self, sink: Box<dyn TuiMirrorSink>, redraw_tx: mpsc::Sender<()>) {
+        let _ = self
+            .ui_tx
+            .send(UiEvent::AttachMirror {
+                bridge: TuiMirrorBridge { sink, redraw_tx },
+            })
+            .await;
     }
 }
 
@@ -890,5 +1170,216 @@ mod tests {
         let with_controls = "hello\x00\x01\x02world";
         let result = sanitize_terminal_output(with_controls);
         assert_eq!(result, "helloworld");
+    }
+
+    // ── P3-4: TUI mirror routing tests ──────────────────────────────────────
+
+    /// In-memory implementation of [`TuiMirrorSink`] used by the routing
+    /// tests below. Captures every sink invocation so we can assert on
+    /// translation order, payload sanitisation, and tool-card transitions
+    /// without depending on the real `chat::tui::TuiState` (which lives in
+    /// the binary crate and is not reachable from `crate::channels`).
+    #[cfg(feature = "terminal-tui")]
+    #[derive(Default)]
+    struct RecordingSink {
+        events: parking_lot::Mutex<Vec<RecordedEvent>>,
+    }
+
+    /// Single recorded sink call, tagged by translation kind.
+    #[cfg(feature = "terminal-tui")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RecordedEvent {
+        Assistant(String),
+        System(String),
+        ToolStarted {
+            name: String,
+            args: String,
+        },
+        ToolFinished {
+            name: String,
+            success: bool,
+            duration_ms: u64,
+        },
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    impl RecordingSink {
+        fn snapshot(&self) -> Vec<RecordedEvent> {
+            self.events.lock().clone()
+        }
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    impl TuiMirrorSink for Arc<RecordingSink> {
+        fn push_assistant(&self, content: &str) {
+            self.events.lock().push(RecordedEvent::Assistant(content.to_string()));
+        }
+        fn push_system(&self, content: &str) {
+            self.events.lock().push(RecordedEvent::System(content.to_string()));
+        }
+        fn push_tool_started(&self, tool_name: &str, args_full: &str) {
+            self.events.lock().push(RecordedEvent::ToolStarted {
+                name: tool_name.to_string(),
+                args: args_full.to_string(),
+            });
+        }
+        fn mark_tool_finished(&self, tool_name: &str, success: bool, duration_ms: u64) -> bool {
+            self.events.lock().push(RecordedEvent::ToolFinished {
+                name: tool_name.to_string(),
+                success,
+                duration_ms,
+            });
+            true
+        }
+    }
+
+    /// Wait up to `tries` * 10ms for `pred` to hold over the captured sink
+    /// snapshot. The actor task is `tokio::spawn`ed, so even after
+    /// `ch.send().await` returns we may not have observed the translation
+    /// yet — this is the standard "give the actor a tick" idiom.
+    #[cfg(feature = "terminal-tui")]
+    async fn wait_for_sink(sink: &Arc<RecordingSink>, tries: u32, pred: impl Fn(&[RecordedEvent]) -> bool) -> bool {
+        for _ in 0..tries {
+            if pred(&sink.snapshot()) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        pred(&sink.snapshot())
+    }
+
+    /// After `with_tui_mirror`, `send()` should land an `Assistant` line in
+    /// the shared sink and emit a redraw signal on the coalescing channel —
+    /// instead of writing to stdout.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn tui_mirror_routes_send_to_assistant_line() {
+        let sink = Arc::new(RecordingSink::default());
+        let (redraw_tx, mut redraw_rx) = mpsc::channel::<()>(1);
+        let ch = TerminalChannel::new(true);
+        ch.with_tui_mirror(Box::new(Arc::clone(&sink)), redraw_tx).await;
+
+        ch.send(&SendMessage::new("hello world", "user"))
+            .await
+            .expect("test: send succeeds");
+
+        assert!(
+            wait_for_sink(&sink, 50, |evts| {
+                evts.iter()
+                    .any(|e| matches!(e, RecordedEvent::Assistant(c) if c == "hello world"))
+            })
+            .await,
+            "expected Assistant translation; got {:?}",
+            sink.snapshot()
+        );
+        assert!(redraw_rx.try_recv().is_ok(), "redraw signal should be pending");
+    }
+
+    /// `send_draft` + `finalize_draft` under the TUI path should land a
+    /// single Assistant translation carrying the final text. TokenDelta is
+    /// dropped in P3-4; P3-5 will introduce streaming mutation. We assert
+    /// no intermediate Assistant translation was emitted for the delta.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn tui_mirror_finalize_draft_pushes_assistant() {
+        let sink = Arc::new(RecordingSink::default());
+        let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
+        let ch = TerminalChannel::new(true);
+        ch.with_tui_mirror(Box::new(Arc::clone(&sink)), redraw_tx).await;
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("", "user"))
+            .await
+            .expect("test: send_draft ok")
+            .expect("test: draft id");
+        ch.update_draft("user", &draft_id, "partial")
+            .await
+            .expect("test: update_draft ok");
+        ch.finalize_draft("user", &draft_id, "complete answer")
+            .await
+            .expect("test: finalize ok");
+
+        assert!(
+            wait_for_sink(&sink, 50, |evts| {
+                evts.iter()
+                    .any(|e| matches!(e, RecordedEvent::Assistant(c) if c == "complete answer"))
+            })
+            .await,
+            "expected Assistant('complete answer'); got {:?}",
+            sink.snapshot()
+        );
+        // No intermediate Assistant emitted for the TokenDelta — must be
+        // exactly one assistant line.
+        let assistants: Vec<_> = sink
+            .snapshot()
+            .into_iter()
+            .filter(|e| matches!(e, RecordedEvent::Assistant(_)))
+            .collect();
+        assert_eq!(
+            assistants.len(),
+            1,
+            "TokenDelta must not emit Assistant; got {assistants:?}"
+        );
+    }
+
+    /// Tool start + finish notifications under the TUI path should produce
+    /// a matching pair of [`RecordedEvent::ToolStarted`] / [`ToolFinished`]
+    /// translations in order.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn tui_mirror_tool_events_push_and_finish_card() {
+        let sink = Arc::new(RecordingSink::default());
+        let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
+        let ch = TerminalChannel::new(true);
+        ch.with_tui_mirror(Box::new(Arc::clone(&sink)), redraw_tx).await;
+
+        ch.notify_tool_started("file_read", "{\"path\":\"/tmp/x\"}").await;
+        ch.notify_tool_finished("file_read", true, 42).await;
+
+        assert!(
+            wait_for_sink(&sink, 50, |evts| {
+                let has_started = evts
+                    .iter()
+                    .any(|e| matches!(e, RecordedEvent::ToolStarted { name, .. } if name == "file_read"));
+                let has_finished = evts.iter().any(|e| {
+                    matches!(
+                        e,
+                        RecordedEvent::ToolFinished { name, success: true, duration_ms: 42 }
+                        if name == "file_read"
+                    )
+                });
+                has_started && has_finished
+            })
+            .await,
+            "expected ToolStarted+ToolFinished(file_read); got {:?}",
+            sink.snapshot()
+        );
+    }
+
+    /// ANSI escapes from untrusted LLM output must not survive into the
+    /// sink — otherwise the renderer would faithfully repaint them into the
+    /// frame buffer. Feed a CSI-laced final message; the recorded text
+    /// must be stripped.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn tui_mirror_sanitizes_ansi_in_final_message() {
+        let sink = Arc::new(RecordingSink::default());
+        let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
+        let ch = TerminalChannel::new(true);
+        ch.with_tui_mirror(Box::new(Arc::clone(&sink)), redraw_tx).await;
+
+        ch.send(&SendMessage::new("Hello \x1b[31mred\x1b[0m world", "user"))
+            .await
+            .expect("test: send ok");
+
+        assert!(
+            wait_for_sink(&sink, 50, |evts| {
+                evts.iter()
+                    .any(|e| matches!(e, RecordedEvent::Assistant(c) if c == "Hello red world"))
+            })
+            .await,
+            "expected sanitised Assistant translation; got {:?}",
+            sink.snapshot()
+        );
     }
 }
