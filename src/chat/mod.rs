@@ -366,24 +366,57 @@ pub async fn run(
     // ── Input channel ────────────────────────────────────────────
     let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
 
-    // Spawn input loop on a separate TerminalChannel (input only, no UI actor)
-    let terminal_for_listen = TerminalChannel::new(plain_mode);
-    tokio::spawn(async move {
-        if let Err(e) = terminal_for_listen.listen(input_tx).await {
-            tracing::error!("Terminal input loop error: {e}");
-        }
-    });
-
     // ── Graceful shutdown signal ─────────────────────────────────
     // Instead of std::process::exit(), all signal handlers use this token to
     // break the main loop gracefully, allowing final session save + teardown.
+    // Created up here (earlier than before) so the TUI input task can also
+    // observe shutdown and exit its blocking poll cleanly.
     let shutdown = CancellationToken::new();
 
     // ── Ctrl+C shared state ─────────────────────────────────────
     // Tracks the timestamp (ms) of the last Ctrl+C press for double-press detection.
+    // Lifted above the input loop so the TUI dispatcher can fold its own
+    // Ctrl+C presses into the same double-press → exit semantics.
     let last_ctrlc_ms = Arc::new(AtomicU64::new(0));
     // The active cancellation token for the current generation turn (if any).
     let active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>> = Arc::new(parking_lot::Mutex::new(None));
+
+    // Spawn the appropriate input loop:
+    //   - feature `terminal-tui` + TTY stdin → ratatui/crossterm KeyEvent loop
+    //     driving `dispatch_global_key` against a session-scoped mirror.
+    //   - otherwise → legacy reedline + BufRead fallback via TerminalChannel.
+    #[cfg(feature = "terminal-tui")]
+    {
+        use std::io::IsTerminal as _;
+        if std::io::stdin().is_terminal() {
+            let mirror_for_input: Arc<parking_lot::Mutex<tui::TuiState>> =
+                Arc::new(parking_lot::Mutex::new(tui::TuiState::new(provider_name, model_name)));
+            spawn_tui_input_task(
+                input_tx,
+                mirror_for_input,
+                shutdown.clone(),
+                Arc::clone(&last_ctrlc_ms),
+                Arc::clone(&active_cancel),
+            );
+        } else {
+            // Non-TTY (pipe / heredoc) — keep the BufRead fallback path.
+            let terminal_for_listen = TerminalChannel::new(plain_mode);
+            tokio::spawn(async move {
+                if let Err(e) = terminal_for_listen.listen(input_tx).await {
+                    tracing::error!("Terminal input loop error: {e}");
+                }
+            });
+        }
+    }
+    #[cfg(not(feature = "terminal-tui"))]
+    {
+        let terminal_for_listen = TerminalChannel::new(plain_mode);
+        tokio::spawn(async move {
+            if let Err(e) = terminal_for_listen.listen(input_tx).await {
+                tracing::error!("Terminal input loop error: {e}");
+            }
+        });
+    }
 
     // Persistent Ctrl+C handler: runs for the entire chat session.
     // - If a generation is active: cancel it (first press) or exit (double press).
@@ -993,6 +1026,142 @@ fn render_response(response: &str) -> String {
     #[cfg(not(feature = "terminal-tui"))]
     {
         format!("\n{response}\n")
+    }
+}
+
+// ── TUI input loop (P2-Integration) ──────────────────────────────────────
+
+/// Spawn the crossterm `KeyEvent` input loop and route each event through
+/// [`tui::dispatch_global_key`].
+///
+/// Lives in a dedicated `spawn_blocking` task because `crossterm::event::read`
+/// blocks the calling thread. On every loop iteration we:
+///   1. Poll with a short timeout so the loop can observe shutdown.
+///   2. Read a single event.
+///   3. Dispatch keys; submissions are forwarded over the shared
+///      `mpsc::Sender<ChannelMessage>` (the same channel `TerminalChannel::listen`
+///      would use, so the rest of `run()` is oblivious to which path produced
+///      the message).
+///
+/// Raw mode is enabled for the duration of the loop and unconditionally
+/// disabled on exit (via the existing panic hook + an explicit cleanup
+/// branch). We do not enter the alternate screen — the existing `UiActor`
+/// renderer in `channels/terminal.rs` keeps writing to the normal buffer, so
+/// keeping the same screen avoids fighting with it.
+#[cfg(feature = "terminal-tui")]
+fn spawn_tui_input_task(
+    input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
+    shutdown: CancellationToken,
+    last_ctrlc_ms: Arc<AtomicU64>,
+    active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
+) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crossterm::terminal::enable_raw_mode() {
+            tracing::error!("failed to enable raw mode for TUI input: {e}");
+            return;
+        }
+        let result = run_tui_input_loop(&input_tx, &mirror, &shutdown, &last_ctrlc_ms, &active_cancel);
+        // Cleanup raw mode regardless of success — keeps the terminal usable
+        // after `prx chat` returns. The panic hook in `run()` also disables
+        // raw mode as a defence-in-depth measure.
+        let _ = crossterm::terminal::disable_raw_mode();
+        if let Err(e) = result {
+            tracing::error!("TUI input loop error: {e}");
+        }
+    });
+}
+
+/// Inner loop body for [`spawn_tui_input_task`].
+///
+/// Polls `crossterm::event` with a short timeout so it stays responsive to
+/// the shutdown token, then routes every key press through
+/// [`tui::dispatch_global_key`] and forwards submissions over the same
+/// `ChannelMessage` channel the legacy reedline path uses. `Ctrl+C` folds
+/// into the existing double-press handler by mutating the shared
+/// `last_ctrlc_ms` + `active_cancel` state — keeping behaviour identical to
+/// the `tokio::signal::ctrl_c()` branch that runs in parallel.
+#[cfg(feature = "terminal-tui")]
+fn run_tui_input_loop(
+    input_tx: &mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    shutdown: &CancellationToken,
+    last_ctrlc_ms: &Arc<AtomicU64>,
+    active_cancel: &Arc<parking_lot::Mutex<Option<CancellationToken>>>,
+) -> Result<()> {
+    use crate::channels::traits::ChannelMessage;
+    use crossterm::event::{Event, KeyEventKind};
+
+    let poll = Duration::from_millis(100);
+    loop {
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
+        if !crossterm::event::poll(poll)? {
+            continue;
+        }
+        let ev = crossterm::event::read()?;
+        let Event::Key(key) = ev else { continue };
+        // Skip key-release events: on terminals with KeyboardEnhancement
+        // flags enabled (Kitty et al.), a single physical press fires both
+        // Press and Release. Only Press / Repeat are authoritative input.
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        let dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
+        match dispatch {
+            tui::KeyDispatch::Submitted(text) => {
+                let trimmed = text.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let msg = ChannelMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    sender: "user".to_string(),
+                    reply_target: "user".to_string(),
+                    content: trimmed,
+                    channel: "terminal".to_string(),
+                    timestamp,
+                    thread_ts: None,
+                    mentioned_uuids: vec![],
+                };
+                if input_tx.blocking_send(msg).is_err() {
+                    return Ok(());
+                }
+            }
+            tui::KeyDispatch::Exit => {
+                // Ctrl+D on empty buffer → graceful shutdown of the whole chat.
+                shutdown.cancel();
+                return Ok(());
+            }
+            tui::KeyDispatch::InterruptTurn => {
+                // Raw mode swallows the kernel-delivered SIGINT, so we replicate
+                // the persistent ctrl_c() handler's logic directly here:
+                //   * Two presses within DOUBLE_CTRLC_WINDOW_MS → exit.
+                //   * Otherwise cancel the in-flight turn (if any).
+                let now = now_ms();
+                let prev = last_ctrlc_ms.swap(now, Ordering::Relaxed);
+                if now.saturating_sub(prev) < DOUBLE_CTRLC_WINDOW_MS {
+                    shutdown.cancel();
+                    return Ok(());
+                }
+                if let Some(token) = active_cancel.lock().as_ref() {
+                    token.cancel();
+                }
+            }
+            tui::KeyDispatch::Scroll(dir) => {
+                let mut guard = mirror.lock();
+                match dir {
+                    tui::ScrollDir::Up => guard.scroll_up(3),
+                    tui::ScrollDir::Down => guard.scroll_down(3),
+                }
+            }
+            tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed => {}
+        }
     }
 }
 
