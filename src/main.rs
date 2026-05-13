@@ -93,6 +93,31 @@ use std::io::Write;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
+// P3-1: Reload handle exposed to the `chat` subcommand so it can redirect
+// tracing output to ~/.openprx/chat.log while the TUI owns stderr.
+//
+// `BoxMakeWriter` lets us swap the writer at runtime without rebuilding the
+// entire subscriber stack. The boxed writer is `Send + Sync + 'static`,
+// which the reload layer requires.
+//
+// The fmt::Layer's `S` type parameter is the *inner* subscriber that the
+// layer wraps. Since the global subscriber stack is
+//   `Registry → EnvFilter → reload::Layer<fmt::Layer<...>>`,
+// the fmt::Layer is layered onto `Layered<EnvFilter, Registry>`, so that's
+// what `S` must be in both the layer's type and the reload handle's type.
+pub(crate) type ChatSubscriber =
+    tracing_subscriber::layer::Layered<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+pub(crate) type ChatWriter = tracing_subscriber::fmt::writer::BoxMakeWriter;
+pub(crate) type ChatFmtLayer = tracing_subscriber::fmt::Layer<
+    ChatSubscriber,
+    tracing_subscriber::fmt::format::DefaultFields,
+    tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full>,
+    ChatWriter,
+>;
+pub(crate) static CHAT_TRACING_RELOAD: std::sync::OnceLock<
+    tracing_subscriber::reload::Handle<ChatFmtLayer, ChatSubscriber>,
+> = std::sync::OnceLock::new();
+
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if !(0.0..=2.0).contains(&t) {
@@ -897,15 +922,27 @@ async fn main() -> Result<()> {
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
-    // For `chat` subcommand, force logs to stderr so that --plain mode stdout
-    // output (model replies) is never polluted by INFO/WARN/ERROR log lines.
+    // For `chat` subcommand, we build a reloadable subscriber so that the
+    // chat handler can redirect tracing to ~/.openprx/chat.log once the TUI
+    // takes over the terminal. Until then logs still go to stderr so startup
+    // diagnostics (config errors, etc.) remain visible to the user.
     let use_stderr = matches!(cli.command, Commands::Chat { .. });
     if use_stderr {
-        let subscriber = fmt::Subscriber::builder()
-            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-            .with_writer(std::io::stderr)
-            .finish();
-        if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let stderr_writer = tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr);
+        let fmt_layer: ChatFmtLayer = tracing_subscriber::fmt::Layer::default().with_writer(stderr_writer);
+        let (reload_layer, reload_handle) = tracing_subscriber::reload::Layer::new(fmt_layer);
+        if CHAT_TRACING_RELOAD.set(reload_handle).is_err() {
+            eprintln!("BUG: CHAT_TRACING_RELOAD already initialized");
+        }
+        if let Err(e) = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(reload_layer)
+            .try_init()
+        {
             eprintln!("failed to set default tracing subscriber: {e}");
         }
     } else {
