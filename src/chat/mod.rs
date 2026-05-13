@@ -175,9 +175,12 @@ fn collect_reasoning_from_history_slice(slice: &[ChatMessage]) -> String {
 /// [`install_chat_panic_hook`].
 ///
 /// Sequence (reverse of entry):
-///   1. Show cursor
-///   2. `LeaveAlternateScreen`
-///   3. `disable_raw_mode`
+///   1. `DisableBracketedPaste` (paired with `EnableBracketedPaste` in enter)
+///   2. Show cursor (explicit — we no longer Hide in enter, but a stray
+///      `frame.set_cursor_position` may have left the cursor hidden if a
+///      previous ratatui frame raced cleanup; Show is idempotent)
+///   3. `LeaveAlternateScreen`
+///   4. `disable_raw_mode`
 ///
 /// Every step swallows its error: by the time this runs we are already on the
 /// cleanup path (Drop or panic unwind) and there is no caller left to surface
@@ -185,7 +188,10 @@ fn collect_reasoning_from_history_slice(slice: &[ChatMessage]) -> String {
 /// avoided to keep this callable from a panic hook without re-entering the
 /// tracing machinery.
 fn restore_terminal_state() {
-    // 1. Show cursor + leave alternate screen, written to stdout (matches
+    // 1. Disable bracketed paste before leaving alt screen so the host shell
+    //    is not left in a half-enabled state if anything afterwards fails.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    // 2. Show cursor + leave alternate screen, written to stdout (matches
     //    where we entered it). stderr is also valid but we keep parity with
     //    `TerminalGuard::enter` which writes to stdout.
     let _ = crossterm::execute!(
@@ -193,7 +199,7 @@ fn restore_terminal_state() {
         crossterm::cursor::Show,
         crossterm::terminal::LeaveAlternateScreen,
     );
-    // 2. Disable raw mode last so any escape sequences emitted above are
+    // 3. Disable raw mode last so any escape sequences emitted above are
     //    interpreted by the terminal as expected.
     let _ = crossterm::terminal::disable_raw_mode();
 }
@@ -223,7 +229,15 @@ pub struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    /// Enter raw mode + alternate screen + hide cursor.
+    /// Enter raw mode + alternate screen + bracketed-paste mode.
+    ///
+    /// Note (P3 rearch): we deliberately do **not** `cursor::Hide` here.
+    /// ratatui's `Frame::set_cursor_position` controls cursor visibility per
+    /// frame; calling `Hide` ahead of time leaves `set_cursor_position` with
+    /// no visible cursor to position and breaks the user's ability to see
+    /// where their input is going. We also enable bracketed paste so CJK IME
+    /// committed strings arrive as a single `Event::Paste(s)` instead of
+    /// being shredded into per-byte `KeyEvent`s with garbage modifier bits.
     ///
     /// Transactional: on partial failure (e.g. raw mode succeeded but
     /// alternate screen failed) the partially-applied state is rolled back
@@ -236,12 +250,13 @@ impl TerminalGuard {
         crossterm::terminal::enable_raw_mode()
             .map_err(|e| anyhow::anyhow!("failed to enable raw mode for chat TUI: {e}"))?;
 
-        // Step 2: alternate screen + hide cursor. If this fails, roll back
-        // step 1 before propagating the error.
+        // Step 2: alternate screen + bracketed paste. If this fails, roll
+        // back step 1 before propagating the error. We intentionally do not
+        // `cursor::Hide` — see doc comment.
         if let Err(e) = crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::EnterAlternateScreen,
-            crossterm::cursor::Hide,
+            crossterm::event::EnableBracketedPaste,
         ) {
             // Best-effort rollback — already on error path, ignore failure.
             let _ = crossterm::terminal::disable_raw_mode();
@@ -264,13 +279,14 @@ impl TerminalGuard {
     pub fn leave(&self) {
         use std::sync::atomic::Ordering;
 
-        // Order mirrors the reverse of entry: cursor + alt screen first,
-        // raw mode last.
+        // Order mirrors the reverse of entry: disable bracketed paste, then
+        // show cursor + leave alt screen, then raw mode last.
         if self
             .alt_screen_active
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
             let _ = crossterm::execute!(
                 std::io::stdout(),
                 crossterm::cursor::Show,
@@ -595,17 +611,24 @@ pub async fn run(
         None => session::ChatSession::new(provider_name, model_name),
     };
 
-    // ── Print banner ─────────────────────────────────────────────
-    if chat_session.turn_count() > 0 {
-        println!(
-            "PRX Chat — {provider_name}/{model_name} — session: {} ({} turns)",
+    // ── Build banner text ────────────────────────────────────────
+    // On the TUI path the banner is *not* printed to stdout here — printing
+    // before `TerminalGuard::enter()` would pollute the parent shell's
+    // scrollback, and printing after would corrupt the ratatui draw buffer
+    // (raw mode strips `\r` from `\n`, producing ladder-shaped garbage).
+    // Instead we capture it as a `String` and `push_system_message` it into
+    // the shared `chat_mirror` after the guard is in place but before the
+    // unified render loop spawns. The legacy fallback path (no TUI) prints
+    // the banner the old way.
+    let banner = if chat_session.turn_count() > 0 {
+        format!(
+            "PRX Chat — {provider_name}/{model_name} — session: {} ({} turns)\nType /help for commands, /quit to exit.",
             chat_session.title,
             chat_session.turn_count()
-        );
+        )
     } else {
-        println!("PRX Chat — {provider_name}/{model_name}");
-    }
-    println!("Type /help for commands, /quit to exit.\n");
+        format!("PRX Chat — {provider_name}/{model_name}\nType /help for commands, /quit to exit.")
+    };
 
     // ── Conversation history ─────────────────────────────────────
     let mut history = if config.skill_rag.enabled {
@@ -678,39 +701,52 @@ pub async fn run(
         let tui_enabled = !tui_opt_out && std::io::stdin().is_terminal();
         if tui_enabled {
             // Order matters: `TerminalGuard::enter()` flips raw mode + alt
-            // screen FIRST, then we create the ratatui `Terminal` (which the
-            // render task takes ownership of via `spawn_blocking`). On enter
-            // failure we fall back to the legacy reedline path so the user
-            // is never left without a prompt.
+            // screen + bracketed paste FIRST, then we wire up the UiActor
+            // mirror BEFORE spawning the unified TUI loop (so no `UiEvent`
+            // can sneak through to the old println!-based renderer in
+            // `channels/terminal.rs`). On enter failure we fall back to the
+            // legacy reedline path so the user is never left without a
+            // prompt.
             match TerminalGuard::enter() {
                 Ok(guard) => {
-                    // mpsc capacity = 1 + try_send is the coalesce idiom: many
-                    // producers calling `try_send(())` while a draw is in
-                    // flight all collapse into a single deferred redraw, so
-                    // the render task never falls behind.
+                    // Seed the banner into the mirror state *before* the
+                    // first draw, so the user sees it on entry rather than
+                    // having it print to the parent shell's scrollback.
+                    chat_mirror.lock().push_system_message(&banner);
+
+                    // The redraw channel exists solely so the UiActor and
+                    // background tasks can wake the unified loop on
+                    // streaming events. cap=1 + try_send is the coalesce
+                    // idiom: bursts collapse into a single deferred redraw.
                     let (redraw_tx, redraw_rx) = mpsc::channel::<()>(1);
-                    let _render_handle = spawn_render_task(Arc::clone(&chat_mirror), redraw_rx, shutdown.clone());
-                    spawn_redraw_tick_task(redraw_tx.clone(), shutdown.clone());
+
                     // P3-4: route every UiActor event into the shared TUI
-                    // mirror + ratatui redraw signal instead of writing to
-                    // stdout (which would tear the draw loop set up above).
-                    // Must run BEFORE any `UiEvent` is sent — the existing
-                    // `terminal` Arc is still pristine here (no draft/send
-                    // call has happened yet).
+                    // mirror instead of writing to stdout (which would tear
+                    // the draw loop). Must run BEFORE the unified loop
+                    // starts taking events.
                     let sink = Box::new(tui::TuiStateMirrorSink::new(Arc::clone(&chat_mirror)));
                     terminal.with_tui_mirror(sink, redraw_tx.clone()).await;
-                    spawn_tui_input_task(
+
+                    // P3-rearch: single thread owns Terminal/stdout + reads
+                    // crossterm events. No more spawn_render_task /
+                    // spawn_redraw_tick_task / spawn_tui_input_task trio —
+                    // they fought each other over the same stdout handle.
+                    spawn_tui_unified_loop(
                         input_tx,
                         Arc::clone(&chat_mirror),
+                        redraw_rx,
                         shutdown.clone(),
                         Arc::clone(&last_ctrlc_ms),
                         Arc::clone(&active_cancel),
-                        redraw_tx,
                     );
                     Some(guard)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "TerminalGuard::enter failed; falling back to reedline input");
+                    // On guard failure the banner has not been printed yet
+                    // and we are about to use the legacy non-TUI path, so
+                    // print it the old way.
+                    println!("{banner}");
                     let terminal_for_listen = TerminalChannel::new(plain_mode);
                     tokio::spawn(async move {
                         if let Err(e) = terminal_for_listen.listen(input_tx).await {
@@ -722,7 +758,10 @@ pub async fn run(
             }
         } else {
             // Fallback path (PRX_TUI=0 opt-out, or non-TTY pipe/heredoc) — keep
-            // the legacy reedline + BufRead fallback via TerminalChannel.
+            // the legacy reedline + BufRead fallback via TerminalChannel and
+            // print the banner the old way for parity with the previous
+            // behaviour.
+            println!("{banner}");
             let terminal_for_listen = TerminalChannel::new(plain_mode);
             tokio::spawn(async move {
                 if let Err(e) = terminal_for_listen.listen(input_tx).await {
@@ -734,6 +773,7 @@ pub async fn run(
     };
     #[cfg(not(feature = "terminal-tui"))]
     {
+        println!("{banner}");
         let terminal_for_listen = TerminalChannel::new(plain_mode);
         tokio::spawn(async move {
             if let Err(e) = terminal_for_listen.listen(input_tx).await {
@@ -802,9 +842,23 @@ pub async fn run(
             break;
         }
 
+        // Route any user-visible slash-command output into the right sink:
+        // ratatui mirror on the TUI path (so it survives raw-mode `\n`
+        // mangling), plain stdout otherwise. Returns immediately for plain
+        // mode so the legacy `--plain` / piped path is unchanged.
+        let emit_chat_output = |text: &str| {
+            #[cfg(feature = "terminal-tui")]
+            {
+                chat_mirror.lock().push_system_message(text);
+            }
+            #[cfg(not(feature = "terminal-tui"))]
+            {
+                println!("{text}");
+            }
+        };
+
         // Handle /clear separately (needs mutable history)
         if matches!(user_input.as_str(), "/clear" | "/new") {
-            println!("Clearing conversation (core memories preserved)...");
             history.clear();
             if !config.skill_rag.enabled {
                 history.push(ChatMessage::system(build_runtime_system_prompt(
@@ -817,11 +871,12 @@ pub async fn run(
                 )));
             }
             let cleared = commands::handle_clear(mem.as_ref(), Some(&chat_session.id)).await;
-            if cleared > 0 {
-                println!("Conversation cleared ({cleared} memory entries removed).\n");
+            let msg = if cleared > 0 {
+                format!("Conversation cleared ({cleared} memory entries removed).")
             } else {
-                println!("Conversation cleared.\n");
-            }
+                "Conversation cleared.".to_string()
+            };
+            emit_chat_output(&msg);
             continue;
         }
 
@@ -836,20 +891,21 @@ pub async fn run(
             };
             match commands::dispatch(&user_input, &cmd_ctx).await {
                 commands::CommandResult::Handled => continue,
+                commands::CommandResult::HandledWithOutput(text) => {
+                    emit_chat_output(&text);
+                    continue;
+                }
                 commands::CommandResult::Quit => break,
                 commands::CommandResult::SetMode(mode) => {
                     chat_session.set_mode(mode);
-                    match mode {
-                        commands::ChatMode::Plan => println!(
-                            "✓ Switched to plan mode (read-only tools only — write/shell/git_commit will be simulated)\n"
-                        ),
-                        commands::ChatMode::Edit => {
-                            println!("✓ Switched to edit mode (default — write tools enabled)\n");
+                    let msg = match mode {
+                        commands::ChatMode::Plan => {
+                            "Switched to plan mode (read-only tools only — write/shell/git_commit will be simulated)"
                         }
-                        commands::ChatMode::Auto => {
-                            println!("✓ Switched to auto mode (all tools, no approval prompts)\n");
-                        }
-                    }
+                        commands::ChatMode::Edit => "Switched to edit mode (default — write tools enabled)",
+                        commands::ChatMode::Auto => "Switched to auto mode (all tools, no approval prompts)",
+                    };
+                    emit_chat_output(msg);
                     continue;
                 }
                 commands::CommandResult::NotACommand => {}
@@ -1388,250 +1444,178 @@ fn render_response(response: &str) -> String {
 /// possible (the borrow is dropped before the next iteration parks).
 /// Producers hold the same lock only across short, non-blocking mutations,
 /// so the renderer never starves.
-#[cfg(feature = "terminal-tui")]
-fn spawn_render_task(
-    mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
-    mut redraw_rx: mpsc::Receiver<()>,
-    shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
-        let stdout = std::io::stdout();
-        let backend = ratatui::backend::CrosstermBackend::new(stdout);
-        let mut terminal = match ratatui::Terminal::new(backend) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("ratatui Terminal::new failed: {e}");
-                return;
-            }
-        };
-
-        // Paint once at startup so the layout appears even before the user
-        // hits a key. Skipping a frame on error is fine — the next redraw
-        // signal will retry.
-        if let Err(e) = terminal.draw(|f| tui::render(f, &mut mirror.lock())) {
-            tracing::warn!(error = %e, "initial TUI draw failed");
-        }
-
-        loop {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            // Block until the next redraw signal (or all senders are dropped,
-            // which happens on shutdown). `None` from `blocking_recv` means
-            // every clone of `redraw_tx` has been dropped — that is the
-            // normal exit path on `chat::run` teardown.
-            match redraw_rx.blocking_recv() {
-                Some(()) => {}
-                None => return,
-            }
-            // Drain any additional pending wakeups so a burst of producer
-            // notifications turns into a single draw call (coalesce).
-            while redraw_rx.try_recv().is_ok() {}
-
-            if shutdown.is_cancelled() {
-                return;
-            }
-            if let Err(e) = terminal.draw(|f| tui::render(f, &mut mirror.lock())) {
-                tracing::warn!(error = %e, "TUI draw failed (will retry on next signal)");
-            }
-        }
-    })
-}
-
-/// Spawn a 250 ms heartbeat that nudges the render task even when no input
-/// or tool event arrived in that window. Useful for cursor blink, time-based
-/// status updates, and (once P3-5 lands) idle stream redraws.
+/// Spawn the unified ratatui TUI loop on a dedicated blocking thread.
 ///
-/// Cancels itself when `shutdown` fires. Send failures are silently ignored
-/// because the receiver is allowed to disappear before this task does.
-#[cfg(feature = "terminal-tui")]
-fn spawn_redraw_tick_task(redraw_tx: mpsc::Sender<()>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(250));
-        // Skip the first immediate tick; the initial draw already painted.
-        interval.tick().await;
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = interval.tick() => {
-                    if redraw_tx.try_send(()).is_err() {
-                        // Either the channel is full (coalesced — fine) or
-                        // closed (render task gone — also fine, we will exit
-                        // on the next shutdown tick).
-                    }
-                }
-            }
-        }
-    });
-}
-
-// ── TUI input loop (P2-Integration) ──────────────────────────────────────
-
-/// Spawn the crossterm `KeyEvent` input loop and route each event through
-/// [`tui::dispatch_global_key`].
+/// **Single-thread architecture (P3 rearch).** The previous design split
+/// rendering, input reading, and a periodic heartbeat across three separate
+/// `spawn_blocking` tasks, each of which held its own raw `std::io::stdout()`
+/// handle. crossterm's internal ANSI queries (DA1/DSR, used during key
+/// dispatch and bracketed-paste decoding) wrote bytes to the same stdout
+/// that ratatui's buffer flush was writing to — so characters made it into
+/// ratatui's internal buffer but were partially overwritten on the wire,
+/// producing the historic "I typed but nothing appears" bug.
 ///
-/// Lives in a dedicated `spawn_blocking` task because `crossterm::event::read`
-/// blocks the calling thread. On every loop iteration we:
-///   1. Poll with a short timeout so the loop can observe shutdown.
-///   2. Read a single event.
-///   3. Dispatch keys; submissions are forwarded over the shared
-///      `mpsc::Sender<ChannelMessage>` (the same channel `TerminalChannel::listen`
-///      would use, so the rest of `run()` is oblivious to which path produced
-///      the message).
-///   4. Poke the render task via `redraw_tx` so the visible state catches up
-///      to the just-dispatched keystroke.
+/// This single loop is what every reference implementation does
+/// (`ratatui/examples/user_input.rs`, OpenAI codex-rs, atuin, yazi, helix,
+/// zellij): **one thread owns the Terminal + stdout**, reads events
+/// directly, and redraws between events. There is no second stdout writer
+/// and no producer/consumer split that can starve the renderer.
 ///
-/// Raw mode + alternate screen are now owned by [`TerminalGuard`] (entered
-/// in `run()` on the TUI path), so this function does NOT touch terminal
-/// state — that avoids a race between the manual disable here and the
-/// guard's Drop on `chat::run` exit.
+/// Wakeup sources:
+///   * Each `crossterm::event::poll(50 ms)` returns either a real event
+///     (keys / resize / paste / focus / mouse) or a timeout — and on every
+///     iteration we redraw, so an in-flight LLM stream pushing deltas into
+///     `mirror` shows up within ~50 ms even with no keypress.
+///   * `redraw_rx` lets the UiActor wake us immediately when a streaming
+///     event arrives; we drain it (coalesce) and let the next loop top
+///     redraw.
+///   * `shutdown` cancels the loop on `Ctrl+D` (empty buffer), double
+///     `Ctrl+C`, or SIGTERM.
+///
+/// The function intentionally does NOT touch raw-mode / alt-screen state —
+/// that is owned by [`TerminalGuard`] in `run()`. If `Terminal::new` fails
+/// the task logs and exits; the guard's Drop still restores the terminal.
 #[cfg(feature = "terminal-tui")]
-fn spawn_tui_input_task(
+#[allow(clippy::too_many_arguments)]
+fn spawn_tui_unified_loop(
     input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
     mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
+    redraw_rx: mpsc::Receiver<()>,
     shutdown: CancellationToken,
     last_ctrlc_ms: Arc<AtomicU64>,
     active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
-    redraw_tx: mpsc::Sender<()>,
 ) {
     tokio::task::spawn_blocking(move || {
-        // Raw mode is owned by `TerminalGuard` (entered in `run()` on the TUI
-        // path). We intentionally do NOT call `enable_raw_mode()` here —
-        // doing so would flip the flag twice and the manual teardown at
-        // `run()` exit would race the guard's Drop. The legacy fallback
-        // path (no guard) never reaches this function.
-        let result = run_tui_input_loop(
-            &input_tx,
-            &mirror,
-            &shutdown,
-            &last_ctrlc_ms,
-            &active_cancel,
-            &redraw_tx,
-        );
-        // Cleanup is owned by `TerminalGuard::leave()` — keep the panic hook
-        // as defence in depth. If the loop returns an error, log it but do
-        // NOT disable raw mode here (the guard handles it).
+        let result = run_tui_unified_loop(input_tx, mirror, redraw_rx, &shutdown, last_ctrlc_ms, active_cancel);
         if let Err(e) = result {
-            tracing::error!("TUI input loop error: {e}");
+            tracing::error!("TUI unified loop error: {e}");
         }
     });
 }
 
-/// Inner loop body for [`spawn_tui_input_task`].
-///
-/// Polls `crossterm::event` with a short timeout so it stays responsive to
-/// the shutdown token, then routes every key press through
-/// [`tui::dispatch_global_key`] and forwards submissions over the same
-/// `ChannelMessage` channel the legacy reedline path uses. `Ctrl+C` folds
-/// into the existing double-press handler by mutating the shared
-/// `last_ctrlc_ms` + `active_cancel` state — keeping behaviour identical to
-/// the `tokio::signal::ctrl_c()` branch that runs in parallel.
+/// Inner body of [`spawn_tui_unified_loop`].
 #[cfg(feature = "terminal-tui")]
-fn run_tui_input_loop(
-    input_tx: &mpsc::Sender<crate::channels::traits::ChannelMessage>,
-    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+fn run_tui_unified_loop(
+    input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
+    mut redraw_rx: mpsc::Receiver<()>,
     shutdown: &CancellationToken,
-    last_ctrlc_ms: &Arc<AtomicU64>,
-    active_cancel: &Arc<parking_lot::Mutex<Option<CancellationToken>>>,
-    redraw_tx: &mpsc::Sender<()>,
+    last_ctrlc_ms: Arc<AtomicU64>,
+    active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
     use crossterm::event::{Event, KeyEventKind};
 
-    let poll = Duration::from_millis(100);
+    let stdout = std::io::stdout();
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal =
+        ratatui::Terminal::new(backend).map_err(|e| anyhow::anyhow!("ratatui Terminal::new failed: {e}"))?;
+
+    // 50 ms event poll → ~20 fps idle redraw cap. Streaming wakes via
+    // `redraw_rx` so this is just a floor, not an upper bound.
+    let poll = Duration::from_millis(50);
+
     loop {
         if shutdown.is_cancelled() {
             return Ok(());
         }
+
+        // Drain any pending redraw wakeups before drawing so a burst of
+        // streaming deltas collapses into a single frame. Then draw.
+        while redraw_rx.try_recv().is_ok() {}
+        if let Err(e) = terminal.draw(|f| tui::render(f, &mut mirror.lock())) {
+            tracing::warn!(error = %e, "TUI draw failed");
+        }
+
+        // Block up to `poll` for the next event. `poll` is the *only* I/O
+        // primitive we use on this thread besides `terminal.draw`, so no
+        // stdout-writer can race the renderer.
         if !crossterm::event::poll(poll)? {
             continue;
         }
         let ev = crossterm::event::read()?;
-        let key = match ev {
-            Event::Key(k) => k,
-            Event::Resize(_w, _h) => {
-                // P3-6: crossterm forwards terminal resize through the OS
-                // (the next ratatui `frame.area()` already reflects the new
-                // size). All we have to do is nudge the render task so the
-                // visible state catches up immediately instead of waiting
-                // for the next periodic redraw tick. `TuiState::viewport_height`
-                // is recomputed inside `tui::render` on every frame, so no
-                // mirror mutation is required here.
-                //
-                // Coalesce-style: try_send into a cap=1 channel — if a redraw
-                // is already pending, drop silently (`Full`); if the receiver
-                // is gone, the render task has exited (`Closed`), which is
-                // the normal shutdown path.
-                let _ = redraw_tx.try_send(());
-                continue;
-            }
-            _ => continue,
-        };
-        // Skip key-release events: on terminals with KeyboardEnhancement
-        // flags enabled (Kitty et al.), a single physical press fires both
-        // Press and Release. Only Press / Repeat are authoritative input.
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            continue;
-        }
-        let dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
-        // Coalesce-style redraw signal: try_send into a cap=1 channel. If a
-        // redraw is already pending, the send fails silently (Full) and the
-        // pending one will pick up the new state. If the receiver is gone
-        // (Closed) the render task has shut down — that is the normal exit
-        // path, so we ignore the error too.
-        let _ = redraw_tx.try_send(());
-        match dispatch {
-            tui::KeyDispatch::Submitted(text) => {
-                let trimmed = text.trim().to_string();
-                if trimmed.is_empty() {
+        match ev {
+            Event::Key(key) => {
+                // Skip key-release events: terminals with
+                // KeyboardEnhancement flags (Kitty et al.) fire both Press
+                // and Release for one physical keystroke. Only Press /
+                // Repeat are authoritative input.
+                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     continue;
                 }
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let msg = ChannelMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    sender: "user".to_string(),
-                    reply_target: "user".to_string(),
-                    content: trimmed,
-                    channel: "terminal".to_string(),
-                    timestamp,
-                    thread_ts: None,
-                    mentioned_uuids: vec![],
-                };
-                if input_tx.blocking_send(msg).is_err() {
-                    return Ok(());
+                let dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
+                match dispatch {
+                    tui::KeyDispatch::Submitted(text) => {
+                        let trimmed = text.trim().to_string();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let msg = ChannelMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            sender: "user".to_string(),
+                            reply_target: "user".to_string(),
+                            content: trimmed,
+                            channel: "terminal".to_string(),
+                            timestamp,
+                            thread_ts: None,
+                            mentioned_uuids: vec![],
+                        };
+                        if input_tx.blocking_send(msg).is_err() {
+                            // Receiver dropped — chat::run is tearing down.
+                            return Ok(());
+                        }
+                    }
+                    tui::KeyDispatch::Exit => {
+                        // Ctrl+D on empty buffer → graceful shutdown.
+                        shutdown.cancel();
+                        return Ok(());
+                    }
+                    tui::KeyDispatch::InterruptTurn => {
+                        // Raw mode swallows kernel-delivered SIGINT, so we
+                        // replicate the persistent ctrl_c() handler's
+                        // double-press semantics directly:
+                        //   * Two presses within DOUBLE_CTRLC_WINDOW_MS → exit.
+                        //   * Otherwise cancel the in-flight turn (if any).
+                        let now = now_ms();
+                        let prev = last_ctrlc_ms.swap(now, Ordering::Relaxed);
+                        if now.saturating_sub(prev) < DOUBLE_CTRLC_WINDOW_MS {
+                            shutdown.cancel();
+                            return Ok(());
+                        }
+                        if let Some(token) = active_cancel.lock().as_ref() {
+                            token.cancel();
+                        }
+                    }
+                    tui::KeyDispatch::Scroll(dir) => {
+                        let mut guard = mirror.lock();
+                        match dir {
+                            tui::ScrollDir::Up => guard.scroll_up(3),
+                            tui::ScrollDir::Down => guard.scroll_down(3),
+                        }
+                    }
+                    tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed => {}
                 }
             }
-            tui::KeyDispatch::Exit => {
-                // Ctrl+D on empty buffer → graceful shutdown of the whole chat.
-                shutdown.cancel();
-                return Ok(());
+            Event::Paste(text) => {
+                // P3 rearch: bracketed-paste mode (enabled in
+                // `TerminalGuard::enter`) is what makes CJK IME input
+                // *and* multi-line clipboard paste actually work. Without
+                // it, IME commit strings are shredded into per-byte
+                // KeyEvents with random modifier bits that
+                // `dispatch_global_key` filters out.
+                mirror.lock().input.paste(&text);
             }
-            tui::KeyDispatch::InterruptTurn => {
-                // Raw mode swallows the kernel-delivered SIGINT, so we replicate
-                // the persistent ctrl_c() handler's logic directly here:
-                //   * Two presses within DOUBLE_CTRLC_WINDOW_MS → exit.
-                //   * Otherwise cancel the in-flight turn (if any).
-                let now = now_ms();
-                let prev = last_ctrlc_ms.swap(now, Ordering::Relaxed);
-                if now.saturating_sub(prev) < DOUBLE_CTRLC_WINDOW_MS {
-                    shutdown.cancel();
-                    return Ok(());
-                }
-                if let Some(token) = active_cancel.lock().as_ref() {
-                    token.cancel();
-                }
+            Event::Resize(_w, _h) => {
+                // `frame.area()` reflects the new size on the next draw —
+                // no mutation required. The next loop top will redraw.
             }
-            tui::KeyDispatch::Scroll(dir) => {
-                let mut guard = mirror.lock();
-                match dir {
-                    tui::ScrollDir::Up => guard.scroll_up(3),
-                    tui::ScrollDir::Down => guard.scroll_down(3),
-                }
+            _ => {
+                // Focus / mouse / other events — ignore for now.
             }
-            tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed => {}
         }
     }
 }

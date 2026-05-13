@@ -1,8 +1,15 @@
 //! Slash command handling for `prx chat`.
 //!
-//! Each command is a pure function that prints output and returns a
-//! [`CommandResult`] so the caller knows whether to `continue` the loop.
-// Chat commands: println! calls are intentional user-facing slash-command output.
+//! Each command is a pure function that **returns** its output (instead of
+//! `println!`-ing) so the caller can route it into the ratatui mirror via
+//! [`super::tui::TuiState::push_system_message`]. Raw mode + alternate screen
+//! mean a bare `\n` does not auto-carriage-return; printing directly to
+//! stdout from inside the TUI produces ladder-shaped garbled output (the
+//! historic `/help` bug). The mirror sink takes care of `\r\n` handling and
+//! line-wrapping inside its own widget layer.
+//!
+//! Tests below still use the legacy `classify_mode_command` helper because
+//! exercising `dispatch` requires a memory backend and tool registry.
 #![allow(clippy::print_stdout)]
 
 use super::session;
@@ -17,16 +24,22 @@ pub use crate::agent::loop_::ChatMode;
 
 /// Outcome of a slash-command dispatch.
 pub enum CommandResult {
-    /// Command was handled — caller should `continue` (skip LLM turn).
+    /// Command was handled with no user-visible output (or output was
+    /// already routed elsewhere). Caller should `continue` (skip LLM turn).
     Handled,
+    /// Command was handled and produced text the caller MUST display to the
+    /// user (typically via `TuiState::push_system_message`). Caller should
+    /// then `continue` the loop.
+    HandledWithOutput(String),
     /// Input was not a command — proceed with normal LLM turn.
     NotACommand,
     /// /quit or /exit — break the loop.
     Quit,
-    /// /plan, /edit, /auto — caller should update session mode + print
-    /// confirmation, then `continue` (skip LLM turn). The mode change is
-    /// returned to the caller so [`ChatMode`] stays out of this module's
-    /// `CommandContext` (which only carries immutable borrows).
+    /// /plan, /edit, /auto — caller should update session mode + display the
+    /// confirmation message via `push_system_message`, then `continue` (skip
+    /// LLM turn). The mode change is returned to the caller so [`ChatMode`]
+    /// stays out of this module's `CommandContext` (which only carries
+    /// immutable borrows).
     SetMode(ChatMode),
 }
 
@@ -39,110 +52,100 @@ pub struct CommandContext<'a> {
     pub mem: &'a dyn Memory,
 }
 
+/// Help text shared between `/help` output and crate documentation.
+const HELP_TEXT: &str = "Available commands:
+  /help              Show this help message
+  /clear /new        Clear conversation history
+  /model [name]      Show or switch model
+  /provider [name]   Show or switch provider
+  /tools             List available tools
+  /memory <query>    Search memory
+  /cost              Show token usage estimate
+  /export [md|json]  Export conversation
+  /plan              Switch to plan mode (read-only tools)
+  /edit              Switch to edit mode (default)
+  /auto              Switch to auto mode (no approval prompts)
+  /quit /exit        Exit chat";
+
 /// Dispatch a slash command. Returns `CommandResult`.
+///
+/// User-facing output is returned via `CommandResult::HandledWithOutput` —
+/// never `println!`-ed — so the chat run loop can route it into the ratatui
+/// state mirror. Raw mode swallows `\r` on bare `\n`, so any direct stdout
+/// write from here would corrupt the visible TUI.
 pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
     match input {
-        "/help" => {
-            println!("Available commands:");
-            println!("  /help              Show this help message");
-            println!("  /clear /new        Clear conversation history");
-            println!("  /model [name]      Show or switch model");
-            println!("  /provider [name]   Show or switch provider");
-            println!("  /tools             List available tools");
-            println!("  /memory <query>    Search memory");
-            println!("  /cost              Show token usage estimate");
-            println!("  /export [md|json]  Export conversation");
-            println!("  /plan              Switch to plan mode (read-only tools)");
-            println!("  /edit              Switch to edit mode (default)");
-            println!("  /auto              Switch to auto mode (no approval prompts)");
-            println!("  /quit /exit        Exit chat\n");
-            CommandResult::Handled
-        }
+        "/help" => CommandResult::HandledWithOutput(HELP_TEXT.to_string()),
         "/quit" | "/exit" => CommandResult::Quit,
         "/plan" => CommandResult::SetMode(ChatMode::Plan),
         "/edit" => CommandResult::SetMode(ChatMode::Edit),
         "/auto" => CommandResult::SetMode(ChatMode::Auto),
         "/tools" => {
-            println!("Available tools:\n");
+            let mut out = String::from("Available tools:\n");
             for tool in ctx.tools_registry {
-                println!("  {:<20} {}", tool.name(), tool.description());
+                out.push_str(&format!("  {:<20} {}\n", tool.name(), tool.description()));
             }
-            println!();
-            CommandResult::Handled
+            CommandResult::HandledWithOutput(out)
         }
         "/cost" => {
             let total_chars: usize = ctx.chat_session.turns.iter().map(|t| t.content.chars().count()).sum();
             let est_tokens = total_chars / 4;
-            println!("Session cost estimate:");
-            println!("  Turns:        {}", ctx.chat_session.turn_count());
-            println!("  Total chars:  {total_chars}");
-            println!("  Est. tokens:  ~{est_tokens}\n");
-            CommandResult::Handled
+            let out = format!(
+                "Session cost estimate:\n  Turns:        {}\n  Total chars:  {total_chars}\n  Est. tokens:  ~{est_tokens}",
+                ctx.chat_session.turn_count()
+            );
+            CommandResult::HandledWithOutput(out)
         }
-        "/model" => {
-            println!("Current model: {}\n", ctx.model_name);
-            CommandResult::Handled
-        }
-        "/provider" => {
-            println!("Current provider: {}\n", ctx.provider_name);
-            CommandResult::Handled
-        }
+        "/model" => CommandResult::HandledWithOutput(format!("Current model: {}", ctx.model_name)),
+        "/provider" => CommandResult::HandledWithOutput(format!("Current provider: {}", ctx.provider_name)),
         _ if input.starts_with("/model ") => {
             let new_model = input["/model ".len()..].trim();
-            println!("Model switching requires restarting: prx chat -m {new_model}\n");
-            CommandResult::Handled
+            CommandResult::HandledWithOutput(format!("Model switching requires restarting: prx chat -m {new_model}"))
         }
         _ if input.starts_with("/provider ") => {
             let new_provider = input["/provider ".len()..].trim();
-            println!("Provider switching requires restarting: prx chat -p {new_provider}\n");
-            CommandResult::Handled
+            CommandResult::HandledWithOutput(format!(
+                "Provider switching requires restarting: prx chat -p {new_provider}"
+            ))
         }
         _ if input.starts_with("/memory ") => {
             let query = input["/memory ".len()..].trim();
             if query.is_empty() {
-                println!("Usage: /memory <search query>\n");
-                return CommandResult::Handled;
+                return CommandResult::HandledWithOutput("Usage: /memory <search query>".to_string());
             }
-            match ctx.mem.recall(query, 5, None).await {
-                Ok(entries) if entries.is_empty() => {
-                    println!("No memory entries found for: {query}\n");
-                }
+            let out = match ctx.mem.recall(query, 5, None).await {
+                Ok(entries) if entries.is_empty() => format!("No memory entries found for: {query}"),
                 Ok(entries) => {
-                    println!("Memory results for \"{query}\":\n");
+                    let mut s = format!("Memory results for \"{query}\":\n");
                     for entry in &entries {
-                        let score = entry.score.map(|s| format!(" ({s:.2})")).unwrap_or_default();
+                        let score = entry.score.map(|sc| format!(" ({sc:.2})")).unwrap_or_default();
                         let preview = if entry.content.chars().count() > 80 {
                             format!("{}...", entry.content.chars().take(80).collect::<String>())
                         } else {
                             entry.content.clone()
                         };
-                        println!("  [{}{score}] {preview}", entry.key);
+                        s.push_str(&format!("  [{}{score}] {preview}\n", entry.key));
                     }
-                    println!();
+                    s
                 }
-                Err(e) => {
-                    println!("Memory search error: {e}\n");
-                }
-            }
-            CommandResult::Handled
+                Err(e) => format!("Memory search error: {e}"),
+            };
+            CommandResult::HandledWithOutput(out)
         }
         _ if input.starts_with("/export") => {
             let format = input.strip_prefix("/export").unwrap_or_default().trim();
             let format = if format.is_empty() { "md" } else { format };
-            match export_session(ctx.chat_session, format) {
-                Ok(path) => println!("Exported to: {path}\n"),
-                Err(e) => println!("Export failed: {e}\n"),
-            }
-            CommandResult::Handled
+            let out = match export_session(ctx.chat_session, format) {
+                Ok(path) => format!("Exported to: {path}"),
+                Err(e) => format!("Export failed: {e}"),
+            };
+            CommandResult::HandledWithOutput(out)
         }
-        "/theme" => {
-            println!("Available themes: dark (default), light, monokai");
-            println!("Set via: PRX_CHAT_THEME=monokai prx chat\n");
-            CommandResult::Handled
-        }
+        "/theme" => CommandResult::HandledWithOutput(
+            "Available themes: dark (default), light, monokai\nSet via: PRX_CHAT_THEME=monokai prx chat".to_string(),
+        ),
         _ if input.starts_with('/') => {
-            println!("Unknown command: {input}. Type /help for available commands.\n");
-            CommandResult::Handled
+            CommandResult::HandledWithOutput(format!("Unknown command: {input}. Type /help for available commands."))
         }
         _ => CommandResult::NotACommand,
     }
@@ -292,6 +295,20 @@ mod mode_tests {
         match r {
             CommandResult::SetMode(m) => assert_eq!(m, ChatMode::Plan),
             _ => panic!("expected SetMode variant"),
+        }
+    }
+
+    /// Guard: ensure `CommandResult::HandledWithOutput` survives future
+    /// refactors. The P3 chat TUI rearch depends on this variant existing
+    /// so command output gets routed through the ratatui mirror instead of
+    /// raw `println!` (which corrupts the alt-screen under raw mode — see
+    /// `chat-tui-rootcause-2026-05-13.md` root cause B).
+    #[test]
+    fn handled_with_output_variant_is_constructible() {
+        let r = CommandResult::HandledWithOutput("hello".to_string());
+        match r {
+            CommandResult::HandledWithOutput(s) => assert_eq!(s, "hello"),
+            _ => panic!("expected HandledWithOutput variant"),
         }
     }
 }
