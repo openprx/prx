@@ -581,12 +581,27 @@ pub async fn run(
         *active_cancel.lock() = Some(cancellation.clone());
 
         // ── Tool event forwarding (visual feedback in terminal) ──
+        //
+        // P2-7: in addition to the existing notify_tool_* calls (which feed
+        // the legacy UiActor renderer in `channels/terminal.rs`), we also
+        // mirror every tool event into a `TuiState` instance behind a
+        // `parking_lot::Mutex`. The ratatui renderer in `chat/tui.rs` reads
+        // from this mirror; full renderer wiring lands in P2-12.
         let (tool_event_tx, mut tool_event_rx) = mpsc::channel::<ToolCallNotification>(TOOL_EVENT_CHANNEL_CAPACITY);
         let terminal_for_tools = Arc::clone(&terminal);
+        #[cfg(feature = "terminal-tui")]
+        let tui_mirror: Arc<parking_lot::Mutex<tui::TuiState>> =
+            Arc::new(parking_lot::Mutex::new(tui::TuiState::new(provider_name, model_name)));
+        #[cfg(feature = "terminal-tui")]
+        let tui_mirror_for_tools = Arc::clone(&tui_mirror);
         let tool_event_forwarder = tokio::spawn(async move {
             while let Some(notif) = tool_event_rx.recv().await {
                 match notif {
                     ToolCallNotification::Started { name, args_summary } => {
+                        #[cfg(feature = "terminal-tui")]
+                        tui_mirror_for_tools
+                            .lock()
+                            .push_tool_result_started(&name, &args_summary);
                         terminal_for_tools.notify_tool_started(&name, &args_summary).await;
                     }
                     ToolCallNotification::Finished {
@@ -594,6 +609,10 @@ pub async fn run(
                         success,
                         duration_ms,
                     } => {
+                        #[cfg(feature = "terminal-tui")]
+                        tui_mirror_for_tools
+                            .lock()
+                            .mark_last_tool_result_finished(&name, success, duration_ms, None);
                         terminal_for_tools
                             .notify_tool_finished(&name, success, duration_ms)
                             .await;
@@ -607,6 +626,14 @@ pub async fn run(
                 }
             }
         });
+        // Log a trace stat so the mirror is observably wired (also keeps the
+        // `tui_mirror` binding from being flagged as unused when the renderer
+        // wiring lands in P2-12).
+        #[cfg(feature = "terminal-tui")]
+        tracing::trace!(
+            tracked_tool_cards = tui_mirror.lock().last_tool_result_index().map(|i| i + 1).unwrap_or(0),
+            "tui_mirror initialized"
+        );
 
         // ── Policy Pipeline for tool access control ──────────────
         let policy_pipeline = PolicyPipeline::from_config(&config);
