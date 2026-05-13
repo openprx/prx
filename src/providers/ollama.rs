@@ -579,6 +579,14 @@ impl Provider for OllamaProvider {
             .send_request(api_messages, &normalized_model, temperature, should_auth, tools_opt)
             .await?;
 
+        // Route `thinking` to reasoning_content so it does NOT leak into the
+        // visible text stream. The chat consumer can drop reasoning from the
+        // live UI while history reconstruction still has access to it.
+        let reasoning_content = response.message.thinking.as_ref().and_then(|t| {
+            let trimmed = t.trim();
+            if trimmed.is_empty() { None } else { Some(t.clone()) }
+        });
+
         // Native tool calls returned by the model.
         if !response.message.tool_calls.is_empty() {
             let tool_calls: Vec<ToolCall> = response
@@ -602,7 +610,7 @@ impl Provider for OllamaProvider {
             return Ok(ChatResponse {
                 text,
                 tool_calls,
-                reasoning_content: None,
+                reasoning_content,
             });
         }
 
@@ -610,6 +618,10 @@ impl Provider for OllamaProvider {
         let content = response.message.content;
         if content.is_empty() {
             if let Some(thinking) = &response.message.thinking {
+                // Empty visible content + thinking-only: the model stopped after
+                // its internal monologue. Log a warning and surface a polite
+                // retry message in the visible text, while preserving the full
+                // thinking content in reasoning_content for history fidelity.
                 tracing::warn!(
                     "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
                     if thinking.len() > 100 {
@@ -619,16 +631,12 @@ impl Provider for OllamaProvider {
                     }
                 );
                 return Ok(ChatResponse {
-                    text: Some(format!(
-                        "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                        if thinking.len() > 200 {
-                            &thinking[..200]
-                        } else {
-                            thinking
-                        }
-                    )),
+                    text: Some(
+                        "The model produced only internal reasoning without a final answer. Please try asking again."
+                            .to_string(),
+                    ),
                     tool_calls: vec![],
-                    reasoning_content: None,
+                    reasoning_content,
                 });
             }
             tracing::warn!("Ollama returned empty content with no tool calls");
@@ -636,7 +644,7 @@ impl Provider for OllamaProvider {
         Ok(ChatResponse {
             text: Some(content),
             tool_calls: vec![],
-            reasoning_content: None,
+            reasoning_content,
         })
     }
 
@@ -793,6 +801,94 @@ mod tests {
         let json = r#"{"message":{"role":"assistant","content":"hello","thinking":"internal reasoning"}}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.message.content, "hello");
+        // Thinking is parsed into its own field — never merged into content.
+        assert_eq!(resp.message.thinking.as_deref(), Some("internal reasoning"));
+    }
+
+    /// Test helper mirroring the body of `chat_with_tools` that routes
+    /// `thinking` into `reasoning_content` and leaves visible text clean.
+    /// Lets us cover the routing logic without a real HTTP server.
+    fn route_response_for_tools(resp: ApiChatResponse) -> ChatResponse {
+        let reasoning_content = resp.message.thinking.as_ref().and_then(|t| {
+            let trimmed = t.trim();
+            if trimmed.is_empty() { None } else { Some(t.clone()) }
+        });
+
+        if !resp.message.tool_calls.is_empty() {
+            let text = if resp.message.content.is_empty() {
+                None
+            } else {
+                Some(resp.message.content)
+            };
+            return ChatResponse {
+                text,
+                tool_calls: vec![],
+                reasoning_content,
+            };
+        }
+
+        let content = resp.message.content;
+        if content.is_empty() {
+            if resp.message.thinking.is_some() {
+                return ChatResponse {
+                    text: Some(
+                        "The model produced only internal reasoning without a final answer. Please try asking again."
+                            .to_string(),
+                    ),
+                    tool_calls: vec![],
+                    reasoning_content,
+                };
+            }
+        }
+        ChatResponse {
+            text: Some(content),
+            tool_calls: vec![],
+            reasoning_content,
+        }
+    }
+
+    #[test]
+    fn ollama_response_routes_thinking_to_reasoning_content_field() {
+        let json = r#"{"message":{"role":"assistant","content":"Visible answer.","thinking":"Step 1: parse... Step 2: respond."}}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let routed = route_response_for_tools(resp);
+
+        // Visible text stays clean of reasoning.
+        assert_eq!(routed.text.as_deref(), Some("Visible answer."));
+        assert_eq!(
+            routed.reasoning_content.as_deref(),
+            Some("Step 1: parse... Step 2: respond.")
+        );
+        assert!(routed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn ollama_thinking_only_response_does_not_leak_thinking_into_text() {
+        let json = r#"{"message":{"role":"assistant","content":"","thinking":"I considered the question but did not answer."}}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let routed = route_response_for_tools(resp);
+
+        // Visible text MUST NOT contain the internal thinking — only a neutral retry hint.
+        let text = routed.text.as_deref().unwrap_or("");
+        assert!(
+            !text.contains("I considered the question"),
+            "thinking content leaked into visible text: {text}"
+        );
+        // But reasoning_content preserves the original thinking for history.
+        assert_eq!(
+            routed.reasoning_content.as_deref(),
+            Some("I considered the question but did not answer.")
+        );
+    }
+
+    #[test]
+    fn ollama_response_without_thinking_keeps_reasoning_none() {
+        let json = r#"{"message":{"role":"assistant","content":"Just an answer."}}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let routed = route_response_for_tools(resp);
+
+        assert_eq!(routed.text.as_deref(), Some("Just an answer."));
+        assert!(routed.reasoning_content.is_none());
     }
 
     #[test]

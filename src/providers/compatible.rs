@@ -308,6 +308,36 @@ fn strip_think_tags(s: &str) -> String {
     result.trim().to_string()
 }
 
+/// Extract the concatenated text inside `<think>...</think>` blocks. Inverse of
+/// [`strip_think_tags`]: returns `None` when no closed `<think>` block exists.
+/// Used to route inline reasoning (MiniMax-style) to the `reasoning_content`
+/// field instead of silently dropping it.
+fn extract_think_tags(s: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("<think>") {
+        let after_open = &rest[start + "<think>".len()..];
+        if let Some(end) = after_open.find("</think>") {
+            parts.push(&after_open[..end]);
+            rest = &after_open[end + "</think>".len()..];
+        } else {
+            // Unclosed tag — drop trailing partial reasoning.
+            break;
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        let joined = parts
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if joined.is_empty() { None } else { Some(joined) }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ResponseMessage {
     #[serde(default)]
@@ -321,38 +351,69 @@ struct ResponseMessage {
 }
 
 impl ResponseMessage {
-    /// Extract text content, falling back to `reasoning_content` when `content`
-    /// is missing or empty. Reasoning/thinking models (Qwen3, GLM-4, etc.)
-    /// often return their output solely in `reasoning_content`.
-    /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
-    /// inline in `content` instead of using a separate field.
-    fn effective_content(&self) -> String {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
-            if !stripped.is_empty() {
-                return stripped;
-            }
-        }
-
-        self.reasoning_content
+    /// Visible text content only. `<think>...</think>` inline blocks (MiniMax
+    /// and similar) are stripped — they are not user-facing output. The
+    /// dedicated `reasoning_content` field is NOT merged in; it is exposed
+    /// separately via [`Self::reasoning`].
+    fn visible_content(&self) -> String {
+        self.content
             .as_ref()
-            .map(|c| strip_think_tags(c))
+            .filter(|c| !c.is_empty())
+            .map(|content| strip_think_tags(content))
             .filter(|c| !c.is_empty())
             .unwrap_or_default()
     }
 
-    fn effective_content_optional(&self) -> Option<String> {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
-            if !stripped.is_empty() {
-                return Some(stripped);
+    /// Visible content as Option (`None` when truly empty). Same semantics as
+    /// [`Self::visible_content`] — reasoning is not merged in.
+    fn visible_content_optional(&self) -> Option<String> {
+        self.content
+            .as_ref()
+            .filter(|c| !c.is_empty())
+            .map(|content| strip_think_tags(content))
+            .filter(|c| !c.is_empty())
+    }
+
+    /// Reasoning/thinking content.
+    ///
+    /// Combines:
+    ///   1. Dedicated `reasoning_content` field (Qwen3, GLM-4 family).
+    ///   2. `<think>...</think>` blocks lifted from inline `content` (MiniMax).
+    ///
+    /// Returns `None` when neither source yields non-empty reasoning.
+    fn reasoning(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(inline) = self.content.as_ref().and_then(|c| extract_think_tags(c)) {
+            let trimmed = inline.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
             }
         }
+        if let Some(rc) = self.reasoning_content.as_ref() {
+            let trimmed = rc.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
+        }
+        if parts.is_empty() { None } else { Some(parts.join("\n")) }
+    }
 
-        self.reasoning_content
-            .as_ref()
-            .map(|c| strip_think_tags(c))
-            .filter(|c| !c.is_empty())
+    /// Legacy fallback for paths that must return a single string and cannot
+    /// surface reasoning separately (`chat_with_system`,
+    /// `chat_with_history`). Prefers visible content; logs and drops reasoning
+    /// if only reasoning is available.
+    fn fallback_text_for_legacy_api(&self) -> String {
+        let visible = self.visible_content();
+        if !visible.is_empty() {
+            return visible;
+        }
+        if let Some(r) = self.reasoning() {
+            tracing::warn!(
+                reasoning_chars = r.chars().count(),
+                "Provider returned only reasoning_content; legacy String-returning API drops reasoning"
+            );
+        }
+        String::new()
     }
 }
 
@@ -481,9 +542,30 @@ struct StreamDelta {
     reasoning_content: Option<String>,
 }
 
+/// Outcome of parsing a single SSE line from an OpenAI-compatible provider.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SseDelta {
+    /// Visible content delta (`choices[].delta.content`).
+    content: Option<String>,
+    /// Reasoning/thinking delta (`choices[].delta.reasoning_content`).
+    /// Streamed separately so the consumer can route it independently.
+    reasoning: Option<String>,
+}
+
+impl SseDelta {
+    const fn is_empty(&self) -> bool {
+        self.content.is_none() && self.reasoning.is_none()
+    }
+}
+
 /// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
 /// Handles the `data: {...}` format and `[DONE]` sentinel.
-fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
+///
+/// Returns `None` on stream sentinels, comments, or chunks with neither
+/// visible content nor reasoning. Otherwise returns a [`SseDelta`] where
+/// `content` and `reasoning` are surfaced as independent fields — they are
+/// never merged together, so the consumer can render only the visible text.
+fn parse_sse_line(line: &str) -> StreamResult<Option<SseDelta>> {
     let line = line.trim();
 
     // Skip empty lines and comments
@@ -503,16 +585,21 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
         // Parse JSON delta
         let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
 
-        // Extract content from delta
+        // Extract content/reasoning from delta as independent fields.
         if let Some(choice) = chunk.choices.first() {
-            if let Some(content) = &choice.delta.content {
-                if !content.is_empty() {
-                    return Ok(Some(content.clone()));
-                }
-            }
-            // Fallback to reasoning_content for thinking models
-            if let Some(reasoning) = &choice.delta.reasoning_content {
-                return Ok(Some(reasoning.clone()));
+            let content = choice
+                .delta
+                .content
+                .as_ref()
+                .and_then(|c| if c.is_empty() { None } else { Some(c.clone()) });
+            let reasoning = choice
+                .delta
+                .reasoning_content
+                .as_ref()
+                .and_then(|r| if r.is_empty() { None } else { Some(r.clone()) });
+            let delta = SseDelta { content, reasoning };
+            if !delta.is_empty() {
+                return Ok(Some(delta));
             }
         }
     }
@@ -565,13 +652,27 @@ fn sse_bytes_to_chunks(
                         buffer = buffer[pos + 1..].to_string();
 
                         match parse_sse_line(&line) {
-                            Ok(Some(content)) => {
-                                let mut chunk = StreamChunk::delta(content);
-                                if count_tokens {
-                                    chunk = chunk.with_token_estimate();
+                            Ok(Some(delta)) => {
+                                // Emit a separate StreamChunk for visible content
+                                // and reasoning so consumers can route them
+                                // independently. They are never merged.
+                                if let Some(content) = delta.content {
+                                    let mut chunk = StreamChunk::delta(content);
+                                    if count_tokens {
+                                        chunk = chunk.with_token_estimate();
+                                    }
+                                    if tx.send(Ok(chunk)).await.is_err() {
+                                        return; // Receiver dropped
+                                    }
                                 }
-                                if tx.send(Ok(chunk)).await.is_err() {
-                                    return; // Receiver dropped
+                                if let Some(reasoning) = delta.reasoning {
+                                    let mut chunk = StreamChunk::reasoning_delta(reasoning);
+                                    if count_tokens {
+                                        chunk = chunk.with_token_estimate();
+                                    }
+                                    if tx.send(Ok(chunk)).await.is_err() {
+                                        return; // Receiver dropped
+                                    }
                                 }
                             }
                             Ok(None) => {}
@@ -1126,10 +1227,12 @@ impl Provider for OpenAiCompatibleProvider {
                 // If tool_calls are present, serialize the full message as JSON
                 // so parse_tool_calls can handle the OpenAI-style format
                 if c.message.tool_calls.is_some() && c.message.tool_calls.as_ref().map_or(false, |t| !t.is_empty()) {
-                    serde_json::to_string(&c.message).unwrap_or_else(|_| c.message.effective_content())
+                    serde_json::to_string(&c.message).unwrap_or_else(|_| c.message.fallback_text_for_legacy_api())
                 } else {
-                    // No tool calls, return content (with reasoning_content fallback)
-                    c.message.effective_content()
+                    // No tool calls — return visible content only. Reasoning is
+                    // intentionally not concatenated; the String-returning
+                    // legacy API cannot carry it back to history.
+                    c.message.fallback_text_for_legacy_api()
                 }
             })
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
@@ -1225,10 +1328,10 @@ impl Provider for OpenAiCompatibleProvider {
                 // If tool_calls are present, serialize the full message as JSON
                 // so parse_tool_calls can handle the OpenAI-style format
                 if c.message.tool_calls.is_some() && c.message.tool_calls.as_ref().map_or(false, |t| !t.is_empty()) {
-                    serde_json::to_string(&c.message).unwrap_or_else(|_| c.message.effective_content())
+                    serde_json::to_string(&c.message).unwrap_or_else(|_| c.message.fallback_text_for_legacy_api())
                 } else {
-                    // No tool calls, return content (with reasoning_content fallback)
-                    c.message.effective_content()
+                    // No tool calls — return visible content only.
+                    c.message.fallback_text_for_legacy_api()
                 }
             })
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
@@ -1307,7 +1410,11 @@ impl Provider for OpenAiCompatibleProvider {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let text = choice.message.effective_content_optional();
+        // Split visible text from reasoning at the provider parsing layer so
+        // chat consumers can drop reasoning from the live stream while history
+        // reconstruction still has it available via `reasoning_content`.
+        let text = choice.message.visible_content_optional();
+        let reasoning_content = choice.message.reasoning();
         let tool_calls = choice
             .message
             .tool_calls
@@ -1328,7 +1435,7 @@ impl Provider for OpenAiCompatibleProvider {
         Ok(ProviderChatResponse {
             text,
             tool_calls,
-            reasoning_content: None,
+            reasoning_content,
         })
     }
 
@@ -2290,72 +2397,105 @@ mod tests {
     }
 
     // ----------------------------------------------------------
-    // Reasoning model fallback tests (reasoning_content)
+    // Reasoning vs visible-content separation tests
     // ----------------------------------------------------------
 
     #[test]
-    fn reasoning_content_fallback_when_content_empty() {
-        // Reasoning models (Qwen3, GLM-4) return content: "" with reasoning_content populated
+    fn reasoning_kept_separate_when_content_empty() {
+        // Reasoning models (Qwen3, GLM-4) return content: "" with reasoning_content populated.
+        // The two streams MUST stay independent — never merged into visible_content.
         let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Thinking output here"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Thinking output here");
+        assert_eq!(msg.visible_content(), "");
+        assert_eq!(msg.reasoning().as_deref(), Some("Thinking output here"));
     }
 
     #[test]
-    fn reasoning_content_fallback_when_content_null() {
-        // Some models may return content: null with reasoning_content
+    fn reasoning_kept_separate_when_content_null() {
         let json = r#"{"choices":[{"message":{"content":null,"reasoning_content":"Fallback text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Fallback text");
+        assert_eq!(msg.visible_content(), "");
+        assert_eq!(msg.reasoning().as_deref(), Some("Fallback text"));
     }
 
     #[test]
-    fn reasoning_content_fallback_when_content_missing() {
-        // content field absent entirely, reasoning_content present
+    fn reasoning_kept_separate_when_content_missing() {
         let json = r#"{"choices":[{"message":{"reasoning_content":"Only reasoning"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Only reasoning");
+        assert_eq!(msg.visible_content(), "");
+        assert_eq!(msg.reasoning().as_deref(), Some("Only reasoning"));
     }
 
     #[test]
-    fn reasoning_content_not_used_when_content_present() {
-        // Normal model: content populated, reasoning_content should be ignored
-        let json = r#"{"choices":[{"message":{"content":"Normal response","reasoning_content":"Should be ignored"}}]}"#;
+    fn visible_content_preferred_when_present_reasoning_still_exposed() {
+        let json = r#"{"choices":[{"message":{"content":"Normal response","reasoning_content":"Sidebar"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Normal response");
+        // visible_content returns just the visible bit.
+        assert_eq!(msg.visible_content(), "Normal response");
+        // reasoning() still exposes the sidebar for history reconstruction.
+        assert_eq!(msg.reasoning().as_deref(), Some("Sidebar"));
     }
 
     #[test]
-    fn reasoning_content_used_when_content_only_think_tags() {
+    fn inline_think_tags_extracted_to_reasoning_not_visible() {
+        // MiniMax-style: <think>...</think> embedded in content. The tag content
+        // must be lifted into reasoning(), and visible_content must NOT contain it.
         let json =
             r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Fallback text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Fallback text");
-        assert_eq!(msg.effective_content_optional().as_deref(), Some("Fallback text"));
+        assert_eq!(msg.visible_content(), "");
+        assert_eq!(msg.visible_content_optional(), None);
+        // reasoning() joins inline <think> body with dedicated reasoning_content.
+        let reasoning = msg.reasoning().expect("test: reasoning must be present");
+        assert!(
+            reasoning.contains("secret"),
+            "missing inline <think> body in reasoning: {reasoning}"
+        );
+        assert!(
+            reasoning.contains("Fallback text"),
+            "missing reasoning_content in reasoning: {reasoning}"
+        );
     }
 
     #[test]
-    fn reasoning_content_both_absent_returns_empty() {
-        // Neither content nor reasoning_content - returns empty string
+    fn both_absent_returns_empty_visible_and_no_reasoning() {
         let json = r#"{"choices":[{"message":{}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "");
+        assert_eq!(msg.visible_content(), "");
+        assert!(msg.reasoning().is_none());
     }
 
     #[test]
-    fn reasoning_content_ignored_by_normal_models() {
-        // Standard response without reasoning_content still works
+    fn reasoning_none_when_normal_model_response() {
         let json = r#"{"choices":[{"message":{"content":"Hello from Venice!"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
         assert!(msg.reasoning_content.is_none());
-        assert_eq!(msg.effective_content(), "Hello from Venice!");
+        assert_eq!(msg.visible_content(), "Hello from Venice!");
+        assert!(msg.reasoning().is_none());
+    }
+
+    #[test]
+    fn extract_think_tags_returns_inline_reasoning_body() {
+        let extracted = extract_think_tags("visible<think>hidden reasoning</think> after");
+        assert_eq!(extracted.as_deref(), Some("hidden reasoning"));
+    }
+
+    #[test]
+    fn extract_think_tags_concats_multiple_blocks() {
+        let extracted = extract_think_tags("a<think>one</think>b<think>two</think>c");
+        assert_eq!(extracted.as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn extract_think_tags_returns_none_when_no_blocks() {
+        assert!(extract_think_tags("no tags here").is_none());
     }
 
     // ----------------------------------------------------------
@@ -2365,35 +2505,62 @@ mod tests {
     #[test]
     fn parse_sse_line_with_content() {
         let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("hello".to_string()));
+        let result = parse_sse_line(line)
+            .expect("test: parse should succeed")
+            .expect("test: should produce delta");
+        assert_eq!(result.content.as_deref(), Some("hello"));
+        assert_eq!(result.reasoning, None);
     }
 
     #[test]
-    fn parse_sse_line_with_reasoning_content() {
+    fn parse_sse_line_with_reasoning_content_goes_to_reasoning_field_only() {
         let line = r#"data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("thinking...".to_string()));
+        let result = parse_sse_line(line)
+            .expect("test: parse should succeed")
+            .expect("test: should produce delta");
+        // Reasoning must NOT be merged into content: prevents thinking leaking into chat output.
+        assert_eq!(result.content, None);
+        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
     #[test]
-    fn parse_sse_line_with_both_prefers_content() {
+    fn parse_sse_line_with_both_keeps_them_separate() {
         let line = r#"data: {"choices":[{"delta":{"content":"real answer","reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("real answer".to_string()));
+        let result = parse_sse_line(line)
+            .expect("test: parse should succeed")
+            .expect("test: should produce delta");
+        // Both fields should be surfaced independently — consumer chooses.
+        assert_eq!(result.content.as_deref(), Some("real answer"));
+        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
     #[test]
-    fn parse_sse_line_with_empty_content_falls_back_to_reasoning_content() {
+    fn parse_sse_line_with_empty_content_still_surfaces_reasoning_separately() {
         let line = r#"data: {"choices":[{"delta":{"content":"","reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("thinking...".to_string()));
+        let result = parse_sse_line(line)
+            .expect("test: parse should succeed")
+            .expect("test: should produce delta");
+        // Empty content is treated as None, reasoning travels in its own field.
+        assert_eq!(result.content, None);
+        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
     #[test]
     fn parse_sse_line_done_sentinel() {
         let line = "data: [DONE]";
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, None);
+        let result = parse_sse_line(line).expect("test: parse should succeed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn stream_chunk_reasoning_does_not_pollute_delta_text() {
+        // Direct verification: building a reasoning_delta chunk leaves visible delta empty.
+        let chunk = StreamChunk::reasoning_delta("internal monologue");
+        assert!(
+            chunk.delta.is_empty(),
+            "visible delta must stay empty for reasoning-only chunk"
+        );
+        assert_eq!(chunk.reasoning.as_deref(), Some("internal monologue"));
+        assert!(chunk.is_reasoning_only());
     }
 }
