@@ -1418,6 +1418,7 @@ async fn run_sub_agent_task(
                 scope_ctx.as_ref(),
                 None,
                 None, // spawned sessions do not use tool tiering
+                crate::agent::loop_::ChatMode::default(),
             )
             .await;
             (task_history, result)

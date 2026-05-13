@@ -503,6 +503,7 @@ impl DelegateTool {
                 scope_ctx.as_ref(),
                 None,
                 None, // delegate sub-agents do not use tool tiering
+                crate::agent::loop_::ChatMode::default(),
             ),
         )
         .await;

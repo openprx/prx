@@ -1039,6 +1039,7 @@ async fn run_gateway_chat_with_multimodal(
         None, // no scope context for webhooks
         None, // no tool call notifications
         Some(&config_snapshot.tool_tiering),
+        crate::agent::loop_::ChatMode::default(),
     )
     .await
 }
