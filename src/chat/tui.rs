@@ -21,6 +21,32 @@ use crate::chat::terminal_proto::{
     DraftVersionTracker, InlineDraftProtocol, LineProtocolError, apply_line_replacement,
 };
 
+/// Live streaming-assistant draft owned by [`TuiState`].
+///
+/// Lives independently of [`TuiState::conversation_lines`] so the renderer
+/// can show in-flight tokens *after* the finalized history without ever
+/// mutating a `ConversationLine` in place. Once the stream completes the
+/// caller invokes [`TuiState::finalize_stream`], which lifts `accumulated`
+/// into a `ConversationLine::Assistant` and clears the draft.
+///
+/// Version monotonicity mirrors the P1-6 `DraftVersionTracker` contract:
+/// any `update_stream` call whose `version` is not strictly greater than
+/// the currently stored one is rejected (stale / reordered delta).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingDraft {
+    /// Draft id from the channel layer — used to reject cross-draft writes
+    /// (start_stream on draft A followed by update_stream on draft B is a
+    /// silent no-op rather than an in-place rewrite of A).
+    pub draft_id: String,
+    /// Accumulated visible text so far. The producer side maintains the
+    /// running concatenation; each `update_stream` call replaces this in
+    /// full, it does NOT splice deltas.
+    pub accumulated: String,
+    /// Monotonically increasing sequence number. `start_stream` returns 0;
+    /// every successful `update_stream` raises it. Stale versions are dropped.
+    pub version: u64,
+}
+
 /// State for the TUI layout.
 pub struct TuiState {
     /// Provider/model displayed in status bar
@@ -40,6 +66,14 @@ pub struct TuiState {
     pub viewport_height: u16,
     /// Render ASCII-only icons instead of unicode glyphs (for non-UTF-8 terms).
     pub ascii_fallback: bool,
+    /// In-flight streaming-assistant draft (P3-5). `None` between turns.
+    ///
+    /// When `Some`, [`render_output`] appends a transient
+    /// [`ConversationLine::StreamingAssistant`]-shaped block beneath the
+    /// finalized history. The streaming buffer is intentionally kept
+    /// separate from `conversation_lines` so a stale or cancelled delta
+    /// can never corrupt persisted history.
+    pub streaming: Option<StreamingDraft>,
 }
 
 /// Maximum width (in chars) for the args preview shown in folded tool cards.
@@ -729,6 +763,91 @@ impl TuiState {
             input: TuiInput::new(),
             viewport_height: 0,
             ascii_fallback: false,
+            streaming: None,
+        }
+    }
+
+    // ── P3-5: streaming-draft API ──────────────────────────────────────────
+    //
+    // The four methods below are the only legitimate entry points for the
+    // P3-5 streaming bridge (`channels::terminal::UiActor::handle_event_tui`
+    // → `TuiMirrorSink`). All other call sites must keep going through
+    // `push_assistant_message` / `push_*` so finalised history remains the
+    // single source of truth.
+
+    /// Begin a new streaming draft. Replaces any previous in-flight draft
+    /// (the caller is expected to have finalised or cancelled it first; if
+    /// not, dropping the stale one is strictly safer than retaining it and
+    /// silently interleaving deltas from two different turns).
+    ///
+    /// Returns the initial version (`0`). Subsequent `update_stream` calls
+    /// must supply a strictly greater version or they are rejected.
+    pub fn start_stream(&mut self, draft_id: &str) -> u64 {
+        self.streaming = Some(StreamingDraft {
+            draft_id: draft_id.to_string(),
+            accumulated: String::new(),
+            version: 0,
+        });
+        self.scroll_to_bottom();
+        0
+    }
+
+    /// Replace the in-flight streaming draft's accumulated text. The
+    /// caller maintains the running concatenation upstream — this method
+    /// does NOT splice deltas, it overwrites in full.
+    ///
+    /// Returns `true` if the update was accepted, `false` if rejected
+    /// (no active draft, mismatched `draft_id`, or non-monotonic version).
+    /// Rejection is silent on purpose: stale deltas are expected during
+    /// cancellation / draft-id reuse races.
+    pub fn update_stream(&mut self, draft_id: &str, accumulated: &str, version: u64) -> bool {
+        let Some(draft) = self.streaming.as_mut() else {
+            return false;
+        };
+        if draft.draft_id != draft_id {
+            return false;
+        }
+        if version <= draft.version && !(version == 0 && draft.version == 0) {
+            // version must strictly advance; the v==0 && stored==0 carve-out
+            // permits a degenerate "initial empty delta at seq 0" but only
+            // when the buffer is also still at v0 (immediately after start).
+            return false;
+        }
+        draft.accumulated.clear();
+        draft.accumulated.push_str(accumulated);
+        draft.version = version;
+        self.scroll_to_bottom();
+        true
+    }
+
+    /// Finalise a streaming draft: lift its text into a permanent
+    /// `ConversationLine::Assistant` (using `final_text` rather than the
+    /// last accumulated buffer, so any post-stream cleanup at the channel
+    /// layer survives) and clear the in-flight slot.
+    ///
+    /// No-op if the active draft id doesn't match. Empty `final_text` still
+    /// clears the streaming slot but pushes nothing — this matches the
+    /// existing `handle_event_tui` policy for empty finalised drafts.
+    pub fn finalize_stream(&mut self, draft_id: &str, final_text: &str) {
+        let matches = self.streaming.as_ref().is_some_and(|d| d.draft_id == draft_id);
+        if !matches {
+            return;
+        }
+        self.streaming = None;
+        if !final_text.is_empty() {
+            self.conversation_lines.push(ConversationLine::Assistant {
+                content: final_text.to_string(),
+            });
+        }
+        self.scroll_to_bottom();
+    }
+
+    /// Discard an in-flight streaming draft without surfacing any text in
+    /// the finalised history. No-op on draft-id mismatch.
+    pub fn cancel_stream(&mut self, draft_id: &str) {
+        if self.streaming.as_ref().is_some_and(|d| d.draft_id == draft_id) {
+            self.streaming = None;
+            self.scroll_to_bottom();
         }
     }
 
@@ -958,6 +1077,19 @@ impl crate::channels::terminal::TuiMirrorSink for TuiStateMirrorSink {
             .lock()
             .mark_last_tool_result_finished(tool_name, success, duration_ms, None)
     }
+    // ── P3-5: streaming bridge ─────────────────────────────────────────
+    fn start_stream(&self, draft_id: &str) {
+        let _ = self.state.lock().start_stream(draft_id);
+    }
+    fn update_stream(&self, draft_id: &str, accumulated: &str, version: u64) {
+        let _ = self.state.lock().update_stream(draft_id, accumulated, version);
+    }
+    fn finalize_stream(&self, draft_id: &str, final_text: &str) {
+        self.state.lock().finalize_stream(draft_id, final_text);
+    }
+    fn cancel_stream(&self, draft_id: &str) {
+        self.state.lock().cancel_stream(draft_id);
+    }
 }
 
 /// Estimate the number of terminal rows a single `ConversationLine` will
@@ -1069,10 +1201,24 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &TuiState) {
 }
 
 fn render_output(frame: &mut Frame, area: Rect, state: &TuiState) {
+    // P3-5: stage a transient `StreamingAssistant` line for the in-flight
+    // draft (if any) BEFORE building `lines`, so it outlives the `Line<'_>`
+    // borrows below. The transient is dropped at the end of this frame; it
+    // never enters `conversation_lines`, so a cancelled stream leaves no
+    // trace in history.
+    let transient_streaming: Option<ConversationLine> =
+        state.streaming.as_ref().map(|s| ConversationLine::StreamingAssistant {
+            content: s.accumulated.clone(),
+        });
+
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     for conv_line in &state.conversation_lines {
         render_conversation_line(&mut lines, conv_line, state.ascii_fallback);
+    }
+
+    if let Some(transient) = transient_streaming.as_ref() {
+        render_conversation_line(&mut lines, transient, state.ascii_fallback);
     }
 
     // Virtual scrolling: compute which lines are visible
@@ -1556,6 +1702,205 @@ mod tests {
         assert_eq!(state.scroll_offset, 2);
         state.scroll_to_bottom();
         assert_eq!(state.scroll_offset, 0);
+    }
+
+    // ── P3-5: streaming-draft API tests ────────────────────────────────
+
+    #[test]
+    fn stream_start_creates_empty_draft_at_version_zero() {
+        let mut state = TuiState::new("p", "m");
+        assert!(state.streaming.is_none(), "fresh state has no draft");
+        let v = state.start_stream("draft-1");
+        assert_eq!(v, 0, "initial version is 0");
+        let draft = state
+            .streaming
+            .as_ref()
+            .expect("test: streaming slot populated after start");
+        assert_eq!(draft.draft_id, "draft-1");
+        assert_eq!(draft.accumulated, "");
+        assert_eq!(draft.version, 0);
+    }
+
+    #[test]
+    fn stream_update_replaces_text_when_version_advances() {
+        let mut state = TuiState::new("p", "m");
+        state.start_stream("d1");
+        assert!(state.update_stream("d1", "Hel", 1));
+        assert_eq!(
+            state.streaming.as_ref().expect("test: streaming present").accumulated,
+            "Hel"
+        );
+        assert!(state.update_stream("d1", "Hello", 2));
+        assert_eq!(
+            state.streaming.as_ref().expect("test: streaming present").accumulated,
+            "Hello"
+        );
+        assert_eq!(state.streaming.as_ref().expect("test: streaming present").version, 2);
+    }
+
+    #[test]
+    fn stream_update_rejects_stale_version() {
+        let mut state = TuiState::new("p", "m");
+        state.start_stream("d1");
+        assert!(state.update_stream("d1", "Hel", 5));
+        // Stale: seq 3 < 5 is dropped.
+        assert!(!state.update_stream("d1", "old", 3));
+        // And the buffer is unchanged.
+        assert_eq!(
+            state.streaming.as_ref().expect("test: streaming present").accumulated,
+            "Hel"
+        );
+        // Same version also rejected (must strictly advance).
+        assert!(!state.update_stream("d1", "still old", 5));
+        assert_eq!(
+            state.streaming.as_ref().expect("test: streaming present").accumulated,
+            "Hel"
+        );
+    }
+
+    #[test]
+    fn stream_update_rejects_mismatched_draft_id() {
+        let mut state = TuiState::new("p", "m");
+        state.start_stream("draft-A");
+        assert!(state.update_stream("draft-A", "alpha", 1));
+        // Wrong draft id — silent no-op, must NOT corrupt the active draft.
+        assert!(!state.update_stream("draft-B", "beta", 99));
+        assert_eq!(
+            state.streaming.as_ref().expect("test: streaming present").accumulated,
+            "alpha"
+        );
+        assert_eq!(
+            state.streaming.as_ref().expect("test: streaming present").draft_id,
+            "draft-A"
+        );
+    }
+
+    #[test]
+    fn stream_update_without_active_draft_is_noop() {
+        let mut state = TuiState::new("p", "m");
+        assert!(!state.update_stream("nope", "lost", 1));
+        assert!(state.streaming.is_none());
+    }
+
+    #[test]
+    fn stream_finalize_lifts_into_conversation_and_clears() {
+        let mut state = TuiState::new("p", "m");
+        state.start_stream("d1");
+        let _ = state.update_stream("d1", "answer body", 1);
+        let len_before = state.conversation_lines.len();
+        state.finalize_stream("d1", "answer body");
+        assert!(state.streaming.is_none(), "streaming slot cleared after finalize");
+        assert_eq!(state.conversation_lines.len(), len_before + 1, "Assistant line pushed");
+        let last = state
+            .conversation_lines
+            .last()
+            .expect("test: at least one conversation line");
+        match last {
+            ConversationLine::Assistant { content } => {
+                assert_eq!(content, "answer body");
+            }
+            other => panic!("test: expected Assistant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_finalize_empty_clears_slot_without_pushing() {
+        let mut state = TuiState::new("p", "m");
+        state.start_stream("d1");
+        let _ = state.update_stream("d1", "partial", 1);
+        let len_before = state.conversation_lines.len();
+        state.finalize_stream("d1", "");
+        assert!(state.streaming.is_none(), "slot cleared even on empty finalise");
+        assert_eq!(state.conversation_lines.len(), len_before, "no line pushed");
+    }
+
+    #[test]
+    fn stream_finalize_mismatched_draft_is_noop() {
+        let mut state = TuiState::new("p", "m");
+        state.start_stream("d1");
+        let _ = state.update_stream("d1", "buf", 1);
+        let len_before = state.conversation_lines.len();
+        state.finalize_stream("OTHER", "should-not-land");
+        assert!(state.streaming.is_some(), "active draft preserved");
+        assert_eq!(state.conversation_lines.len(), len_before, "no line pushed");
+    }
+
+    #[test]
+    fn stream_cancel_clears_slot_without_pushing() {
+        let mut state = TuiState::new("p", "m");
+        state.start_stream("d1");
+        let _ = state.update_stream("d1", "buf", 1);
+        let len_before = state.conversation_lines.len();
+        state.cancel_stream("d1");
+        assert!(state.streaming.is_none(), "slot cleared after cancel");
+        assert_eq!(state.conversation_lines.len(), len_before, "no line pushed on cancel");
+    }
+
+    #[test]
+    fn stream_cancel_mismatched_draft_is_noop() {
+        let mut state = TuiState::new("p", "m");
+        state.start_stream("d1");
+        state.cancel_stream("WRONG");
+        assert!(state.streaming.is_some(), "active draft survives wrong-id cancel");
+    }
+
+    #[test]
+    fn stream_start_replaces_previous_inflight_draft() {
+        // Defensive: if the channel layer fails to finalise the previous draft
+        // before starting a new one, dropping the stale buffer is safer than
+        // interleaving deltas across turns.
+        let mut state = TuiState::new("p", "m");
+        state.start_stream("d1");
+        let _ = state.update_stream("d1", "stale buffer", 4);
+        state.start_stream("d2");
+        let draft = state.streaming.as_ref().expect("test: new streaming slot present");
+        assert_eq!(draft.draft_id, "d2");
+        assert_eq!(draft.accumulated, "");
+        assert_eq!(draft.version, 0);
+    }
+
+    #[test]
+    fn render_output_appends_streaming_block_after_history() {
+        // Drive `render_conversation_line` over both the history and the
+        // staged transient line, mirroring what `render_output` does
+        // internally. Assert the streaming block lands AFTER the last
+        // Assistant line.
+        let mut state = TuiState::new("p", "m");
+        state.push_assistant_message("first turn done");
+        state.start_stream("d-live");
+        assert!(state.update_stream("d-live", "in-flight tokens", 1));
+
+        // Simulate the render path's two-stage line build.
+        let transient: Option<ConversationLine> =
+            state.streaming.as_ref().map(|s| ConversationLine::StreamingAssistant {
+                content: s.accumulated.clone(),
+            });
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        for conv_line in &state.conversation_lines {
+            render_conversation_line(&mut lines, conv_line, false);
+        }
+        let history_end = lines.len();
+        if let Some(t) = transient.as_ref() {
+            render_conversation_line(&mut lines, t, false);
+        }
+        assert!(lines.len() > history_end, "streaming block contributed >=1 line");
+        // The streaming body must contain the in-flight tokens AND end with
+        // the streaming cursor glyph — confirms it routed through the
+        // StreamingAssistant variant rather than the finalized Assistant one.
+        let streaming_body: String = lines
+            .get(history_end + 1)
+            .expect("test: body line present after header")
+            .iter()
+            .map(ratatui::text::Span::to_string)
+            .collect();
+        assert!(
+            streaming_body.contains("in-flight tokens"),
+            "expected streaming body, got {streaming_body:?}"
+        );
+        assert!(
+            streaming_body.ends_with('\u{258C}'),
+            "streaming body ends with ▌ cursor"
+        );
     }
 
     #[test]

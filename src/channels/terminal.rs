@@ -179,6 +179,27 @@ pub trait TuiMirrorSink: Send {
     /// Finalise the most recent `Running` card with the given name.
     /// Returns `true` if a matching card was found and updated.
     fn mark_tool_finished(&self, tool_name: &str, success: bool, duration_ms: u64) -> bool;
+
+    // ── P3-5: streaming-draft surface ──────────────────────────────────
+    //
+    // The four methods below mirror `TuiState::{start,update,finalize,
+    // cancel}_stream`. The default impls are intentionally no-ops so a
+    // legacy sink (e.g. the in-test `RecordingSink`) that predates P3-5
+    // still compiles — the binary's `TuiStateMirrorSink` overrides them
+    // to drive the real ratatui frame.
+
+    /// Begin a new streaming-assistant draft.
+    fn start_stream(&self, _draft_id: &str) {}
+    /// Replace the in-flight streaming draft's accumulated text.
+    ///
+    /// `accumulated` is the full running text so far (NOT a delta).
+    /// `version` is monotonic; stale versions are dropped by the sink.
+    fn update_stream(&self, _draft_id: &str, _accumulated: &str, _version: u64) {}
+    /// Finalise the in-flight streaming draft with `final_text` and lift
+    /// it into permanent conversation history.
+    fn finalize_stream(&self, _draft_id: &str, _final_text: &str) {}
+    /// Discard the in-flight streaming draft without surfacing any text.
+    fn cancel_stream(&self, _draft_id: &str) {}
 }
 
 /// Routing handle that converts an actor running under [`UiActor::run`] from
@@ -564,11 +585,10 @@ impl UiActor {
     /// [`sanitize_terminal_output`] so the renderer cannot repaint a CSI or
     /// OSC escape from a malicious provider response into the frame.
     ///
-    /// `TokenDelta` is intentionally dropped on this path — P3-5 will replace
-    /// this with streaming mutation of a `ConversationLine::StreamingAssistant`.
-    /// `DraftStarted` only flips internal bookkeeping (no spinner; the TUI
-    /// draws its own indicator). `DraftFinalized` is what surfaces the
-    /// assistant text into the conversation.
+    /// `DraftStarted` opens a streaming slot on the sink (P3-5); subsequent
+    /// `TokenDelta` events drive `update_stream` with the running accumulated
+    /// text. `DraftFinalized` lifts the buffer into permanent history.
+    /// `DraftCancelled` discards the slot without surfacing any text.
     #[cfg(feature = "terminal-tui")]
     fn handle_event_tui(&mut self, event: UiEvent) {
         // Every branch below acquires the mirror lock for the shortest
@@ -583,29 +603,42 @@ impl UiActor {
         match event {
             UiEvent::DraftStarted { draft_id } => {
                 self.state = UiState::Streaming;
-                self.active_draft_id = Some(draft_id);
+                self.active_draft_id = Some(draft_id.clone());
                 self.draft_buffer.clear();
                 self.last_seq = 0;
+                // P3-5: open a streaming-assistant slot on the TUI sink so
+                // subsequent TokenDelta events have something to mutate.
+                bridge.sink.start_stream(&draft_id);
                 // No spinner under TUI; the render task draws its own status
                 // bar. Still notify so any state-derived indicator refreshes.
                 self.notify_redraw();
             }
 
-            UiEvent::TokenDelta { draft_id, seq, .. } => {
-                // P3-5 will replace this with streaming TuiState mutation
-                // (push/update a `ConversationLine::StreamingAssistant`).
-                // For P3-4 we only advance the ordering metadata so a late
-                // out-of-order delta cannot rewind the sequence counter.
+            UiEvent::TokenDelta { draft_id, seq, text } => {
+                // P3-5: drive the streaming-assistant frame block. `text`
+                // is already the full accumulated text from the channel
+                // layer (see `TerminalChannel::update_draft`), so we don't
+                // need to maintain a per-draft accumulator here — `seq`
+                // doubles as the monotonic version for stale-delta drop.
                 if self.state != UiState::Streaming {
                     return;
                 }
                 if self.active_draft_id.as_deref() != Some(&draft_id) {
                     return;
                 }
-                if seq > self.last_seq {
-                    self.last_seq = seq;
+                if seq <= self.last_seq {
+                    // Stale / out-of-order delta — drop silently.
+                    return;
                 }
-                // Intentionally no redraw — the visible state has not changed.
+                self.last_seq = seq;
+                // Sanitise before the bytes reach the renderer so a CSI
+                // injection from a malicious LLM provider cannot ride a
+                // delta into the frame buffer.
+                let safe = sanitize_terminal_output(&text);
+                bridge.sink.update_stream(&draft_id, &safe, seq);
+                self.draft_buffer.clear();
+                self.draft_buffer.push_str(&text);
+                self.notify_redraw();
             }
 
             UiEvent::DraftFinalized { draft_id, full_text } => {
@@ -616,12 +649,12 @@ impl UiActor {
                     self.draft_buffer.clear();
                     self.last_seq = 0;
                 }
-                if full_text.is_empty() {
-                    self.notify_redraw();
-                    return;
-                }
+                // P3-5: hand the final text to the sink so it can lift the
+                // streaming buffer into permanent history. Even an empty
+                // finalisation must clear the streaming slot — otherwise a
+                // cancelled-then-zero-finalised draft would linger.
                 let safe = sanitize_terminal_output(&full_text);
-                bridge.sink.push_assistant(&safe);
+                bridge.sink.finalize_stream(&draft_id, &safe);
                 self.notify_redraw();
             }
 
@@ -631,6 +664,9 @@ impl UiActor {
                     self.draft_buffer.clear();
                     self.last_seq = 0;
                     self.state = UiState::Idle;
+                    // P3-5: drop the streaming buffer first, then surface a
+                    // dimmed system note so the user sees the cancellation.
+                    bridge.sink.cancel_stream(&draft_id);
                     bridge.sink.push_system("(cancelled)");
                     self.notify_redraw();
                 }
@@ -1200,6 +1236,22 @@ mod tests {
             success: bool,
             duration_ms: u64,
         },
+        // P3-5: streaming-draft surface
+        StreamStarted {
+            draft_id: String,
+        },
+        StreamUpdated {
+            draft_id: String,
+            accumulated: String,
+            version: u64,
+        },
+        StreamFinalized {
+            draft_id: String,
+            final_text: String,
+        },
+        StreamCancelled {
+            draft_id: String,
+        },
     }
 
     #[cfg(feature = "terminal-tui")]
@@ -1230,6 +1282,30 @@ mod tests {
                 duration_ms,
             });
             true
+        }
+        // P3-5: streaming bridge
+        fn start_stream(&self, draft_id: &str) {
+            self.events.lock().push(RecordedEvent::StreamStarted {
+                draft_id: draft_id.to_string(),
+            });
+        }
+        fn update_stream(&self, draft_id: &str, accumulated: &str, version: u64) {
+            self.events.lock().push(RecordedEvent::StreamUpdated {
+                draft_id: draft_id.to_string(),
+                accumulated: accumulated.to_string(),
+                version,
+            });
+        }
+        fn finalize_stream(&self, draft_id: &str, final_text: &str) {
+            self.events.lock().push(RecordedEvent::StreamFinalized {
+                draft_id: draft_id.to_string(),
+                final_text: final_text.to_string(),
+            });
+        }
+        fn cancel_stream(&self, draft_id: &str) {
+            self.events.lock().push(RecordedEvent::StreamCancelled {
+                draft_id: draft_id.to_string(),
+            });
         }
     }
 
@@ -1275,10 +1351,10 @@ mod tests {
         assert!(redraw_rx.try_recv().is_ok(), "redraw signal should be pending");
     }
 
-    /// `send_draft` + `finalize_draft` under the TUI path should land a
-    /// single Assistant translation carrying the final text. TokenDelta is
-    /// dropped in P3-4; P3-5 will introduce streaming mutation. We assert
-    /// no intermediate Assistant translation was emitted for the delta.
+    /// P3-5: `send_draft` + `update_draft` + `finalize_draft` under the TUI
+    /// path should land Stream{Started,Updated,Finalized} translations in
+    /// order, and MUST NOT use the legacy `push_assistant` surface (which is
+    /// reserved for non-streaming `FinalMessage` events).
     #[cfg(feature = "terminal-tui")]
     #[tokio::test]
     async fn tui_mirror_finalize_draft_pushes_assistant() {
@@ -1301,24 +1377,173 @@ mod tests {
 
         assert!(
             wait_for_sink(&sink, 50, |evts| {
-                evts.iter()
-                    .any(|e| matches!(e, RecordedEvent::Assistant(c) if c == "complete answer"))
+                evts.iter().any(|e| {
+                    matches!(
+                        e,
+                        RecordedEvent::StreamFinalized { final_text, .. } if final_text == "complete answer"
+                    )
+                })
             })
             .await,
-            "expected Assistant('complete answer'); got {:?}",
+            "expected StreamFinalized('complete answer'); got {:?}",
             sink.snapshot()
         );
-        // No intermediate Assistant emitted for the TokenDelta — must be
-        // exactly one assistant line.
+        // The streaming path must NEVER push through the legacy
+        // `push_assistant` surface — that is reserved for non-streaming
+        // `FinalMessage` events.
         let assistants: Vec<_> = sink
             .snapshot()
             .into_iter()
             .filter(|e| matches!(e, RecordedEvent::Assistant(_)))
             .collect();
-        assert_eq!(
-            assistants.len(),
-            1,
-            "TokenDelta must not emit Assistant; got {assistants:?}"
+        assert!(
+            assistants.is_empty(),
+            "TokenDelta path must not emit Assistant; got {assistants:?}"
+        );
+    }
+
+    /// P3-5: a streaming sequence (`send_draft` → `update_draft` × 2 →
+    /// `finalize_draft`) translates into ordered Stream{Started,Updated,
+    /// Finalized} sink calls carrying the accumulated text and monotonic
+    /// version (`seq`).
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn tui_mirror_token_delta_drives_update_stream() {
+        let sink = Arc::new(RecordingSink::default());
+        let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
+        let ch = TerminalChannel::new(true);
+        ch.with_tui_mirror(Box::new(Arc::clone(&sink)), redraw_tx).await;
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("", "user"))
+            .await
+            .expect("test: send_draft ok")
+            .expect("test: draft id");
+        ch.update_draft("user", &draft_id, "Hel").await.expect("test: u1");
+        ch.update_draft("user", &draft_id, "Hello").await.expect("test: u2");
+        ch.finalize_draft("user", &draft_id, "Hello world")
+            .await
+            .expect("test: finalize ok");
+
+        assert!(
+            wait_for_sink(&sink, 50, |evts| {
+                evts.iter().any(|e| {
+                    matches!(
+                        e,
+                        RecordedEvent::StreamFinalized { final_text, .. } if final_text == "Hello world"
+                    )
+                })
+            })
+            .await,
+            "expected StreamFinalized after sequence; got {:?}",
+            sink.snapshot()
+        );
+
+        let snap = sink.snapshot();
+        let started = snap
+            .iter()
+            .position(|e| matches!(e, RecordedEvent::StreamStarted { draft_id: d } if d == &draft_id))
+            .expect("test: StreamStarted present");
+        let updates: Vec<(String, u64)> = snap
+            .iter()
+            .filter_map(|e| match e {
+                RecordedEvent::StreamUpdated {
+                    draft_id: d,
+                    accumulated,
+                    version,
+                } if d == &draft_id => Some((accumulated.clone(), *version)),
+                _ => None,
+            })
+            .collect();
+        let finalized = snap
+            .iter()
+            .position(|e| matches!(e, RecordedEvent::StreamFinalized { draft_id: d, .. } if d == &draft_id))
+            .expect("test: StreamFinalized present");
+
+        assert!(started < finalized, "Started before Finalized");
+        assert_eq!(updates.len(), 2, "two TokenDelta translations; got {updates:?}");
+        let u0 = updates.first().expect("test: first update");
+        let u1 = updates.get(1).expect("test: second update");
+        assert_eq!(u0.0, "Hel");
+        assert_eq!(u1.0, "Hello");
+        // seq is monotonic (TerminalChannel::update_draft uses fetch_add(1)+1).
+        assert!(u0.1 < u1.1, "version strictly increases");
+    }
+
+    /// P3-5: an in-flight draft cancellation must translate into a
+    /// `StreamCancelled` call (not a `StreamFinalized`), and surface the
+    /// `(cancelled)` system note for user feedback.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn tui_mirror_cancel_draft_emits_stream_cancel() {
+        let sink = Arc::new(RecordingSink::default());
+        let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
+        let ch = TerminalChannel::new(true);
+        ch.with_tui_mirror(Box::new(Arc::clone(&sink)), redraw_tx).await;
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("", "user"))
+            .await
+            .expect("test: send_draft ok")
+            .expect("test: draft id");
+        ch.update_draft("user", &draft_id, "partial")
+            .await
+            .expect("test: update ok");
+        ch.cancel_draft("user", &draft_id).await.expect("test: cancel ok");
+
+        assert!(
+            wait_for_sink(&sink, 50, |evts| {
+                evts.iter()
+                    .any(|e| matches!(e, RecordedEvent::StreamCancelled { draft_id: d } if d == &draft_id))
+            })
+            .await,
+            "expected StreamCancelled; got {:?}",
+            sink.snapshot()
+        );
+        let snap = sink.snapshot();
+        assert!(
+            !snap.iter().any(|e| matches!(e, RecordedEvent::StreamFinalized { .. })),
+            "cancel must not emit StreamFinalized; got {snap:?}"
+        );
+        assert!(
+            snap.iter()
+                .any(|e| matches!(e, RecordedEvent::System(s) if s == "(cancelled)")),
+            "expected dimmed (cancelled) system note; got {snap:?}"
+        );
+    }
+
+    /// P3-5: ANSI escapes inside a TokenDelta payload must be stripped
+    /// before they reach the sink — otherwise a malicious LLM provider
+    /// could inject CSI/OSC into the streaming frame buffer.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn tui_mirror_sanitizes_ansi_in_token_delta() {
+        let sink = Arc::new(RecordingSink::default());
+        let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
+        let ch = TerminalChannel::new(true);
+        ch.with_tui_mirror(Box::new(Arc::clone(&sink)), redraw_tx).await;
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("", "user"))
+            .await
+            .expect("test: send_draft ok")
+            .expect("test: draft id");
+        ch.update_draft("user", &draft_id, "Hello \x1b[31mred\x1b[0m world")
+            .await
+            .expect("test: update ok");
+
+        assert!(
+            wait_for_sink(&sink, 50, |evts| {
+                evts.iter().any(|e| {
+                    matches!(
+                        e,
+                        RecordedEvent::StreamUpdated { accumulated, .. } if accumulated == "Hello red world"
+                    )
+                })
+            })
+            .await,
+            "expected sanitised StreamUpdated; got {:?}",
+            sink.snapshot()
         );
     }
 
