@@ -134,25 +134,66 @@ fn now_ms() -> u64 {
 /// - `Off`:  旧路径单写（默认）。reducer 不构造、不执行。
 /// - `Both`: 双写。Event 同时分发到旧路径和 reducer，两者并行 mutate；
 ///   用于开发/测试期对账 reducer 与旧实现的行为一致。
-/// - `Redux`: 新路径主导关键控制流（Quit / forward-delete 等）。
-///   旧路径仍执行以维持渲染源（chat_mirror），Step 5 起删除。
+/// - `Redux`: 新路径主导关键控制流（Quit / forward-delete 等），保留作为
+///   `Both` 的别名以维持向后兼容（早期用 `PRX_CHAT_REDUX=1` 启用）。
+/// - `Pure`: S3 T3-3 收官模式，reducer 单路由。driver 路径**默认开启**（无需
+///   `PRX_CHAT_REDUX_DRIVER=1`），legacy 守卫全关，`chat_session.add_*_turn`
+///   不再执行（由 reducer 的 `RecordUserTurn`/`RecordAssistantTurn` +
+///   `Effect::SaveSession` 接管）。
 #[cfg(feature = "terminal-tui")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReduxMode {
     Off,
     Both,
     Redux,
+    Pure,
 }
 
 #[cfg(feature = "terminal-tui")]
 impl ReduxMode {
     /// 解析环境变量 `PRX_CHAT_REDUX`. 默认 `Off`.
+    ///
+    /// 值大小写不敏感，识别规则：
+    /// - `""` / `"0"` / `"off"` / `"legacy"` / 未设置 → [`Self::Off`]
+    /// - `"1"` / `"both"` → [`Self::Both`]（向后兼容：原 `Redux` 别名也归此）
+    /// - `"redux"` → [`Self::Redux`]（显式别名，等价 `Both` + driver opt-in 语义）
+    /// - `"pure"` / `"2"` → [`Self::Pure`]（T3-3 收官模式，reducer 单路由）
+    /// - 其他未识别值 → [`Self::Off`]（fail-safe，避免误升级）
     fn from_env() -> Self {
-        match std::env::var("PRX_CHAT_REDUX").as_deref() {
-            Ok("1") => Self::Redux,
-            Ok("both") => Self::Both,
+        std::env::var("PRX_CHAT_REDUX")
+            .ok()
+            .map_or(Self::Off, |raw| Self::parse(&raw))
+    }
+
+    /// 解析单个字符串值（大小写不敏感）；fail-safe 到 `Off`.
+    ///
+    /// 拆成独立 fn 让 env 解析逻辑可单测，不依赖进程级 env 状态.
+    fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "off" | "legacy" => Self::Off,
+            "1" | "both" => Self::Both,
+            "redux" => Self::Redux,
+            "pure" | "2" => Self::Pure,
             _ => Self::Off,
         }
+    }
+
+    /// 是否启用 reducer 路径（构造 + 执行 Effect）.
+    ///
+    /// `Off` → false（reducer 完全静默，旧路径单写）.
+    /// `Both` / `Redux` / `Pure` → true.
+    #[must_use]
+    pub(crate) const fn reducer_active(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// 是否在 Pure 模式（reducer 单路由，legacy 守卫全关）.
+    ///
+    /// T3-3-c 关键判断：`Pure` 时跳过 `chat_session.add_*_turn` 并让 reducer 的
+    /// `Effect::SaveSession` 单写持久化；`Off` / `Both` / `Redux` 保留 legacy.
+    #[must_use]
+    pub(crate) const fn is_pure(self) -> bool {
+        matches!(self, Self::Pure)
     }
 }
 
@@ -226,6 +267,9 @@ fn force_empty_tools_from_env() -> bool {
 /// | Both  | *             | LegacyToolLoop |
 /// | Redux | false         | LegacyToolLoop |
 /// | Redux | true          | ReduxDriver    |
+/// | Pure  | *             | ReduxDriver    |
+///
+/// `Pure` 模式下 `driver_opt_in` 不再需要——T3-3 收官把 reducer 路由设为默认。
 ///
 /// 非 TUI feature 下永远返回 [`TurnRoute::LegacyToolLoop`].
 ///
@@ -240,10 +284,12 @@ fn force_empty_tools_from_env() -> bool {
 #[cfg(feature = "terminal-tui")]
 #[must_use]
 pub(crate) const fn route_turn(mode: ReduxMode, driver_opt_in: bool, _tools_empty: bool) -> TurnRoute {
-    if matches!(mode, ReduxMode::Redux) && driver_opt_in {
-        TurnRoute::ReduxDriver
-    } else {
-        TurnRoute::LegacyToolLoop
+    match mode {
+        // T3-3 收官：Pure 必走 driver，不再依赖 driver_opt_in env.
+        ReduxMode::Pure => TurnRoute::ReduxDriver,
+        // 向后兼容：Redux 需 driver opt-in 才切换；保持 5a-4 的"显式 opt-in"语义.
+        ReduxMode::Redux if driver_opt_in => TurnRoute::ReduxDriver,
+        _ => TurnRoute::LegacyToolLoop,
     }
 }
 
@@ -1476,9 +1522,12 @@ pub async fn run(
             let coalescer_draft_id = d_id.clone();
             // S2-A: capture per-turn mode snapshot. In `Off` and `Both` the
             // legacy `update_draft` still runs (renderer source of truth);
-            // in pure `Redux` it is skipped so the reducer-driven path is the
-            // sole UI writer. The coalescer dispatch always runs — the
+            // in `Redux` / `Pure` it is skipped so the reducer-driven path is
+            // the sole UI writer. The coalescer dispatch always runs — the
             // reducer needs every delta for its `StreamState::draft` mirror.
+            //
+            // T3-3 收官（Pure）：与 Redux 同样关闸；guard 用 matches!(Off|Both)
+            // 反向命题保证未来新增 ReduxMode 变体时编译期可见漏写.
             #[cfg(feature = "terminal-tui")]
             let legacy_update_draft_enabled = matches!(redux_mode, ReduxMode::Off | ReduxMode::Both);
             #[cfg(not(feature = "terminal-tui"))]
@@ -1525,7 +1574,7 @@ pub async fn run(
         // Ctrl+C 的真取消。legacy `active_cancel` Arc 仍由顶层 Ctrl+C handler
         // (mod.rs 持久 ctrl_c() 任务) 和 TUI 内部 `InterruptTurn` 读取 — 这两条
         // 路径无法直接访问 ChatState，所以 legacy 字段在 Off/Both 模式下必须保留写
-        // 以确保兜底。Redux 模式下 legacy 字段不必再写（reducer 是单一真源）。
+        // 以确保兜底。Redux / Pure 模式下 legacy 字段不必再写（reducer 是单一真源）。
         #[cfg(feature = "terminal-tui")]
         let legacy_active_cancel_enabled = matches!(redux_mode, ReduxMode::Off | ReduxMode::Both);
         #[cfg(not(feature = "terminal-tui"))]
@@ -2122,15 +2171,26 @@ pub async fn run(
         // Sanitize content before persistence (redact secrets, truncate large outputs).
         //
         // S2-B Step 4: RecordUserTurn / RecordAssistantTurn 已经在上面（enriched /
-        // history_response 同点）dispatch；这里 legacy `chat_session.add_*_turn` 仍
-        // unconditional 跑，因为 `chat_session` 是 `save_session(mem, &chat_session)`
-        // 的真实持久化源。S2-C 阶段由 reducer SaveSession effect 接管 chat_session
-        // 时再删除 legacy 写。两条记录的内容（sanitized vs enriched/history_response）
-        // 暂有差异，由 S2-C 统一。
+        // history_response 同点）dispatch；这里 legacy `chat_session.add_*_turn` 在
+        // `Off` / `Both` / `Redux` 模式下保留，因为 `chat_session` 仍是
+        // `save_session(mem, &chat_session)` 的真实持久化源。
+        //
+        // T3-3-c 收官：**Pure 模式跳过 legacy add_*_turn** —— reducer 的
+        // `RecordUserTurn` / `RecordAssistantTurn` + `Effect::SaveSession` 接管
+        // 单源持久化，下方 `save_session(...)` 也由 `dual_write_guard` 抑制。
+        // 这关闭了 S2-D/E 阶段保留的最后一处双写残留。
         let sanitized_input = sanitize::sanitize_for_persistence(&user_input);
         let sanitized_response = sanitize::sanitize_for_persistence(&response);
-        chat_session.add_user_turn(&sanitized_input);
-        chat_session.add_assistant_turn(&sanitized_response, Vec::new());
+        #[cfg(feature = "terminal-tui")]
+        let legacy_session_writes_enabled = !ReduxMode::from_env().is_pure();
+        #[cfg(not(feature = "terminal-tui"))]
+        let legacy_session_writes_enabled = true;
+        if legacy_session_writes_enabled {
+            chat_session.add_user_turn(&sanitized_input);
+            chat_session.add_assistant_turn(&sanitized_response, Vec::new());
+        } else {
+            tracing::debug!("T3-3-c Pure mode: skip legacy chat_session.add_*_turn (reducer owns persistence)");
+        }
 
         // P0-1 fix: 旧路径在 Both/Redux 模式下受 dual_write_guard 守卫。
         // Redux reducer 的 SaveSession effect 已在 execute_real 中置位 guard，
@@ -2574,6 +2634,7 @@ fn run_tui_unified_loop(
                         // S2-B Step 3: 单击 Ctrl+C — 优先走 reducer 路径
                         // (Action::CancelRequested → Effect::CancelToken → 真 cancel)；
                         // legacy token.cancel() 在 Off/Both 模式兜底，避免漏取消。
+                        // Pure / Redux 模式由 reducer 单源负责取消（已 dispatch 到上）。
                         let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::CancelRequested);
                         if matches!(redux_mode, ReduxMode::Off | ReduxMode::Both)
                             && let Some(token) = active_cancel.lock().as_ref()
@@ -2583,10 +2644,10 @@ fn run_tui_unified_loop(
                     }
                     tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed => {}
                 }
-                // Redux mode: shadow 的 Effect::Quit 也能触发退出（用于灰度验证
+                // Redux / Pure mode: shadow 的 Effect::Quit 也能触发退出（用于灰度验证
                 // 新路径的 Ctrl+D 空 buffer / 双 Ctrl+C 语义）。Both 模式仅记录差异。
-                if matches!(redux_mode, ReduxMode::Redux) && shadow_wants_quit {
-                    tracing::info!("redux: shadow requested Quit; shutting down");
+                if matches!(redux_mode, ReduxMode::Redux | ReduxMode::Pure) && shadow_wants_quit {
+                    tracing::info!(mode = ?redux_mode, "redux: shadow requested Quit; shutting down");
                     shutdown.cancel();
                     return Ok(());
                 }
@@ -3184,6 +3245,120 @@ mod tracing_redirect_tests {
                 assert!(
                     msg.contains("cannot determine home directory"),
                     "unexpected error: {msg}"
+                );
+            }
+        }
+    }
+}
+
+// ─── T3-3: ReduxMode 解析 + route_turn 真值表 ─────────────────────────────────
+
+#[cfg(test)]
+#[cfg(feature = "terminal-tui")]
+mod redux_mode_tests {
+    //! T3-3-a: `ReduxMode::parse` 覆盖 4 个枚举值 + fail-safe；
+    //! T3-3-b: `route_turn` Pure → ReduxDriver 无需 driver_opt_in.
+    //!
+    //! 解析逻辑用 `ReduxMode::parse(&str)` 单测，避免依赖进程级 env state（不同测试
+    //! 并行跑时 env 互相污染）。`from_env` 只是 env→parse 的薄包装，已由集成测试覆盖。
+    use super::*;
+
+    /// T3-3-a-1: Off 类输入（含空串 / 0 / off / legacy / 未识别）一律 Off
+    #[test]
+    fn parse_off_values() {
+        assert_eq!(ReduxMode::parse(""), ReduxMode::Off);
+        assert_eq!(ReduxMode::parse("0"), ReduxMode::Off);
+        assert_eq!(ReduxMode::parse("off"), ReduxMode::Off);
+        assert_eq!(ReduxMode::parse("OFF"), ReduxMode::Off);
+        assert_eq!(ReduxMode::parse("Legacy"), ReduxMode::Off);
+        // fail-safe：未识别值不升级到 Pure，防止误开 reducer 单路由
+        assert_eq!(ReduxMode::parse("garbage"), ReduxMode::Off);
+        assert_eq!(ReduxMode::parse("3"), ReduxMode::Off);
+    }
+
+    /// T3-3-a-2: "1" 与 "both"（大小写不敏感）都映射到 Both
+    #[test]
+    fn parse_both_values() {
+        assert_eq!(ReduxMode::parse("1"), ReduxMode::Both);
+        assert_eq!(ReduxMode::parse("both"), ReduxMode::Both);
+        assert_eq!(ReduxMode::parse("BOTH"), ReduxMode::Both);
+        assert_eq!(ReduxMode::parse(" both "), ReduxMode::Both, "trim 应生效");
+    }
+
+    /// T3-3-a-3: "redux" 显式别名（保留向后兼容）
+    #[test]
+    fn parse_redux_value() {
+        assert_eq!(ReduxMode::parse("redux"), ReduxMode::Redux);
+        assert_eq!(ReduxMode::parse("REDUX"), ReduxMode::Redux);
+    }
+
+    /// T3-3-a-4: "pure" / "2" → Pure（T3-3 收官模式）
+    #[test]
+    fn parse_pure_values() {
+        assert_eq!(ReduxMode::parse("pure"), ReduxMode::Pure);
+        assert_eq!(ReduxMode::parse("PURE"), ReduxMode::Pure);
+        assert_eq!(ReduxMode::parse("2"), ReduxMode::Pure);
+        assert_eq!(ReduxMode::parse(" pure "), ReduxMode::Pure, "trim 应生效");
+    }
+
+    /// T3-3-a-5: reducer_active / is_pure 辅助方法
+    #[test]
+    fn mode_helper_predicates() {
+        assert!(!ReduxMode::Off.reducer_active());
+        assert!(ReduxMode::Both.reducer_active());
+        assert!(ReduxMode::Redux.reducer_active());
+        assert!(ReduxMode::Pure.reducer_active());
+
+        assert!(!ReduxMode::Off.is_pure());
+        assert!(!ReduxMode::Both.is_pure());
+        assert!(!ReduxMode::Redux.is_pure());
+        assert!(ReduxMode::Pure.is_pure());
+    }
+
+    /// T3-3-b-1: Off / Both 任何 driver_opt_in 都走 legacy
+    #[test]
+    fn route_off_and_both_always_legacy() {
+        for tools_empty in [false, true] {
+            assert!(matches!(
+                route_turn(ReduxMode::Off, false, tools_empty),
+                TurnRoute::LegacyToolLoop
+            ));
+            assert!(matches!(
+                route_turn(ReduxMode::Off, true, tools_empty),
+                TurnRoute::LegacyToolLoop
+            ));
+            assert!(matches!(
+                route_turn(ReduxMode::Both, false, tools_empty),
+                TurnRoute::LegacyToolLoop
+            ));
+            assert!(matches!(
+                route_turn(ReduxMode::Both, true, tools_empty),
+                TurnRoute::LegacyToolLoop
+            ));
+        }
+    }
+
+    /// T3-3-b-2: Redux 需 driver_opt_in 才切到 driver（向后兼容 5a-4 语义）
+    #[test]
+    fn route_redux_requires_opt_in() {
+        assert!(matches!(
+            route_turn(ReduxMode::Redux, false, true),
+            TurnRoute::LegacyToolLoop
+        ));
+        assert!(matches!(
+            route_turn(ReduxMode::Redux, true, true),
+            TurnRoute::ReduxDriver
+        ));
+    }
+
+    /// T3-3-b-3: Pure 必走 driver，无论 driver_opt_in（T3-3 收官关键契约）
+    #[test]
+    fn route_pure_always_driver() {
+        for opt_in in [false, true] {
+            for tools_empty in [false, true] {
+                assert!(
+                    matches!(route_turn(ReduxMode::Pure, opt_in, tools_empty), TurnRoute::ReduxDriver),
+                    "Pure mode must always route to ReduxDriver (opt_in={opt_in} tools_empty={tools_empty})"
                 );
             }
         }
