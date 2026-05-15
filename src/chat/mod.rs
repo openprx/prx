@@ -309,6 +309,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
             Effect::NotifyHook { .. } => "NotifyHook",
             Effect::DisplayMedia { .. } => "DisplayMedia",
             Effect::AutoTitleSession(_) => "AutoTitleSession",
+            Effect::RequestApproval { .. } => "RequestApproval",
         })
         .collect();
 
@@ -944,6 +945,10 @@ pub async fn run(
                 // 5a-6: 共享 tools_registry，让 driver 在 tool turn 中按名查表执行。
                 tools_registry: Some(Arc::clone(&tools_registry)),
                 max_tool_iterations: config.agent.max_tool_iterations,
+                // S3 T3-1: approval 桥接 — 共享 router + manager 句柄给 driver。
+                // ApprovalManager 由 chat::run 上方已构造（line 814），这里 wrap Arc。
+                approval_router: Arc::new(dispatcher::ApprovalRouter::new()),
+                approval_manager: Some(Arc::new(ApprovalManager::from_config(&config.autonomy))),
             };
             tracing::info!(mode = ?mode, "PRX_CHAT_REDUX: EffectExecutor in real-deps mode");
             dispatcher::EffectExecutor::new_with_deps(deps)
