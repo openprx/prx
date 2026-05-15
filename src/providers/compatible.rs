@@ -5,7 +5,7 @@
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
-    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
+    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk, ToolCallChunkStatus,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -523,49 +523,125 @@ struct ResponsesContent {
 /// Server-Sent Event stream chunk for OpenAI-compatible streaming.
 #[derive(Debug, Deserialize)]
 struct StreamChunkResponse {
+    #[serde(default)]
     choices: Vec<StreamChoice>,
 }
 
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
+    #[serde(default)]
     delta: StreamDelta,
-    #[serde(rename = "finish_reason")]
-    _finish_reason: Option<String>,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Per-choice delta. Mirrors the OpenAI Chat Completions streaming format used
+/// by Groq, Mistral, Cohere (via `/compatibility` endpoint), MiniMax, GLM, etc.
+#[derive(Debug, Default, Deserialize)]
 struct StreamDelta {
+    /// Visible content token fragment.
     #[serde(default)]
     content: Option<String>,
     /// Reasoning/thinking models may stream output via `reasoning_content`.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// **S3 T3-2-D**: incremental tool-call deltas. Each entry is keyed by
+    /// `index` and may carry an `id`, a `function.name`, and/or a
+    /// `function.arguments` fragment to be concatenated with prior fragments
+    /// for the same index.
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamSseToolCall>>,
+}
+
+/// A single tool-call delta within `choices[].delta.tool_calls[]`.
+///
+/// OpenAI-compatible providers stream the leading delta with `id` + `type` +
+/// `function.name` and then a sequence of deltas carrying only
+/// `function.arguments` fragments keyed by the same `index`.
+#[derive(Debug, Deserialize)]
+struct StreamSseToolCall {
+    /// Concurrent-call slot (0..N).
+    #[serde(default)]
+    index: usize,
+    /// Provider-assigned call id. Usually present only on the first delta.
+    #[serde(default)]
+    id: Option<String>,
+    /// Function payload (`name` + incremental `arguments`).
+    #[serde(default)]
+    function: Option<StreamSseFunction>,
+}
+
+/// Function payload inside a streaming tool-call delta.
+#[derive(Debug, Deserialize)]
+struct StreamSseFunction {
+    /// Tool name (only present on the leading delta).
+    #[serde(default)]
+    name: Option<String>,
+    /// Incremental fragment of the JSON arguments string.
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 /// Outcome of parsing a single SSE line from an OpenAI-compatible provider.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct SseDelta {
+#[derive(Debug, Default)]
+struct SseEvent {
     /// Visible content delta (`choices[].delta.content`).
     content: Option<String>,
     /// Reasoning/thinking delta (`choices[].delta.reasoning_content`).
     /// Streamed separately so the consumer can route it independently.
     reasoning: Option<String>,
+    /// Incremental tool-call deltas (`choices[].delta.tool_calls[]`).
+    /// Empty for ordinary content/reasoning chunks.
+    tool_call_deltas: Vec<StreamSseToolCall>,
+    /// `choices[].finish_reason`; `Some("tool_calls")` is the signal to flush
+    /// the accumulated tool-call buffer.
+    finish_reason: Option<String>,
+    /// `true` when the chunk was the `[DONE]` sentinel.
+    done_sentinel: bool,
 }
 
-impl SseDelta {
-    const fn is_empty(&self) -> bool {
-        self.content.is_none() && self.reasoning.is_none()
+impl SseEvent {
+    /// `true` when the event carries no payload at all (no content, no
+    /// reasoning, no tool deltas, no finish reason and not the DONE sentinel).
+    const fn is_noop(&self) -> bool {
+        self.content.is_none()
+            && self.reasoning.is_none()
+            && self.tool_call_deltas.is_empty()
+            && self.finish_reason.is_none()
+            && !self.done_sentinel
     }
+}
+
+/// Buffered state for a single in-flight tool call across SSE chunks.
+///
+/// OpenAI-compatible providers stream `function.arguments` as incremental JSON
+/// fragments keyed by `index`. We accumulate them per-slot and emit a
+/// terminal `Completed` [`ToolCallChunk`] once `finish_reason == "tool_calls"`
+/// arrives. The same buffer also tracks whether the leading "open" Streaming
+/// chunk has already been forwarded so we don't re-emit it on subsequent
+/// argument fragments.
+#[derive(Debug, Default, Clone)]
+struct ToolCallBuffer {
+    /// Provider-assigned call id, defaulted lazily to a UUID when missing.
+    id: String,
+    /// Function name (must match a registered `ToolSpec.name`).
+    name: String,
+    /// Concatenation of every `function.arguments` fragment observed so far.
+    arguments: String,
+    /// `true` once the leading `Streaming` chunk (open marker) has been
+    /// forwarded — prevents duplicate empty-delta chunks when a provider
+    /// emits `id` + `name` across multiple frames.
+    opened: bool,
 }
 
 /// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
 /// Handles the `data: {...}` format and `[DONE]` sentinel.
 ///
-/// Returns `None` on stream sentinels, comments, or chunks with neither
-/// visible content nor reasoning. Otherwise returns a [`SseDelta`] where
-/// `content` and `reasoning` are surfaced as independent fields — they are
-/// never merged together, so the consumer can render only the visible text.
-fn parse_sse_line(line: &str) -> StreamResult<Option<SseDelta>> {
+/// Returns `None` on blank/comment lines (no-op). Returns `Some(SseEvent)`
+/// for every `data:` payload, including the `[DONE]` sentinel and chunks
+/// whose only meaningful field is `finish_reason` — the caller needs those
+/// to flush the tool-call buffer.
+fn parse_sse_line(line: &str) -> StreamResult<Option<SseEvent>> {
     let line = line.trim();
 
     // Skip empty lines and comments
@@ -574,40 +650,183 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<SseDelta>> {
     }
 
     // SSE format: "data: {...}"
-    if let Some(data) = line.strip_prefix("data:") {
-        let data = data.trim();
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let data = data.trim();
 
-        // Check for [DONE] sentinel
-        if data == "[DONE]" {
-            return Ok(None);
+    // Check for [DONE] sentinel
+    if data == "[DONE]" {
+        return Ok(Some(SseEvent {
+            done_sentinel: true,
+            ..SseEvent::default()
+        }));
+    }
+
+    // Parse JSON delta
+    let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
+
+    let Some(choice) = chunk.choices.into_iter().next() else {
+        return Ok(None);
+    };
+
+    let content = choice.delta.content.filter(|c| !c.is_empty());
+    let reasoning = choice.delta.reasoning_content.filter(|r| !r.is_empty());
+    let tool_call_deltas = choice.delta.tool_calls.unwrap_or_default();
+    let finish_reason = choice.finish_reason;
+
+    let event = SseEvent {
+        content,
+        reasoning,
+        tool_call_deltas,
+        finish_reason,
+        done_sentinel: false,
+    };
+
+    if event.is_noop() {
+        return Ok(None);
+    }
+
+    Ok(Some(event))
+}
+
+/// Apply a vec of tool_call deltas onto the index-keyed buffer.
+///
+/// **S3 T3-2-D**: in addition to accumulating fragments into the buffer, this
+/// returns a vec of `Streaming`-status [`ToolCallChunk`]s in observation order
+/// so the caller can emit them incrementally. The streaming protocol mirrors
+/// the OpenAI provider's behaviour (`T3-2-B`):
+///
+/// - The first delta for a given index carrying `id`/`name` emits a leading
+///   `Streaming` chunk with `arguments_delta = Some("")` so the driver sees
+///   the call has been opened, even before any argument fragment arrives.
+/// - Each subsequent delta carrying a `function.arguments` fragment emits a
+///   `Streaming` chunk with `arguments_delta = Some(fragment)`.
+///
+/// `id` is sourced from whichever delta first carried it; when no provider id
+/// ever arrives, a UUID is minted lazily on the flush path and recorded back
+/// into the buffer so the matching `Completed` chunk shares the same id.
+fn apply_tool_call_deltas(buf: &mut Vec<ToolCallBuffer>, deltas: Vec<StreamSseToolCall>) -> Vec<ToolCallChunk> {
+    let mut streaming = Vec::with_capacity(deltas.len());
+
+    for delta in deltas {
+        let slot = delta.index;
+        while buf.len() <= slot {
+            buf.push(ToolCallBuffer::default());
+        }
+        let Some(entry) = buf.get_mut(slot) else {
+            continue;
+        };
+
+        let mut saw_open_signal = false;
+        if let Some(id) = delta.id {
+            if !id.is_empty() {
+                entry.id = id;
+                saw_open_signal = true;
+            }
+        }
+        let mut arg_fragment: Option<String> = None;
+        if let Some(func) = delta.function {
+            if let Some(name) = func.name {
+                if !name.is_empty() {
+                    entry.name = name;
+                    saw_open_signal = true;
+                }
+            }
+            if let Some(args) = func.arguments {
+                if !args.is_empty() {
+                    entry.arguments.push_str(&args);
+                    arg_fragment = Some(args);
+                }
+            }
         }
 
-        // Parse JSON delta
-        let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
+        // Defensive: skip deltas that carried neither identifying info nor an
+        // argument fragment (should not happen on well-formed OpenAI streams).
+        if !saw_open_signal && arg_fragment.is_none() {
+            continue;
+        }
 
-        // Extract content/reasoning from delta as independent fields.
-        if let Some(choice) = chunk.choices.first() {
-            let content = choice
-                .delta
-                .content
-                .as_ref()
-                .and_then(|c| if c.is_empty() { None } else { Some(c.clone()) });
-            let reasoning = choice
-                .delta
-                .reasoning_content
-                .as_ref()
-                .and_then(|r| if r.is_empty() { None } else { Some(r.clone()) });
-            let delta = SseDelta { content, reasoning };
-            if !delta.is_empty() {
-                return Ok(Some(delta));
-            }
+        // Hold the streaming chunk until at least the function name is known —
+        // consumers key on `name` to route the call.
+        if entry.name.is_empty() {
+            continue;
+        }
+
+        if entry.id.is_empty() {
+            entry.id = uuid::Uuid::new_v4().to_string();
+        }
+
+        // Emit a leading "open" chunk exactly once per index, then one chunk
+        // per non-empty argument fragment.
+        if !entry.opened {
+            entry.opened = true;
+            streaming.push(ToolCallChunk {
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                args: String::new(),
+                index: slot,
+                arguments_delta: Some(String::new()),
+                status: ToolCallChunkStatus::Streaming,
+            });
+        }
+
+        if let Some(fragment) = arg_fragment {
+            streaming.push(ToolCallChunk {
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                args: String::new(),
+                index: slot,
+                arguments_delta: Some(fragment),
+                status: ToolCallChunkStatus::Streaming,
+            });
         }
     }
 
-    Ok(None)
+    streaming
+}
+
+/// Flush the tool_call buffer into terminal `Completed` chunks.
+///
+/// **S3 T3-2-D**: invoked when `finish_reason == "tool_calls"` arrives. The
+/// driver-side aggregator treats `Completed.args` as authoritative, so this
+/// must always return the full concatenated argument JSON (falling back to
+/// `"{}"` when no fragments were observed).
+fn flush_tool_call_buffer(buf: &[ToolCallBuffer]) -> Vec<ToolCallChunk> {
+    buf.iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.name.is_empty())
+        .map(|(idx, entry)| {
+            let id = if entry.id.is_empty() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                entry.id.clone()
+            };
+            let args = if entry.arguments.is_empty() {
+                "{}".to_string()
+            } else {
+                entry.arguments.clone()
+            };
+            ToolCallChunk {
+                id,
+                name: entry.name.clone(),
+                args,
+                index: idx,
+                arguments_delta: None,
+                status: ToolCallChunkStatus::Completed,
+            }
+        })
+        .collect()
 }
 
 /// Convert SSE byte stream to text chunks.
+///
+/// **S3 T3-2-D**: in addition to forwarding visible-content and reasoning
+/// deltas, this maintains an index-keyed [`ToolCallBuffer`] across SSE frames
+/// so each `delta.tool_calls[]` fragment is surfaced as an incremental
+/// `Streaming` [`ToolCallChunk`]. When `finish_reason == "tool_calls"` is
+/// observed, the buffer is flushed into a single terminal `tool_call_chunk`
+/// carrying one `Completed` entry per accumulated index.
 fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
@@ -618,6 +837,10 @@ fn sse_bytes_to_chunks(
     tokio::spawn(async move {
         // Buffer for incomplete lines
         let mut buffer = String::new();
+        // Per-index tool-call accumulator. Carried across all SSE frames so
+        // argument fragments split across multiple `data:` lines aggregate
+        // correctly before flush.
+        let mut tool_buf: Vec<ToolCallBuffer> = Vec::new();
 
         // Get response body as bytes stream
         match response.error_for_status_ref() {
@@ -652,11 +875,15 @@ fn sse_bytes_to_chunks(
                         buffer = buffer[pos + 1..].to_string();
 
                         match parse_sse_line(&line) {
-                            Ok(Some(delta)) => {
+                            Ok(Some(event)) => {
+                                // `[DONE]` carries no payload; nothing else to emit.
+                                if event.done_sentinel {
+                                    continue;
+                                }
                                 // Emit a separate StreamChunk for visible content
                                 // and reasoning so consumers can route them
                                 // independently. They are never merged.
-                                if let Some(content) = delta.content {
+                                if let Some(content) = event.content {
                                     let mut chunk = StreamChunk::delta(content);
                                     if count_tokens {
                                         chunk = chunk.with_token_estimate();
@@ -665,13 +892,32 @@ fn sse_bytes_to_chunks(
                                         return; // Receiver dropped
                                     }
                                 }
-                                if let Some(reasoning) = delta.reasoning {
+                                if let Some(reasoning) = event.reasoning {
                                     let mut chunk = StreamChunk::reasoning_delta(reasoning);
                                     if count_tokens {
                                         chunk = chunk.with_token_estimate();
                                     }
                                     if tx.send(Ok(chunk)).await.is_err() {
                                         return; // Receiver dropped
+                                    }
+                                }
+                                if !event.tool_call_deltas.is_empty() {
+                                    let streaming = apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas);
+                                    if !streaming.is_empty()
+                                        && tx.send(Ok(StreamChunk::tool_call_chunk(streaming))).await.is_err()
+                                    {
+                                        return; // Receiver dropped
+                                    }
+                                }
+                                if let Some(finish) = event.finish_reason {
+                                    if finish == "tool_calls" && !tool_buf.is_empty() {
+                                        let calls = flush_tool_call_buffer(&tool_buf);
+                                        tool_buf.clear();
+                                        if !calls.is_empty()
+                                            && tx.send(Ok(StreamChunk::tool_call_chunk(calls))).await.is_err()
+                                        {
+                                            return; // Receiver dropped
+                                        }
                                     }
                                 }
                             }
@@ -687,6 +933,17 @@ fn sse_bytes_to_chunks(
                     let _ = tx.send(Err(StreamError::Http(e))).await;
                     break;
                 }
+            }
+        }
+
+        // Defensive flush: if the stream ended without an explicit
+        // `finish_reason == "tool_calls"` marker (some providers omit it for
+        // single-call turns), surface the buffered tool calls anyway so the
+        // driver does not lose them.
+        if !tool_buf.is_empty() {
+            let calls = flush_tool_call_buffer(&tool_buf);
+            if !calls.is_empty() {
+                let _ = tx.send(Ok(StreamChunk::tool_call_chunk(calls))).await;
             }
         }
 
@@ -2548,8 +2805,14 @@ mod tests {
     #[test]
     fn parse_sse_line_done_sentinel() {
         let line = "data: [DONE]";
-        let result = parse_sse_line(line).expect("test: parse should succeed");
-        assert!(result.is_none());
+        let event = parse_sse_line(line)
+            .expect("test: parse should succeed")
+            .expect("test: [DONE] should produce a sentinel event");
+        assert!(event.done_sentinel);
+        assert!(event.content.is_none());
+        assert!(event.reasoning.is_none());
+        assert!(event.tool_call_deltas.is_empty());
+        assert!(event.finish_reason.is_none());
     }
 
     #[test]
@@ -2562,5 +2825,165 @@ mod tests {
         );
         assert_eq!(chunk.reasoning.as_deref(), Some("internal monologue"));
         assert!(chunk.is_reasoning_only());
+    }
+
+    // ----------------------------------------------------------
+    // S3 T3-2-D: tool_calls SSE streaming (Cohere / Groq / Mistral
+    // share this parser via OpenAiCompatibleProvider).
+    // ----------------------------------------------------------
+
+    /// Mock SSE sequence for a single-tool call: open frame + 3 argument
+    /// fragments + terminal `finish_reason = "tool_calls"`. Verifies the
+    /// parser emits one leading `Streaming` open chunk (empty delta), one
+    /// `Streaming` chunk per argument fragment, and one terminal `Completed`
+    /// chunk carrying the concatenated JSON.
+    #[test]
+    fn test_compatible_tool_calls_streaming_emits_incremental_chunks() {
+        let mut buf: Vec<ToolCallBuffer> = Vec::new();
+        let mut emitted: Vec<ToolCallChunk> = Vec::new();
+
+        // Frame 1: id + name, no arguments yet
+        let frame1 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"search","arguments":""}}]}}]}"#;
+        let event = parse_sse_line(frame1)
+            .expect("frame1 parses")
+            .expect("frame1 yields event");
+        emitted.extend(apply_tool_call_deltas(&mut buf, event.tool_call_deltas));
+
+        // Frame 2-4: argument fragments. The fragments are the raw decoded
+        // strings the parser will surface (each piece concatenates into
+        // `{"q":"hello"}`). The on-the-wire JSON encodes the inner quotes as
+        // `\"` — `serde_json::to_string` handles that for us.
+        let fragments = [r#"{"q"#, r#"":"hello"#, r#""}"#];
+        for fragment in fragments {
+            let arguments_json = serde_json::to_string(fragment).expect("test: arg json encode");
+            let line = format!(
+                r#"data: {{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"function":{{"arguments":{arguments_json}}}}}]}}}}]}}"#,
+            );
+            let ev = parse_sse_line(&line)
+                .expect("fragment parses")
+                .expect("fragment yields event");
+            emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas));
+        }
+
+        // Frame 5: finish_reason flushes Completed
+        let finish = r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let ev = parse_sse_line(finish)
+            .expect("finish parses")
+            .expect("finish yields event");
+        assert!(ev.tool_call_deltas.is_empty());
+        assert_eq!(ev.finish_reason.as_deref(), Some("tool_calls"));
+        let completed = flush_tool_call_buffer(&buf);
+        emitted.extend(completed);
+
+        // Expect: 1 open Streaming + 3 fragment Streaming + 1 Completed = 5
+        assert_eq!(emitted.len(), 5, "should emit 1 open + 3 fragments + 1 completed");
+
+        // Leading open chunk: empty arguments_delta, Streaming status.
+        assert_eq!(emitted[0].status, ToolCallChunkStatus::Streaming);
+        assert_eq!(emitted[0].id, "call_abc");
+        assert_eq!(emitted[0].name, "search");
+        assert_eq!(emitted[0].arguments_delta.as_deref(), Some(""));
+        assert_eq!(emitted[0].args, "");
+        assert_eq!(emitted[0].index, 0);
+
+        // Argument fragments
+        assert_eq!(emitted[1].status, ToolCallChunkStatus::Streaming);
+        assert_eq!(emitted[1].arguments_delta.as_deref(), Some(fragments[0]));
+        assert_eq!(emitted[2].arguments_delta.as_deref(), Some(fragments[1]));
+        assert_eq!(emitted[3].arguments_delta.as_deref(), Some(fragments[2]));
+
+        // Terminal Completed chunk
+        let last = &emitted[4];
+        assert_eq!(last.status, ToolCallChunkStatus::Completed);
+        assert_eq!(last.id, "call_abc");
+        assert_eq!(last.name, "search");
+        assert_eq!(last.index, 0);
+        assert!(last.arguments_delta.is_none());
+        // Concatenated arguments equal the join of all fragments.
+        assert_eq!(last.args, r#"{"q":"hello"}"#);
+    }
+
+    /// Two concurrent tool calls (index 0 + 1) interleaving their argument
+    /// fragments across SSE frames. Verifies the index-keyed buffer keeps
+    /// them isolated and emits a separate `Completed` per index.
+    #[test]
+    fn test_compatible_tool_calls_concurrent_indices() {
+        let mut buf: Vec<ToolCallBuffer> = Vec::new();
+        let mut emitted: Vec<ToolCallChunk> = Vec::new();
+
+        // Frame 1: open call #0 (search)
+        let f1 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"search","arguments":""}}]}}]}"#;
+        let ev = parse_sse_line(f1).expect("ok").expect("event");
+        emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas));
+
+        // Frame 2: open call #1 (lookup) + fragment for #0 in same frame
+        let f2 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","type":"function","function":{"name":"lookup","arguments":""}},{"index":0,"function":{"arguments":"{\"q\":1}"}}]}}]}"#;
+        let ev = parse_sse_line(f2).expect("ok").expect("event");
+        emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas));
+
+        // Frame 3: fragment for #1
+        let f3 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"k\":2}"}}]}}]}"#;
+        let ev = parse_sse_line(f3).expect("ok").expect("event");
+        emitted.extend(apply_tool_call_deltas(&mut buf, ev.tool_call_deltas));
+
+        // Flush
+        let finish = r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let ev = parse_sse_line(finish).expect("ok").expect("event");
+        assert_eq!(ev.finish_reason.as_deref(), Some("tool_calls"));
+        let completed = flush_tool_call_buffer(&buf);
+
+        // Streaming emissions so far: open #0, open #1, fragment #0, fragment #1 = 4.
+        assert_eq!(emitted.len(), 4);
+        assert!(emitted.iter().all(|c| c.status == ToolCallChunkStatus::Streaming));
+
+        // Indices preserved through interleaving.
+        assert_eq!(emitted[0].index, 0);
+        assert_eq!(emitted[0].name, "search");
+        assert_eq!(emitted[1].index, 1);
+        assert_eq!(emitted[1].name, "lookup");
+        assert_eq!(emitted[2].index, 0);
+        assert_eq!(emitted[2].arguments_delta.as_deref(), Some(r#"{"q":1}"#));
+        assert_eq!(emitted[3].index, 1);
+        assert_eq!(emitted[3].arguments_delta.as_deref(), Some(r#"{"k":2}"#));
+
+        // Two terminal Completed chunks, one per index, with isolated args.
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].index, 0);
+        assert_eq!(completed[0].id, "call_0");
+        assert_eq!(completed[0].name, "search");
+        assert_eq!(completed[0].args, r#"{"q":1}"#);
+        assert_eq!(completed[0].status, ToolCallChunkStatus::Completed);
+        assert_eq!(completed[1].index, 1);
+        assert_eq!(completed[1].id, "call_1");
+        assert_eq!(completed[1].name, "lookup");
+        assert_eq!(completed[1].args, r#"{"k":2}"#);
+        assert_eq!(completed[1].status, ToolCallChunkStatus::Completed);
+    }
+
+    /// Defensive: a tool-call delta arriving with only `id` (no `name`) must
+    /// not emit any Streaming chunk until the name is observed. Mirrors
+    /// permissive parsing of out-of-order Cohere/Groq frames.
+    #[test]
+    fn test_compatible_tool_call_delta_without_name_holds_streaming_chunk() {
+        let mut buf: Vec<ToolCallBuffer> = Vec::new();
+
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x"}]}}]}"#;
+        let ev = parse_sse_line(line).expect("ok").expect("event");
+        let emitted = apply_tool_call_deltas(&mut buf, ev.tool_call_deltas);
+        assert!(emitted.is_empty(), "no name => no streaming chunk yet");
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0].id, "call_x");
+        assert!(buf[0].name.is_empty());
+        assert!(!buf[0].opened);
+
+        // Now name arrives; expect the leading open chunk.
+        let line2 = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"fetch"}}]}}]}"#;
+        let ev2 = parse_sse_line(line2).expect("ok").expect("event");
+        let emitted2 = apply_tool_call_deltas(&mut buf, ev2.tool_call_deltas);
+        assert_eq!(emitted2.len(), 1);
+        assert_eq!(emitted2[0].name, "fetch");
+        assert_eq!(emitted2[0].id, "call_x");
+        assert_eq!(emitted2[0].status, ToolCallChunkStatus::Streaming);
+        assert_eq!(emitted2[0].arguments_delta.as_deref(), Some(""));
     }
 }

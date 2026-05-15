@@ -409,36 +409,90 @@ fn parse_openai_sse_line(line: &str) -> StreamResult<Option<OpenAiSseEvent>> {
 }
 
 /// Apply a vec of tool_call deltas onto the index-keyed buffer.
-fn apply_tool_call_deltas(buf: &mut Vec<ToolCallBuffer>, deltas: Vec<StreamSseToolCall>) {
+///
+/// **S3 T3-2-B**: in addition to accumulating into the buffer, this returns a
+/// vec of [`ToolCallChunk`]s with `status = Streaming` so the caller can emit
+/// them as the SSE stream progresses. One streaming chunk is produced per input
+/// delta to preserve the wire-order observed by the provider:
+/// - First delta (carrying `id` + `name`): emits a `Streaming` chunk with
+///   `arguments_delta = Some("")` even when no `arguments` fragment is present,
+///   so the driver sees the call has been opened.
+/// - Subsequent delta (with `function.arguments` fragment): emits a `Streaming`
+///   chunk with `arguments_delta = Some(fragment)`.
+///
+/// `id` is sourced from whichever delta first carried it; if absent, a UUID is
+/// minted lazily and recorded back into the buffer so the matching `Completed`
+/// chunk shares the same id.
+fn apply_tool_call_deltas(buf: &mut Vec<ToolCallBuffer>, deltas: Vec<StreamSseToolCall>) -> Vec<ToolCallChunk> {
+    let mut streaming = Vec::with_capacity(deltas.len());
     for delta in deltas {
         let slot = delta.index;
         while buf.len() <= slot {
             buf.push(ToolCallBuffer::default());
         }
-        // Safety: just expanded so slot is in-bounds.
         let entry = match buf.get_mut(slot) {
             Some(e) => e,
             None => continue,
         };
+
+        let mut got_id_or_name = false;
         if let Some(id) = delta.id {
             if !id.is_empty() {
                 entry.id = id;
+                got_id_or_name = true;
             }
         }
+        let mut arg_fragment: Option<String> = None;
         if let Some(func) = delta.function {
             if let Some(name) = func.name {
                 if !name.is_empty() {
                     entry.name = name;
+                    got_id_or_name = true;
                 }
             }
             if let Some(args) = func.arguments {
                 entry.arguments.push_str(&args);
+                arg_fragment = Some(args);
             }
         }
+
+        // Skip producing a streaming chunk when neither identifying info nor
+        // an argument fragment arrived (defensive — should not happen in
+        // well-formed OpenAI streams, but the parser is permissive).
+        if !got_id_or_name && arg_fragment.is_none() {
+            continue;
+        }
+
+        // We can only emit a useful Streaming chunk once we know the function
+        // name (driver consumers key on `name`). If the very first delta for
+        // an index is malformed and carries only `id`, we still buffer it but
+        // hold the streaming chunk until name arrives.
+        if entry.name.is_empty() {
+            continue;
+        }
+
+        if entry.id.is_empty() {
+            entry.id = uuid::Uuid::new_v4().to_string();
+        }
+        let delta_text = arg_fragment.unwrap_or_default();
+        streaming.push(ToolCallChunk {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            args: String::new(),
+            index: slot,
+            arguments_delta: Some(delta_text),
+            status: crate::providers::traits::ToolCallChunkStatus::Streaming,
+        });
     }
+    streaming
 }
 
 /// Flush the tool_call buffer into chunks suitable for [`StreamChunk::tool_call_chunk`].
+///
+/// **S3 T3-2-B**: emits the terminal `Completed` chunk for each buffered tool
+/// call after preceding `Streaming` chunks have already been forwarded. The
+/// driver-side aggregator treats `Completed.args` as authoritative, so this
+/// must always return the full concatenated argument JSON.
 fn flush_tool_call_buffer(buf: &[ToolCallBuffer]) -> Vec<ToolCallChunk> {
     buf.iter()
         .enumerate()
@@ -454,9 +508,6 @@ fn flush_tool_call_buffer(buf: &[ToolCallBuffer]) -> Vec<ToolCallChunk> {
             } else {
                 entry.arguments.clone()
             };
-            // S3 T3-0: OpenAI uses the legacy completion protocol — buffer
-            // all `function.arguments` SSE fragments and emit a single
-            // `Completed` chunk. Incremental streaming will be added in T3-2.
             ToolCallChunk {
                 id,
                 name: entry.name.clone(),
@@ -666,9 +717,16 @@ impl Provider for OpenAiProvider {
     /// **5a-7a**: Native streaming with full history + tool_calls.
     ///
     /// Sends `stream: true` to `/v1/chat/completions`, parses SSE chunks via
-    /// [`parse_openai_sse_line`], and emits a single [`ToolCallChunk`] per
-    /// in-flight tool call when `finish_reason == "tool_calls"` arrives (so
-    /// driver can execute and feed `tool_results` back to history).
+    /// [`parse_openai_sse_line`].
+    ///
+    /// **S3 T3-2-B**: emits the dual-phase tool-call protocol:
+    /// - For each in-flight `tool_calls` SSE delta, emits a `Streaming`
+    ///   [`ToolCallChunk`] carrying the `arguments_delta` fragment (or an
+    ///   empty delta on the opening fragment that only carries `id`/`name`).
+    /// - On `finish_reason == "tool_calls"`, emits one terminal `Completed`
+    ///   [`ToolCallChunk`] per buffered index with the full JSON `args`.
+    /// The driver-side aggregator reconciles both phases; aggregating all
+    /// `Streaming.arguments_delta` MUST equal the terminal `Completed.args`.
     fn stream_chat_with_history(
         &self,
         messages: &[ChatMessage],
@@ -772,7 +830,11 @@ impl Provider for OpenAiProvider {
                     }
 
                     if !event.tool_call_deltas.is_empty() {
-                        apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas);
+                        let streaming = apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas);
+                        if !streaming.is_empty() && tx.send(Ok(StreamChunk::tool_call_chunk(streaming))).await.is_err()
+                        {
+                            return;
+                        }
                     }
 
                     if let Some(content) = event.content {
@@ -1141,7 +1203,7 @@ mod tests {
     #[test]
     fn tool_call_buffer_accumulates_partial_arguments() {
         let mut buf: Vec<ToolCallBuffer> = Vec::new();
-        apply_tool_call_deltas(
+        let s1 = apply_tool_call_deltas(
             &mut buf,
             vec![StreamSseToolCall {
                 index: 0,
@@ -1152,7 +1214,12 @@ mod tests {
                 }),
             }],
         );
-        apply_tool_call_deltas(
+        // First delta carries id+name+partial args → one Streaming chunk.
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s1[0].status, crate::providers::traits::ToolCallChunkStatus::Streaming);
+        assert_eq!(s1[0].arguments_delta.as_deref(), Some(r#"{"a""#));
+
+        let s2 = apply_tool_call_deltas(
             &mut buf,
             vec![StreamSseToolCall {
                 index: 0,
@@ -1163,18 +1230,26 @@ mod tests {
                 }),
             }],
         );
+        assert_eq!(s2.len(), 1);
+        assert_eq!(s2[0].arguments_delta.as_deref(), Some(r#": 1}"#));
+
         let flushed = flush_tool_call_buffer(&buf);
         assert_eq!(flushed.len(), 1);
         assert_eq!(flushed[0].id, "call_1");
         assert_eq!(flushed[0].name, "shell");
         assert_eq!(flushed[0].args, r#"{"a": 1}"#);
         assert_eq!(flushed[0].index, 0);
+        assert_eq!(
+            flushed[0].status,
+            crate::providers::traits::ToolCallChunkStatus::Completed
+        );
+        assert!(flushed[0].arguments_delta.is_none());
     }
 
     #[test]
     fn tool_call_buffer_supports_parallel_calls_by_index() {
         let mut buf: Vec<ToolCallBuffer> = Vec::new();
-        apply_tool_call_deltas(
+        let streaming = apply_tool_call_deltas(
             &mut buf,
             vec![
                 StreamSseToolCall {
@@ -1195,6 +1270,10 @@ mod tests {
                 },
             ],
         );
+        assert_eq!(streaming.len(), 2);
+        assert_eq!(streaming[0].index, 0);
+        assert_eq!(streaming[1].index, 1);
+
         let flushed = flush_tool_call_buffer(&buf);
         assert_eq!(flushed.len(), 2);
         assert_eq!(flushed[0].name, "ls");
@@ -1207,7 +1286,7 @@ mod tests {
         // Some servers send empty `arguments` chunks before name appears; we
         // must not emit unnamed/empty placeholder calls.
         let mut buf: Vec<ToolCallBuffer> = Vec::new();
-        apply_tool_call_deltas(
+        let streaming = apply_tool_call_deltas(
             &mut buf,
             vec![StreamSseToolCall {
                 index: 0,
@@ -1218,11 +1297,17 @@ mod tests {
                 }),
             }],
         );
+        // No name yet → no Streaming chunk emitted to the driver.
+        assert!(streaming.is_empty());
         assert!(flush_tool_call_buffer(&buf).is_empty());
     }
 
     /// Test helper: replay a sequence of SSE lines through the parser to
     /// assert the driver-facing chunk shape (delta / tool_call / final).
+    ///
+    /// Returns `(text, all_emitted_calls, saw_final, had_finish_reason)` where
+    /// `all_emitted_calls` interleaves Streaming chunks (in arrival order) and
+    /// the terminal Completed chunks emitted at `finish_reason == "tool_calls"`.
     fn replay_openai_sse(lines: &[&str]) -> (String, Vec<ToolCallChunk>, bool, bool) {
         let mut tool_buf: Vec<ToolCallBuffer> = Vec::new();
         let mut text = String::new();
@@ -1239,7 +1324,8 @@ mod tests {
                 break;
             }
             if !event.tool_call_deltas.is_empty() {
-                apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas);
+                let streaming = apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas);
+                emitted_calls.extend(streaming);
             }
             if let Some(c) = event.content {
                 text.push_str(&c);
@@ -1259,6 +1345,7 @@ mod tests {
 
     #[test]
     fn openai_streaming_native_tool_call_via_fixture() {
+        use crate::providers::traits::ToolCallChunkStatus;
         // Replay a realistic SSE stream: content delta, then two `tool_calls`
         // arguments fragments, then `finish_reason=tool_calls`, then [DONE].
         let lines = [
@@ -1272,11 +1359,15 @@ mod tests {
         assert_eq!(text, "checking");
         assert!(had_finish, "stream must include finish_reason");
         assert!(final_seen, "must reach final / done sentinel");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
-        assert_eq!(calls[0].id, "call_1");
-        assert_eq!(calls[0].args, r#"{"cmd":"ls"}"#);
-        assert_eq!(calls[0].index, 0);
+        // 2 Streaming + 1 Completed.
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].status, ToolCallChunkStatus::Streaming);
+        assert_eq!(calls[1].status, ToolCallChunkStatus::Streaming);
+        assert_eq!(calls[2].status, ToolCallChunkStatus::Completed);
+        assert_eq!(calls[2].name, "shell");
+        assert_eq!(calls[2].id, "call_1");
+        assert_eq!(calls[2].args, r#"{"cmd":"ls"}"#);
+        assert_eq!(calls[2].index, 0);
     }
 
     #[test]
@@ -1296,6 +1387,7 @@ mod tests {
 
     #[test]
     fn openai_streaming_handles_partial_tool_args_across_three_chunks() {
+        use crate::providers::traits::ToolCallChunkStatus;
         let lines = [
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_z","function":{"name":"edit"}}]}}]}"#,
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"p\""}}]}}]}"#,
@@ -1304,9 +1396,127 @@ mod tests {
             r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
         ];
         let (_text, calls, _final, _finish) = replay_openai_sse(&lines);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "edit");
-        assert_eq!(calls[0].args, r#"{"p":"a.rs","l":1}"#);
+        // 4 Streaming (id/name + 3 args fragments) + 1 Completed = 5.
+        assert_eq!(calls.len(), 5);
+        let completed = calls.last().expect("test: completed chunk");
+        assert_eq!(completed.status, ToolCallChunkStatus::Completed);
+        assert_eq!(completed.name, "edit");
+        assert_eq!(completed.args, r#"{"p":"a.rs","l":1}"#);
+    }
+
+    /// **S3 T3-2-B**: incremental Streaming protocol — provider must emit a
+    /// `Streaming` `ToolCallChunk` for each SSE delta carrying a tool-call
+    /// fragment, then a single final `Completed` chunk whose `args` equals the
+    /// concatenation of all preceding `arguments_delta` values.
+    #[test]
+    fn test_tool_calls_streaming_emits_incremental_chunks() {
+        use crate::providers::traits::ToolCallChunkStatus;
+        let lines = [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"search","arguments":""}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"uery\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hello\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let (_text, calls, final_seen, had_finish) = replay_openai_sse(&lines);
+        assert!(had_finish);
+        assert!(final_seen);
+
+        // 4 Streaming (1 opener with empty args + 3 fragments) + 1 Completed.
+        assert_eq!(calls.len(), 5, "expected 4 Streaming + 1 Completed, got {calls:?}");
+        let (streaming_chunks, completed_chunks): (Vec<_>, Vec<_>) =
+            calls.iter().partition(|c| c.status == ToolCallChunkStatus::Streaming);
+        assert_eq!(streaming_chunks.len(), 4);
+        assert_eq!(completed_chunks.len(), 1);
+
+        // Every Streaming chunk must carry an `arguments_delta` (possibly empty
+        // on the opener) and an empty `args` field.
+        for chunk in &streaming_chunks {
+            assert_eq!(chunk.id, "call_abc");
+            assert_eq!(chunk.name, "search");
+            assert_eq!(chunk.index, 0);
+            assert_eq!(chunk.args, "");
+            assert!(chunk.arguments_delta.is_some());
+        }
+
+        // Aggregated streaming deltas must equal Completed.args.
+        let aggregated: String = streaming_chunks
+            .iter()
+            .filter_map(|c| c.arguments_delta.as_deref())
+            .collect();
+        let completed = completed_chunks[0];
+        assert_eq!(completed.status, ToolCallChunkStatus::Completed);
+        assert_eq!(completed.id, "call_abc");
+        assert_eq!(completed.name, "search");
+        assert_eq!(completed.index, 0);
+        assert!(completed.arguments_delta.is_none());
+        assert_eq!(completed.args, r#"{"query":"hello"}"#);
+        assert_eq!(
+            aggregated, completed.args,
+            "streaming deltas aggregated must equal Completed.args"
+        );
+    }
+
+    /// **S3 T3-2-B**: concurrent tool calls — buffer must be isolated by
+    /// `index` and emit independent `Completed` chunks for each call.
+    #[test]
+    fn test_tool_calls_concurrent_indices() {
+        use crate::providers::traits::ToolCallChunkStatus;
+        // Interleaved deltas for two concurrent tool calls (index 0 + 1).
+        let lines = [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"search","arguments":""}},{"index":1,"id":"call_b","function":{"name":"fetch","arguments":""}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":\"rust\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"url\":\"x\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let (_text, calls, _final, _finish) = replay_openai_sse(&lines);
+
+        let streaming_chunks: Vec<&ToolCallChunk> = calls
+            .iter()
+            .filter(|c| c.status == ToolCallChunkStatus::Streaming)
+            .collect();
+        let completed_chunks: Vec<&ToolCallChunk> = calls
+            .iter()
+            .filter(|c| c.status == ToolCallChunkStatus::Completed)
+            .collect();
+
+        // 2 openers + 1 fragment for index 0 + 1 fragment for index 1 = 4 Streaming.
+        assert_eq!(streaming_chunks.len(), 4);
+        assert_eq!(completed_chunks.len(), 2, "expected 2 independent Completed chunks");
+
+        // Find Completed by index.
+        let c0 = completed_chunks
+            .iter()
+            .find(|c| c.index == 0)
+            .expect("test: completed index 0");
+        let c1 = completed_chunks
+            .iter()
+            .find(|c| c.index == 1)
+            .expect("test: completed index 1");
+
+        assert_eq!(c0.id, "call_a");
+        assert_eq!(c0.name, "search");
+        assert_eq!(c0.args, r#"{"q":"rust"}"#);
+        assert!(c0.arguments_delta.is_none());
+
+        assert_eq!(c1.id, "call_b");
+        assert_eq!(c1.name, "fetch");
+        assert_eq!(c1.args, r#"{"url":"x"}"#);
+        assert!(c1.arguments_delta.is_none());
+
+        // Per-index aggregation invariant.
+        let agg0: String = streaming_chunks
+            .iter()
+            .filter(|c| c.index == 0)
+            .filter_map(|c| c.arguments_delta.as_deref())
+            .collect();
+        let agg1: String = streaming_chunks
+            .iter()
+            .filter(|c| c.index == 1)
+            .filter_map(|c| c.arguments_delta.as_deref())
+            .collect();
+        assert_eq!(agg0, c0.args);
+        assert_eq!(agg1, c1.args);
     }
 
     #[tokio::test]
