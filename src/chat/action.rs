@@ -121,6 +121,27 @@ pub enum Action {
     },
     /// 工具调用进度（iteration/max）
     ToolProgress { iteration: usize, max: usize },
+    /// **S3 T3-1**: driver 请求 UI 对某工具调用做 approval（supervised autonomy 模式下触发）.
+    ///
+    /// reducer 仅产生 `Effect::RequestApproval`，driver 自身通过 oneshot rx 等响应。
+    /// `tool_id` 即 LLM 给出的 `tool_call_id`，用于将响应 [`Self::ToolApprovalReceived`]
+    /// 关联到具体 pending oneshot。
+    ToolApprovalRequested {
+        tool_id: String,
+        name: String,
+        args: String,
+    },
+    /// **S3 T3-1**: UI / EffectExecutor 把用户审批结果回投给 driver.
+    ///
+    /// dispatcher 接收此 Action 时将通过 `approval_response_tx`（注入到 driver 的
+    /// 单 mpsc 入口）把决策转给等待中的 driver；driver 端按 `tool_id` 对应到
+    /// pending oneshot::Sender<bool> 并 resolve。
+    ToolApprovalReceived { tool_id: String, approved: bool },
+    /// **S3 T3-1**: 网络瞬时故障重试尝试通知（仅作 UI / trace 用，不变状态）.
+    ///
+    /// `attempt` 从 1 起计数（第 1 次失败 → attempt=1 之后开始 sleep 重试）。
+    /// 失败原因放在 `reason`，便于 UI 显示。
+    StreamRetryAttempt { attempt: u8, reason: String },
 
     // ── 会话 ────────────────────────────────────────────────────
     /// 会话加载完毕
