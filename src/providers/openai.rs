@@ -875,6 +875,17 @@ impl Provider for OpenAiProvider {
             }
 
             if !sent_final {
+                // Defensive tail flush: some upstream gateways close the byte
+                // stream without ever delivering `finish_reason == "tool_calls"`
+                // (and without `[DONE]`). Surface any buffered tool calls so the
+                // driver does not silently lose them on EOF.
+                if !tool_buf.is_empty() {
+                    let calls = flush_tool_call_buffer(&tool_buf);
+                    tool_buf.clear();
+                    if !calls.is_empty() {
+                        let _ = tx.send(Ok(StreamChunk::tool_call_chunk(calls))).await;
+                    }
+                }
                 let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
             }
         });
@@ -1279,6 +1290,69 @@ mod tests {
         assert_eq!(flushed[0].name, "ls");
         assert_eq!(flushed[1].name, "pwd");
         assert_eq!(flushed[1].index, 1);
+    }
+
+    /// Regression for the OpenAI EOF tail-flush path.
+    ///
+    /// Some OpenAI-compatible gateways close the byte stream after emitting
+    /// `tool_calls` deltas but before sending `finish_reason == "tool_calls"`
+    /// or `[DONE]`. Without an EOF tail flush the buffered tool call would be
+    /// silently dropped. We replay the exact splitter + post-loop flush that
+    /// `stream_chat_with_system` runs and verify the buffer would still flush
+    /// to a `Completed` chunk on EOF.
+    #[test]
+    fn tool_call_buffer_flushes_on_eof_without_finish_reason() {
+        use crate::providers::traits::ToolCallChunkStatus;
+
+        // Replay: 1 SSE line with id+name+partial args, 1 SSE line with the
+        // remainder of args, then the byte stream ends WITHOUT any
+        // `finish_reason` or `[DONE]` line. The post-loop branch in
+        // `stream_chat_with_system` must surface the buffered tool call.
+        let lines = [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_eof","function":{"name":"shell","arguments":"{\"cmd\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]}}]}"#,
+        ];
+
+        let mut tool_buf: Vec<ToolCallBuffer> = Vec::new();
+        let mut streaming_emitted: Vec<ToolCallChunk> = Vec::new();
+        let mut saw_finish = false;
+        for line in lines {
+            let event = match parse_openai_sse_line(line).expect("test: line parses") {
+                Some(e) => e,
+                None => continue,
+            };
+            if event.done_sentinel {
+                saw_finish = true;
+                break;
+            }
+            if !event.tool_call_deltas.is_empty() {
+                streaming_emitted.extend(apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas));
+            }
+            if event.finish_reason.is_some() {
+                saw_finish = true;
+                break;
+            }
+        }
+
+        // Precondition: nothing closed the turn — neither [DONE] nor a
+        // finish_reason landed before the byte stream ended.
+        assert!(!saw_finish, "test setup: no terminator must arrive before EOF");
+        assert!(!tool_buf.is_empty(), "test setup: tool buffer must hold the call");
+        assert_eq!(streaming_emitted.len(), 2, "two Streaming deltas (open + arg fragment)");
+
+        // Drive the exact post-loop branch from `stream_chat_with_system`:
+        // when no `final_chunk` has been sent, flush the buffered tool calls
+        // before sending the synthetic final chunk.
+        let calls = flush_tool_call_buffer(&tool_buf);
+        tool_buf.clear();
+
+        assert_eq!(calls.len(), 1, "EOF tail flush must surface the buffered call");
+        assert_eq!(calls[0].id, "call_eof");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].args, r#"{"cmd":"ls"}"#);
+        assert_eq!(calls[0].index, 0);
+        assert_eq!(calls[0].status, ToolCallChunkStatus::Completed);
+        assert!(calls[0].arguments_delta.is_none());
     }
 
     #[test]

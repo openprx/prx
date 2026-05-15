@@ -900,6 +900,42 @@ impl AnthropicStreamState {
             status: ToolCallChunkStatus::Completed,
         })
     }
+
+    /// Defensive tail flush invoked at stream EOF when no `content_block_stop`
+    /// (and no `message_stop`) ever arrived for one or more in-flight tool_use
+    /// blocks. Drains every remaining block and returns a terminal `Completed`
+    /// chunk for each well-formed tool_use entry so the driver does not silently
+    /// lose tool calls on truncated streams. Non-tool / unnamed blocks are
+    /// discarded. The returned chunks preserve their original `index` so the
+    /// driver can still reconcile them with the prior Streaming deltas.
+    fn drain_pending_tool_calls(&mut self) -> Vec<ToolCallChunk> {
+        let mut completed: Vec<ToolCallChunk> = self
+            .blocks
+            .drain()
+            .filter_map(|(_, entry)| {
+                if entry.kind != "tool_use" || entry.tool_name.is_empty() {
+                    return None;
+                }
+                let args = if entry.tool_args.is_empty() {
+                    "{}".to_string()
+                } else {
+                    entry.tool_args
+                };
+                Some(ToolCallChunk {
+                    id: entry.tool_id,
+                    name: entry.tool_name,
+                    args,
+                    index: entry.tool_order,
+                    arguments_delta: None,
+                    status: ToolCallChunkStatus::Completed,
+                })
+            })
+            .collect();
+        // HashMap iteration order is non-deterministic; sort by the stable
+        // `tool_order` so callers and tests observe a predictable sequence.
+        completed.sort_by_key(|c| c.index);
+        completed
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1353,6 +1389,16 @@ impl Provider for AnthropicProvider {
             }
 
             if !sent_final {
+                // Defensive tail flush: if the upstream closed the byte stream
+                // without ever sending `content_block_stop` (and `message_stop`)
+                // for in-flight tool_use blocks, drain them now so the driver
+                // gets the terminal `Completed` chunks it needs to finalise the
+                // turn. Without this, partial tool calls would be lost on EOF.
+                for call in state.drain_pending_tool_calls() {
+                    if tx.send(Ok(StreamChunk::tool_call_chunk(vec![call]))).await.is_err() {
+                        return;
+                    }
+                }
                 let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
             }
         });
@@ -2341,5 +2387,61 @@ mod tests {
         assert_eq!(completed2.index, 1);
         assert_eq!(completed2.args, "{}");
         assert_eq!(completed2.status, ToolCallChunkStatus::Completed);
+    }
+
+    /// Regression for the Anthropic EOF tail-flush path.
+    ///
+    /// If the upstream byte stream closes after `input_json_delta` events but
+    /// before `content_block_stop` (and `message_stop`) arrive, the provider
+    /// must still emit the terminal `Completed` chunks for every in-flight
+    /// tool_use block so the driver does not silently lose the tool call.
+    /// `drain_pending_tool_calls` is the canonical entry point for that flush.
+    #[test]
+    fn test_tool_use_eof_tail_flush_drains_pending_calls() {
+        let mut state = AnthropicStreamState::default();
+
+        // Two in-flight tool_use blocks, both received their fragments but
+        // neither got a `content_block_stop` before EOF.
+        let _ = state
+            .on_content_block_start(0, tool_use_start_block("tu_x", "search"))
+            .expect("initial Streaming chunk for tool 0");
+        let _ = state
+            .on_content_block_delta(0, input_json_delta(r#"{"q":"abc"}"#))
+            .expect("partial fragment must surface for tool 0");
+
+        let _ = state
+            .on_content_block_start(1, tool_use_start_block("tu_y", "edit"))
+            .expect("initial Streaming chunk for tool 1");
+        // Tool 1 received no fragments — `args` must fall back to `{}`.
+
+        assert_eq!(state.blocks.len(), 2, "two in-flight blocks before EOF flush");
+
+        // Simulate EOF: the byte stream ended without BlockStop / MessageStop.
+        let flushed = state.drain_pending_tool_calls();
+
+        // Both pending tool_use blocks must surface as terminal Completed
+        // chunks. Order is sorted by stable `index` for determinism.
+        assert_eq!(
+            flushed.len(),
+            2,
+            "EOF flush must emit one Completed per pending tool_use"
+        );
+        assert!(state.blocks.is_empty(), "drain must empty the per-block map");
+
+        assert_eq!(flushed[0].index, 0);
+        assert_eq!(flushed[0].id, "tu_x");
+        assert_eq!(flushed[0].name, "search");
+        assert_eq!(flushed[0].args, r#"{"q":"abc"}"#);
+        assert_eq!(flushed[0].status, ToolCallChunkStatus::Completed);
+        assert!(flushed[0].arguments_delta.is_none());
+
+        assert_eq!(flushed[1].index, 1);
+        assert_eq!(flushed[1].id, "tu_y");
+        assert_eq!(flushed[1].name, "edit");
+        assert_eq!(flushed[1].args, "{}", "no fragments => fallback {{}}");
+        assert_eq!(flushed[1].status, ToolCallChunkStatus::Completed);
+
+        // Re-draining an empty state must be a safe no-op.
+        assert!(state.drain_pending_tool_calls().is_empty());
     }
 }
