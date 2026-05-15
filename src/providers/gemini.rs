@@ -2,9 +2,12 @@
 //! - Direct API key (from config or auth-profiles.json)
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
 
-use crate::providers::traits::{ChatMessage, Provider};
+use crate::providers::traits::{
+    ChatMessage, Provider, StreamChunk, StreamError, StreamOptions, StreamResult, ToolCallChunk, ToolCallChunkStatus,
+};
 use async_trait::async_trait;
 use directories::UserDirs;
+use futures::stream::{self, BoxStream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -118,6 +121,26 @@ struct CandidateContent {
 #[derive(Debug, Deserialize)]
 struct ResponsePart {
     text: Option<String>,
+    /// **S3 T3-2-C**: Gemini API surfaces tool invocations as
+    /// `functionCall { name, args }` parts. `args` is the parsed JSON object
+    /// (Gemini emits the full object at once; it does not stream argument
+    /// fragments today). See [`FunctionCall`] for the wire shape.
+    #[serde(rename = "functionCall", default)]
+    function_call: Option<FunctionCall>,
+}
+
+/// Gemini API function call payload (used in both non-streaming responses and
+/// `streamGenerateContent` chunks).
+///
+/// `args` is the structured JSON arguments object — Gemini emits it complete
+/// in a single part rather than streaming fragments, so the streaming path
+/// surfaces this as a `Completed` [`ToolCallChunk`].
+#[derive(Debug, Deserialize)]
+struct FunctionCall {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    args: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,6 +310,30 @@ impl GeminiProvider {
         }
     }
 
+    /// **S3 T3-2-C**: Build the streaming URL using `streamGenerateContent`.
+    ///
+    /// We pass `?alt=sse` so Gemini emits standard `data: {...}\n\n` SSE
+    /// records rather than a streamed JSON array; the SSE shape is much
+    /// easier to parse incrementally and matches the OpenAI / Anthropic
+    /// parsing approach already used in this crate.
+    fn build_stream_url(model: &str, auth: &GeminiAuth) -> String {
+        match auth {
+            GeminiAuth::OAuthToken(_) => {
+                // cloudcode-pa internal endpoint — model goes in the body.
+                format!("{CLOUDCODE_PA_ENDPOINT}:streamGenerateContent?alt=sse")
+            }
+            _ => {
+                let model_name = Self::format_model_name(model);
+                let base = format!("{PUBLIC_API_ENDPOINT}/{model_name}:streamGenerateContent");
+                if auth.is_api_key() {
+                    format!("{base}?alt=sse&key={}", auth.credential())
+                } else {
+                    format!("{base}?alt=sse")
+                }
+            }
+        }
+    }
+
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.gemini", 120, 10)
             .map_err(|e| {
@@ -325,6 +372,47 @@ impl GeminiProvider {
 }
 
 impl GeminiProvider {
+    /// Convert generic `ChatMessage` history into Gemini-native `Content`
+    /// values plus an optional combined `systemInstruction`. Used by both
+    /// non-streaming `chat_with_history` and `stream_chat_with_history`.
+    fn convert_messages(messages: &[ChatMessage]) -> (Option<Content>, Vec<Content>) {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
+
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => system_parts.push(&msg.content),
+                "user" => contents.push(Content {
+                    role: Some("user".to_string()),
+                    parts: vec![Part {
+                        text: msg.content.clone(),
+                    }],
+                }),
+                "assistant" => contents.push(Content {
+                    // Gemini API uses "model" role instead of "assistant".
+                    role: Some("model".to_string()),
+                    parts: vec![Part {
+                        text: msg.content.clone(),
+                    }],
+                }),
+                _ => {}
+            }
+        }
+
+        let system_instruction = if system_parts.is_empty() {
+            None
+        } else {
+            Some(Content {
+                role: None,
+                parts: vec![Part {
+                    text: system_parts.join("\n\n"),
+                }],
+            })
+        };
+
+        (system_instruction, contents)
+    }
+
     async fn send_generate_content(
         &self,
         contents: Vec<Content>,
@@ -383,6 +471,132 @@ impl GeminiProvider {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// STREAMING (S3 T3-2-C)
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Gemini's `:streamGenerateContent` returns either:
+//   - a JSON array streamed incrementally (the default), or
+//   - standard SSE (`data: {json}\n\n`) when called with `?alt=sse`.
+//
+// We use `?alt=sse` to match the framing already handled by Anthropic /
+// OpenAI parsers and avoid building an ad-hoc JSON-array-stream parser.
+//
+// Each SSE event payload is a fully-typed `GenerateContentResponse` with one
+// or more `candidates[].content.parts[]`. Parts may carry:
+//   - `text` deltas (we emit `StreamChunk::delta`), or
+//   - a `functionCall { name, args }` object (we emit one terminal
+//     `ToolCallChunk { status: Completed, args: <serialized JSON>, .. }`).
+//
+// **Gemini specifics**: Gemini does NOT stream function-call argument
+// fragments today — the `args` object arrives complete in a single part.
+// We therefore use the legacy "completion protocol" (single `Completed`
+// chunk) for tool calls, mirroring the current Anthropic / OpenAI emission
+// shape pre-T3-2. If/when Google adds incremental function-call streaming
+// we can upgrade to the dual-phase `Streaming` + `Completed` protocol
+// defined in T3-0.
+
+/// Parse a single Gemini SSE record (`data: {...}` lines plus an optional
+/// blank-line terminator). Returns `Ok(None)` for empty / comment-only
+/// records, `Ok(Some(resp))` for a successfully decoded payload, and
+/// `Err(StreamError::InvalidSse)` if the `data:` line is not valid JSON.
+fn parse_gemini_sse_record(record: &str) -> StreamResult<Option<GenerateContentResponse>> {
+    let mut data_lines: Vec<&str> = Vec::new();
+    for line in record.split('\n') {
+        let line = line.trim_end_matches('\r');
+        // SSE comments start with ":" and must be ignored.
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            data_lines.push(rest.trim_start());
+        }
+        // Other SSE fields (`event:`, `id:`, `retry:`) are not used by Gemini.
+    }
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+    let payload = data_lines.join("\n");
+    if payload == "[DONE]" {
+        // Gemini does not actually emit `[DONE]` today, but be defensive.
+        return Ok(None);
+    }
+    let parsed: GenerateContentResponse =
+        serde_json::from_str(&payload).map_err(|e| StreamError::InvalidSse(format!("gemini SSE json: {e}")))?;
+    Ok(Some(parsed))
+}
+
+/// Drain one `GenerateContentResponse` chunk into zero or more `StreamChunk`
+/// values, threading the running `tool_call_order` counter so successive
+/// function-call chunks get monotonically increasing `index`es.
+///
+/// Returns `Err(StreamError::Provider)` if the chunk carries an API-level
+/// error (`error.message` populated).
+fn drain_gemini_chunk(
+    chunk: GenerateContentResponse,
+    tool_call_order: &mut usize,
+    count_tokens: bool,
+) -> StreamResult<Vec<StreamChunk>> {
+    let effective = chunk.into_effective_response();
+    if let Some(err) = effective.error {
+        return Err(StreamError::Provider(err.message));
+    }
+    let Some(candidates) = effective.candidates else {
+        return Ok(Vec::new());
+    };
+
+    let mut out: Vec<StreamChunk> = Vec::new();
+    for candidate in candidates {
+        for part in candidate.content.parts {
+            if let Some(text) = part.text {
+                if !text.is_empty() {
+                    let mut sc = StreamChunk::delta(text);
+                    if count_tokens {
+                        sc = sc.with_token_estimate();
+                    }
+                    out.push(sc);
+                }
+            }
+            if let Some(call) = part.function_call {
+                let name = call.name.unwrap_or_default();
+                if name.is_empty() {
+                    // Defensive: skip malformed function_call entries that
+                    // are missing a name — surfacing them would break the
+                    // driver's tool dispatch which keys on the registered
+                    // tool name.
+                    continue;
+                }
+                // `serde_json::to_string` on a parsed `Value` cannot
+                // realistically fail (no non-string map keys, no NaN at this
+                // layer); fall back to `{}` defensively so a malformed
+                // payload degrades gracefully rather than killing the
+                // streaming task mid-tool-call.
+                let args_str = call.args.map_or_else(
+                    || "{}".to_string(),
+                    |v| serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()),
+                );
+                // Gemini does not provide stable tool-call IDs in its API
+                // surface (function calls are correlated by name + position).
+                // Generate a UUID to align with OpenAI / Anthropic semantics
+                // expected by the driver-side aggregator.
+                let id = uuid::Uuid::new_v4().to_string();
+                let index = *tool_call_order;
+                *tool_call_order = tool_call_order.saturating_add(1);
+                let tc = ToolCallChunk {
+                    id,
+                    name,
+                    args: args_str,
+                    index,
+                    arguments_delta: None,
+                    status: ToolCallChunkStatus::Completed,
+                };
+                out.push(StreamChunk::tool_call_chunk(vec![tc]));
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[async_trait]
 impl Provider for GeminiProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
@@ -421,46 +635,7 @@ impl Provider for GeminiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let mut system_parts: Vec<&str> = Vec::new();
-        let mut contents: Vec<Content> = Vec::new();
-
-        for msg in messages {
-            match msg.role.as_str() {
-                "system" => {
-                    system_parts.push(&msg.content);
-                }
-                "user" => {
-                    contents.push(Content {
-                        role: Some("user".to_string()),
-                        parts: vec![Part {
-                            text: msg.content.clone(),
-                        }],
-                    });
-                }
-                "assistant" => {
-                    // Gemini API uses "model" role instead of "assistant"
-                    contents.push(Content {
-                        role: Some("model".to_string()),
-                        parts: vec![Part {
-                            text: msg.content.clone(),
-                        }],
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        let system_instruction = if system_parts.is_empty() {
-            None
-        } else {
-            Some(Content {
-                role: None,
-                parts: vec![Part {
-                    text: system_parts.join("\n\n"),
-                }],
-            })
-        };
-
+        let (system_instruction, contents) = Self::convert_messages(messages);
         self.send_generate_content(contents, system_instruction, model, temperature)
             .await
     }
@@ -486,6 +661,176 @@ impl Provider for GeminiProvider {
         }
         Ok(())
     }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    /// **S3 T3-2-C**: Native Gemini `:streamGenerateContent` (SSE mode).
+    ///
+    /// Each `data:` record decodes to a partial [`GenerateContentResponse`];
+    /// text parts are emitted as [`StreamChunk::delta`] and any `functionCall`
+    /// part is emitted as a single terminal `Completed` [`ToolCallChunk`]
+    /// (Gemini does not stream function-call argument fragments today —
+    /// see TODO at the top of the streaming section).
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        let Some(auth) = self.auth.as_ref() else {
+            return stream::once(async {
+                Err(StreamError::Provider(
+                    "Gemini API key not found — set GEMINI_API_KEY / GOOGLE_API_KEY or run `gemini` CLI".into(),
+                ))
+            })
+            .boxed();
+        };
+
+        let (system_instruction, contents) = Self::convert_messages(messages);
+        let request_body = GenerateContentRequest {
+            contents,
+            system_instruction,
+            generation_config: GenerationConfig {
+                temperature,
+                max_output_tokens: 8192,
+            },
+        };
+
+        let url = Self::build_stream_url(model, auth);
+        let client = self.http_client();
+        let model_owned = model.to_string();
+        let auth_kind = match auth {
+            GeminiAuth::OAuthToken(token) => OwnedGeminiAuth::OAuthToken(token.clone()),
+            // The explicit API key is already embedded in `url` as the
+            // `?key=` query parameter, so we don't need to carry the
+            // value across the await boundary — we only need the variant
+            // to choose the right request shape.
+            GeminiAuth::ExplicitKey(_) => OwnedGeminiAuth::ExplicitKey,
+        };
+        let count_tokens = options.count_tokens;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            let request_builder = match &auth_kind {
+                OwnedGeminiAuth::OAuthToken(token) => {
+                    let envelope = InternalGenerateContentEnvelope {
+                        model: Self::format_internal_model_name(&model_owned),
+                        project: None,
+                        user_prompt_id: None,
+                        request: InternalGenerateContentRequest {
+                            contents: request_body.contents.clone(),
+                            system_instruction: request_body.system_instruction.clone(),
+                            generation_config: request_body.generation_config.clone(),
+                        },
+                    };
+                    client
+                        .post(&url)
+                        .header("accept", "text/event-stream")
+                        .json(&envelope)
+                        .bearer_auth(token)
+                }
+                OwnedGeminiAuth::ExplicitKey => client
+                    .post(&url)
+                    .header("accept", "text/event-stream")
+                    .json(&request_body),
+            };
+
+            let response = match request_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let preview = body.chars().take(300).collect::<String>();
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!(
+                        "Gemini streaming HTTP {status}: {preview}"
+                    ))))
+                    .await;
+                return;
+            }
+
+            let mut tool_call_order: usize = 0;
+            let mut byte_stream = response.bytes_stream();
+            let mut buf = String::new();
+
+            'outer: while let Some(bytes_res) = byte_stream.next().await {
+                let bytes = match bytes_res {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx.send(Err(StreamError::Http(e))).await;
+                        return;
+                    }
+                };
+                let text = match std::str::from_utf8(&bytes) {
+                    Ok(t) => t.to_string(),
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(StreamError::InvalidSse(format!(
+                                "non-utf8 byte in Gemini SSE: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                buf.push_str(&text);
+
+                // SSE records are separated by blank lines (`\n\n`).
+                while let Some(end) = buf.find("\n\n") {
+                    let record: String = buf.drain(..end + 2).collect();
+                    let parsed = match parse_gemini_sse_record(&record) {
+                        Ok(Some(p)) => p,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    };
+                    let chunks = match drain_gemini_chunk(parsed, &mut tool_call_order, count_tokens) {
+                        Ok(cs) => cs,
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    };
+                    for chunk in chunks {
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+
+            // Gemini's SSE stream simply closes when complete (no
+            // explicit `[DONE]` marker), so we always emit a synthesised
+            // final chunk after the byte stream is drained.
+            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+        });
+
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
+    }
+}
+
+/// Owned variant of [`GeminiAuth`] usable from a `'static` `tokio::spawn`
+/// future. Mirrors the borrowed enum so we can take ownership of the
+/// credential before crossing the await boundary.
+///
+/// `ExplicitKey` carries no payload because the API key is already encoded
+/// into the URL `?key=` query parameter before the future is spawned —
+/// the variant exists only to select the request-shape branch.
+#[derive(Debug)]
+enum OwnedGeminiAuth {
+    ExplicitKey,
+    OAuthToken(String),
 }
 
 #[allow(clippy::indexing_slicing)]
@@ -834,5 +1179,220 @@ mod tests {
         };
         let result = provider.warmup().await;
         assert!(result.is_ok());
+    }
+
+    // ─── S3 T3-2-C streaming protocol tests ────────────────────────────────
+
+    #[test]
+    fn stream_url_for_api_key_uses_sse_and_public_endpoint() {
+        let auth = GeminiAuth::ExplicitKey("api-key-123".into());
+        let url = GeminiProvider::build_stream_url("gemini-2.0-flash", &auth);
+        assert!(url.contains("generativelanguage.googleapis.com/v1beta"));
+        assert!(url.contains(":streamGenerateContent"));
+        assert!(url.contains("alt=sse"));
+        assert!(url.contains("key=api-key-123"));
+    }
+
+    #[test]
+    fn stream_url_for_oauth_uses_internal_endpoint() {
+        let auth = GeminiAuth::OAuthToken("ya29.mock".into());
+        let url = GeminiProvider::build_stream_url("gemini-2.5-pro", &auth);
+        assert!(url.starts_with("https://cloudcode-pa.googleapis.com/v1internal"));
+        assert!(url.contains(":streamGenerateContent"));
+        assert!(url.contains("alt=sse"));
+        assert!(!url.contains("?key="));
+    }
+
+    #[test]
+    fn parse_sse_record_skips_blank_and_comments() {
+        // Empty record -> None.
+        let empty = parse_gemini_sse_record("\n\n").expect("empty record is valid");
+        assert!(empty.is_none());
+
+        // Comment-only record (`:` lines) -> None.
+        let only_comments = parse_gemini_sse_record(": keepalive\n: heartbeat\n\n").expect("comments valid");
+        assert!(only_comments.is_none());
+    }
+
+    #[test]
+    fn parse_sse_record_decodes_text_payload() {
+        let record = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]}}]}\n\n";
+        let parsed = parse_gemini_sse_record(record).expect("ok").expect("payload present");
+        let text = parsed
+            .candidates
+            .expect("candidates")
+            .into_iter()
+            .next()
+            .expect("first candidate")
+            .content
+            .parts
+            .into_iter()
+            .next()
+            .expect("first part")
+            .text;
+        assert_eq!(text.as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn parse_sse_record_rejects_invalid_json() {
+        let err = parse_gemini_sse_record("data: {not-json\n\n").expect_err("invalid json");
+        match err {
+            StreamError::InvalidSse(msg) => assert!(msg.contains("gemini SSE json")),
+            other => panic!("expected InvalidSse, got {other:?}"),
+        }
+    }
+
+    /// **T3-2-C required**: mock a Gemini SSE stream of multiple text deltas
+    /// and verify the parsed `StreamChunk` sequence: order is preserved and
+    /// concatenation reproduces the full assistant text.
+    #[test]
+    fn test_gemini_streaming_text_chunks() {
+        let records = [
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello, \"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"world\"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"!\"}]}}]}\n\n",
+        ];
+
+        let mut tool_order: usize = 0;
+        let mut collected: Vec<StreamChunk> = Vec::new();
+        for rec in records {
+            let parsed = parse_gemini_sse_record(rec)
+                .expect("parse ok")
+                .expect("payload present");
+            let chunks = drain_gemini_chunk(parsed, &mut tool_order, false).expect("drain ok");
+            collected.extend(chunks);
+        }
+
+        // Three pure-text chunks, no tool_calls.
+        assert_eq!(collected.len(), 3, "expected 3 text deltas");
+        assert!(collected.iter().all(|c| c.tool_calls.is_empty()));
+        let combined: String = collected.iter().map(|c| c.delta.clone()).collect();
+        assert_eq!(combined, "Hello, world!");
+        // Order counter not advanced when there are no function calls.
+        assert_eq!(tool_order, 0);
+    }
+
+    /// **T3-2-C required**: a Gemini stream carrying a `functionCall` part
+    /// must surface as a single terminal `Completed` `ToolCallChunk` with
+    /// the full JSON arguments and `arguments_delta = None`. Gemini does not
+    /// stream argument fragments, so the legacy completion protocol is the
+    /// only valid shape today.
+    #[test]
+    fn test_gemini_streaming_function_call_completed() {
+        let record = r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{"command":"ls -la"}}}]}}]}
+
+"#;
+        let parsed = parse_gemini_sse_record(record)
+            .expect("parse ok")
+            .expect("payload present");
+
+        let mut tool_order: usize = 0;
+        let chunks = drain_gemini_chunk(parsed, &mut tool_order, false).expect("drain ok");
+
+        assert_eq!(chunks.len(), 1, "expected single tool_call chunk");
+        let chunk = &chunks[0];
+        assert!(chunk.delta.is_empty(), "tool_call chunk has no visible delta");
+        assert_eq!(chunk.tool_calls.len(), 1);
+
+        let tc = &chunk.tool_calls[0];
+        assert_eq!(tc.name, "shell");
+        assert_eq!(tc.index, 0);
+        assert_eq!(
+            tc.status,
+            ToolCallChunkStatus::Completed,
+            "Gemini emits Completed-only (no streaming fragments today)"
+        );
+        assert!(tc.arguments_delta.is_none(), "Completed.arguments_delta MUST be None");
+        assert!(!tc.id.is_empty(), "fresh UUID assigned for missing API id");
+
+        // Args round-trip back to a JSON object containing the expected command.
+        let args_val: serde_json::Value = serde_json::from_str(&tc.args).expect("args is JSON");
+        assert_eq!(args_val["command"], "ls -la");
+
+        // Successive function_calls in the same stream get monotonic indexes.
+        assert_eq!(tool_order, 1);
+    }
+
+    /// Mixed text + functionCall in a single SSE record: each part becomes
+    /// its own `StreamChunk`, and order is preserved.
+    #[test]
+    fn drain_gemini_chunk_mixes_text_and_function_call_in_order() {
+        let record = r#"data: {"candidates":[{"content":{"parts":[{"text":"calling tool now"},{"functionCall":{"name":"search","args":{"q":"rust"}}}]}}]}
+
+"#;
+        let parsed = parse_gemini_sse_record(record)
+            .expect("parse ok")
+            .expect("payload present");
+
+        let mut tool_order: usize = 0;
+        let chunks = drain_gemini_chunk(parsed, &mut tool_order, false).expect("drain ok");
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].delta, "calling tool now");
+        assert!(chunks[0].tool_calls.is_empty());
+
+        assert!(chunks[1].delta.is_empty());
+        assert_eq!(chunks[1].tool_calls.len(), 1);
+        assert_eq!(chunks[1].tool_calls[0].name, "search");
+        assert_eq!(chunks[1].tool_calls[0].status, ToolCallChunkStatus::Completed);
+    }
+
+    /// An empty-name `functionCall` part is defensively skipped (the driver
+    /// keys tool dispatch on `name`, so a nameless call is unactionable).
+    #[test]
+    fn drain_gemini_chunk_skips_function_call_without_name() {
+        let record = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"args\":{}}}]}}]}\n\n";
+        let parsed = parse_gemini_sse_record(record)
+            .expect("parse ok")
+            .expect("payload present");
+
+        let mut tool_order: usize = 0;
+        let chunks = drain_gemini_chunk(parsed, &mut tool_order, false).expect("drain ok");
+
+        assert!(chunks.is_empty(), "malformed function_call must be skipped");
+        assert_eq!(tool_order, 0, "skipped call must not consume index");
+    }
+
+    /// Chunk-level API error (`error.message` populated) is surfaced as a
+    /// `StreamError::Provider` so the streaming task can fail fast.
+    #[test]
+    fn drain_gemini_chunk_surfaces_api_error() {
+        let record = "data: {\"error\":{\"message\":\"quota exceeded\"}}\n\n";
+        let parsed = parse_gemini_sse_record(record)
+            .expect("parse ok")
+            .expect("payload present");
+
+        let mut tool_order: usize = 0;
+        let err = drain_gemini_chunk(parsed, &mut tool_order, false).expect_err("error chunk");
+        match err {
+            StreamError::Provider(msg) => assert!(msg.contains("quota exceeded")),
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
+    /// `into_effective_response` unwrapping: cloudcode-pa wraps payloads in
+    /// `{ "response": {...} }`. The drain helper must look through that
+    /// envelope so streaming parses identically for OAuth & API-key paths.
+    #[test]
+    fn drain_gemini_chunk_unwraps_cloudcode_pa_envelope() {
+        let record = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}}\n\n";
+        let parsed = parse_gemini_sse_record(record)
+            .expect("parse ok")
+            .expect("payload present");
+
+        let mut tool_order: usize = 0;
+        let chunks = drain_gemini_chunk(parsed, &mut tool_order, false).expect("drain ok");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].delta, "hi");
+    }
+
+    /// `supports_streaming()` must be `true` for the trait-object dispatch
+    /// path (router uses this to choose between streaming and one-shot).
+    #[test]
+    fn supports_streaming_returns_true() {
+        let provider = GeminiProvider {
+            auth: Some(GeminiAuth::ExplicitKey("k".into())),
+        };
+        assert!(provider.supports_streaming());
     }
 }
