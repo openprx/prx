@@ -852,6 +852,37 @@ impl Provider for ReliableProvider {
         self.providers.iter().any(|(_, p)| p.supports_streaming())
     }
 
+    /// 把 `stream_chat_with_history` 转发到第一个支持 streaming 的内部 provider.
+    ///
+    /// Step 5a-4 关键：trait 默认 `stream_chat_with_history` 返回错误 chunk
+    /// `"unknown does not support streaming"`，会让 dispatcher driver 路径
+    /// 立刻 StreamFailed。这里转发给具体 provider（如 `MockEnvProvider` /
+    /// `OpenAiProvider` 等）真正流式实现，与 `stream_chat_with_system` 行为对齐。
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        for (_provider_name, provider) in &self.providers {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+            let current_model = self
+                .model_chain(model)
+                .first()
+                .map_or_else(|| model.to_string(), |m| m.to_string());
+            return provider.stream_chat_with_history(messages, &current_model, temperature, options);
+        }
+        stream::once(async move {
+            Err(super::traits::StreamError::Provider(
+                "No provider supports streaming".to_string(),
+            ))
+        })
+        .boxed()
+    }
+
     fn stream_chat_with_system(
         &self,
         system_prompt: Option<&str>,
