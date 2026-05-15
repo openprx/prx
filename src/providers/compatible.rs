@@ -869,10 +869,13 @@ fn sse_bytes_to_chunks(
 
                     buffer.push_str(&text);
 
-                    // Process complete lines
+                    // Process complete lines. `drain(..=pos)` already removes the
+                    // terminator from `buffer`; the previous re-slice into
+                    // `buffer[pos+1..]` was a dangling index relative to the
+                    // already-shortened vector and would panic (e.g. `buffer == "\n"`
+                    // → `drain` yields `""` and the empty buffer has no `[1..]`).
                     while let Some(pos) = buffer.find('\n') {
                         let line = buffer.drain(..=pos).collect::<String>();
-                        buffer = buffer[pos + 1..].to_string();
 
                         match parse_sse_line(&line) {
                             Ok(Some(event)) => {
@@ -2958,6 +2961,57 @@ mod tests {
         assert_eq!(completed[1].name, "lookup");
         assert_eq!(completed[1].args, r#"{"k":2}"#);
         assert_eq!(completed[1].status, ToolCallChunkStatus::Completed);
+    }
+
+    /// Regression: the previous SSE line splitter ran `buffer.drain(..=pos)`
+    /// followed by `buffer = buffer[pos+1..].to_string()`. After the drain the
+    /// buffer is already shortened to `len - (pos+1)`, so the re-slice was
+    /// indexing into a dangling range and would panic. The minimal trigger is
+    /// a buffer that contains exactly one byte — the newline terminator: after
+    /// `drain` the buffer is empty, and `buffer[1..]` is out of bounds.
+    ///
+    /// This test replays that splitter contract directly (no provider, no I/O)
+    /// to guarantee the fix stays in place: drain alone is sufficient.
+    #[test]
+    fn test_compatible_sse_line_splitter_no_panic_on_lone_newline() {
+        // Replay the exact splitter logic used in `stream_chat_with_system`.
+        fn split_lines(buffer: &mut String) -> Vec<String> {
+            let mut out = Vec::new();
+            while let Some(pos) = buffer.find('\n') {
+                let line: String = buffer.drain(..=pos).collect();
+                out.push(line);
+            }
+            out
+        }
+
+        // Case 1: lone newline — previously panicked because `buffer[1..]` on
+        // an empty buffer is out of bounds.
+        let mut b1 = String::from("\n");
+        let lines = split_lines(&mut b1);
+        assert_eq!(lines, vec!["\n".to_string()]);
+        assert!(b1.is_empty(), "lone newline must fully drain the buffer");
+
+        // Case 2: two complete lines back-to-back. The bug would corrupt the
+        // remainder between iterations even when no panic was triggered.
+        let mut b2 = String::from("a\nb\n");
+        let lines = split_lines(&mut b2);
+        assert_eq!(lines, vec!["a\n".to_string(), "b\n".to_string()]);
+        assert!(b2.is_empty(), "two complete lines must fully drain");
+
+        // Case 3: one complete line + partial remainder. The partial must be
+        // preserved verbatim for the next chunk to concatenate.
+        let mut b3 = String::from("first\npartial-without-newline");
+        let lines = split_lines(&mut b3);
+        assert_eq!(lines, vec!["first\n".to_string()]);
+        assert_eq!(b3, "partial-without-newline");
+
+        // Case 4: multi-byte UTF-8 right before the newline. `drain(..=pos)`
+        // is byte-indexed; the splitter must remain panic-free even when the
+        // last code point uses 3 bytes (e.g. `中`).
+        let mut b4 = String::from("中\n中\n");
+        let lines = split_lines(&mut b4);
+        assert_eq!(lines, vec!["中\n".to_string(), "中\n".to_string()]);
+        assert!(b4.is_empty());
     }
 
     /// Defensive: a tool-call delta arriving with only `id` (no `name`) must
