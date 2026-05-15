@@ -1,0 +1,3560 @@
+//! Redux-like ChatState 及其 reducer.
+//!
+//! 包含:
+//! - [`ChatState`] — 顶层状态，持有 4 个子结构
+//! - [`SessionState`] / [`UiState`] / [`StreamState`] / [`ControlState`]
+//! - [`Effect`] — reduce 返回的副作用指令，由主循环的 async 外壳执行
+//!
+//! 设计原则:
+//! - `ChatState::reduce` 是纯 sync 函数，无 I/O，无 await，只 mutate 自身
+//! - Effect 是 enum（非 Box<dyn FnOnce>），Send + Sync，可序列化/可测试
+//! - ChatState 由单一 owner（主循环）持有，不需要 Arc<Mutex<>>
+
+// Step 2: 接入真实类型 — TuiInput / ConversationLine / StreamingDraft 来自
+// `crate::chat::tui`（feature = "terminal-tui"）。非 TUI feature 下沿用占位
+// 类型以确保两套 feature 均可独立编译。
+//
+// 注意：UiState 中 `input` 是 reducer 的输入缓冲快照（new path 写入），
+// 而旧路径仍把按键转发给 `chat_mirror.lock().input`（TuiState 内嵌 TuiInput）。
+// Step 5 删旧路径后 chat_mirror 即被 ChatState.ui 取代。
+
+#[cfg(feature = "terminal-tui")]
+pub use crate::chat::tui::{ConversationLine, StreamingDraft, TuiInput};
+
+/// 占位：TuiInput（非 terminal-tui feature；保持 reducer 在最小 feature 下也能编译）
+#[cfg(not(feature = "terminal-tui"))]
+pub type TuiInput = Vec<String>;
+
+/// 占位：ConversationLine（非 terminal-tui feature）
+#[cfg(not(feature = "terminal-tui"))]
+pub type ConversationLine = String;
+
+/// 占位：StreamingDraft（非 terminal-tui feature）
+#[cfg(not(feature = "terminal-tui"))]
+pub type StreamingDraft = (String, String, u64);
+
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+use crate::agent::loop_::ChatMode;
+use crate::channels::traits::SendMessage;
+use crate::chat::action::{Action, CompactReason, HistoryDir};
+use crate::chat::session::{ChatSession, ChatTurn};
+use crate::hooks::HookEvent;
+use crate::memory::MemoryCategory;
+use crate::providers::ChatMessage;
+use crate::util::truncate_with_ellipsis;
+
+/// S2-B Step 1: `Action::HistoryCompacted` reducer 对齐 `chat::mod::compact_chat_history`
+/// 的常量边界。三个常量必须与 `chat::mod` 同源以确保两条路径在双写期产生相同结果；
+/// 后续 step 删除旧路径时直接用 reducer 这套即可。
+const COMPACT_KEEP_MESSAGES: usize = 8;
+const COMPACT_CONTENT_CHARS: usize = 320;
+const COMPACT_TOTAL_CHARS: usize = 2400;
+
+// ─── Effect ──────────────────────────────────────────────────────────────────
+
+/// Effect = 必须由 async 外壳执行的副作用.
+///
+/// 设计为 enum 而非 `Box<dyn FnOnce>`:
+/// - `Send + Sync` 天然满足
+/// - 可序列化用于日志/replay/test snapshot
+/// - 无堆分配（除内置 String/Arc）
+///
+/// 由 [`ChatState::reduce`] 返回，交给主循环 dispatch。
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum Effect {
+    /// 开始新一轮 LLM 推理：传入 draft_id、history 快照、取消令牌.
+    ///
+    /// `draft_id` 由 [`Action::TurnStarted`] 携带并写入 `state.stream.draft`；
+    /// 执行器子任务用它给 `StreamChunkReceived` / `StreamCompleted` 等 Action
+    /// 打标记，reducer 才能匹配并合并 delta（见 `state.rs::reduce_stream_chunk_received`）。
+    /// Step 5a-2 起 `EffectExecutor` 在 deps 模式下真调 `provider.stream_chat_with_history`，
+    /// 流式 chunk 通过 `EffectDeps::action_tx` 回投到 reducer。
+    StartTurn {
+        draft_id: String,
+        history: Vec<ChatMessage>,
+        cancel: CancellationToken,
+    },
+    /// 持久化当前会话快照
+    SaveSession(ChatSession),
+    /// 通知渲染层 draft 已完成，推入 conversation_lines
+    SendDraftFinalize { draft_id: String, text: String },
+    /// 取消指定 draft 的 streaming
+    CancelDraft(String),
+    /// S2-B Step 2: 真正调用 `CancellationToken::cancel()` 取消当前 turn 的 LLM/工具流.
+    ///
+    /// 与 [`Self::CancelDraft`] 的区别:
+    /// - `CancelDraft` 仅通知 channel 撤销 draft UI（用户看到的 streaming 块停止追加）
+    /// - `CancelToken` 真触发底层 token cancel，让 `run_tool_call_loop` /
+    ///   `drive_start_turn_stream` 立刻返回 cancelled 错误
+    ///
+    /// reducer 在 `reduce_cancel_requested` 内**收集** active_cancel.take() 后构造此
+    /// Effect；EffectExecutor 在 real 模式下直接 `token.cancel()`，shadow 模式下记
+    /// debug log。这关闭了 S2-B Codex 风险中 "UI 取消了但底层仍跑" 的窗口。
+    CancelToken(CancellationToken),
+    /// 向 channel 发送消息（槽命令输出等）
+    EmitChannelMessage(SendMessage),
+    /// 写入 memory backend
+    PersistToMemory {
+        key: String,
+        value: String,
+        category: MemoryCategory,
+    },
+    /// 触发 hook 事件
+    NotifyHook {
+        event: HookEvent,
+        payload: serde_json::Value,
+    },
+    /// 请求 TUI 重绘一帧
+    RequestRedraw,
+    /// 展示媒体内容（图像/音频等）
+    DisplayMedia { kind: String, path: String },
+    /// 自动为会话生成标题
+    AutoTitleSession(String),
+    /// 结构化 trace 日志
+    LogTrace { level: tracing::Level, msg: String },
+    /// 优雅退出主循环
+    Quit,
+}
+
+// ─── Sub-states ───────────────────────────────────────────────────────────────
+
+/// 会话持久化相关状态（写入 memory backend）.
+#[allow(dead_code)]
+pub struct SessionState {
+    /// 会话唯一 ID
+    pub id: String,
+    /// 会话标题（自动生成或用户设置）
+    pub title: String,
+    /// 当前 provider 名（整个 session 不变，Arc<str> 减少 clone）
+    pub provider: Arc<str>,
+    /// 当前 model 名
+    pub model: Arc<str>,
+    /// 交互模式（plan/edit/auto）
+    pub mode: ChatMode,
+    /// 完整对话回合（持久化用）
+    pub turns: Vec<ChatTurn>,
+    /// LLM 上下文消息列表（system+user+assistant，用于下一次请求）
+    pub history: Vec<ChatMessage>,
+}
+
+/// TUI UI 临时状态（退出即弃，不持久化）.
+///
+/// Step 2 起接入真实 `TuiInput`/`ConversationLine`（feature = "terminal-tui"）；
+/// 非 TUI feature 下使用占位类型保持编译兼容。
+#[allow(dead_code)]
+pub struct UiState {
+    /// 渲染好的对话行
+    pub conversation_lines: Vec<ConversationLine>,
+    /// 多行输入 buffer + 历史
+    pub input: TuiInput,
+    /// 当前对话回合计数（用于状态栏）
+    pub turn_count: usize,
+    /// 是否启用 ASCII 降级（非 UTF-8 终端）
+    pub ascii_fallback: bool,
+    /// 上次 Ctrl+C 的时间戳（ms），用于双击窗口判断
+    pub last_ctrlc_ms: u64,
+    /// 最近一次输入提交（reducer 内 KeyPressed::Enter 时由 reduce 自身派生
+    /// `Action::InputSubmitted`；该字段用于测试断言双写期最后一次提交内容）
+    pub last_submitted: Option<String>,
+}
+
+/// 流式推理中间态（每轮重置）.
+#[allow(dead_code)]
+pub struct StreamState {
+    /// 当前 in-flight streaming draft（Step 3 起由 reducer 接管版本号防护）
+    pub draft: Option<StreamingDraft>,
+    /// 当前回合中处于 Running 状态的工具卡片索引列表
+    pub pending_tool_cards: Vec<usize>,
+}
+
+/// 取消/关停控制状态.
+#[allow(dead_code)]
+pub struct ControlState {
+    /// 当前回合的取消令牌（None 表示空闲）
+    pub active_cancel: Option<CancellationToken>,
+    /// 全局关停令牌（长生命周期，跨任务共享）
+    pub shutdown: CancellationToken,
+    /// 是否正在生成（用于 CancelRequested 分支判断）
+    pub generating: bool,
+}
+
+// ─── ChatState ────────────────────────────────────────────────────────────────
+
+/// 顶层聊天状态，由主循环单一 owner 持有.
+///
+/// 不使用 `Arc<Mutex<ChatState>>`；renderer 通过快照 channel 接收只读副本。
+/// 所有变更通过 [`ChatState::reduce`] 统一应用。
+#[allow(dead_code)]
+pub struct ChatState {
+    /// 持久化会话状态
+    pub session: SessionState,
+    /// TUI UI 临时状态
+    pub ui: UiState,
+    /// 流式中间态
+    pub stream: StreamState,
+    /// 取消/关停控制
+    pub control: ControlState,
+}
+
+impl ChatState {
+    /// 构造初始状态（合理默认值）.
+    ///
+    /// `provider`/`model` 传入 Arc<str> 以避免后续 clone。
+    /// `shutdown` 由调用方创建并共享给所有子任务。
+    pub fn new(provider: Arc<str>, model: Arc<str>, shutdown: CancellationToken) -> Self {
+        Self {
+            session: SessionState {
+                id: String::new(),
+                title: String::new(),
+                provider,
+                model,
+                mode: ChatMode::default(),
+                turns: Vec::new(),
+                history: Vec::new(),
+            },
+            ui: UiState {
+                conversation_lines: Vec::new(),
+                input: Self::new_input(),
+                turn_count: 0,
+                ascii_fallback: false,
+                last_ctrlc_ms: 0,
+                last_submitted: None,
+            },
+            stream: StreamState {
+                draft: None,
+                pending_tool_cards: Vec::new(),
+            },
+            control: ControlState {
+                active_cancel: None,
+                shutdown,
+                generating: false,
+            },
+        }
+    }
+
+    /// 构造空 TuiInput / 占位 Vec（与当前 feature 匹配）.
+    #[cfg(feature = "terminal-tui")]
+    fn new_input() -> TuiInput {
+        TuiInput::new()
+    }
+
+    /// 非 terminal-tui feature 下使用占位 Vec.
+    #[cfg(not(feature = "terminal-tui"))]
+    #[allow(clippy::missing_const_for_fn)]
+    fn new_input() -> TuiInput {
+        Vec::new()
+    }
+
+    /// 纯 sync 状态机 — 根据 [`Action`] mutate self，返回需要主循环执行的 [`Effect`] 列表.
+    ///
+    /// 约束:
+    /// - 无 `.await`，无 I/O，无 `spawn`
+    /// - 所有 async 副作用通过 `Effect` 返回，由主循环 dispatch
+    /// - 内部调用 `now_ms()` 读取墙钟（双击窗口判断），见 [`Self::reduce_with_now`]
+    ///   暴露的纯参数化版本以便测试注入时间
+    pub fn reduce(&mut self, action: Action) -> Vec<Effect> {
+        let now = now_ms();
+        self.reduce_with_now(action, now)
+    }
+
+    /// 与 [`Self::reduce`] 等价，但 `now_ms` 显式注入以便测试构造确定时间.
+    pub fn reduce_with_now(&mut self, action: Action, now_ms: u64) -> Vec<Effect> {
+        match action {
+            // ── 输入路径 ──────────────────────────────────────────
+            Action::KeyPressed(key) => self.reduce_key_pressed(key, now_ms),
+            Action::PasteReceived(text) => self.reduce_paste_received(&text),
+            Action::TerminalResized { w: _w, h: _h } => {
+                // Step 2: 无尺寸缓存，仅请求重绘（ratatui 自动适配）
+                vec![Effect::RequestRedraw]
+            }
+            Action::InputSubmitted(text) => self.reduce_input_submitted(text),
+            Action::HistoryNavigated(dir) => self.reduce_history_navigated(dir),
+            Action::InputCancelled => self.reduce_input_cancelled(),
+
+            // ── 槽命令 ────────────────────────────────────────────
+            Action::SlashCommandIssued { cmd: _cmd, args: _args } => {
+                // Step 4: 分发到 commands 模块处理
+                vec![]
+            }
+            Action::ModeChanged(mode) => {
+                // Step 2: ModeChanged reducer 已实现，但主循环尚无 dispatch 来源。
+                // 由 SlashCommand 路径转发，Step 5 接入；当前分支供回归测试用。
+                self.session.mode = mode;
+                vec![Effect::RequestRedraw]
+            }
+            Action::HistoryCleared => self.reduce_history_cleared(),
+            Action::HistoryCompacted { reason } => self.reduce_history_compacted(reason),
+
+            // ── LLM 流式 (Step 3) ─────────────────────────────────
+            Action::TurnStarted { draft_id, cancel } => self.reduce_turn_started(draft_id, cancel),
+            Action::StartLLMTurn {
+                draft_id,
+                history,
+                cancel,
+            } => self.reduce_start_llm_turn(draft_id, history, cancel),
+            Action::StreamChunkReceived {
+                draft_id,
+                delta,
+                version,
+            } => self.reduce_stream_chunk_received(&draft_id, &delta, version),
+            Action::StreamCompleted {
+                draft_id,
+                final_text,
+                reasoning,
+            } => self.reduce_stream_completed(&draft_id, final_text, reasoning),
+            Action::StreamFailed {
+                draft_id,
+                err,
+                retryable,
+            } => self.reduce_stream_failed(&draft_id, err, retryable),
+            Action::StreamCancelled { draft_id } => self.reduce_stream_cancelled(&draft_id),
+
+            // ── 工具事件 (Step 3) ─────────────────────────────────
+            Action::ToolStarted { name, args } => self.reduce_tool_started(name, args),
+            Action::ToolFinished {
+                name,
+                success,
+                duration_ms,
+                result,
+            } => self.reduce_tool_finished(name, success, duration_ms, result),
+            Action::ToolProgress { iteration, max } => self.reduce_tool_progress(iteration, max),
+
+            // ── 会话 ──────────────────────────────────────────────
+            Action::SessionLoaded(session) => self.reduce_session_loaded(session),
+            Action::SessionSaved { id } => self.reduce_session_saved(id),
+            Action::SessionSwitched { id } => self.reduce_session_switched(id),
+            Action::RecordUserTurn(content) => self.reduce_record_user_turn(content),
+            Action::RecordAssistantTurn(content) => self.reduce_record_assistant_turn(content),
+            Action::RecordSystemMessage { content } => self.reduce_record_system_message(content),
+            Action::SetLeadingSystemPrompt { content } => self.reduce_set_leading_system_prompt(content),
+
+            // ── UI 折叠/展开 ────────────────────────────────────
+            Action::ToolCardFoldToggled => self.reduce_tool_card_fold_toggled(),
+            Action::ReasoningFoldToggled => self.reduce_reasoning_fold_toggled(),
+            Action::RedrawRequested => vec![Effect::RequestRedraw],
+            Action::SystemMessageAdded { text } => self.reduce_system_message_added(text),
+
+            // ── 退出 ──────────────────────────────────────────────
+            Action::CancelRequested => self.reduce_cancel_requested(),
+            Action::ShutdownRequested => self.reduce_shutdown_requested(),
+            Action::ForceQuit => vec![Effect::Quit],
+        }
+    }
+
+    // ── 输入路径子函数（Step 2） ────────────────────────────────────────────────
+
+    /// 处理 `KeyPressed`：按键分发到 input buffer / 全局快捷键 / 退出语义.
+    ///
+    /// 此函数本质上是 `tui::dispatch_global_key` 的 reducer 版本，但作用对象是
+    /// `UiState.input` 而非 `TuiState`。返回 Effect 序列（典型只有 RequestRedraw）。
+    /// 实际向 channel 投递 user message / 触发 cancel 等仍由主循环根据 Effect 执行。
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_key_pressed(&mut self, key: crossterm::event::KeyEvent, now_ms: u64) -> Vec<Effect> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        // Tab → 折叠/展开最近 ToolResult 卡片
+        if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
+            return self.reduce_tool_card_fold_toggled();
+        }
+        // Ctrl+R → 折叠/展开 Reasoning 卡片
+        if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
+            return self.reduce_reasoning_fold_toggled();
+        }
+        // Ctrl+L → 清屏（请求重绘即可，host 终端清屏由 effect 执行器决定）
+        if key.code == KeyCode::Char('l') && key.modifiers == KeyModifiers::CONTROL {
+            return vec![Effect::RequestRedraw];
+        }
+        // Ctrl+C → 单击取消 / 双击退出（500ms 窗口）
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            let prev = self.ui.last_ctrlc_ms;
+            self.ui.last_ctrlc_ms = now_ms;
+            if prev != 0 && now_ms.saturating_sub(prev) < DOUBLE_CTRLC_WINDOW_MS {
+                // 双击 → 优雅退出。Effect::Quit 由外壳触发 shutdown_token.cancel()
+                return vec![Effect::Quit];
+            }
+            // 单击 → 仅记录窗口；实际 cancel 由外壳读取 active_cancel
+            return vec![];
+        }
+        // Ctrl+D → 空 buffer 退出 / 非空 forward-delete（委托 handle_key）
+        if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
+            if self.ui.input.is_empty() {
+                return vec![Effect::Quit];
+            }
+            // 非空 buffer 转发为 Delete
+            let synthetic = crossterm::event::KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
+            let _ = self.ui.input.handle_key(synthetic);
+            return vec![Effect::RequestRedraw];
+        }
+        // 其他键 → 转发到 input buffer，根据 InputOutcome 派生后续 Action 自递归
+        match self.ui.input.handle_key(key) {
+            crate::chat::tui::InputOutcome::Submitted(text) => {
+                // 用 reduce_with_now 重入以保持单一处理路径
+                self.reduce_input_submitted(text)
+            }
+            crate::chat::tui::InputOutcome::Cancelled => self.reduce_input_cancelled(),
+            crate::chat::tui::InputOutcome::Consumed | crate::chat::tui::InputOutcome::Unhandled => {
+                vec![Effect::RequestRedraw]
+            }
+        }
+    }
+
+    /// 非 terminal-tui feature 下的占位（KeyEvent 仅在 crossterm 可用时存在）
+    #[cfg(not(feature = "terminal-tui"))]
+    #[allow(clippy::needless_pass_by_ref_mut, clippy::missing_const_for_fn)]
+    fn reduce_key_pressed(&mut self, _key: crossterm::event::KeyEvent, _now_ms: u64) -> Vec<Effect> {
+        let _ = &self.ui;
+        vec![]
+    }
+
+    /// 处理括号粘贴：将文本插入到 input buffer.
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_paste_received(&mut self, text: &str) -> Vec<Effect> {
+        self.ui.input.paste(text);
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn reduce_paste_received(&mut self, _text: &str) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
+    }
+
+    /// 处理用户提交 — 仅做 UI 侧记账（turn_count + last_submitted）.
+    ///
+    /// Step 2 不触发 LLM（Step 3 才追加 `Effect::StartTurn`）。
+    /// `LogTrace` 用于双写期对账。
+    fn reduce_input_submitted(&mut self, text: String) -> Vec<Effect> {
+        self.ui.turn_count = self.ui.turn_count.saturating_add(1);
+        let log_msg = format!("input_submitted len={}", text.chars().count());
+        self.ui.last_submitted = Some(text);
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::DEBUG,
+                msg: log_msg,
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
+    /// 处理 Up/Down 历史导航.
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_history_navigated(&mut self, dir: HistoryDir) -> Vec<Effect> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = match dir {
+            HistoryDir::Up => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            HistoryDir::Down => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        };
+        let _ = self.ui.input.handle_key(key);
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn reduce_history_navigated(&mut self, _dir: HistoryDir) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
+    }
+
+    /// 处理 Esc — 清空 input buffer.
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_input_cancelled(&mut self) -> Vec<Effect> {
+        self.ui.input.clear();
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn reduce_input_cancelled(&mut self) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
+    }
+
+    /// 处理 Tab — 折叠/展开最近 ToolResult.
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_tool_card_fold_toggled(&mut self) -> Vec<Effect> {
+        use crate::chat::tui::ConversationLine;
+        for line in self.ui.conversation_lines.iter_mut().rev() {
+            if let ConversationLine::ToolResult { folded, .. } = line {
+                *folded = !*folded;
+                break;
+            }
+        }
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn reduce_tool_card_fold_toggled(&mut self) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
+    }
+
+    /// 处理 Ctrl+R — 折叠/展开最近 Reasoning.
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_reasoning_fold_toggled(&mut self) -> Vec<Effect> {
+        use crate::chat::tui::ConversationLine;
+        for line in self.ui.conversation_lines.iter_mut().rev() {
+            if let ConversationLine::Reasoning { folded, .. } = line {
+                *folded = !*folded;
+                break;
+            }
+        }
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn reduce_reasoning_fold_toggled(&mut self) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
+    }
+
+    // ── 流式 / 工具子函数（Step 3） ──────────────────────────────────────────
+    //
+    // P3-5 版本号机制完整下沉：reducer 内的 `StreamState::draft` 是
+    // 单一防护源。版本号比对（strict-monotonic）由 `reduce_stream_chunk_received`
+    // 实现，规则：
+    //   1. 无 draft（已 finalize）→ 丢弃
+    //   2. draft_id 不匹配（跨 turn stale）→ 丢弃
+    //   3. version <= 当前 draft.version → 丢弃（含相等，strict-monotonic）
+    //   4. 否则：累积 delta + 更新 version + RequestRedraw
+    //
+    // 旧 `DraftVersionTracker`（HashMap-based、Mutex-guarded）作为过度防御
+    // 自 Step 3 起从 `chat::mod::draft_updater` 任务中撤除（单线程 mpsc 自然
+    // FIFO，counter 足够保证 monotonic）。Reducer 接管后版本号机制只在一处，
+    // 杜绝双写期竞争。
+
+    /// `Action::TurnStarted` — 初始化 streaming draft + 注册取消令牌.
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
+        self.stream.draft = Some(StreamingDraft {
+            draft_id: draft_id.clone(),
+            accumulated: String::new(),
+            version: 0,
+        });
+        self.control.active_cancel = Some(cancel);
+        self.control.generating = true;
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: format!("turn_started draft_id={draft_id}"),
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
+        // 占位 feature 下 StreamingDraft = (String, String, u64)
+        self.stream.draft = Some((draft_id.clone(), String::new(), 0));
+        self.control.active_cancel = Some(cancel);
+        self.control.generating = true;
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: format!("turn_started draft_id={draft_id}"),
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
+    /// Step 5a-3 Phase A — `Action::StartLLMTurn`：发起 LLM 流式 turn.
+    ///
+    /// 行为:
+    /// 1. 状态变更与 [`Self::reduce_turn_started`] 一致（初始化 draft、注册 cancel、置 generating）
+    /// 2. **额外**发射 `Effect::StartTurn { draft_id, history, cancel }`，由 EffectExecutor
+    ///    在 real-deps 模式下 spawn 子任务真接 `provider.stream_chat_with_history`
+    ///
+    /// 与 `TurnStarted` 的核心区别：携带 history 快照让 reducer 能驱动真 LLM 流式。
+    /// Phase A 阶段 chat::run 主循环旧路径并未切换；本 Action 仅供 Phase B+ 主循环
+    /// 切换、或单元测试验证 reducer → Effect → EffectExecutor 闭环时使用。
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_start_llm_turn(
+        &mut self,
+        draft_id: String,
+        history: Vec<crate::providers::ChatMessage>,
+        cancel: CancellationToken,
+    ) -> Vec<Effect> {
+        self.stream.draft = Some(StreamingDraft {
+            draft_id: draft_id.clone(),
+            accumulated: String::new(),
+            version: 0,
+        });
+        self.control.active_cancel = Some(cancel.clone());
+        self.control.generating = true;
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: format!("start_llm_turn draft_id={draft_id} history_len={}", history.len()),
+            },
+            Effect::StartTurn {
+                draft_id,
+                history,
+                cancel,
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn reduce_start_llm_turn(
+        &mut self,
+        draft_id: String,
+        history: Vec<crate::providers::ChatMessage>,
+        cancel: CancellationToken,
+    ) -> Vec<Effect> {
+        self.stream.draft = Some((draft_id.clone(), String::new(), 0));
+        self.control.active_cancel = Some(cancel.clone());
+        self.control.generating = true;
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: format!("start_llm_turn draft_id={draft_id} history_len={}", history.len()),
+            },
+            Effect::StartTurn {
+                draft_id,
+                history,
+                cancel,
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
+    /// `Action::StreamChunkReceived` — 版本号防护 + 累积 delta.
+    ///
+    /// 返回值：
+    /// - 接受时 → `[RequestRedraw]`
+    /// - 丢弃时 → `[]`（静默；调用方可通过比较 draft.version 前后是否变化判断）
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_stream_chunk_received(&mut self, draft_id: &str, delta: &str, version: u64) -> Vec<Effect> {
+        let Some(draft) = self.stream.draft.as_mut() else {
+            // 已 finalize — chunk 视为 stale，丢弃
+            return vec![];
+        };
+        if draft.draft_id != draft_id {
+            // 跨 turn stale
+            return vec![];
+        }
+        if version <= draft.version {
+            // 严格单调：等于或更小都视为乱序/重复，丢弃
+            return vec![];
+        }
+        draft.accumulated.push_str(delta);
+        draft.version = version;
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn reduce_stream_chunk_received(&mut self, draft_id: &str, delta: &str, version: u64) -> Vec<Effect> {
+        let Some(draft) = self.stream.draft.as_mut() else {
+            return vec![];
+        };
+        if draft.0 != draft_id {
+            return vec![];
+        }
+        if version <= draft.2 {
+            return vec![];
+        }
+        draft.1.push_str(delta);
+        draft.2 = version;
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::StreamCompleted` — 清除 draft + push assistant message + 通知钩子.
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_stream_completed(&mut self, draft_id: &str, final_text: String, reasoning: String) -> Vec<Effect> {
+        use crate::chat::tui::ConversationLine;
+        let matches = self.stream.draft.as_ref().is_some_and(|d| d.draft_id == draft_id);
+        if !matches {
+            return vec![];
+        }
+        self.stream.draft = None;
+        self.stream.pending_tool_cards.clear();
+        self.control.active_cancel = None;
+        self.control.generating = false;
+        if !final_text.is_empty() {
+            self.ui.conversation_lines.push(ConversationLine::Assistant {
+                content: final_text.clone(),
+            });
+        }
+        if !reasoning.trim().is_empty() {
+            let char_count = reasoning.chars().count();
+            self.ui.conversation_lines.push(ConversationLine::Reasoning {
+                content: reasoning,
+                char_count,
+                folded: true,
+            });
+        }
+        let chars = final_text.chars().count();
+        vec![
+            Effect::NotifyHook {
+                event: HookEvent::TurnComplete,
+                payload: serde_json::json!({
+                    "mode": "chat",
+                    "response_chars": chars,
+                }),
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn reduce_stream_completed(&mut self, draft_id: &str, final_text: String, reasoning: String) -> Vec<Effect> {
+        let matches = self.stream.draft.as_ref().is_some_and(|d| d.0 == draft_id);
+        if !matches {
+            return vec![];
+        }
+        self.stream.draft = None;
+        self.stream.pending_tool_cards.clear();
+        self.control.active_cancel = None;
+        self.control.generating = false;
+        if !final_text.is_empty() {
+            self.ui.conversation_lines.push(final_text.clone());
+        }
+        if !reasoning.trim().is_empty() {
+            self.ui.conversation_lines.push(reasoning);
+        }
+        let chars = final_text.chars().count();
+        vec![
+            Effect::NotifyHook {
+                event: HookEvent::TurnComplete,
+                payload: serde_json::json!({
+                    "mode": "chat",
+                    "response_chars": chars,
+                }),
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
+    /// `Action::StreamFailed` — 清除 draft + LogTrace + NotifyHook(Error).
+    ///
+    /// Phase F：与旧路径在 chat::run 主循环里 `hooks.emit(HookEvent::Error, payload_error(...))`
+    /// 的语义保持一致 — failed turn 必须触发 Error hook，否则外部审计 / webhook 会漏报。
+    /// retryable 字段由 EffectExecutor 上层（chat::run 主循环重试逻辑）观察决定是否重发；
+    /// hook 一律触发，因为对外可见的"本轮失败"是确定事件。
+    fn reduce_stream_failed(&mut self, draft_id: &str, err: String, retryable: bool) -> Vec<Effect> {
+        let matches = Self::stream_draft_id_matches(self.stream.draft.as_ref(), draft_id);
+        if !matches {
+            return vec![];
+        }
+        self.stream.draft = None;
+        self.stream.pending_tool_cards.clear();
+        self.control.active_cancel = None;
+        self.control.generating = false;
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::WARN,
+                msg: format!("stream_failed draft_id={draft_id} retryable={retryable} err={err}"),
+            },
+            Effect::NotifyHook {
+                event: HookEvent::Error,
+                payload: serde_json::json!({
+                    "component": "chat-turn",
+                    "message": err,
+                    "retryable": retryable,
+                    "draft_id": draft_id,
+                }),
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
+    /// `Action::StreamCancelled` — 用户主动取消，仅清除 draft.
+    fn reduce_stream_cancelled(&mut self, draft_id: &str) -> Vec<Effect> {
+        let matches = Self::stream_draft_id_matches(self.stream.draft.as_ref(), draft_id);
+        if !matches {
+            return vec![];
+        }
+        self.stream.draft = None;
+        self.stream.pending_tool_cards.clear();
+        self.control.active_cancel = None;
+        self.control.generating = false;
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::ToolStarted` — 追加 Running 状态的 ToolResult 卡片 + 记录索引.
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_tool_started(&mut self, name: String, args: String) -> Vec<Effect> {
+        use crate::chat::tui::{ConversationLine, ToolStatus};
+        let args_preview = if args.chars().count() > 80 {
+            let prefix: String = args.chars().take(80).collect();
+            format!("{prefix}…")
+        } else {
+            args.clone()
+        };
+        self.ui.conversation_lines.push(ConversationLine::ToolResult {
+            tool_name: name,
+            args_preview,
+            args_full: args,
+            result: None,
+            status: ToolStatus::Running,
+            elapsed_ms: None,
+            folded: true,
+        });
+        let idx = self.ui.conversation_lines.len().saturating_sub(1);
+        self.stream.pending_tool_cards.push(idx);
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn reduce_tool_started(&mut self, name: String, args: String) -> Vec<Effect> {
+        self.ui.conversation_lines.push(format!("tool_started:{name}:{args}"));
+        let idx = self.ui.conversation_lines.len().saturating_sub(1);
+        self.stream.pending_tool_cards.push(idx);
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::ToolFinished` — 更新对应 Running 卡片 → Done/Error.
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_tool_finished(
+        &mut self,
+        name: String,
+        success: bool,
+        duration_ms: u64,
+        result: Option<String>,
+    ) -> Vec<Effect> {
+        use crate::chat::tui::{ConversationLine, ToolStatus};
+        // 第 1 步：从 pending_tool_cards 反向查找最近一个 name 匹配 + Running 的卡片
+        // （只借用 conversation_lines，不持 mut 引用，避免 result 跨循环 move 冲突）
+        let target_pos = self
+            .stream
+            .pending_tool_cards
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(pos, &idx)| match self.ui.conversation_lines.get(idx) {
+                Some(ConversationLine::ToolResult { tool_name, status, .. })
+                    if tool_name == &name && *status == ToolStatus::Running =>
+                {
+                    Some((pos, idx))
+                }
+                _ => None,
+            });
+        // 第 2 步：找到目标后再做 mut 更新 + 从 pending 移除
+        if let Some((pending_pos, line_idx)) = target_pos {
+            if let Some(ConversationLine::ToolResult {
+                status,
+                elapsed_ms,
+                result: result_slot,
+                ..
+            }) = self.ui.conversation_lines.get_mut(line_idx)
+            {
+                *status = if success { ToolStatus::Done } else { ToolStatus::Error };
+                *elapsed_ms = Some(duration_ms);
+                *result_slot = result;
+            }
+            self.stream.pending_tool_cards.remove(pending_pos);
+        }
+        vec![
+            Effect::RequestRedraw,
+            Effect::LogTrace {
+                level: tracing::Level::DEBUG,
+                msg: format!("tool_finished name={name} success={success} duration_ms={duration_ms}"),
+            },
+        ]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn reduce_tool_finished(
+        &mut self,
+        name: String,
+        success: bool,
+        duration_ms: u64,
+        _result: Option<String>,
+    ) -> Vec<Effect> {
+        // 占位 feature 下仅记录 + 弹出最后一个 pending 索引
+        if !self.stream.pending_tool_cards.is_empty() {
+            self.stream.pending_tool_cards.pop();
+        }
+        vec![
+            Effect::RequestRedraw,
+            Effect::LogTrace {
+                level: tracing::Level::DEBUG,
+                msg: format!("tool_finished name={name} success={success} duration_ms={duration_ms}"),
+            },
+        ]
+    }
+
+    /// `Action::ToolProgress` — 进度通知（仅 RequestRedraw + LogTrace）.
+    ///
+    /// 当前 UI 未单独显示 progress 字段；保留 Action 是为了未来扩展 + 钩子触发.
+    /// 不 mutate UI 状态（签名仍接受 `&self` 但 reducer 入口统一传 `&mut`，
+    /// 此处用 `&self` 让 clippy::needless-pass-by-ref-mut 静音）.
+    fn reduce_tool_progress(&self, iteration: usize, max: usize) -> Vec<Effect> {
+        let _ = &self.ui; // 强制依赖 self 防止变 const fn
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::DEBUG,
+                msg: format!("tool_progress {iteration}/{max}"),
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
+    /// Helper：判断当前 draft 的 id 是否匹配传入值（处理 terminal-tui 和占位两种 StreamingDraft 类型）.
+    #[cfg(feature = "terminal-tui")]
+    fn stream_draft_id_matches(draft: Option<&StreamingDraft>, draft_id: &str) -> bool {
+        draft.is_some_and(|d| d.draft_id == draft_id)
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn stream_draft_id_matches(draft: Option<&StreamingDraft>, draft_id: &str) -> bool {
+        draft.is_some_and(|d| d.0 == draft_id)
+    }
+
+    // ── Step 4 子函数（退出 + 会话） ─────────────────────────────────────────────
+
+    /// `Action::CancelRequested` — 单击 Ctrl+C，取消当前流式回合（如有）.
+    ///
+    /// - 若 generating == false → 无活动回合，返回 vec![]（no-op）
+    /// - 若 generating == true  → 清除 stream.draft + control 状态，返回
+    ///   [CancelToken(tok)?, CancelDraft(id), LogTrace, RequestRedraw]
+    ///
+    /// S2-B Step 2: 新增 [`Effect::CancelToken`] — 在 reducer 把 `active_cancel.take()`
+    /// 取出后立刻发给 EffectExecutor，由它真调 `token.cancel()`。这关闭了之前
+    /// "UI 已 cancel 但底层 LLM 流仍在跑" 的窗口（reducer 仅清状态、不 cancel token
+    /// 是 S2-B Codex 风险点）。
+    fn reduce_cancel_requested(&mut self) -> Vec<Effect> {
+        if !self.control.generating {
+            // 空闲时取消无意义 — no-op
+            return vec![];
+        }
+        // 取出 draft id（如有）+ cancel token（如有）用于 Effect
+        let draft_id_opt = Self::take_draft_id(&self.stream);
+        let cancel_opt = self.control.active_cancel.take();
+        // 清除流式状态
+        self.stream.draft = None;
+        self.control.generating = false;
+
+        let mut effects = Vec::new();
+        // 优先发 CancelToken 真触发底层取消；再发 CancelDraft 同步 channel UI。
+        if let Some(token) = cancel_opt {
+            effects.push(Effect::CancelToken(token));
+        }
+        if let Some(draft_id) = draft_id_opt {
+            effects.push(Effect::CancelDraft(draft_id));
+        }
+        effects.push(Effect::LogTrace {
+            level: tracing::Level::INFO,
+            msg: "Turn cancelled by CancelRequested".to_string(),
+        });
+        effects.push(Effect::RequestRedraw);
+        effects
+    }
+
+    /// `Action::ShutdownRequested` — 双击 Ctrl+C / SIGTERM，优雅退出.
+    ///
+    /// 若正在生成则一并取消当前 draft + token，然后返回 [Quit]。
+    /// 主循环看到 `Effect::Quit` 后调用 `shutdown.cancel()`（CancellationToken 持有在
+    /// 主循环外壳，reducer 不直接持有，Step 5 完整接线时确认）。
+    ///
+    /// S2-B Step 2: 与 [`Self::reduce_cancel_requested`] 一致 — 流式 turn 还活着时
+    /// 必须发 `Effect::CancelToken` 让 EffectExecutor 真调 token.cancel()，否则
+    /// 底层 LLM 流不会立刻收到 cancel 信号。
+    fn reduce_shutdown_requested(&mut self) -> Vec<Effect> {
+        let (draft_id_opt, cancel_opt) = if self.control.generating {
+            let id = Self::take_draft_id(&self.stream);
+            let tok = self.control.active_cancel.take();
+            self.stream.draft = None;
+            self.control.generating = false;
+            (id, tok)
+        } else {
+            (None, None)
+        };
+
+        let mut effects = Vec::new();
+        if let Some(token) = cancel_opt {
+            effects.push(Effect::CancelToken(token));
+        }
+        if let Some(draft_id) = draft_id_opt {
+            effects.push(Effect::CancelDraft(draft_id));
+        }
+        effects.push(Effect::Quit);
+        effects
+    }
+
+    /// `Action::SessionLoaded(ChatSession)` — 恢复持久化会话到 SessionState.
+    ///
+    /// 全字段替换（id/title/provider/model/mode/turns）；history 由主循环在
+    /// SessionLoaded 到来时从 turns 重建（Step 5 接线）。
+    fn reduce_session_loaded(&mut self, loaded: ChatSession) -> Vec<Effect> {
+        let id = loaded.id.clone();
+        self.session.id = loaded.id;
+        self.session.title = loaded.title;
+        self.session.provider = Arc::from(loaded.provider.as_str());
+        self.session.model = Arc::from(loaded.model.as_str());
+        self.session.mode = loaded.mode;
+        self.session.turns = loaded.turns;
+        // history 从 turns 重建（仅 user/assistant 角色进 LLM context）
+        self.session.history = self
+            .session
+            .turns
+            .iter()
+            .filter(|t| t.role == "user" || t.role == "assistant")
+            .map(|t| ChatMessage {
+                role: t.role.clone(),
+                content: t.content.clone(),
+            })
+            .collect();
+        vec![
+            Effect::RequestRedraw,
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: format!("Session loaded: {id}"),
+            },
+        ]
+    }
+
+    /// `Action::SessionSaved { id }` — 更新会话 id（首次保存时服务端可能分配新 id）.
+    fn reduce_session_saved(&mut self, id: String) -> Vec<Effect> {
+        if self.session.id != id {
+            self.session.id = id.clone();
+        }
+        vec![Effect::LogTrace {
+            level: tracing::Level::INFO,
+            msg: format!("Session saved: {id}"),
+        }]
+    }
+
+    /// `Action::SessionSwitched { id }` — 请求切换到另一个会话.
+    ///
+    /// 设计：两步异步流程，reducer 只负责 effects[0] = SaveSession(current)。
+    /// 主循环执行 save 后，spawn 异步加载并 dispatch `SessionLoaded(new_session)`。
+    /// 中断窗口（save 成功前崩溃）由主循环的 try/catch 处理，不在 reducer 内。
+    ///
+    /// effects 顺序（精确）：
+    ///   [0] SaveSession(current_snapshot)
+    ///   [1] LogTrace
+    ///   [2] RequestRedraw
+    fn reduce_session_switched(&self, id: String) -> Vec<Effect> {
+        // 对当前 session 快照生成持久化 effect
+        // clone 是必要的（reducer 不持有 &mut mem backend）
+        let snapshot = ChatSession {
+            id: self.session.id.clone(),
+            schema_version: crate::chat::session::SCHEMA_VERSION,
+            title: self.session.title.clone(),
+            provider: self.session.provider.as_ref().to_owned(),
+            model: self.session.model.as_ref().to_owned(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            turns: self.session.turns.clone(),
+            mode: self.session.mode,
+        };
+        vec![
+            Effect::SaveSession(snapshot),
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: format!("Session switching to: {id}"),
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
+    /// `Action::RecordUserTurn(text)` — 请求 reducer 持久化用户回合到 session 记录和 LLM history.
+    ///
+    /// 对齐 `session.add_user_turn` 语义：
+    /// - `updated_at` 由 effect executor 在构建 `SaveSession` 快照时设置（SessionState 不含时间戳）
+    /// - 首条 user turn 时若 title 为空则自动 set_title（截断前 50 字符，对齐 ChatSession 逻辑）
+    /// - tool_calls 留空，tool 同步由 `ToolStarted`/`ToolFinished` 单独处理（Step 5b）
+    fn reduce_record_user_turn(&mut self, content: String) -> Vec<Effect> {
+        self.session.turns.push(crate::chat::session::ChatTurn {
+            role: "user".to_string(),
+            content: content.clone(),
+            timestamp: chrono::Utc::now(),
+            tool_calls: Vec::new(),
+        });
+        // 首条 user turn 且 title 为空时自动设置标题（对齐 session.add_user_turn 行为）
+        if self.session.title.is_empty() {
+            self.session.title = crate::chat::session::truncate_title(&content);
+        }
+        self.session.history.push(ChatMessage::user(content));
+        vec![Effect::LogTrace {
+            level: tracing::Level::DEBUG,
+            msg: format!("RecordUserTurn len={}", self.session.turns.len()),
+        }]
+    }
+
+    /// `Action::RecordAssistantTurn(text)` — 请求 reducer 持久化助手回合到 session 记录和 LLM history.
+    ///
+    /// 对齐 `session.add_assistant_turn` 语义：
+    /// - `updated_at` 由 effect executor 在构建 `SaveSession` 快照时设置（SessionState 不含时间戳）
+    /// - tool_calls 留空（Step 5b 由 ToolStarted/ToolFinished Action 补充）
+    // TODO: tool_calls 同步留 Step 5b
+    fn reduce_record_assistant_turn(&mut self, content: String) -> Vec<Effect> {
+        self.session.turns.push(crate::chat::session::ChatTurn {
+            role: "assistant".to_string(),
+            content: content.clone(),
+            timestamp: chrono::Utc::now(),
+            tool_calls: Vec::new(),
+        });
+        self.session.history.push(ChatMessage::assistant(content));
+        vec![Effect::LogTrace {
+            level: tracing::Level::DEBUG,
+            msg: format!("RecordAssistantTurn len={}", self.session.turns.len()),
+        }]
+    }
+
+    /// `Action::RecordSystemMessage` — append 一条 system 消息到 LLM context history.
+    ///
+    /// S2-C Step 2: 与 legacy `history.push(ChatMessage::system(content))` 对齐.
+    /// 与 [`Self::reduce_set_leading_system_prompt`] 的区别:
+    /// - 本函数永远 append（典型场景: `/clear` 后重建 system prompt — clear 已经把
+    ///   history 清空，新 system 直接 push 到末尾即首位，append 与替换等价）
+    /// - `SetLeadingSystemPrompt` 做 upsert（empty → push，非空 → 替换 history[0]）
+    ///
+    /// session.turns 不更新（system 消息不是用户/助手"回合"，仅是 LLM 上下文配置）。
+    fn reduce_record_system_message(&mut self, content: String) -> Vec<Effect> {
+        self.session.history.push(ChatMessage::system(content));
+        vec![Effect::LogTrace {
+            level: tracing::Level::DEBUG,
+            msg: format!("RecordSystemMessage history_len={}", self.session.history.len()),
+        }]
+    }
+
+    /// `Action::SetLeadingSystemPrompt` — set/replace 首位 system prompt.
+    ///
+    /// S2-C Step 2: 与 chat::mod 主循环 `if history.is_empty() { push } else {
+    /// first_mut = system }` 字节级对齐。每轮 turn 都会跑（technique selection
+    /// 后重建 system prompt），用 append 表达会让 history 越长越多 system 消息。
+    ///
+    /// 行为:
+    /// - history 为空 → push 一条 system
+    /// - history 非空且首位为 system → 替换 `history[0]` 内容（与 legacy `*first = ...` 一致）
+    /// - history 非空但首位**不**是 system → 仍然替换 `history[0]`（与 legacy `first_mut`
+    ///   一致；理论上首位应为 system，若不是已是 invariant 违反但 reducer 保持兼容）
+    fn reduce_set_leading_system_prompt(&mut self, content: String) -> Vec<Effect> {
+        if self.session.history.is_empty() {
+            self.session.history.push(ChatMessage::system(content));
+        } else if let Some(first) = self.session.history.first_mut() {
+            *first = ChatMessage::system(content);
+        }
+        vec![Effect::LogTrace {
+            level: tracing::Level::DEBUG,
+            msg: format!("SetLeadingSystemPrompt history_len={}", self.session.history.len()),
+        }]
+    }
+
+    /// `Action::SystemMessageAdded` — append 一条 system 消息到 Redux UI 镜像.
+    ///
+    /// S2-C Step 2: 与 legacy `chat_mirror.lock().push_system_message(text)` 双写.
+    /// reducer 在 `ui.conversation_lines` 维护一份 ConversationLine::System，
+    /// 让 Redux 路径有自己的 UI 账本；真实可见 TUI 仍由 `chat_mirror` 渲染，
+    /// 本 reducer 不替代 mirror（chat_mirror 的写仍在 mod.rs unconditional 跑）。
+    ///
+    /// 非 terminal-tui feature 下仅发 RequestRedraw（占位类型 String 不语义化），
+    /// 与其他 TUI-only push 函数（user/assistant）行为对称。
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_system_message_added(&mut self, text: String) -> Vec<Effect> {
+        self.ui
+            .conversation_lines
+            .push(crate::chat::tui::ConversationLine::System { content: text });
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn reduce_system_message_added(&mut self, _text: String) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::HistoryCleared` — 清除 LLM context history（保留 system prompt）+ 清 UI.
+    ///
+    /// session.turns 不清除（持久化记录不可逆）；只重置 LLM context（下次请求
+    /// 不带历史消息）和 TUI conversation_lines 显示。
+    fn reduce_history_cleared(&mut self) -> Vec<Effect> {
+        // 防御性保留所有 system 消息（通常只有 1 条，但扫描全部以防 system 不在首位）
+        let system_msgs: Vec<_> = self.session.history.drain(..).filter(|m| m.role == "system").collect();
+        // history 已由 drain(..) 清空，重新插入 system 消息
+        self.session.history.extend(system_msgs);
+        // 注: 当前 input buffer 不清理，由 InputCancelled 单独处理
+        self.ui.conversation_lines.clear();
+        vec![
+            Effect::RequestRedraw,
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: "History cleared".to_string(),
+            },
+        ]
+    }
+
+    /// `Action::HistoryCompacted` — 对 LLM context history 做 compaction.
+    ///
+    /// 算法与 `chat::mod::compact_chat_history` 完全对齐（双写期两路径必须产生
+    /// 字节级相同结果）:
+    /// 1. `history.len() <= 1` 时直接返回（无可压缩 turn）.
+    /// 2. 保留 system prompt（首位若 role==system）.
+    /// 3. 只保留最后 [`COMPACT_KEEP_MESSAGES`] 条非 system 消息（drain 较老者）.
+    /// 4. 单条消息超 [`COMPACT_CONTENT_CHARS`] 字符时用 ellipsis 截断.
+    /// 5. 总预算超 [`COMPACT_TOTAL_CHARS`] 时按 FIFO drop oldest turn.
+    fn reduce_history_compacted(&mut self, reason: CompactReason) -> Vec<Effect> {
+        let history = &mut self.session.history;
+        if history.len() <= 1 {
+            return vec![Effect::LogTrace {
+                level: tracing::Level::DEBUG,
+                msg: format!("HistoryCompacted noop reason={reason:?} len={}", history.len()),
+            }];
+        }
+        let has_system = history.first().is_some_and(|m| m.role == "system");
+        let start = usize::from(has_system);
+
+        // Step 1: 只保留最后 COMPACT_KEEP_MESSAGES 条非 system 消息
+        let turn_count = history.len().saturating_sub(start);
+        if turn_count > COMPACT_KEEP_MESSAGES {
+            let drain_end = start.saturating_add(turn_count.saturating_sub(COMPACT_KEEP_MESSAGES));
+            history.drain(start..drain_end);
+        }
+
+        // Step 2: 单条消息内容截断
+        for msg in history.iter_mut().skip(start) {
+            if msg.content.chars().count() > COMPACT_CONTENT_CHARS {
+                msg.content = truncate_with_ellipsis(&msg.content, COMPACT_CONTENT_CHARS);
+            }
+        }
+
+        // Step 3: 总预算约束（drop oldest first）
+        while history
+            .iter()
+            .skip(start)
+            .map(|m| m.content.chars().count())
+            .sum::<usize>()
+            > COMPACT_TOTAL_CHARS
+            && history.len() > start.saturating_add(1)
+        {
+            history.remove(start);
+        }
+
+        let final_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
+        vec![Effect::LogTrace {
+            level: tracing::Level::INFO,
+            msg: format!(
+                "HistoryCompacted reason={reason:?} len={} chars={final_chars}",
+                history.len()
+            ),
+        }]
+    }
+
+    /// 辅助：从 StreamState 中取出当前 draft 的 id（不同 feature 下结构不同）.
+    #[cfg(feature = "terminal-tui")]
+    fn take_draft_id(stream: &StreamState) -> Option<String> {
+        stream.draft.as_ref().map(|d| d.draft_id.clone())
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn take_draft_id(stream: &StreamState) -> Option<String> {
+        stream.draft.as_ref().map(|d| d.0.clone())
+    }
+}
+
+// ─── Internal helpers ────────────────────────────────────────────────────────
+
+/// 双击 Ctrl+C 退出窗口（毫秒）.
+const DOUBLE_CTRLC_WINDOW_MS: u64 = 500;
+
+/// 读取当前墙钟（ms 自 UNIX epoch）。reducer 内唯一允许的"非纯"调用 —
+/// 仅用于 Ctrl+C 双击窗口判断。测试通过 [`ChatState::reduce_with_now`] 注入。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_state() -> ChatState {
+        let shutdown = CancellationToken::new();
+        ChatState::new(Arc::from("test-provider"), Arc::from("test-model"), shutdown)
+    }
+
+    /// 验证 SessionState 默认值是否合理
+    #[test]
+    fn test_chatstate_new_default_session() {
+        let state = make_state();
+        assert!(state.session.id.is_empty());
+        assert!(state.session.title.is_empty());
+        assert_eq!(&*state.session.provider, "test-provider");
+        assert_eq!(&*state.session.model, "test-model");
+        assert!(state.session.turns.is_empty());
+        assert!(state.session.history.is_empty());
+    }
+
+    /// 验证 UiState 默认值是否合理
+    #[test]
+    fn test_chatstate_new_default_ui() {
+        let state = make_state();
+        assert!(state.ui.conversation_lines.is_empty());
+        assert!(state.ui.input.is_empty());
+        assert_eq!(state.ui.turn_count, 0);
+        assert!(!state.ui.ascii_fallback);
+        assert_eq!(state.ui.last_ctrlc_ms, 0);
+    }
+
+    /// 验证 StreamState 默认值是否合理
+    #[test]
+    fn test_chatstate_new_default_stream() {
+        let state = make_state();
+        assert!(state.stream.draft.is_none());
+        assert!(state.stream.pending_tool_cards.is_empty());
+    }
+
+    /// reduce 不 panic（健壮性 baseline，沿用 Step 1 名称便于 grep）
+    #[test]
+    fn test_reduce_key_pressed_returns_empty_step1() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut state = make_state();
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let _effects = state.reduce(Action::KeyPressed(key));
+        // Step 2 起 KeyPressed('a') 会写入 input buffer → RequestRedraw
+        // 此处仅断言不 panic
+    }
+
+    /// Step 4 完成后仍返回空的 Action（仅剩 SlashCommandIssued）
+    #[test]
+    fn test_reduce_unfilled_actions_return_empty() {
+        let mut state = make_state();
+        // Step 4 已填充: HistoryCleared/SessionLoaded/SessionSaved/SessionSwitched/
+        //   RecordUserTurn/RecordAssistantTurn/CancelRequested/ShutdownRequested
+        // 以下仍为 Step 5 实现（返回空 vec）:
+        let unfilled = [Action::SlashCommandIssued {
+            cmd: "clear".to_string(),
+            args: String::new(),
+        }];
+        for action in unfilled {
+            let effects = state.reduce(action);
+            assert!(effects.is_empty(), "未填充 Action 应返回 vec![]");
+        }
+    }
+
+    /// Step 3 新增：StreamChunkReceived 无 draft 时返回 vec![] (stale)
+    #[test]
+    fn test_reduce_stream_chunk_no_draft_returns_empty() {
+        let mut state = make_state();
+        let effects = state.reduce(Action::StreamChunkReceived {
+            draft_id: "d1".to_string(),
+            delta: "x".to_string(),
+            version: 1,
+        });
+        assert!(effects.is_empty(), "无 draft 时 chunk 应丢弃");
+    }
+
+    /// 所有 Action 变体 reduce 不 panic（覆盖契约）
+    #[test]
+    fn test_reduce_does_not_panic_for_all_actions() {
+        use crate::chat::action::HistoryDir;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let actions: Vec<Action> = vec![
+            Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::PasteReceived("paste text".to_string()),
+            Action::TerminalResized { w: 80, h: 24 },
+            Action::InputSubmitted("hello".to_string()),
+            Action::HistoryNavigated(HistoryDir::Up),
+            Action::HistoryNavigated(HistoryDir::Down),
+            Action::InputCancelled,
+            Action::ToolCardFoldToggled,
+            Action::ReasoningFoldToggled,
+            Action::RedrawRequested,
+            Action::ForceQuit,
+        ];
+
+        for action in actions {
+            let mut state = make_state();
+            let _effects = state.reduce(action);
+        }
+    }
+
+    /// Action 必须是 Send + Sync（编译期断言，保证可通过 channel 跨任务传递）
+    #[test]
+    fn test_action_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Action>();
+    }
+
+    /// Effect 必须是 Send + Sync（编译期断言，保证可通过 channel 传递给执行器）
+    #[test]
+    fn test_effect_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Effect>();
+    }
+
+    /// EmitChannelMessage 携带 SendMessage（P1 验证：不是裸 String）
+    #[test]
+    fn test_effect_emit_channel_message_has_send_message_type() {
+        use crate::channels::traits::SendMessage;
+        // 能构造 Effect::EmitChannelMessage(SendMessage) 说明类型正确接入
+        let msg = SendMessage::new("hello", "bob");
+        let effect = Effect::EmitChannelMessage(msg);
+        // 验证 Debug 实现存在
+        let debug_str = format!("{:?}", effect);
+        assert!(
+            debug_str.contains("EmitChannelMessage"),
+            "EmitChannelMessage Debug 输出异常"
+        );
+    }
+
+    /// ControlState 默认值验证
+    #[test]
+    fn test_chatstate_new_default_control() {
+        let state = make_state();
+        assert!(state.control.active_cancel.is_none());
+        assert!(!state.control.generating);
+    }
+
+    /// 多次 reduce 调用不 panic（健壮性）
+    #[test]
+    fn test_reduce_multiple_calls_no_panic() {
+        let mut state = make_state();
+        for _ in 0..10 {
+            let _effects = state.reduce(Action::RedrawRequested);
+        }
+    }
+
+    // ─── Step 2 单元测试（输入路径） ───────────────────────────────────────────
+    //
+    // 大部分输入路径测试依赖 terminal-tui feature 提供的真实 TuiInput /
+    // ConversationLine。非 TUI feature 下 reducer 走占位分支，行为退化为
+    // "返回 RequestRedraw 且不 mutate buffer"，因此 Step 2 系列断言整体 cfg-gate。
+
+    #[cfg(feature = "terminal-tui")]
+    mod step2 {
+        use super::super::*;
+        use crate::chat::action::HistoryDir;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        fn s() -> ChatState {
+            ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new())
+        }
+
+        fn has_request_redraw(effects: &[Effect]) -> bool {
+            effects.iter().any(|e| matches!(e, Effect::RequestRedraw))
+        }
+
+        fn has_quit(effects: &[Effect]) -> bool {
+            effects.iter().any(|e| matches!(e, Effect::Quit))
+        }
+
+        fn has_log_trace(effects: &[Effect]) -> bool {
+            effects.iter().any(|e| matches!(e, Effect::LogTrace { .. }))
+        }
+
+        /// 1. Enter on non-empty buffer → 派生 InputSubmitted 路径，turn_count += 1
+        #[test]
+        fn test_reduce_key_pressed_enter_returns_input_submitted() {
+            let mut state = s();
+            // 模拟用户输入 "hi"
+            for ch in "hi".chars() {
+                let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)));
+            }
+            assert_eq!(state.ui.input.text(), "hi");
+            let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            assert!(has_log_trace(&effects), "Enter 应触发 LogTrace");
+            assert!(has_request_redraw(&effects), "Enter 应触发 RequestRedraw");
+            assert_eq!(state.ui.turn_count, 1, "turn_count 应递增");
+            assert_eq!(state.ui.last_submitted.as_deref(), Some("hi"));
+            assert!(state.ui.input.is_empty(), "提交后 buffer 应清空");
+        }
+
+        /// 2. Tab → ToolCardFoldToggled，返回 RequestRedraw
+        #[test]
+        fn test_reduce_key_pressed_tab_returns_fold_toggled() {
+            let mut state = s();
+            let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+            assert!(has_request_redraw(&effects));
+            // Tab 不应进入 input buffer
+            assert!(state.ui.input.is_empty());
+        }
+
+        /// 3. Ctrl+C 单击 → 仅记录窗口，不返回 Quit
+        #[test]
+        fn test_reduce_key_pressed_ctrl_c_single_returns_cancel() {
+            let mut state = s();
+            let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            let effects = state.reduce_with_now(Action::KeyPressed(key), 10_000);
+            assert!(!has_quit(&effects), "单击 Ctrl+C 不应 Quit");
+            assert_eq!(state.ui.last_ctrlc_ms, 10_000, "记录窗口时间戳");
+        }
+
+        /// 4. Ctrl+C 500ms 内双击 → Quit
+        #[test]
+        fn test_reduce_key_pressed_ctrl_c_double_within_500ms_returns_shutdown() {
+            let mut state = s();
+            let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            let _ = state.reduce_with_now(Action::KeyPressed(key.clone()), 10_000);
+            // 100ms 后再次 Ctrl+C
+            let effects = state.reduce_with_now(Action::KeyPressed(key), 10_100);
+            assert!(has_quit(&effects), "双击 Ctrl+C 应 Quit");
+        }
+
+        /// 5. Ctrl+C 超过 500ms 后再按 → 仅记录，不 Quit
+        #[test]
+        fn test_reduce_key_pressed_ctrl_c_double_after_500ms_returns_cancel_only() {
+            let mut state = s();
+            let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            let _ = state.reduce_with_now(Action::KeyPressed(key.clone()), 10_000);
+            // 600ms 后 — 超过窗口
+            let effects = state.reduce_with_now(Action::KeyPressed(key), 10_600);
+            assert!(!has_quit(&effects), "超过 500ms 的双击不算双击");
+            assert_eq!(state.ui.last_ctrlc_ms, 10_600);
+        }
+
+        /// 6. Ctrl+D on empty buffer → Quit
+        #[test]
+        fn test_reduce_key_pressed_ctrl_d_empty_buffer_returns_quit() {
+            let mut state = s();
+            let effects = state.reduce(Action::KeyPressed(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(has_quit(&effects), "空 buffer 上 Ctrl+D 应 Quit");
+        }
+
+        /// 7. Ctrl+D non-empty buffer → forward-delete，不 Quit
+        #[test]
+        fn test_reduce_key_pressed_ctrl_d_non_empty_buffer_inserts_char_or_eof() {
+            let mut state = s();
+            // 输入 "abc" 然后 Home 移到行首
+            for ch in "abc".chars() {
+                let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)));
+            }
+            let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+            assert_eq!(state.ui.input.text(), "abc");
+            // Ctrl+D 应该 forward-delete 'a'
+            let effects = state.reduce(Action::KeyPressed(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(!has_quit(&effects), "非空 buffer Ctrl+D 不 Quit");
+            assert_eq!(state.ui.input.text(), "bc", "forward-delete 应删除 'a'");
+        }
+
+        /// 8. PasteReceived → 内容追加到 input buffer
+        #[test]
+        fn test_reduce_paste_received_appends_to_input() {
+            let mut state = s();
+            let effects = state.reduce(Action::PasteReceived("pasted-text".to_string()));
+            assert!(has_request_redraw(&effects));
+            assert_eq!(state.ui.input.text(), "pasted-text");
+        }
+
+        /// 9. TerminalResized → RequestRedraw
+        #[test]
+        fn test_reduce_terminal_resized_returns_redraw() {
+            let mut state = s();
+            let effects = state.reduce(Action::TerminalResized { w: 120, h: 40 });
+            assert!(has_request_redraw(&effects));
+        }
+
+        /// 10. InputSubmitted (直接) → turn_count 递增 + last_submitted 记录
+        #[test]
+        fn test_reduce_input_submitted_increments_turn_count() {
+            let mut state = s();
+            assert_eq!(state.ui.turn_count, 0);
+            let effects = state.reduce(Action::InputSubmitted("hello world".to_string()));
+            assert_eq!(state.ui.turn_count, 1);
+            assert_eq!(state.ui.last_submitted.as_deref(), Some("hello world"));
+            assert!(has_log_trace(&effects));
+            assert!(has_request_redraw(&effects));
+        }
+
+        /// 额外：HistoryNavigated Up 在空历史时不 panic
+        #[test]
+        fn test_reduce_history_navigated_up_empty_history() {
+            let mut state = s();
+            let effects = state.reduce(Action::HistoryNavigated(HistoryDir::Up));
+            assert!(has_request_redraw(&effects));
+        }
+
+        /// 额外：InputCancelled 清空 buffer
+        #[test]
+        fn test_reduce_input_cancelled_clears_buffer() {
+            let mut state = s();
+            for ch in "draft".chars() {
+                let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)));
+            }
+            assert_eq!(state.ui.input.text(), "draft");
+            let effects = state.reduce(Action::InputCancelled);
+            assert!(has_request_redraw(&effects));
+            assert!(state.ui.input.is_empty());
+        }
+
+        /// 额外：ReasoningFoldToggled 在无 reasoning 卡片时也返回 RequestRedraw
+        #[test]
+        fn test_reduce_reasoning_fold_toggled_no_panic_when_absent() {
+            let mut state = s();
+            let effects = state.reduce(Action::ReasoningFoldToggled);
+            assert!(has_request_redraw(&effects));
+        }
+
+        // ─── Step 2 集成测试（P1-1 PTY 覆盖空洞补全）──────────────────────────
+        //
+        // 以下测试通过直接构造 ChatState + 调用 reduce 序列，模拟完整用户交互流程，
+        // 覆盖 run_tui_unified_loop 中 reducer 路径（PRX_CHAT_REDUX=1/both 灰度范围）。
+        // 使用 reduce_with_now 注入确定时间，避开 SystemTime 依赖。
+
+        /// P1-1-a: 完整输入提交流程 — paste "hello" → Enter → 期望含 LogTrace + RequestRedraw
+        #[test]
+        fn test_redux_full_input_to_submit_flow() {
+            let mut state = s();
+            // 粘贴 "hello"
+            let effects = state.reduce(Action::PasteReceived("hello".to_string()));
+            assert!(has_request_redraw(&effects), "paste 应触发 RequestRedraw");
+            assert_eq!(state.ui.input.text(), "hello");
+            // 按 Enter 提交
+            let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            assert!(has_log_trace(&effects), "Enter 应触发 LogTrace");
+            assert!(has_request_redraw(&effects), "Enter 应触发 RequestRedraw");
+            assert_eq!(state.ui.turn_count, 1, "turn_count 应递增至 1");
+            assert_eq!(
+                state.ui.last_submitted.as_deref(),
+                Some("hello"),
+                "last_submitted 应记录 'hello'"
+            );
+            assert!(state.ui.input.is_empty(), "提交后 input buffer 应清空");
+        }
+
+        /// P1-1-b: 双 Ctrl+C 在 500ms 内 → Quit
+        #[test]
+        fn test_redux_double_ctrl_c_within_500ms_quits() {
+            let mut state = s();
+            let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            let effects = state.reduce_with_now(Action::KeyPressed(key.clone()), 100);
+            assert!(!has_quit(&effects), "第一次 Ctrl+C 不应 Quit");
+            let effects = state.reduce_with_now(Action::KeyPressed(key), 300);
+            assert!(has_quit(&effects), "500ms 内双击 Ctrl+C 应产生 Quit effect");
+        }
+
+        /// P1-1-c: Ctrl+C 间隔超过 500ms 不退出
+        #[test]
+        fn test_redux_ctrl_c_then_ctrl_c_after_500ms_does_not_quit() {
+            let mut state = s();
+            let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            let effects = state.reduce_with_now(Action::KeyPressed(key.clone()), 100);
+            assert!(!has_quit(&effects));
+            // 700ms 后再按 — 超过 500ms 窗口
+            let effects = state.reduce_with_now(Action::KeyPressed(key), 700);
+            assert!(!has_quit(&effects), "超过 500ms 的双击不应 Quit");
+            assert_eq!(state.ui.last_ctrlc_ms, 700);
+        }
+
+        /// P1-1-d: Ctrl+D 空 buffer → Quit
+        #[test]
+        fn test_redux_ctrl_d_empty_buffer_quits() {
+            let mut state = s();
+            assert!(state.ui.input.is_empty(), "前提：buffer 为空");
+            let effects = state.reduce(Action::KeyPressed(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(has_quit(&effects), "空 buffer Ctrl+D 应 Quit");
+        }
+
+        /// P1-1-e: Ctrl+D 非空 buffer → 不退出（forward-delete）
+        #[test]
+        fn test_redux_ctrl_d_non_empty_does_not_quit() {
+            let mut state = s();
+            // 输入 "xyz" 然后 Home 移到行首，使光标前有内容
+            let _ = state.reduce(Action::PasteReceived("xyz".to_string()));
+            let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+            assert_eq!(state.ui.input.text(), "xyz");
+            let effects = state.reduce(Action::KeyPressed(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(!has_quit(&effects), "非空 buffer Ctrl+D 不应 Quit");
+        }
+
+        /// P1-1-f: HistoryNavigated Up/Down — 空历史时不 panic，返回 RequestRedraw
+        #[test]
+        fn test_redux_history_navigation_up_down() {
+            let mut state = s();
+            let up = state.reduce(Action::HistoryNavigated(HistoryDir::Up));
+            assert!(has_request_redraw(&up), "Up 应返回 RequestRedraw");
+            let down = state.reduce(Action::HistoryNavigated(HistoryDir::Down));
+            assert!(has_request_redraw(&down), "Down 应返回 RequestRedraw");
+        }
+
+        /// P1-1-g: PasteReceived → input buffer 含文本 + RequestRedraw
+        #[test]
+        fn test_redux_paste_into_input() {
+            let mut state = s();
+            let effects = state.reduce(Action::PasteReceived("pasted content".to_string()));
+            assert!(has_request_redraw(&effects), "粘贴应触发 RequestRedraw");
+            assert_eq!(state.ui.input.text(), "pasted content");
+        }
+
+        /// P1-1-h: TerminalResized → RequestRedraw
+        #[test]
+        fn test_redux_terminal_resize_returns_redraw() {
+            let mut state = s();
+            let effects = state.reduce(Action::TerminalResized { w: 80, h: 24 });
+            assert!(has_request_redraw(&effects), "resize 应触发 RequestRedraw");
+        }
+
+        // ─── Step 3 单元测试（流式 + 工具路径） ────────────────────────────────
+        //
+        // 覆盖目标：
+        //   - 5 个流式 Action (TurnStarted/StreamChunkReceived/StreamCompleted/
+        //     StreamFailed/StreamCancelled) + 3 个工具 Action
+        //     (ToolStarted/ToolFinished/ToolProgress)
+        //   - P3-5 版本号防护下沉至 reducer 后的所有 stale-drop 路径
+        //   - 与 finalize_draft 重试路径的幂等性边界
+        //
+        // 这些测试是 P3-5 版本号机制完整下沉到 reducer 的核心证据。
+
+        /// Step3-1: TurnStarted 初始化 stream.draft + active_cancel + generating
+        #[test]
+        fn test_redux_turn_started_sets_stream_state() {
+            let mut state = s();
+            assert!(state.stream.draft.is_none());
+            assert!(state.control.active_cancel.is_none());
+            assert!(!state.control.generating);
+            let effects = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            assert!(state.stream.draft.is_some());
+            assert_eq!(
+                state.stream.draft.as_ref().map(|d| d.draft_id.clone()),
+                Some("d1".to_string())
+            );
+            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(0));
+            assert!(state.control.active_cancel.is_some());
+            assert!(state.control.generating);
+            assert!(has_request_redraw(&effects));
+            assert!(has_log_trace(&effects));
+        }
+
+        /// Step3-2: 正常 chunk → 累积 + version 更新 + RequestRedraw
+        #[test]
+        fn test_redux_stream_chunk_received_valid_appends() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "hello".to_string(),
+                version: 1,
+            });
+            assert!(has_request_redraw(&effects));
+            assert_eq!(
+                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                Some("hello".to_string())
+            );
+            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(1));
+
+            // 第二个有效 chunk → 累积
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: " world".to_string(),
+                version: 2,
+            });
+            assert!(has_request_redraw(&effects));
+            assert_eq!(
+                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                Some("hello world".to_string())
+            );
+            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(2));
+        }
+
+        /// Step3-3: stale version（version=1 在 version=2 之后到达）→ 丢弃
+        #[test]
+        fn test_redux_stream_chunk_received_stale_version_dropped() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            // 先收到 version=2
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "AB".to_string(),
+                version: 2,
+            });
+            assert_eq!(
+                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                Some("AB".to_string())
+            );
+            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(2));
+            // 后来才到 version=1 → 丢弃
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "STALE".to_string(),
+                version: 1,
+            });
+            assert!(effects.is_empty(), "stale version 应返回空 effects");
+            assert_eq!(
+                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                Some("AB".to_string()),
+                "accumulated 应保持不变"
+            );
+            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(2));
+
+            // 重复 version=2 → 也丢弃（strict-monotonic）
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "DUP".to_string(),
+                version: 2,
+            });
+            assert!(effects.is_empty(), "重复 version 应丢弃");
+            assert_eq!(
+                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                Some("AB".to_string())
+            );
+        }
+
+        /// Step3-4: 跨 turn draft_id 不匹配 → 丢弃
+        #[test]
+        fn test_redux_stream_chunk_received_wrong_draft_id_dropped() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "ok".to_string(),
+                version: 1,
+            });
+            // 错误 draft_id → 丢弃
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d2".to_string(),
+                delta: "STALE".to_string(),
+                version: 99,
+            });
+            assert!(effects.is_empty(), "draft_id 不匹配应返回空");
+            assert_eq!(
+                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                Some("ok".to_string())
+            );
+            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(1));
+        }
+
+        /// Step3-5: finalize 后再到达的 chunk → 丢弃
+        #[test]
+        fn test_redux_stream_chunk_received_after_finalize_dropped() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "complete".to_string(),
+                version: 1,
+            });
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "d1".to_string(),
+                final_text: "complete".to_string(),
+                reasoning: String::new(),
+            });
+            assert!(state.stream.draft.is_none(), "finalize 后 draft 应清空");
+            // 此后 chunk 视为 stale
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "LATE".to_string(),
+                version: 2,
+            });
+            assert!(effects.is_empty(), "finalize 后 chunk 应丢弃");
+            assert!(state.stream.draft.is_none());
+        }
+
+        /// Step3-6: StreamCompleted 清除 draft + push assistant + NotifyHook
+        #[test]
+        fn test_redux_stream_completed_clears_draft_and_pushes_assistant() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            assert!(state.control.generating);
+            let prev_lines = state.ui.conversation_lines.len();
+            let effects = state.reduce(Action::StreamCompleted {
+                draft_id: "d1".to_string(),
+                final_text: "final answer".to_string(),
+                reasoning: String::new(),
+            });
+            assert!(state.stream.draft.is_none(), "draft 应清空");
+            assert!(state.control.active_cancel.is_none());
+            assert!(!state.control.generating);
+            assert_eq!(
+                state.ui.conversation_lines.len(),
+                prev_lines + 1,
+                "应 push 1 个 Assistant 行"
+            );
+            // 验证最后一行是 Assistant("final answer")
+            if let Some(crate::chat::tui::ConversationLine::Assistant { content }) = state.ui.conversation_lines.last()
+            {
+                assert_eq!(content, "final answer");
+            } else {
+                panic!("最后一行应是 ConversationLine::Assistant");
+            }
+            assert!(has_request_redraw(&effects));
+            assert!(
+                effects.iter().any(|e| matches!(e, Effect::NotifyHook { .. })),
+                "应包含 NotifyHook(TurnComplete)"
+            );
+        }
+
+        /// Step3-6b: StreamCompleted with reasoning → 同时 push Reasoning 卡片
+        #[test]
+        fn test_redux_stream_completed_with_reasoning_pushes_card() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "d1".to_string(),
+                final_text: "ans".to_string(),
+                reasoning: "thinking step".to_string(),
+            });
+            // 应有 Assistant + Reasoning 共 2 行
+            assert_eq!(state.ui.conversation_lines.len(), 2);
+            assert!(
+                matches!(
+                    state.ui.conversation_lines.last(),
+                    Some(crate::chat::tui::ConversationLine::Reasoning { .. })
+                ),
+                "最后一行应是 Reasoning"
+            );
+        }
+
+        /// Step3-7: StreamFailed 清除 draft + WARN LogTrace
+        #[test]
+        fn test_redux_stream_failed_clears_draft() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "partial".to_string(),
+                version: 1,
+            });
+            let effects = state.reduce(Action::StreamFailed {
+                draft_id: "d1".to_string(),
+                err: "network".to_string(),
+                retryable: true,
+            });
+            assert!(state.stream.draft.is_none());
+            assert!(!state.control.generating);
+            assert!(has_request_redraw(&effects));
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::LogTrace { level, .. } if *level == tracing::Level::WARN)),
+                "应包含 WARN LogTrace"
+            );
+        }
+
+        /// Step3-8: StreamCancelled 清除 draft + 不 push 任何消息
+        #[test]
+        fn test_redux_stream_cancelled_clears_draft() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "partial".to_string(),
+                version: 1,
+            });
+            let lines_before = state.ui.conversation_lines.len();
+            let effects = state.reduce(Action::StreamCancelled {
+                draft_id: "d1".to_string(),
+            });
+            assert!(state.stream.draft.is_none());
+            assert!(!state.control.generating);
+            assert!(state.control.active_cancel.is_none());
+            assert!(has_request_redraw(&effects));
+            assert_eq!(
+                state.ui.conversation_lines.len(),
+                lines_before,
+                "cancel 不应 push 任何 conversation line"
+            );
+        }
+
+        /// Step3-8b: 不匹配 draft_id 的 StreamCancelled / StreamFailed / StreamCompleted → no-op
+        #[test]
+        fn test_redux_stream_terminal_actions_wrong_id_noop() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            // 用错误 id 触发三个终止 action — 全部应 no-op
+            let e1 = state.reduce(Action::StreamCancelled {
+                draft_id: "wrong".to_string(),
+            });
+            let e2 = state.reduce(Action::StreamFailed {
+                draft_id: "wrong".to_string(),
+                err: "x".to_string(),
+                retryable: false,
+            });
+            let e3 = state.reduce(Action::StreamCompleted {
+                draft_id: "wrong".to_string(),
+                final_text: "x".to_string(),
+                reasoning: String::new(),
+            });
+            assert!(e1.is_empty() && e2.is_empty() && e3.is_empty());
+            assert!(state.stream.draft.is_some(), "原 draft 应保留");
+            assert!(state.control.generating, "generating 标志应保留");
+        }
+
+        /// Step3-9: ToolStarted → push Running ToolResult + 索引入队
+        #[test]
+        fn test_redux_tool_started_pushes_card() {
+            use crate::chat::tui::{ConversationLine, ToolStatus};
+            let mut state = s();
+            let effects = state.reduce(Action::ToolStarted {
+                name: "shell".to_string(),
+                args: r#"{"cmd":"ls"}"#.to_string(),
+            });
+            assert!(has_request_redraw(&effects));
+            assert_eq!(state.ui.conversation_lines.len(), 1);
+            assert_eq!(state.stream.pending_tool_cards.len(), 1);
+            if let Some(ConversationLine::ToolResult { tool_name, status, .. }) = state.ui.conversation_lines.last() {
+                assert_eq!(tool_name, "shell");
+                assert_eq!(*status, ToolStatus::Running);
+            } else {
+                panic!("最后一行应是 Running ToolResult");
+            }
+        }
+
+        /// Step3-10: ToolFinished → Running → Done + 从 pending 移除
+        #[test]
+        fn test_redux_tool_finished_updates_card() {
+            use crate::chat::tui::{ConversationLine, ToolStatus};
+            let mut state = s();
+            let _ = state.reduce(Action::ToolStarted {
+                name: "shell".to_string(),
+                args: r#"{"cmd":"ls"}"#.to_string(),
+            });
+            let effects = state.reduce(Action::ToolFinished {
+                name: "shell".to_string(),
+                success: true,
+                duration_ms: 42,
+                result: Some("ok".to_string()),
+            });
+            assert!(has_request_redraw(&effects));
+            assert!(state.stream.pending_tool_cards.is_empty(), "pending 应被清空");
+            if let Some(ConversationLine::ToolResult {
+                status,
+                elapsed_ms,
+                result,
+                ..
+            }) = state.ui.conversation_lines.last()
+            {
+                assert_eq!(*status, ToolStatus::Done);
+                assert_eq!(*elapsed_ms, Some(42));
+                assert_eq!(result.as_deref(), Some("ok"));
+            } else {
+                panic!("最后一行应是 ToolResult");
+            }
+        }
+
+        /// Step3-10b: ToolFinished success=false → Error
+        #[test]
+        fn test_redux_tool_finished_failed_marks_error() {
+            use crate::chat::tui::{ConversationLine, ToolStatus};
+            let mut state = s();
+            let _ = state.reduce(Action::ToolStarted {
+                name: "shell".to_string(),
+                args: r#"{}"#.to_string(),
+            });
+            let _ = state.reduce(Action::ToolFinished {
+                name: "shell".to_string(),
+                success: false,
+                duration_ms: 10,
+                result: Some("err".to_string()),
+            });
+            if let Some(ConversationLine::ToolResult { status, .. }) = state.ui.conversation_lines.last() {
+                assert_eq!(*status, ToolStatus::Error);
+            } else {
+                panic!("最后一行应是 ToolResult");
+            }
+        }
+
+        /// Step3-11: ToolProgress 仅返回 RequestRedraw + LogTrace
+        #[test]
+        fn test_redux_tool_progress_returns_log_and_redraw() {
+            let mut state = s();
+            let effects = state.reduce(Action::ToolProgress { iteration: 3, max: 10 });
+            assert!(has_request_redraw(&effects));
+            assert!(has_log_trace(&effects));
+            // 不 mutate conversation_lines
+            assert!(state.ui.conversation_lines.is_empty());
+        }
+
+        /// Step3-12: finalize 路径的幂等性 — 即便 StreamCompleted 被错误地重复
+        /// 触发，第二次 reduce 应是 no-op（draft_id 已不存在）
+        #[test]
+        fn test_redux_finalize_retry_after_stream_completed_idempotent() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "d1".to_string(),
+                final_text: "ans".to_string(),
+                reasoning: String::new(),
+            });
+            let lines_after_first = state.ui.conversation_lines.len();
+            // 再次 finalize 相同 draft_id — 此时 draft 已清空 → no-op
+            let effects = state.reduce(Action::StreamCompleted {
+                draft_id: "d1".to_string(),
+                final_text: "ans-dup".to_string(),
+                reasoning: String::new(),
+            });
+            assert!(effects.is_empty(), "重复 finalize 应是 no-op");
+            assert_eq!(
+                state.ui.conversation_lines.len(),
+                lines_after_first,
+                "不应 push 重复 assistant 行（幂等）"
+            );
+        }
+
+        /// Step3-13: StreamFailed 后重试新一轮 Turn — 版本号从 0 重新开始
+        #[test]
+        fn test_redux_finalize_retry_after_stream_failed() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "partial".to_string(),
+                version: 5,
+            });
+            let _ = state.reduce(Action::StreamFailed {
+                draft_id: "d1".to_string(),
+                err: "boom".to_string(),
+                retryable: true,
+            });
+            assert!(state.stream.draft.is_none());
+            // 重试：开一个新 turn (相同 draft_id 也 OK，draft.version 从 0 起)
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(0));
+            // version=1 应被接受（不被前一轮的 5 影响 — 因为 draft 已重建）
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d1".to_string(),
+                delta: "retry".to_string(),
+                version: 1,
+            });
+            assert!(has_request_redraw(&effects), "新 turn 的 v=1 应被接受");
+            assert_eq!(
+                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                Some("retry".to_string())
+            );
+        }
+
+        /// P1-2: Both 模式下连续 10 个正常 Action — 无语义差异（diff_count 基线验证）.
+        ///
+        /// 此测试验证 reducer 自身行为稳定；实际 diff_count 跨进程不可查，
+        /// 因此通过直接检查 reduce 输出的语义一致性（同一 Action 序列下 effects 稳定）
+        /// 作为等价验证。
+        #[test]
+        fn test_redux_both_mode_diff_count_zero() {
+            let mut state1 = s();
+            let mut state2 = s();
+            // 对两个独立 state 跑相同 Action 序列，期望 effects 语义类别完全一致
+            let actions: Vec<Action> = vec![
+                Action::PasteReceived("hello".to_string()),
+                Action::TerminalResized { w: 120, h: 40 },
+                Action::RedrawRequested,
+                Action::ToolCardFoldToggled,
+                Action::ReasoningFoldToggled,
+                Action::HistoryNavigated(HistoryDir::Up),
+                Action::HistoryNavigated(HistoryDir::Down),
+                Action::InputCancelled,
+                Action::InputSubmitted("test input".to_string()),
+                Action::RedrawRequested,
+            ];
+            for action in actions {
+                let e1 = state1.reduce(action.clone());
+                let e2 = state2.reduce(action);
+                // 两次独立执行相同 action，effects 类别数量应一致
+                assert_eq!(
+                    e1.len(),
+                    e2.len(),
+                    "同 Action 在两个独立 state 上应产生相同数量的 effects"
+                );
+            }
+        }
+
+        // ─── Step 4 单元测试（退出 + 会话路径） ────────────────────────────────
+
+        /// Step4-1: generating=false 时 CancelRequested → no-op（vec![]）
+        #[test]
+        fn test_redux_cancel_requested_no_active_turn_noop() {
+            let mut state = s();
+            assert!(!state.control.generating, "前提：未在生成中");
+            let effects = state.reduce(Action::CancelRequested);
+            assert!(effects.is_empty(), "非生成中 CancelRequested 应返回 vec![]");
+        }
+
+        /// Step4-2: generating=true, 有 draft 时 CancelRequested → 清 draft + CancelDraft effect
+        #[test]
+        fn test_redux_cancel_requested_with_active_turn_clears_state() {
+            let mut state = s();
+            // 开始一轮流式
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            assert!(state.control.generating);
+            assert!(state.stream.draft.is_some());
+
+            let effects = state.reduce(Action::CancelRequested);
+
+            // 状态应已清除
+            assert!(!state.control.generating, "generating 应清为 false");
+            assert!(state.stream.draft.is_none(), "draft 应清空");
+            assert!(state.control.active_cancel.is_none(), "active_cancel 应清空");
+            // effects 应含 CancelDraft + LogTrace + RequestRedraw
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::CancelDraft(id) if id == "d1")),
+                "应包含 CancelDraft(d1)"
+            );
+            assert!(has_log_trace(&effects), "应包含 LogTrace");
+            assert!(has_request_redraw(&effects), "应包含 RequestRedraw");
+        }
+
+        /// Step4-3: ShutdownRequested (idle) → vec![Quit]
+        #[test]
+        fn test_redux_shutdown_requested_returns_quit() {
+            let mut state = s();
+            let effects = state.reduce(Action::ShutdownRequested);
+            assert!(has_quit(&effects), "ShutdownRequested 应返回 Quit effect");
+            // 空闲时无 CancelDraft
+            assert!(
+                !effects.iter().any(|e| matches!(e, Effect::CancelDraft(_))),
+                "空闲 shutdown 不应含 CancelDraft"
+            );
+        }
+
+        /// Step4-4: 流式中 ShutdownRequested → Quit + CancelDraft
+        #[test]
+        fn test_redux_shutdown_during_streaming_cancels_draft() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d2".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            assert!(state.control.generating);
+
+            let effects = state.reduce(Action::ShutdownRequested);
+
+            assert!(!state.control.generating, "generating 应清除");
+            assert!(state.stream.draft.is_none(), "draft 应清空");
+            // S2-B Step 2: effect 顺序变为 [CancelToken, CancelDraft, Quit].
+            // CancelToken 在前（真取消底层 turn），CancelDraft 紧随（同步 channel UI），
+            // Quit 在最后（外壳调 shutdown.cancel()）。
+            assert!(effects.len() >= 3, "流式 ShutdownRequested 应至少 3 个 effect");
+            assert!(
+                matches!(effects.first(), Some(Effect::CancelToken(_))),
+                "effects[0] 应为 CancelToken，实际: {:?}",
+                effects.first()
+            );
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::CancelDraft(id) if id == "d2")),
+                "effects 必须含 CancelDraft(d2)"
+            );
+            assert!(
+                matches!(effects.last(), Some(Effect::Quit)),
+                "effects.last() 应为 Quit，实际: {:?}",
+                effects.last()
+            );
+        }
+
+        /// Step4-5: SessionLoaded 替换 session 全部字段
+        #[test]
+        fn test_redux_session_loaded_replaces_session_state() {
+            use crate::chat::session::ChatSession;
+            let mut state = s();
+            // 给 history 加点东西，确认会被替换
+            state.session.history.push(crate::providers::ChatMessage::user("old"));
+
+            let mut loaded = ChatSession::new("prov2", "model2");
+            loaded.id = "sess-abc".to_string();
+            loaded.title = "My Session".to_string();
+            loaded.add_user_turn("hello");
+            loaded.add_assistant_turn("hi", vec![]);
+
+            let effects = state.reduce(Action::SessionLoaded(loaded));
+
+            assert_eq!(state.session.id, "sess-abc");
+            assert_eq!(state.session.title, "My Session");
+            assert_eq!(&*state.session.provider, "prov2");
+            assert_eq!(&*state.session.model, "model2");
+            assert_eq!(state.session.turns.len(), 2, "2 个 turn");
+            // history 从 turns 重建：user + assistant
+            assert_eq!(
+                state.session.history.len(),
+                2,
+                "history 应从 turns 重建(user+assistant)"
+            );
+            assert!(has_request_redraw(&effects), "应含 RequestRedraw");
+            assert!(has_log_trace(&effects), "应含 LogTrace");
+        }
+
+        /// Step4-5b: SessionLoaded 含 system prompt — history 中保留 user/assistant，
+        /// system turn 不进 LLM history（turns 里 role=system 不过滤进 history）
+        #[test]
+        fn test_redux_session_loaded_only_user_assistant_in_history() {
+            use crate::chat::session::{ChatSession, ChatTurn};
+            let mut state = s();
+            let mut loaded = ChatSession::new("p", "m");
+            loaded.turns.push(ChatTurn {
+                role: "system".to_string(),
+                content: "You are helpful".to_string(),
+                timestamp: chrono::Utc::now(),
+                tool_calls: vec![],
+            });
+            loaded.add_user_turn("q");
+            let _ = state.reduce(Action::SessionLoaded(loaded));
+            // history 只含 user，不含 system（系统在 SessionLoaded 路径不自动加入 history）
+            assert_eq!(
+                state.session.history.len(),
+                1,
+                "仅 user turn 进 history（role=system 过滤掉）"
+            );
+            assert_eq!(
+                state.session.history.first().map(|m| m.role.as_str()),
+                Some("user"),
+                "history[0] 应为 user role"
+            );
+        }
+
+        /// Step4-6: SessionSaved 更新 session.id
+        #[test]
+        fn test_redux_session_saved_updates_id() {
+            let mut state = s();
+            state.session.id = String::new(); // 模拟还未有 id
+            let effects = state.reduce(Action::SessionSaved {
+                id: "new-id-123".to_string(),
+            });
+            assert_eq!(state.session.id, "new-id-123");
+            assert!(has_log_trace(&effects), "应含 LogTrace");
+        }
+
+        /// Step4-6b: SessionSaved 相同 id — 不变（幂等）
+        #[test]
+        fn test_redux_session_saved_same_id_idempotent() {
+            let mut state = s();
+            state.session.id = "already-set".to_string();
+            let effects = state.reduce(Action::SessionSaved {
+                id: "already-set".to_string(),
+            });
+            assert_eq!(state.session.id, "already-set");
+            assert!(has_log_trace(&effects));
+        }
+
+        /// Step4-7: SessionSwitched → SaveSession + LogTrace + RequestRedraw
+        #[test]
+        fn test_redux_session_switched_saves_current_then_logs() {
+            let mut state = s();
+            state.session.id = "cur-session".to_string();
+            state.session.title = "Current".to_string();
+            let effects = state.reduce(Action::SessionSwitched {
+                id: "new-session".to_string(),
+            });
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::SaveSession(sess) if sess.id == "cur-session")),
+                "应先 SaveSession 当前 session"
+            );
+            assert!(has_log_trace(&effects), "应含 LogTrace");
+            assert!(has_request_redraw(&effects), "应含 RequestRedraw");
+        }
+
+        /// P2-C: SessionSwitched effects[0] 精确为 SaveSession（两步异步流程前置保存）
+        #[test]
+        fn test_redux_session_switched_emits_save_first() {
+            let mut state = s();
+            state.session.id = "session-x".to_string();
+            let effects = state.reduce(Action::SessionSwitched {
+                id: "session-y".to_string(),
+            });
+            assert!(!effects.is_empty(), "SessionSwitched 应至少有 1 个 effect");
+            assert!(
+                matches!(effects.first(), Some(Effect::SaveSession(sess)) if sess.id == "session-x"),
+                "effects[0] 必须是 SaveSession(current)，实际: {:?}",
+                effects.first()
+            );
+        }
+
+        /// Step4-8: RecordUserTurn → session.turns + history 增长，updated_at 更新，首条 user 自动 set_title
+        #[test]
+        fn test_redux_record_user_turn_grows_history() {
+            let mut state = s();
+            assert_eq!(state.session.turns.len(), 0);
+            assert_eq!(state.session.history.len(), 0);
+            assert!(state.session.title.is_empty(), "初始 title 为空");
+            let effects = state.reduce(Action::RecordUserTurn("what is Rust?".to_string()));
+            assert_eq!(state.session.turns.len(), 1, "turns 增长");
+            assert_eq!(state.session.history.len(), 1, "history 增长");
+            assert_eq!(
+                state.session.turns.first().map(|t| t.role.as_str()),
+                Some("user"),
+                "turns[0] role"
+            );
+            assert_eq!(
+                state.session.history.first().map(|m| m.role.as_str()),
+                Some("user"),
+                "history[0] role"
+            );
+            assert_eq!(
+                state.session.history.first().map(|m| m.content.as_str()),
+                Some("what is Rust?"),
+                "history[0] content"
+            );
+            // 首条 user turn 自动设置 title
+            assert_eq!(state.session.title, "what is Rust?", "首条 user turn 应自动 set_title");
+            assert!(has_log_trace(&effects));
+        }
+
+        /// Step4-8b: RecordUserTurn 第二条时不覆盖已有 title
+        #[test]
+        fn test_redux_record_user_turn_no_overwrite_existing_title() {
+            let mut state = s();
+            state.session.title = "My Chat".to_string();
+            let _ = state.reduce(Action::RecordUserTurn("second question".to_string()));
+            assert_eq!(state.session.title, "My Chat", "已有 title 不应被覆盖");
+        }
+
+        /// Step4-9: RecordAssistantTurn → session.turns + history 增长，updated_at 更新
+        #[test]
+        fn test_redux_record_assistant_turn_grows_history() {
+            let mut state = s();
+            let _ = state.reduce(Action::RecordUserTurn("hello".to_string()));
+            let effects = state.reduce(Action::RecordAssistantTurn("Rust is fast.".to_string()));
+            assert_eq!(state.session.turns.len(), 2, "turns 增长至 2");
+            assert_eq!(state.session.history.len(), 2, "history 增长至 2");
+            assert_eq!(
+                state.session.turns.last().map(|t| t.role.as_str()),
+                Some("assistant"),
+                "turns.last() role"
+            );
+            assert_eq!(
+                state.session.history.last().map(|m| m.role.as_str()),
+                Some("assistant"),
+                "history.last() role"
+            );
+            assert_eq!(
+                state.session.history.last().map(|m| m.content.as_str()),
+                Some("Rust is fast."),
+                "history.last() content"
+            );
+            assert!(has_log_trace(&effects));
+        }
+
+        /// Step4-10: HistoryCleared — 保留 system prompt，清空 user/assistant
+        #[test]
+        fn test_redux_history_cleared_keeps_system_prompt() {
+            let mut state = s();
+            // 构造 system + user + assistant
+            state
+                .session
+                .history
+                .push(crate::providers::ChatMessage::system("Be helpful"));
+            state.session.history.push(crate::providers::ChatMessage::user("hi"));
+            state
+                .session
+                .history
+                .push(crate::providers::ChatMessage::assistant("hello!"));
+            state
+                .ui
+                .conversation_lines
+                .push(crate::chat::tui::ConversationLine::User {
+                    content: "hi".to_string(),
+                });
+            assert_eq!(state.session.history.len(), 3);
+
+            let effects = state.reduce(Action::HistoryCleared);
+
+            // history 只剩 system prompt
+            assert_eq!(state.session.history.len(), 1, "清除后应只保留 system prompt");
+            assert_eq!(
+                state.session.history.first().map(|m| m.role.as_str()),
+                Some("system"),
+                "保留的 history[0] 应为 system"
+            );
+            // conversation_lines 清空
+            assert!(state.ui.conversation_lines.is_empty(), "UI conversation_lines 应清空");
+            assert!(has_request_redraw(&effects));
+            assert!(has_log_trace(&effects));
+        }
+
+        /// Step4-10b: HistoryCleared 无 system prompt — 全清
+        #[test]
+        fn test_redux_history_cleared_no_system_prompt_clears_all() {
+            let mut state = s();
+            state.session.history.push(crate::providers::ChatMessage::user("q"));
+            state
+                .session
+                .history
+                .push(crate::providers::ChatMessage::assistant("a"));
+            let effects = state.reduce(Action::HistoryCleared);
+            assert!(state.session.history.is_empty(), "无 system prompt 应完全清空");
+            assert!(has_request_redraw(&effects));
+        }
+
+        /// P2-D: HistoryCleared system 不在首位 — 仍能保留（防御性全扫描）
+        #[test]
+        fn test_redux_history_cleared_preserves_system_in_middle() {
+            let mut state = s();
+            // 故意把 system 放中间（非正常顺序，但防御性处理）
+            state.session.history.push(crate::providers::ChatMessage::user("q1"));
+            state
+                .session
+                .history
+                .push(crate::providers::ChatMessage::system("Be helpful"));
+            state
+                .session
+                .history
+                .push(crate::providers::ChatMessage::assistant("a1"));
+            assert_eq!(state.session.history.len(), 3);
+
+            let _effects = state.reduce(Action::HistoryCleared);
+
+            // system 消息应被保留，user/assistant 清除
+            assert_eq!(state.session.history.len(), 1, "应只保留 1 条 system 消息");
+            assert_eq!(
+                state.session.history.first().map(|m| m.role.as_str()),
+                Some("system"),
+                "保留的应为 system 消息"
+            );
+        }
+
+        /// Step4-11: 完整双 Ctrl+C 链路（含 Effect 序列）
+        ///
+        /// t=100: KeyPressed(Ctrl+C) → 单击，last_ctrlc_ms=100, no Quit
+        /// t=300: KeyPressed(Ctrl+C) → 双击(<500ms), → Quit effect
+        #[test]
+        fn test_redux_double_ctrl_c_flow_e2e() {
+            let mut state = s();
+            let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+            // 第一次 Ctrl+C at t=100
+            let effects1 = state.reduce_with_now(Action::KeyPressed(key.clone()), 100);
+            assert!(!has_quit(&effects1), "第一次 Ctrl+C 不应 Quit");
+            assert_eq!(state.ui.last_ctrlc_ms, 100, "记录窗口时间戳");
+
+            // 第二次 Ctrl+C at t=300（100ms 内）
+            let effects2 = state.reduce_with_now(Action::KeyPressed(key), 300);
+            assert!(has_quit(&effects2), "300ms 内双击 Ctrl+C 应产生 Quit");
+
+            // 验证 Effect::Quit 在结果中
+            let has_quit_effect = effects2.iter().any(|e| matches!(e, Effect::Quit));
+            assert!(has_quit_effect, "effects2 应包含 Effect::Quit");
+        }
+
+        /// S2-B Step 1: HistoryCompacted 算法基线 — 保留 system + 截断单条 + 限总预算
+        #[test]
+        fn test_redux_history_compacted_basic_algorithm() {
+            use crate::chat::action::CompactReason;
+            let mut state = s();
+            // 构造 1 个 system + 20 条 user/assistant 长消息
+            state
+                .session
+                .history
+                .push(crate::providers::ChatMessage::system("system prompt - keep me"));
+            for i in 0..20 {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                let content = "x".repeat(500); // 超 COMPACT_CONTENT_CHARS=320
+                state.session.history.push(crate::providers::ChatMessage {
+                    role: role.to_string(),
+                    content: format!("{content} #{i}"),
+                });
+            }
+            let before_len = state.session.history.len();
+            assert_eq!(before_len, 21);
+
+            let effects = state.reduce(Action::HistoryCompacted {
+                reason: CompactReason::ContextOverflow,
+            });
+
+            // system prompt 必须保留在首位
+            assert_eq!(
+                state.session.history.first().map(|m| m.role.as_str()),
+                Some("system"),
+                "compaction 后 system 仍在首位"
+            );
+            // 总条数应 <= 1 system + COMPACT_KEEP_MESSAGES
+            assert!(
+                state.session.history.len() <= 1 + super::COMPACT_KEEP_MESSAGES,
+                "compaction 后非 system 条数 ≤ COMPACT_KEEP_MESSAGES, got {}",
+                state.session.history.len()
+            );
+            // 每条非 system 消息字符数 ≤ COMPACT_CONTENT_CHARS（+ "..." 后 +3）
+            for m in state.session.history.iter().skip(1) {
+                assert!(
+                    m.content.chars().count() <= super::COMPACT_CONTENT_CHARS + 3,
+                    "non-system msg should be truncated, got {} chars",
+                    m.content.chars().count()
+                );
+            }
+            // 总预算（非 system）应 ≤ COMPACT_TOTAL_CHARS
+            let non_system_chars: usize = state
+                .session
+                .history
+                .iter()
+                .skip(1)
+                .map(|m| m.content.chars().count())
+                .sum();
+            assert!(
+                non_system_chars <= super::COMPACT_TOTAL_CHARS,
+                "non-system total chars {non_system_chars} > budget {}",
+                super::COMPACT_TOTAL_CHARS
+            );
+            // 必发 LogTrace
+            assert!(has_log_trace(&effects), "HistoryCompacted 必须发 LogTrace");
+        }
+
+        /// S2-B Step 1: HistoryCompacted 在 len<=1 时是 no-op
+        #[test]
+        fn test_redux_history_compacted_noop_when_short() {
+            use crate::chat::action::CompactReason;
+            let mut state = s();
+            // 仅 1 条 system → 无可压缩
+            state
+                .session
+                .history
+                .push(crate::providers::ChatMessage::system("only system"));
+            let effects = state.reduce(Action::HistoryCompacted {
+                reason: CompactReason::Manual,
+            });
+            assert_eq!(state.session.history.len(), 1, "len<=1 时不变");
+            assert!(has_log_trace(&effects), "no-op 仍发 LogTrace(DEBUG)");
+        }
+
+        /// Step4-12: CancelRequested 后再 CancelRequested — 第二次 no-op（generating=false）
+        #[test]
+        fn test_redux_cancel_requested_twice_second_noop() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            // 第一次取消
+            let effects1 = state.reduce(Action::CancelRequested);
+            assert!(!effects1.is_empty(), "第一次取消应有 effects");
+            // 第二次取消 — generating 已 false → no-op
+            let effects2 = state.reduce(Action::CancelRequested);
+            assert!(effects2.is_empty(), "第二次 CancelRequested(generating=false) 应 no-op");
+        }
+    }
+
+    // ─── Step 5a-3 Phase A + F 测试 ────────────────────────────────────────────
+    //
+    // Phase A: StartLLMTurn 真主导路径 — reducer 初始化 draft + 同时发射 Effect::StartTurn
+    // Phase F: StreamFailed 真发 NotifyHook(Error)；StreamCancelled 不发 hook 也不 SaveSession
+
+    #[cfg(test)]
+    mod phase_a_f {
+        use super::super::*;
+        use crate::chat::action::Action;
+        use crate::providers::ChatMessage;
+        use tokio_util::sync::CancellationToken;
+
+        fn s() -> ChatState {
+            ChatState::new(Arc::from("openai"), Arc::from("gpt-4o-mini"), CancellationToken::new())
+        }
+
+        fn has_start_turn(effects: &[Effect]) -> bool {
+            effects.iter().any(|e| matches!(e, Effect::StartTurn { .. }))
+        }
+        fn has_notify_hook(effects: &[Effect]) -> bool {
+            effects.iter().any(|e| matches!(e, Effect::NotifyHook { .. }))
+        }
+        fn has_save_session(effects: &[Effect]) -> bool {
+            effects.iter().any(|e| matches!(e, Effect::SaveSession(_)))
+        }
+        fn has_request_redraw(effects: &[Effect]) -> bool {
+            effects.iter().any(|e| matches!(e, Effect::RequestRedraw))
+        }
+
+        /// Phase A-1: StartLLMTurn 初始化 draft + 同步发射 Effect::StartTurn(携带 history)
+        #[test]
+        fn test_phase_a_start_llm_turn_emits_effect_start_turn() {
+            let mut state = s();
+            let cancel = CancellationToken::new();
+            let history = vec![ChatMessage::system("you are helpful"), ChatMessage::user("hi")];
+
+            let effects = state.reduce(Action::StartLLMTurn {
+                draft_id: "draft-1".to_string(),
+                history,
+                cancel,
+            });
+
+            // 状态变更：draft + active_cancel + generating
+            assert!(state.stream.draft.is_some(), "stream.draft 必须被设置");
+            assert!(state.control.active_cancel.is_some(), "active_cancel 必须被注册");
+            assert!(state.control.generating, "generating 必须置 true");
+
+            // Effect 验证
+            assert!(has_start_turn(&effects), "必须发射 Effect::StartTurn");
+            assert!(has_request_redraw(&effects), "必须发射 Effect::RequestRedraw");
+
+            // history 必须穿透到 Effect::StartTurn
+            let history_in_effect = effects.iter().find_map(|e| match e {
+                Effect::StartTurn { history, draft_id, .. } => Some((draft_id.clone(), history.clone())),
+                _ => None,
+            });
+            let (draft_id, hist) = history_in_effect.expect("StartTurn effect 必须存在");
+            assert_eq!(draft_id, "draft-1");
+            assert_eq!(hist.len(), 2);
+            let h0 = hist.first().expect("history[0] 必须存在");
+            let h1 = hist.get(1).expect("history[1] 必须存在");
+            assert_eq!(h0.role, "system");
+            assert_eq!(h1.role, "user");
+        }
+
+        /// Phase A-2: StartLLMTurn 注册的 cancel 与 Effect::StartTurn 中的 cancel 是同一个 token
+        #[test]
+        fn test_phase_a_start_llm_turn_cancel_propagates() {
+            let mut state = s();
+            let cancel = CancellationToken::new();
+            let effects = state.reduce(Action::StartLLMTurn {
+                draft_id: "d2".to_string(),
+                history: vec![ChatMessage::user("x")],
+                cancel: cancel.clone(),
+            });
+            // 通过取消原 token，验证 Effect 内的 token 一并取消（共享 cancellation）
+            cancel.cancel();
+            let cancel_in_effect = effects.iter().find_map(|e| match e {
+                Effect::StartTurn { cancel, .. } => Some(cancel.clone()),
+                _ => None,
+            });
+            let tok = cancel_in_effect.expect("StartTurn 必须携带 cancel");
+            assert!(tok.is_cancelled(), "StartTurn 中的 cancel 应与原 token 共享");
+        }
+
+        /// Phase A-3: TurnStarted（旧 Action）保持原行为 — 不发射 Effect::StartTurn
+        #[test]
+        fn test_phase_a_legacy_turn_started_no_start_turn_effect() {
+            let mut state = s();
+            let effects = state.reduce(Action::TurnStarted {
+                draft_id: "legacy".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            assert!(state.stream.draft.is_some(), "TurnStarted 同样初始化 draft");
+            assert!(
+                !has_start_turn(&effects),
+                "TurnStarted 不应发 Effect::StartTurn（旧路径仍由 chat::run 主导）"
+            );
+        }
+
+        /// Phase F-1: StreamFailed 发射 NotifyHook(Error) — 与旧路径 hooks.emit(HookEvent::Error) 对齐
+        #[test]
+        fn test_phase_f_stream_failed_emits_notify_hook() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d3".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let effects = state.reduce(Action::StreamFailed {
+                draft_id: "d3".to_string(),
+                err: "boom".to_string(),
+                retryable: false,
+            });
+            assert!(has_notify_hook(&effects), "StreamFailed 必须发 NotifyHook(Error)");
+            let hook_evt = effects.iter().find_map(|e| match e {
+                Effect::NotifyHook { event, payload } => Some((*event, payload.clone())),
+                _ => None,
+            });
+            let (evt, payload) = hook_evt.expect("NotifyHook 必须存在");
+            assert!(matches!(evt, HookEvent::Error));
+            assert_eq!(payload.get("component").and_then(|v| v.as_str()), Some("chat-turn"));
+            assert_eq!(payload.get("message").and_then(|v| v.as_str()), Some("boom"));
+            assert_eq!(
+                payload.get("retryable").and_then(serde_json::Value::as_bool),
+                Some(false)
+            );
+        }
+
+        /// Phase F-2: StreamCancelled 不发 NotifyHook 也不 SaveSession（中断 turn 不写持久化、不双触发钩子）
+        #[test]
+        fn test_phase_f_stream_cancelled_no_save_no_hook() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d4".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let effects = state.reduce(Action::StreamCancelled {
+                draft_id: "d4".to_string(),
+            });
+            assert!(!has_notify_hook(&effects), "StreamCancelled 不应发 NotifyHook");
+            assert!(!has_save_session(&effects), "StreamCancelled 不应 SaveSession");
+            assert!(has_request_redraw(&effects), "StreamCancelled 仍需 RequestRedraw");
+        }
+
+        /// Phase F-3: 不匹配 draft_id 的 StreamFailed → no-op，不发 NotifyHook（防止 stale 误报）
+        #[test]
+        fn test_phase_f_stream_failed_wrong_id_no_hook() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "right".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let effects = state.reduce(Action::StreamFailed {
+                draft_id: "wrong".to_string(),
+                err: "stale".to_string(),
+                retryable: true,
+            });
+            assert!(effects.is_empty(), "stale draft_id 应 no-op");
+            assert!(!has_notify_hook(&effects));
+        }
+
+        /// Phase A-4: StartLLMTurn 后立刻取消 — 状态正确清理（generating=true → cancel token 也准备好让执行器收到 cancelled）
+        #[test]
+        fn test_phase_a_start_llm_turn_then_cancel_request() {
+            let mut state = s();
+            let cancel = CancellationToken::new();
+            let _ = state.reduce(Action::StartLLMTurn {
+                draft_id: "d5".to_string(),
+                history: vec![ChatMessage::user("hi")],
+                cancel,
+            });
+            assert!(state.control.generating);
+
+            let effects = state.reduce(Action::CancelRequested);
+            // generating=true → reducer 发 CancelDraft
+            assert!(
+                effects.iter().any(|e| matches!(e, Effect::CancelDraft(_))),
+                "CancelRequested(generating=true) 应发 CancelDraft"
+            );
+            assert!(!state.control.generating, "cancel 后 generating 必须复位");
+            assert!(state.stream.draft.is_none(), "cancel 后 draft 必须清理");
+        }
+
+        // ─── S2-A: chat::run stream-path → Redux dispatch wiring tests ─────
+        //
+        // 这四个测试覆盖 chat::mod 的流式路径接入 Redux dispatch 后的契约：
+        //   1. 双写一致性（M2 验收点）：同一 delta 序列下，旧路径 `update_draft`
+        //      传给 terminal 的 `accumulated` 文本 == reducer `stream.draft.accumulated`。
+        //      reducer 通过 StreamChunkReceived 累积；旧路径通过 push_str 累积；
+        //      两者必须字节级相同。
+        //   2. StreamCompleted Effect 序列：含 NotifyHook(TurnComplete) + RequestRedraw。
+        //   3. StreamFailed Effect 序列：含 LogTrace(WARN) + NotifyHook(Error) + RequestRedraw。
+        //   4. StreamCancelled Effect 序列：仅 RequestRedraw（不发 hook），且 cancel
+        //      在失败分类**之前**判别（避免误发 Failed）。
+
+        /// S2-A test 1: draft_text_consistency_legacy_vs_redux
+        ///
+        /// 复现 chat::mod 主循环 `draft_updater` 任务的 delta 累积语义：
+        ///   - 旧路径：`accumulated.push_str(&delta); update_draft(accumulated)` — 传累计
+        ///   - 新路径：`coalescer.try_send_chunk(draft_id, delta, version)` → reducer
+        ///     `reduce_stream_chunk_received` 通过 `draft.accumulated.push_str(delta)` 累积
+        ///
+        /// 在 fast-path（coalescer 不背压）下两者必须字节级一致。
+        #[test]
+        fn test_s2a_draft_text_consistency_legacy_vs_redux() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "draft-consistency".to_string(),
+                cancel: CancellationToken::new(),
+            });
+
+            // 模拟 SSE 流式 deltas（含 emoji / 多字节字符，验证字节级一致性）
+            let deltas: [&str; 6] = ["Hel", "lo, ", "wo", "rld", " 你好", " 🌍"];
+            let mut legacy_accumulated = String::new();
+            let mut version: u64 = 0;
+            for delta in &deltas {
+                // 旧路径累积语义：accumulated.push_str + update_draft(accumulated)
+                legacy_accumulated.push_str(delta);
+                // 新路径：dispatch 增量 delta（非累计串）
+                version = version.saturating_add(1);
+                let _ = state.reduce(Action::StreamChunkReceived {
+                    draft_id: "draft-consistency".to_string(),
+                    delta: (*delta).to_string(),
+                    version,
+                });
+            }
+
+            // 核心验收点：旧路径 accumulated == reducer 内部 accumulated
+            let redux_accumulated = state
+                .stream
+                .draft
+                .as_ref()
+                .map(|d| d.accumulated.clone())
+                .expect("test: stream.draft must exist after StreamChunkReceived");
+            assert_eq!(
+                redux_accumulated, legacy_accumulated,
+                "S2-A M2 验收：reducer accumulated 必须等于旧路径 update_draft 传入的累计串"
+            );
+            assert_eq!(
+                state.stream.draft.as_ref().map(|d| d.version),
+                Some(version),
+                "reducer version 必须等于 draft_updater 内 counter 终值"
+            );
+        }
+
+        /// S2-A test 2: stream_completed_effect_sequence
+        ///
+        /// Success 路径：chat::mod 主循环按 S2-A 改造后投递
+        ///   `Action::StreamCompleted { draft_id, final_text, reasoning: "" }`
+        /// 期望 reducer 发射 `[NotifyHook(TurnComplete), RequestRedraw]` 且 draft 清理。
+        #[test]
+        fn test_s2a_stream_completed_effect_sequence() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "draft-completed".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-completed".to_string(),
+                delta: "the answer".to_string(),
+                version: 1,
+            });
+
+            let effects = state.reduce(Action::StreamCompleted {
+                draft_id: "draft-completed".to_string(),
+                final_text: "the answer".to_string(),
+                reasoning: String::new(),
+            });
+
+            // 终态清理
+            assert!(state.stream.draft.is_none(), "completed 后 draft 应清空");
+            assert!(!state.control.generating, "completed 后 generating=false");
+            assert!(state.control.active_cancel.is_none(), "active_cancel 复位");
+
+            // Effect 序列：NotifyHook(TurnComplete) + RequestRedraw
+            let notify_turn_complete = effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::NotifyHook {
+                        event: HookEvent::TurnComplete,
+                        ..
+                    }
+                )
+            });
+            assert!(notify_turn_complete, "StreamCompleted 必须发 NotifyHook(TurnComplete)");
+            assert!(has_request_redraw(&effects), "StreamCompleted 必须发 RequestRedraw");
+        }
+
+        /// S2-A test 3: stream_failed_effect_sequence
+        ///
+        /// Failure 路径（timeout / context-overflow / 其他错误）：chat::mod 主循环按
+        /// S2-A 改造后投递 `Action::StreamFailed { draft_id, err, retryable }`。
+        /// 期望 reducer 发射 `[LogTrace(WARN), NotifyHook(Error), RequestRedraw]`。
+        #[test]
+        fn test_s2a_stream_failed_effect_sequence() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "draft-failed".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            // 模拟流式过程中先收到 partial chunk
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-failed".to_string(),
+                delta: "partial...".to_string(),
+                version: 1,
+            });
+
+            let effects = state.reduce(Action::StreamFailed {
+                draft_id: "draft-failed".to_string(),
+                err: "timeout".to_string(),
+                retryable: false,
+            });
+
+            // 终态清理
+            assert!(state.stream.draft.is_none(), "failed 后 draft 应清空");
+            assert!(!state.control.generating);
+
+            // Effect 序列断言（按 reduce_stream_failed 的发射顺序）
+            let has_warn_log = effects
+                .iter()
+                .any(|e| matches!(e, Effect::LogTrace { level, .. } if *level == tracing::Level::WARN));
+            assert!(has_warn_log, "StreamFailed 必须发 LogTrace(WARN)");
+
+            let notify_error = effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::NotifyHook {
+                        event: HookEvent::Error,
+                        ..
+                    }
+                )
+            });
+            assert!(notify_error, "StreamFailed 必须发 NotifyHook(Error)");
+            assert!(has_request_redraw(&effects), "StreamFailed 必须发 RequestRedraw");
+
+            // retryable=false 应穿透到 hook payload (验证字段映射)
+            let retryable_in_payload = effects.iter().any(|e| {
+                if let Effect::NotifyHook {
+                    event: HookEvent::Error,
+                    payload,
+                } = e
+                {
+                    payload.get("retryable").and_then(serde_json::Value::as_bool) == Some(false)
+                } else {
+                    false
+                }
+            });
+            assert!(retryable_in_payload, "retryable=false 必须穿透到 NotifyHook payload");
+        }
+
+        /// S2-A test 4: stream_cancelled_effect_sequence
+        ///
+        /// Cancel 路径（Ctrl+C / is_tool_loop_cancelled）：chat::mod 主循环按
+        /// S2-A 改造后**先**判取消、**再**分类失败 — 取消必须投递
+        /// `Action::StreamCancelled { draft_id }`，而非 `StreamFailed`。
+        /// 期望 reducer 仅发射 `[RequestRedraw]`（不发 hook，不发 SaveSession）。
+        #[test]
+        fn test_s2a_stream_cancelled_effect_sequence() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "draft-cancelled".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-cancelled".to_string(),
+                delta: "interrupted".to_string(),
+                version: 1,
+            });
+
+            let effects = state.reduce(Action::StreamCancelled {
+                draft_id: "draft-cancelled".to_string(),
+            });
+
+            // 终态清理
+            assert!(state.stream.draft.is_none(), "cancelled 后 draft 应清空");
+            assert!(!state.control.generating);
+            assert!(state.control.active_cancel.is_none());
+
+            // Effect 序列：仅 RequestRedraw — 不发 NotifyHook，不发 LogTrace(WARN)，不发 SaveSession
+            assert!(has_request_redraw(&effects), "StreamCancelled 必须发 RequestRedraw");
+            assert!(
+                !has_notify_hook(&effects),
+                "StreamCancelled 不应发 NotifyHook（取消不算错误）"
+            );
+            assert!(
+                !has_save_session(&effects),
+                "StreamCancelled 不应 SaveSession（与 Failed 一致，避免误持久化中断状态）"
+            );
+            let has_warn_log = effects
+                .iter()
+                .any(|e| matches!(e, Effect::LogTrace { level, .. } if *level == tracing::Level::WARN));
+            assert!(!has_warn_log, "StreamCancelled 不应发 WARN LogTrace（cancel 不算异常）");
+
+            // 协议契约：cancel 必须在失败分类**之前**判别 — 若误把 cancel 当 failed
+            // 投递为 StreamFailed，会触发上面 stream_failed_effect_sequence 测试中
+            // 的 NotifyHook(Error)，与此处的 !has_notify_hook 矛盾，从而 fail。
+            // 本测试通过缺席 NotifyHook(Error) 间接验证 chat::mod 主循环的
+            // "先判 is_tool_loop_cancelled → 再分类 FailedWithError" 顺序契约.
+        }
+    }
+
+    // ─── S2-B 集成测试 (5 个新增测试) ─────────────────────────────────────────
+    //
+    // 这五个测试覆盖 S2-B 把 chat 模块的会话/取消路径接入 Redux dispatch 后的契约：
+    //   1. CancelRequested 真发 CancelToken effect 并清 control 状态
+    //   2. ModeChanged 与 legacy chat_session.set_mode 后 state.session.mode 等值
+    //   3. RecordUserTurn 单次写入不产生重复 session.turns
+    //   4. HistoryCompacted 保留 system + 控制总预算
+    //   5. StreamCancelled 与 S2-A 终态行为一致（cancel 与 token cancel 不互相干扰）
+
+    #[cfg(test)]
+    mod s2b {
+        use super::super::*;
+        use crate::chat::action::{Action, CompactReason};
+        use crate::providers::ChatMessage;
+        use tokio_util::sync::CancellationToken;
+
+        fn s() -> ChatState {
+            ChatState::new(Arc::from("openai"), Arc::from("gpt-4o-mini"), CancellationToken::new())
+        }
+
+        /// S2-B-1: redux_cancel_requested_clears_control_and_emits_cancel_effect
+        ///
+        /// 单击 Ctrl+C 期间：reducer 必须发 `Effect::CancelToken(token)` 真触发
+        /// 底层取消（替代旧手动 `token.cancel()`），同时清 generating/draft/active_cancel.
+        /// 关闭了 S2-B Codex 风险中 "UI 取消了但底层仍跑" 的窗口。
+        #[test]
+        fn redux_cancel_requested_clears_control_and_emits_cancel_effect() {
+            let mut state = s();
+            let tok = CancellationToken::new();
+            // 开 turn → control.active_cancel=Some(tok), generating=true
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-s2b-1".to_string(),
+                cancel: tok,
+            });
+            assert!(state.control.generating);
+            assert!(state.control.active_cancel.is_some());
+
+            let effects = state.reduce(Action::CancelRequested);
+
+            // control 状态必须清干净
+            assert!(!state.control.generating, "CancelRequested 后 generating=false");
+            assert!(state.stream.draft.is_none(), "CancelRequested 后 draft 清空");
+            assert!(
+                state.control.active_cancel.is_none(),
+                "CancelRequested 后 active_cancel 清空（token 已交给 Effect::CancelToken）"
+            );
+
+            // Effect 序列必须含 CancelToken（关键 — 真取消）+ CancelDraft + LogTrace + RequestRedraw
+            let has_cancel_token = effects.iter().any(|e| matches!(e, Effect::CancelToken(_)));
+            assert!(
+                has_cancel_token,
+                "CancelRequested 必须发 Effect::CancelToken — 这是 S2-B 关键差异"
+            );
+            let has_cancel_draft = effects
+                .iter()
+                .any(|e| matches!(e, Effect::CancelDraft(id) if id == "d-s2b-1"));
+            assert!(has_cancel_draft, "应含 CancelDraft(draft-id)");
+            // CancelToken 必须在 CancelDraft 之前（先真取消底层，再清 UI）
+            let pos_token = effects
+                .iter()
+                .position(|e| matches!(e, Effect::CancelToken(_)))
+                .expect("CancelToken present");
+            let pos_draft = effects
+                .iter()
+                .position(|e| matches!(e, Effect::CancelDraft(_)))
+                .expect("CancelDraft present");
+            assert!(pos_token < pos_draft, "CancelToken 必须在 CancelDraft 之前");
+        }
+
+        /// S2-B-2: redux_mode_changed_matches_legacy_chat_session_mode
+        ///
+        /// 双写期 reducer `state.session.mode` 必须与 legacy `chat_session.mode` 同步.
+        /// 此测试通过对 ChatSession 和 ChatState 都跑相同序列（set_mode + ModeChanged）
+        /// 验证 mode 最终值一致。
+        #[test]
+        fn redux_mode_changed_matches_legacy_chat_session_mode() {
+            use crate::chat::session::ChatSession;
+            let mut state = s();
+            let mut legacy = ChatSession::new("openai", "gpt-4o-mini");
+
+            // Plan
+            let _ = state.reduce(Action::ModeChanged(ChatMode::Plan));
+            legacy.set_mode(ChatMode::Plan);
+            assert_eq!(state.session.mode, legacy.mode, "Plan 模式应一致");
+
+            // Auto
+            let _ = state.reduce(Action::ModeChanged(ChatMode::Auto));
+            legacy.set_mode(ChatMode::Auto);
+            assert_eq!(state.session.mode, legacy.mode, "Auto 模式应一致");
+
+            // Edit (default)
+            let _ = state.reduce(Action::ModeChanged(ChatMode::Edit));
+            legacy.set_mode(ChatMode::Edit);
+            assert_eq!(state.session.mode, legacy.mode, "Edit 模式应一致");
+        }
+
+        /// S2-B-3: redux_record_turns_single_write_no_duplicate_session_turns
+        ///
+        /// dispatch `RecordUserTurn` + `RecordAssistantTurn` 各一次后，
+        /// `state.session.turns` 必须恰好增长 +2，绝不产生重复条目（之前的 1197+2055
+        /// 双 dispatch 已合并为 enriched 同点一次 dispatch）。
+        #[test]
+        fn redux_record_turns_single_write_no_duplicate_session_turns() {
+            let mut state = s();
+            assert_eq!(state.session.turns.len(), 0);
+
+            let _ = state.reduce(Action::RecordUserTurn("hello".to_string()));
+            assert_eq!(state.session.turns.len(), 1);
+            assert_eq!(state.session.history.len(), 1, "history 也应同步增长（reducer 单写）");
+
+            let _ = state.reduce(Action::RecordAssistantTurn("hi back".to_string()));
+            assert_eq!(state.session.turns.len(), 2, "user + assistant 两条，无重复");
+            assert_eq!(state.session.history.len(), 2, "history 也应是 user+assistant 两条");
+
+            // 关键防回归：用同样的内容再 dispatch 一次，turns 应增长为 4，不是被去重为 2
+            // （reducer 不做幂等性—去重由调用方保证；此测试确认 reducer 是 append-only）
+            let _ = state.reduce(Action::RecordUserTurn("hello".to_string()));
+            assert_eq!(state.session.turns.len(), 3, "再次 dispatch 必须 append 一条");
+        }
+
+        /// S2-B-4: redux_compaction_action_preserves_system_and_budget
+        ///
+        /// HistoryCompacted 必须保留 system prompt 且总字符数 ≤ COMPACT_TOTAL_CHARS.
+        /// 这是 chat::mod 主循环 context-overflow 重试路径的核心契约。
+        #[test]
+        fn redux_compaction_action_preserves_system_and_budget() {
+            let mut state = s();
+            // system + 20 条长 user/assistant 消息
+            state
+                .session
+                .history
+                .push(ChatMessage::system("system rules — must survive compaction"));
+            for i in 0..20 {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                state.session.history.push(ChatMessage {
+                    role: role.to_string(),
+                    content: format!("turn-{i} {}", "y".repeat(400)),
+                });
+            }
+
+            let effects = state.reduce(Action::HistoryCompacted {
+                reason: CompactReason::ContextOverflow,
+            });
+
+            // System prompt 必须保留在首位
+            assert_eq!(
+                state.session.history.first().map(|m| m.role.as_str()),
+                Some("system"),
+                "compaction 后 system 仍在首位"
+            );
+            assert!(
+                state
+                    .session
+                    .history
+                    .first()
+                    .is_some_and(|m| m.content.contains("must survive")),
+                "system 内容必须完整保留（不被截断）"
+            );
+            // 非 system 部分总预算 ≤ COMPACT_TOTAL_CHARS
+            let non_system_chars: usize = state
+                .session
+                .history
+                .iter()
+                .skip(1)
+                .map(|m| m.content.chars().count())
+                .sum();
+            assert!(
+                non_system_chars <= super::COMPACT_TOTAL_CHARS,
+                "非 system 总字符 {non_system_chars} 必须 ≤ {}",
+                super::COMPACT_TOTAL_CHARS
+            );
+            // 至少发 LogTrace
+            assert!(
+                effects.iter().any(|e| matches!(e, Effect::LogTrace { .. })),
+                "HistoryCompacted 必须发 LogTrace"
+            );
+        }
+
+        /// S2-B-5: redux_stream_cancelled_cooperates_with_s2a_terminal_actions
+        ///
+        /// 用户在流式期间 Ctrl+C → reducer 发 CancelToken 取消底层 + 清状态.
+        /// 紧接着 chat::run 主循环投递 `StreamCancelled` 作为 turn 终态 — reducer
+        /// 应是 no-op（draft 已清），不重复发 hook 也不打错 effect 顺序。
+        #[test]
+        fn redux_stream_cancelled_cooperates_with_s2a_terminal_actions() {
+            let mut state = s();
+            let tok = CancellationToken::new();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-coop".to_string(),
+                cancel: tok.clone(),
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d-coop".to_string(),
+                delta: "partial".to_string(),
+                version: 1,
+            });
+
+            // 1. 用户 Ctrl+C → CancelRequested
+            let cancel_effects = state.reduce(Action::CancelRequested);
+            // 真取消 token (通过 effect 验证 — reducer 已 take 出来)
+            let cancel_token_effect = cancel_effects.iter().find_map(|e| match e {
+                Effect::CancelToken(t) => Some(t.clone()),
+                _ => None,
+            });
+            let token_from_effect = cancel_token_effect.expect("CancelToken effect 必须存在");
+            // EffectExecutor 真调 cancel — 此处模拟
+            token_from_effect.cancel();
+            assert!(
+                tok.is_cancelled(),
+                "原 token 应被 effect 中的 token 取消（共享 cancellation）"
+            );
+            // control 已清
+            assert!(!state.control.generating);
+            assert!(state.stream.draft.is_none());
+
+            // 2. chat::run 主循环检测到 cancellation → 投递 StreamCancelled 终态
+            let terminal_effects = state.reduce(Action::StreamCancelled {
+                draft_id: "d-coop".to_string(),
+            });
+            // 此时 draft 已被 CancelRequested 清，StreamCancelled 必须是 no-op（不重发 hook）
+            let has_notify = terminal_effects.iter().any(|e| matches!(e, Effect::NotifyHook { .. }));
+            assert!(
+                !has_notify,
+                "StreamCancelled (draft 已清) 不应再发 NotifyHook — 避免双发"
+            );
+            // 也不应再有 CancelToken（token 已经发过且取消）
+            let has_cancel_token = terminal_effects.iter().any(|e| matches!(e, Effect::CancelToken(_)));
+            assert!(!has_cancel_token, "StreamCancelled 不应再发 CancelToken");
+        }
+    }
+
+    // ─── S2-C 集成测试 (3 个新增测试) ─────────────────────────────────────────
+    //
+    // 这三个测试覆盖 S2-C 把 chat 模块的 mirror / history 路径接入 Redux dispatch 后
+    // 的契约：
+    //   1. /clear 路径 reducer 端保留 system + UI 镜像有 system message 行
+    //   2. user/assistant 双 dispatch 后 session.turns + session.history 顺序稳定
+    //   3. SystemMessageAdded 与 RecordSystemMessage 不串扰（UI 与 history 是两个轴）
+    //
+    // 关键设计决策（来自 Codex P0 审计）:
+    //   - 不引入 legacy_mirror_enabled / legacy_history_enabled 守卫——legacy
+    //     history 仍是 LLM 真上下文源，reducer 是观察账本。S2-C 只新增 dispatch.
+    //   - SetLeadingSystemPrompt 区别于 RecordSystemMessage：前者 upsert 首位（每轮
+    //     turn 都跑，覆盖 skill 列表变化），后者 append（/clear 后重建）.
+    #[cfg(test)]
+    mod s2c {
+        use super::super::*;
+        use crate::chat::action::Action;
+        use crate::providers::ChatMessage;
+        use tokio_util::sync::CancellationToken;
+
+        fn s() -> ChatState {
+            ChatState::new(Arc::from("openai"), Arc::from("gpt-4o-mini"), CancellationToken::new())
+        }
+
+        /// S2-C-1: redux_history_cleared_on_slash_clear_keeps_system_only
+        ///
+        /// 模拟 /clear 路径：reducer 收到 HistoryCleared 时必须保留所有 system
+        /// 消息、清空 user/assistant。验证 reducer 与 legacy `history.clear() +
+        /// 条件 push system` 终态等价（仅当 skill_rag 关闭时 legacy 重 push；
+        /// reducer 直接保留已有 system，无需重 push 等价于 skill_rag.enabled 路径）。
+        #[test]
+        fn redux_history_cleared_on_slash_clear_keeps_system_only() {
+            let mut state = s();
+            // 起始 history: system + 2 user + 2 assistant
+            state.session.history.push(ChatMessage::system("sys-prompt-v1"));
+            state.session.history.push(ChatMessage::user("u1"));
+            state.session.history.push(ChatMessage::assistant("a1"));
+            state.session.history.push(ChatMessage::user("u2"));
+            state.session.history.push(ChatMessage::assistant("a2"));
+            assert_eq!(state.session.history.len(), 5);
+
+            let effects = state.reduce(Action::HistoryCleared);
+
+            // 终态：只保留 system 那一条
+            assert_eq!(
+                state.session.history.len(),
+                1,
+                "HistoryCleared 后 history 应只剩 1 条 system"
+            );
+            let kept = state.session.history.first().expect("test: history 应有 1 条 system");
+            assert_eq!(kept.role, "system");
+            assert_eq!(kept.content, "sys-prompt-v1");
+
+            // 必发 RequestRedraw + LogTrace
+            assert!(effects.iter().any(|e| matches!(e, Effect::RequestRedraw)));
+            assert!(effects.iter().any(|e| matches!(e, Effect::LogTrace { .. })));
+
+            // 边界：连续 /clear 应幂等（system 仍只一条）
+            let _ = state.reduce(Action::HistoryCleared);
+            assert_eq!(state.session.history.len(), 1, "二次 /clear 仍保留 1 条 system");
+        }
+
+        /// S2-C-2: redux_history_append_order_user_assistant_stable
+        ///
+        /// dispatch SetLeadingSystemPrompt + RecordUserTurn + RecordAssistantTurn 后,
+        /// session.history 顺序必须稳定为 [system, user, assistant]，且与同序 legacy
+        /// `history.push` 序列字节级一致。验证 reducer 不会重排 / 不会漏 push.
+        #[test]
+        fn redux_history_append_order_user_assistant_stable() {
+            let mut state = s();
+            assert!(state.session.history.is_empty());
+
+            // SetLeadingSystemPrompt 在空 history 上应 push（与 legacy
+            // `if history.is_empty() { push }` 等价）
+            let _ = state.reduce(Action::SetLeadingSystemPrompt {
+                content: "system-rules".to_string(),
+            });
+            assert_eq!(state.session.history.len(), 1);
+            let h0 = state.session.history.first().expect("test: history[0] after push");
+            assert_eq!(h0.role, "system");
+
+            // 再次 SetLeadingSystemPrompt（typical: 每轮 turn 都跑）应替换首位，不 append
+            let _ = state.reduce(Action::SetLeadingSystemPrompt {
+                content: "system-rules-v2".to_string(),
+            });
+            assert_eq!(
+                state.session.history.len(),
+                1,
+                "SetLeadingSystemPrompt 二次调用必须 upsert 首位，不能 append"
+            );
+            let h0v2 = state.session.history.first().expect("test: history[0] after upsert");
+            assert_eq!(h0v2.content, "system-rules-v2");
+
+            // RecordUserTurn → append user
+            let _ = state.reduce(Action::RecordUserTurn("user-q1".to_string()));
+            assert_eq!(state.session.history.len(), 2);
+            let h1 = state.session.history.get(1).expect("test: history[1] = user");
+            assert_eq!(h1.role, "user");
+            assert_eq!(h1.content, "user-q1");
+            assert_eq!(state.session.turns.len(), 1, "session.turns 也应增长（user）");
+
+            // RecordAssistantTurn → append assistant
+            let _ = state.reduce(Action::RecordAssistantTurn("assistant-r1".to_string()));
+            assert_eq!(state.session.history.len(), 3);
+            let h2 = state.session.history.get(2).expect("test: history[2] = assistant");
+            assert_eq!(h2.role, "assistant");
+            assert_eq!(h2.content, "assistant-r1");
+            assert_eq!(state.session.turns.len(), 2, "session.turns +1（assistant）");
+
+            // 再来一轮 — 顺序应仍稳定 system, user, assistant, user, assistant
+            let _ = state.reduce(Action::RecordUserTurn("user-q2".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn("assistant-r2".to_string()));
+            assert_eq!(state.session.history.len(), 5);
+            let roles: Vec<&str> = state.session.history.iter().map(|m| m.role.as_str()).collect();
+            assert_eq!(
+                roles,
+                vec!["system", "user", "assistant", "user", "assistant"],
+                "顺序必须稳定"
+            );
+            // session.turns 不含 system（仅 user/assistant 是回合）
+            assert_eq!(state.session.turns.len(), 4);
+            let turn_roles: Vec<&str> = state.session.turns.iter().map(|t| t.role.as_str()).collect();
+            assert_eq!(turn_roles, vec!["user", "assistant", "user", "assistant"]);
+        }
+
+        /// S2-C-3: redux_system_message_mirror_and_state_consistent
+        ///
+        /// SystemMessageAdded 应只动 UI 镜像（ui.conversation_lines），不污染
+        /// session.history；RecordSystemMessage 应只动 session.history，不污染
+        /// ui.conversation_lines. 两条路径正交。
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn redux_system_message_mirror_and_state_consistent() {
+            use crate::chat::tui::ConversationLine;
+            let mut state = s();
+            assert_eq!(state.ui.conversation_lines.len(), 0);
+            assert_eq!(state.session.history.len(), 0);
+
+            // SystemMessageAdded → 只动 UI mirror
+            let effects = state.reduce(Action::SystemMessageAdded {
+                text: "Banner v1".to_string(),
+            });
+            assert_eq!(state.ui.conversation_lines.len(), 1, "ui mirror 应增长");
+            let first_line = state
+                .ui
+                .conversation_lines
+                .first()
+                .expect("test: conversation_lines[0] after SystemMessageAdded");
+            assert!(
+                matches!(
+                    first_line,
+                    ConversationLine::System { content } if content == "Banner v1"
+                ),
+                "应是 ConversationLine::System variant"
+            );
+            assert_eq!(state.session.history.len(), 0, "session.history 必须不动");
+            assert!(effects.iter().any(|e| matches!(e, Effect::RequestRedraw)));
+
+            // RecordSystemMessage → 只动 session.history
+            let _ = state.reduce(Action::RecordSystemMessage {
+                content: "ctx-system-1".to_string(),
+            });
+            assert_eq!(state.session.history.len(), 1, "session.history 应增长");
+            let first_hist = state.session.history.first().expect("test: history[0] = system");
+            assert_eq!(first_hist.role, "system");
+            assert_eq!(first_hist.content, "ctx-system-1");
+            assert_eq!(
+                state.ui.conversation_lines.len(),
+                1,
+                "ui mirror 必须不动（仍是 1 条 banner）"
+            );
+
+            // 多发几条 SystemMessageAdded — UI mirror 单调增长，history 仍不变
+            let _ = state.reduce(Action::SystemMessageAdded {
+                text: "Slash output 1".to_string(),
+            });
+            let _ = state.reduce(Action::SystemMessageAdded {
+                text: "Slash output 2".to_string(),
+            });
+            assert_eq!(state.ui.conversation_lines.len(), 3);
+            assert_eq!(state.session.history.len(), 1, "session.history 仍是 1");
+        }
+
+        /// S2-C-bonus2 (Codex P0 回归): /clear 后再 dispatch SetLeadingSystemPrompt
+        /// 应保持终态 ≤ 1 条 system —— 若误用 RecordSystemMessage 会累计成 2+ 条
+        /// system. 本测试模拟 mod.rs:1254-1287 /clear !skill_rag.enabled 完整路径.
+        #[test]
+        fn redux_clear_then_set_leading_yields_single_system() {
+            let mut state = s();
+            // 起始 history: system + 几条会话
+            state.session.history.push(ChatMessage::system("old-system"));
+            state.session.history.push(ChatMessage::user("u1"));
+            state.session.history.push(ChatMessage::assistant("a1"));
+            state.session.history.push(ChatMessage::user("u2"));
+            assert_eq!(state.session.history.len(), 4);
+
+            // Step 1: HistoryCleared (与 legacy `history.clear()` 双写) —
+            // reducer 保留旧 system，drain user/assistant
+            let _ = state.reduce(Action::HistoryCleared);
+            assert_eq!(state.session.history.len(), 1, "HistoryCleared 后仅保留 1 条旧 system");
+            let after_clear = state.session.history.first().expect("test: post-clear history[0]");
+            assert_eq!(after_clear.content, "old-system");
+
+            // Step 2: SetLeadingSystemPrompt (与 legacy `history.push(new system)` 双写) —
+            // upsert: 替换已有首位 system 为新 prompt（绝不 append）
+            let _ = state.reduce(Action::SetLeadingSystemPrompt {
+                content: "new-system".to_string(),
+            });
+            // 关键：终态必须仍是 1 条 system，content 是新的（不是 2 条 system）
+            assert_eq!(
+                state.session.history.len(),
+                1,
+                "/clear + SetLeadingSystemPrompt 终态必须 1 条 system，不能累计"
+            );
+            let after_reset = state.session.history.first().expect("test: post-reset history[0]");
+            assert_eq!(after_reset.role, "system");
+            assert_eq!(after_reset.content, "new-system");
+
+            // 防回归：若误用 RecordSystemMessage 会变成 2 条 — 这里显式验证
+            // SetLeadingSystemPrompt 不是 append 语义
+            let _ = state.reduce(Action::SetLeadingSystemPrompt {
+                content: "newer-system".to_string(),
+            });
+            assert_eq!(
+                state.session.history.len(),
+                1,
+                "再次 SetLeadingSystemPrompt 仍 upsert，不 append"
+            );
+        }
+
+        /// S2-C-bonus (Codex 建议): SetLeadingSystemPrompt 在非空 history 上必须
+        /// 替换首位，不能 append — 防回归 1336 语义。
+        #[test]
+        fn set_leading_system_prompt_replaces_first_instead_of_append() {
+            let mut state = s();
+            // 先预置 history: [system-old, user1, assistant1]
+            state.session.history.push(ChatMessage::system("system-old"));
+            state.session.history.push(ChatMessage::user("user1"));
+            state.session.history.push(ChatMessage::assistant("assistant1"));
+            assert_eq!(state.session.history.len(), 3);
+
+            // SetLeadingSystemPrompt 必须替换首位 system，不能 append
+            let _ = state.reduce(Action::SetLeadingSystemPrompt {
+                content: "system-new".to_string(),
+            });
+            assert_eq!(
+                state.session.history.len(),
+                3,
+                "SetLeadingSystemPrompt 不能改变 history 长度（替换不 append）"
+            );
+            let h0 = state.session.history.first().expect("test: history[0] = system-new");
+            assert_eq!(h0.role, "system");
+            assert_eq!(h0.content, "system-new");
+            // user / assistant 顺序不变
+            let h1 = state.session.history.get(1).expect("test: history[1] = user1");
+            assert_eq!(h1.role, "user");
+            assert_eq!(h1.content, "user1");
+            let h2 = state.session.history.get(2).expect("test: history[2] = assistant1");
+            assert_eq!(h2.role, "assistant");
+        }
+    }
+}

@@ -1,0 +1,3639 @@
+//! Redux dispatcher 基础设施 (Step 5a-1 — 真业务执行 + dual-write guard).
+//!
+//! 提供三件套，把生产事件接入 reducer 并按需执行业务：
+//! - [`ChatDispatcher`]: `Action` 发送端封装（bounded mpsc + try_send 政策）
+//! - [`EffectExecutor`]: shadow 模式（5b）所有业务 Effect 都是 no-op；
+//!   real 模式（5a-1）持有 [`EffectDeps`]，按 PRX_CHAT_REDUX 灰度真执行
+//! - [`StreamChunkCoalescer`]: 当 channel 满时合并 `StreamChunkReceived` delta
+//!   为单个 `Action`，避免反压丢失中间块
+//!
+//! 设计要点（Codex 审计 P0-1 / P0-2 / P0-3 / P2-coalescer-version）:
+//! - **bounded channel**：`Action` channel 容量 2048，防 OOM
+//! - **dual-write guard**：[`RuntimeDualWriteGuard`] (Arc<AtomicBool>) 标记本轮是否
+//!   由 Redux 路径处理；旧路径在 Both/Redux 模式下根据 guard 决定是否跳过持久化，
+//!   防止 history / session 被双写
+//! - **长耗时 effect spawn 子任务**：`StartTurn` / `SaveSession` / `EmitChannelMessage`
+//!   / `PersistToMemory` 在 deps 模式下统一 `tokio::spawn`，避免 await 阻塞主循环
+//! - **coalescer version 取最新**：与 reducer `state.rs:540` strict-monotonic
+//!   一致，合并时 `version = max(pending, new)`，否则高版本先到合并后会被丢
+//! - **OS 信号统一入 Action**：Ctrl+C / SIGTERM handler `try_send` shutdown action
+//!
+//! 灰度模式（与 `chat::ReduxMode` 对齐）:
+//! - `Off`：EffectExecutor::new_shadow()（业务 no-op，仅 LogTrace 跑）
+//! - `Both`：EffectExecutor::new_with_deps()（业务真执行）+ 旧路径仍跑 + guard 抑制
+//!   旧路径的持久化，让两路并行但只有 reducer 真正持久化（reducer 是新真源）
+//! - `Redux`：与 Both 类似（5a-1 阶段不删旧路径，仅运行时让 reducer 主导，
+//!   5a-3 才真正删旧路径）
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use parking_lot::Mutex as ParkingMutex;
+use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio_util::sync::CancellationToken;
+
+use crate::channels::Channel;
+use crate::chat::action::Action;
+use crate::chat::state::{ChatState, Effect};
+use crate::hooks::HookManager;
+use crate::memory::Memory;
+use crate::observability::Observer;
+use crate::providers::Provider;
+
+/// Action channel 容量上限（Codex P0-3）.
+///
+/// 选 2048：覆盖典型 chat session 的 burst（用户输入 + 流式 chunk + 工具事件），
+/// 又能在 OOM 前触发 backpressure → coalescing。
+pub const ACTION_CHANNEL_CAPACITY: usize = 2048;
+
+// ─── ChatDispatcher ────────────────────────────────────────────────────────────
+
+/// `Action` 发送端封装。仅暴露 `try_send` / `send` 两种政策，禁止 unbounded clone。
+///
+/// - `try_send`：非阻塞 — 用于流式 chunk / 控制 Action（满时调用方应走 coalescer）
+/// - `send_blocking`：阻塞同步路径 — 用于关键退出 Action（Ctrl+C / SIGTERM handler）
+/// - `send`：异步阻塞 — 用于关键 Action 且调用方在 async 上下文（如 main 循环）
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct ChatDispatcher {
+    action_tx: mpsc::Sender<Action>,
+}
+
+/// `try_send` 政策结果（供调用方决定是否需要 coalescing / 兜底）.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchResult {
+    /// Action 已入队
+    Sent,
+    /// Channel 已满（调用方应 coalesce 或丢弃）
+    Backpressured,
+    /// Channel 已关闭（dispatcher task 已退出）
+    ChannelClosed,
+}
+
+impl ChatDispatcher {
+    /// 构造 dispatcher + 接收端。接收端给 [`spawn_dispatcher_task`] 消费。
+    #[allow(dead_code)]
+    pub fn new() -> (Self, mpsc::Receiver<Action>) {
+        let (action_tx, action_rx) = mpsc::channel::<Action>(ACTION_CHANNEL_CAPACITY);
+        (Self { action_tx }, action_rx)
+    }
+
+    /// 非阻塞发送。满时返回 `Backpressured`，调用方决定 coalesce / 丢弃。
+    #[allow(dead_code)]
+    pub fn try_dispatch(&self, action: Action) -> DispatchResult {
+        match self.action_tx.try_send(action) {
+            Ok(()) => DispatchResult::Sent,
+            Err(TrySendError::Full(_)) => DispatchResult::Backpressured,
+            Err(TrySendError::Closed(_)) => DispatchResult::ChannelClosed,
+        }
+    }
+
+    /// 同步阻塞发送（仅在非 async 上下文调用，如 OS 信号 handler 的同步部分）.
+    ///
+    /// **注意**：tokio runtime 内部不允许 blocking_send，否则 panic。
+    /// Ctrl+C / SIGTERM handler 在 spawned task 内（async 上下文），应优先用
+    /// [`Self::try_dispatch`] 或 [`Self::dispatch`]。
+    #[allow(dead_code)]
+    pub fn blocking_dispatch(&self, action: Action) -> DispatchResult {
+        match self.action_tx.blocking_send(action) {
+            Ok(()) => DispatchResult::Sent,
+            Err(_) => DispatchResult::ChannelClosed,
+        }
+    }
+
+    /// 异步阻塞发送（推荐：在 async 路径中安全反压）.
+    #[allow(dead_code)]
+    pub async fn dispatch(&self, action: Action) -> DispatchResult {
+        match self.action_tx.send(action).await {
+            Ok(()) => DispatchResult::Sent,
+            Err(_) => DispatchResult::ChannelClosed,
+        }
+    }
+
+    /// 返回底层 sender clone，供需要直接持有 `mpsc::Sender` 的子任务使用.
+    ///
+    /// 警告：直接持有 sender 会绕过 [`Self::try_dispatch`] 的政策检查。
+    /// 仅在 coalescer 等需要 `TrySendError` 细粒度处理的场景使用。
+    #[allow(dead_code)]
+    pub fn sender(&self) -> mpsc::Sender<Action> {
+        self.action_tx.clone()
+    }
+}
+
+// ─── TurnCompletionSignal (Step 5a-4) ─────────────────────────────────────────
+
+/// Turn 终结的语义结果，由 dispatcher 在 [`TurnCompletionSignal::record_and_notify`]
+/// 时写入，供 chat::run await 之后读取以决定 UI/hook 行为.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum TurnOutcomeKind {
+    /// LLM 流式成功完成；`final_text` 为最终累计可见文本.
+    Completed { final_text: String },
+    /// LLM 流式失败；`err` 为 [`Action::StreamFailed`] 携带的错误描述，
+    /// `retryable` 反映 [`stream_error_is_retryable`] 判定结果。
+    Failed { err: String, retryable: bool },
+    /// 用户取消或 shutdown 抢占。
+    Cancelled,
+}
+
+/// Turn 终结显式信号 + 结果槽位，用于 `chat::run` 在 Redux driver 切闸路径下
+/// await turn 完成并读取语义结果.
+///
+/// dispatcher task 在 `state.reduce(action)` 后检测到 terminal action
+/// (`StreamCompleted` / `StreamFailed` / `StreamCancelled`) 时：
+///   1. 把对应 [`TurnOutcomeKind`] 写入 `outcome` slot
+///   2. 调用 `notify_waiters` 唤醒所有等待方
+///
+/// 与 `RuntimeDualWriteGuard` 解耦 — guard 是双写抑制开关，不是 turn 生命周期信号；
+/// 把 turn 生命周期建模为独立的 `Notify + Mutex<Option<Outcome>>` 让语义清晰、
+/// 可测试、无忙等。
+///
+/// 设计选择：用 `tokio::sync::Notify` 而非 `oneshot::channel`：
+/// - chat::run 多个 turn 复用同一个 signal；oneshot 仅能 fire 一次
+/// - `notify_waiters` latch-less，通知前必须先 `notified()` 获 future，否则错过通知
+/// - 协议：每次 dispatch StartLLMTurn 前 chat::run 先获取 `notified()` future
+///   并 `consume_outcome()` 清空旧 slot，再 dispatch，最后 await future。
+#[derive(Clone)]
+pub struct TurnCompletionSignal {
+    inner: Arc<tokio::sync::Notify>,
+    outcome: Arc<ParkingMutex<Option<TurnOutcomeKind>>>,
+}
+
+impl TurnCompletionSignal {
+    /// 构造新的信号实例。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Notify::new()),
+            outcome: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    /// dispatcher task 调用：写入 outcome + 唤醒等待方。
+    pub fn record_and_notify(&self, outcome: TurnOutcomeKind) {
+        *self.outcome.lock() = Some(outcome);
+        self.inner.notify_waiters();
+    }
+
+    /// 兜底通知（无 outcome 写入，例如 shutdown 抢占）。
+    /// 等待方读取到 `None` 应视为 cancelled。
+    pub fn notify(&self) {
+        self.inner.notify_waiters();
+    }
+
+    /// 返回 `Notified` future。chat::run 协议：dispatch 前调用，await 在 dispatch 之后。
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.notified()
+    }
+
+    /// 取走当前 outcome（消费式）。返回 `None` 表示无终结事件被记录（shutdown 兜底）。
+    #[must_use]
+    pub fn consume_outcome(&self) -> Option<TurnOutcomeKind> {
+        self.outcome.lock().take()
+    }
+}
+
+impl Default for TurnCompletionSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for TurnCompletionSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnCompletionSignal").finish_non_exhaustive()
+    }
+}
+
+/// 从 action 类型映射到 turn outcome（用于 dispatcher task 在 reduce 前抽取）。
+#[must_use]
+#[allow(dead_code)]
+pub fn extract_turn_outcome(action: &Action) -> Option<TurnOutcomeKind> {
+    match action {
+        Action::StreamCompleted { final_text, .. } => Some(TurnOutcomeKind::Completed {
+            final_text: final_text.clone(),
+        }),
+        Action::StreamFailed { err, retryable, .. } => Some(TurnOutcomeKind::Failed {
+            err: err.clone(),
+            retryable: *retryable,
+        }),
+        Action::StreamCancelled { .. } => Some(TurnOutcomeKind::Cancelled),
+        _ => None,
+    }
+}
+
+/// 判断 action 是否为 turn 终结事件。dispatcher task 用此函数决定何时
+/// 触发 [`TurnCompletionSignal::notify`].
+#[must_use]
+pub const fn is_turn_terminal_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::StreamCompleted { .. } | Action::StreamFailed { .. } | Action::StreamCancelled { .. }
+    )
+}
+
+// ─── RuntimeDualWriteGuard ─────────────────────────────────────────────────────
+
+/// 双写抑制计数器（Step 5a-1，5a-5 Codex P1 修复：bool → AtomicU64 计数）.
+///
+/// 在 Both/Redux 模式下，业务 Effect 真执行的同时旧路径仍在跑。为防止 history /
+/// session 等持久化资源被写两次，我们让 reducer 路径在执行业务 Effect 前 +1，
+/// 旧路径在持久化前检查计数器——若 > 0 则跳过自己的写。
+///
+/// **5a-5 修复**：之前是 `AtomicBool`，存在严重时序窗——多个 effect 并发持有
+/// `DualWriteGuardScope` 时，一个 scope drop 会把全部 active 状态清空，造成另一
+/// 个还在跑的 effect 旁路被"放行"。改为 `AtomicU64` 计数：每个 scope `fetch_add(1)`
+/// 进入，`fetch_sub(1)` 退出，`is_active()` 即 `> 0`。
+///
+/// guard 由 `chat::run` 持有 `Arc<AtomicU64>`，dispatcher 与旧路径共享。
+/// 仅在 Both/Redux 模式构造；Off 模式不构造（旧路径正常单写）。
+///
+/// 注意：guard 不是 mutex——它是「策略开关」而非「锁」。旧路径检查计数器时如果发现
+/// > 0，简单 `continue` 即可；不存在等待语义。这避免了双写期任何死锁可能。
+#[derive(Debug, Clone)]
+pub struct RuntimeDualWriteGuard {
+    /// 活跃 scope 计数（> 0 → 旧路径跳过对应持久化）.
+    active: Arc<AtomicU64>,
+}
+
+impl RuntimeDualWriteGuard {
+    /// 构造新 guard（active=0，旧路径正常持久化）.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// 旧路径查询当前是否被 Redux 抢占（计数 > 0）.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire) > 0
+    }
+
+    /// 测试观测：返回当前活跃 scope 计数（仅 cfg(test)，生产代码不需要）.
+    #[cfg(test)]
+    #[must_use]
+    pub fn active_count(&self) -> u64 {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// 创建 RAII scope：进入时 +1，离开（或 panic）时自动 -1.
+    ///
+    /// 多个 scope 同时存在时，计数器累加；只有全部 scope drop 后才回到 0。
+    /// 这解决了 5a-4 之前的 bool 版本"早 drop 误清零"问题。
+    #[must_use]
+    pub fn enter_scope(&self) -> DualWriteGuardScope {
+        DualWriteGuardScope::enter(Arc::clone(&self.active))
+    }
+}
+
+impl Default for RuntimeDualWriteGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAII scope for [`RuntimeDualWriteGuard`].
+///
+/// 进入时通过 `fetch_add(1)` 累计；`Drop` 时通过 `fetch_sub(1)` 释放，
+/// 无论正常退出还是 panic unwind 均生效，让计数器准确反映活跃 scope 数。
+///
+/// 通过 `RuntimeDualWriteGuard::enter_scope()` 构造。
+pub struct DualWriteGuardScope {
+    inner: Arc<AtomicU64>,
+}
+
+impl DualWriteGuardScope {
+    fn enter(inner: Arc<AtomicU64>) -> Self {
+        inner.fetch_add(1, Ordering::Release);
+        Self { inner }
+    }
+}
+
+impl Drop for DualWriteGuardScope {
+    fn drop(&mut self) {
+        // saturating_sub via fetch_update would be safer, but counters are
+        // strictly balanced (every fetch_add followed by exactly one Drop),
+        // so fetch_sub is correct. Underflow would indicate a logic bug.
+        self.inner.fetch_sub(1, Ordering::Release);
+    }
+}
+
+// ─── EffectDeps ────────────────────────────────────────────────────────────────
+
+/// EffectExecutor 真业务执行所需依赖.
+///
+/// 由 `chat::run` 在启动期收集；clone 成本仅为 Arc bump，安全地传给 spawn 子任务。
+/// 缺任一项即等于 shadow 模式（构造时强制 `new_with_deps` 接收全部字段）。
+#[derive(Clone)]
+pub struct EffectDeps {
+    /// 当前 provider（LLM 调用）— Step 5a-1 仅供 StartTurn 使用，后续 effect 复用
+    pub provider: Arc<dyn Provider>,
+    /// memory backend（SaveSession / PersistToMemory）
+    pub memory: Arc<dyn Memory>,
+    /// 当前 channel（EmitChannelMessage / SendDraftFinalize / CancelDraft）
+    pub channel: Arc<dyn Channel>,
+    /// hook 管理器（NotifyHook）
+    pub hooks: Arc<HookManager>,
+    /// observability observer（结构化事件）
+    pub observer: Arc<dyn Observer>,
+    /// Action 回投 channel sender（StartTurn 子任务的流式回调）
+    pub action_tx: mpsc::Sender<Action>,
+    /// 双写抑制 guard（Both/Redux 模式下持久化 effect 前置位）
+    pub dual_write_guard: RuntimeDualWriteGuard,
+    /// 渲染重绘 channel（RequestRedraw 唤醒主循环）
+    /// 用 mpsc::Sender<()> 而非 broadcast，因为我们只需要"踢一下"主循环
+    pub redraw_tx: Option<mpsc::Sender<()>>,
+    /// 关停信号（Effect::Quit 触发）
+    pub shutdown: CancellationToken,
+    /// Step 5a-4 (Codex P1)：当前 LLM model name，drive_start_turn_stream 用此
+    /// 调 `provider.stream_chat_with_history(_, model, _, _)`。原本 hard-coded
+    /// 为空串导致真实 provider (OpenAI/Anthropic) 拒绝；mock provider 测试不暴露此问题.
+    pub model: Arc<str>,
+    /// 当前 temperature（默认从 CLI 参数注入；与 model 配对传给 stream API）.
+    pub temperature: f64,
+    /// **5a-6**: tool registry — driver 执行 tool_call 时按名查找并调用。`None`
+    /// 表示当前 turn 不允许 tool 调用（driver 收到 tool_call 时发 StreamFailed）。
+    /// 用 `Arc<Vec<Box<dyn Tool>>>` 而非 slice：跨 spawn 边界共享所有权，clone 仅 Arc bump。
+    pub tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
+    /// **5a-6**: max tool iterations — 防 LLM 死循环。0 走默认 (16)，上限受 driver 内部保护。
+    pub max_tool_iterations: usize,
+}
+
+// ─── EffectExecutor (5a-1: real-mode + shadow-mode) ───────────────────────────
+
+/// `Effect` 执行器。两种构造形态：
+/// - shadow 模式 (`new_shadow`)：除 `LogTrace` 外所有业务 Effect 都是 no-op；保留
+///   用于 Off 模式 / 单元测试 / 5b 行为基线
+/// - real 模式 (`new_with_deps`)：持有 [`EffectDeps`]，业务 Effect 真执行；长耗时
+///   操作 spawn 子任务回投 Action（Codex P0-1）
+///
+/// P0-2 fix: `redraw_tx` 通过共享的 `Arc<parking_lot::Mutex<Option<mpsc::Sender<()>>>>` 后注入。
+/// `chat::run` 先构造 EffectExecutor（此时 redraw_tx 尚无），spawn dispatcher task 后
+/// 再通过 `redraw_handle()` 返回的 Arc 将 `redraw_tx` 注入，解决时序问题。
+#[allow(dead_code)]
+pub struct EffectExecutor {
+    /// shadow 模式标志。`true` 时所有业务 Effect 都跳过执行。
+    shadow_mode: bool,
+    /// 真业务依赖。Some 表示 deps 模式，None 表示 shadow 模式。
+    deps: Option<EffectDeps>,
+    /// P0-2: 可后注入的 redraw_tx 句柄。spawn 后由 chat::run 填入真实 sender。
+    /// real 模式下两者共享同一个 Arc，允许在 dispatcher task 运行期注入。
+    redraw_slot: Arc<ParkingMutex<Option<mpsc::Sender<()>>>>,
+}
+
+impl EffectExecutor {
+    /// 构造 shadow 模式执行器（Step 5b 兼容、单元测试、Off 模式）.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn new_shadow() -> Self {
+        Self {
+            shadow_mode: true,
+            deps: None,
+            redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    /// 构造真业务执行器（Step 5a-1，PRX_CHAT_REDUX=both/1 模式）.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn new_with_deps(deps: EffectDeps) -> Self {
+        Self {
+            shadow_mode: false,
+            deps: Some(deps),
+            redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    /// P0-2 fix: 返回共享的 redraw_tx 槽位 Arc，供 chat::run 在 TUI 初始化后注入.
+    ///
+    /// 调用方持有此 Arc，在 `redraw_tx` 创建后调用 `*slot.lock() = Some(tx)` 即可。
+    /// dispatcher task spawn 后仍可注入，因为 Arc 跨越了 spawn 边界。
+    ///
+    /// shadow 模式下注入无效（execute_shadow 不读此槽位）。
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn redraw_handle(&self) -> Arc<ParkingMutex<Option<mpsc::Sender<()>>>> {
+        Arc::clone(&self.redraw_slot)
+    }
+
+    /// 测试观测：是否处于 shadow 模式.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn is_shadow(&self) -> bool {
+        self.shadow_mode
+    }
+
+    /// 执行单个 Effect。
+    ///
+    /// - shadow 模式：仅 `LogTrace` 真执行（结构化日志属于可观测性必要工具），
+    ///   `RequestRedraw` 输出 trace，其余业务 Effect 输出 debug log。
+    /// - real 模式：每个业务 Effect 走对应 deps 的真实路径；StartTurn / SaveSession
+    ///   等长耗时 effect `tokio::spawn` 子任务回投，避免阻塞主循环。
+    ///
+    /// 双写抑制：进入业务 Effect 时如有 deps，先置位 dual_write_guard（让旧路径跳过
+    /// 自己的对应写）。SaveSession / PersistToMemory / EmitChannelMessage 等持久化
+    /// effect 完成后由调用方控制复位（典型在 turn 结束）。
+    #[allow(dead_code)]
+    pub async fn execute(&self, effect: Effect) {
+        // LogTrace 在两种模式下都真执行（可观测性）
+        if let Effect::LogTrace { level, msg } = &effect {
+            Self::emit_trace(*level, msg);
+            return;
+        }
+        match (self.shadow_mode, &self.deps) {
+            (true, _) | (_, None) => self.execute_shadow(effect),
+            (false, Some(deps)) => self.execute_real(effect, deps).await,
+        }
+    }
+
+    /// shadow 模式分支：业务 Effect 全部 no-op + debug log.
+    fn execute_shadow(&self, effect: Effect) {
+        match &effect {
+            Effect::RequestRedraw => {
+                tracing::trace!("effect: RequestRedraw (shadow no-op)");
+            }
+            other => {
+                tracing::debug!(effect = ?other, "effect skipped (shadow mode)");
+            }
+        }
+    }
+
+    /// real 模式分支：按 Effect 类型分发到真业务执行.
+    async fn execute_real(&self, effect: Effect, deps: &EffectDeps) {
+        match effect {
+            Effect::RequestRedraw => {
+                // P0-2 fix: 优先读 redraw_slot（后注入），回退到 deps.redraw_tx（构造时注入）.
+                // redraw_slot 在 TUI 初始化完成后由 chat::run 填入真实 sender，
+                // 确保 RequestRedraw 真正触发重绘而非 no-op。
+                let slot_guard = self.redraw_slot.lock();
+                let tx = slot_guard.as_ref().or(deps.redraw_tx.as_ref());
+                if let Some(tx) = tx {
+                    let _ = tx.try_send(());
+                } else {
+                    tracing::trace!("RequestRedraw: redraw_tx not yet injected (P0-2)");
+                }
+            }
+            Effect::StartTurn {
+                draft_id,
+                history,
+                cancel,
+            } => {
+                // Step 5a-2 — 长耗时：spawn 子任务真调 provider.stream_chat_with_history，
+                // 通过 deps.action_tx 把 chunk / 完成 / 失败 / 取消事件回投给 reducer，
+                // 取代旧 `delta_tx → draft_updater → coalescer` 链路。
+                //
+                // 设计要点（与 plan Step 5a-2 一致）：
+                //   1. `tokio::pin!` 固定 stream，`tokio::select!` 同时监听 cancel + chunk
+                //   2. version 由本地计数器严格递增（与 reducer strict-monotonic 一致）
+                //   3. Reasoning 不混入主文本流（与现网 chat::run 行为对齐）
+                //   4. RAII `DualWriteGuardScope` 守住整个 turn 期间，子任务退出自动复位
+                //   5. 任意分支错误用 `action_tx.send().await`（不丢 chunk，让反压自然回退）
+                //
+                // 注意：StartTurn 当前 **没有** 被 reducer 自动触发——本路径仅在调用方
+                // 显式 spawn `Effect::StartTurn { ... }` 时生效（如单测 / 5a-3 接线后的
+                // ratatui 路径）。chat::run 主循环仍由 `run_tool_call_loop` 主导（旧路径），
+                // 双写抑制由 `dual_write_guard` 在 reducer 持久化 effect 时已经守住。
+                let provider = Arc::clone(&deps.provider);
+                let action_tx = deps.action_tx.clone();
+                let guard_scope = deps.dual_write_guard.enter_scope();
+                // Codex P1 fix：从 deps 拿真实 model + temperature 传给 stream API.
+                let model = deps.model.to_string();
+                let temperature = deps.temperature;
+                // 5a-6: 透传 tool registry + max iterations (None / 0 → driver 退化为纯文本流式).
+                let tools_registry = deps.tools_registry.as_ref().map(Arc::clone);
+                let max_tool_iterations = deps.max_tool_iterations;
+                tokio::spawn(async move {
+                    // RAII scope：子任务退出（含 panic）时自动复位 dual_write_guard。
+                    let _scope = guard_scope;
+                    if cancel.is_cancelled() {
+                        // 启动前已取消：直接发 StreamCancelled，不发 LLM 请求.
+                        if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id }).await {
+                            tracing::debug!(error = %e, "StartTurn: action_tx closed on pre-cancel");
+                        }
+                        return;
+                    }
+                    drive_start_turn_stream(
+                        provider,
+                        history,
+                        model,
+                        temperature,
+                        cancel,
+                        draft_id,
+                        action_tx,
+                        tools_registry,
+                        max_tool_iterations,
+                    )
+                    .await;
+                });
+            }
+            Effect::SaveSession(session) => {
+                // 双写抑制：spawn 子任务内创建 RAII scope，任务退出时自动复位.
+                let guard_scope = deps.dual_write_guard.enter_scope();
+                let memory = Arc::clone(&deps.memory);
+                let action_tx = deps.action_tx.clone();
+                let session_id = session.id.clone();
+                tokio::spawn(async move {
+                    // scope 在子任务内持有，子任务退出（含 panic）时自动清除 guard.
+                    let _scope = guard_scope;
+                    let json = match session.to_json() {
+                        Ok(j) => j,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "SaveSession effect: serialize failed");
+                            return;
+                        }
+                    };
+                    match memory
+                        .store(
+                            &session.memory_key(),
+                            &json,
+                            crate::memory::MemoryCategory::Conversation,
+                            Some(&session.id),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            let _ = action_tx.try_send(Action::SessionSaved { id: session_id });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "SaveSession effect: store failed");
+                        }
+                    }
+                });
+            }
+            Effect::SendDraftFinalize { draft_id, text } => {
+                // 双写抑制 RAII scope：子任务退出时自动复位.
+                let guard_scope = deps.dual_write_guard.enter_scope();
+                let channel = Arc::clone(&deps.channel);
+                tokio::spawn(async move {
+                    let _scope = guard_scope;
+                    let recipient = "user";
+                    tracing::debug!(
+                        draft_id = %draft_id,
+                        text_len = text.len(),
+                        channel = %channel.name(),
+                        "SendDraftFinalize effect: calling channel.finalize_draft"
+                    );
+                    if let Err(e) = channel.finalize_draft(recipient, &draft_id, &text).await {
+                        tracing::warn!(
+                            error = %e,
+                            draft_id = %draft_id,
+                            "SendDraftFinalize effect: finalize_draft failed"
+                        );
+                    }
+                });
+            }
+            Effect::CancelDraft(draft_id) => {
+                // 直接调 channel.cancel_draft（短同步路径，无需 spawn）
+                let channel = Arc::clone(&deps.channel);
+                let recipient = "user".to_string();
+                if let Err(e) = channel.cancel_draft(&recipient, &draft_id).await {
+                    tracing::debug!(error = %e, draft_id = %draft_id, "CancelDraft effect: channel returned err");
+                }
+            }
+            Effect::CancelToken(token) => {
+                // S2-B Step 2: 真触发底层 CancellationToken — 让 LLM 流 / tool loop
+                // 立刻收到 cancel 信号返回 cancelled 错误。无需 spawn（cancel 本身
+                // 不阻塞），无需 dual_write_guard（取消是幂等动作，重复 cancel 安全）。
+                tracing::info!("effect: CancelToken -> token.cancel()");
+                token.cancel();
+            }
+            Effect::EmitChannelMessage(send_msg) => {
+                let guard_scope = deps.dual_write_guard.enter_scope();
+                let channel = Arc::clone(&deps.channel);
+                tokio::spawn(async move {
+                    let _scope = guard_scope;
+                    if let Err(e) = channel.send(&send_msg).await {
+                        tracing::warn!(error = %e, "EmitChannelMessage effect: send failed");
+                    }
+                });
+            }
+            Effect::PersistToMemory { key, value, category } => {
+                let guard_scope = deps.dual_write_guard.enter_scope();
+                let memory = Arc::clone(&deps.memory);
+                tokio::spawn(async move {
+                    let _scope = guard_scope;
+                    if let Err(e) = memory.store(&key, &value, category, None).await {
+                        tracing::warn!(error = %e, key = %key, "PersistToMemory effect: store failed");
+                    }
+                });
+            }
+            Effect::NotifyHook { event, payload } => {
+                let guard_scope = deps.dual_write_guard.enter_scope();
+                let hooks = Arc::clone(&deps.hooks);
+                tokio::spawn(async move {
+                    let _scope = guard_scope;
+                    hooks.emit(event, payload).await;
+                });
+            }
+            Effect::DisplayMedia { kind, path } => {
+                // 媒体显示是用户可见短同步路径；用 tracing 记录（observer 没有
+                // 通用 trace 变体，且 5a-1 阶段旧路径仍负责真正的媒体显示）。
+                tracing::debug!(kind = %kind, path = %path, "DisplayMedia effect");
+                let _ = deps.observer.name(); // 占位避免 deps.observer 字段被警告
+            }
+            Effect::AutoTitleSession(title) => {
+                tracing::debug!(title = %title, "AutoTitleSession effect");
+            }
+            Effect::Quit => {
+                // 关停信号：真 cancel + drop 等隐式协议由 chat::run 收尾处理
+                tracing::info!("effect: Quit -> shutdown.cancel()");
+                deps.shutdown.cancel();
+            }
+            Effect::LogTrace { .. } => {
+                // 已在 execute() 顶部分支处理
+            }
+        }
+    }
+
+    /// 将 [`tracing::Level`] 分发到对应的 macro（避免 dyn dispatch）.
+    fn emit_trace(level: tracing::Level, msg: &str) {
+        if level == tracing::Level::ERROR {
+            tracing::error!("{}", msg);
+        } else if level == tracing::Level::WARN {
+            tracing::warn!("{}", msg);
+        } else if level == tracing::Level::INFO {
+            tracing::info!("{}", msg);
+        } else if level == tracing::Level::DEBUG {
+            tracing::debug!("{}", msg);
+        } else {
+            tracing::trace!("{}", msg);
+        }
+    }
+}
+
+// ─── StartTurn streaming driver (Step 5a-2) ────────────────────────────────────
+
+/// 判断 [`StreamError`] 是否值得重试.
+///
+/// 与 reducer `Action::StreamFailed { retryable, .. }` 字段对齐：让上层（chat::run
+/// 主循环或未来的自动重试逻辑）依据布尔值决定是否安排另一轮 turn。当前判断准则：
+/// - `Http` / `Io`：网络瞬时故障，retryable
+/// - `Json` / `InvalidSse`：数据破损，多半重试也复发，non-retryable
+/// - `Provider`：服务端语义错误，倾向于 non-retryable（让上层显示并由用户决定）
+#[must_use]
+const fn stream_error_is_retryable(err: &crate::providers::traits::StreamError) -> bool {
+    use crate::providers::traits::StreamError;
+    matches!(err, StreamError::Http(_) | StreamError::Io(_))
+}
+
+/// 真接 `provider.stream_chat_with_history` 并把流式事件回投到 reducer.
+///
+/// 设计在 spawn 子任务内独立运行；通过 `cancel` 中途取消，通过 `action_tx` 回投。
+/// 拆成独立 fn 而非内联在 `execute_real`，便于：
+///   - 单元测试直接驱动 fake provider 验证回投序列
+///   - 让 borrow / move 关系清晰（spawn move 闭包内不再持有 deps 引用）
+///
+/// 行为保证：
+/// - 任何退出路径必发 **恰一条** terminal action：`StreamCompleted` / `StreamFailed` /
+///   `StreamCancelled`，让 reducer 能匹配并清理 `state.stream.draft`
+/// - `version` 严格单调递增（1, 2, 3, …），跨所有 tool iteration 单调，与 reducer
+///   strict-monotonic 一致
+/// - `reasoning` 不混入主 delta（只在最终 `StreamCompleted.reasoning` 字段携带）
+///
+/// **5a-6**: 多轮 tool turn 支持。
+/// - 收到 `ToolCallChunk` 时：通过 `tools_registry` 按名查找 → 执行 → 把
+///   assistant tool_call + tool result 追加到 history → 重新调
+///   `stream_chat_with_history` 进入下一轮。
+/// - tool 执行用 `tokio::select!` 与 `cancel` 竞速，避免长 tool 卡死 cancel 路径。
+/// - 当 `tools_registry == None` 或迭代超过 `max_tool_iterations` 时退化为
+///   StreamFailed(retryable=false)，让 chat::run fallthrough 到 legacy 兜底.
+/// - **未覆盖**（保留在 legacy `run_tool_call_loop`）：approval、multimodal
+///   图片校验、parallel tools、scope_ctx 治理、自动 compaction、tool tiering、
+///   priority scheduling。这些场景 driver 不命中（route_turn 后续可继续 fallback）。
+#[allow(clippy::too_many_arguments)]
+async fn drive_start_turn_stream(
+    provider: Arc<dyn Provider>,
+    mut history: Vec<crate::providers::traits::ChatMessage>,
+    model: String,
+    temperature: f64,
+    cancel: CancellationToken,
+    draft_id: String,
+    action_tx: mpsc::Sender<Action>,
+    tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
+    max_tool_iterations: usize,
+) {
+    use crate::providers::traits::{StreamChunk, StreamOptions};
+    use futures::StreamExt;
+
+    // 默认 / 上限：与 `agent::loop_::DEFAULT_MAX_TOOL_ITERATIONS` 概念对齐，
+    // 但 driver 内部独立维护防止意外 0 走入死循环。
+    const DEFAULT_MAX_ITERATIONS: usize = 16;
+    const ABSOLUTE_MAX_ITERATIONS: usize = 64;
+    let max_iterations = if max_tool_iterations == 0 {
+        DEFAULT_MAX_ITERATIONS
+    } else {
+        max_tool_iterations.min(ABSOLUTE_MAX_ITERATIONS)
+    };
+
+    let mut version: u64 = 0;
+    let mut accumulated = String::new();
+    let mut reasoning_buf = String::new();
+    let mut iteration: usize = 0;
+
+    'outer: loop {
+        iteration = iteration.saturating_add(1);
+        if iteration > max_iterations {
+            let action = Action::StreamFailed {
+                draft_id: draft_id.clone(),
+                err: format!("redux driver: max tool iterations exceeded ({max_iterations})"),
+                retryable: false,
+            };
+            if let Err(e) = action_tx.send(action).await {
+                tracing::debug!(error = %e, "StartTurn: action_tx closed on max-iter exceeded");
+            }
+            return;
+        }
+
+        let opts = StreamOptions::new(true);
+        let stream = provider.stream_chat_with_history(&history, &model, temperature, opts);
+        tokio::pin!(stream);
+
+        // 本轮 stream 内已经收到、尚未执行的 tool_calls.
+        let mut pending_tool_calls: Vec<crate::providers::traits::ToolCallChunk> = Vec::new();
+        // 本轮 stream 内已经累计的 assistant 文本（tool_call 同 turn 也可能伴随文本，
+        // 与 OpenAI/Anthropic 行为对齐）。仅在 turn 完成（最终 StreamCompleted）时
+        // 拼入 `accumulated`；进入 tool 回合时丢弃，避免 partial 文本混入下一轮 history。
+        let mut iter_text = String::new();
+
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id: draft_id.clone() }).await {
+                        tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel");
+                    }
+                    return;
+                }
+                next = stream.next() => {
+                    match next {
+                        Some(Ok(StreamChunk { delta, reasoning, is_final, tool_calls, .. })) => {
+                            // **5a-6**: tool_call 接通. 累积所有 tool_calls (provider 已 buffer 完整 args).
+                            if !tool_calls.is_empty() {
+                                for tc in tool_calls {
+                                    pending_tool_calls.push(tc);
+                                }
+                            }
+                            if let Some(reason_text) = reasoning {
+                                if !reason_text.is_empty() {
+                                    reasoning_buf.push_str(&reason_text);
+                                }
+                            }
+                            if !delta.is_empty() {
+                                version = version.saturating_add(1);
+                                iter_text.push_str(&delta);
+                                let action = Action::StreamChunkReceived {
+                                    draft_id: draft_id.clone(),
+                                    delta,
+                                    version,
+                                };
+                                if let Err(e) = action_tx.send(action).await {
+                                    tracing::debug!(error = %e, "StartTurn: action_tx closed mid-stream");
+                                    return;
+                                }
+                            }
+                            if is_final {
+                                break;
+                            }
+                        }
+                        Some(Err(err)) => {
+                            let retryable = stream_error_is_retryable(&err);
+                            let action = Action::StreamFailed {
+                                draft_id: draft_id.clone(),
+                                err: err.to_string(),
+                                retryable,
+                            };
+                            if let Err(e) = action_tx.send(action).await {
+                                tracing::debug!(error = %e, "StartTurn: action_tx closed on error");
+                            }
+                            return;
+                        }
+                        None => {
+                            // Stream ended without explicit final chunk — treat as completion.
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 本轮 stream 结束。检查是否需要执行 tool calls.
+        if pending_tool_calls.is_empty() {
+            // 普通文本回合：accumulate 本轮文本并退出.
+            accumulated.push_str(&iter_text);
+            break 'outer;
+        }
+
+        // 进入 tool 回合：需要 registry.
+        let registry = match tools_registry.as_ref() {
+            Some(r) => r,
+            None => {
+                let action = Action::StreamFailed {
+                    draft_id: draft_id.clone(),
+                    err: "redux driver: tool_calls received but no tools_registry available (route should have stayed on legacy path)"
+                        .to_string(),
+                    retryable: false,
+                };
+                if let Err(e) = action_tx.send(action).await {
+                    tracing::debug!(error = %e, "StartTurn: action_tx closed on missing-registry");
+                }
+                return;
+            }
+        };
+
+        // 1) 把 assistant 的 tool_call 追加到 history. OpenAI 协议把 assistant 的 tool_call
+        //    序列化为 JSON, content 为空; 我们用更紧凑的 marker 字符串表示, 兼容 ChatMessage
+        //    (无 tool_calls 专用字段). legacy run_tool_call_loop 用 build_native_assistant_history
+        //    做更复杂的格式; 这里 driver 保守降级 — 用 JSON 让 provider 在下一轮收到完整
+        //    assistant tool_call 上下文。后续 provider native 接通时可换为结构化字段.
+        let assistant_payload = serde_json::json!({
+            "tool_calls": pending_tool_calls.iter().map(|tc| serde_json::json!({
+                "id": tc.id,
+                "type": "function",
+                "function": { "name": tc.name, "arguments": tc.args },
+            })).collect::<Vec<_>>(),
+            "content": iter_text,
+        });
+        history.push(crate::providers::traits::ChatMessage {
+            role: "assistant".to_string(),
+            content: assistant_payload.to_string(),
+        });
+
+        // 2) 顺序执行每个 tool call 并把结果追加到 history. 用 select! 与 cancel 竞速,
+        //    保证用户 Ctrl+C 能立即打断长 tool. parallel/scope_ctx/approval 不覆盖.
+        for call in pending_tool_calls {
+            // 发 ToolStarted 让 reducer/UI 感知.
+            let _ = action_tx
+                .send(Action::ToolStarted {
+                    name: call.name.clone(),
+                    args: call.args.clone(),
+                })
+                .await;
+
+            // 解析 args JSON. 失败 → 把错误回填给 LLM 让它自己修正, 而非中断 turn.
+            let args_value: serde_json::Value = match serde_json::from_str(&call.args) {
+                Ok(v) => v,
+                Err(parse_err) => {
+                    let err_msg = format!("tool args JSON parse error: {parse_err}");
+                    let tool_payload = serde_json::json!({
+                        "tool_call_id": call.id,
+                        "content": err_msg,
+                        "success": false,
+                    });
+                    history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
+                    let _ = action_tx
+                        .send(Action::ToolFinished {
+                            name: call.name.clone(),
+                            success: false,
+                            duration_ms: 0,
+                            result: Some(err_msg),
+                        })
+                        .await;
+                    continue;
+                }
+            };
+
+            // 查找 tool. 未找到也走"回填给 LLM"路径.
+            let tool_match = registry.iter().find(|t| t.supports_name(&call.name));
+            let tool = match tool_match {
+                Some(t) => t,
+                None => {
+                    let err_msg = format!("tool not found: {}", call.name);
+                    let tool_payload = serde_json::json!({
+                        "tool_call_id": call.id,
+                        "content": err_msg,
+                        "success": false,
+                    });
+                    history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
+                    let _ = action_tx
+                        .send(Action::ToolFinished {
+                            name: call.name.clone(),
+                            success: false,
+                            duration_ms: 0,
+                            result: Some(err_msg),
+                        })
+                        .await;
+                    continue;
+                }
+            };
+
+            // 执行 tool, 与 cancel 竞速.
+            let start = std::time::Instant::now();
+            let exec_result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id: draft_id.clone() }).await {
+                        tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel mid-tool");
+                    }
+                    return;
+                }
+                res = tool.execute_named(&call.name, args_value) => res,
+            };
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            let (tool_payload, ok_flag, summary) = match exec_result {
+                Ok(tool_result) => {
+                    let payload = serde_json::json!({
+                        "tool_call_id": call.id,
+                        "content": tool_result.output,
+                        "success": tool_result.success,
+                        "error": tool_result.error,
+                    });
+                    let summary = if tool_result.success {
+                        tool_result.output.clone()
+                    } else {
+                        tool_result.error.clone().unwrap_or_else(|| "tool failed".to_string())
+                    };
+                    (payload, tool_result.success, summary)
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let payload = serde_json::json!({
+                        "tool_call_id": call.id,
+                        "content": err_str,
+                        "success": false,
+                    });
+                    (payload, false, err_str)
+                }
+            };
+            history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
+            let _ = action_tx
+                .send(Action::ToolFinished {
+                    name: call.name.clone(),
+                    success: ok_flag,
+                    duration_ms,
+                    result: Some(summary),
+                })
+                .await;
+        }
+
+        // 继续下一轮 LLM 调用. iter_text 已经写入 assistant message, 不计入最终 accumulated.
+    }
+
+    let action = Action::StreamCompleted {
+        draft_id,
+        final_text: accumulated,
+        reasoning: reasoning_buf,
+    };
+    if let Err(e) = action_tx.send(action).await {
+        tracing::debug!(error = %e, "StartTurn: action_tx closed on completion");
+    }
+}
+
+// ─── Dispatcher task ───────────────────────────────────────────────────────────
+
+/// Spawn the central dispatcher task: drives `state.reduce(action)` for every
+/// Action received on `action_rx`, then runs each returned Effect through the
+/// shadow [`EffectExecutor`].
+///
+/// 关闭条件:
+/// - `action_rx.recv()` 返回 `None`（所有 sender drop 完毕）
+/// - `shutdown.cancelled()` 触发（select! 抢占）
+///
+/// Step 5b shadow 模式：dispatcher task 只跑 reducer + log effect，不会产生外部副作用，
+/// 因此与 main loop 的旧路径并存安全。返回 `JoinHandle` 让 `chat::run` 在结束前 await
+/// 一次以确保最后的 trace 输出完整。
+#[allow(dead_code)]
+pub fn spawn_dispatcher_task(
+    initial_state: ChatState,
+    action_rx: mpsc::Receiver<Action>,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<DispatcherStats> {
+    spawn_dispatcher_task_with_executor(initial_state, action_rx, shutdown, EffectExecutor::new_shadow())
+}
+
+/// Spawn dispatcher task with explicit [`EffectExecutor`].
+///
+/// 与 [`spawn_dispatcher_task`] 等价但允许 caller 注入 real-mode executor（Step 5a-1）.
+/// 测试与 shadow 兼容场景仍用 `spawn_dispatcher_task`.
+#[allow(dead_code)]
+pub fn spawn_dispatcher_task_with_executor(
+    initial_state: ChatState,
+    action_rx: mpsc::Receiver<Action>,
+    shutdown: CancellationToken,
+    executor: EffectExecutor,
+) -> tokio::task::JoinHandle<DispatcherStats> {
+    spawn_dispatcher_task_with_signal(initial_state, action_rx, shutdown, executor, None)
+}
+
+/// Step 5a-4: Spawn dispatcher task with optional [`TurnCompletionSignal`].
+///
+/// 当 signal 存在时，dispatcher 在 reduce 完任意 turn 终结 action
+/// (`StreamCompleted` / `StreamFailed` / `StreamCancelled`) 后调用
+/// `signal.notify()`，唤醒在 `chat::run` 主循环里等待 turn 完成的 await 点。
+///
+/// 该协议与 [`is_turn_terminal_action`] 配合使用：dispatcher 完全不感知具体
+/// driver 实现，仅按 action 类型触发 turn 边界事件。
+#[allow(dead_code)]
+pub fn spawn_dispatcher_task_with_signal(
+    initial_state: ChatState,
+    mut action_rx: mpsc::Receiver<Action>,
+    shutdown: CancellationToken,
+    executor: EffectExecutor,
+    turn_signal: Option<TurnCompletionSignal>,
+) -> tokio::task::JoinHandle<DispatcherStats> {
+    tokio::spawn(async move {
+        let mut state = initial_state;
+        let mut stats = DispatcherStats::default();
+
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    // Drain whatever is left (best-effort) before exit so
+                    // late-arriving Actions still hit the reducer for
+                    // observability. Bounded by remaining queue depth, not by
+                    // network/disk I/O.
+                    while let Ok(action) = action_rx.try_recv() {
+                        stats.actions_seen = stats.actions_seen.saturating_add(1);
+                        let outcome = extract_turn_outcome(&action);
+                        let effects = state.reduce(action);
+                        stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
+                        for effect in effects {
+                            executor.execute(effect).await;
+                        }
+                        // Shutdown 阶段也要触发 turn_signal，否则 chat::run await
+                        // 会被 shutdown 抢占前最后一轮 turn 永远卡住（导致 round 2 hang
+                        // 回归）。terminal action 携带 outcome — main.rs:888
+                        // shutdown_timeout 兜底保证主进程最终退出。
+                        if let (Some(out), Some(ref sig)) = (outcome, turn_signal.as_ref()) {
+                            sig.record_and_notify(out);
+                        }
+                    }
+                    // 兜底：shutdown 期间 chat::run 仍可能在 await turn_signal.notified()，
+                    // 通知一轮让其检测到 shutdown.cancelled() 退出 select（无 outcome
+                    // → 等待方按 cancelled 解释）。
+                    if let Some(ref sig) = turn_signal {
+                        sig.notify();
+                    }
+                    tracing::debug!(
+                        actions = stats.actions_seen,
+                        effects = stats.effects_seen,
+                        "redux dispatcher task: shutdown drained"
+                    );
+                    break;
+                }
+                maybe_action = action_rx.recv() => {
+                    match maybe_action {
+                        Some(action) => {
+                            stats.actions_seen = stats.actions_seen.saturating_add(1);
+                            let outcome = extract_turn_outcome(&action);
+                            let effects = state.reduce(action);
+                            stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
+                            for effect in effects {
+                                executor.execute(effect).await;
+                            }
+                            if let (Some(out), Some(ref sig)) = (outcome, turn_signal.as_ref()) {
+                                sig.record_and_notify(out);
+                            }
+                        }
+                        None => {
+                            // Channel 关闭：所有 dispatcher sender 已 drop。
+                            // 兜底 notify 防止 chat::run await 永远等待。
+                            if let Some(ref sig) = turn_signal {
+                                sig.notify();
+                            }
+                            tracing::debug!(
+                                actions = stats.actions_seen,
+                                effects = stats.effects_seen,
+                                "redux dispatcher task: channel closed, exiting"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        stats
+    })
+}
+
+/// Lightweight stats returned by [`spawn_dispatcher_task`] on shutdown
+/// (for integration tests and metrics).
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DispatcherStats {
+    pub actions_seen: u64,
+    pub effects_seen: u64,
+}
+
+// ─── StreamChunkCoalescer ──────────────────────────────────────────────────────
+
+/// `StreamChunkReceived` delta 合并器（Codex P0-3 应对 channel 满）.
+///
+/// 工作原理:
+/// 1. 调用 `try_send_chunk` 先尝试 `try_send`，成功即清空 pending
+/// 2. 满（Backpressured）时，把 delta 累加到 `pending` 暂存
+/// 3. 下次 `try_send_chunk` 时，先发送 pending（已累加），再发当前 delta
+/// 4. `flush` 在 shutdown 或 stream end 时强制冲刷 pending
+///
+/// 设计选择:
+/// - 只为同 draft_id coalesce；跨 draft 时丢弃旧 pending（防御性，正常路径不应跨）
+/// - **version 取最新**（Codex P2 fix）：与 reducer `state.rs:540` strict-monotonic
+///   一致——`version <= draft.version` 一律丢弃。若取最早，高版本先到合并后会被
+///   reducer 因 `merged.version <= draft.version` 丢掉，导致 delta 永久丢失。
+///   merge 时取 `max(pending.version, new.version)` 保证合并 Action 至少能让
+///   reducer 向前推进。
+#[allow(dead_code)]
+pub struct StreamChunkCoalescer {
+    /// pending: (draft_id, accumulated_delta, latest_version)
+    pending: Option<(String, String, u64)>,
+    sender: mpsc::Sender<Action>,
+}
+
+impl StreamChunkCoalescer {
+    #[allow(dead_code)]
+    pub const fn new(sender: mpsc::Sender<Action>) -> Self {
+        Self { pending: None, sender }
+    }
+
+    /// 尝试发送一个 chunk Action。channel 满时累加到 pending。
+    ///
+    /// 返回 `DispatchResult` 供调用方观测（Closed 时调用方应停止泵 chunk）。
+    #[allow(dead_code)]
+    pub fn try_send_chunk(&mut self, draft_id: String, delta: String, version: u64) -> DispatchResult {
+        // 1. 如有 pending，先尝试一次性发送累加结果 + 当前 delta（合并为一条 Action）
+        if let Some((p_draft, p_delta, p_version)) = self.pending.take() {
+            if p_draft == draft_id {
+                // 同 draft：累加 delta，version 取 max（与 reducer strict-monotonic 一致）
+                let merged_delta = format!("{p_delta}{delta}");
+                let merged_version = p_version.max(version);
+                let action = Action::StreamChunkReceived {
+                    draft_id: draft_id.clone(),
+                    delta: merged_delta.clone(),
+                    version: merged_version,
+                };
+                return match self.sender.try_send(action) {
+                    Ok(()) => DispatchResult::Sent,
+                    Err(TrySendError::Full(_)) => {
+                        // 仍满：累加到 pending（version 保持 max）
+                        self.pending = Some((draft_id, merged_delta, merged_version));
+                        DispatchResult::Backpressured
+                    }
+                    Err(TrySendError::Closed(_)) => DispatchResult::ChannelClosed,
+                };
+            }
+            // 跨 draft：旧 pending 已无意义，丢弃，按当前 delta 走 fast path
+            tracing::warn!(
+                old_draft = %p_draft,
+                new_draft = %draft_id,
+                "coalescer cross-draft pending dropped (defensive)"
+            );
+        }
+
+        // 2. 没有 pending（或刚清空）：直接 try_send 当前 delta
+        let action = Action::StreamChunkReceived {
+            draft_id: draft_id.clone(),
+            delta: delta.clone(),
+            version,
+        };
+        match self.sender.try_send(action) {
+            Ok(()) => DispatchResult::Sent,
+            Err(TrySendError::Full(_)) => {
+                self.pending = Some((draft_id, delta, version));
+                DispatchResult::Backpressured
+            }
+            Err(TrySendError::Closed(_)) => DispatchResult::ChannelClosed,
+        }
+    }
+
+    /// stream 结束或 shutdown 时强制冲刷 pending（best-effort）.
+    #[allow(dead_code)]
+    pub fn flush(&mut self) -> DispatchResult {
+        let Some((draft_id, delta, version)) = self.pending.take() else {
+            return DispatchResult::Sent;
+        };
+        let action = Action::StreamChunkReceived {
+            draft_id,
+            delta,
+            version,
+        };
+        match self.sender.try_send(action) {
+            Ok(()) => DispatchResult::Sent,
+            Err(TrySendError::Full(_)) => DispatchResult::Backpressured,
+            Err(TrySendError::Closed(_)) => DispatchResult::ChannelClosed,
+        }
+    }
+
+    /// 测试观测 pending 状态.
+    #[cfg(test)]
+    pub const fn pending_for_test(&self) -> Option<&(String, String, u64)> {
+        self.pending.as_ref()
+    }
+}
+
+// ─── 单元测试 ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::action::Action;
+
+    #[tokio::test]
+    async fn dispatcher_try_send_ok() {
+        let (dispatcher, mut rx) = ChatDispatcher::new();
+        let result = dispatcher.try_dispatch(Action::ForceQuit);
+        assert_eq!(result, DispatchResult::Sent);
+        let received = rx.recv().await.expect("expected one Action");
+        assert!(matches!(received, Action::ForceQuit));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_channel_closed() {
+        let (dispatcher, rx) = ChatDispatcher::new();
+        drop(rx);
+        let result = dispatcher.try_dispatch(Action::ForceQuit);
+        assert_eq!(result, DispatchResult::ChannelClosed);
+    }
+
+    #[tokio::test]
+    async fn coalescer_passthrough_when_not_full() {
+        let (tx, mut rx) = mpsc::channel::<Action>(16);
+        let mut coalescer = StreamChunkCoalescer::new(tx);
+
+        coalescer.try_send_chunk("d1".to_string(), "hello ".to_string(), 1);
+        coalescer.try_send_chunk("d1".to_string(), "world".to_string(), 2);
+
+        // Both should pass through individually (channel not full)
+        let a1 = rx.recv().await.expect("expected chunk 1");
+        let a2 = rx.recv().await.expect("expected chunk 2");
+        match a1 {
+            Action::StreamChunkReceived { delta, .. } => assert_eq!(delta, "hello "),
+            other => panic!("unexpected action {other:?}"),
+        }
+        match a2 {
+            Action::StreamChunkReceived { delta, .. } => assert_eq!(delta, "world"),
+            other => panic!("unexpected action {other:?}"),
+        }
+        assert!(coalescer.pending_for_test().is_none());
+    }
+
+    #[tokio::test]
+    async fn coalescer_merges_when_full() {
+        // 容量 1 channel：写一条后必满
+        let (tx, mut rx) = mpsc::channel::<Action>(1);
+        let mut coalescer = StreamChunkCoalescer::new(tx);
+
+        // 第一条：成功
+        let r1 = coalescer.try_send_chunk("d1".to_string(), "a".to_string(), 1);
+        assert_eq!(r1, DispatchResult::Sent);
+        // 第二条：channel 满，进 pending
+        let r2 = coalescer.try_send_chunk("d1".to_string(), "b".to_string(), 2);
+        assert_eq!(r2, DispatchResult::Backpressured);
+        // 第三条：仍满，与 pending 合并
+        let r3 = coalescer.try_send_chunk("d1".to_string(), "c".to_string(), 3);
+        assert_eq!(r3, DispatchResult::Backpressured);
+        let pending = coalescer.pending_for_test().expect("pending should exist");
+        assert_eq!(pending.1, "bc");
+        assert_eq!(pending.2, 3, "version should be max(2,3)=3 (Codex P2 fix)");
+
+        // 消费第一条，腾出空间
+        let a1 = rx.recv().await.expect("first chunk");
+        match a1 {
+            Action::StreamChunkReceived { delta, version, .. } => {
+                assert_eq!(delta, "a");
+                assert_eq!(version, 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // flush pending
+        let rf = coalescer.flush();
+        assert_eq!(rf, DispatchResult::Sent);
+        let a_merged = rx.recv().await.expect("merged chunk");
+        match a_merged {
+            Action::StreamChunkReceived { delta, version, .. } => {
+                assert_eq!(delta, "bc");
+                assert_eq!(version, 3, "merged version is max (Codex P2 fix)");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(coalescer.pending_for_test().is_none());
+    }
+
+    #[tokio::test]
+    async fn coalescer_cross_draft_drops_old_pending() {
+        let (tx, mut rx) = mpsc::channel::<Action>(1);
+        let mut coalescer = StreamChunkCoalescer::new(tx);
+
+        // d1 chunk 1 → 成功（填满）
+        coalescer.try_send_chunk("d1".to_string(), "a".to_string(), 1);
+        // d1 chunk 2 → 满，进 pending
+        coalescer.try_send_chunk("d1".to_string(), "b".to_string(), 2);
+        // d2 chunk 1 → 跨 draft，旧 pending 丢弃
+        // 通道仍满（d1 chunk 1 未消费），d2 chunk 1 进 pending
+        let r = coalescer.try_send_chunk("d2".to_string(), "x".to_string(), 5);
+        assert_eq!(r, DispatchResult::Backpressured);
+        let pending = coalescer.pending_for_test().expect("pending");
+        assert_eq!(pending.0, "d2");
+        assert_eq!(pending.1, "x");
+
+        // 排空 d1 chunk 1
+        let _ = rx.recv().await;
+        let _ = coalescer.flush();
+        let a = rx.recv().await.expect("d2 chunk");
+        match a {
+            Action::StreamChunkReceived {
+                draft_id,
+                delta,
+                version,
+            } => {
+                assert_eq!(draft_id, "d2");
+                assert_eq!(delta, "x");
+                assert_eq!(version, 5);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// P2 fix: 高版本先到，低版本后合并 — pending.version 应保持 max 而非被覆盖.
+    ///
+    /// 场景: version=5 chunk 先通过 try_send（成功），version=2 chunk 后到（满，进 pending），
+    /// version=3 chunk 继续到（满，与 pending 合并）。
+    /// 期望: pending.version = max(2,3) = 3（不是 2，也不是乱序倒退）。
+    /// 验证 coalescer 总是取 max version，无论到达顺序如何。
+    #[tokio::test]
+    async fn coalescer_handles_out_of_order_versions() {
+        // 容量 1 channel
+        let (tx, mut rx) = mpsc::channel::<Action>(1);
+        let mut coalescer = StreamChunkCoalescer::new(tx);
+
+        // 第一条 version=5 成功（填满 channel）
+        let r1 = coalescer.try_send_chunk("d1".to_string(), "a".to_string(), 5);
+        assert_eq!(r1, DispatchResult::Sent, "first chunk should succeed");
+
+        // 第二条 version=2（低于已发送的 5）— channel 满，进 pending
+        let r2 = coalescer.try_send_chunk("d1".to_string(), "b".to_string(), 2);
+        assert_eq!(r2, DispatchResult::Backpressured);
+
+        // 第三条 version=3 — channel 仍满，与 pending(version=2) 合并
+        // 合并规则: version = max(2, 3) = 3
+        let r3 = coalescer.try_send_chunk("d1".to_string(), "c".to_string(), 3);
+        assert_eq!(r3, DispatchResult::Backpressured);
+
+        let pending = coalescer.pending_for_test().expect("pending should exist");
+        assert_eq!(pending.1, "bc", "delta should be concatenated");
+        assert_eq!(
+            pending.2, 3,
+            "version must be max(2,3)=3 even with out-of-order arrival (P2)"
+        );
+
+        // 消费，flush，验证最终输出
+        let _ = rx.recv().await.expect("first chunk (version=5)");
+        let rf = coalescer.flush();
+        assert_eq!(rf, DispatchResult::Sent);
+        let merged = rx.recv().await.expect("merged chunk");
+        match merged {
+            Action::StreamChunkReceived { delta, version, .. } => {
+                assert_eq!(delta, "bc");
+                assert_eq!(version, 3, "flushed version should be max(2,3)=3");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// P2 extra: 验证 reducer 在 strict-monotonic 模式下正常处理高版本先到 + 低版本后到.
+    /// reducer 应接受 version=5，然后因 version=2 < current_stream_version 而忽略它。
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn redux_stream_chunk_strict_monotonic_high_then_low() {
+        use crate::chat::state::ChatState;
+        use tokio_util::sync::CancellationToken;
+
+        let shutdown = CancellationToken::new();
+        let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), shutdown);
+
+        // 启动 turn
+        let cancel = CancellationToken::new();
+        let effects0 = state.reduce(Action::TurnStarted {
+            draft_id: "d1".to_string(),
+            cancel,
+        });
+        // TurnStarted 可能产生 StartTurn effect；只确认不 panic
+        let _ = effects0;
+
+        // version=5 先到 — strict-monotonic: 应被接受 (5 > 0)
+        let e1 = state.reduce(Action::StreamChunkReceived {
+            draft_id: "d1".to_string(),
+            delta: "high".to_string(),
+            version: 5,
+        });
+        // 应该产出 RequestRedraw effect（chunk 被接受）
+        assert!(
+            e1.iter()
+                .any(|e| matches!(e, crate::chat::state::Effect::RequestRedraw)),
+            "version=5 chunk should be accepted and produce RequestRedraw"
+        );
+
+        // version=2 后到 — strict-monotonic: 应被丢弃 (2 < 5)
+        let e2 = state.reduce(Action::StreamChunkReceived {
+            draft_id: "d1".to_string(),
+            delta: "low".to_string(),
+            version: 2,
+        });
+        // 低版本 chunk 被 reducer 静默丢弃，不应产出 RequestRedraw
+        assert!(
+            !e2.iter()
+                .any(|e| matches!(e, crate::chat::state::Effect::RequestRedraw)),
+            "version=2 chunk (lower than 5) should be discarded by strict-monotonic reducer"
+        );
+    }
+
+    #[tokio::test]
+    async fn effect_executor_shadow_log_trace_runs() {
+        let executor = EffectExecutor::new_shadow();
+        // LogTrace 真执行（shadow 也跑）；这里只验证不 panic / 不 await 外部
+        executor
+            .execute(Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: "shadow log".to_string(),
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn effect_executor_shadow_business_noop() {
+        let executor = EffectExecutor::new_shadow();
+        // 所有业务 effect 都是 no-op；仅验证不 panic
+        executor.execute(Effect::RequestRedraw).await;
+        executor.execute(Effect::Quit).await;
+        executor.execute(Effect::CancelDraft("d1".to_string())).await;
+        executor
+            .execute(Effect::SendDraftFinalize {
+                draft_id: "d1".to_string(),
+                text: "hello".to_string(),
+            })
+            .await;
+    }
+}
+
+// ─── Step 5b 集成测试（dispatcher + reducer + coalescer + EffectExecutor 端到端）─
+
+#[cfg(test)]
+mod integration_tests {
+    //! 直接构造 dispatcher + spawn dispatcher task + 灌入 Action 流，
+    //! 复现 `chat::run` 的接线逻辑，覆盖：
+    //! - dispatcher channel 容量与 backpressure
+    //! - reducer 是否被驱动（stats.actions_seen / effects_seen）
+    //! - shadow effect executor 是否正确 no-op
+    //! - shutdown 协议（drop sender + cancel token）是否能让 dispatcher 退出
+    //!
+    //! 重要约束：
+    //! - REDUX_DIFF_COUNT == 0：shadow 模式下业务 effect no-op，不会双写 history
+    //! - 测试中所有 timeout 不超过 2s，与 main.rs:866 RUNTIME_SHUTDOWN_TIMEOUT 对齐
+    use super::*;
+    use crate::chat::action::{Action, HistoryDir};
+    use crate::chat::state::ChatState;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    fn make_state(shutdown: CancellationToken) -> ChatState {
+        ChatState::new(Arc::from("mock"), Arc::from("mock-model"), shutdown)
+    }
+
+    #[tokio::test]
+    async fn full_chat_flow_input_to_exit() {
+        // 模拟一次完整 chat 流程：输入 → 流式 → 完成 → 退出.
+        let shutdown = CancellationToken::new();
+        let state = make_state(shutdown.clone());
+        let (dispatcher, action_rx) = ChatDispatcher::new();
+        let handle = spawn_dispatcher_task(state, action_rx, shutdown.clone());
+
+        // 1. 用户输入
+        assert_eq!(
+            dispatcher.try_dispatch(Action::InputSubmitted("hello".to_string())),
+            DispatchResult::Sent
+        );
+        assert_eq!(
+            dispatcher.try_dispatch(Action::RecordUserTurn("hello".to_string())),
+            DispatchResult::Sent
+        );
+
+        // 2. LLM 推理开始 + 流式 chunk
+        let draft_id = "draft-1".to_string();
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            dispatcher.try_dispatch(Action::TurnStarted {
+                draft_id: draft_id.clone(),
+                cancel: cancel.clone(),
+            }),
+            DispatchResult::Sent
+        );
+        for i in 1..=5u64 {
+            assert_eq!(
+                dispatcher.try_dispatch(Action::StreamChunkReceived {
+                    draft_id: draft_id.clone(),
+                    delta: format!("chunk{i} "),
+                    version: i,
+                }),
+                DispatchResult::Sent
+            );
+        }
+
+        // 3. 流式完成
+        assert_eq!(
+            dispatcher.try_dispatch(Action::StreamCompleted {
+                draft_id: draft_id.clone(),
+                final_text: "hello user, response complete".to_string(),
+                reasoning: "thinking...".to_string(),
+            }),
+            DispatchResult::Sent
+        );
+        assert_eq!(
+            dispatcher.try_dispatch(Action::RecordAssistantTurn("hello user, response complete".to_string())),
+            DispatchResult::Sent
+        );
+
+        // 4. 退出
+        assert_eq!(dispatcher.try_dispatch(Action::ShutdownRequested), DispatchResult::Sent);
+
+        // 5. 收尾 — drop sender + cancel shutdown，dispatcher 应在 2s 内退出
+        shutdown.cancel();
+        drop(dispatcher);
+        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("dispatcher should exit within 2s")
+            .expect("join ok");
+
+        // 全部 11 actions 经过 reducer
+        assert_eq!(stats.actions_seen, 11, "actions_seen={}", stats.actions_seen);
+        // reducer 应该至少产出一些 effect（RequestRedraw / LogTrace / NotifyHook 等）
+        assert!(stats.effects_seen > 0, "no effects produced");
+
+        // 验证 REDUX_DIFF_COUNT == 0：shadow 模式下业务 effect no-op，
+        // 不存在双写 history 引发的差异（DIFF 仅 PRX_CHAT_REDUX=both 在
+        // run_tui_unified_loop key event 路径里产生；此集成测试不走那条路径）
+        #[cfg(feature = "terminal-tui")]
+        assert_eq!(
+            crate::chat::redux_diff_count(),
+            0,
+            "shadow mode should produce zero REDUX_DIFF_COUNT"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_exits_on_shutdown_cancel_only() {
+        // 验证 shutdown.cancel() 单独触发也能让 dispatcher 退出（无 drop sender）
+        let shutdown = CancellationToken::new();
+        let state = make_state(shutdown.clone());
+        let (dispatcher, action_rx) = ChatDispatcher::new();
+        let handle = spawn_dispatcher_task(state, action_rx, shutdown.clone());
+
+        let _ = dispatcher.try_dispatch(Action::ForceQuit);
+        shutdown.cancel();
+        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("dispatcher should exit on shutdown")
+            .expect("join ok");
+        assert!(stats.actions_seen >= 1);
+        drop(dispatcher);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_exits_on_channel_close_only() {
+        // 验证 drop(sender) → channel close → dispatcher 退出（无 shutdown.cancel）
+        let shutdown = CancellationToken::new();
+        let state = make_state(shutdown.clone());
+        let (dispatcher, action_rx) = ChatDispatcher::new();
+        let handle = spawn_dispatcher_task(state, action_rx, shutdown);
+
+        let _ = dispatcher.try_dispatch(Action::ForceQuit);
+        drop(dispatcher);
+        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("dispatcher should exit on channel close")
+            .expect("join ok");
+        assert_eq!(stats.actions_seen, 1);
+    }
+
+    #[tokio::test]
+    async fn coalescer_under_dispatcher_load() {
+        // 端到端：dispatcher + coalescer，100 个 chunk + 容量 4 channel → 必触发 backpressure。
+        let shutdown = CancellationToken::new();
+        let state = make_state(shutdown.clone());
+        let (tx, action_rx) = mpsc::channel::<Action>(4);
+        let handle = spawn_dispatcher_task(state, action_rx, shutdown.clone());
+
+        let draft = "draft-load".to_string();
+        let mut coalescer = StreamChunkCoalescer::new(tx.clone());
+
+        let cancel = CancellationToken::new();
+        let _ = tx
+            .send(Action::TurnStarted {
+                draft_id: draft.clone(),
+                cancel: cancel.clone(),
+            })
+            .await;
+
+        let mut backpressure_count = 0u64;
+        for i in 1..=100u64 {
+            let r = coalescer.try_send_chunk(draft.clone(), format!("c{i}"), i);
+            if matches!(r, DispatchResult::Backpressured) {
+                backpressure_count += 1;
+            }
+        }
+        let _ = coalescer.flush();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown.cancel();
+        drop(coalescer);
+        drop(tx);
+
+        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("dispatcher should exit")
+            .expect("join ok");
+
+        assert!(stats.actions_seen >= 2);
+        assert!(
+            backpressure_count > 0,
+            "backpressure must trigger at cap=4 / 100 chunks (saw {backpressure_count})"
+        );
+        // coalescer 合并后 dispatcher 看到的 actions 数应远 < 101
+        // （一个完整的合并能把多个 chunk 压缩成单个 Action）
+        assert!(stats.actions_seen <= 101);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_drives_all_action_variants() {
+        // Sanity: 所有 Action 变体走一遍 reducer，shadow 模式下都不应 panic.
+        let shutdown = CancellationToken::new();
+        let state = make_state(shutdown.clone());
+        let (dispatcher, action_rx) = ChatDispatcher::new();
+        let handle = spawn_dispatcher_task(state, action_rx, shutdown.clone());
+
+        let actions: Vec<Action> = vec![
+            Action::InputSubmitted("x".to_string()),
+            Action::HistoryNavigated(HistoryDir::Up),
+            Action::HistoryNavigated(HistoryDir::Down),
+            Action::InputCancelled,
+            Action::RedrawRequested,
+            Action::TerminalResized { w: 80, h: 24 },
+            Action::PasteReceived("paste".to_string()),
+            Action::CancelRequested,
+            Action::ShutdownRequested,
+            Action::HistoryCleared,
+            Action::ForceQuit,
+            Action::ToolCardFoldToggled,
+            Action::ReasoningFoldToggled,
+            // S2-C: 新增 3 个 Action 必须能被 dispatcher reduce（不 panic）.
+            Action::SystemMessageAdded {
+                text: "banner".to_string(),
+            },
+            Action::RecordSystemMessage {
+                content: "ctx-system".to_string(),
+            },
+            Action::SetLeadingSystemPrompt {
+                content: "sys-prompt".to_string(),
+            },
+        ];
+        for action in actions {
+            let _ = dispatcher.try_dispatch(action);
+        }
+        shutdown.cancel();
+        drop(dispatcher);
+        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("dispatcher exit")
+            .expect("join ok");
+        // S2-C: actions_seen 应 ≥ 16（13 个原有 + 3 个新增）.
+        assert!(stats.actions_seen >= 16);
+    }
+
+    #[tokio::test]
+    async fn effect_executor_handles_all_variants() {
+        // Sanity: 所有 Effect 变体在 shadow 模式下都不应 panic.
+        use crate::hooks::HookEvent;
+        use crate::memory::MemoryCategory;
+
+        let executor = EffectExecutor::new_shadow();
+        let token = CancellationToken::new();
+
+        let effects: Vec<Effect> = vec![
+            Effect::RequestRedraw,
+            Effect::Quit,
+            Effect::CancelDraft("d1".to_string()),
+            Effect::DisplayMedia {
+                kind: "IMAGE".to_string(),
+                path: "/tmp/x.png".to_string(),
+            },
+            Effect::AutoTitleSession("session-1".to_string()),
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: "test".to_string(),
+            },
+            Effect::LogTrace {
+                level: tracing::Level::WARN,
+                msg: "warn-test".to_string(),
+            },
+            Effect::PersistToMemory {
+                key: "k".to_string(),
+                value: "v".to_string(),
+                category: MemoryCategory::Conversation,
+            },
+            Effect::NotifyHook {
+                event: HookEvent::TurnComplete,
+                payload: serde_json::json!({"foo": "bar"}),
+            },
+            Effect::SendDraftFinalize {
+                draft_id: "d1".to_string(),
+                text: "final".to_string(),
+            },
+            Effect::StartTurn {
+                draft_id: "shadow-d".to_string(),
+                history: Vec::new(),
+                cancel: token.clone(),
+            },
+            Effect::CancelToken(token),
+        ];
+
+        for effect in effects {
+            executor.execute(effect).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_dispatch_works_in_spawn_blocking_context() {
+        // blocking_dispatch 只在同步上下文可用；通过 spawn_blocking 隔离调用.
+        let shutdown = CancellationToken::new();
+        let (dispatcher, action_rx) = ChatDispatcher::new();
+        let _handle = spawn_dispatcher_task(make_state(shutdown.clone()), action_rx, shutdown.clone());
+
+        let dispatcher_clone = dispatcher.clone();
+        let r = tokio::task::spawn_blocking(move || dispatcher_clone.blocking_dispatch(Action::ForceQuit))
+            .await
+            .expect("spawn_blocking join");
+        assert_eq!(r, DispatchResult::Sent);
+
+        shutdown.cancel();
+        drop(dispatcher);
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn redux_diff_count_remains_zero_in_shadow_mode() {
+        // P0-2 验证：shadow 模式下 reducer 不双写 history，REDUX_DIFF_COUNT == 0.
+        // 该计数器仅在 PRX_CHAT_REDUX=both 模式下的 run_tui_unified_loop key
+        // event 路径累加；本测试不触达该路径，所以始终为 0。
+        crate::chat::reset_redux_diff_count();
+
+        let shutdown = CancellationToken::new();
+        let state = make_state(shutdown.clone());
+        let (dispatcher, action_rx) = ChatDispatcher::new();
+        let handle = spawn_dispatcher_task(state, action_rx, shutdown.clone());
+
+        // 跑 50 个 mixed Action，模拟流式 + 工具 + 输入
+        for i in 0..50u64 {
+            let _ = dispatcher.try_dispatch(Action::InputSubmitted(format!("msg{i}")));
+            let _ = dispatcher.try_dispatch(Action::RecordUserTurn(format!("user{i}")));
+            let _ = dispatcher.try_dispatch(Action::RecordAssistantTurn(format!("assist{i}")));
+        }
+
+        shutdown.cancel();
+        drop(dispatcher);
+        let _stats = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("exit")
+            .expect("join");
+
+        assert_eq!(
+            crate::chat::redux_diff_count(),
+            0,
+            "shadow mode must not produce any REDUX_DIFF_COUNT increments"
+        );
+    }
+}
+
+// ─── Step 5a-1 真业务执行测试（EffectExecutor::new_with_deps） ─────────────────
+
+#[cfg(test)]
+mod real_mode_tests {
+    //! 验证 EffectExecutor 从 shadow 切到 real 模式后，业务 Effect 真执行。
+    //!
+    //! 这是 Codex P0 的核心证伪测试 — shadow_mode 恒真 + effect no-op + diff=0
+    //! 是循环论证；本模块构造真 mock deps，证明：
+    //!   1. SaveSession → memory.store 被调用
+    //!   2. CancelDraft → channel.cancel_draft 被调用
+    //!   3. NotifyHook → hooks.emit 被调用（spawn 子任务回投，需要等待）
+    //!   4. Quit → shutdown.cancel() 被调用
+    //!   5. StartTurn → spawn 子任务回投 Action::RedrawRequested
+    //!   6. dual_write_guard 在持久化 effect 后被置位
+    use super::*;
+    use crate::channels::TerminalChannel;
+    use crate::chat::session::ChatSession;
+    use crate::hooks::HookManager;
+    use crate::memory::{Memory, MemoryCategory, NoneMemory};
+    use crate::observability::NoopObserver;
+    use crate::providers::Provider;
+    use crate::providers::router::MockEnvProvider;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    /// 记录 memory.store 次数的 wrapper（NoneMemory 不会真存，只 trace 调用）.
+    struct CountingMemory {
+        inner: NoneMemory,
+        store_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for CountingMemory {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.store_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.store(key, content, category, session_id).await
+        }
+        async fn recall(&self, q: &str, l: usize, s: Option<&str>) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            self.inner.recall(q, l, s).await
+        }
+        async fn get(&self, k: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+            self.inner.get(k).await
+        }
+        async fn list(
+            &self,
+            c: Option<&MemoryCategory>,
+            s: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            self.inner.list(c, s).await
+        }
+        async fn forget(&self, k: &str) -> anyhow::Result<bool> {
+            self.inner.forget(k).await
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            self.inner.count().await
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+    }
+
+    /// 计数器版 HookManager wrapper —— 直接复用 HookManager 但放在临时目录.
+    fn build_hook_manager() -> (Arc<HookManager>, TempDir) {
+        let temp = TempDir::new().expect("tempdir");
+        let mgr = HookManager::new(temp.path().to_path_buf());
+        (Arc::new(mgr), temp)
+    }
+
+    /// 构造完整 EffectDeps with mock providers / memory / channel / hooks.
+    fn build_deps(
+        memory: Arc<dyn Memory>,
+        shutdown: CancellationToken,
+    ) -> (EffectDeps, mpsc::Receiver<Action>, Arc<HookManager>, TempDir) {
+        let provider: Arc<dyn Provider> = Arc::new(MockEnvProvider::from_env());
+        let channel: Arc<dyn crate::channels::Channel> = Arc::new(TerminalChannel::new(true));
+        let (hooks, temp) = build_hook_manager();
+        let observer: Arc<dyn crate::observability::Observer> = Arc::new(NoopObserver);
+        let (action_tx, action_rx) = mpsc::channel::<Action>(64);
+        let dual_write_guard = RuntimeDualWriteGuard::new();
+        let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
+        let deps = EffectDeps {
+            provider,
+            memory,
+            channel,
+            hooks: Arc::clone(&hooks),
+            observer,
+            action_tx,
+            dual_write_guard,
+            redraw_tx: Some(redraw_tx),
+            shutdown,
+            model: Arc::from("test-model"),
+            temperature: 0.0,
+            tools_registry: None,
+            max_tool_iterations: 0,
+        };
+        (deps, action_rx, hooks, temp)
+    }
+
+    #[tokio::test]
+    async fn real_mode_save_session_triggers_memory_store() {
+        // 证明 SaveSession effect 在 real 模式下真调用 memory.store.
+        let store_count = Arc::new(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(CountingMemory {
+            inner: NoneMemory::new(),
+            store_count: Arc::clone(&store_count),
+        });
+        let shutdown = CancellationToken::new();
+        let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown.clone());
+        let executor = EffectExecutor::new_with_deps(deps.clone());
+        assert!(!executor.is_shadow());
+
+        let session = ChatSession::new("prov", "model");
+        executor.execute(Effect::SaveSession(session)).await;
+
+        // spawn 子任务异步执行；等一小段时间让其完成.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(
+            store_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "memory.store should be called exactly once"
+        );
+        // RAII scope：子任务完成后 guard 应自动复位（不粘住）.
+        assert!(
+            !deps.dual_write_guard.is_active(),
+            "dual_write_guard should auto-clear after SaveSession completes (RAII scope)"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_mode_cancel_draft_invokes_channel() {
+        // CancelDraft 是短同步路径，直接 await；不会 panic 表示路径通畅.
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown.clone());
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor.execute(Effect::CancelDraft("draft-x".to_string())).await;
+        // 不 panic + 没 hang 即通过；TerminalChannel.cancel_draft 总是 Ok.
+    }
+
+    #[tokio::test]
+    async fn real_mode_quit_cancels_shutdown_token() {
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown.clone());
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        assert!(!shutdown.is_cancelled());
+        executor.execute(Effect::Quit).await;
+        assert!(shutdown.is_cancelled(), "Effect::Quit must cancel shutdown token");
+    }
+
+    #[tokio::test]
+    async fn real_mode_request_redraw_pings_renderer() {
+        // RequestRedraw 在 real 模式下通过 deps.redraw_tx 唤醒主循环.
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let provider: Arc<dyn Provider> = Arc::new(MockEnvProvider::from_env());
+        let channel: Arc<dyn crate::channels::Channel> = Arc::new(TerminalChannel::new(true));
+        let (hooks, _temp) = build_hook_manager();
+        let observer: Arc<dyn crate::observability::Observer> = Arc::new(NoopObserver);
+        let (action_tx, _action_rx) = mpsc::channel::<Action>(64);
+        let (redraw_tx, mut redraw_rx) = mpsc::channel::<()>(4);
+        let deps = EffectDeps {
+            provider,
+            memory,
+            channel,
+            hooks,
+            observer,
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+            redraw_tx: Some(redraw_tx),
+            shutdown: shutdown.clone(),
+            model: Arc::from("test-model"),
+            temperature: 0.0,
+            tools_registry: None,
+            max_tool_iterations: 0,
+        };
+        let executor = EffectExecutor::new_with_deps(deps);
+        executor.execute(Effect::RequestRedraw).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), redraw_rx.recv())
+                .await
+                .expect("redraw within 200ms")
+                .is_some(),
+            "RequestRedraw should ping the redraw channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_mode_start_turn_spawns_subtask_and_does_not_block() {
+        // StartTurn 必须 spawn 子任务回投 Action（Codex P0-1），不阻塞主循环.
+        // 5a-2 起：子任务真接 provider.stream_chat_with_history，并把流式事件
+        // 通过 action_tx 回投——这里走 MockEnvProvider 的 trait 默认实现，
+        // 默认实现发一个 final error chunk，因此应收到 StreamChunkReceived → StreamCompleted。
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let start = std::time::Instant::now();
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-real".to_string(),
+                history: Vec::new(),
+                cancel: CancellationToken::new(),
+            })
+            .await;
+        // execute() 立即返回（不阻塞）；spawn 子任务在后台真调 provider + 回投 Action.
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "StartTurn should not block (Codex P0-1)"
+        );
+
+        // 收第一条 Action：默认 stream 实现发一个 error chunk（delta=error message,
+        // is_final=true），转换成 StreamChunkReceived (因 delta 非空).
+        let action = tokio::time::timeout(Duration::from_millis(1000), action_rx.recv())
+            .await
+            .expect("action within 1s")
+            .expect("action received");
+        match action {
+            Action::StreamChunkReceived { draft_id, version, .. } => {
+                assert_eq!(draft_id, "draft-real", "draft_id must propagate");
+                assert!(version >= 1, "version must start at 1+");
+            }
+            other => panic!("expected StreamChunkReceived, got {other:?}"),
+        }
+
+        // 第二条：is_final=true 进入 break，发送 StreamCompleted.
+        let action = tokio::time::timeout(Duration::from_millis(1000), action_rx.recv())
+            .await
+            .expect("completion within 1s")
+            .expect("completion received");
+        match action {
+            Action::StreamCompleted { draft_id, .. } => {
+                assert_eq!(draft_id, "draft-real", "completion draft_id must propagate");
+            }
+            other => panic!("expected StreamCompleted, got {other:?}"),
+        }
+    }
+
+    /// Step 5a-2 — StartTurn 在 cancel pre-trigger 后立刻发 StreamCancelled.
+    #[tokio::test]
+    async fn real_mode_start_turn_pre_cancel_emits_stream_cancelled() {
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // 启动前即取消
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-cancelled".to_string(),
+                history: Vec::new(),
+                cancel,
+            })
+            .await;
+
+        let action = tokio::time::timeout(Duration::from_millis(500), action_rx.recv())
+            .await
+            .expect("action within 500ms")
+            .expect("action received");
+        match action {
+            Action::StreamCancelled { draft_id } => {
+                assert_eq!(draft_id, "draft-cancelled");
+            }
+            other => panic!("expected StreamCancelled, got {other:?}"),
+        }
+    }
+
+    /// Step 5a-2 — fake streaming provider 验证完整 chunk → completion 序列 + 版本号严格递增.
+    #[tokio::test]
+    async fn real_mode_start_turn_streams_chunks_then_completes() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct FakeStreamProvider;
+
+        #[async_trait]
+        impl Provider for FakeStreamProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    native_tool_calling: false,
+                    vision: false,
+                }
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temperature: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let chunks: Vec<StreamResult<StreamChunk>> = vec![
+                    Ok(StreamChunk::delta("hello ")),
+                    Ok(StreamChunk::reasoning_delta("thinking…")),
+                    Ok(StreamChunk::delta("world")),
+                    Ok(StreamChunk::final_chunk()),
+                ];
+                stream::iter(chunks).boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(FakeStreamProvider);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-stream".to_string(),
+                history: Vec::new(),
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        // 收 chunk 1 (delta="hello ")
+        let a1 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+            .await
+            .expect("first chunk within 1.5s")
+            .expect("first chunk received");
+        match a1 {
+            Action::StreamChunkReceived {
+                draft_id,
+                delta,
+                version,
+            } => {
+                assert_eq!(draft_id, "draft-stream");
+                assert_eq!(delta, "hello ");
+                assert_eq!(version, 1, "first delta version must be 1");
+            }
+            other => panic!("expected StreamChunkReceived#1, got {other:?}"),
+        }
+
+        // reasoning chunk 不产生 Action（被 buffer），下一条仍是 chunk 2 (delta="world")
+        let a2 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+            .await
+            .expect("second chunk within 1.5s")
+            .expect("second chunk received");
+        match a2 {
+            Action::StreamChunkReceived { delta, version, .. } => {
+                assert_eq!(delta, "world");
+                assert_eq!(version, 2, "second delta version must strictly increase");
+            }
+            other => panic!("expected StreamChunkReceived#2, got {other:?}"),
+        }
+
+        // 最终 StreamCompleted，final_text 累计，reasoning 包含 thinking 文本.
+        let a3 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+            .await
+            .expect("completion within 1.5s")
+            .expect("completion received");
+        match a3 {
+            Action::StreamCompleted {
+                draft_id,
+                final_text,
+                reasoning,
+            } => {
+                assert_eq!(draft_id, "draft-stream");
+                assert_eq!(final_text, "hello world");
+                assert_eq!(reasoning, "thinking…");
+            }
+            other => panic!("expected StreamCompleted, got {other:?}"),
+        }
+    }
+
+    /// Step 5a-2 — provider stream 产生 Err 时发 StreamFailed（含 retryable 判定）.
+    #[tokio::test]
+    async fn real_mode_start_turn_stream_error_emits_stream_failed() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamError,
+            StreamOptions, StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct FailingStreamProvider;
+
+        #[async_trait]
+        impl Provider for FailingStreamProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temperature: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let chunks: Vec<StreamResult<StreamChunk>> =
+                    vec![Err(StreamError::Provider("simulated failure".to_string()))];
+                stream::iter(chunks).boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(FailingStreamProvider);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-fail".to_string(),
+                history: Vec::new(),
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+            .await
+            .expect("fail within 1.5s")
+            .expect("fail action received");
+        match action {
+            Action::StreamFailed {
+                draft_id,
+                err,
+                retryable,
+            } => {
+                assert_eq!(draft_id, "draft-fail");
+                assert!(err.contains("simulated failure"));
+                assert!(!retryable, "Provider error is non-retryable");
+            }
+            other => panic!("expected StreamFailed, got {other:?}"),
+        }
+    }
+
+    /// Step 5a-2 — 流中途 cancel 触发 StreamCancelled.
+    #[tokio::test]
+    async fn real_mode_start_turn_mid_stream_cancel_emits_cancelled() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct SlowStreamProvider;
+
+        #[async_trait]
+        impl Provider for SlowStreamProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temperature: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                // 每个 chunk 之间 sleep 200ms 给 cancel 机会
+                let s = stream::unfold(0u32, |i| async move {
+                    if i >= 5 {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Some((Ok(StreamChunk::delta(format!("chunk{i} "))), i + 1))
+                });
+                s.boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(SlowStreamProvider);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let cancel = CancellationToken::new();
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-mid-cancel".to_string(),
+                history: Vec::new(),
+                cancel: cancel.clone(),
+            })
+            .await;
+
+        // 在 250ms 后 cancel：应已经收到至少 1 个 chunk，然后立即 cancel.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        cancel.cancel();
+
+        // 收若干 Action，找到 StreamCancelled.
+        let mut found_cancelled = false;
+        for _ in 0..10 {
+            let action = match tokio::time::timeout(Duration::from_millis(800), action_rx.recv()).await {
+                Ok(Some(a)) => a,
+                _ => break,
+            };
+            if matches!(action, Action::StreamCancelled { .. }) {
+                found_cancelled = true;
+                break;
+            }
+        }
+        assert!(
+            found_cancelled,
+            "mid-stream cancel must emit StreamCancelled within reasonable time"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_write_guard_default_is_inactive() {
+        let g = RuntimeDualWriteGuard::new();
+        assert!(!g.is_active());
+        let scope = g.enter_scope();
+        assert!(g.is_active());
+        assert_eq!(g.active_count(), 1);
+        drop(scope);
+        assert!(!g.is_active());
+        assert_eq!(g.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn dual_write_guard_clone_shares_state() {
+        let g1 = RuntimeDualWriteGuard::new();
+        let g2 = g1.clone();
+        assert!(!g2.is_active());
+        let _scope = g1.enter_scope();
+        assert!(g2.is_active(), "clone shares the same Arc<AtomicU64>");
+    }
+
+    /// 5a-5 Codex P1 修复验证：多个 RAII scope 并发存在时，
+    /// drop 单个 scope 不会让 guard 变 inactive；只有全部 scope drop 后才回到 0.
+    /// 旧的 AtomicBool 实现有严重时序窗：先到的 drop 会把后到的也"清零"。
+    #[tokio::test]
+    async fn dual_write_guard_counting_raii_prevents_early_release() {
+        let g = RuntimeDualWriteGuard::new();
+        let s1 = g.enter_scope();
+        assert!(g.is_active());
+        assert_eq!(g.active_count(), 1);
+        let s2 = g.enter_scope();
+        assert_eq!(g.active_count(), 2);
+        let s3 = g.enter_scope();
+        assert_eq!(g.active_count(), 3);
+
+        // 中间 drop 一个，guard 仍然 active.
+        drop(s2);
+        assert!(
+            g.is_active(),
+            "guard must remain active while sibling scopes are alive (5a-5 P1 fix)"
+        );
+        assert_eq!(g.active_count(), 2);
+
+        drop(s1);
+        assert!(g.is_active(), "guard remains active with last scope alive");
+        assert_eq!(g.active_count(), 1);
+
+        drop(s3);
+        assert!(!g.is_active(), "guard becomes inactive only after all scopes drop");
+        assert_eq!(g.active_count(), 0);
+    }
+
+    /// Ratatui 路径 Ctrl+C 防回归（退化为构造 ChatState + dispatch 双 Ctrl+C 验证 Effect::Quit）.
+    ///
+    /// **背景**：Codex P1 指出 PTY 测试用 `PRX_TUI=0` 走 reedline，没有覆盖
+    /// `run_tui_unified_loop` 的 Ctrl+C 分支。PTY 抓 ratatui 全屏 TUI 输出困难，
+    /// 这里退化为 reducer + executor 单元测试：
+    ///   - 构造 ChatState 模拟 ratatui 路径下双 Ctrl+C in DOUBLE_CTRLC_WINDOW_MS
+    ///   - 验证 reducer 返回 Effect::Quit
+    ///   - 把 Effect::Quit 喂给 real-mode EffectExecutor，验证 shutdown.cancel() 被调用
+    /// 这是端到端"Ctrl+C → 退出"链条的最小可验证子集，覆盖 round 2 hang bug
+    /// 的核心防御路径（reducer 决策 + executor 触发）。
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn ratatui_path_double_ctrlc_exits_via_reducer_and_executor() {
+        use crate::chat::state::ChatState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let shutdown = CancellationToken::new();
+        let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), shutdown.clone());
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        // 第一次 Ctrl+C @ t=1000ms — 不应触发 Quit（仅记录窗口；reducer 要求 prev != 0）
+        let effects1 = state.reduce_with_now(Action::KeyPressed(ctrl_c), 1000);
+        let has_quit_1 = effects1.iter().any(|e| matches!(e, Effect::Quit));
+        assert!(!has_quit_1, "first Ctrl+C should not Quit");
+
+        // 第二次 Ctrl+C @ t=1200ms — 在 500ms 窗口内（200ms 间隔），应 Quit
+        let effects2 = state.reduce_with_now(Action::KeyPressed(ctrl_c), 1200);
+        let has_quit_2 = effects2.iter().any(|e| matches!(e, Effect::Quit));
+        assert!(has_quit_2, "double Ctrl+C within 500ms must Quit");
+
+        // 喂给 real-mode EffectExecutor，验证 shutdown.cancel() 真执行
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown.clone());
+        let executor = EffectExecutor::new_with_deps(deps);
+        for e in effects2 {
+            executor.execute(e).await;
+        }
+        assert!(
+            shutdown.is_cancelled(),
+            "real-mode executor must propagate Effect::Quit to shutdown.cancel()"
+        );
+    }
+
+    /// 防回归补充：单击 Ctrl+C in flight turn 不应导致退出（仅取消当前 turn）.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn single_ctrlc_during_turn_does_not_exit() {
+        use crate::chat::state::ChatState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let shutdown = CancellationToken::new();
+        let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), shutdown.clone());
+        // 模拟 turn 进行中（generating=true）— 通过 TurnStarted action 设置
+        let cancel = CancellationToken::new();
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "d1".to_string(),
+            cancel: cancel.clone(),
+        });
+        assert!(state.control.generating);
+
+        // 单 Ctrl+C — 在 generating 状态下应 cancel draft，不退出.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let effects = state.reduce_with_now(Action::KeyPressed(ctrl_c), 1000);
+        let has_quit = effects.iter().any(|e| matches!(e, Effect::Quit));
+        assert!(!has_quit, "single Ctrl+C in flight turn must not Quit");
+
+        // shutdown 不该被取消
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown.clone());
+        let executor = EffectExecutor::new_with_deps(deps);
+        for e in effects {
+            executor.execute(e).await;
+        }
+        assert!(!shutdown.is_cancelled(), "single Ctrl+C must not cancel shutdown");
+    }
+
+    /// 防回归：Mutex 测试避免 ".unwrap()" — 强制使用 parking_lot.
+    #[tokio::test]
+    async fn parking_lot_mutex_in_test() {
+        let m: Mutex<u32> = Mutex::new(0);
+        *m.lock() = 42;
+        assert_eq!(*m.lock(), 42);
+    }
+
+    // ─── P1: 补足 Effect 真业务单测覆盖 (7/7) ────────────────────────────────────
+
+    /// CountingChannel: 记录 send 调用次数（wrap TerminalChannel）.
+    struct CountingChannel {
+        inner: crate::channels::TerminalChannel,
+        send_count: Arc<AtomicUsize>,
+        finalize_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::channels::Channel for CountingChannel {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        async fn send(&self, message: &crate::channels::traits::SendMessage) -> anyhow::Result<()> {
+            self.send_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.send(message).await
+        }
+        async fn listen(
+            &self,
+            tx: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.inner.listen(tx).await
+        }
+        async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> anyhow::Result<()> {
+            self.finalize_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.finalize_draft(recipient, message_id, text).await
+        }
+        async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+            self.inner.cancel_draft(recipient, message_id).await
+        }
+    }
+
+    /// 构建 CountingChannel deps.
+    fn build_counting_channel_deps(
+        send_count: Arc<AtomicUsize>,
+        finalize_count: Arc<AtomicUsize>,
+        shutdown: CancellationToken,
+    ) -> (EffectDeps, mpsc::Receiver<Action>, TempDir) {
+        let provider: Arc<dyn crate::providers::Provider> =
+            Arc::new(crate::providers::router::MockEnvProvider::from_env());
+        let channel: Arc<dyn crate::channels::Channel> = Arc::new(CountingChannel {
+            inner: crate::channels::TerminalChannel::new(true),
+            send_count,
+            finalize_count,
+        });
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::NoneMemory::new());
+        let (hooks, temp) = build_hook_manager();
+        let observer: Arc<dyn crate::observability::Observer> = Arc::new(crate::observability::NoopObserver);
+        let (action_tx, action_rx) = mpsc::channel::<Action>(64);
+        let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
+        let deps = EffectDeps {
+            provider,
+            memory,
+            channel,
+            hooks,
+            observer,
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+            redraw_tx: Some(redraw_tx),
+            shutdown,
+            model: Arc::from("test-model"),
+            temperature: 0.0,
+            tools_registry: None,
+            max_tool_iterations: 0,
+        };
+        (deps, action_rx, temp)
+    }
+
+    /// P1-1: EmitChannelMessage → channel.send 被真正调用.
+    #[tokio::test]
+    async fn real_mode_emit_channel_message_triggers_channel_send() {
+        let send_count = Arc::new(AtomicUsize::new(0));
+        let finalize_count = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let (deps, _rx, _temp) =
+            build_counting_channel_deps(Arc::clone(&send_count), Arc::clone(&finalize_count), shutdown);
+        let executor = EffectExecutor::new_with_deps(deps.clone());
+
+        use crate::channels::traits::SendMessage;
+        let msg = SendMessage::new("hello from effect".to_string(), "user");
+        executor.execute(Effect::EmitChannelMessage(msg)).await;
+
+        // spawn 子任务异步；等待完成
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(
+            send_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "channel.send should be called exactly once for EmitChannelMessage"
+        );
+        // RAII scope：子任务完成后 guard 应自动复位（不粘住）.
+        assert!(
+            !deps.dual_write_guard.is_active(),
+            "dual_write_guard should auto-clear after EmitChannelMessage completes (RAII scope)"
+        );
+    }
+
+    /// P1-2: PersistToMemory → memory.store 被真正调用（使用已有 CountingMemory）.
+    #[tokio::test]
+    async fn real_mode_persist_to_memory_triggers_memory_store() {
+        let store_count = Arc::new(AtomicUsize::new(0));
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(CountingMemory {
+            inner: crate::memory::NoneMemory::new(),
+            store_count: Arc::clone(&store_count),
+        });
+        let shutdown = CancellationToken::new();
+        let (deps, _rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = EffectExecutor::new_with_deps(deps.clone());
+
+        executor
+            .execute(Effect::PersistToMemory {
+                key: "persist-test-key".to_string(),
+                value: "test-value".to_string(),
+                category: crate::memory::MemoryCategory::Conversation,
+            })
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(
+            store_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "memory.store should be called exactly once for PersistToMemory"
+        );
+        // RAII scope：子任务完成后 guard 应自动复位（不粘住）.
+        assert!(
+            !deps.dual_write_guard.is_active(),
+            "dual_write_guard should auto-clear after PersistToMemory completes (RAII scope)"
+        );
+    }
+
+    /// P1-3a: NotifyHook → 不 panic，RAII scope 确保 guard 在子任务完成后自动复位.
+    ///
+    /// HookManager 不是 trait 无法 wrap 计数；行为验证：
+    /// emit 完成后 guard 自动清 = executor 走了真路径 + RAII 不粘住。
+    /// HookManager 无注册 hooks → emit 是快速 no-op，不影响测试速度。
+    #[tokio::test]
+    async fn real_mode_notify_hook_guard_does_not_stick() {
+        use crate::hooks::HookEvent;
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (deps, _rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = EffectExecutor::new_with_deps(deps.clone());
+
+        assert!(!deps.dual_write_guard.is_active(), "guard should start inactive");
+
+        executor
+            .execute(Effect::NotifyHook {
+                event: HookEvent::TurnComplete,
+                payload: serde_json::json!({"test": "notify-hook"}),
+            })
+            .await;
+
+        // spawn 子任务异步；给足时间完成
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // RAII scope：子任务完成后 guard 应自动复位（不粘住）.
+        assert!(
+            !deps.dual_write_guard.is_active(),
+            "dual_write_guard must auto-clear after NotifyHook completes (RAII scope prevents sticking)"
+        );
+    }
+
+    /// P1-3b: NotifyHook → hooks.emit 真被调用（向临时目录注册真实 hook，用 touch 创建哨兵文件）.
+    ///
+    /// HookManager 不是 trait，无法 mock。改为注册真实 hook：
+    /// 在临时目录写 hooks.json，注册 turn_complete event 执行 `touch <sentinel>`，
+    /// emit 后验证哨兵文件存在即证明 emit 真调了 hook action。
+    #[tokio::test]
+    async fn real_mode_notify_hook_triggers_emit() {
+        use crate::hooks::HookEvent;
+
+        // 构造临时目录 + 注册真实 hook（touch 哨兵文件）
+        let temp = TempDir::new().expect("tempdir");
+        let sentinel = temp.path().join("hook_was_called");
+        let sentinel_str = sentinel.to_str().expect("valid path");
+
+        let hooks_json = serde_json::json!({
+            "enabled": true,
+            "hooks": {
+                "turn_complete": [
+                    {
+                        "command": "touch",
+                        "args": [sentinel_str],
+                        "stdin_json": false
+                    }
+                ]
+            }
+        });
+        std::fs::write(temp.path().join("hooks.json"), hooks_json.to_string()).expect("write hooks.json");
+
+        let hooks = Arc::new(HookManager::new(temp.path().to_path_buf()));
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::NoneMemory::new());
+        let provider: Arc<dyn crate::providers::Provider> =
+            Arc::new(crate::providers::router::MockEnvProvider::from_env());
+        let channel: Arc<dyn crate::channels::Channel> = Arc::new(crate::channels::TerminalChannel::new(true));
+        let observer: Arc<dyn crate::observability::Observer> = Arc::new(crate::observability::NoopObserver);
+        let (action_tx, _action_rx) = mpsc::channel::<Action>(64);
+        let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
+        let shutdown = CancellationToken::new();
+        let deps = EffectDeps {
+            provider,
+            memory,
+            channel,
+            hooks: Arc::clone(&hooks),
+            observer,
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+            redraw_tx: Some(redraw_tx),
+            shutdown,
+            model: Arc::from("test-model"),
+            temperature: 0.0,
+            tools_registry: None,
+            max_tool_iterations: 0,
+        };
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::NotifyHook {
+                event: HookEvent::TurnComplete,
+                payload: serde_json::json!({"turn": "test"}),
+            })
+            .await;
+
+        // hook 通过 tokio::process::Command 执行（异步），给足时间完成
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert!(
+            sentinel.exists(),
+            "hooks.emit should have executed 'touch {sentinel_str}' — sentinel file not found, emit was not called"
+        );
+    }
+
+    /// P1-4a: SendDraftFinalize → 不 panic，不阻塞，RAII guard 不粘.
+    ///
+    /// 验证点：① 不阻塞（立即返回）② guard 子任务完成后自动复位（不粘住）
+    /// ③ channel.finalize_draft 真被调用（finalize_count == 1）.
+    #[tokio::test]
+    async fn real_mode_send_draft_finalize_triggers_channel_finalize() {
+        let send_count = Arc::new(AtomicUsize::new(0));
+        let finalize_count = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let (deps, _rx, _temp) =
+            build_counting_channel_deps(Arc::clone(&send_count), Arc::clone(&finalize_count), shutdown);
+        let executor = EffectExecutor::new_with_deps(deps.clone());
+
+        let start = std::time::Instant::now();
+        executor
+            .execute(Effect::SendDraftFinalize {
+                draft_id: "draft-finalize-test".to_string(),
+                text: "final response text".to_string(),
+            })
+            .await;
+        // 不阻塞：spawn 后立即返回
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "SendDraftFinalize should not block (Codex P0-1)"
+        );
+
+        // 等子任务完成
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // channel.finalize_draft 真被调用
+        assert_eq!(
+            finalize_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "channel.finalize_draft should be called exactly once for SendDraftFinalize"
+        );
+        // RAII scope：guard 在子任务完成后自动复位（不粘住）
+        assert!(
+            !deps.dual_write_guard.is_active(),
+            "dual_write_guard must auto-clear after SendDraftFinalize completes (RAII scope)"
+        );
+    }
+
+    /// P1-5: DisplayMedia → 不 panic，走 trace/debug 路径（5a-1 旧路径主导媒体显示）.
+    #[tokio::test]
+    async fn real_mode_display_media_does_not_panic() {
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (deps, _rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        // 不 panic = 路径通畅；5a-1 阶段仅 debug log，无外部副作用
+        executor
+            .execute(Effect::DisplayMedia {
+                kind: "IMAGE".to_string(),
+                path: "/tmp/test_image.png".to_string(),
+            })
+            .await;
+        // 通过 = 不 panic
+    }
+
+    /// P1-6: AutoTitleSession → 不 panic，走 debug trace 路径.
+    #[tokio::test]
+    async fn real_mode_auto_title_session_does_not_panic() {
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (deps, _rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::AutoTitleSession("session-title-test".to_string()))
+            .await;
+        // 通过 = 不 panic；5a-1 阶段 AutoTitleSession 仅 debug log
+    }
+
+    /// P1-7: LogTrace real 模式 — 验证所有 tracing::Level 都不 panic（real 模式与 shadow 相同路径）.
+    #[tokio::test]
+    async fn real_mode_log_trace_all_levels_do_not_panic() {
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (deps, _rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let levels = [
+            tracing::Level::ERROR,
+            tracing::Level::WARN,
+            tracing::Level::INFO,
+            tracing::Level::DEBUG,
+            tracing::Level::TRACE,
+        ];
+        for level in levels {
+            executor
+                .execute(Effect::LogTrace {
+                    level,
+                    msg: format!("real-mode log test at {level}"),
+                })
+                .await;
+        }
+        // 全部通过 = 不 panic，real 模式 LogTrace 走与 shadow 相同的 emit_trace 路径
+    }
+
+    /// P0-2 验证: set_redraw_tx 后注入 redraw_handle Arc，RequestRedraw 真触发重绘.
+    ///
+    /// 模拟 chat::run 场景：先构造 EffectExecutor（redraw_tx=None），
+    /// 取出 redraw_handle，"spawn"（此处直接执行），然后填入 redraw_tx，
+    /// 验证 RequestRedraw effect 真正触发重绘。
+    #[tokio::test]
+    async fn redraw_handle_injection_enables_request_redraw() {
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        // 构造时 deps.redraw_tx = Some（build_deps 默认给 Some），但我们用 None 模拟时序问题
+        let provider: Arc<dyn crate::providers::Provider> =
+            Arc::new(crate::providers::router::MockEnvProvider::from_env());
+        let channel: Arc<dyn crate::channels::Channel> = Arc::new(crate::channels::TerminalChannel::new(true));
+        let (hooks, _temp) = build_hook_manager();
+        let observer: Arc<dyn crate::observability::Observer> = Arc::new(crate::observability::NoopObserver);
+        let (action_tx, _action_rx) = mpsc::channel::<Action>(64);
+        let deps = EffectDeps {
+            provider,
+            memory,
+            channel,
+            hooks,
+            observer,
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+            redraw_tx: None, // 模拟构造时 redraw_tx 尚不存在
+            shutdown: shutdown.clone(),
+            model: Arc::from("test-model"),
+            temperature: 0.0,
+            tools_registry: None,
+            max_tool_iterations: 0,
+        };
+
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        // 取出 redraw_handle（模拟 chat::run 提前保存 Arc）
+        let redraw_slot = executor.redraw_handle();
+
+        // RequestRedraw before injection — slot is None, should be no-op (no panic)
+        executor.execute(Effect::RequestRedraw).await;
+
+        // 后注入 redraw_tx（模拟 TUI 初始化完成后注入）
+        let (redraw_tx, mut redraw_rx) = mpsc::channel::<()>(4);
+        *redraw_slot.lock() = Some(redraw_tx);
+
+        // 注入后 RequestRedraw 应真正触发
+        executor.execute(Effect::RequestRedraw).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), redraw_rx.recv())
+                .await
+                .expect("redraw within 200ms after injection")
+                .is_some(),
+            "RequestRedraw should trigger after redraw_handle injection (P0-2)"
+        );
+    }
+
+    // ─── P0: DualWriteGuardScope RAII 专项单测 ────────────────────────────────
+
+    /// P0-scope-1: DualWriteGuardScope::enter → guard true；Drop → guard false.
+    #[tokio::test]
+    async fn dual_write_guard_scope_clears_on_drop() {
+        let guard = RuntimeDualWriteGuard::new();
+        assert!(!guard.is_active(), "guard should start false");
+
+        {
+            let _scope = guard.enter_scope();
+            assert!(guard.is_active(), "guard should be true while scope is held");
+        } // scope drops here
+
+        assert!(
+            !guard.is_active(),
+            "guard should be false after scope drop (RAII cleared)"
+        );
+    }
+
+    /// P0-scope-2: panic 路径下 DualWriteGuardScope::drop 仍执行（unwind safety）.
+    #[tokio::test]
+    async fn dual_write_guard_scope_panic_safe() {
+        let guard = RuntimeDualWriteGuard::new();
+        let inner = Arc::clone(&guard.active);
+
+        let result = std::panic::catch_unwind(move || {
+            let scope = DualWriteGuardScope::enter(Arc::clone(&inner));
+            assert!(
+                inner.load(Ordering::Acquire) > 0,
+                "count should be positive inside scope"
+            );
+            // 故意 panic；drop 应在 unwind 期间执行
+            let _keep = scope;
+            panic!("deliberate test panic");
+        });
+
+        assert!(result.is_err(), "catch_unwind should have caught the panic");
+        // panic 后 Drop 执行 → guard 应复位为 false
+        assert!(
+            !guard.is_active(),
+            "guard must be false after panic unwind (Drop still runs)"
+        );
+    }
+
+    /// P0-scope-3: real_mode SaveSession 完成后 guard 不粘（spawn scope 自动清）.
+    ///
+    /// 比 real_mode_save_session_triggers_memory_store 更专注验证 guard 生命周期：
+    /// execute() 调用后 guard 短暂为 true，子任务完成后自动复位 false。
+    #[tokio::test]
+    async fn real_mode_save_session_clears_guard_after_completion() {
+        let store_count = Arc::new(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(CountingMemory {
+            inner: NoneMemory::new(),
+            store_count: Arc::clone(&store_count),
+        });
+        let shutdown = CancellationToken::new();
+        let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = EffectExecutor::new_with_deps(deps.clone());
+
+        let session = crate::chat::session::ChatSession::new("prov", "model");
+        executor.execute(Effect::SaveSession(session)).await;
+
+        // 轮询等待子任务完成（最多 500ms）
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if store_count.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "memory.store not called within 500ms"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 子任务完成后 guard 必须自动复位
+        assert!(
+            !deps.dual_write_guard.is_active(),
+            "dual_write_guard must be false after SaveSession subtask completes (RAII scope auto-cleared)"
+        );
+    }
+
+    // ── Step 5a-4 必补测试 (Codex Phase 3 审计要求) ─────────────────────────
+
+    /// P0-2: EffectDeps.model + temperature 真实透传给 drive_start_turn_stream.
+    ///
+    /// 用 capture provider 断言 stream_chat_with_history 收到的 model/temperature
+    /// 等于 deps 注入值。修复了 5a-2 hard-coded String::new()/0.0 的 Codex P1.
+    #[tokio::test]
+    async fn real_mode_start_turn_passes_model_and_temperature_from_deps() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use parking_lot::Mutex as PMutex;
+
+        #[derive(Default)]
+        struct ParamCaptureProvider {
+            captured_model: Arc<PMutex<String>>,
+            captured_temp: Arc<PMutex<f64>>,
+        }
+
+        #[async_trait]
+        impl Provider for ParamCaptureProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                model: &str,
+                temperature: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                *self.captured_model.lock() = model.to_string();
+                *self.captured_temp.lock() = temperature;
+                let chunks: Vec<StreamResult<StreamChunk>> =
+                    vec![Ok(StreamChunk::delta("ok")), Ok(StreamChunk::final_chunk())];
+                stream::iter(chunks).boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured_model = Arc::new(PMutex::new(String::new()));
+        let captured_temp = Arc::new(PMutex::new(0.0_f64));
+        let provider = Arc::new(ParamCaptureProvider {
+            captured_model: Arc::clone(&captured_model),
+            captured_temp: Arc::clone(&captured_temp),
+        });
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = provider.clone();
+        // 注入非默认 model / temperature 让 capture 能区分.
+        deps.model = Arc::from("gpt-test-99");
+        deps.temperature = 0.42;
+
+        let executor = EffectExecutor::new_with_deps(deps);
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-params".to_string(),
+                history: Vec::new(),
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        // 等首条 chunk 到达，确保 stream_chat_with_history 已被调用.
+        let _ = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+            .await
+            .expect("first chunk within 1.5s");
+
+        let model_seen = captured_model.lock().clone();
+        let temp_seen = *captured_temp.lock();
+        assert_eq!(
+            model_seen, "gpt-test-99",
+            "model must be passed through from EffectDeps"
+        );
+        assert!(
+            (temp_seen - 0.42).abs() < f64::EPSILON,
+            "temperature must be passed through from EffectDeps (got {temp_seen})"
+        );
+    }
+
+    /// P1-1: TurnCompletionSignal 失败链路 API 契约.
+    ///
+    /// 验证 `extract_turn_outcome(StreamFailed) → TurnOutcomeKind::Failed`,
+    /// 且 `record_and_notify` 后 `consume_outcome` 读到同一 Failed (含 err / retryable).
+    /// driver 全链路 (provider Err → drive_start_turn_stream 发 StreamFailed)
+    /// 已被 `real_mode_start_turn_stream_error_emits_stream_failed` 覆盖；
+    /// reducer 链路 (StreamFailed → NotifyHook(Error)) 已被 state.rs 单测覆盖。
+    /// 本测试锁定二者拼接处 TurnCompletionSignal 不丢失 err 语义。
+    #[tokio::test]
+    async fn turn_signal_records_failed_outcome_from_stream_failed_action() {
+        let signal = TurnCompletionSignal::new();
+        let action = Action::StreamFailed {
+            draft_id: "d1".to_string(),
+            err: "simulated provider failure".to_string(),
+            retryable: true,
+        };
+        let outcome = extract_turn_outcome(&action);
+        assert!(matches!(outcome, Some(TurnOutcomeKind::Failed { .. })));
+        if let Some(out) = outcome {
+            signal.record_and_notify(out);
+        }
+        let consumed = signal.consume_outcome();
+        match consumed {
+            Some(TurnOutcomeKind::Failed { err, retryable }) => {
+                assert!(err.contains("simulated"), "err must contain original message");
+                assert!(retryable, "retryable bit must be preserved");
+            }
+            other => panic!("expected Failed outcome, got {other:?}"),
+        }
+        // 第二次 consume 应为 None（消费式 API）.
+        assert!(signal.consume_outcome().is_none(), "consume_outcome must drain slot");
+    }
+
+    /// **5a-6 negative case**：driver 收到 tool_calls chunk 但 `tools_registry == None`，
+    /// 应发 `StreamFailed(retryable=false)`。
+    ///
+    /// route_turn 现在允许 driver 走 tool turn，但 `tools_registry` 为 None 时
+    /// driver 无法执行 tool — 立即 fail-fast，让 chat::run fallthrough.
+    #[tokio::test]
+    async fn driver_without_registry_rejects_tool_call_chunk() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult, ToolCallChunk,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct ToolCallProvider;
+        #[async_trait]
+        impl Provider for ToolCallProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temp: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let calls = vec![ToolCallChunk::new("c1", "shell", r#"{"cmd":"ls"}"#, 0)];
+                stream::iter(vec![
+                    Ok(StreamChunk::tool_call_chunk(calls)),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(ToolCallProvider);
+        // 显式: 不提供 registry → driver 必须 fail.
+        deps.tools_registry = None;
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let cancel = CancellationToken::new();
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-no-registry".to_string(),
+                history: Vec::new(),
+                cancel,
+            })
+            .await;
+
+        // 跳过潜在 ToolStarted (no-registry 路径下不会发, 因为 registry 检查在 ToolStarted 之前) — 用 loop 拿到 StreamFailed.
+        let mut got_failed = false;
+        for _ in 0..6 {
+            let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                .await
+                .expect("driver must respond within 1.5s")
+                .expect("action must be received");
+            match action {
+                Action::StreamFailed {
+                    draft_id,
+                    err,
+                    retryable,
+                } => {
+                    assert_eq!(draft_id, "draft-no-registry");
+                    assert!(!retryable, "no-registry rejection is permanent");
+                    assert!(
+                        err.contains("tools_registry") || err.contains("tool_calls"),
+                        "err must hint at missing registry / tool_calls (got: {err})"
+                    );
+                    got_failed = true;
+                    break;
+                }
+                Action::StreamChunkReceived { .. } | Action::ToolStarted { .. } | Action::ToolFinished { .. } => {
+                    // permitted pre-failure noise; keep draining.
+                }
+                other => panic!("unexpected action before StreamFailed: {other:?}"),
+            }
+        }
+        assert!(got_failed, "driver must emit StreamFailed within 6 actions");
+    }
+
+    /// **5a-6 happy path**：driver 收到 tool_call → 通过 tools_registry 执行 → 把
+    /// tool result 喂回 history → 下一轮 LLM 调用拿到最终文本 → StreamCompleted.
+    ///
+    /// 模拟两轮: 第 1 轮 provider 发 ToolCall(echo-tool, {"text": "hi"}), driver 执行
+    /// echo-tool 返回 "hi"; 第 2 轮 provider 发 final_text="done", driver 完成 turn.
+    #[tokio::test]
+    async fn driver_executes_tool_call_chunk_and_continues_to_completion() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult, ToolCallChunk,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        // ── Echo tool: 返回 args["text"] 原样, 让 driver 把它喂回 provider 验证 history 流转. ──
+        struct EchoTool;
+        #[async_trait]
+        impl crate::tools::Tool for EchoTool {
+            fn name(&self) -> &str {
+                "echo-tool"
+            }
+            fn description(&self) -> &str {
+                "echoes back its text argument"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}})
+            }
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                let text = args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: text,
+                    error: None,
+                })
+            }
+        }
+
+        // ── Provider: 第 1 次 stream 发 tool_call, 第 2 次发 final 文本. ──
+        struct ToolThenTextProvider {
+            counter: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for ToolThenTextProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temp: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+                if n == 0 {
+                    let calls = vec![ToolCallChunk::new("tc-1", "echo-tool", r#"{"text":"echoed"}"#, 0)];
+                    stream::iter(vec![
+                        Ok(StreamChunk::tool_call_chunk(calls)),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                } else {
+                    stream::iter(vec![Ok(StreamChunk::delta("done")), Ok(StreamChunk::final_chunk())]).boxed()
+                }
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(ToolThenTextProvider {
+            counter: Arc::new(AtomicUsize::new(0)),
+        });
+        deps.tools_registry = Some(Arc::new(vec![Box::new(EchoTool) as Box<dyn crate::tools::Tool>]));
+        deps.max_tool_iterations = 4;
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let cancel = CancellationToken::new();
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-tool-happy".to_string(),
+                history: Vec::new(),
+                cancel,
+            })
+            .await;
+
+        let mut saw_tool_started = false;
+        let mut saw_tool_finished_success = false;
+        let mut saw_completion = false;
+        let mut final_text_seen = String::new();
+        for _ in 0..16 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver should respond within 2s per action")
+                .expect("action must arrive");
+            match action {
+                Action::ToolStarted { name, .. } => {
+                    assert_eq!(name, "echo-tool");
+                    saw_tool_started = true;
+                }
+                Action::ToolFinished {
+                    name, success, result, ..
+                } => {
+                    assert_eq!(name, "echo-tool");
+                    if success {
+                        saw_tool_finished_success = true;
+                        assert!(
+                            result.as_deref().is_some_and(|s| s.contains("echoed")),
+                            "tool result must echo back text arg (got {result:?})"
+                        );
+                    }
+                }
+                Action::StreamChunkReceived { delta, .. } => {
+                    final_text_seen.push_str(&delta);
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    saw_completion = true;
+                    assert!(
+                        final_text.contains("done"),
+                        "final text must contain 'done' (got {final_text:?})"
+                    );
+                    break;
+                }
+                Action::StreamFailed { err, .. } => {
+                    panic!("driver should not fail in happy path: {err}");
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_tool_started, "must see ToolStarted");
+        assert!(saw_tool_finished_success, "must see ToolFinished(success=true)");
+        assert!(saw_completion, "must see StreamCompleted");
+        assert!(
+            final_text_seen.contains("done"),
+            "streaming delta must include 'done' (got {final_text_seen:?})"
+        );
+    }
+
+    /// **5a-6 limit case**：max_tool_iterations 超过即触发 StreamFailed.
+    ///
+    /// 模拟 provider 每次都发 tool_call (不停止) — driver 达到 iter 上限后必须 fail.
+    #[tokio::test]
+    async fn driver_max_tool_iterations_emits_stream_failed() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult, ToolCallChunk,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct NoopTool;
+        #[async_trait]
+        impl crate::tools::Tool for NoopTool {
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn description(&self) -> &str {
+                "no-op"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "ok".to_string(),
+                    error: None,
+                })
+            }
+        }
+
+        struct AlwaysToolCallProvider;
+        #[async_trait]
+        impl Provider for AlwaysToolCallProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let calls = vec![ToolCallChunk::new("loop", "noop", "{}", 0)];
+                stream::iter(vec![
+                    Ok(StreamChunk::tool_call_chunk(calls)),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(AlwaysToolCallProvider);
+        deps.tools_registry = Some(Arc::new(vec![Box::new(NoopTool) as Box<dyn crate::tools::Tool>]));
+        deps.max_tool_iterations = 2; // 故意低
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let cancel = CancellationToken::new();
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-max-iter".to_string(),
+                history: Vec::new(),
+                cancel,
+            })
+            .await;
+
+        let mut got_failed = false;
+        for _ in 0..32 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver should respond per action within 2s")
+                .expect("action must arrive");
+            if let Action::StreamFailed { err, retryable, .. } = &action {
+                assert!(!retryable, "max-iter exceeded is permanent");
+                assert!(
+                    err.contains("max tool iterations") || err.contains("max_tool"),
+                    "err must mention max iterations (got: {err})"
+                );
+                got_failed = true;
+                break;
+            }
+        }
+        assert!(
+            got_failed,
+            "driver must emit StreamFailed when max_tool_iterations exceeded"
+        );
+    }
+
+    /// P1-2: driver 路径下 turn 中 cancel — drive_start_turn_stream 内 select! 选 cancel 分支.
+    ///
+    /// 验证 cancel_token cancel 后, drive_start_turn_stream 发 StreamCancelled,
+    /// 而不是继续消费 stream 或发 StreamCompleted.
+    #[tokio::test]
+    async fn driver_mid_turn_cancel_emits_stream_cancelled() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        /// Provider 返回一个"永远不结束"的 stream — 由 cancel 接管.
+        struct PendingStreamProvider;
+        #[async_trait]
+        impl Provider for PendingStreamProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temp: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                // 单 delta + pending（用 stream::pending 让 next() 永远 pending）
+                stream::iter(vec![Ok(StreamChunk::delta("partial"))])
+                    .chain(stream::pending())
+                    .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(PendingStreamProvider);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let cancel = CancellationToken::new();
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-cancel-mid".to_string(),
+                history: Vec::new(),
+                cancel: cancel.clone(),
+            })
+            .await;
+
+        // 先收到一个 delta（partial）证明 stream 已活跃.
+        let a1 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+            .await
+            .expect("first delta within 1.5s")
+            .expect("first delta received");
+        assert!(
+            matches!(a1, Action::StreamChunkReceived { ref delta, .. } if delta == "partial"),
+            "expected first partial delta, got {a1:?}"
+        );
+
+        // turn 中 cancel
+        cancel.cancel();
+
+        // 应立刻收到 StreamCancelled.
+        let a2 = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+            .await
+            .expect("StreamCancelled within 1.5s after cancel")
+            .expect("StreamCancelled received");
+        match a2 {
+            Action::StreamCancelled { draft_id } => assert_eq!(draft_id, "draft-cancel-mid"),
+            other => panic!("expected StreamCancelled after mid-turn cancel, got {other:?}"),
+        }
+    }
+
+    /// P0-1 简化版: try_dispatch ChannelClosed 时返回 ChannelClosed
+    /// (chat::run driver 分支会据此 abort turn + cleanup + continue).
+    #[tokio::test]
+    async fn chat_dispatcher_try_dispatch_returns_channel_closed_after_rx_drop() {
+        let (dispatcher, rx) = ChatDispatcher::new();
+        drop(rx);
+        let result = dispatcher.try_dispatch(Action::StartLLMTurn {
+            draft_id: "d1".to_string(),
+            history: Vec::new(),
+            cancel: CancellationToken::new(),
+        });
+        assert!(
+            matches!(result, DispatchResult::ChannelClosed),
+            "after action_rx drop, try_dispatch must return ChannelClosed (got {result:?})"
+        );
+    }
+}

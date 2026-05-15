@@ -303,6 +303,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
             Effect::SaveSession(_) => "SaveSession",
             Effect::SendDraftFinalize { .. } => "SendDraftFinalize",
             Effect::CancelDraft(_) => "CancelDraft",
+            Effect::CancelToken(_) => "CancelToken",
             Effect::EmitChannelMessage(_) => "EmitChannelMessage",
             Effect::PersistToMemory { .. } => "PersistToMemory",
             Effect::NotifyHook { .. } => "NotifyHook",
@@ -1017,6 +1018,14 @@ pub async fn run(
                     // first draw, so the user sees it on entry rather than
                     // having it print to the parent shell's scrollback.
                     chat_mirror.lock().push_system_message(&banner);
+                    // S2-C Step 3: 双写到 Redux UI 镜像。chat_mirror 仍是 TUI 渲染源
+                    // （Codex P0-3：不能用 reducer ui.conversation_lines 替代 mirror，
+                    // 真实可见 TUI 由 mirror 主导）。本 dispatch 仅供 Redux 路径维护
+                    // 一致的 UI 账本 + 测试断言，redraw_tx 此时尚未注入 EffectExecutor
+                    // 故 RequestRedraw 是 no-op，下方 spawn_tui_unified_loop 启动后
+                    // 首屏会自然 redraw。
+                    let _ = chat_dispatcher
+                        .try_dispatch(crate::chat::action::Action::SystemMessageAdded { text: banner.clone() });
 
                     // The redraw channel exists solely so the UiActor and
                     // background tasks can wake the unified loop on
@@ -1055,6 +1064,7 @@ pub async fn run(
                         shutdown.clone(),
                         Arc::clone(&last_ctrlc_ms),
                         Arc::clone(&active_cancel),
+                        chat_dispatcher.clone(),
                     );
                     (Some(guard), Some(redraw_tx_main))
                 }
@@ -1188,11 +1198,10 @@ pub async fn run(
         let user_input = msg.content.clone();
 
         // Step 5b 双写：每条用户输入入 dispatcher（shadow 观察 reducer）。
-        // InputSubmitted（UI 记账 + LogTrace）+ RecordUserTurn（持久化 history）
-        // 在 reducer 内分别处理。shadow 模式下 history 双写不会真发生（业务
-        // Effect no-op），所以 REDUX_DIFF_COUNT 不会因双写而增加。
+        // InputSubmitted 仅记 UI/LogTrace；RecordUserTurn 真写 history + session.turns，
+        // 必须在 mem_context 注入后才 dispatch（用 `enriched` 与 legacy `history.push`
+        // 字节级对齐 — 见 S2-B Step 4 risk notes）.
         let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::InputSubmitted(user_input.clone()));
-        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordUserTurn(user_input.clone()));
 
         // Echo the user's input into the TUI conversation pane.
         //
@@ -1228,6 +1237,11 @@ pub async fn run(
             #[cfg(feature = "terminal-tui")]
             {
                 chat_mirror.lock().push_system_message(text);
+                // S2-C Step 3: 双写到 Redux UI 镜像（chat_mirror 仍是渲染源）。
+                // Codex P0-3：reducer ui.conversation_lines 不能替代 mirror，
+                // 因此 mirror 写不能在 S2-C 阶段加守卫关闭；本 dispatch 仅是观察账本。
+                let _ = chat_dispatcher
+                    .try_dispatch(crate::chat::action::Action::SystemMessageAdded { text: text.to_string() });
                 // Nudge the unified loop so the slash-command echo shows up
                 // immediately rather than waiting up to 50 ms for the next
                 // crossterm poll cycle. `try_send` + cap=1 coalesces bursts.
@@ -1244,15 +1258,35 @@ pub async fn run(
         // Handle /clear separately (needs mutable history)
         if matches!(user_input.as_str(), "/clear" | "/new") {
             history.clear();
+            // S2-C Step 4: 双写 HistoryCleared 到 reducer。reducer 的语义是
+            // "drain 所有非 system + 保留 system"——legacy 是先 clear 再可能 push
+            // system（仅当 !skill_rag.enabled），最终态都是 "system only"（或空，
+            // 当 skill_rag.enabled 时）。双写期两路径终态一致，但中间状态不同：
+            //   - legacy: clear() 把 history 清空 → 可能 push system
+            //   - reducer: HistoryCleared 保留已有 system（不重新构造）
+            // 实际生产路径 legacy 后续会 push 新构造的 system（覆盖旧 system 的
+            // skill 列表），reducer 这边的 system 仍是上一轮的。本 S2-C 阶段
+            // 不做修正——legacy 仍是 LLM 真上下文源，reducer 是观察账本。
+            let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::HistoryCleared);
             if !config.skill_rag.enabled {
-                history.push(ChatMessage::system(build_runtime_system_prompt(
+                let cleared_system = build_runtime_system_prompt(
                     &config,
                     model_name,
                     &tool_descs,
                     &skills,
                     native_tools,
                     &tools_registry,
-                )));
+                );
+                history.push(ChatMessage::system(cleared_system.clone()));
+                // S2-C Step 4 (Codex P0 修正): 用 SetLeadingSystemPrompt 而非
+                // RecordSystemMessage。reducer 的 HistoryCleared 是 "drain 非 system
+                // 保留 system" — 之前的 system 仍在；若此处用 RecordSystemMessage
+                // (append) 会产生重复 system，长期累计多条。SetLeadingSystemPrompt
+                // 是 upsert：替换已有首位 system 或 push 到空 history，与 legacy
+                // `clear + push` 终态等价（≤ 1 条 system）。
+                let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::SetLeadingSystemPrompt {
+                    content: cleared_system,
+                });
             }
             let cleared = commands::handle_clear(mem.as_ref(), Some(&chat_session.id)).await;
             let msg = if cleared > 0 {
@@ -1281,6 +1315,11 @@ pub async fn run(
                 }
                 commands::CommandResult::Quit => break,
                 commands::CommandResult::SetMode(mode) => {
+                    // S2-B Step 4: dispatch `Action::ModeChanged` 让 reducer 写
+                    // `state.session.mode`。legacy `chat_session.set_mode` 仍 unconditional
+                    // 跑——`chat_session.mode` 在 `run_tool_call_loop` 处被读取，
+                    // 是真实业务驱动源，S2-C 删除 legacy 路径前不能跳过。
+                    let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::ModeChanged(mode));
                     chat_session.set_mode(mode);
                     let msg = match mode {
                         commands::ChatMode::Plan => {
@@ -1327,11 +1366,23 @@ pub async fn run(
             &tools_registry,
         );
         if history.is_empty() {
-            history.push(ChatMessage::system(system_prompt));
+            history.push(ChatMessage::system(system_prompt.clone()));
         } else if let Some(first) = history.first_mut() {
-            *first = ChatMessage::system(system_prompt);
+            *first = ChatMessage::system(system_prompt.clone());
         }
+        // S2-C Step 4: 双写 SetLeadingSystemPrompt 到 reducer — 与 legacy
+        // `if empty { push } else { first_mut = ... }` 字节级语义对齐（reducer
+        // 内部走同样分支）。每轮 turn 都会跑，append 表达会让 system 堆积。
+        let _ = chat_dispatcher
+            .try_dispatch(crate::chat::action::Action::SetLeadingSystemPrompt { content: system_prompt });
         history.push(ChatMessage::user(&enriched));
+
+        // S2-B Step 4: 在与 legacy `history.push(ChatMessage::user(&enriched))` 同一点
+        // dispatch `RecordUserTurn(enriched)` — reducer 内 session.history 与 legacy
+        // history 字节级对齐，session.turns 也用 enriched（与 legacy
+        // `chat_session.add_user_turn(&sanitized_input)` 略有 sanitization 差异；
+        // S2-C 阶段统一持久化路径时再合并）。
+        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordUserTurn(enriched.clone()));
 
         // ── Set active recipient/channel on tools (for proactive messaging) ──
         for tool in tools_registry.iter() {
@@ -1351,6 +1402,14 @@ pub async fn run(
         // only, so the user never sees the model's internal monologue.
         let cancellation = CancellationToken::new();
         let (delta_tx, delta_rx) = mpsc::channel::<String>(DELTA_CHANNEL_CAPACITY);
+
+        // S2-A: per-turn Redux mode snapshot. Read once here so the
+        // `draft_updater` closure (and any future per-turn gating) sees a
+        // consistent view even if env changes mid-process. Off/Both keep the
+        // legacy `update_draft(accumulated)` UI writer; pure Redux mode lets
+        // the reducer-driven renderer own UI text exclusively.
+        #[cfg(feature = "terminal-tui")]
+        let redux_mode = ReduxMode::from_env();
 
         // Start a streaming draft on the terminal
         let draft_id = match terminal.send_draft(&SendMessage::new("", "user")).await {
@@ -1410,6 +1469,15 @@ pub async fn run(
             // bounded(2048) action_tx 满时由 coalescer 合并 delta，避免无界增长。
             let coalescer_sender = chat_dispatcher.sender();
             let coalescer_draft_id = d_id.clone();
+            // S2-A: capture per-turn mode snapshot. In `Off` and `Both` the
+            // legacy `update_draft` still runs (renderer source of truth);
+            // in pure `Redux` it is skipped so the reducer-driven path is the
+            // sole UI writer. The coalescer dispatch always runs — the
+            // reducer needs every delta for its `StreamState::draft` mirror.
+            #[cfg(feature = "terminal-tui")]
+            let legacy_update_draft_enabled = matches!(redux_mode, ReduxMode::Off | ReduxMode::Both);
+            #[cfg(not(feature = "terminal-tui"))]
+            let legacy_update_draft_enabled = true;
             Some(tokio::spawn(async move {
                 let mut accumulated = String::new();
                 let mut coalescer = dispatcher::StreamChunkCoalescer::new(coalescer_sender);
@@ -1419,12 +1487,19 @@ pub async fn run(
                     // inline-redraw protocol uses it). No tracker.accept() —
                     // see comment block above.
                     let version = version_counter.next();
-                    if let Err(e) = channel.update_draft(&reply_target, &draft_id_owned, &accumulated).await {
+                    // S2-A gating: legacy UI write only in Off/Both; pure
+                    // Redux mode lets the reducer + EffectExecutor render.
+                    if legacy_update_draft_enabled
+                        && let Err(e) = channel.update_draft(&reply_target, &draft_id_owned, &accumulated).await
+                    {
                         tracing::debug!("Draft update failed: {e}");
                     }
-                    // Step 5b shadow: investor the delta into the reducer.
-                    // Backpressure or close are silently tolerated (旧路径仍负责
-                    // 真实渲染；shadow 路径只是观察）。
+                    // Step 5b shadow: forward the **incremental** delta into
+                    // the reducer via the coalescer. The reducer accumulates
+                    // its own `draft.accumulated` mirror — feeding the full
+                    // `accumulated` string here would cause double-accumulation.
+                    // Backpressure or close are silently tolerated (legacy
+                    // path remains the renderer source; shadow path observes).
                     let _ = coalescer.try_send_chunk(coalescer_draft_id.clone(), delta, version);
                 }
                 // Stream ended — flush pending coalescer state, counter goes
@@ -1439,7 +1514,20 @@ pub async fn run(
         };
 
         // Register this turn's cancellation token so the Ctrl+C handler can cancel it.
-        *active_cancel.lock() = Some(cancellation.clone());
+        //
+        // S2-B Step 3: 在 Redux 主路径下 `Action::TurnStarted` 已经把 token 写进
+        // `state.control.active_cancel`；reducer + `Effect::CancelToken` 接管单击
+        // Ctrl+C 的真取消。legacy `active_cancel` Arc 仍由顶层 Ctrl+C handler
+        // (mod.rs 持久 ctrl_c() 任务) 和 TUI 内部 `InterruptTurn` 读取 — 这两条
+        // 路径无法直接访问 ChatState，所以 legacy 字段在 Off/Both 模式下必须保留写
+        // 以确保兜底。Redux 模式下 legacy 字段不必再写（reducer 是单一真源）。
+        #[cfg(feature = "terminal-tui")]
+        let legacy_active_cancel_enabled = matches!(redux_mode, ReduxMode::Off | ReduxMode::Both);
+        #[cfg(not(feature = "terminal-tui"))]
+        let legacy_active_cancel_enabled = true;
+        if legacy_active_cancel_enabled {
+            *active_cancel.lock() = Some(cancellation.clone());
+        }
 
         // ── Tool event forwarding (visual feedback in terminal) ──
         //
@@ -1526,9 +1614,23 @@ pub async fn run(
         let mut timeout_retries = 0usize;
         let mut history_len_before_tools;
 
+        // S2-A refinement: split the coarse `Failed` variant so the Redux
+        // dispatch path can distinguish user-driven cancellation from real
+        // errors. The legacy renderer still treats every non-Success as a
+        // failure (continue), but the reducer now sees the correct semantic
+        // (`StreamCancelled` vs `StreamFailed { err, retryable }`).
         enum TurnOutcome {
             Success(String),
-            Failed,
+            /// User-initiated cancel (Ctrl+C) or `is_tool_loop_cancelled` from
+            /// the inner loop. Reducer side maps to `StreamCancelled`.
+            Cancelled,
+            /// Genuine failure (timeout / context-overflow exhausted / other
+            /// error). Carries error string + retryable hint for the reducer's
+            /// `StreamFailed` payload (mirrors `dispatcher::TurnOutcomeKind::Failed`).
+            FailedWithError {
+                err: String,
+                retryable: bool,
+            },
         }
 
         // ── Step 5a-4: Route — Redux driver vs Legacy tool loop ──
@@ -1612,7 +1714,15 @@ pub async fn run(
                     result = ?dispatch_result,
                     "Redux driver: StartLLMTurn dispatch failed; aborting turn"
                 );
-                *active_cancel.lock() = None;
+                // S2-B Step 3: 同步发 StreamCancelled 让 reducer 清 active_cancel，
+                // 旧字段仅在 Off/Both 兜底（与 register 处的守卫对称）。
+                if let Some(ref d_id) = draft_id {
+                    let _ = chat_dispatcher
+                        .try_dispatch(crate::chat::action::Action::StreamCancelled { draft_id: d_id.clone() });
+                }
+                if legacy_active_cancel_enabled {
+                    *active_cancel.lock() = None;
+                }
                 drop(delta_tx);
                 drop(tool_event_tx);
                 if let Some(handle) = draft_updater {
@@ -1637,7 +1747,12 @@ pub async fn run(
             let outcome = turn_signal.consume_outcome();
 
             // Finalize streaming（与 legacy 收尾对齐）：drop senders 让后台任务收口.
-            *active_cancel.lock() = None;
+            //
+            // S2-B Step 3: driver 路径下 reducer 在收到 StreamCompleted/Failed/Cancelled
+            // 时已经清掉 `state.control.active_cancel`；legacy Arc 仅在 Off/Both 兜底.
+            if legacy_active_cancel_enabled {
+                *active_cancel.lock() = None;
+            }
             drop(delta_tx);
             drop(tool_event_tx);
             if let Some(handle) = draft_updater {
@@ -1744,7 +1859,11 @@ pub async fn run(
                             .emit(HookEvent::Error, payload_error("chat-turn", "timeout"))
                             .await;
                     }
-                    break TurnOutcome::Failed;
+                    // S2-A: timeout exhausted is a non-retryable hard failure.
+                    break TurnOutcome::FailedWithError {
+                        err: "timeout".to_string(),
+                        retryable: false,
+                    };
                 }
                 // ── Success ───────────────────────────────────────
                 Ok(Ok(resp)) => break TurnOutcome::Success(resp),
@@ -1753,10 +1872,24 @@ pub async fn run(
                     if let Some(ref d_id) = draft_id {
                         let _ = terminal.cancel_draft("user", d_id).await;
                     }
-                    break TurnOutcome::Failed;
+                    // S2-A: user-driven cancel — distinguished from real
+                    // failures so the reducer emits `StreamCancelled` (no
+                    // Error hook fan-out) instead of `StreamFailed`.
+                    break TurnOutcome::Cancelled;
                 }
                 // ── Context window overflow → compact + retry ─────
                 Ok(Err(ref e)) if is_context_window_overflow_error(e) => {
+                    // S2-B Step 4: dispatch `HistoryCompacted` 让 reducer 对
+                    // `state.session.history` 应用同样的 compaction 算法（两侧共享
+                    // COMPACT_KEEP_MESSAGES/COMPACT_CONTENT_CHARS/COMPACT_TOTAL_CHARS
+                    // 三个常量，state.rs 与 mod.rs 同源 → 字节级一致）。
+                    // legacy `compact_chat_history(&mut history)` 仍 unconditional 跑，
+                    // 因为 `history` 是真实喂给 `run_tool_call_loop` 的 LLM 上下文 Vec —
+                    // S2-C 删除 legacy 路径前不能跳过它，否则 Redux 模式下 overflow
+                    // 重试会拿同一份未压缩的 history 二次失败。
+                    let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::HistoryCompacted {
+                        reason: crate::chat::action::CompactReason::ContextOverflow,
+                    });
                     compact_chat_history(&mut history);
                     let compacted_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
                     tracing::warn!(
@@ -1786,28 +1919,45 @@ pub async fn run(
                             )
                             .await;
                     }
-                    break TurnOutcome::Failed;
+                    // S2-A: compaction retries exhausted — non-retryable.
+                    break TurnOutcome::FailedWithError {
+                        err: "context-overflow-exhausted".to_string(),
+                        retryable: false,
+                    };
                 }
                 // ── Other errors ──────────────────────────────────
                 Ok(Err(e)) => {
                     if let Some(ref d_id) = draft_id {
                         let _ = terminal.cancel_draft("user", d_id).await;
                     }
-                    eprintln!("\nError: {e}\n");
+                    let err_text = e.to_string();
+                    eprintln!("\nError: {err_text}\n");
                     // Phase E (5a-4): dual_write_guard 守卫见 timeout 分支同理.
                     if !dual_write_guard.is_active() {
                         hooks
-                            .emit(HookEvent::Error, payload_error("chat-turn", &e.to_string()))
+                            .emit(HookEvent::Error, payload_error("chat-turn", &err_text))
                             .await;
                     }
-                    break TurnOutcome::Failed;
+                    // S2-A: generic provider/loop error — retryable hint is
+                    // false (the caller already chose to surface and continue;
+                    // retry policy is owned by upstream once tooling lands).
+                    break TurnOutcome::FailedWithError {
+                        err: err_text,
+                        retryable: false,
+                    };
                 }
             }
         };
 
         // ── Finalize streaming ────────────────────────────────────
-        // Deregister this turn's cancellation token
-        *active_cancel.lock() = None;
+        // Deregister this turn's cancellation token.
+        //
+        // S2-B Step 3: legacy 路径下 reducer 在 Stream{Completed,Cancelled,Failed}
+        // dispatch (下方 1886-1911) 时也清 `state.control.active_cancel`；legacy
+        // Arc 仅在 Off/Both 模式兜底（外部 Ctrl+C handler 读这个）。
+        if legacy_active_cancel_enabled {
+            *active_cancel.lock() = None;
+        }
 
         // Drop our channel senders so background tasks receive channel close
         drop(delta_tx);
@@ -1819,6 +1969,14 @@ pub async fn run(
 
         // Step 5b 双写：根据 turn 结果投递相应的流式结束 Action。
         // 当 draft_id 存在时 reducer 才能匹配 stream.draft 并清理；否则 no-op.
+        //
+        // S2-A: split the previous single-pronged "Failed → StreamCancelled"
+        // fallback. Order is **critical**: cancellation is detected up the
+        // stack via `is_tool_loop_cancelled` / `cancellation.is_cancelled()`
+        // and surfaces as `TurnOutcome::Cancelled`. Real errors (timeout /
+        // context overflow / provider error) surface as `FailedWithError` and
+        // map to `StreamFailed { err, retryable }` so the reducer emits the
+        // `NotifyHook(Error) + LogTrace + RequestRedraw` effect chain.
         match &turn_outcome {
             TurnOutcome::Success(resp) => {
                 if let Some(ref d_id) = draft_id {
@@ -1829,20 +1987,27 @@ pub async fn run(
                     });
                 }
             }
-            TurnOutcome::Failed => {
+            TurnOutcome::Cancelled => {
                 if let Some(ref d_id) = draft_id {
-                    // 区分 cancelled vs failed：cancelled 由 active_cancel 取消（旧路径已 cancel）
-                    // 这里统一报 cancelled，更贴合 cancel_draft 已发的 UI 状态。
                     let _ = chat_dispatcher
                         .try_dispatch(crate::chat::action::Action::StreamCancelled { draft_id: d_id.clone() });
                 }
             }
+            TurnOutcome::FailedWithError { err, retryable } => {
+                if let Some(ref d_id) = draft_id {
+                    let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::StreamFailed {
+                        draft_id: d_id.clone(),
+                        err: err.clone(),
+                        retryable: *retryable,
+                    });
+                }
+            }
         }
 
-        // If the turn failed (timeout/cancel/error), skip response processing
+        // If the turn failed or was cancelled, skip response processing
         let response = match turn_outcome {
             TurnOutcome::Success(resp) => resp,
-            TurnOutcome::Failed => continue,
+            TurnOutcome::Cancelled | TurnOutcome::FailedWithError { .. } => continue,
         };
 
         // ── P2-12: Mirror reasoning content into the TUI as a folded card. ──
@@ -1886,6 +2051,15 @@ pub async fn run(
             format!("{tool_summary}\n{response}")
         };
         history.push(ChatMessage::assistant(&history_response));
+
+        // S2-B Step 4: dispatch RecordAssistantTurn(history_response) 在与 legacy
+        // `history.push(ChatMessage::assistant(...))` 同一点 — reducer 的
+        // session.history 与 legacy history 字节级对齐。下方 line 2055 处的
+        // 旧 dispatch 用 sanitized_response，与 history.push 内容不同 — S2-B Step 4
+        // 起改在此处 dispatch 用 history_response，下方旧 dispatch 删除。
+        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordAssistantTurn(
+            history_response.clone(),
+        ));
 
         // ── Extract and display media markers (images, documents, etc.) ──
         let (clean_response, media_items) = extract_outgoing_media(&response);
@@ -1940,16 +2114,18 @@ pub async fn run(
         }
 
         // ── Record turn in session + persist ───────────────────
-        // Sanitize content before persistence (redact secrets, truncate large outputs)
+        // Sanitize content before persistence (redact secrets, truncate large outputs).
+        //
+        // S2-B Step 4: RecordUserTurn / RecordAssistantTurn 已经在上面（enriched /
+        // history_response 同点）dispatch；这里 legacy `chat_session.add_*_turn` 仍
+        // unconditional 跑，因为 `chat_session` 是 `save_session(mem, &chat_session)`
+        // 的真实持久化源。S2-C 阶段由 reducer SaveSession effect 接管 chat_session
+        // 时再删除 legacy 写。两条记录的内容（sanitized vs enriched/history_response）
+        // 暂有差异，由 S2-C 统一。
         let sanitized_input = sanitize::sanitize_for_persistence(&user_input);
         let sanitized_response = sanitize::sanitize_for_persistence(&response);
         chat_session.add_user_turn(&sanitized_input);
         chat_session.add_assistant_turn(&sanitized_response, Vec::new());
-        // Step 5b 双写：把 assistant 回合也投递给 reducer（shadow 状态记账）。
-        // user turn 已经在主循环入口投递 (Action::RecordUserTurn)，此处补 assistant。
-        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordAssistantTurn(
-            sanitized_response.clone(),
-        ));
 
         // P0-1 fix: 旧路径在 Both/Redux 模式下受 dual_write_guard 守卫。
         // Redux reducer 的 SaveSession effect 已在 execute_real 中置位 guard，
@@ -2127,6 +2303,7 @@ fn spawn_tui_unified_loop(
     shutdown: CancellationToken,
     last_ctrlc_ms: Arc<AtomicU64>,
     active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
+    chat_dispatcher: dispatcher::ChatDispatcher,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = run_tui_unified_loop(
@@ -2137,6 +2314,7 @@ fn spawn_tui_unified_loop(
             &shutdown,
             last_ctrlc_ms,
             active_cancel,
+            &chat_dispatcher,
         );
         if let Err(e) = result {
             tracing::error!("TUI unified loop error: {e}");
@@ -2164,6 +2342,7 @@ fn run_tui_unified_loop(
     shutdown: &CancellationToken,
     last_ctrlc_ms: Arc<AtomicU64>,
     active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
     use crate::chat::action::Action;
@@ -2380,10 +2559,20 @@ fn run_tui_unified_loop(
                         let now = now_ms();
                         let prev = last_ctrlc_ms.swap(now, Ordering::Relaxed);
                         if now.saturating_sub(prev) < DOUBLE_CTRLC_WINDOW_MS {
+                            // S2-B Step 3: 双击 — 同时 dispatch ShutdownRequested
+                            // 让 reducer 真发 CancelToken/Quit (Off/Both 模式仍 fallback
+                            // 到 shutdown.cancel()).
+                            let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::ShutdownRequested);
                             shutdown.cancel();
                             return Ok(());
                         }
-                        if let Some(token) = active_cancel.lock().as_ref() {
+                        // S2-B Step 3: 单击 Ctrl+C — 优先走 reducer 路径
+                        // (Action::CancelRequested → Effect::CancelToken → 真 cancel)；
+                        // legacy token.cancel() 在 Off/Both 模式兜底，避免漏取消。
+                        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::CancelRequested);
+                        if matches!(redux_mode, ReduxMode::Off | ReduxMode::Both)
+                            && let Some(token) = active_cancel.lock().as_ref()
+                        {
                             token.cancel();
                         }
                     }

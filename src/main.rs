@@ -863,10 +863,35 @@ enum IntegrationCommands {
     },
 }
 
-#[tokio::main]
+/// Process-wide bound on how long the runtime drop will wait for stuck
+/// blocking threads (notably the reedline `read_line` task that parks in
+/// `spawn_blocking` reading from stdin).
+///
+/// Without this bound, `#[tokio::main]`'s default runtime drop would
+/// `join()` blocking threads forever; reedline's blocking stdin read does
+/// not observe `CancellationToken`s, so e.g. the double-Ctrl-C exit path
+/// (`shutdown.cancel()` → `chat::run` returns) would hang the process
+/// until the user manually killed it. Capping the wait at 2 seconds gives
+/// well-behaved shutdowns time to finish while preventing the foot-gun.
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[allow(unsafe_code)]
+fn main() -> Result<()> {
+    // Build the runtime explicitly (instead of using `#[tokio::main]`) so
+    // that we can bound how long runtime drop waits for blocking threads.
+    // See `RUNTIME_SHUTDOWN_TIMEOUT` above for the rationale.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+    let result = runtime.block_on(async_main());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(unsafe_code)]
-async fn main() -> Result<()> {
+async fn async_main() -> Result<()> {
     // Install default crypto provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
