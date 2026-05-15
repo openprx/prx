@@ -3,6 +3,7 @@
 //! Uses `syntect` for 200+ language syntax highlighting in terminal output.
 //! Gated behind the `terminal-tui` feature.
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
@@ -429,14 +430,25 @@ fn emit_highlighted_block(result: &mut String, state: &mut AnsiState, code: &str
 }
 
 /// Apply basic inline markdown formatting (bold, italic, code).
-fn render_inline_markdown(line: &str) -> String {
-    let mut result = line.to_string();
+///
+/// Returns `Cow::Borrowed(line)` when no inline code is found, avoiding an
+/// allocation for plain-prose lines. When backtick pairs are found the string
+/// is rebuilt with `\x1b[33m…\x1b[0m` wrapping (always reset-terminated so
+/// the shared [`AnsiState`] in the caller can track the trailing reset via
+/// `recompute_from_tail`).
+fn render_inline_markdown(line: &str) -> Cow<'_, str> {
+    // Fast path: no backtick ⇒ borrow the original slice, zero allocation.
+    if !line.contains('`') {
+        return Cow::Borrowed(line);
+    }
+
+    let mut result = line.to_owned();
 
     // Inline code: `code` → \x1b[33mcode\x1b[0m (yellow)
     while let Some(start) = result.find('`') {
-        if let Some(end) = result[start + 1..].find('`') {
-            let end = start + 1 + end;
-            let code = &result[start + 1..end];
+        if let Some(rel_end) = result[start + 1..].find('`') {
+            let end = start + 1 + rel_end;
+            let code = result[start + 1..end].to_owned();
             let replacement = format!("\x1b[33m{code}\x1b[0m");
             result = format!("{}{}{}", &result[..start], replacement, &result[end + 1..]);
         } else {
@@ -444,7 +456,7 @@ fn render_inline_markdown(line: &str) -> String {
         }
     }
 
-    result
+    Cow::Owned(result)
 }
 
 /// Calculate the display width of a string, accounting for CJK characters.
@@ -940,5 +952,69 @@ mod tests {
         assert_eq!(split_eol("abc\r\n"), ("abc", "\r\n"));
         assert_eq!(split_eol("abc"), ("abc", ""));
         assert_eq!(split_eol(""), ("", ""));
+    }
+
+    // ---------------------------------------------------------------
+    // S1-C — AnsiState append-chain integration tests
+    // ---------------------------------------------------------------
+
+    /// Simulates the real append-chunk + push_reset_if_needed call pattern:
+    /// multiple coloured segments, each terminated by push_reset_if_needed,
+    /// must never accumulate consecutive `\x1b[0m\x1b[0m` pairs regardless of
+    /// how many segments are appended in sequence.
+    #[test]
+    fn ansi_state_consecutive_reset_chunks_no_double_reset() {
+        // Each "segment" mirrors what emit_highlighted_block does per line:
+        // 1. push_reset_if_needed (border prefix guard)
+        // 2. push colour introducer
+        // 3. push content
+        // 4. push_reset_if_needed (close colour)
+        let segments: &[(&str, &str)] = &[
+            ("\x1b[31m", "red line"),
+            ("\x1b[32m", "green line"),
+            ("\x1b[1;36m", "hunk header"),
+            ("\x1b[32m", "another add line"),
+        ];
+        let mut s = AnsiState::default();
+        let mut buf = String::new();
+        for (color, text) in segments {
+            // Guard before border — idempotent on first iteration (default state
+            // is "needs reset"), no-op on subsequent iterations that left reset.
+            s.push_reset_if_needed(&mut buf);
+            s.push(&mut buf, color);
+            s.push(&mut buf, text);
+            s.push_reset_if_needed(&mut buf);
+        }
+        assert!(
+            !buf.contains("\x1b[0m\x1b[0m"),
+            "consecutive resets found in output: {buf:?}"
+        );
+        // Exactly one reset must close each segment (4 segments → 4 resets).
+        // The initial push_reset_if_needed for the first segment uses the
+        // default "needs reset" state — so it emits one extra. Total: 5.
+        let resets = count_occurrences(&buf, "\x1b[0m");
+        assert!(resets <= 5, "too many resets for 4 segments ({resets}): {buf:?}");
+    }
+
+    /// Inline code (`render_inline_markdown`) always ends with \x1b[0m.
+    /// When a fenced code block follows immediately on the next line the
+    /// shared AnsiState must not insert a spurious second reset between
+    /// the inline-code reset and the opening border of the block.
+    #[test]
+    fn inline_code_before_code_block_no_double_reset() {
+        // The inline `word` on line 1 ends with \x1b[0m.  The opening border
+        // `  ┌─rust─` emits via state.push (plain text — no SGR).  The first
+        // highlighted line inside the block begins with state.push_reset_if_needed,
+        // which must be a no-op because ends_with_reset is already true.
+        let md = "Use `word` before block\n```rust\nfn f() {}\n```";
+        let out = render_markdown_with_highlighting(md);
+        assert!(
+            !out.contains("\x1b[0m\x1b[0m"),
+            "double reset at inline-code / code-block junction: {out:?}"
+        );
+        // The inline-code yellow colour must still be present.
+        assert!(out.contains("\x1b[33m"), "inline code colour missing");
+        // The fenced block border must still appear.
+        assert!(out.contains("┌─rust"), "opening border missing");
     }
 }
