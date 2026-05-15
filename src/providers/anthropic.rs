@@ -1,13 +1,14 @@
 use crate::multimodal;
 use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
-    ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
+    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
 };
 use crate::tools::ToolSpec;
 use crate::tools::schema::SchemaCleanr;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures::stream::{self, BoxStream, StreamExt};
 use parking_lot::Mutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -671,6 +672,240 @@ impl AnthropicProvider {
     }
 }
 
+// ─── Streaming SSE (5a-7a) ────────────────────────────────────────────────
+//
+// Anthropic Messages API streaming uses an event-driven SSE protocol:
+//   event: message_start
+//   data: {...}
+//
+//   event: content_block_start
+//   data: {"index":0,"content_block":{"type":"text"|"tool_use",...}}
+//
+//   event: content_block_delta
+//   data: {"index":0,"delta":{"type":"text_delta"|"input_json_delta"|"thinking_delta",...}}
+//
+//   event: content_block_stop
+//   data: {"index":0}
+//
+//   event: message_delta / message_stop
+//
+// Tool calls arrive as: content_block_start (tool_use with id/name) + a series
+// of content_block_delta (input_json_delta partial_json fragments) +
+// content_block_stop. We accumulate per-block, then emit a single
+// [`ToolCallChunk`] at content_block_stop time when the block was tool_use.
+
+#[derive(Debug, Serialize)]
+struct OwnedNativeToolSpec {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamingChatRequest {
+    model: String,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<SystemPrompt>,
+    messages: Vec<NativeMessage>,
+    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OwnedNativeToolSpec>>,
+    stream: bool,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct AnthropicSseContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    /// For text blocks, initial text. Usually empty for tool_use start events.
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct AnthropicSseDelta {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    partial_json: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AnthropicStreamState {
+    /// Per-content-block accumulators keyed by Anthropic `index`.
+    blocks: std::collections::HashMap<usize, AnthropicBlockState>,
+    /// Stable emission order for tool calls (chunk `index` field).
+    tool_call_order: usize,
+}
+
+#[derive(Debug, Default)]
+struct AnthropicBlockState {
+    kind: String,
+    tool_id: String,
+    tool_name: String,
+    tool_args: String,
+}
+
+impl AnthropicStreamState {
+    fn on_content_block_start(&mut self, idx: usize, block: AnthropicSseContentBlock) {
+        let mut entry = AnthropicBlockState {
+            kind: block.kind.clone(),
+            ..AnthropicBlockState::default()
+        };
+        if block.kind == "tool_use" {
+            entry.tool_id = block.id.unwrap_or_default();
+            entry.tool_name = block.name.unwrap_or_default();
+        }
+        self.blocks.insert(idx, entry);
+        let _ = block.text; // text in start is unused
+    }
+
+    fn on_content_block_delta(&mut self, idx: usize, delta: AnthropicSseDelta) -> Option<DeltaOutcome> {
+        match delta.kind.as_str() {
+            "text_delta" => {
+                let text = delta.text.unwrap_or_default();
+                if !text.is_empty() {
+                    return Some(DeltaOutcome::Text(text));
+                }
+            }
+            "thinking_delta" => {
+                let text = delta.thinking.or(delta.text).unwrap_or_default();
+                if !text.is_empty() {
+                    return Some(DeltaOutcome::Reasoning(text));
+                }
+            }
+            "input_json_delta" => {
+                let frag = delta.partial_json.unwrap_or_default();
+                if let Some(entry) = self.blocks.get_mut(&idx) {
+                    entry.tool_args.push_str(&frag);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn on_content_block_stop(&mut self, idx: usize) -> Option<ToolCallChunk> {
+        let entry = self.blocks.remove(&idx)?;
+        if entry.kind != "tool_use" {
+            return None;
+        }
+        if entry.tool_name.is_empty() {
+            return None;
+        }
+        let order = self.tool_call_order;
+        self.tool_call_order = self.tool_call_order.saturating_add(1);
+        let id = if entry.tool_id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            entry.tool_id
+        };
+        let args = if entry.tool_args.is_empty() {
+            "{}".to_string()
+        } else {
+            entry.tool_args
+        };
+        Some(ToolCallChunk {
+            id,
+            name: entry.tool_name,
+            args,
+            index: order,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeltaOutcome {
+    Text(String),
+    Reasoning(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AnthropicEvent {
+    /// `event: content_block_start` with parsed payload index + block.
+    BlockStart(usize, AnthropicSseContentBlock),
+    /// `event: content_block_delta` index + delta.
+    BlockDelta(usize, AnthropicSseDelta),
+    /// `event: content_block_stop` index.
+    BlockStop(usize),
+    /// `event: message_stop` — terminates the turn.
+    MessageStop,
+    /// Any other event (ping/message_start/message_delta) — ignored.
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockStartPayload {
+    index: usize,
+    content_block: AnthropicSseContentBlock,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockDeltaPayload {
+    index: usize,
+    delta: AnthropicSseDelta,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockStopPayload {
+    index: usize,
+}
+
+/// Parse a single Anthropic SSE record into a structured event. The record
+/// consists of one or more `event:`/`data:` lines (no blank-line separator
+/// inside the record). Returns `Ok(None)` when the record has no `data:` line.
+fn parse_anthropic_sse_record(record: &str) -> StreamResult<Option<AnthropicEvent>> {
+    let mut event_name: Option<&str> = None;
+    let mut data_buf = String::new();
+    for line in record.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_name = Some(rest.trim());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data_buf.is_empty() {
+                data_buf.push('\n');
+            }
+            data_buf.push_str(rest.trim());
+        }
+    }
+    if data_buf.is_empty() {
+        return Ok(None);
+    }
+    let event_name = event_name.unwrap_or("");
+    match event_name {
+        "content_block_start" => {
+            let payload: BlockStartPayload = serde_json::from_str(&data_buf).map_err(StreamError::Json)?;
+            Ok(Some(AnthropicEvent::BlockStart(payload.index, payload.content_block)))
+        }
+        "content_block_delta" => {
+            let payload: BlockDeltaPayload = serde_json::from_str(&data_buf).map_err(StreamError::Json)?;
+            Ok(Some(AnthropicEvent::BlockDelta(payload.index, payload.delta)))
+        }
+        "content_block_stop" => {
+            let payload: BlockStopPayload = serde_json::from_str(&data_buf).map_err(StreamError::Json)?;
+            Ok(Some(AnthropicEvent::BlockStop(payload.index)))
+        }
+        "message_stop" => Ok(Some(AnthropicEvent::MessageStop)),
+        _ => Ok(Some(AnthropicEvent::Other)),
+    }
+}
+
 #[async_trait]
 impl Provider for AnthropicProvider {
     async fn chat_with_system(
@@ -857,6 +1092,174 @@ impl Provider for AnthropicProvider {
             let _ = request.send().await?;
         }
         Ok(())
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    /// **5a-7a**: Native Anthropic Messages API streaming.
+    ///
+    /// Sends `stream: true` to `/v1/messages`, parses the event-driven SSE
+    /// stream via [`parse_anthropic_sse_record`], aggregates `input_json_delta`
+    /// fragments per content_block, and emits a [`ToolCallChunk`] on each
+    /// `content_block_stop` whose block is `tool_use`.
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        let credential = match self.ensure_fresh_credential() {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = e.to_string();
+                return stream::once(async move { Err(StreamError::Provider(msg)) }).boxed();
+            }
+        };
+
+        let (system_prompt, native_messages) = Self::convert_messages(messages);
+        // Anthropic tools API is not surfaced over the legacy
+        // `stream_chat_with_history(messages, model, ..)` signature; the
+        // driver passes tools through `EffectDeps.tools_registry` and we
+        // serialise assistant tool_call / tool_result back into history. So we
+        // *also* need to send the tool catalogue on every streaming call —
+        // resolve it from the global registry hook below. Until tools are
+        // threaded through the trait, we omit tools here; chat::run still
+        // injects native tool schema through the legacy chat_with_tools path
+        // when needed. driver path will operate without native schema until
+        // step 5a-7b adds tools to the streaming signature.
+        let tools: Option<Vec<OwnedNativeToolSpec>> = None;
+
+        let url = format!("{}/v1/messages", self.base_url);
+        let client = self.http_client();
+        let use_bearer = Self::is_setup_token(&credential);
+
+        let request_body = StreamingChatRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            system: system_prompt,
+            messages: native_messages,
+            temperature,
+            tools,
+            stream: true,
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            let mut req = client
+                .post(&url)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .json(&request_body);
+            req = if use_bearer {
+                req.header("Authorization", format!("Bearer {credential}"))
+                    .header("anthropic-beta", "oauth-2025-04-20")
+            } else {
+                req.header("x-api-key", &credential)
+            };
+
+            let response = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let preview = body.chars().take(300).collect::<String>();
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!(
+                        "Anthropic streaming HTTP {status}: {preview}"
+                    ))))
+                    .await;
+                return;
+            }
+
+            let mut state = AnthropicStreamState::default();
+            let mut byte_stream = response.bytes_stream();
+            let mut buf = String::new();
+            let mut sent_final = false;
+
+            'outer: while let Some(bytes_res) = byte_stream.next().await {
+                let bytes = match bytes_res {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx.send(Err(StreamError::Http(e))).await;
+                        return;
+                    }
+                };
+                let text = match std::str::from_utf8(&bytes) {
+                    Ok(t) => t.to_string(),
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(StreamError::InvalidSse(format!(
+                                "non-utf8 byte in Anthropic SSE: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                buf.push_str(&text);
+
+                // SSE records are separated by blank lines (`\n\n`).
+                while let Some(end) = buf.find("\n\n") {
+                    let record: String = buf.drain(..end + 2).collect();
+                    let event = match parse_anthropic_sse_record(&record) {
+                        Ok(Some(ev)) => ev,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    };
+                    match event {
+                        AnthropicEvent::BlockStart(idx, block) => {
+                            state.on_content_block_start(idx, block);
+                        }
+                        AnthropicEvent::BlockDelta(idx, delta) => {
+                            if let Some(outcome) = state.on_content_block_delta(idx, delta) {
+                                let mut chunk = match outcome {
+                                    DeltaOutcome::Text(t) => StreamChunk::delta(t),
+                                    DeltaOutcome::Reasoning(r) => StreamChunk::reasoning_delta(r),
+                                };
+                                if options.count_tokens {
+                                    chunk = chunk.with_token_estimate();
+                                }
+                                if tx.send(Ok(chunk)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        AnthropicEvent::BlockStop(idx) => {
+                            if let Some(call) = state.on_content_block_stop(idx) {
+                                if tx.send(Ok(StreamChunk::tool_call_chunk(vec![call]))).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        AnthropicEvent::MessageStop => {
+                            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+                            sent_final = true;
+                            break 'outer;
+                        }
+                        AnthropicEvent::Other => {}
+                    }
+                }
+            }
+
+            if !sent_final {
+                let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
     }
 }
 
