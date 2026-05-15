@@ -6,9 +6,12 @@
 // Chat module: println!/eprintln! are intentional user-facing output (banners, status, errors).
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+pub mod action;
 pub mod commands;
+pub mod dispatcher;
 pub mod sanitize;
 pub mod session;
+pub mod state;
 pub mod terminal_proto;
 
 #[cfg(feature = "terminal-tui")]
@@ -26,7 +29,7 @@ use crate::channels::{
     Channel, SendMessage, TerminalChannel, extract_tool_context_summary, is_context_window_overflow_error,
     sanitize_channel_response,
 };
-use crate::chat::terminal_proto::{DraftVersionCounter, DraftVersionTracker};
+use crate::chat::terminal_proto::DraftVersionCounter;
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
 use crate::memory::{self, Memory, MemoryCategory};
@@ -35,7 +38,7 @@ use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::PolicyPipeline;
 use crate::security::SecurityPolicy;
-use crate::tools;
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::sync::Arc;
@@ -124,6 +127,221 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Chat 输入路径的 Redux 灰度模式. 由环境变量 `PRX_CHAT_REDUX` 控制.
+///
+/// - `Off`:  旧路径单写（默认）。reducer 不构造、不执行。
+/// - `Both`: 双写。Event 同时分发到旧路径和 reducer，两者并行 mutate；
+///   用于开发/测试期对账 reducer 与旧实现的行为一致。
+/// - `Redux`: 新路径主导关键控制流（Quit / forward-delete 等）。
+///   旧路径仍执行以维持渲染源（chat_mirror），Step 5 起删除。
+#[cfg(feature = "terminal-tui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReduxMode {
+    Off,
+    Both,
+    Redux,
+}
+
+#[cfg(feature = "terminal-tui")]
+impl ReduxMode {
+    /// 解析环境变量 `PRX_CHAT_REDUX`. 默认 `Off`.
+    fn from_env() -> Self {
+        match std::env::var("PRX_CHAT_REDUX").as_deref() {
+            Ok("1") => Self::Redux,
+            Ok("both") => Self::Both,
+            _ => Self::Off,
+        }
+    }
+}
+
+/// Step 5a-4: chat::run 主循环 LLM turn 路由结果.
+///
+/// "切闸"决策由两个独立环境变量正交控制：
+/// - `PRX_CHAT_REDUX=1` → reducer 模式（[`ReduxMode::Redux`]）— driver 切闸的前置条件
+/// - `PRX_CHAT_REDUX_DRIVER=1` → 在 Redux 模式下显式 opt-in dispatcher driver
+///
+/// **5a-6 更新**：driver 现已支持 tool turn ( `drive_start_turn_stream` 收到
+/// `ToolCallChunk` 后通过 `EffectDeps::tools_registry` 执行 + 多轮回合).
+/// 命中 [`TurnRoute::ReduxDriver`] 仅需 `PRX_CHAT_REDUX=1` + `PRX_CHAT_REDUX_DRIVER=1`，
+/// `tools_registry` 是否为空不再是路由条件。但 driver 未覆盖 approval / multimodal /
+/// parallel / compaction / tiering 等高级场景，这些需要时仍走 legacy `run_tool_call_loop`
+/// (后续 step 渐进迁移).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Off / TUI 关闭场景下未必引用所有 variant
+pub(crate) enum TurnRoute {
+    /// 走旧 `run_tool_call_loop`（生产默认）.
+    LegacyToolLoop,
+    /// 走 Redux dispatcher driver（仅当 Redux + driver opt-in + 无 tools）.
+    ReduxDriver,
+}
+
+/// 解析 `PRX_CHAT_REDUX_DRIVER` env 是否启用 driver 切闸.
+#[cfg(feature = "terminal-tui")]
+#[allow(dead_code)]
+fn driver_opt_in_from_env() -> bool {
+    matches!(std::env::var("PRX_CHAT_REDUX_DRIVER").as_deref(), Ok("1"))
+}
+
+/// 测试钩子：`PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS=1` 强制把 tools_registry 视为空，
+/// 让 5a-4 driver 切闸路径在 PTY E2E 中能被命中验证（生产环境核心工具硬编码非空）.
+///
+/// 仅影响路由判定 — tools_registry 内容本身**不**被清空，所以 legacy 路径分支
+/// 不受影响。命名带 `FORCE_EMPTY_TOOLS` 让生产部署 grep 容易识别为测试旁路。
+///
+/// **5a-5 Codex P0 修复**：用 `cfg(any(test, feature = "test-mock"))` 编译期门控
+/// — release build 不含 `test-mock` feature 时该函数永远返回 `false`，env 完全无效，
+/// 杜绝生产环境误开旁路丢失工具能力的风险。运行时 warn 只是兜底，不是终极防线。
+#[cfg(feature = "terminal-tui")]
+#[allow(dead_code)]
+#[allow(clippy::missing_const_for_fn)]
+fn force_empty_tools_from_env() -> bool {
+    // 编译期门控：只有 test build 或显式 test-mock feature 才允许读取这个 env.
+    // 标准 release build (cargo build --release --features terminal-tui) 直接走
+    // 下方 `false` 兜底分支，与 env 值无关 — 即便 attacker 设了该 env 也无效.
+    #[cfg(any(test, feature = "test-mock"))]
+    {
+        matches!(
+            std::env::var("PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS").as_deref(),
+            Ok("1")
+        )
+    }
+    #[cfg(not(any(test, feature = "test-mock")))]
+    {
+        false
+    }
+}
+
+/// Step 5a-4 路由契约函数：根据 ReduxMode + driver opt-in 决定本轮 turn 走哪条路径.
+///
+/// **5a-6 更新**：`tools_empty` 限制已移除. driver 现支持 tool turn (`drive_start_turn_stream`
+/// 收到 `ToolCallChunk` 时通过 `tools_registry` 执行 + 多轮回合). 保留 `driver_opt_in`
+/// env 闸 (`PRX_CHAT_REDUX_DRIVER`) 作为生产灰度开关; 默认仍走 legacy.
+///
+/// 路由真值表 (TUI feature):
+/// | mode  | driver_opt_in | 路由           |
+/// |-------|---------------|----------------|
+/// | Off   | *             | LegacyToolLoop |
+/// | Both  | *             | LegacyToolLoop |
+/// | Redux | false         | LegacyToolLoop |
+/// | Redux | true          | ReduxDriver    |
+///
+/// 非 TUI feature 下永远返回 [`TurnRoute::LegacyToolLoop`].
+///
+/// 注意 driver **未覆盖**的 legacy 能力（5a-6 故意保守）:
+/// - approval_manager (危险 tool 审批)
+/// - multimodal 图片校验
+/// - parallel tools / scope_ctx / 并发治理
+/// - context overflow 自动 compaction
+/// - tool tiering / priority scheduling
+///
+/// 这些场景上游 (run_tool_call_loop) 仍主导, 由后续 step 渐进迁移.
+#[cfg(feature = "terminal-tui")]
+#[must_use]
+pub(crate) const fn route_turn(mode: ReduxMode, driver_opt_in: bool, _tools_empty: bool) -> TurnRoute {
+    if matches!(mode, ReduxMode::Redux) && driver_opt_in {
+        TurnRoute::ReduxDriver
+    } else {
+        TurnRoute::LegacyToolLoop
+    }
+}
+
+#[cfg(not(feature = "terminal-tui"))]
+#[must_use]
+#[allow(dead_code)]
+pub(crate) const fn route_turn(_mode: (), _driver_opt_in: bool, _tools_empty: bool) -> TurnRoute {
+    TurnRoute::LegacyToolLoop
+}
+
+/// P1-2: Both 模式下的累计差异计数器.
+///
+/// 每次 `log_redux_key_diff` 检测到旧路径 dispatch 与新路径 Effect 存在语义差异时 += 1.
+/// 测试可通过 [`redux_diff_count`] 查询该值，断言双写期行为一致（期望 0）。
+#[cfg(feature = "terminal-tui")]
+static REDUX_DIFF_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// 查询 Both 模式下累计的对账差异次数（供测试断言用）.
+#[cfg(feature = "terminal-tui")]
+#[allow(dead_code)]
+pub fn redux_diff_count() -> u64 {
+    REDUX_DIFF_COUNT.load(Ordering::Relaxed)
+}
+
+/// 重置对账差异计数器（测试间隔离用）.
+#[cfg(feature = "terminal-tui")]
+#[allow(dead_code)]
+pub fn reset_redux_diff_count() {
+    REDUX_DIFF_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Both 模式下记录旧路径 dispatch 与 reducer Effect 列表的差异（tracing::debug + 计数器）.
+///
+/// 用于 Step 2 双写期对账：若关键控制流（Quit / Submit）在两侧产生不同输出，
+/// 该日志能在 PTY 测试日志里高亮出来，同时 `REDUX_DIFF_COUNT` += 1 供测试断言。
+/// Step 5 删除旧路径后移除。
+///
+/// P2-5: 补充字段级比对——检测 Quit 语义差异（旧路径 Exit vs 新路径 Quit）和
+/// Submitted 语义差异（旧路径 Submitted vs 新路径含 LogTrace）。
+#[cfg(feature = "terminal-tui")]
+fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
+    use state::Effect;
+    let old_kind = match old {
+        tui::KeyDispatch::Submitted(_) => "Submitted",
+        tui::KeyDispatch::Exit => "Exit",
+        tui::KeyDispatch::InterruptTurn => "InterruptTurn",
+        tui::KeyDispatch::Cancelled => "Cancelled",
+        tui::KeyDispatch::Consumed => "Consumed",
+    };
+    let new_kinds: Vec<&'static str> = new_effects
+        .iter()
+        .map(|e| match e {
+            Effect::Quit => "Quit",
+            Effect::RequestRedraw => "RequestRedraw",
+            Effect::LogTrace { .. } => "LogTrace",
+            Effect::StartTurn { .. } => "StartTurn",
+            Effect::SaveSession(_) => "SaveSession",
+            Effect::SendDraftFinalize { .. } => "SendDraftFinalize",
+            Effect::CancelDraft(_) => "CancelDraft",
+            Effect::EmitChannelMessage(_) => "EmitChannelMessage",
+            Effect::PersistToMemory { .. } => "PersistToMemory",
+            Effect::NotifyHook { .. } => "NotifyHook",
+            Effect::DisplayMedia { .. } => "DisplayMedia",
+            Effect::AutoTitleSession(_) => "AutoTitleSession",
+        })
+        .collect();
+
+    // P1-2 + P2-5: 字段级语义差异检测——比对关键控制流分类是否一致.
+    // 差异定义：
+    //   1. 旧路径 Exit（Ctrl+D 空 buffer）≠ 新路径无 Quit
+    //   2. 旧路径无 Exit，但新路径有 Quit（reducer 检测到双 Ctrl+C 或 Ctrl+D）
+    //   3. 旧路径 Submitted，但新路径无 LogTrace（InputSubmitted 路径未触发）
+    let new_has_quit = new_effects.iter().any(|e| matches!(e, Effect::Quit));
+    let new_has_log_trace = new_effects.iter().any(|e| matches!(e, Effect::LogTrace { .. }));
+
+    let is_diff = match old {
+        tui::KeyDispatch::Exit => !new_has_quit,
+        tui::KeyDispatch::Submitted(_) => !new_has_log_trace,
+        // Ctrl+C → InterruptTurn in old path; new path either returns [] or Quit.
+        // 只在新路径意外产生 Quit（但旧路径没有 Exit 语义）时记为差异.
+        tui::KeyDispatch::InterruptTurn | tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed => new_has_quit,
+    };
+
+    if is_diff {
+        REDUX_DIFF_COUNT.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            old_dispatch = old_kind,
+            new_effects = ?new_kinds,
+            diff_count = REDUX_DIFF_COUNT.load(Ordering::Relaxed),
+            "redux:both SEMANTIC DIFF detected"
+        );
+    } else {
+        tracing::debug!(
+            old_dispatch = old_kind,
+            new_effects = ?new_kinds,
+            "redux:both ok"
+        );
+    }
 }
 
 fn autosave_memory_key(prefix: &str) -> String {
@@ -478,7 +696,7 @@ pub async fn run(
     // ── Wire up subsystems (same as agent::run) ──────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
-    let hooks = HookManager::new(config.workspace_dir.clone());
+    let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
 
@@ -508,7 +726,11 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let tools_registry = tools::all_tools_with_runtime(
+    // 5a-6: tools_registry 用 `Arc<Vec<Box<dyn Tool>>>` 共享，让 Redux driver
+    // (Effect::StartTurn → drive_start_turn_stream 子任务) 与 legacy `run_tool_call_loop`
+    // (借用 &tools_registry) 共用同一份 registry，无需重新构造。Arc clone 仅 +1 引用，
+    // 不触发深拷贝；legacy 借用通过 &*tools_registry 解引用拿到 &Vec.
+    let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -521,7 +743,7 @@ pub async fn run(
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    );
+    ));
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -545,7 +767,7 @@ pub async fn run(
         codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
     };
 
-    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider_with_options(
         provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
@@ -553,7 +775,7 @@ pub async fn run(
         &config.model_routes,
         model_name,
         &provider_runtime_options,
-    )?;
+    )?);
 
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
@@ -677,6 +899,78 @@ pub async fn run(
     // observe shutdown and exit its blocking poll cleanly.
     let shutdown = CancellationToken::new();
 
+    // ── Step 5a-1: Redux dispatcher (shadow / real-deps mode) ────
+    //
+    // 全局 dispatcher channel + EffectExecutor + ChatState 在此构造。
+    // EffectExecutor 模式由 `PRX_CHAT_REDUX` env 决定：
+    //   - Off (默认)：shadow 模式，业务 Effect 全部 no-op；旧路径单写
+    //   - Both：real 模式，业务 Effect 真执行 + 旧路径仍跑；dual_write_guard
+    //     在 reducer 持久化 effect 后置位，旧路径检查 guard 跳过对应写
+    //   - Redux：与 Both 行为相同（5a-1 阶段不删旧路径；5a-3 才真正删旧路径）
+    //
+    // bounded(2048)：覆盖典型 chat session 的 Action 流（用户输入 + 流式 chunk +
+    // 工具事件 + 信号），同时在反压时通过 [`StreamChunkCoalescer`] 合并 delta，
+    // 避免无界增长导致 OOM。
+    let (chat_dispatcher, chat_action_rx) = dispatcher::ChatDispatcher::new();
+    let dispatcher_shadow_state =
+        state::ChatState::new(Arc::from(provider_name), Arc::from(model_name), shutdown.clone());
+
+    // 共享 dual-write guard（在 Both/Redux 模式下被 EffectExecutor 置位；旧路径
+    // 检查 guard 决定是否跳过持久化。即使 Off 模式也构造，旧路径检查总是 false 零开销。
+    // P0-1 fix: 去掉 allow(unused_variables)，guard 在旧路径 turn 结束时被读取，
+    // 两种 feature 配置下都确保真正使用）
+    let dual_write_guard = dispatcher::RuntimeDualWriteGuard::new();
+
+    // 根据 redux mode 选择 EffectExecutor 模式（TUI feature only）
+    #[cfg(feature = "terminal-tui")]
+    let effect_executor = {
+        let mode = ReduxMode::from_env();
+        if matches!(mode, ReduxMode::Off) {
+            dispatcher::EffectExecutor::new_shadow()
+        } else {
+            let deps = dispatcher::EffectDeps {
+                provider: Arc::clone(&provider),
+                memory: Arc::clone(&mem),
+                channel: Arc::clone(&terminal) as Arc<dyn crate::channels::Channel>,
+                hooks: Arc::clone(&hooks),
+                observer: Arc::clone(&observer),
+                action_tx: chat_dispatcher.sender(),
+                dual_write_guard: dual_write_guard.clone(),
+                redraw_tx: None,
+                shutdown: shutdown.clone(),
+                model: Arc::from(model_name),
+                temperature,
+                // 5a-6: 共享 tools_registry，让 driver 在 tool turn 中按名查表执行。
+                tools_registry: Some(Arc::clone(&tools_registry)),
+                max_tool_iterations: config.agent.max_tool_iterations,
+            };
+            tracing::info!(mode = ?mode, "PRX_CHAT_REDUX: EffectExecutor in real-deps mode");
+            dispatcher::EffectExecutor::new_with_deps(deps)
+        }
+    };
+    #[cfg(not(feature = "terminal-tui"))]
+    let effect_executor = dispatcher::EffectExecutor::new_shadow();
+
+    // P0-2 fix: 提前获取 redraw_slot Arc，用于在 TUI 初始化完成后后注入 redraw_tx。
+    // EffectExecutor 被 spawn_dispatcher_task_with_executor 消费，但 Arc 在 spawn
+    // 前复制出来，spawn 后仍可通过此 Arc 填入真实 sender，让 RequestRedraw 真执行。
+    #[cfg(feature = "terminal-tui")]
+    let executor_redraw_slot = effect_executor.redraw_handle();
+
+    // Step 5a-4: TurnCompletionSignal — Redux driver 切闸路径用此 signal 在
+    // chat::run 主循环里 await turn 完成。dispatcher task 消费 terminal action
+    // (StreamCompleted/Failed/Cancelled) 后 notify_waiters，唤醒等待。
+    // Off / legacy 路径不读 signal，构造成本极低（Arc<Notify>）。
+    let turn_signal = dispatcher::TurnCompletionSignal::new();
+
+    let dispatcher_handle = dispatcher::spawn_dispatcher_task_with_signal(
+        dispatcher_shadow_state,
+        chat_action_rx,
+        shutdown.clone(),
+        effect_executor,
+        Some(turn_signal.clone()),
+    );
+
     // ── Ctrl+C shared state ─────────────────────────────────────
     // Tracks the timestamp (ms) of the last Ctrl+C press for double-press detection.
     // Lifted above the input loop so the TUI dispatcher can fold its own
@@ -729,6 +1023,13 @@ pub async fn run(
                     // streaming events. cap=1 + try_send is the coalesce
                     // idiom: bursts collapse into a single deferred redraw.
                     let (redraw_tx, redraw_rx) = mpsc::channel::<()>(1);
+
+                    // P0-2 fix: 将 redraw_tx 后注入 EffectExecutor 的 redraw_slot。
+                    // EffectExecutor 已被 dispatcher task 消费，但通过提前保存的
+                    // executor_redraw_slot Arc 可跨越 spawn 边界填入真实 sender，
+                    // 从而让 RequestRedraw effect 真正触发重绘。
+                    *executor_redraw_slot.lock() = Some(redraw_tx.clone());
+                    tracing::debug!("P0-2: redraw_tx injected into EffectExecutor redraw_slot");
 
                     // P3-4: route every UiActor event into the shared TUI
                     // mirror instead of writing to stdout (which would tear
@@ -801,14 +1102,29 @@ pub async fn run(
     // Persistent Ctrl+C handler: runs for the entire chat session.
     // - If a generation is active: cancel it (first press) or exit (double press).
     // - If idle (no generation): exit on double press.
+    //
+    // Step 5b 双写：每次 Ctrl+C 在旧路径 cancel/shutdown 之外，同步 try_dispatch
+    // `CancelRequested` / `ShutdownRequested` 给 dispatcher（shadow 模式下仅入 reducer
+    // + log，不参与真实控制流）。try_send 满或 closed 都不影响旧路径兜底。
+    //
+    // shutdown 触发时 handler 也需要退出，避免持有 dispatcher sender 阻塞
+    // dispatcher task 退出（drop(chat_dispatcher) + 此 handler 内的 clone 同时
+    // drop，channel 才能真正关闭，dispatcher_handle.await 才能返回）。
     {
         let last_ctrlc = Arc::clone(&last_ctrlc_ms);
         let cancel_ref = Arc::clone(&active_cancel);
         let shutdown_signal = shutdown.clone();
+        let dispatcher_for_signal = chat_dispatcher.clone();
         tokio::spawn(async move {
             loop {
-                if tokio::signal::ctrl_c().await.is_err() {
-                    break;
+                tokio::select! {
+                    biased;
+                    () = shutdown_signal.cancelled() => break,
+                    res = tokio::signal::ctrl_c() => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
                 }
                 let now = now_ms();
                 let prev = last_ctrlc.swap(now, Ordering::Relaxed);
@@ -816,11 +1132,15 @@ pub async fn run(
                 if now.saturating_sub(prev) < DOUBLE_CTRLC_WINDOW_MS {
                     // Double Ctrl+C → graceful shutdown
                     eprintln!("\nExiting...");
+                    // Step 5b shadow: 同步投递 ShutdownRequested.
+                    let _ = dispatcher_for_signal.try_dispatch(crate::chat::action::Action::ShutdownRequested);
                     shutdown_signal.cancel();
                     break;
                 }
 
                 // Single Ctrl+C → cancel active generation if any
+                // Step 5b shadow: 同步投递 CancelRequested 给 reducer 观察。
+                let _ = dispatcher_for_signal.try_dispatch(crate::chat::action::Action::CancelRequested);
                 if let Some(token) = cancel_ref.lock().as_ref() {
                     token.cancel();
                 }
@@ -829,15 +1149,29 @@ pub async fn run(
     }
 
     // SIGTERM handler: signal graceful shutdown.
+    //
+    // Step 5b 双写：投递 ShutdownRequested 给 dispatcher（shadow 观察），同时
+    // 调用 shutdown.cancel() 兜底（旧路径退出协议保留）。
+    // shutdown 触发时此任务也要主动退出，避免持有 sender clone 阻塞 dispatcher
+    // task 关闭。
     #[cfg(unix)]
     {
         let sigterm_result = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
         match sigterm_result {
             Ok(mut sigterm) => {
                 let shutdown_signal = shutdown.clone();
+                let dispatcher_for_sigterm = chat_dispatcher.clone();
                 tokio::spawn(async move {
-                    sigterm.recv().await;
-                    shutdown_signal.cancel();
+                    tokio::select! {
+                        biased;
+                        () = shutdown_signal.cancelled() => {
+                            // 主路径已 shutdown，无需再触发；退出释放 sender clone。
+                        }
+                        _ = sigterm.recv() => {
+                            let _ = dispatcher_for_sigterm.try_dispatch(crate::chat::action::Action::ShutdownRequested);
+                            shutdown_signal.cancel();
+                        }
+                    }
                 });
             }
             Err(e) => {
@@ -852,6 +1186,13 @@ pub async fn run(
         _ = shutdown.cancelled() => None,
     } {
         let user_input = msg.content.clone();
+
+        // Step 5b 双写：每条用户输入入 dispatcher（shadow 观察 reducer）。
+        // InputSubmitted（UI 记账 + LogTrace）+ RecordUserTurn（持久化 history）
+        // 在 reducer 内分别处理。shadow 模式下 history 双写不会真发生（业务
+        // Effect no-op），所以 REDUX_DIFF_COUNT 不会因双写而增加。
+        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::InputSubmitted(user_input.clone()));
+        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordUserTurn(user_input.clone()));
 
         // Echo the user's input into the TUI conversation pane.
         //
@@ -993,7 +1334,7 @@ pub async fn run(
         history.push(ChatMessage::user(&enriched));
 
         // ── Set active recipient/channel on tools (for proactive messaging) ──
-        for tool in &tools_registry {
+        for tool in tools_registry.iter() {
             tool.set_active_recipient("user").await;
             tool.set_active_channel(Arc::clone(&terminal) as Arc<dyn Channel>).await;
         }
@@ -1020,46 +1361,76 @@ pub async fn run(
             }
         };
 
+        // Step 5b 双写：宣告新一轮 LLM 推理开始（仅在 draft 存在时）。
+        // shadow 模式下 reducer 设置 stream.draft + control.generating=true；
+        // 无外部副作用（业务 Effect no-op）。
+        if let Some(ref d_id) = draft_id {
+            let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::TurnStarted {
+                draft_id: d_id.clone(),
+                cancel: cancellation.clone(),
+            });
+        }
+
         // Spawn background task: accumulate deltas → channel.update_draft()
         // Follows the exact same pattern as process_channel_message in channels/mod.rs.
         //
-        // P1-6 — Monotonic draft version protocol. Even though the delta mpsc itself
-        // is FIFO, the accumulated text is forwarded over additional channels inside
-        // the channel implementation (TerminalChannel → UiActor) where a late or
-        // duplicated message could otherwise visually rewind rendered text. The
-        // sender-side counter stamps each accumulated snapshot with a strictly
-        // monotonic `u64`; the receiver-side tracker drops any non-increasing
-        // arrival before issuing the `update_draft` call.
+        // P1-6 — Monotonic draft version protocol (Step 3 update). The
+        // sender-side counter still stamps each accumulated snapshot with a
+        // strictly monotonic `u64` (kept for `update_draft` downstream
+        // consumers and the inline-redraw protocol). The receiver-side stale
+        // check formerly performed here by `DraftVersionTracker.accept()` has
+        // been DELETED — its protection is now owned end-to-end by the
+        // Redux-style reducer in `chat::state` via `StreamState::draft.version`
+        // (see `ChatState::reduce_stream_chunk_received`).
+        //
+        // Why this is safe to remove:
+        //   1. `delta_rx` is a single-task tokio mpsc; FIFO is guaranteed at
+        //      the runtime layer (no parallel accumulators).
+        //   2. The counter is incremented atomically inside the same task,
+        //      producing a strictly monotonic sequence by construction. The
+        //      old tracker call was over-defence ("unreachable here" per the
+        //      original comment).
+        //   3. The reducer's `StreamChunkReceived` arm now enforces
+        //      strict-monotonic version + draft_id matching + finalize-state
+        //      check as the single source of truth. Once Step 5 makes the
+        //      reducer the renderer source, this task disappears entirely.
+        //
+        // This is the P3-5 "one-shot switch" called out in the Step 3 plan:
+        // no double-write period for the version protocol. Off / Both / Redux
+        // modes all share this single counter-driven path and rely on the
+        // reducer (via shadow ChatState or its Step 5 successor) for any
+        // re-ordering protection beyond what mpsc already provides.
         let draft_updater = if let Some(ref d_id) = draft_id {
             let channel: Arc<TerminalChannel> = Arc::clone(&terminal);
             let reply_target = "user".to_string();
             let draft_id_owned = d_id.clone();
             let mut rx = delta_rx;
             let version_counter = Arc::new(DraftVersionCounter::new());
-            let version_tracker = Arc::new(DraftVersionTracker::new());
+            // Step 5b 双写：把每个 delta 通过 coalescer 投递成 Action::StreamChunkReceived。
+            // bounded(2048) action_tx 满时由 coalescer 合并 delta，避免无界增长。
+            let coalescer_sender = chat_dispatcher.sender();
+            let coalescer_draft_id = d_id.clone();
             Some(tokio::spawn(async move {
                 let mut accumulated = String::new();
+                let mut coalescer = dispatcher::StreamChunkCoalescer::new(coalescer_sender);
                 while let Some(delta) = rx.recv().await {
                     accumulated.push_str(&delta);
+                    // Counter still ticks for downstream consumers (UiActor's
+                    // inline-redraw protocol uses it). No tracker.accept() —
+                    // see comment block above.
                     let version = version_counter.next();
-                    if !version_tracker.accept(&draft_id_owned, version) {
-                        // Stale snapshot — drop to prevent visual rewind. In practice
-                        // unreachable here because counter is single-task monotonic,
-                        // but the guard is cheap and defends against future
-                        // re-architecting (e.g. parallel accumulator tasks).
-                        tracing::trace!(
-                            draft_id = %draft_id_owned,
-                            version,
-                            "dropping stale draft delta"
-                        );
-                        continue;
-                    }
                     if let Err(e) = channel.update_draft(&reply_target, &draft_id_owned, &accumulated).await {
                         tracing::debug!("Draft update failed: {e}");
                     }
+                    // Step 5b shadow: investor the delta into the reducer.
+                    // Backpressure or close are silently tolerated (旧路径仍负责
+                    // 真实渲染；shadow 路径只是观察）。
+                    let _ = coalescer.try_send_chunk(coalescer_draft_id.clone(), delta, version);
                 }
-                // Stream ended — release per-draft version state.
-                version_tracker.clear(&draft_id_owned);
+                // Stream ended — flush pending coalescer state, counter goes
+                // out of scope; reducer-side version state is cleared on
+                // StreamCompleted/Failed/Cancelled (投递在 chat::run 主循环里完成).
+                let _ = coalescer.flush();
             }))
         } else {
             // No draft — consume delta_rx so the sender doesn't block
@@ -1160,6 +1531,151 @@ pub async fn run(
             Failed,
         }
 
+        // ── Step 5a-4: Route — Redux driver vs Legacy tool loop ──
+        //
+        // 路由契约：仅当 PRX_CHAT_REDUX=1 + PRX_CHAT_REDUX_DRIVER=1 +
+        // tools_registry 为空时切到 dispatcher driver。生产环境核心工具
+        // 总会注册，故路由几乎总命中 LegacyToolLoop —— 这是 5a-4 阶段
+        // 刻意保守的"测试/演进闸"，确保零回归。tool 协议迁移在 5a-5。
+        #[cfg(feature = "terminal-tui")]
+        let turn_route = {
+            let mode = ReduxMode::from_env();
+            let driver_opt_in = driver_opt_in_from_env();
+            // 路由判定中允许测试 env 强制把 tools_registry 视为空（5a-4 PTY 验证用）。
+            // Codex P2: 生产环境若误开此 env 会丢失工具能力，因此首次命中时 WARN
+            // 提示运维（每条 turn 都 warn 太吵——这里靠 tracing::warn_once 语义自然由
+            // 用户 LOG 聚合工具去重，或者运维通过 grep RUNTIME 启动日志识别）。
+            let force_empty = force_empty_tools_from_env();
+            if force_empty && !tools_registry.is_empty() {
+                tracing::warn!(
+                    "PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS=1 is a TEST-ONLY backdoor; \
+                     production tools will be ignored for routing decisions"
+                );
+            }
+            let tools_empty = tools_registry.is_empty() || force_empty;
+            let route = route_turn(mode, driver_opt_in, tools_empty);
+            // 可观测性：每轮 turn 记录路由结果（生产排障线索 + Codex 审计要求）。
+            tracing::info!(
+                redux_mode = ?mode,
+                driver_opt_in,
+                tools_empty,
+                tools_count = tools_registry.len(),
+                route = ?route,
+                fallback_reason = if matches!(route, TurnRoute::LegacyToolLoop) && driver_opt_in && matches!(mode, ReduxMode::Redux) {
+                    if tools_empty { "n/a" } else { "non_empty_tools_registry" }
+                } else {
+                    "n/a"
+                },
+                "chat::run turn route decision"
+            );
+            route
+        };
+        // 非 TUI feature 下 turn_route 不参与控制流（driver 分支被 cfg 屏蔽），
+        // 仅作变量保留以让两条 feature 配置下 chat::run 共享同一路由契约。
+        #[cfg(not(feature = "terminal-tui"))]
+        let _ = TurnRoute::LegacyToolLoop;
+
+        // ── Redux Driver 切闸路径（Step 5a-4） ─────────────────────
+        //
+        // 仅在路由命中 ReduxDriver 时进入。dispatch Action::StartLLMTurn →
+        // EffectExecutor::execute_real(Effect::StartTurn) → spawn drive_start_turn_stream
+        // 流式驱动 → 通过 action_tx 回投 StreamChunkReceived / Completed / Failed /
+        // Cancelled → dispatcher task reduce 后 turn_signal.record_and_notify →
+        // 此处 await 拿 outcome。
+        //
+        // 此分支**不调** run_tool_call_loop，旧路径完全不跑：
+        //   * 无 hook 双发（旧路径 hooks.emit 不执行；reducer 内 NotifyHook(Error) 独写）
+        //   * 无 history 双写（reducer 通过 RecordAssistantTurn 单写）
+        //   * round 2 hang 防御：tokio::select! 上 shutdown.cancelled() 兜底
+        //
+        // 进入条件 `tools_registry.is_empty()` 保证不会丢失工具调用——driver
+        // 协议（StreamChunk）天然不承载 tool_calls，5a-5 推进 tool 协议迁移。
+        #[cfg(feature = "terminal-tui")]
+        if matches!(turn_route, TurnRoute::ReduxDriver)
+            && let Some(d_id) = draft_id.clone()
+        {
+            // 协议：先获取 notified() future，再 dispatch，再 await。
+            // 在 dispatch 前消费旧 outcome 残留以确保读到的是本轮的。
+            let notify_fut = turn_signal.notified();
+            let _ = turn_signal.consume_outcome();
+
+            let dispatch_result = chat_dispatcher.try_dispatch(crate::chat::action::Action::StartLLMTurn {
+                draft_id: d_id.clone(),
+                history: history.clone(),
+                cancel: cancellation.clone(),
+            });
+            // Codex P1：try_dispatch 可能 Backpressured / ChannelClosed。任一失败
+            // 都意味着 dispatcher task 不会产生 turn outcome，chat::run 必须立即
+            // 视为 Failed 并 fall-through 到 cleanup，否则 notify_fut 永远不被 fire。
+            if !matches!(dispatch_result, dispatcher::DispatchResult::Sent) {
+                tracing::warn!(
+                    result = ?dispatch_result,
+                    "Redux driver: StartLLMTurn dispatch failed; aborting turn"
+                );
+                *active_cancel.lock() = None;
+                drop(delta_tx);
+                drop(tool_event_tx);
+                if let Some(handle) = draft_updater {
+                    let _ = handle.await;
+                }
+                let _ = tool_event_forwarder.await;
+                if let Some(ref id) = draft_id {
+                    let _ = terminal.cancel_draft("user", id).await;
+                }
+                eprintln!("\nError: redux driver dispatch failed\n");
+                continue;
+            }
+
+            // shutdown 抢占保护防 round 2 hang。
+            tokio::select! {
+                () = notify_fut => {}
+                () = shutdown.cancelled() => {
+                    tracing::debug!("Redux driver: shutdown.cancelled before turn complete");
+                }
+            }
+
+            let outcome = turn_signal.consume_outcome();
+
+            // Finalize streaming（与 legacy 收尾对齐）：drop senders 让后台任务收口.
+            *active_cancel.lock() = None;
+            drop(delta_tx);
+            drop(tool_event_tx);
+            if let Some(handle) = draft_updater {
+                let _ = handle.await;
+            }
+            let _ = tool_event_forwarder.await;
+
+            match outcome {
+                Some(dispatcher::TurnOutcomeKind::Completed { final_text }) => {
+                    // 1) 把 driver 流式累计的最终文本写回 LLM history（与 legacy 行尾
+                    //    `history.push(ChatMessage::assistant(...))` 对齐）。
+                    history.push(ChatMessage::assistant(final_text.clone()));
+                    // 2) finalize_draft：把文本投递给 terminal channel 让用户可见
+                    //    （driver 路径不走 delta_tx → draft_updater 链路，直接最终化）。
+                    if let Err(e) = terminal.finalize_draft("user", &d_id, &final_text).await {
+                        tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
+                    }
+                    // 3) RecordAssistantTurn 让 reducer 单写 session.turns
+                    //    （旧路径不跑 → 不会双写）。
+                    let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordAssistantTurn(final_text));
+                }
+                Some(dispatcher::TurnOutcomeKind::Failed { err, retryable: _ }) => {
+                    // reducer NotifyHook(Error) 已发；这里不再 hooks.emit 避免双发.
+                    if let Some(ref id) = draft_id {
+                        let _ = terminal.cancel_draft("user", id).await;
+                    }
+                    eprintln!("\nError: {err}\n");
+                }
+                Some(dispatcher::TurnOutcomeKind::Cancelled) | None => {
+                    if let Some(ref id) = draft_id {
+                        let _ = terminal.cancel_draft("user", id).await;
+                    }
+                }
+            }
+
+            continue;
+        }
+
         let turn_outcome = loop {
             history_len_before_tools = history.len();
 
@@ -1220,9 +1736,14 @@ pub async fn run(
                         let _ = terminal.cancel_draft("user", d_id).await;
                     }
                     eprintln!("\nError: operation timed out\n");
-                    hooks
-                        .emit(HookEvent::Error, payload_error("chat-turn", "timeout"))
-                        .await;
+                    // Phase E (5a-4): dual_write_guard 守卫防止与 reducer 的 NotifyHook(Error)
+                    // 在 Both / Redux 双写期产生双发（reducer 通过 Effect::NotifyHook 已发）。
+                    // Off 模式 guard 永远 false → 行为不变（旧路径单发）。
+                    if !dual_write_guard.is_active() {
+                        hooks
+                            .emit(HookEvent::Error, payload_error("chat-turn", "timeout"))
+                            .await;
+                    }
                     break TurnOutcome::Failed;
                 }
                 // ── Success ───────────────────────────────────────
@@ -1256,12 +1777,15 @@ pub async fn run(
                         "\nError: context window exceeded after {} compaction retries\n",
                         MAX_CONTEXT_OVERFLOW_RETRIES
                     );
-                    hooks
-                        .emit(
-                            HookEvent::Error,
-                            payload_error("chat-turn", "context-overflow-exhausted"),
-                        )
-                        .await;
+                    // Phase E (5a-4): dual_write_guard 守卫见 timeout 分支同理.
+                    if !dual_write_guard.is_active() {
+                        hooks
+                            .emit(
+                                HookEvent::Error,
+                                payload_error("chat-turn", "context-overflow-exhausted"),
+                            )
+                            .await;
+                    }
                     break TurnOutcome::Failed;
                 }
                 // ── Other errors ──────────────────────────────────
@@ -1270,9 +1794,12 @@ pub async fn run(
                         let _ = terminal.cancel_draft("user", d_id).await;
                     }
                     eprintln!("\nError: {e}\n");
-                    hooks
-                        .emit(HookEvent::Error, payload_error("chat-turn", &e.to_string()))
-                        .await;
+                    // Phase E (5a-4): dual_write_guard 守卫见 timeout 分支同理.
+                    if !dual_write_guard.is_active() {
+                        hooks
+                            .emit(HookEvent::Error, payload_error("chat-turn", &e.to_string()))
+                            .await;
+                    }
                     break TurnOutcome::Failed;
                 }
             }
@@ -1289,6 +1816,28 @@ pub async fn run(
             let _ = handle.await;
         }
         let _ = tool_event_forwarder.await;
+
+        // Step 5b 双写：根据 turn 结果投递相应的流式结束 Action。
+        // 当 draft_id 存在时 reducer 才能匹配 stream.draft 并清理；否则 no-op.
+        match &turn_outcome {
+            TurnOutcome::Success(resp) => {
+                if let Some(ref d_id) = draft_id {
+                    let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::StreamCompleted {
+                        draft_id: d_id.clone(),
+                        final_text: resp.clone(),
+                        reasoning: String::new(),
+                    });
+                }
+            }
+            TurnOutcome::Failed => {
+                if let Some(ref d_id) = draft_id {
+                    // 区分 cancelled vs failed：cancelled 由 active_cancel 取消（旧路径已 cancel）
+                    // 这里统一报 cancelled，更贴合 cancel_draft 已发的 UI 状态。
+                    let _ = chat_dispatcher
+                        .try_dispatch(crate::chat::action::Action::StreamCancelled { draft_id: d_id.clone() });
+                }
+            }
+        }
 
         // If the turn failed (timeout/cancel/error), skip response processing
         let response = match turn_outcome {
@@ -1396,20 +1945,43 @@ pub async fn run(
         let sanitized_response = sanitize::sanitize_for_persistence(&response);
         chat_session.add_user_turn(&sanitized_input);
         chat_session.add_assistant_turn(&sanitized_response, Vec::new());
-        if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
-            tracing::warn!("Failed to persist session: {e}");
-        }
+        // Step 5b 双写：把 assistant 回合也投递给 reducer（shadow 状态记账）。
+        // user turn 已经在主循环入口投递 (Action::RecordUserTurn)，此处补 assistant。
+        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordAssistantTurn(
+            sanitized_response.clone(),
+        ));
 
-        observer.record_event(&ObserverEvent::TurnComplete);
-        hooks
-            .emit(
-                HookEvent::TurnComplete,
-                serde_json::json!({
-                    "mode": "chat",
-                    "response_chars": response.chars().count(),
-                }),
-            )
-            .await;
+        // P0-1 fix: 旧路径在 Both/Redux 模式下受 dual_write_guard 守卫。
+        // Redux reducer 的 SaveSession effect 已在 execute_real 中置位 guard，
+        // 若 guard 已激活则旧路径跳过 save_session + hooks.emit(TurnComplete)，
+        // 防止 hooks/webhook 双触发（hooks/webhook 不幂等，真会双发）。
+        // Off 模式下 guard 永远 false，旧路径如常单写。
+        // 选 turn-level（而非 effect-level）：整个 turn 期间只要 Redux 执行了
+        // SaveSession/NotifyHook 之一，guard 即 active，旧路径的所有后续写都被抑制。
+        if !dual_write_guard.is_active() {
+            if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
+                tracing::warn!("Failed to persist session: {e}");
+            }
+
+            observer.record_event(&ObserverEvent::TurnComplete);
+            hooks
+                .emit(
+                    HookEvent::TurnComplete,
+                    serde_json::json!({
+                        "mode": "chat",
+                        "response_chars": response.chars().count(),
+                    }),
+                )
+                .await;
+        } else {
+            // Guard active: Redux path already handled save_session + hooks.emit.
+            // 旧路径跳过，避免双写/双发。
+            tracing::debug!(
+                "P0-1: dual_write_guard active — legacy path skipping save_session + hooks.emit(TurnComplete)"
+            );
+            // observer.record_event 仍然调用（observer 只是本地计数，无外部副作用）
+            observer.record_event(&ObserverEvent::TurnComplete);
+        }
     }
 
     // ── Graceful teardown: restore terminal state ────────────────
@@ -1430,6 +2002,26 @@ pub async fn run(
     // `terminal.insert_before`.
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(std::io::stderr(), crossterm::cursor::Show);
+
+    // Step 5b: dispatcher task graceful shutdown.
+    //
+    // 1. shutdown.cancel() 让所有 spawn 出去的信号 handler / TUI loop 主动退出，
+    //    释放它们持有的 chat_dispatcher sender clone（否则 action_rx 永远不会
+    //    自然 close，dispatcher_handle.await 会 hang）。
+    // 2. drop(chat_dispatcher) 释放主路径持有的 sender。
+    // 3. dispatcher_handle.await 收尾——select! 中 shutdown.cancelled() 分支立即
+    //    触发，dispatcher 退出。main.rs:866 的 RUNTIME_SHUTDOWN_TIMEOUT (2s)
+    //    仍兜底（不可改）。
+    shutdown.cancel();
+    drop(chat_dispatcher);
+    match dispatcher_handle.await {
+        Ok(stats) => tracing::info!(
+            actions = stats.actions_seen,
+            effects = stats.effects_seen,
+            "redux dispatcher shutdown clean"
+        ),
+        Err(e) => tracing::warn!(error = %e, "redux dispatcher join failed"),
+    }
 
     // Final session save before exit
     if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
@@ -1574,8 +2166,34 @@ fn run_tui_unified_loop(
     active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
+    use crate::chat::action::Action;
+    use crate::chat::state::{ChatState, Effect};
     use crossterm::event::{Event, KeyEventKind};
     use ratatui::{TerminalOptions, Viewport};
+
+    // Step 2: 双写灰度 — `PRX_CHAT_REDUX` 控制 reducer 路径是否生效
+    //   未设 / "0"  → 旧路径单写（默认；reducer 不构造）
+    //   "both"      → 双写（旧路径 + reducer，比对效果用于回归排查）
+    //   "1"         → 新路径影响关键控制流（仅 Quit / Ctrl+D 空 buffer 走 reducer；
+    //                   InterruptTurn / cancel 仍走旧路径，Step 4 才完整迁移）
+    let redux_mode = ReduxMode::from_env();
+    // shadow ChatState 仅在 redux_mode != Off 时构造；占位用 dummy provider/model
+    let mut shadow: Option<ChatState> = if matches!(redux_mode, ReduxMode::Off) {
+        None
+    } else {
+        let (provider_name, model_name) = {
+            let guard = mirror.lock();
+            (guard.provider.clone(), guard.model.clone())
+        };
+        Some(ChatState::new(
+            Arc::from(provider_name.as_str()),
+            Arc::from(model_name.as_str()),
+            shutdown.clone(),
+        ))
+    };
+    if !matches!(redux_mode, ReduxMode::Off) {
+        tracing::info!(mode = ?redux_mode, "PRX_CHAT_REDUX active — Step 2 双写模式");
+    }
 
     let stdout = std::io::stdout();
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
@@ -1703,6 +2321,14 @@ fn run_tui_unified_loop(
                 if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     continue;
                 }
+                // Step 2 双写: 如果 redux 模式启用，并行 reduce 到 shadow state。
+                // 旧路径仍执行（dispatch_global_key）；shadow 输出的 Effect 仅在
+                // Redux mode 下参与控制流（Quit）。Both mode 仅记录用于对账。
+                let shadow_effects: Vec<Effect> = shadow
+                    .as_mut()
+                    .map_or_else(Vec::new, |state| state.reduce(Action::KeyPressed(key)));
+                let shadow_wants_quit = shadow_effects.iter().any(|e| matches!(e, Effect::Quit));
+
                 let dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
                 // C1 fix: any consumed keystroke may have mutated visible
                 // state — typing in the input box, Tab folding a tool card,
@@ -1712,6 +2338,9 @@ fn run_tui_unified_loop(
                 // crossterm event (worst case 50 ms idle poll). cap=1 +
                 // try_send coalesces, so this is cheap on key floods.
                 let _ = redraw_tx.try_send(());
+                if matches!(redux_mode, ReduxMode::Both) {
+                    log_redux_key_diff(&dispatch, &shadow_effects);
+                }
                 match dispatch {
                     tui::KeyDispatch::Submitted(text) => {
                         let trimmed = text.trim().to_string();
@@ -1760,6 +2389,13 @@ fn run_tui_unified_loop(
                     }
                     tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed => {}
                 }
+                // Redux mode: shadow 的 Effect::Quit 也能触发退出（用于灰度验证
+                // 新路径的 Ctrl+D 空 buffer / 双 Ctrl+C 语义）。Both 模式仅记录差异。
+                if matches!(redux_mode, ReduxMode::Redux) && shadow_wants_quit {
+                    tracing::info!("redux: shadow requested Quit; shutting down");
+                    shutdown.cancel();
+                    return Ok(());
+                }
             }
             Event::Paste(text) => {
                 // P3 rearch: bracketed-paste mode (enabled in
@@ -1768,13 +2404,19 @@ fn run_tui_unified_loop(
                 // it, IME commit strings are shredded into per-byte
                 // KeyEvents with random modifier bits that
                 // `dispatch_global_key` filters out.
+                if let Some(state) = shadow.as_mut() {
+                    let _ = state.reduce(Action::PasteReceived(text.clone()));
+                }
                 mirror.lock().input.paste(&text);
                 // Paste mutates `input.lines` directly so the chrome must
                 // repaint; without this kick the next redraw is gated on
                 // the 50 ms poll.
                 let _ = redraw_tx.try_send(());
             }
-            Event::Resize(_w, _h) => {
+            Event::Resize(w, h) => {
+                if let Some(state) = shadow.as_mut() {
+                    let _ = state.reduce(Action::TerminalResized { w, h });
+                }
                 // crossterm forwards the new size to ratatui automatically
                 // on the next `draw()` call; we just nudge the loop so the
                 // redraw happens immediately rather than waiting up to

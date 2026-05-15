@@ -234,12 +234,18 @@ pub enum InputOutcome {
 ///
 /// This is a pure-function projection over the global shortcut table layered
 /// on top of [`TuiState::handle_input_key`]:
-///   * `Tab`     → toggles the most recent tool-result card (fold/unfold)
-///   * `Ctrl+R`  → toggles the most recent reasoning card
-///   * `Ctrl+C`  → interrupt the current turn (caller cancels in-flight work)
-///   * `Ctrl+D`  → EOF when the input buffer is logically empty
-///   * everything else → forwarded to the input box; submissions surface as
-///     `Submitted(text)`.
+///
+/// - `Tab` — toggles the most recent foldable card (reasoning OR
+///   tool-result, whichever appears later in the conversation).
+///   The folded reasoning summary itself hints `press Tab to
+///   expand`, so the user never has to learn a separate
+///   keybinding for thinking blocks.
+/// - `Ctrl+R` — toggles the most recent reasoning card (legacy shortcut,
+///   kept for muscle-memory after the Tab unification).
+/// - `Ctrl+C` — interrupt the current turn (caller cancels in-flight work)
+/// - `Ctrl+D` — EOF when the input buffer is logically empty
+/// - everything else — forwarded to the input box; submissions surface as
+///   `Submitted(text)`.
 ///
 /// Keeping the dispatch separate from the actual I/O loop lets us unit-test
 /// the keybindings without spinning up a terminal.
@@ -261,6 +267,18 @@ pub enum KeyDispatch {
     Exit,
 }
 
+/// Identifies which kind of foldable card was toggled by the unified `Tab`
+/// keybinding. Returned alongside the new folded state from
+/// [`TuiState::toggle_last_foldable_card`] so call-sites (or tests) can
+/// observe the dispatch decision without re-scanning `conversation_lines`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldableKind {
+    /// A `ConversationLine::Reasoning` card was flipped.
+    Reasoning,
+    /// A `ConversationLine::ToolResult` card was flipped.
+    ToolResult,
+}
+
 /// Resolve a [`KeyEvent`] against the global shortcut table layered above the
 /// input box. See [`KeyDispatch`] for the priority order. The function is
 /// pure: it consumes a mutable reference to [`TuiState`] only to forward the
@@ -279,10 +297,11 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         input_first_line_chars = state.input.lines.first().map(|s| s.chars().count()).unwrap_or(0),
         "dispatch_global_key_entry"
     );
-    // Tab → toggle most recent tool-result card. If there is no tool card we
-    // still consume the key (per spec, Tab is never forwarded to input).
+    // Tab → toggle the most recent foldable card (reasoning OR tool-result,
+    // whichever appears later in the conversation). When neither exists Tab
+    // is still consumed — per spec it never falls through to the input box.
     if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
-        let _ = state.toggle_last_tool_result_folded();
+        let _ = state.toggle_last_foldable_card();
         return KeyDispatch::Consumed;
     }
     // Ctrl+R → toggle most recent reasoning card. Never falls through.
@@ -1030,6 +1049,32 @@ impl TuiState {
         self.conversation_lines.iter().rposition(ConversationLine::is_reasoning)
     }
 
+    /// Toggle the folded flag of the most recent foldable card — either a
+    /// `Reasoning` or a `ToolResult`, whichever appears later in
+    /// `conversation_lines`. Returns the new folded value and a tag
+    /// describing which variant was touched, or `None` if neither exists.
+    ///
+    /// This is the keystone behind the unified `Tab` keybinding: the user
+    /// never has to remember whether the most recent card is a tool or a
+    /// thinking block — Tab "does the obvious thing" by flipping whichever
+    /// foldable thing sits closest to the cursor.
+    pub fn toggle_last_foldable_card(&mut self) -> Option<(FoldableKind, bool)> {
+        for line in self.conversation_lines.iter_mut().rev() {
+            match line {
+                ConversationLine::Reasoning { folded, .. } => {
+                    *folded = !*folded;
+                    return Some((FoldableKind::Reasoning, *folded));
+                }
+                ConversationLine::ToolResult { folded, .. } => {
+                    *folded = !*folded;
+                    return Some((FoldableKind::ToolResult, *folded));
+                }
+                _ => continue,
+            }
+        }
+        None
+    }
+
     /// Total content lines (estimated). Used by tests to compare folded vs
     /// expanded card row counts.
     #[cfg(test)]
@@ -1558,34 +1603,51 @@ fn render_tool_result<'a>(
 
 /// Render a `Reasoning` card in Claude-Code style.
 ///
-/// Folded → `✻ Thinking…` (or `* Thinking...` in ASCII), dim gray + italic.
-/// Expanded → header `✻ Thinking…` followed by the body, each line indented
-/// by two spaces and rendered in dim gray italic so the eye flows back to
-/// the visible assistant text below.
+/// Folded → `▸ Thinking (123 tokens) - press Tab to expand`
+///   (or `> Thinking (123 tokens) - press Tab to expand` in ASCII),
+///   dim gray + italic so the line reads as a collapsed annotation rather
+///   than primary content.
+/// Expanded → header `▾ Thinking (123 tokens)` (or `v Thinking (...)`) on
+///   row 0, followed by the body — each line indented by two spaces and
+///   rendered in dim gray italic so the eye flows back to the visible
+///   assistant text below.
+///
+/// Token count is estimated as `chars / 4`, matching the rough heuristic
+/// used by [`StreamChunk::with_token_estimate`] elsewhere in the codebase.
+/// `char_count` is taken straight from the cached field on
+/// `ConversationLine::Reasoning` so we never re-walk the body on every
+/// frame.
 ///
 /// We do NOT apply markdown / syntax highlighting here — that interacts with
 /// the P1-5 ANSI state machine and P2-9 diff renderer in ways that would
 /// need dedicated isolation; reasoning text is dimmed plain text so the user
 /// can always read it without ANSI bleed.
-///
-/// The `_char_count` parameter is retained for source compatibility with the
-/// `Reasoning` variant but no longer rendered — Claude Code keeps the folded
-/// summary minimal.
 fn render_reasoning_card<'a>(
     lines: &mut Vec<Line<'a>>,
     content: &'a str,
-    _char_count: usize,
+    char_count: usize,
     folded: bool,
     ascii: bool,
 ) {
-    let (icon, ellipsis) = reasoning_card_glyphs(ascii);
-    let header = format!("{icon} Thinking{ellipsis}");
+    let (folded_icon, expanded_icon) = reasoning_card_glyphs(ascii);
+    let tokens = estimate_reasoning_tokens(char_count);
+    let token_word = if tokens == 1 { "token" } else { "tokens" };
     let header_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
-    lines.push(Line::from(Span::styled(header, header_style)));
 
     if folded {
+        // Single-line folded summary — token count + key hint, no body.
+        let header = format!("{folded_icon} Thinking ({tokens} {token_word}) - press Tab to expand");
+        lines.push(Line::from(Span::styled(header, header_style)));
         return;
     }
+
+    // Unicode: remind users of both shortcuts; ASCII: keep it terse.
+    let header = if ascii {
+        format!("{expanded_icon} Thinking ({tokens} {token_word})")
+    } else {
+        format!("{expanded_icon} Thinking ({tokens} {token_word}) - Tab to collapse (Ctrl+R)")
+    };
+    lines.push(Line::from(Span::styled(header, header_style)));
 
     let body_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
     for body_line in content.lines() {
@@ -1593,14 +1655,28 @@ fn render_reasoning_card<'a>(
     }
 }
 
-/// Pick the leading sparkle icon (`✻` / `*`) and ellipsis (`…` / `...`) for
-/// a reasoning card. Claude Code uses the eight-pointed asterisk `✻` for the
-/// thinking indicator.
+/// Rough token estimate for a reasoning body. Mirrors the `len / 4` heuristic
+/// used by [`StreamChunk::with_token_estimate`] but on a `char` count to stay
+/// stable for non-ASCII content. Always at least `1` for non-empty bodies so
+/// the folded summary never advertises a `(0 tokens)` card; `0` is reserved
+/// for the empty case (and `push_reasoning` already drops empty inputs).
+const fn estimate_reasoning_tokens(char_count: usize) -> usize {
+    if char_count == 0 {
+        return 0;
+    }
+    let est = char_count.div_ceil(4);
+    if est == 0 { 1 } else { est }
+}
+
+/// Pick the folded / expanded leading triangle glyph used by a reasoning card.
+///
+/// Folded   → `▸` (or `>` in ASCII) — points right, "click me to open".
+/// Expanded → `▾` (or `v` in ASCII) — points down, "the body follows".
 const fn reasoning_card_glyphs(ascii: bool) -> (&'static str, &'static str) {
     if ascii {
-        ("*", "...")
+        (">", "v")
     } else {
-        ("\u{273B}", "\u{2026}") // ✻ …
+        ("\u{25B8}", "\u{25BE}") // ▸ ▾
     }
 }
 
@@ -2597,12 +2673,14 @@ mod tests {
         render_conversation_line(&mut lines, &card, false);
         assert_eq!(lines.len(), 1, "folded card is exactly one line");
         let rendered = line_text(lines.first().expect("test: first line"));
-        // Claude-Code style: `✻ Thinking…` — sparkle icon, no char count.
-        assert!(rendered.contains("\u{273B}"), "uses ✻ icon: {rendered}");
+        // S1-A folded summary: `▸ Thinking (N tokens) - press Tab to expand`.
+        assert!(rendered.starts_with("\u{25B8} "), "uses ▸ folded icon: {rendered}");
         assert!(rendered.contains("Thinking"), "shows Thinking label: {rendered}");
-        assert!(rendered.contains("\u{2026}"), "ends with … ellipsis: {rendered}");
-        // Char count must NOT be exposed in the minimal Claude-Code summary.
-        assert!(!rendered.contains("45 chars"), "no char count: {rendered}");
+        assert!(rendered.contains("tokens"), "shows token count: {rendered}");
+        assert!(
+            rendered.contains("press Tab to expand"),
+            "advertises Tab keybinding: {rendered}"
+        );
         // Folded summary must NOT leak the body text.
         assert!(!rendered.contains("Step 1"), "body hidden when folded: {rendered}");
     }
@@ -2620,10 +2698,26 @@ mod tests {
         // 1 header + 3 body rows = 4 lines.
         assert_eq!(lines.len(), 4, "header + 3 body rows: {}", lines.len());
         let header = line_text(lines.first().expect("test: header"));
-        assert!(header.contains("\u{273B}"), "expanded header still shows ✻: {header}");
+        assert!(
+            header.starts_with("\u{25BE} "),
+            "expanded header shows ▾ icon: {header}"
+        );
         assert!(
             header.contains("Thinking"),
             "expanded header still says Thinking: {header}"
+        );
+        assert!(
+            header.contains("tokens"),
+            "expanded header carries token count: {header}"
+        );
+        // Expanded header shows collapse shortcut with Ctrl+R legacy hint.
+        assert!(
+            !header.contains("press Tab to expand"),
+            "expanded header drops the expand hint: {header}"
+        );
+        assert!(
+            header.contains("Tab to collapse (Ctrl+R)"),
+            "expanded header shows collapse + Ctrl+R hint: {header}"
         );
         // Each body row begins with "  " indent.
         for (idx, original) in body.lines().enumerate() {
@@ -2642,13 +2736,19 @@ mod tests {
         };
         render_conversation_line(&mut lines, &card, true);
         let rendered = line_text(lines.first().expect("test: first line"));
-        // ASCII icon `*` and dot-dot-dot ellipsis.
-        assert!(rendered.starts_with("* "), "ASCII icon *: {rendered}");
-        assert!(rendered.contains("Thinking..."), "ASCII ellipsis ...: {rendered}");
-        assert!(!rendered.contains("\u{273B}"), "no ✻ in ASCII mode: {rendered}");
-        assert!(!rendered.contains("\u{2026}"), "no … in ASCII mode: {rendered}");
+        // ASCII folded glyph is `>`.
+        assert!(rendered.starts_with("> "), "ASCII folded icon >: {rendered}");
+        assert!(
+            rendered.contains("Thinking ("),
+            "ASCII keeps Thinking label: {rendered}"
+        );
+        assert!(
+            rendered.contains("press Tab to expand"),
+            "ASCII keeps Tab hint: {rendered}"
+        );
+        assert!(!rendered.contains("\u{25B8}"), "no ▸ in ASCII mode: {rendered}");
 
-        // Expanded ASCII uses same header glyph (no separate collapse icon).
+        // Expanded ASCII uses `v` chevron.
         let mut lines2: Vec<Line<'_>> = Vec::new();
         let expanded = ConversationLine::Reasoning {
             content: "x".to_string(),
@@ -2657,7 +2757,8 @@ mod tests {
         };
         render_conversation_line(&mut lines2, &expanded, true);
         let header = line_text(lines2.first().expect("test: expanded header"));
-        assert!(header.starts_with("* Thinking..."), "ASCII expanded header: {header}");
+        assert!(header.starts_with("v Thinking ("), "ASCII expanded header: {header}");
+        assert!(!header.contains("\u{25BE}"), "no ▾ in ASCII mode: {header}");
     }
 
     #[test]
@@ -2680,11 +2781,24 @@ mod tests {
 
     #[test]
     fn reasoning_card_glyphs_table() {
-        // Claude-Code style: a sparkle (`✻` / `*`) plus an ellipsis (`…` /
-        // `...`). The fold state no longer changes the glyph — folded vs
-        // expanded is communicated by row count rather than icon swap.
-        assert_eq!(reasoning_card_glyphs(false), ("\u{273B}", "\u{2026}"));
-        assert_eq!(reasoning_card_glyphs(true), ("*", "..."));
+        // S1-A: triangle glyphs — `▸` folded / `▾` expanded — with `>` / `v`
+        // as ASCII fallbacks. The fold state DOES change the leading icon so
+        // the user can see at a glance whether a card is currently expanded.
+        assert_eq!(reasoning_card_glyphs(false), ("\u{25B8}", "\u{25BE}"));
+        assert_eq!(reasoning_card_glyphs(true), (">", "v"));
+    }
+
+    #[test]
+    fn estimate_reasoning_tokens_table() {
+        // Empty → 0 (folded card never reaches this because push_reasoning
+        // drops empty bodies, but the function should still be sane).
+        assert_eq!(estimate_reasoning_tokens(0), 0);
+        // Anything non-empty rounds up to at least 1 token.
+        assert_eq!(estimate_reasoning_tokens(1), 1);
+        assert_eq!(estimate_reasoning_tokens(3), 1);
+        assert_eq!(estimate_reasoning_tokens(4), 1);
+        assert_eq!(estimate_reasoning_tokens(5), 2);
+        assert_eq!(estimate_reasoning_tokens(400), 100);
     }
 
     // ── P2-10: TuiInput multi-line + history tests ───────────────────────────
@@ -2955,7 +3069,7 @@ mod tests {
     #[test]
     fn dispatch_tab_toggles_last_tool_result_card() {
         let mut state = TuiState::new("p", "m");
-        // Without any tool card the Tab keystroke is still consumed (no-op).
+        // Without any foldable card the Tab keystroke is still consumed (no-op).
         let out = dispatch_global_key(key(KeyCode::Tab), &mut state);
         assert_eq!(out, KeyDispatch::Consumed);
 
@@ -2974,6 +3088,52 @@ mod tests {
         assert_ne!(folded_before, folded_after, "Tab must flip folded state");
         // Tab is consumed by the dispatcher → input buffer untouched.
         assert!(state.input.is_empty(), "Tab must not fall through to input box");
+    }
+
+    #[test]
+    fn dispatch_tab_toggles_last_reasoning_card_when_more_recent_than_tool() {
+        // S1-A: Tab now toggles whichever foldable card sits closest to the
+        // end of the conversation. A reasoning card pushed AFTER a tool card
+        // must win the Tab dispatch.
+        let mut state = TuiState::new("p", "m");
+        state.push_tool_result_started("shell", "{}");
+        assert!(state.push_reasoning("step 1\nstep 2"));
+
+        // Defaults: both folded = true. Tab should flip the reasoning card.
+        let out = dispatch_global_key(key(KeyCode::Tab), &mut state);
+        assert_eq!(out, KeyDispatch::Consumed);
+        match state.conversation_lines.last() {
+            Some(ConversationLine::Reasoning { folded, .. }) => assert!(!*folded, "Tab unfolded reasoning"),
+            other => panic!("test: expected Reasoning at end, got {other:?}"),
+        }
+        // The tool-result card must NOT have been touched.
+        let tool_idx = state
+            .conversation_lines
+            .iter()
+            .position(ConversationLine::is_tool_result)
+            .expect("test: tool card exists");
+        match state.conversation_lines.get(tool_idx).expect("test: tool idx valid") {
+            ConversationLine::ToolResult { folded, .. } => assert!(*folded, "tool card untouched"),
+            other => panic!("test: expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_last_foldable_card_returns_kind_tag() {
+        let mut state = TuiState::new("p", "m");
+        assert_eq!(state.toggle_last_foldable_card(), None);
+
+        state.push_tool_result_started("shell", "{}");
+        assert_eq!(
+            state.toggle_last_foldable_card(),
+            Some((FoldableKind::ToolResult, false))
+        );
+
+        assert!(state.push_reasoning("thinking"));
+        assert_eq!(
+            state.toggle_last_foldable_card(),
+            Some((FoldableKind::Reasoning, false))
+        );
     }
 
     #[test]
@@ -3235,6 +3395,144 @@ mod tests {
         assert!(
             tall <= BOTTOM_CHROME_MAX_HEIGHT,
             "must be clamped to BOTTOM_CHROME_MAX_HEIGHT"
+        );
+    }
+
+    // ── CJK / wide-char rendering regression tests ───────────────────────
+    //
+    // These tests guard against the phantom-space bug that appeared in TUI
+    // mode when `insert_before` used the non-scrolling-regions path
+    // (`draw_lines`), which iterated raw Buffer cells without skipping the
+    // "continuation" cell that ratatui places after every wide (CJK) glyph.
+    // Each CJK character occupies 2 columns; ratatui stores the glyph in
+    // cell[x] and resets cell[x+1] to `Cell::EMPTY` (whose `symbol()`
+    // returns `" "`). When `draw_lines` emitted that space verbatim, the
+    // terminal saw `你 好 世 界` instead of `你好世界`.
+    //
+    // The fix: enable the `scrolling-regions` ratatui feature so that
+    // `insert_before` uses `draw_lines_over_cleared`, which goes through
+    // `Buffer::diff()`. `diff()` tracks `to_skip` for wide glyphs and
+    // therefore never emits the continuation cell.
+    //
+    // Here we verify the buffer-level invariants: specifically that the
+    // cells produced by the `scrolling-regions` diff path omit continuation
+    // cells and reconstruct the original CJK text faithfully.
+
+    #[test]
+    #[cfg(feature = "terminal-tui")]
+    fn cjk_buffer_diff_omits_continuation_cells() {
+        // Build a buffer containing a Chinese assistant message, then take
+        // its diff against an empty buffer (same as `draw_lines_over_cleared`
+        // does internally).  The diff updates must not contain any
+        // continuation-cell spaces between consecutive CJK characters.
+        let line = ConversationLine::Assistant {
+            content: "你好世界欢迎使用PRX".to_string(),
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 2,
+        };
+        let empty = Buffer::empty(area);
+        let mut filled = Buffer::empty(area);
+        render_message_for_insert(&mut filled, &line, false);
+
+        // Collect symbols from the diff — this is exactly what the
+        // `scrolling-regions` insert_before path emits to the backend.
+        let diff = empty.diff(&filled);
+        let mut row0_symbols = String::new();
+        for (_x, y, cell) in &diff {
+            if *y == 0 {
+                // Only gather non-space content on row 0 for readability.
+                // Trailing spaces that come from the padding at the end of
+                // the line are acceptable and are trimmed below.
+                row0_symbols.push_str(cell.symbol());
+            }
+        }
+        let trimmed = row0_symbols.trim_end();
+        // The diff must faithfully reconstruct the text (no phantom spaces).
+        assert!(
+            trimmed.contains("你好世界欢迎使用PRX"),
+            "diff path should emit CJK chars without inter-character spaces, got {trimmed:?}"
+        );
+        assert!(
+            !trimmed.contains("你 好") && !trimmed.contains("好 世"),
+            "phantom spaces detected in diff output: {trimmed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "terminal-tui")]
+    fn cjk_streaming_buffer_diff_omits_continuation_cells() {
+        // StreamingAssistant appends a block-cursor glyph (▌). Verify that
+        // CJK content before the cursor is also contiguous in the diff path.
+        let line = ConversationLine::StreamingAssistant {
+            content: "你好世界".to_string(),
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 2,
+        };
+        let empty = Buffer::empty(area);
+        let mut filled = Buffer::empty(area);
+        render_message_for_insert(&mut filled, &line, false);
+
+        let diff = empty.diff(&filled);
+        let mut row0 = String::new();
+        for (_x, y, cell) in &diff {
+            if *y == 0 {
+                row0.push_str(cell.symbol());
+            }
+        }
+        let trimmed = row0.trim_end();
+        // 你好世界▌ — all chars contiguous in diff output.
+        assert!(
+            trimmed.starts_with("你好世界"),
+            "streaming CJK diff should be contiguous, got {trimmed:?}"
+        );
+        assert!(
+            !trimmed.contains("你 好") && !trimmed.contains("好 世"),
+            "phantom spaces detected in streaming diff output: {trimmed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "terminal-tui")]
+    fn cjk_user_message_diff_omits_continuation_cells() {
+        // User message is prefixed with `> ` in a styled Span. Verify the
+        // full row (including prefix) is contiguous in the diff path.
+        let line = ConversationLine::User {
+            content: "你好世界".to_string(),
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 2,
+        };
+        let empty = Buffer::empty(area);
+        let mut filled = Buffer::empty(area);
+        render_message_for_insert(&mut filled, &line, false);
+
+        let diff = empty.diff(&filled);
+        let mut row0 = String::new();
+        for (_x, y, cell) in &diff {
+            if *y == 0 {
+                row0.push_str(cell.symbol());
+            }
+        }
+        let trimmed = row0.trim_end();
+        // Row 0: "> 你好世界"  (two-space prefix + content)
+        assert!(
+            trimmed.starts_with("> 你好世界"),
+            "user CJK diff should be '> 你好世界', got {trimmed:?}"
+        );
+        assert!(
+            !trimmed.contains("你 好"),
+            "phantom spaces detected in user CJK diff: {trimmed:?}"
         );
     }
 }
