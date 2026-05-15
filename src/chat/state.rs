@@ -680,7 +680,21 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
-    /// `Action::StreamCompleted` — 清除 draft + push assistant message + 通知钩子.
+    /// `Action::StreamCompleted` — 清除 draft + push assistant message + 通知钩子 + **持久化会话**.
+    ///
+    /// T3-3-c: Effect 序列末尾追加 [`Effect::SaveSession`]，让 reducer 在每轮完成时
+    /// 触发会话快照写入；这把 Pure 模式下原本由 legacy `chat_session.add_*_turn`
+    /// + `save_session(...)` 完成的持久化收敛到 reducer 单源。
+    ///
+    /// Effect 顺序保证（执行器按 Vec 顺序消费）：
+    ///
+    /// - `[0]` NotifyHook(TurnComplete) — webhook / observer 先知道本轮完成
+    /// - `[1]` SaveSession(snapshot)    — 持久化 turns（dual_write_guard 防双写）
+    /// - `[2]` RequestRedraw            — UI 刷新放最后
+    ///
+    /// **重要**：快照基于 reducer 自己的 `session.turns`（由 `RecordAssistantTurn` 写入），
+    /// 不是 legacy `chat_session` 副本。Pure 模式下两者本就同步，legacy 副本被 T3-3-c
+    /// 守卫跳过；Off / Both / Redux 模式 dual_write_guard 抑制重复保存。
     #[cfg(feature = "terminal-tui")]
     fn reduce_stream_completed(&mut self, draft_id: &str, final_text: String, reasoning: String) -> Vec<Effect> {
         use crate::chat::tui::ConversationLine;
@@ -714,6 +728,7 @@ impl ChatState {
                     "response_chars": chars,
                 }),
             },
+            Effect::SaveSession(self.build_session_snapshot()),
             Effect::RequestRedraw,
         ]
     }
@@ -743,6 +758,7 @@ impl ChatState {
                     "response_chars": chars,
                 }),
             },
+            Effect::SaveSession(self.build_session_snapshot()),
             Effect::RequestRedraw,
         ]
     }
@@ -1089,9 +1105,27 @@ impl ChatState {
     ///   [1] LogTrace
     ///   [2] RequestRedraw
     fn reduce_session_switched(&self, id: String) -> Vec<Effect> {
-        // 对当前 session 快照生成持久化 effect
-        // clone 是必要的（reducer 不持有 &mut mem backend）
-        let snapshot = ChatSession {
+        vec![
+            Effect::SaveSession(self.build_session_snapshot()),
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: format!("Session switching to: {id}"),
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
+    /// T3-3-c: 从 `SessionState` 构造一个 [`ChatSession`] 快照，用于 [`Effect::SaveSession`].
+    ///
+    /// `SessionState` 不持有 `created_at` / `updated_at` 时间戳（chronological 元数据由
+    /// `ChatSession` 持久化层管理），因此快照构造时用当前时间填充——既能区分多次保存的
+    /// `updated_at`，也允许 `load_latest_session` 用 `updated_at` 比较选最新会话。
+    /// `schema_version` 用 `SCHEMA_VERSION` 常量统一。
+    ///
+    /// 抽出独立 fn 让 `reduce_session_switched` / `reduce_stream_completed` 等多处共用同一
+    /// 构造路径，避免字段错漏。
+    fn build_session_snapshot(&self) -> ChatSession {
+        ChatSession {
             id: self.session.id.clone(),
             schema_version: crate::chat::session::SCHEMA_VERSION,
             title: self.session.title.clone(),
@@ -1101,15 +1135,7 @@ impl ChatState {
             updated_at: chrono::Utc::now(),
             turns: self.session.turns.clone(),
             mode: self.session.mode,
-        };
-        vec![
-            Effect::SaveSession(snapshot),
-            Effect::LogTrace {
-                level: tracing::Level::INFO,
-                msg: format!("Session switching to: {id}"),
-            },
-            Effect::RequestRedraw,
-        ]
+        }
     }
 
     /// `Action::RecordUserTurn(text)` — 请求 reducer 持久化用户回合到 session 记录和 LLM history.
@@ -3036,6 +3062,85 @@ mod tests {
             assert!(has_request_redraw(&effects), "StreamCompleted 必须发 RequestRedraw");
         }
 
+        /// T3-3-c-1: `StreamCompleted` 必须发 `Effect::SaveSession`（reducer 单源持久化）.
+        ///
+        /// 同时验证 Effect 序列契约（执行顺序：NotifyHook → SaveSession → RequestRedraw）.
+        #[test]
+        fn test_t3_3c_stream_completed_emits_save_session() {
+            let mut state = s();
+            state.session.id = "sess-T3-3c".to_string();
+            // 先 record 用户 turn 让 session.turns 非空，验证快照真带 turns
+            let _ = state.reduce(Action::RecordUserTurn("question".to_string()));
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "draft-T3-3c".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::RecordAssistantTurn("answer".to_string()));
+            let effects = state.reduce(Action::StreamCompleted {
+                draft_id: "draft-T3-3c".to_string(),
+                final_text: "answer".to_string(),
+                reasoning: String::new(),
+            });
+
+            // 验证 SaveSession 存在且快照内容正确
+            let save_effect = effects.iter().find(|e| matches!(e, Effect::SaveSession(_)));
+            assert!(
+                save_effect.is_some(),
+                "T3-3-c: StreamCompleted 必须发 Effect::SaveSession"
+            );
+            if let Some(Effect::SaveSession(snapshot)) = save_effect {
+                assert_eq!(snapshot.id, "sess-T3-3c", "快照 id 应等于 session.id");
+                assert_eq!(snapshot.turns.len(), 2, "快照应含 user+assistant 两条 turn");
+                assert_eq!(snapshot.turns.first().map(|t| t.role.as_str()), Some("user"));
+                let assistant = snapshot.turns.get(1).expect("test: turns[1] must exist");
+                assert_eq!(assistant.role, "assistant");
+                assert_eq!(assistant.content, "answer");
+                assert_eq!(snapshot.title, "question", "auto-title 应来自首条 user turn");
+            }
+
+            // Effect 顺序契约：NotifyHook 在前，SaveSession 中段，RequestRedraw 收尾
+            let positions: Vec<&'static str> = effects
+                .iter()
+                .map(|e| match e {
+                    Effect::NotifyHook { .. } => "notify",
+                    Effect::SaveSession(_) => "save",
+                    Effect::RequestRedraw => "redraw",
+                    _ => "other",
+                })
+                .collect();
+            let notify_pos = positions.iter().position(|s| *s == "notify");
+            let save_pos = positions.iter().position(|s| *s == "save");
+            let redraw_pos = positions.iter().position(|s| *s == "redraw");
+            assert!(
+                notify_pos < save_pos && save_pos < redraw_pos,
+                "Effect 顺序应为 NotifyHook < SaveSession < RequestRedraw, got: {positions:?}"
+            );
+        }
+
+        /// T3-3-c-2: 重复 `StreamCompleted` 不应触发第二次 SaveSession（draft 已清空 → no-op）
+        #[test]
+        fn test_t3_3c_duplicate_stream_completed_no_save() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-dup".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            // 第一次 — 应含 SaveSession
+            let first = state.reduce(Action::StreamCompleted {
+                draft_id: "d-dup".to_string(),
+                final_text: "ans".to_string(),
+                reasoning: String::new(),
+            });
+            assert!(first.iter().any(|e| matches!(e, Effect::SaveSession(_))));
+            // 第二次 — draft 已 None → 空 vec，无 SaveSession 重复
+            let second = state.reduce(Action::StreamCompleted {
+                draft_id: "d-dup".to_string(),
+                final_text: "ans-dup".to_string(),
+                reasoning: String::new(),
+            });
+            assert!(second.is_empty(), "重复 StreamCompleted 应是 no-op");
+        }
+
         /// S2-A test 3: stream_failed_effect_sequence
         ///
         /// Failure 路径（timeout / context-overflow / 其他错误）：chat::mod 主循环按
@@ -3358,6 +3463,61 @@ mod tests {
             let _ = state.reduce(Action::ModeChanged(ChatMode::Edit));
             legacy.set_mode(ChatMode::Edit);
             assert_eq!(state.session.mode, legacy.mode, "Edit 模式应一致");
+        }
+
+        /// T3-3-d-byte-parity: reducer `session.history` 与 legacy `ChatSession.turns`
+        /// 在 Both 模式下应字节级对账（同一条 user/assistant 内容写入两端时内容一致）.
+        ///
+        /// 这把 Both 模式"双写期对账"做成 in-process 单测，避免 PTY 比对的 noise.
+        /// 关键断言：
+        ///   1. session.turns.len() == legacy.turns.len()（条目数对齐）
+        ///   2. role 序列完全一致
+        ///   3. content 字节级一致（无 sanitization 差异时）
+        #[test]
+        fn t3_3d_both_mode_history_byte_level_parity() {
+            use crate::chat::session::ChatSession;
+            let mut state = s();
+            let mut legacy = ChatSession::new("test-prov", "test-model");
+
+            let inputs = [
+                ("user", "hi there"),
+                ("assistant", "hello!"),
+                ("user", "explain monads in 1 sentence"),
+                ("assistant", "a monad is a monoid in the category of endofunctors"),
+                ("user", ""), // 空字符串边界
+                ("assistant", "🚀 unicode 中文 mixed content"),
+            ];
+
+            for (role, text) in inputs {
+                if role == "user" {
+                    let _ = state.reduce(Action::RecordUserTurn(text.to_string()));
+                    legacy.add_user_turn(text);
+                } else {
+                    // 测试输入闭包所有 role 都是 "user" / "assistant"，else 分支即 assistant
+                    let _ = state.reduce(Action::RecordAssistantTurn(text.to_string()));
+                    legacy.add_assistant_turn(text, Vec::new());
+                }
+            }
+
+            assert_eq!(
+                state.session.turns.len(),
+                legacy.turns.len(),
+                "Both 模式：reducer.session.turns.len() 应等于 legacy.turns.len()"
+            );
+            for (i, (lhs, rhs)) in state.session.turns.iter().zip(legacy.turns.iter()).enumerate() {
+                assert_eq!(lhs.role, rhs.role, "turn {i} role 不一致");
+                assert_eq!(
+                    lhs.content.as_bytes(),
+                    rhs.content.as_bytes(),
+                    "turn {i} content 字节级不一致（reducer vs legacy）"
+                );
+            }
+            // history 与 turns 同步增长
+            assert_eq!(
+                state.session.history.len(),
+                state.session.turns.len(),
+                "reducer.session.history.len() 应与 turns.len() 同步"
+            );
         }
 
         /// S2-B-3: redux_record_turns_single_write_no_duplicate_session_turns

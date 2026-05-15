@@ -784,3 +784,110 @@ fn test_chat_redux_driver_double_ctrl_c_no_round2_hang() {
         "driver 路径下双 Ctrl+C 应在 {exit_deadline:?} 内退出 — round 2 hang bug 未回归"
     );
 }
+
+// ─── T3-3-d: Pure 模式 PTY E2E 覆盖 ───────────────────────────────────────────
+//
+// `PRX_CHAT_REDUX=pure`：T3-3 收官模式 — reducer 单路由，driver 默认开（无需
+// `PRX_CHAT_REDUX_DRIVER=1`），legacy `chat_session.add_*_turn` 不再执行，
+// reducer 的 `Effect::SaveSession` 接管持久化。
+//
+// 这两个测试是 T3-3-d 的关键防回归：
+//   - mock_response_works: 验证 Pure 模式端到端对话能跑通（输入→驱动→渲染）
+//   - tool_call_completes: 验证 Pure 模式 driver 自动 attach tools_registry
+//                          （不依赖 FORCE_EMPTY_TOOLS backdoor）
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_redux_pure_mock_response_works() {
+    // Pure 模式 + mock provider：driver 路径默认开（无 PRX_CHAT_REDUX_DRIVER），
+    // 用户输入 → driver streams → reducer StreamCompleted → SaveSession Effect →
+    // memory.store（本测试只断言 sentinel 渲染到 PTY，持久化由单测覆盖）.
+    let sentinel = "[MOCK-REDUX-PURE]";
+    let (mut sg, _guard) = spawn_chat(
+        &[],
+        &[
+            ("OPENPRX_MOCK_RESPONSE", sentinel),
+            ("PRX_CHAT_REDUX", "pure"),
+            // 故意不设 PRX_CHAT_REDUX_DRIVER；Pure 模式必须默认走 driver.
+            ("PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS", "1"),
+        ],
+    );
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+    session.send("hi\r").expect("send hi");
+    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        captured.contains(sentinel),
+        "Pure 模式下 mock 回复应渲染. captured:\n{captured}"
+    );
+    session.send("/exit\r").expect("send /exit");
+    assert!(wait_for_exit(session, EXIT_TIMEOUT), "Pure 模式下 /exit 应干净退出");
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_redux_pure_tool_call_completes() {
+    // Pure 模式 + 真 tools_registry（无 FORCE_EMPTY_TOOLS）：driver 在 Pure 下
+    // 必须默认 attach tools_registry 才能完成 tool turn 闭环。
+    let sentinel = "[MOCK-PURE-TOOL-ROUND-2]";
+    let (mut sg, _guard) = spawn_chat(
+        &[],
+        &[
+            ("OPENPRX_MOCK_RESPONSE", sentinel),
+            ("OPENPRX_MOCK_TOOL_CALL", "memory_recall:{\"query\":\"hi\",\"limit\":3}"),
+            ("PRX_CHAT_REDUX", "pure"),
+        ],
+    );
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+    session.send("hi\r").expect("send hi");
+    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        captured.contains(sentinel),
+        "Pure 模式 driver tool-call 闭环应返回 final sentinel. captured:\n{captured}"
+    );
+    session.send("/exit\r").expect("send /exit");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "Pure 模式工具回合后 /exit 应干净退出"
+    );
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_redux_pure_double_ctrl_c_exits_cleanly() {
+    // Pure 模式下双 Ctrl+C 不能 hang round 2（与 Redux 模式同样的 round-2 hang 防回归）.
+    let (mut sg, _guard) = spawn_chat(
+        &[],
+        &[
+            ("PRX_CHAT_REDUX", "pure"),
+            ("PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS", "1"),
+        ],
+    );
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("first SIGINT");
+    std::thread::sleep(Duration::from_millis(100));
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("second SIGINT");
+
+    let captured = read_until_with_dsr(session, "Exiting...", EXIT_TIMEOUT);
+    assert!(
+        captured.contains("Exiting..."),
+        "Pure 模式下双 Ctrl+C 应输出 Exiting...; captured:\n{captured}"
+    );
+    let exit_deadline = Duration::from_secs(6);
+    assert!(
+        wait_for_exit(session, exit_deadline),
+        "Pure 模式下双 Ctrl+C 应在 {exit_deadline:?} 内退出"
+    );
+}

@@ -2604,6 +2604,56 @@ mod real_mode_tests {
         // 不 panic + 没 hang 即通过；TerminalChannel.cancel_draft 总是 Ok.
     }
 
+    /// T3-3-c-3 闭环：reducer dispatch `StreamCompleted` → 多个 Effect 中含 SaveSession,
+    /// EffectExecutor::execute_real 后 memory.store 被调用 1 次（reducer 单源持久化路径通畅）.
+    #[tokio::test]
+    async fn t3_3c_stream_completed_drives_save_session_through_executor() {
+        use crate::chat::action::Action;
+        use crate::chat::state::ChatState;
+
+        let store_count = Arc::new(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(CountingMemory {
+            inner: NoneMemory::new(),
+            store_count: Arc::clone(&store_count),
+        });
+        let shutdown = CancellationToken::new();
+        let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown.clone());
+        let executor = EffectExecutor::new_with_deps(deps.clone());
+
+        // 用真 reducer 生成 Effect 序列（含 SaveSession），逐个交给 executor.
+        let mut state = ChatState::new(
+            Arc::from("test-prov"),
+            Arc::from("test-model"),
+            CancellationToken::new(),
+        );
+        state.session.id = "t3-3c-session".to_string();
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "d-T3-3c".to_string(),
+            cancel: CancellationToken::new(),
+        });
+        let effects = state.reduce(Action::StreamCompleted {
+            draft_id: "d-T3-3c".to_string(),
+            final_text: "the answer".to_string(),
+            reasoning: String::new(),
+        });
+        let mut had_save_session = false;
+        for effect in effects {
+            if matches!(effect, Effect::SaveSession(_)) {
+                had_save_session = true;
+            }
+            executor.execute(effect).await;
+        }
+        assert!(had_save_session, "reducer must emit SaveSession for StreamCompleted");
+
+        // SaveSession 走 spawn 子任务，等待其完成.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            store_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "reducer-emitted SaveSession 应触发 memory.store 一次"
+        );
+    }
+
     #[tokio::test]
     async fn real_mode_quit_cancels_shutdown_token() {
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
