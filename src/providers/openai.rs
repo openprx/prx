@@ -1,9 +1,10 @@
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
-    ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
+    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
+use futures::stream::{self, BoxStream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -295,6 +296,174 @@ impl OpenAiProvider {
     }
 }
 
+// ─── Streaming SSE (5a-7a) ────────────────────────────────────────────────
+//
+// OpenAI Chat Completions native streaming with `stream: true` + tool_calls.
+// SSE events have the shape:
+//   data: {"choices":[{"delta":{"content":"...","tool_calls":[...]},
+//                      "finish_reason": null | "stop" | "tool_calls"}]}
+//   data: [DONE]
+//
+// Tool call deltas stream `index`-keyed fragments — provider must accumulate
+// `function.arguments` strings until `finish_reason == "tool_calls"` then emit
+// a single [`ToolCallChunk`] per accumulated call.
+
+#[derive(Debug, Deserialize)]
+struct StreamSseResponse {
+    #[serde(default)]
+    choices: Vec<StreamSseChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamSseChoice {
+    delta: StreamSseDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamSseDelta {
+    #[serde(default)]
+    content: Option<String>,
+    /// DeepSeek / Kimi / GLM extension: reasoning tokens are emitted in a
+    /// dedicated field, intentionally split from `content` so the consumer
+    /// can route the chain-of-thought independently.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamSseToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamSseToolCall {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamSseFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamSseFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// Buffered state for a single in-flight tool call across SSE chunks.
+/// OpenAI streams `function.arguments` as incremental JSON fragments keyed by
+/// `index`; we accumulate then emit a complete [`ToolCallChunk`] on
+/// `finish_reason == "tool_calls"`.
+#[derive(Debug, Default, Clone)]
+struct ToolCallBuffer {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Outcome of feeding a single SSE `data:` payload into the parser.
+#[derive(Debug, Default)]
+struct OpenAiSseEvent {
+    content: Option<String>,
+    reasoning: Option<String>,
+    tool_call_deltas: Vec<StreamSseToolCall>,
+    finish_reason: Option<String>,
+    done_sentinel: bool,
+}
+
+/// Parse a single SSE line into a structured event. Returns `Ok(None)` for
+/// blank lines, comments, or non-data events.
+fn parse_openai_sse_line(line: &str) -> StreamResult<Option<OpenAiSseEvent>> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') {
+        return Ok(None);
+    }
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return Ok(Some(OpenAiSseEvent {
+            done_sentinel: true,
+            ..OpenAiSseEvent::default()
+        }));
+    }
+
+    let parsed: StreamSseResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
+    let Some(choice) = parsed.choices.into_iter().next() else {
+        return Ok(None);
+    };
+
+    let mut event = OpenAiSseEvent {
+        finish_reason: choice.finish_reason,
+        ..OpenAiSseEvent::default()
+    };
+    event.content = choice.delta.content.filter(|c| !c.is_empty());
+    event.reasoning = choice.delta.reasoning_content.filter(|r| !r.is_empty());
+    if let Some(tcs) = choice.delta.tool_calls {
+        event.tool_call_deltas = tcs;
+    }
+    Ok(Some(event))
+}
+
+/// Apply a vec of tool_call deltas onto the index-keyed buffer.
+fn apply_tool_call_deltas(buf: &mut Vec<ToolCallBuffer>, deltas: Vec<StreamSseToolCall>) {
+    for delta in deltas {
+        let slot = delta.index;
+        while buf.len() <= slot {
+            buf.push(ToolCallBuffer::default());
+        }
+        // Safety: just expanded so slot is in-bounds.
+        let entry = match buf.get_mut(slot) {
+            Some(e) => e,
+            None => continue,
+        };
+        if let Some(id) = delta.id {
+            if !id.is_empty() {
+                entry.id = id;
+            }
+        }
+        if let Some(func) = delta.function {
+            if let Some(name) = func.name {
+                if !name.is_empty() {
+                    entry.name = name;
+                }
+            }
+            if let Some(args) = func.arguments {
+                entry.arguments.push_str(&args);
+            }
+        }
+    }
+}
+
+/// Flush the tool_call buffer into chunks suitable for [`StreamChunk::tool_call_chunk`].
+fn flush_tool_call_buffer(buf: &[ToolCallBuffer]) -> Vec<ToolCallChunk> {
+    buf.iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.name.is_empty())
+        .map(|(idx, entry)| {
+            let id = if entry.id.is_empty() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                entry.id.clone()
+            };
+            let args = if entry.arguments.is_empty() {
+                "{}".to_string()
+            } else {
+                entry.arguments.clone()
+            };
+            ToolCallChunk {
+                id,
+                name: entry.name.clone(),
+                args,
+                index: idx,
+            }
+        })
+        .collect()
+}
+
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
@@ -483,6 +652,167 @@ impl Provider for OpenAiProvider {
                 .error_for_status()?;
         }
         Ok(())
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    /// **5a-7a**: Native streaming with full history + tool_calls.
+    ///
+    /// Sends `stream: true` to `/v1/chat/completions`, parses SSE chunks via
+    /// [`parse_openai_sse_line`], and emits a single [`ToolCallChunk`] per
+    /// in-flight tool call when `finish_reason == "tool_calls"` arrives (so
+    /// driver can execute and feed `tool_results` back to history).
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        let Some(credential) = self.credential.clone() else {
+            return stream::once(async { Err(StreamError::Provider("OpenAI API key not set".to_string())) }).boxed();
+        };
+
+        let native_messages = Self::convert_messages(messages);
+        let url = format!("{}/chat/completions", self.base_url);
+        let client = self.http_client();
+
+        #[derive(Serialize)]
+        struct StreamingChatRequest {
+            model: String,
+            messages: Vec<NativeMessage>,
+            temperature: f64,
+            stream: bool,
+        }
+
+        let request_body = StreamingChatRequest {
+            model: model.to_string(),
+            messages: native_messages,
+            temperature,
+            stream: true,
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            let response = match client
+                .post(&url)
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("Accept", "text/event-stream")
+                .json(&request_body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let preview = body.chars().take(300).collect::<String>();
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!(
+                        "OpenAI streaming HTTP {status}: {preview}"
+                    ))))
+                    .await;
+                return;
+            }
+
+            let mut tool_buf: Vec<ToolCallBuffer> = Vec::new();
+            let mut byte_stream = response.bytes_stream();
+            let mut text_buf = String::new();
+            let mut sent_final = false;
+            'outer: while let Some(bytes_res) = byte_stream.next().await {
+                let bytes = match bytes_res {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx.send(Err(StreamError::Http(e))).await;
+                        return;
+                    }
+                };
+                let text = match std::str::from_utf8(&bytes) {
+                    Ok(t) => t.to_string(),
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(StreamError::InvalidSse(format!(
+                                "non-utf8 byte in OpenAI SSE: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                text_buf.push_str(&text);
+
+                while let Some(pos) = text_buf.find('\n') {
+                    let line: String = text_buf.drain(..=pos).collect();
+                    let event = match parse_openai_sse_line(&line) {
+                        Ok(Some(ev)) => ev,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    };
+
+                    if event.done_sentinel {
+                        let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+                        sent_final = true;
+                        break 'outer;
+                    }
+
+                    if !event.tool_call_deltas.is_empty() {
+                        apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas);
+                    }
+
+                    if let Some(content) = event.content {
+                        let mut chunk = StreamChunk::delta(content);
+                        if options.count_tokens {
+                            chunk = chunk.with_token_estimate();
+                        }
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            return;
+                        }
+                    }
+                    if let Some(reasoning) = event.reasoning {
+                        let mut chunk = StreamChunk::reasoning_delta(reasoning);
+                        if options.count_tokens {
+                            chunk = chunk.with_token_estimate();
+                        }
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            return;
+                        }
+                    }
+
+                    if let Some(finish) = event.finish_reason.as_deref() {
+                        if finish == "tool_calls" && !tool_buf.is_empty() {
+                            let calls = flush_tool_call_buffer(&tool_buf);
+                            tool_buf.clear();
+                            if !calls.is_empty() && tx.send(Ok(StreamChunk::tool_call_chunk(calls))).await.is_err() {
+                                return;
+                            }
+                        }
+                        // finish_reason==stop|length|content_filter|tool_calls all
+                        // close the turn. We emit `final_chunk` to be safe even
+                        // when the server forgets `[DONE]`.
+                        let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+                        sent_final = true;
+                        break 'outer;
+                    }
+                }
+            }
+
+            if !sent_final {
+                let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
     }
 }
 
@@ -749,5 +1079,266 @@ mod tests {
         let spec = parse_native_tool_spec(json).unwrap();
         assert_eq!(spec.kind, "function");
         assert_eq!(spec.function.name, "shell");
+    }
+
+    // ─── 5a-7a Streaming SSE tests ──────────────────────────────────────
+
+    #[test]
+    fn openai_sse_line_done_sentinel() {
+        let ev = parse_openai_sse_line("data: [DONE]").unwrap().expect("event");
+        assert!(ev.done_sentinel);
+        assert!(ev.content.is_none());
+    }
+
+    #[test]
+    fn openai_sse_line_blank_and_comment_skipped() {
+        assert!(parse_openai_sse_line("").unwrap().is_none());
+        assert!(parse_openai_sse_line(":heartbeat").unwrap().is_none());
+        assert!(parse_openai_sse_line("\n").unwrap().is_none());
+    }
+
+    #[test]
+    fn openai_sse_line_parses_content_delta() {
+        let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
+        let ev = parse_openai_sse_line(line).unwrap().expect("event");
+        assert_eq!(ev.content.as_deref(), Some("hello"));
+        assert!(ev.tool_call_deltas.is_empty());
+    }
+
+    #[test]
+    fn openai_sse_line_parses_reasoning_content_separately() {
+        let line = r#"data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}"#;
+        let ev = parse_openai_sse_line(line).unwrap().expect("event");
+        assert!(ev.content.is_none());
+        assert_eq!(ev.reasoning.as_deref(), Some("thinking"));
+    }
+
+    #[test]
+    fn openai_sse_line_parses_tool_call_delta() {
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_42","function":{"name":"shell","arguments":"{\"cmd\":"}}]}}]}"#;
+        let ev = parse_openai_sse_line(line).unwrap().expect("event");
+        assert_eq!(ev.tool_call_deltas.len(), 1);
+        let tc = &ev.tool_call_deltas[0];
+        assert_eq!(tc.index, 0);
+        assert_eq!(tc.id.as_deref(), Some("call_42"));
+        let f = tc.function.as_ref().unwrap();
+        assert_eq!(f.name.as_deref(), Some("shell"));
+        assert_eq!(f.arguments.as_deref(), Some("{\"cmd\":"));
+    }
+
+    #[test]
+    fn openai_sse_finish_reason_propagates() {
+        let line = r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let ev = parse_openai_sse_line(line).unwrap().expect("event");
+        assert_eq!(ev.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn tool_call_buffer_accumulates_partial_arguments() {
+        let mut buf: Vec<ToolCallBuffer> = Vec::new();
+        apply_tool_call_deltas(
+            &mut buf,
+            vec![StreamSseToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                function: Some(StreamSseFunction {
+                    name: Some("shell".into()),
+                    arguments: Some(r#"{"a""#.into()),
+                }),
+            }],
+        );
+        apply_tool_call_deltas(
+            &mut buf,
+            vec![StreamSseToolCall {
+                index: 0,
+                id: None,
+                function: Some(StreamSseFunction {
+                    name: None,
+                    arguments: Some(r#": 1}"#.into()),
+                }),
+            }],
+        );
+        let flushed = flush_tool_call_buffer(&buf);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].id, "call_1");
+        assert_eq!(flushed[0].name, "shell");
+        assert_eq!(flushed[0].args, r#"{"a": 1}"#);
+        assert_eq!(flushed[0].index, 0);
+    }
+
+    #[test]
+    fn tool_call_buffer_supports_parallel_calls_by_index() {
+        let mut buf: Vec<ToolCallBuffer> = Vec::new();
+        apply_tool_call_deltas(
+            &mut buf,
+            vec![
+                StreamSseToolCall {
+                    index: 0,
+                    id: Some("call_a".into()),
+                    function: Some(StreamSseFunction {
+                        name: Some("ls".into()),
+                        arguments: Some("{}".into()),
+                    }),
+                },
+                StreamSseToolCall {
+                    index: 1,
+                    id: Some("call_b".into()),
+                    function: Some(StreamSseFunction {
+                        name: Some("pwd".into()),
+                        arguments: Some("{}".into()),
+                    }),
+                },
+            ],
+        );
+        let flushed = flush_tool_call_buffer(&buf);
+        assert_eq!(flushed.len(), 2);
+        assert_eq!(flushed[0].name, "ls");
+        assert_eq!(flushed[1].name, "pwd");
+        assert_eq!(flushed[1].index, 1);
+    }
+
+    #[test]
+    fn tool_call_buffer_skips_unnamed_entries() {
+        // Some servers send empty `arguments` chunks before name appears; we
+        // must not emit unnamed/empty placeholder calls.
+        let mut buf: Vec<ToolCallBuffer> = Vec::new();
+        apply_tool_call_deltas(
+            &mut buf,
+            vec![StreamSseToolCall {
+                index: 0,
+                id: Some("call_x".into()),
+                function: Some(StreamSseFunction {
+                    name: None,
+                    arguments: Some(String::new()),
+                }),
+            }],
+        );
+        assert!(flush_tool_call_buffer(&buf).is_empty());
+    }
+
+    /// Test helper: replay a sequence of SSE lines through the parser to
+    /// assert the driver-facing chunk shape (delta / tool_call / final).
+    fn replay_openai_sse(lines: &[&str]) -> (String, Vec<ToolCallChunk>, bool, bool) {
+        let mut tool_buf: Vec<ToolCallBuffer> = Vec::new();
+        let mut text = String::new();
+        let mut emitted_calls: Vec<ToolCallChunk> = Vec::new();
+        let mut saw_final = false;
+        let mut had_finish_reason = false;
+        for line in lines {
+            let event = match parse_openai_sse_line(line).expect("test: line parses") {
+                Some(e) => e,
+                None => continue,
+            };
+            if event.done_sentinel {
+                saw_final = true;
+                break;
+            }
+            if !event.tool_call_deltas.is_empty() {
+                apply_tool_call_deltas(&mut tool_buf, event.tool_call_deltas);
+            }
+            if let Some(c) = event.content {
+                text.push_str(&c);
+            }
+            if let Some(finish) = event.finish_reason.as_deref() {
+                had_finish_reason = true;
+                if finish == "tool_calls" {
+                    emitted_calls.extend(flush_tool_call_buffer(&tool_buf));
+                    tool_buf.clear();
+                }
+                saw_final = true;
+                break;
+            }
+        }
+        (text, emitted_calls, saw_final, had_finish_reason)
+    }
+
+    #[test]
+    fn openai_streaming_native_tool_call_via_fixture() {
+        // Replay a realistic SSE stream: content delta, then two `tool_calls`
+        // arguments fragments, then `finish_reason=tool_calls`, then [DONE].
+        let lines = [
+            r#"data: {"choices":[{"delta":{"content":"checking"}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{\"cmd\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        let (text, calls, final_seen, had_finish) = replay_openai_sse(&lines);
+        assert_eq!(text, "checking");
+        assert!(had_finish, "stream must include finish_reason");
+        assert!(final_seen, "must reach final / done sentinel");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].args, r#"{"cmd":"ls"}"#);
+        assert_eq!(calls[0].index, 0);
+    }
+
+    #[test]
+    fn openai_streaming_delta_then_final_stop() {
+        let lines = [
+            r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":" world"}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ];
+        let (text, calls, final_seen, had_finish) = replay_openai_sse(&lines);
+        assert_eq!(text, "hello world");
+        assert!(had_finish);
+        assert!(final_seen);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn openai_streaming_handles_partial_tool_args_across_three_chunks() {
+        let lines = [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_z","function":{"name":"edit"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"p\""}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"a.rs\","}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"l\":1}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let (_text, calls, _final, _finish) = replay_openai_sse(&lines);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "edit");
+        assert_eq!(calls[0].args, r#"{"p":"a.rs","l":1}"#);
+    }
+
+    #[tokio::test]
+    async fn openai_streaming_fails_without_key() {
+        use crate::providers::traits::StreamOptions;
+        let provider = OpenAiProvider::new(None);
+        let messages = vec![ChatMessage::user("hi".to_string())];
+        let mut stream = provider.stream_chat_with_history(&messages, "gpt-4o", 0.0, StreamOptions::new(false));
+        let first = stream.next().await.expect("chunk");
+        let err = first.expect_err("no key → error");
+        assert!(err.to_string().contains("API key not set"));
+    }
+
+    #[tokio::test]
+    async fn openai_streaming_propagates_http_error() {
+        use crate::providers::traits::StreamOptions;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn unauthorized() -> (StatusCode, &'static str) {
+            (StatusCode::UNAUTHORIZED, "Unauthorized")
+        }
+        let app = Router::new().route("/chat/completions", post(unauthorized));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let addr = listener.local_addr().expect("test: addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = OpenAiProvider::with_base_url(Some(&format!("http://{addr}")), Some("bad-key"));
+        let messages = vec![ChatMessage::user("hi".to_string())];
+        let mut stream = provider.stream_chat_with_history(&messages, "gpt-4o", 0.0, StreamOptions::new(false));
+        let first = stream.next().await.expect("chunk");
+        let err = first.expect_err("must surface 401 as StreamError");
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "got: {msg}");
     }
 }

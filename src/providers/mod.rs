@@ -1276,6 +1276,12 @@ fn create_provider_with_url_and_options(
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
     match name {
+        // ── Test-only providers (gated by `test-mock` feature) ─────
+        // Allows PTY E2E tests (tests/chat_pty_e2e.rs) to drive
+        // `prx chat -p mock` without hitting any real LLM. Response text is
+        // read from OPENPRX_MOCK_RESPONSE (default "[MOCK-DEFAULT]").
+        #[cfg(any(test, feature = "test-mock"))]
+        "mock" => Ok(Box::new(router::MockEnvProvider::from_env())),
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => {
@@ -2234,6 +2240,19 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             aliases: &["ovh"],
             local: false,
             accepts_any_model: false,
+        },
+        // Test-only mock provider. `local: true` ensures
+        // `provider_requires_explicit_credential` returns false so the
+        // availability check passes without any API key.
+        // Compiled-in only when `test-mock` feature is enabled (or under
+        // `#[cfg(test)]` for the in-crate provider tests).
+        #[cfg(any(test, feature = "test-mock"))]
+        ProviderInfo {
+            name: "mock",
+            display_name: "Mock (test)",
+            aliases: &[],
+            local: true,
+            accepts_any_model: true,
         },
     ]
 }
