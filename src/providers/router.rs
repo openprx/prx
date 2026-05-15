@@ -1,7 +1,11 @@
 use super::Provider;
-use super::traits::{ChatMessage, ChatRequest, ChatResponse};
+use super::traits::{ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult};
 use async_trait::async_trait;
 use std::collections::HashMap;
+#[cfg(any(test, feature = "test-mock"))]
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-mock"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A single route: maps a task hint to a provider + model combo.
 #[derive(Debug, Clone)]
@@ -151,6 +155,35 @@ impl Provider for RouterProvider {
         self.providers.iter().any(|(_, provider)| provider.supports_vision())
     }
 
+    fn supports_streaming(&self) -> bool {
+        self.providers.iter().any(|(_, provider)| provider.supports_streaming())
+    }
+
+    /// 把 `stream_chat_with_history` 转发到被路由的具体 provider，
+    /// 与 `chat_with_history` 的行为对齐。否则默认 trait 实现会回退到
+    /// "unknown does not support streaming" 错误 chunk，
+    /// 让 Step 5a-4 dispatcher driver 路径（依赖 streaming）无法工作。
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> futures::stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        use futures::StreamExt as _;
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let Some((_, provider)) = self.providers.get(provider_idx) else {
+            // resolve() 永远返回有效 idx；防御性兜底返回错误 chunk 而非 panic.
+            return futures::stream::once(async move {
+                Err(super::traits::StreamError::Provider(format!(
+                    "RouterProvider: resolved provider index {provider_idx} out of bounds"
+                )))
+            })
+            .boxed();
+        };
+        provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up routed provider");
@@ -162,12 +195,195 @@ impl Provider for RouterProvider {
     }
 }
 
+/// Deterministic in-process provider for tests and the PTY E2E harness.
+///
+/// Enabled by the `test-mock` Cargo feature (and unconditionally in `#[cfg(test)]`).
+/// Reads the response text from the `OPENPRX_MOCK_RESPONSE` environment variable
+/// at construction time so PTY tests can pin a unique sentinel per scenario,
+/// e.g. `OPENPRX_MOCK_RESPONSE=[MOCK-END-A1B2]`. Falls back to `[MOCK-DEFAULT]`
+/// when the env var is unset so the binary still runs deterministically without
+/// any extra setup.
+///
+/// Intentionally bypasses prompt-guided tool injection by reporting
+/// `supports_native_tools() = true` — the chat tool loop then treats `Provider::chat`
+/// as native, and our impl just returns the canned text with no tool calls.
+#[cfg(any(test, feature = "test-mock"))]
+pub(crate) struct MockEnvProvider {
+    response: String,
+    /// 5a-6: 当设置 `OPENPRX_MOCK_TOOL_CALL=name:args_json` 时，第一次 streaming
+    /// 调用产生 `ToolCallChunk`(name, args)，后续调用返回 `response` 文本。
+    /// 让 PTY E2E 能验证 driver 完整 tool turn 闭环（call → execute → continue → final）。
+    /// `None` 时维持原 5a-2 行为（直接返回 response 文本）.
+    tool_call_spec: Option<MockToolCallSpec>,
+    /// 流式调用计数器，决定本次 emit tool_call 还是 final text。
+    call_counter: Arc<AtomicUsize>,
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+#[derive(Clone, Debug)]
+struct MockToolCallSpec {
+    name: String,
+    args: String,
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+impl MockEnvProvider {
+    /// Read response sentinel from `OPENPRX_MOCK_RESPONSE` (default
+    /// `[MOCK-DEFAULT-RESPONSE][MOCK-END]`).
+    ///
+    /// Empty-string is treated as "unset" and falls back to the default
+    /// sentinel — an empty mock response would never satisfy any PTY
+    /// `expect` matcher and would silently turn into a hang.
+    ///
+    /// 5a-6: 读取 `OPENPRX_MOCK_TOOL_CALL` 控制 streaming 是否在首次返回 tool_call.
+    /// 格式: `name:args_json` (e.g. `shell:{"cmd":"ls"}`). 解析失败回退为无 tool_call.
+    pub(crate) fn from_env() -> Self {
+        const DEFAULT_SENTINEL: &str = "[MOCK-DEFAULT-RESPONSE][MOCK-END]";
+        let response = match std::env::var("OPENPRX_MOCK_RESPONSE") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => DEFAULT_SENTINEL.to_string(),
+        };
+        let tool_call_spec = std::env::var("OPENPRX_MOCK_TOOL_CALL").ok().and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let (name, args) = trimmed.split_once(':')?;
+            let name = name.trim();
+            let args = args.trim();
+            if name.is_empty() || args.is_empty() {
+                return None;
+            }
+            Some(MockToolCallSpec {
+                name: name.to_string(),
+                args: args.to_string(),
+            })
+        });
+        Self {
+            response,
+            tool_call_spec,
+            call_counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+#[async_trait]
+impl Provider for MockEnvProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok(self.response.clone())
+    }
+
+    async fn chat_with_history(
+        &self,
+        _messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok(self.response.clone())
+    }
+
+    // Native-tools = true so the agent loop calls Provider::chat directly and
+    // doesn't inject the prompt-guided tool instructions (which would otherwise
+    // pollute the output and make sentinel matching brittle).
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    async fn chat(&self, _request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
+        Ok(ChatResponse {
+            text: Some(self.response.clone()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        })
+    }
+
+    async fn chat_with_tools(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        Ok(ChatResponse {
+            text: Some(self.response.clone()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        })
+    }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// 显式实现 streaming：把 `response` 作为单个 delta 推送 + final 标记。
+    ///
+    /// 仅在 `test-mock` 启用下编译。PRX_CHAT_REDUX_DRIVER 路径的 PTY 验证依赖这里
+    /// 真返回 chunk（默认 trait 实现返回错误 chunk "unknown does not support streaming"）。
+    ///
+    /// 5a-6: 当 `OPENPRX_MOCK_TOOL_CALL=name:args` 设置且 `call_counter == 0` 时，首次
+    /// 调用返回单个 `ToolCallChunk` (无 delta 文本) — driver 收到后执行 tool，把
+    /// tool_result 喂回 history，再次调 stream_chat_with_history（此时 counter == 1），
+    /// 返回 `response` 文本作为最终答复，turn 闭环。
+    fn stream_chat_with_history(
+        &self,
+        _messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+        _options: StreamOptions,
+    ) -> futures::stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        use crate::providers::traits::ToolCallChunk;
+        use futures::StreamExt as _;
+
+        let counter_val = self.call_counter.fetch_add(1, Ordering::SeqCst);
+        let response = self.response.clone();
+
+        // First call + tool_call_spec configured → emit ToolCallChunk.
+        if counter_val == 0
+            && let Some(spec) = self.tool_call_spec.as_ref()
+        {
+            let calls = vec![ToolCallChunk::new(
+                format!("mock-call-{counter_val}"),
+                spec.name.clone(),
+                spec.args.clone(),
+                0,
+            )];
+            return futures::stream::iter(vec![
+                Ok(StreamChunk::tool_call_chunk(calls)),
+                Ok(StreamChunk::final_chunk()),
+            ])
+            .boxed();
+        }
+
+        // Default path / subsequent call → text response.
+        futures::stream::iter(vec![
+            Ok(StreamChunk {
+                delta: response,
+                reasoning: None,
+                is_final: false,
+                token_count: 0,
+                tool_calls: Vec::new(),
+            }),
+            Ok(StreamChunk::final_chunk()),
+        ])
+        .boxed()
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+}
+
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockProvider {
         calls: Arc<AtomicUsize>,

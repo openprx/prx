@@ -129,7 +129,7 @@ crossterm = { version = "0.28", default-features = false, features = ["events", 
 reedline = "0.38"
 
 # TUI advanced features (Phase 3) — gated behind terminal-tui feature
-ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm", "scrolling-regions"] }
 syntect = { version = "5.2", optional = true, default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "html", "plist-load", "dump-load", "dump-create", "regex-fancy"] }
 unicode-width = { version = "0.2", optional = true }
 
@@ -226,6 +226,10 @@ wasm-plugins = ["dep:wasmtime", "dep:wasmtime-wasi"]
 llm-router = ["dep:skillratings", "dep:tiktoken-rs"]
 # Terminal TUI advanced features (Phase 3): ratatui layout, syntect highlighting, CJK width
 terminal-tui = ["dep:ratatui", "dep:syntect", "dep:unicode-width"]
+# test-mock = expose an in-process MockProvider as the `"mock"` provider name so
+# PTY end-to-end tests can drive `prx chat` without hitting any real LLM.
+# Implementation: src/providers/router.rs + src/providers/mod.rs (factory match).
+test-mock = []
 
 [profile.release]
 opt-level = "z"      # Optimize for size
@@ -254,6 +258,11 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
+# PTY-driven end-to-end tests for `prx chat` (see tests/chat_pty_e2e.rs).
+expectrl = "0.7"
+# Serialize PTY tests that share controlling-tty resources, without forcing
+# `--test-threads=1` on the whole test binary.
+serial_test = "3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

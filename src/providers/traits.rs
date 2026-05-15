@@ -102,6 +102,41 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolResultMessage>),
 }
 
+/// A tool call surfaced through a streaming response.
+///
+/// **5a-5 协议层扩展**：当 provider 在 SSE 流中识别到 LLM 要调用工具，emit 一个
+/// 携带 `tool_calls` 的 `StreamChunk`。承载完整 args（provider 已 buffer），消费
+/// 端无需逐 chunk 拼装。`index` 用来区分单轮内并发 tool call。
+///
+/// 注：5a-6 阶段 driver 已通过 mock provider 真接通 tool turn 闭环
+/// (`drive_start_turn_stream` 执行 + 多轮回合)。OpenAI / Anthropic 等 provider
+/// native SSE tool_call 解析推迟到 5a-7 — 它们目前在 streaming 路径下未实现
+/// `stream_chat_with_history`，driver 路径仅在 mock provider / 已实现 streaming
+/// 的 provider 上工作；其他场景 chat::run 仍 fallback 到 legacy `run_tool_call_loop`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolCallChunk {
+    /// LLM 给出的 tool_call_id（用作 result 回填的关联键）.
+    pub id: String,
+    /// 工具名（必须匹配 tools_registry 注册的 ToolSpec.name）.
+    pub name: String,
+    /// 完整参数 JSON 字符串（provider 已经把 SSE delta 拼成完整 JSON）.
+    pub args: String,
+    /// 同一轮内并发 tool call 的序号（0..N）.
+    pub index: usize,
+}
+
+impl ToolCallChunk {
+    /// Construct a new tool call chunk.
+    pub fn new(id: impl Into<String>, name: impl Into<String>, args: impl Into<String>, index: usize) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            args: args.into(),
+            index,
+        }
+    }
+}
+
 /// A chunk of content from a streaming response.
 ///
 /// Reasoning/thinking content (Anthropic `thinking` blocks, OpenAI
@@ -109,6 +144,10 @@ pub enum ConversationMessage {
 /// visible `delta` text so chat consumers can choose whether to render it.
 /// The default chat consumer drops reasoning from the live stream and only
 /// preserves the final aggregated text + reasoning in conversation history.
+///
+/// **5a-5 扩展**：新增 `tool_calls` 字段（默认空 vec，向后兼容）。当 provider
+/// 在 streaming 中识别 LLM 要调用工具，emit 一个携带 tool_calls 的 chunk；
+/// driver 检测到非空 tool_calls 时进入工具回合循环。
 #[derive(Debug, Clone, Default)]
 pub struct StreamChunk {
     /// Visible text delta for this chunk (assistant's "spoken" output).
@@ -121,6 +160,12 @@ pub struct StreamChunk {
     pub is_final: bool,
     /// Approximate token count for this chunk (estimated).
     pub token_count: usize,
+    /// **5a-5**: Tool calls surfaced in this chunk. Empty for ordinary text;
+    /// non-empty when the provider has parsed a tool_use block from the stream.
+    ///
+    /// Provider 负责把所有 SSE event 累积成完整 tool_call (id + name + args)
+    /// 再 emit 单个 chunk；driver 不做增量解析。
+    pub tool_calls: Vec<ToolCallChunk>,
 }
 
 impl StreamChunk {
@@ -131,6 +176,7 @@ impl StreamChunk {
             reasoning: None,
             is_final: false,
             token_count: 0,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -143,6 +189,22 @@ impl StreamChunk {
             reasoning: Some(text.into()),
             is_final: false,
             token_count: 0,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// **5a-5**: Create a non-final chunk carrying tool calls only.
+    ///
+    /// Provider 在 streaming 中识别 LLM 要调用工具时，emit 此变体。`delta` 留空
+    /// 让 UI 不把 tool_call 当文本 token 渲染。driver 检测到 `tool_calls.is_empty()
+    /// == false` 时进入工具执行回合。
+    pub const fn tool_call_chunk(calls: Vec<ToolCallChunk>) -> Self {
+        Self {
+            delta: String::new(),
+            reasoning: None,
+            is_final: false,
+            token_count: 0,
+            tool_calls: calls,
         }
     }
 
@@ -153,6 +215,7 @@ impl StreamChunk {
             reasoning: None,
             is_final: true,
             token_count: 0,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -163,12 +226,18 @@ impl StreamChunk {
             reasoning: None,
             is_final: true,
             token_count: 0,
+            tool_calls: Vec::new(),
         }
     }
 
     /// True when this chunk carries only reasoning (no visible delta).
     pub const fn is_reasoning_only(&self) -> bool {
         self.delta.is_empty() && self.reasoning.is_some()
+    }
+
+    /// **5a-5**: True when this chunk carries tool calls (regardless of delta).
+    pub const fn has_tool_calls(&self) -> bool {
+        !self.tool_calls.is_empty()
     }
 
     /// Estimate tokens (rough approximation: ~4 chars per token).
@@ -905,5 +974,72 @@ mod tests {
         let message = err.to_string();
 
         assert!(message.contains("non-prompt-guided"));
+    }
+
+    // ─── 5a-5 StreamChunk + ToolCallChunk 协议层契约测试 ────────────────────
+
+    #[test]
+    fn tool_call_chunk_new_constructs_fields() {
+        let c = ToolCallChunk::new("call_42", "shell", r#"{"cmd":"ls"}"#, 0);
+        assert_eq!(c.id, "call_42");
+        assert_eq!(c.name, "shell");
+        assert_eq!(c.args, r#"{"cmd":"ls"}"#);
+        assert_eq!(c.index, 0);
+    }
+
+    #[test]
+    fn tool_call_chunk_serde_roundtrip() {
+        let original = ToolCallChunk::new("call_1", "edit", r#"{"path":"a.rs"}"#, 2);
+        let json = serde_json::to_string(&original).expect("serialize ToolCallChunk");
+        let parsed: ToolCallChunk = serde_json::from_str(&json).expect("deserialize ToolCallChunk");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn stream_chunk_delta_has_empty_tool_calls() {
+        let c = StreamChunk::delta("hello");
+        assert_eq!(c.delta, "hello");
+        assert!(c.tool_calls.is_empty());
+        assert!(!c.has_tool_calls());
+    }
+
+    #[test]
+    fn stream_chunk_reasoning_has_empty_tool_calls() {
+        let c = StreamChunk::reasoning_delta("thinking...");
+        assert!(c.delta.is_empty());
+        assert!(c.reasoning.is_some());
+        assert!(c.tool_calls.is_empty());
+        assert!(c.is_reasoning_only());
+        assert!(!c.has_tool_calls());
+    }
+
+    #[test]
+    fn stream_chunk_tool_call_chunk_constructor() {
+        let calls = vec![
+            ToolCallChunk::new("call_a", "shell", "{}", 0),
+            ToolCallChunk::new("call_b", "edit", "{}", 1),
+        ];
+        let c = StreamChunk::tool_call_chunk(calls.clone());
+        assert!(c.delta.is_empty(), "tool_call_chunk has no visible delta");
+        assert!(c.reasoning.is_none());
+        assert!(!c.is_final);
+        assert_eq!(c.tool_calls, calls);
+        assert!(c.has_tool_calls());
+    }
+
+    #[test]
+    fn stream_chunk_final_and_error_have_no_tool_calls() {
+        assert!(StreamChunk::final_chunk().tool_calls.is_empty());
+        assert!(StreamChunk::error("boom").tool_calls.is_empty());
+    }
+
+    #[test]
+    fn stream_chunk_default_is_backwards_compatible() {
+        // Default impl 是协议向后兼容的保证：所有 provider 即便不感知 5a-5
+        // 也能编译 — 字段被默认补 Vec::new()，has_tool_calls() == false.
+        let c = StreamChunk::default();
+        assert!(c.delta.is_empty());
+        assert!(c.tool_calls.is_empty());
+        assert!(!c.has_tool_calls());
     }
 }
