@@ -133,7 +133,7 @@ impl ChatSession {
 }
 
 /// Truncate content to a title (max 50 chars, break at word boundary).
-fn truncate_title(content: &str) -> String {
+pub(crate) fn truncate_title(content: &str) -> String {
     let trimmed = content.trim();
     if trimmed.chars().count() <= 50 {
         return trimmed.to_string();
