@@ -2,7 +2,7 @@ use crate::multimodal;
 use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
-    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
+    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk, ToolCallChunkStatus,
 };
 use crate::tools::ToolSpec;
 use crate::tools::schema::SchemaCleanr;
@@ -691,8 +691,17 @@ impl AnthropicProvider {
 //
 // Tool calls arrive as: content_block_start (tool_use with id/name) + a series
 // of content_block_delta (input_json_delta partial_json fragments) +
-// content_block_stop. We accumulate per-block, then emit a single
-// [`ToolCallChunk`] at content_block_stop time when the block was tool_use.
+// content_block_stop. **S3 T3-2-A**: we emit chunks incrementally —
+//   - `content_block_start(tool_use)` → emit `ToolCallChunk { status: Streaming,
+//     arguments_delta: Some(""), .. }` so the driver registers the new tool
+//     call immediately;
+//   - each `input_json_delta` → emit `ToolCallChunk { status: Streaming,
+//     arguments_delta: Some(partial_json), .. }`;
+//   - `content_block_stop(tool_use)` → emit a terminal
+//     `ToolCallChunk { status: Completed, args: full JSON, .. }`.
+// All chunks for one tool_use share the same stable `index` allocated at
+// `content_block_start` time. Driver-side `ToolCallAggregator` (T3-1) handles
+// both legacy (single Completed) and incremental (Streaming…Completed) shapes.
 
 #[derive(Debug, Serialize)]
 struct OwnedNativeToolSpec {
@@ -754,21 +763,77 @@ struct AnthropicBlockState {
     kind: String,
     tool_id: String,
     tool_name: String,
+    /// Buffer of all `input_json_delta` fragments accumulated for this tool_use
+    /// content block. The buffered value is replayed verbatim in the terminal
+    /// `Completed` chunk so the driver's aggregator can validate that
+    /// `Σ Streaming.arguments_delta == Completed.args` (T3-0 invariant).
     tool_args: String,
+    /// Stable chunk `index` for this tool_use, reserved at
+    /// `content_block_start` time so every chunk in the Streaming … Completed
+    /// sequence shares the same value. Unused for non-tool_use blocks.
+    tool_order: usize,
 }
 
 impl AnthropicStreamState {
-    fn on_content_block_start(&mut self, idx: usize, block: AnthropicSseContentBlock) {
-        let mut entry = AnthropicBlockState {
-            kind: block.kind.clone(),
-            ..AnthropicBlockState::default()
-        };
-        if block.kind == "tool_use" {
-            entry.tool_id = block.id.unwrap_or_default();
-            entry.tool_name = block.name.unwrap_or_default();
+    /// Allocate a stable tool-call ordinal. Returns the previous counter value
+    /// and bumps it by one (saturating, so a pathological stream never panics).
+    const fn next_tool_order(&mut self) -> usize {
+        let order = self.tool_call_order;
+        self.tool_call_order = self.tool_call_order.saturating_add(1);
+        order
+    }
+
+    /// Generate a synthetic id when the upstream `content_block_start` did
+    /// not include one. Anthropic always sends `id`, but defensive code keeps
+    /// the driver-side invariants (non-empty `id` per chunk) intact.
+    fn id_or_synthetic(raw: String) -> String {
+        if raw.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            raw
         }
+    }
+
+    /// **S3 T3-2-A**: also returns an initial `Streaming` chunk (with empty
+    /// `arguments_delta`) for `tool_use` blocks so the driver can register the
+    /// new tool call before any argument bytes arrive. Returns `None` for text
+    /// and thinking blocks.
+    fn on_content_block_start(&mut self, idx: usize, block: AnthropicSseContentBlock) -> Option<ToolCallChunk> {
+        let kind = block.kind.clone();
+        let is_tool = kind == "tool_use";
+        let tool_id_raw = if is_tool {
+            block.id.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let tool_name = if is_tool {
+            block.name.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let tool_order = if is_tool { self.next_tool_order() } else { 0 };
+
+        let entry = AnthropicBlockState {
+            kind,
+            tool_id: if is_tool {
+                Self::id_or_synthetic(tool_id_raw)
+            } else {
+                String::new()
+            },
+            tool_name: tool_name.clone(),
+            tool_args: String::new(),
+            tool_order,
+        };
         self.blocks.insert(idx, entry);
         let _ = block.text; // text in start is unused
+
+        if !is_tool || tool_name.is_empty() {
+            return None;
+        }
+        // SAFETY: we just inserted this entry above; the lookup is for the
+        // freshly normalised id (post-synthesis).
+        let id = self.blocks.get(&idx).map(|e| e.tool_id.clone()).unwrap_or_default();
+        Some(ToolCallChunk::streaming_delta(id, tool_name, "", tool_order))
     }
 
     fn on_content_block_delta(&mut self, idx: usize, delta: AnthropicSseDelta) -> Option<DeltaOutcome> {
@@ -787,9 +852,23 @@ impl AnthropicStreamState {
             }
             "input_json_delta" => {
                 let frag = delta.partial_json.unwrap_or_default();
-                if let Some(entry) = self.blocks.get_mut(&idx) {
-                    entry.tool_args.push_str(&frag);
+                let entry = self.blocks.get_mut(&idx)?;
+                if entry.kind != "tool_use" || entry.tool_name.is_empty() {
+                    return None;
                 }
+                entry.tool_args.push_str(&frag);
+                // S3 T3-2-A: emit incremental Streaming chunk carrying the
+                // raw partial_json fragment. `args` stays empty per T3-0
+                // protocol invariants.
+                let chunk = ToolCallChunk {
+                    id: entry.tool_id.clone(),
+                    name: entry.tool_name.clone(),
+                    args: String::new(),
+                    index: entry.tool_order,
+                    arguments_delta: Some(frag),
+                    status: ToolCallChunkStatus::Streaming,
+                };
+                return Some(DeltaOutcome::ToolDelta(chunk));
             }
             _ => {}
         }
@@ -804,29 +883,21 @@ impl AnthropicStreamState {
         if entry.tool_name.is_empty() {
             return None;
         }
-        let order = self.tool_call_order;
-        self.tool_call_order = self.tool_call_order.saturating_add(1);
-        let id = if entry.tool_id.is_empty() {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            entry.tool_id
-        };
         let args = if entry.tool_args.is_empty() {
             "{}".to_string()
         } else {
             entry.tool_args
         };
-        // S3 T3-0: Anthropic uses the legacy completion protocol — buffer
-        // `input_json_delta` fragments per content_block and emit a single
-        // `Completed` chunk at content_block_stop. Incremental streaming
-        // will be added in T3-2.
+        // S3 T3-2-A: terminal `Completed` chunk. The driver aggregator uses
+        // this to flush — and to validate that the accumulated Streaming
+        // deltas concatenate to the same JSON string.
         Some(ToolCallChunk {
-            id,
+            id: entry.tool_id,
             name: entry.tool_name,
             args,
-            index: order,
+            index: entry.tool_order,
             arguments_delta: None,
-            status: crate::providers::traits::ToolCallChunkStatus::Completed,
+            status: ToolCallChunkStatus::Completed,
         })
     }
 }
@@ -835,6 +906,9 @@ impl AnthropicStreamState {
 enum DeltaOutcome {
     Text(String),
     Reasoning(String),
+    /// **S3 T3-2-A**: a `Streaming` tool-call chunk carrying an
+    /// `arguments_delta` fragment.
+    ToolDelta(ToolCallChunk),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1227,17 +1301,35 @@ impl Provider for AnthropicProvider {
                     };
                     match event {
                         AnthropicEvent::BlockStart(idx, block) => {
-                            state.on_content_block_start(idx, block);
+                            if let Some(initial) = state.on_content_block_start(idx, block) {
+                                if tx.send(Ok(StreamChunk::tool_call_chunk(vec![initial]))).await.is_err() {
+                                    return;
+                                }
+                            }
                         }
                         AnthropicEvent::BlockDelta(idx, delta) => {
                             if let Some(outcome) = state.on_content_block_delta(idx, delta) {
-                                let mut chunk = match outcome {
-                                    DeltaOutcome::Text(t) => StreamChunk::delta(t),
-                                    DeltaOutcome::Reasoning(r) => StreamChunk::reasoning_delta(r),
+                                let chunk = match outcome {
+                                    DeltaOutcome::Text(t) => {
+                                        let mut c = StreamChunk::delta(t);
+                                        if options.count_tokens {
+                                            c = c.with_token_estimate();
+                                        }
+                                        c
+                                    }
+                                    DeltaOutcome::Reasoning(r) => {
+                                        let mut c = StreamChunk::reasoning_delta(r);
+                                        if options.count_tokens {
+                                            c = c.with_token_estimate();
+                                        }
+                                        c
+                                    }
+                                    DeltaOutcome::ToolDelta(tool_chunk) => {
+                                        // Tool-call chunks are never token-counted —
+                                        // they don't carry user-visible text.
+                                        StreamChunk::tool_call_chunk(vec![tool_chunk])
+                                    }
                                 };
-                                if options.count_tokens {
-                                    chunk = chunk.with_token_estimate();
-                                }
                                 if tx.send(Ok(chunk)).await.is_err() {
                                     return;
                                 }
@@ -2113,5 +2205,141 @@ mod tests {
 
         assert_eq!(parsed.text.as_deref(), Some("Just an answer."));
         assert_eq!(parsed.reasoning_content, None);
+    }
+
+    // ─── S3 T3-2-A: SSE tool_use incremental streaming ──────────────────────
+
+    /// Build a `tool_use` `content_block_start` payload.
+    fn tool_use_start_block(id: &str, name: &str) -> AnthropicSseContentBlock {
+        AnthropicSseContentBlock {
+            kind: "tool_use".into(),
+            id: Some(id.into()),
+            name: Some(name.into()),
+            text: None,
+        }
+    }
+
+    /// Build an `input_json_delta` SSE delta.
+    fn input_json_delta(partial: &str) -> AnthropicSseDelta {
+        AnthropicSseDelta {
+            kind: "input_json_delta".into(),
+            text: None,
+            thinking: None,
+            partial_json: Some(partial.into()),
+        }
+    }
+
+    /// Mock the full SSE sequence for a single tool_use block (start +
+    /// multiple input_json_delta + stop) and verify provider emits:
+    /// 1) an initial `Streaming { arguments_delta: Some("") }` chunk,
+    /// 2) one `Streaming` chunk per partial_json with the verbatim fragment,
+    /// 3) a final `Completed` chunk whose `args` equals Σ fragments.
+    #[test]
+    fn test_tool_use_streaming_emits_incremental_chunks() {
+        let mut state = AnthropicStreamState::default();
+
+        // BlockStart → initial Streaming chunk
+        let initial = state
+            .on_content_block_start(0, tool_use_start_block("tu_42", "shell"))
+            .expect("BlockStart for tool_use must emit an initial Streaming chunk");
+        assert_eq!(initial.id, "tu_42");
+        assert_eq!(initial.name, "shell");
+        assert_eq!(initial.index, 0);
+        assert_eq!(initial.status, ToolCallChunkStatus::Streaming);
+        assert_eq!(initial.arguments_delta.as_deref(), Some(""));
+        assert!(initial.args.is_empty(), "Streaming.args MUST be empty");
+
+        // Three input_json_delta events → three Streaming chunks
+        let fragments = [r#"{"command":"#, r#" "ls -"#, r#"la"}"#];
+        let mut streamed_chunks: Vec<ToolCallChunk> = Vec::new();
+        for frag in &fragments {
+            let outcome = state
+                .on_content_block_delta(0, input_json_delta(frag))
+                .expect("input_json_delta must produce a ToolDelta outcome");
+            match outcome {
+                DeltaOutcome::ToolDelta(chunk) => {
+                    assert_eq!(chunk.id, "tu_42");
+                    assert_eq!(chunk.name, "shell");
+                    assert_eq!(chunk.index, 0);
+                    assert_eq!(chunk.status, ToolCallChunkStatus::Streaming);
+                    assert!(chunk.args.is_empty(), "Streaming.args MUST be empty");
+                    assert_eq!(chunk.arguments_delta.as_deref(), Some(*frag));
+                    streamed_chunks.push(chunk);
+                }
+                other => panic!("expected ToolDelta, got {other:?}"),
+            }
+        }
+        assert_eq!(streamed_chunks.len(), 3);
+
+        // BlockStop → terminal Completed chunk with full JSON
+        let completed = state
+            .on_content_block_stop(0)
+            .expect("BlockStop for tool_use must emit a Completed chunk");
+        assert_eq!(completed.id, "tu_42");
+        assert_eq!(completed.name, "shell");
+        assert_eq!(completed.index, 0);
+        assert_eq!(completed.status, ToolCallChunkStatus::Completed);
+        assert!(
+            completed.arguments_delta.is_none(),
+            "Completed.arguments_delta MUST be None"
+        );
+
+        // T3-0 invariant: Σ Streaming.arguments_delta == Completed.args.
+        let aggregated: String = streamed_chunks
+            .iter()
+            .filter_map(|c| c.arguments_delta.as_deref())
+            .collect();
+        assert_eq!(aggregated, completed.args);
+        assert_eq!(completed.args, r#"{"command": "ls -la"}"#);
+
+        // The block-level entry must be drained at BlockStop.
+        assert!(state.blocks.is_empty(), "blocks map must drain at BlockStop");
+    }
+
+    /// Stream interruption: BlockStop never arrives. Provider must not panic;
+    /// the per-block entry stays in the map, no terminal Completed is emitted,
+    /// and a follow-up second tool_use still gets a fresh stable `index`.
+    #[test]
+    fn test_tool_use_streaming_interrupted_handles_partial_json() {
+        let mut state = AnthropicStreamState::default();
+
+        // Tool 1: start + one partial fragment, then "stream ends" — no stop.
+        let initial1 = state
+            .on_content_block_start(0, tool_use_start_block("tu_a", "search"))
+            .expect("initial Streaming chunk");
+        assert_eq!(initial1.index, 0);
+
+        let frag_out = state
+            .on_content_block_delta(0, input_json_delta(r#"{"query":"#))
+            .expect("partial fragment must surface");
+        match frag_out {
+            DeltaOutcome::ToolDelta(chunk) => {
+                assert_eq!(chunk.index, 0);
+                assert_eq!(chunk.arguments_delta.as_deref(), Some(r#"{"query":"#));
+            }
+            other => panic!("expected ToolDelta, got {other:?}"),
+        }
+
+        // Buffer is still alive (no Completed flushed yet).
+        assert_eq!(state.blocks.len(), 1, "interrupted tool buffer must persist");
+
+        // A second tool_use must still allocate a *fresh* index (1) — the
+        // ordinal counter is independent of orphan buffers.
+        let initial2 = state
+            .on_content_block_start(1, tool_use_start_block("tu_b", "edit"))
+            .expect("second initial Streaming chunk");
+        assert_eq!(initial2.index, 1);
+        assert_eq!(initial2.id, "tu_b");
+
+        // Calling stop on a content_block that was never started must not panic
+        // and must return None.
+        assert!(state.on_content_block_stop(99).is_none());
+
+        // Calling stop on the second tool flushes it cleanly with empty-args
+        // fallback (`{}`) even though no input_json_delta arrived for it.
+        let completed2 = state.on_content_block_stop(1).expect("Completed for tool 2");
+        assert_eq!(completed2.index, 1);
+        assert_eq!(completed2.args, "{}");
+        assert_eq!(completed2.status, ToolCallChunkStatus::Completed);
     }
 }
