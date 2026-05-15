@@ -3063,6 +3063,121 @@ mod tests {
             // 本测试通过缺席 NotifyHook(Error) 间接验证 chat::mod 主循环的
             // "先判 is_tool_loop_cancelled → 再分类 FailedWithError" 顺序契约.
         }
+
+        /// S2-A test 5 (Codex 阻塞): tool_call_chunk_interleave_consistency
+        ///
+        /// 验证同一 turn 内 tool 事件（`ToolStarted` / `ToolFinished`）与
+        /// `StreamChunkReceived` **交织**时，reducer 仍然按"独立轴"维持一致状态：
+        /// - stream.draft.accumulated 只由 stream chunk 累积，tool 事件不污染
+        /// - tool 事件只影响 ui.conversation_lines / pending_tool_cards，不动 draft
+        /// - 与"先收完所有 stream chunk、再处理 tool"的等价序列输出 state 一致
+        ///
+        /// 这是 chat::run 主循环 tool-call loop 与 streaming 路径并行的关键不变量 —
+        /// 若 reducer 在 ToolStarted/ToolFinished 路径上误清/误改 draft，会出现
+        /// 用户可见的 streaming 文字"突然回退一段"的回归。
+        #[test]
+        fn test_s2a_tool_call_chunk_interleave_consistency() {
+            // ── 场景 A：交织序列 — stream / tool / stream / tool 交错 ──
+            let mut state_a = s();
+            let _ = state_a.reduce(Action::TurnStarted {
+                draft_id: "draft-interleave".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state_a.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-interleave".to_string(),
+                delta: "hello ".to_string(),
+                version: 1,
+            });
+            let _ = state_a.reduce(Action::ToolStarted {
+                name: "search".to_string(),
+                args: "{\"q\":\"openprx\"}".to_string(),
+            });
+            let _ = state_a.reduce(Action::ToolFinished {
+                name: "search".to_string(),
+                success: true,
+                duration_ms: 42,
+                result: Some("found 3 results".to_string()),
+            });
+            let _ = state_a.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-interleave".to_string(),
+                delta: "world".to_string(),
+                version: 2,
+            });
+
+            // ── 场景 B：等价"纯流式后置 tool"序列 ──
+            let mut state_b = s();
+            let _ = state_b.reduce(Action::TurnStarted {
+                draft_id: "draft-interleave".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state_b.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-interleave".to_string(),
+                delta: "hello ".to_string(),
+                version: 1,
+            });
+            let _ = state_b.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-interleave".to_string(),
+                delta: "world".to_string(),
+                version: 2,
+            });
+            let _ = state_b.reduce(Action::ToolStarted {
+                name: "search".to_string(),
+                args: "{\"q\":\"openprx\"}".to_string(),
+            });
+            let _ = state_b.reduce(Action::ToolFinished {
+                name: "search".to_string(),
+                success: true,
+                duration_ms: 42,
+                result: Some("found 3 results".to_string()),
+            });
+
+            // 核心不变量：draft.accumulated 完全相同（tool 事件不污染流式文本）
+            let acc_a = state_a
+                .stream
+                .draft
+                .as_ref()
+                .map(|d| d.accumulated.clone())
+                .expect("test: scenario A draft must exist");
+            let acc_b = state_b
+                .stream
+                .draft
+                .as_ref()
+                .map(|d| d.accumulated.clone())
+                .expect("test: scenario B draft must exist");
+            assert_eq!(
+                acc_a, "hello world",
+                "交织序列下 draft.accumulated 仅由 stream chunk 累积"
+            );
+            assert_eq!(
+                acc_a, acc_b,
+                "交织 vs 纯流式后置 tool 的 draft.accumulated 必须字节级一致"
+            );
+
+            // version 也必须相等（tool 事件不动 version）
+            assert_eq!(
+                state_a.stream.draft.as_ref().map(|d| d.version),
+                state_b.stream.draft.as_ref().map(|d| d.version),
+                "tool 事件不应推进 stream.version"
+            );
+            assert_eq!(state_a.stream.draft.as_ref().map(|d| d.version), Some(2));
+
+            // tool 卡片在两边都已落地，且 ToolFinished 后已从 pending 移除
+            assert_eq!(
+                state_a.stream.pending_tool_cards.len(),
+                state_b.stream.pending_tool_cards.len(),
+                "两个序列 pending_tool_cards 数量必须一致"
+            );
+            assert!(
+                state_a.stream.pending_tool_cards.is_empty(),
+                "ToolFinished 后 pending_tool_cards 应清空"
+            );
+
+            // control 状态一致：仍在生成中，cancel token 未变
+            assert!(state_a.control.generating);
+            assert!(state_b.control.generating);
+            assert!(state_a.control.active_cancel.is_some());
+            assert!(state_b.control.active_cancel.is_some());
+        }
     }
 
     // ─── S2-B 集成测试 (5 个新增测试) ─────────────────────────────────────────
@@ -3293,6 +3408,234 @@ mod tests {
             // 也不应再有 CancelToken（token 已经发过且取消）
             let has_cancel_token = terminal_effects.iter().any(|e| matches!(e, Effect::CancelToken(_)));
             assert!(!has_cancel_token, "StreamCancelled 不应再发 CancelToken");
+        }
+
+        /// S2-B-6 (Codex 阻塞): cancel_shutdown_race_single_terminal
+        ///
+        /// 用户在流式 turn 内**几乎同时**触发 `CancelRequested` + `ShutdownRequested`
+        /// （典型：长按 Ctrl+C 后立刻 Ctrl+D / SIGTERM）时:
+        /// - 第一发 CancelRequested take 走 active_cancel → 发 `Effect::CancelToken`
+        /// - 第二发 ShutdownRequested 看到 `generating == false` → **不应**再发
+        ///   `Effect::CancelToken`（otherwise 会 take 一个已被 take 走的 Option，
+        ///   或更糟，发个 None token 让 EffectExecutor 解引用）
+        ///
+        /// 验证两点契约:
+        /// 1. 整个序列只发 **一个** `Effect::CancelToken`（terminal cancel 是单次的）
+        /// 2. 第二发 ShutdownRequested 不会 panic / 不会重复 cancel / 仍发 `Effect::Quit`
+        #[test]
+        fn test_s2b_cancel_shutdown_race_single_terminal() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-race".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d-race".to_string(),
+                delta: "streaming...".to_string(),
+                version: 1,
+            });
+            assert!(state.control.generating);
+            assert!(state.control.active_cancel.is_some());
+
+            // 1. CancelRequested — take active_cancel + 发 CancelToken
+            let cancel_effects = state.reduce(Action::CancelRequested);
+            let cancel_token_count = cancel_effects
+                .iter()
+                .filter(|e| matches!(e, Effect::CancelToken(_)))
+                .count();
+            assert_eq!(cancel_token_count, 1, "CancelRequested 阶段应发恰好 1 个 CancelToken");
+            assert!(!state.control.generating, "CancelRequested 后 generating=false");
+            assert!(state.control.active_cancel.is_none(), "active_cancel 已被 take 走");
+
+            // 2. ShutdownRequested — 此时 generating=false, active_cancel=None.
+            //    reducer 必须**不**再发 CancelToken（避免双重 cancel + 防御性 take None）
+            let shutdown_effects = state.reduce(Action::ShutdownRequested);
+            let shutdown_cancel_token_count = shutdown_effects
+                .iter()
+                .filter(|e| matches!(e, Effect::CancelToken(_)))
+                .count();
+            assert_eq!(
+                shutdown_cancel_token_count, 0,
+                "ShutdownRequested 在 active_cancel 已被 take 后不应再发 CancelToken"
+            );
+            // 同样不应再发 CancelDraft（draft 已被 CancelRequested 清）
+            let shutdown_cancel_draft_count = shutdown_effects
+                .iter()
+                .filter(|e| matches!(e, Effect::CancelDraft(_)))
+                .count();
+            assert_eq!(
+                shutdown_cancel_draft_count, 0,
+                "ShutdownRequested 在 draft 已清后不应再发 CancelDraft"
+            );
+            // 但必须发 Effect::Quit
+            assert!(
+                shutdown_effects.iter().any(|e| matches!(e, Effect::Quit)),
+                "ShutdownRequested 必须发 Effect::Quit"
+            );
+
+            // 全序列只发 1 个 CancelToken（terminal effect 唯一）
+            let total_cancel_tokens = cancel_effects
+                .iter()
+                .chain(shutdown_effects.iter())
+                .filter(|e| matches!(e, Effect::CancelToken(_)))
+                .count();
+            assert_eq!(
+                total_cancel_tokens, 1,
+                "整个 race 序列只能发 1 个 Effect::CancelToken（terminal cancel 单一性）"
+            );
+
+            // 终态：generating=false, active_cancel=None, draft=None — 不留残留
+            assert!(!state.control.generating);
+            assert!(state.control.active_cancel.is_none());
+            assert!(state.stream.draft.is_none());
+
+            // 反向 race 验证：构造另一份 state，先 Shutdown 再 Cancel —
+            // 同样只能发 1 个 CancelToken（首发 take 走 token，后续 Cancel 在
+            // generating=false 下 no-op）.
+            let mut state2 = s();
+            let tok2 = CancellationToken::new();
+            let _ = state2.reduce(Action::TurnStarted {
+                draft_id: "d-race-2".to_string(),
+                cancel: tok2,
+            });
+            let first_effects = state2.reduce(Action::ShutdownRequested);
+            let second_effects = state2.reduce(Action::CancelRequested);
+            let cancel_token_total = first_effects
+                .iter()
+                .chain(second_effects.iter())
+                .filter(|e| matches!(e, Effect::CancelToken(_)))
+                .count();
+            assert_eq!(
+                cancel_token_total, 1,
+                "反向 race（Shutdown→Cancel）同样只发 1 个 CancelToken"
+            );
+            // 第二发 CancelRequested 必须是 no-op（generating=false）
+            assert!(
+                second_effects.is_empty(),
+                "Shutdown 后 generating=false，CancelRequested 必须 no-op，实际: {second_effects:?}"
+            );
+        }
+
+        /// S2-B-7 (Codex 阻塞): both_mode_legacy_arc_cancel_token_sync
+        ///
+        /// ReduxMode::Both 期间，chat::run 同时:
+        /// - 把 `cancellation.clone()` 写入 legacy `Arc<Mutex<Option<CancellationToken>>>`
+        ///   (mod.rs:1529 `*active_cancel.lock() = Some(cancellation.clone())`)
+        /// - 把 `cancellation.clone()` 通过 `Action::TurnStarted { cancel }` 写入
+        ///   `state.control.active_cancel`
+        ///
+        /// 这两个 token 必须是**同一个 cancellation 实例的克隆**（共享 internal
+        /// cancellation state），否则会出现"UI 取消了但底层仍跑"的窗口 —
+        /// 用户按 Ctrl+C → reducer 发 `Effect::CancelToken(state_clone)` →
+        /// executor 调 `state_clone.cancel()` →
+        /// 但旧顶层 Ctrl+C handler 读 `legacy_arc.lock().as_ref().cancel()`
+        /// 必须**也**看到 cancelled。
+        ///
+        /// 本测试模拟 Both 模式的双写，验证：
+        /// 1. 双写后 legacy Arc 与 state 各自持有 Some(token)
+        /// 2. 取消 Effect::CancelToken 携带的 token 后，legacy Arc 中的 token
+        ///    `is_cancelled()` 也变 true（共享 cancellation）
+        /// 3. 反向同样：取消 legacy Arc 中的 token，state 内的 token 也立即取消
+        #[test]
+        fn test_s2b_both_mode_legacy_arc_cancel_token_sync() {
+            // 模拟 Both 模式：chat::run 创建一份 cancellation，clone 给两条路径
+            let cancellation = CancellationToken::new();
+            let legacy_arc: Arc<parking_lot::Mutex<Option<CancellationToken>>> =
+                Arc::new(parking_lot::Mutex::new(None));
+
+            // 双写 1：写入 legacy Arc（mod.rs:1529 路径）
+            *legacy_arc.lock() = Some(cancellation.clone());
+
+            // 双写 2：写入 reducer state（Action::TurnStarted 路径）
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-both".to_string(),
+                cancel: cancellation.clone(),
+            });
+
+            // 契约 1：双写后两边都持有 Some(token)
+            assert!(legacy_arc.lock().is_some(), "legacy Arc 应持有 Some(token)");
+            assert!(
+                state.control.active_cancel.is_some(),
+                "state.control.active_cancel 应持有 Some(token)"
+            );
+            // 两边都还没 cancel
+            assert!(
+                legacy_arc
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|t| !CancellationToken::is_cancelled(t)),
+                "legacy Arc 中的 token 应处于未取消状态"
+            );
+            assert!(
+                state
+                    .control
+                    .active_cancel
+                    .as_ref()
+                    .is_some_and(|t| !CancellationToken::is_cancelled(t)),
+                "state 端 token 应处于未取消状态"
+            );
+
+            // 触发 CancelRequested → reducer take 走 state 端 token、发 Effect::CancelToken
+            let effects = state.reduce(Action::CancelRequested);
+            let token_from_effect = effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::CancelToken(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .expect("test: Effect::CancelToken must be present");
+
+            // 关键断言：reducer 已 take 走 state 端，但 legacy Arc 仍持有 Some
+            // （Both 模式下 legacy 字段独立写/清，reducer 不动它）
+            assert!(state.control.active_cancel.is_none(), "reducer take 后 state 端清空");
+            assert!(
+                legacy_arc.lock().is_some(),
+                "Both 模式下 legacy Arc 仍持有 token（独立轴），不被 reducer 清空"
+            );
+
+            // 契约 2：EffectExecutor 真调 token.cancel() —
+            // legacy Arc 中的 token 必须**同步**变 cancelled（共享 cancellation 状态）
+            token_from_effect.cancel();
+            let legacy_is_cancelled = legacy_arc.lock().as_ref().map(CancellationToken::is_cancelled);
+            assert_eq!(
+                legacy_is_cancelled,
+                Some(true),
+                "legacy Arc 中的 token 必须与 Effect::CancelToken 的 token 共享 cancellation — \
+                 否则会出现 'UI 取消了但底层仍跑' 的窗口"
+            );
+            // 原始 cancellation 也应同步 cancelled
+            assert!(
+                cancellation.is_cancelled(),
+                "原始 cancellation handle 也应 cancelled（同一 token 克隆）"
+            );
+
+            // 契约 3：反向同步 — 新一轮 turn，从 legacy Arc 端 cancel，state 端应同步
+            let cancellation_b = CancellationToken::new();
+            let legacy_arc_b: Arc<parking_lot::Mutex<Option<CancellationToken>>> =
+                Arc::new(parking_lot::Mutex::new(Some(cancellation_b.clone())));
+            let mut state_b = s();
+            let _ = state_b.reduce(Action::TurnStarted {
+                draft_id: "d-both-b".to_string(),
+                cancel: cancellation_b.clone(),
+            });
+            // legacy 端调 cancel
+            if let Some(t) = legacy_arc_b.lock().as_ref() {
+                t.cancel();
+            }
+            // state 端应同步 cancelled
+            assert!(
+                state_b
+                    .control
+                    .active_cancel
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled),
+                "legacy 端 cancel 后 state 端 token 应同步 cancelled（同一 cancellation 克隆）"
+            );
+            assert!(
+                cancellation_b.is_cancelled(),
+                "原始 cancellation handle B 也应同步 cancelled"
+            );
         }
     }
 
