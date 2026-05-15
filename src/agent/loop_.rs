@@ -22,6 +22,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::agent::sanitize::{known_tool_names, sanitize_stream_chunk};
 use crate::agent::stream_buffer::StreamBoundaryBuffer;
 
 /// Interactive chat operating mode. Aligned with codex CLI's `plan`/`edit`/`auto`
@@ -2690,21 +2691,39 @@ pub(crate) async fn run_tool_call_loop(
                 // `stream_buffer::StreamBoundaryBuffer` for the state machine.
                 let mut sbuf = StreamBoundaryBuffer::new();
                 let mut receiver_alive = true;
+                // Precompute the known-tool-name set once. The scrubber needs
+                // it to decide whether an isolated `{"name":...}` JSON object
+                // really is a tool call. Reused for every flushed chunk on
+                // the hot path; rebuilding it per word would be wasteful.
+                let tool_names = known_tool_names(tools_registry);
                 // Feed deltas roughly word-sized so progressive flushes still happen
                 // inside long plain-text runs.
                 for word in display_text.split_inclusive(char::is_whitespace) {
                     if cancellation_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
                         return Err(ToolLoopCancelled.into());
                     }
-                    if let Some(chunk) = sbuf.push(word)
-                        && tx.send(chunk).await.is_err()
-                    {
-                        receiver_alive = false;
-                        break; // receiver dropped
+                    if let Some(chunk) = sbuf.push(word) {
+                        // Sanitize the chunk *before* it enters the channel
+                        // mpsc::Sender so any tool-call XML/JSON artifact is
+                        // removed at the source instead of being painted on
+                        // screen and replaced after the response completes
+                        // (which would flicker — see P0-3 in the chat-mode
+                        // fix plan, 2026-05-12).
+                        let cleaned = sanitize_stream_chunk(&chunk, &tool_names);
+                        if cleaned.is_empty() {
+                            continue;
+                        }
+                        if tx.send(cleaned.into_owned()).await.is_err() {
+                            receiver_alive = false;
+                            break; // receiver dropped
+                        }
                     }
                 }
                 if receiver_alive && let Some(tail) = sbuf.flush_all() {
-                    let _ = tx.send(tail).await;
+                    let cleaned = sanitize_stream_chunk(&tail, &tool_names);
+                    if !cleaned.is_empty() {
+                        let _ = tx.send(cleaned.into_owned()).await;
+                    }
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
