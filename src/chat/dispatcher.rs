@@ -46,6 +46,69 @@ use crate::providers::Provider;
 /// 又能在 OOM 前触发 backpressure → coalescing。
 pub const ACTION_CHANNEL_CAPACITY: usize = 2048;
 
+// ─── ApprovalRouter (S3 T3-1) ─────────────────────────────────────────────────
+
+/// **S3 T3-1**: 工具 approval 请求-应答路由器.
+///
+/// driver 在执行需 approval 的 tool 前注册一个 `tool_id → oneshot::Sender<bool>`；
+/// dispatcher_task 在 reducer 处理完 `Action::ToolApprovalReceived` 后调用
+/// [`Self::resolve`]，把决策回传给阻塞在 oneshot rx 上的 driver。
+///
+/// 设计要点（Codex 审计 B+D 推荐方案）:
+/// - oneshot per request，自然 fire-and-forget 不重复消费
+/// - `Arc<ApprovalRouter>` 跨 spawn 边界共享所有权（driver / dispatcher_task）
+/// - parking_lot Mutex：register/resolve 都是短同步操作，绝不持锁过 await
+/// - 拒绝 / 超时 / 取消任意路径都由 driver 自身负责清理 pending（drop oneshot tx）
+///
+/// 不变量：每个 `tool_id` 至多注册一次。重复注册视为 BUG（driver bug），后注册
+/// 会替换前一个 sender — 由 driver 保证不发生（每次发请求前 tool_id 是唯一新值）。
+#[derive(Default)]
+pub struct ApprovalRouter {
+    pending: ParkingMutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+}
+
+impl ApprovalRouter {
+    /// 构造空路由器.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// driver 注册一个 pending approval（`tool_id`→`tx`）.
+    ///
+    /// 同 `tool_id` 已存在时旧 sender 被替换（仅用作防御性容错，正常路径不会触发）.
+    pub fn register(&self, tool_id: String, tx: tokio::sync::oneshot::Sender<bool>) {
+        let mut guard = self.pending.lock();
+        if guard.insert(tool_id.clone(), tx).is_some() {
+            tracing::warn!(tool_id = %tool_id, "ApprovalRouter::register: replacing existing pending tx");
+        }
+    }
+
+    /// dispatcher_task 调用：取出 pending sender 并 resolve 决策.
+    ///
+    /// 找不到对应 `tool_id`（driver 已经超时清理 / cancel 路径丢弃）时返回 false。
+    pub fn resolve(&self, tool_id: &str, approved: bool) -> bool {
+        let tx_opt = self.pending.lock().remove(tool_id);
+        tx_opt.map_or_else(
+            || {
+                tracing::debug!(tool_id = %tool_id, "ApprovalRouter::resolve: no pending entry");
+                false
+            },
+            |tx| {
+                if tx.send(approved).is_err() {
+                    tracing::debug!(
+                        tool_id = %tool_id,
+                        "ApprovalRouter::resolve: rx already dropped (driver cancelled)"
+                    );
+                }
+                true
+            },
+        )
+    }
+}
+
 // ─── ChatDispatcher ────────────────────────────────────────────────────────────
 
 /// `Action` 发送端封装。仅暴露 `try_send` / `send` 两种政策，禁止 unbounded clone。
@@ -360,6 +423,17 @@ pub struct EffectDeps {
     pub tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
     /// **5a-6**: max tool iterations — 防 LLM 死循环。0 走默认 (16)，上限受 driver 内部保护。
     pub max_tool_iterations: usize,
+    /// **S3 T3-1**: approval 请求-应答路由器 (driver↔dispatcher 桥接 oneshot).
+    ///
+    /// driver 在执行需 approval 的 tool 前注册 oneshot tx；dispatcher_task 在
+    /// reducer 处理完 `Action::ToolApprovalReceived` 之后调用 `resolve()` 把决策
+    /// 回投。`Arc` 跨 spawn 边界共享所有权。
+    pub approval_router: Arc<ApprovalRouter>,
+    /// **S3 T3-1**: 危险 tool approval 管理器 — driver 据此判断是否要 prompt.
+    ///
+    /// 来自 `chat::run` 构造的 `ApprovalManager::from_config(&config.autonomy)`。
+    /// `None` 时 driver 不做任何 approval 检查（兼容现有未接入 approval 的测试）。
+    pub approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
 }
 
 // ─── EffectExecutor (5a-1: real-mode + shadow-mode) ───────────────────────────
@@ -417,6 +491,16 @@ impl EffectExecutor {
     #[must_use]
     pub fn redraw_handle(&self) -> Arc<ParkingMutex<Option<mpsc::Sender<()>>>> {
         Arc::clone(&self.redraw_slot)
+    }
+
+    /// **S3 T3-1**: 返回 deps 中的 approval router（real 模式独有）.
+    ///
+    /// `spawn_dispatcher_task_with_signal` 用此句柄在 `Action::ToolApprovalReceived`
+    /// 进入 reducer 之后把决策回投给 driver pending oneshot。shadow 模式无 deps 返回 None。
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn approval_router(&self) -> Option<Arc<ApprovalRouter>> {
+        self.deps.as_ref().map(|d| Arc::clone(&d.approval_router))
     }
 
     /// 测试观测：是否处于 shadow 模式.
@@ -505,6 +589,9 @@ impl EffectExecutor {
                 // 5a-6: 透传 tool registry + max iterations (None / 0 → driver 退化为纯文本流式).
                 let tools_registry = deps.tools_registry.as_ref().map(Arc::clone);
                 let max_tool_iterations = deps.max_tool_iterations;
+                // S3 T3-1: approval 桥接 — router + manager 句柄一起透传给 driver.
+                let approval_router = Some(Arc::clone(&deps.approval_router));
+                let approval_manager = deps.approval_manager.as_ref().map(Arc::clone);
                 tokio::spawn(async move {
                     // RAII scope：子任务退出（含 panic）时自动复位 dual_write_guard。
                     let _scope = guard_scope;
@@ -525,6 +612,8 @@ impl EffectExecutor {
                         action_tx,
                         tools_registry,
                         max_tool_iterations,
+                        approval_router,
+                        approval_manager,
                     )
                     .await;
                 });
@@ -637,6 +726,36 @@ impl EffectExecutor {
             Effect::AutoTitleSession(title) => {
                 tracing::debug!(title = %title, "AutoTitleSession effect");
             }
+            Effect::RequestApproval { tool_id, name, args } => {
+                // **S3 T3-1**: 当前 stub — 立即回投 `Action::ToolApprovalReceived { approved=true }`，
+                // 让 driver 不被挂起。后续任务（UI 接线）会替换为真实的 prompt 路径。
+                //
+                // 设计原因：
+                // - Effect 单向 fire-and-forget；响应路径必须走反向 Action。
+                // - dispatcher 内任何接收 ToolApprovalReceived 的 task 会把决策通过
+                //   `EffectDeps::approval_response_tx` 转发给 driver 内部的 mpsc rx。
+                // - 默认放行（approved=true）保证旧 autonomy=full 路径行为不变；
+                //   supervised 模式下真接 UI prompt 时由真实路径覆盖该 stub。
+                tracing::info!(
+                    tool_id = %tool_id,
+                    name = %name,
+                    args_len = args.len(),
+                    "RequestApproval effect (stub): auto-approving (UI not wired yet)"
+                );
+                let _ = args; // 留 args 用于未来 prompt
+                let action_tx = deps.action_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = action_tx
+                        .send(Action::ToolApprovalReceived {
+                            tool_id,
+                            approved: true,
+                        })
+                        .await
+                    {
+                        tracing::debug!(error = %e, "RequestApproval stub: action_tx closed");
+                    }
+                });
+            }
             Effect::Quit => {
                 // 关停信号：真 cancel + drop 等隐式协议由 chat::run 收尾处理
                 tracing::info!("effect: Quit -> shutdown.cancel()");
@@ -679,6 +798,188 @@ const fn stream_error_is_retryable(err: &crate::providers::traits::StreamError) 
     matches!(err, StreamError::Http(_) | StreamError::Io(_))
 }
 
+/// **S3 T3-1**: 网络超时 / 连接错误识别 — 决定 driver 是否走 exponential backoff retry.
+///
+/// 命中条件：
+/// - `StreamError::Io` 总是被视为可重试瞬时故障（与 [`stream_error_is_retryable`] 同源）
+/// - `StreamError::Http(reqwest_err)` 且 `is_timeout()` 或 `is_connect()` 返回 true
+///
+/// 其他场景返回 false，由调用方走普通 `StreamFailed` 路径而非 retry loop。
+#[must_use]
+fn stream_error_is_network_timeout(err: &crate::providers::traits::StreamError) -> bool {
+    use crate::providers::traits::StreamError;
+    match err {
+        StreamError::Io(_) => true,
+        StreamError::Http(http_err) => http_err.is_timeout() || http_err.is_connect(),
+        StreamError::Json(_) | StreamError::InvalidSse(_) | StreamError::Provider(_) => false,
+    }
+}
+
+/// **S3 T3-1**: 识别 context overflow / context_length_exceeded 类错误.
+///
+/// 命中 → driver 触发一次 history compaction + 单次重试。判定走 `StreamError::Provider`
+/// 的 message 子串匹配（OpenAI 返回 "maximum context length"、Anthropic 返回
+/// "prompt is too long"、Gemini 返回 "input token count" 等）。
+///
+/// 不做精确正则：provider 错误消息格式不稳定，子串容错更安全；误判（多走一次 compact）
+/// 也只损耗少量算力而非破坏正确性。
+#[must_use]
+fn stream_error_is_context_overflow(err: &crate::providers::traits::StreamError) -> bool {
+    use crate::providers::traits::StreamError;
+    let msg = match err {
+        StreamError::Provider(s) => s.as_str(),
+        StreamError::Http(http_err) => return matches!(http_err.status(), Some(s) if s.as_u16() == 413),
+        StreamError::Json(_) | StreamError::InvalidSse(_) | StreamError::Io(_) => return false,
+    };
+    let needles = [
+        "context_length_exceeded",
+        "context length exceeded",
+        "maximum context",
+        "exceeds maximum",
+        "prompt is too long",
+        "input token count",
+        "exceed the maximum",
+        "too many tokens",
+        "token limit",
+    ];
+    let lower = msg.to_ascii_lowercase();
+    needles.iter().any(|n| lower.contains(n))
+}
+
+/// **S3 T3-1**: 工具回合参数聚合 buffer.
+///
+/// driver 内部按 [`ToolCallChunk::index`] 维护每个 in-flight tool call 的状态；
+/// 收到 Streaming chunk → push `arguments_delta`；收到 Completed → 比较聚合值与
+/// `args` 校验一致性（discrepancy 时优先信任 Completed.args）。
+///
+/// 设计要点（Codex 审计 1）：
+/// - 仅在 Completed chunk 到达后 emit `Action::ToolStarted`（避免半成品 args 触发执行）
+/// - 重复 Completed 同 index 视为幂等 no-op，防 provider 错误 emit 两次
+/// - `id` / `name` 严格不变；如果出现冲突记录 warn 但仍以最后一次 Completed 为准
+struct ToolCallAggregator {
+    /// 已经聚合的 chunk 索引 → buffer
+    by_index: std::collections::HashMap<usize, ToolCallSlot>,
+    /// 已发射 Completed 的 index 集合（防止 provider 重复 emit）
+    completed: std::collections::HashSet<usize>,
+}
+
+/// 单个 tool call 的聚合槽位.
+struct ToolCallSlot {
+    id: String,
+    name: String,
+    args_buffer: String,
+    final_args: Option<String>,
+}
+
+impl ToolCallAggregator {
+    fn new() -> Self {
+        Self {
+            by_index: std::collections::HashMap::new(),
+            completed: std::collections::HashSet::new(),
+        }
+    }
+
+    /// 摄入一个 `ToolCallChunk` — 按 `status` 分发到 streaming-append / completed-finalize.
+    ///
+    /// 返回 `Some((id, name, args))` 表示一个 tool call 已完整就绪并应触发 ToolStarted；
+    /// 返回 `None` 表示尚未就绪 / 重复完成（已发射过）/ 协议冲突已 log。
+    fn ingest(&mut self, chunk: crate::providers::traits::ToolCallChunk) -> Option<(String, String, String)> {
+        use crate::providers::traits::ToolCallChunkStatus;
+        match chunk.status {
+            ToolCallChunkStatus::Streaming => {
+                let slot = self.by_index.entry(chunk.index).or_insert_with(|| ToolCallSlot {
+                    id: chunk.id.clone(),
+                    name: chunk.name.clone(),
+                    args_buffer: String::new(),
+                    final_args: None,
+                });
+                // ID / name 不变性校验：provider 协议禁止改名换 ID
+                if !chunk.id.is_empty() && slot.id != chunk.id {
+                    tracing::warn!(
+                        index = chunk.index,
+                        prev_id = %slot.id,
+                        new_id = %chunk.id,
+                        "ToolCallAggregator: streaming chunk changed id; keeping first id"
+                    );
+                }
+                if !chunk.name.is_empty() && slot.name != chunk.name {
+                    tracing::warn!(
+                        index = chunk.index,
+                        prev_name = %slot.name,
+                        new_name = %chunk.name,
+                        "ToolCallAggregator: streaming chunk changed name; keeping first name"
+                    );
+                }
+                if let Some(delta) = chunk.arguments_delta {
+                    slot.args_buffer.push_str(&delta);
+                }
+                None
+            }
+            ToolCallChunkStatus::Completed => {
+                if self.completed.contains(&chunk.index) {
+                    tracing::debug!(
+                        index = chunk.index,
+                        id = %chunk.id,
+                        "ToolCallAggregator: duplicate Completed; ignoring"
+                    );
+                    return None;
+                }
+                self.completed.insert(chunk.index);
+                let slot = self.by_index.entry(chunk.index).or_insert_with(|| ToolCallSlot {
+                    id: chunk.id.clone(),
+                    name: chunk.name.clone(),
+                    args_buffer: String::new(),
+                    final_args: None,
+                });
+                slot.final_args = Some(chunk.args.clone());
+                // 信任 Completed.args 为准（与 traits.rs 协议注释一致）.
+                let resolved_id = if chunk.id.is_empty() { slot.id.clone() } else { chunk.id };
+                let resolved_name = if chunk.name.is_empty() {
+                    slot.name.clone()
+                } else {
+                    chunk.name
+                };
+                Some((resolved_id, resolved_name, chunk.args))
+            }
+        }
+    }
+}
+
+/// 已完成（Completed）的工具调用，准备执行.
+struct ResolvedToolCall {
+    id: String,
+    name: String,
+    args: String,
+}
+
+/// **S3 T3-1**: 网络瞬时故障 backoff retry 上限（次）.
+const MAX_NETWORK_RETRIES: u8 = 3;
+/// **S3 T3-1**: context overflow 自动 compact + retry 上限（仅 1 次防无限循环）.
+const MAX_CONTEXT_OVERFLOW_RETRIES: u8 = 1;
+/// **S3 T3-1**: backoff 起步 sleep（毫秒，第 1 次重试前 sleep 500ms，第 2 次 1s，第 3 次 2s）.
+const BACKOFF_BASE_MS: u64 = 500;
+
+/// 单轮 stream 的结果分类（driver loop 用此向上 unwind）.
+enum StreamPassOutcome {
+    /// 本轮没有 tool_call，普通文本生成结束。携带最终累计文本。
+    Completed { iter_text: String },
+    /// 本轮 LLM 要求工具调用 — 携带聚合好的 tool_calls + 本轮 assistant 文本（提示词）。
+    ToolCallRequested {
+        calls: Vec<ResolvedToolCall>,
+        iter_text: String,
+    },
+    /// 网络瞬时错误（可走 backoff retry，不消耗 iteration 配额）.
+    TransientNetworkError { err: String },
+    /// context overflow（可走 compact + retry 一次）.
+    ContextOverflow { err: String },
+    /// 非可重试的硬错误 — driver 终止并发 StreamFailed.
+    HardError { err: String, retryable: bool },
+    /// 用户 Cancel —  driver 已发 StreamCancelled 直接返回.
+    Cancelled,
+    /// action_tx 关闭，driver 静默退出（不再发 action）.
+    SenderClosed,
+}
+
 /// 真接 `provider.stream_chat_with_history` 并把流式事件回投到 reducer.
 ///
 /// 设计在 spawn 子任务内独立运行；通过 `cancel` 中途取消，通过 `action_tx` 回投。
@@ -694,15 +995,8 @@ const fn stream_error_is_retryable(err: &crate::providers::traits::StreamError) 
 /// - `reasoning` 不混入主 delta（只在最终 `StreamCompleted.reasoning` 字段携带）
 ///
 /// **5a-6**: 多轮 tool turn 支持。
-/// - 收到 `ToolCallChunk` 时：通过 `tools_registry` 按名查找 → 执行 → 把
-///   assistant tool_call + tool result 追加到 history → 重新调
-///   `stream_chat_with_history` 进入下一轮。
-/// - tool 执行用 `tokio::select!` 与 `cancel` 竞速，避免长 tool 卡死 cancel 路径。
-/// - 当 `tools_registry == None` 或迭代超过 `max_tool_iterations` 时退化为
-///   StreamFailed(retryable=false)，让 chat::run fallthrough 到 legacy 兜底.
-/// - **未覆盖**（保留在 legacy `run_tool_call_loop`）：approval、multimodal
-///   图片校验、parallel tools、scope_ctx 治理、自动 compaction、tool tiering、
-///   priority scheduling。这些场景 driver 不命中（route_turn 后续可继续 fallback）。
+/// **S3 T3-1**: 四件套扩展（工具回合状态机 / context overflow compact / approval 桥接 /
+/// timeout backoff retry）。详见 `task/prx/T3-1.md`.
 #[allow(clippy::too_many_arguments)]
 async fn drive_start_turn_stream(
     provider: Arc<dyn Provider>,
@@ -714,10 +1008,9 @@ async fn drive_start_turn_stream(
     action_tx: mpsc::Sender<Action>,
     tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
     max_tool_iterations: usize,
+    approval_router: Option<Arc<ApprovalRouter>>,
+    approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
 ) {
-    use crate::providers::traits::{StreamChunk, StreamOptions};
-    use futures::StreamExt;
-
     // 默认 / 上限：与 `agent::loop_::DEFAULT_MAX_TOOL_ITERATIONS` 概念对齐，
     // 但 driver 内部独立维护防止意外 0 走入死循环。
     const DEFAULT_MAX_ITERATIONS: usize = 16;
@@ -732,6 +1025,9 @@ async fn drive_start_turn_stream(
     let mut accumulated = String::new();
     let mut reasoning_buf = String::new();
     let mut iteration: usize = 0;
+    let mut overflow_retries: u8 = 0;
+    // 已经执行过的 tool_call_id（防 context overflow 重试后重复执行同一工具）.
+    let mut executed_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     'outer: loop {
         iteration = iteration.saturating_add(1);
@@ -747,229 +1043,143 @@ async fn drive_start_turn_stream(
             return;
         }
 
-        let opts = StreamOptions::new(true);
-        let stream = provider.stream_chat_with_history(&history, &model, temperature, opts);
-        tokio::pin!(stream);
+        // ── 单轮 stream 执行 + backoff retry ──────────────────────────
+        let pass = run_one_stream_pass_with_retry(
+            provider.as_ref(),
+            &history,
+            &model,
+            temperature,
+            &cancel,
+            &draft_id,
+            &action_tx,
+            &mut version,
+            &mut reasoning_buf,
+        )
+        .await;
 
-        // 本轮 stream 内已经收到、尚未执行的 tool_calls.
-        let mut pending_tool_calls: Vec<crate::providers::traits::ToolCallChunk> = Vec::new();
-        // 本轮 stream 内已经累计的 assistant 文本（tool_call 同 turn 也可能伴随文本，
-        // 与 OpenAI/Anthropic 行为对齐）。仅在 turn 完成（最终 StreamCompleted）时
-        // 拼入 `accumulated`；进入 tool 回合时丢弃，避免 partial 文本混入下一轮 history。
-        let mut iter_text = String::new();
-
-        loop {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
-                    if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id: draft_id.clone() }).await {
-                        tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel");
+        match pass {
+            StreamPassOutcome::Completed { iter_text } => {
+                accumulated.push_str(&iter_text);
+                break 'outer;
+            }
+            StreamPassOutcome::ContextOverflow { err } => {
+                if overflow_retries >= MAX_CONTEXT_OVERFLOW_RETRIES {
+                    let action = Action::StreamFailed {
+                        draft_id: draft_id.clone(),
+                        err: format!("context overflow after {MAX_CONTEXT_OVERFLOW_RETRIES} retry: {err}"),
+                        retryable: false,
+                    };
+                    if let Err(e) = action_tx.send(action).await {
+                        tracing::debug!(error = %e, "StartTurn: action_tx closed on overflow-exhausted");
                     }
                     return;
                 }
-                next = stream.next() => {
-                    match next {
-                        Some(Ok(StreamChunk { delta, reasoning, is_final, tool_calls, .. })) => {
-                            // **5a-6**: tool_call 接通. 累积所有 tool_calls (provider 已 buffer 完整 args).
-                            if !tool_calls.is_empty() {
-                                for tc in tool_calls {
-                                    pending_tool_calls.push(tc);
-                                }
-                            }
-                            if let Some(reason_text) = reasoning {
-                                if !reason_text.is_empty() {
-                                    reasoning_buf.push_str(&reason_text);
-                                }
-                            }
-                            if !delta.is_empty() {
-                                version = version.saturating_add(1);
-                                iter_text.push_str(&delta);
-                                let action = Action::StreamChunkReceived {
-                                    draft_id: draft_id.clone(),
-                                    delta,
-                                    version,
-                                };
-                                if let Err(e) = action_tx.send(action).await {
-                                    tracing::debug!(error = %e, "StartTurn: action_tx closed mid-stream");
-                                    return;
-                                }
-                            }
-                            if is_final {
-                                break;
-                            }
-                        }
-                        Some(Err(err)) => {
-                            let retryable = stream_error_is_retryable(&err);
-                            let action = Action::StreamFailed {
-                                draft_id: draft_id.clone(),
-                                err: err.to_string(),
-                                retryable,
-                            };
-                            if let Err(e) = action_tx.send(action).await {
-                                tracing::debug!(error = %e, "StartTurn: action_tx closed on error");
-                            }
-                            return;
-                        }
-                        None => {
-                            // Stream ended without explicit final chunk — treat as completion.
-                            break;
-                        }
-                    }
+                overflow_retries = overflow_retries.saturating_add(1);
+                // 同步两侧：driver 自己 compact + 通知 reducer compact 自己的 history.
+                crate::chat::state::compact_history_in_place(&mut history);
+                if let Err(e) = action_tx
+                    .send(Action::HistoryCompacted {
+                        reason: crate::chat::action::CompactReason::ContextOverflow,
+                    })
+                    .await
+                {
+                    tracing::debug!(error = %e, "StartTurn: action_tx closed on compact-dispatch");
+                    return;
                 }
+                // 同一次 outer iteration 不消耗配额 — decrement 让重试不计入 max_iterations.
+                iteration = iteration.saturating_sub(1);
+                continue 'outer;
             }
-        }
-
-        // 本轮 stream 结束。检查是否需要执行 tool calls.
-        if pending_tool_calls.is_empty() {
-            // 普通文本回合：accumulate 本轮文本并退出.
-            accumulated.push_str(&iter_text);
-            break 'outer;
-        }
-
-        // 进入 tool 回合：需要 registry.
-        let registry = match tools_registry.as_ref() {
-            Some(r) => r,
-            None => {
+            StreamPassOutcome::TransientNetworkError { err } => {
+                // 已经在 run_one_stream_pass_with_retry 里耗尽 backoff，直接 hard fail.
                 let action = Action::StreamFailed {
                     draft_id: draft_id.clone(),
-                    err: "redux driver: tool_calls received but no tools_registry available (route should have stayed on legacy path)"
-                        .to_string(),
+                    err,
                     retryable: false,
                 };
                 if let Err(e) = action_tx.send(action).await {
-                    tracing::debug!(error = %e, "StartTurn: action_tx closed on missing-registry");
+                    tracing::debug!(error = %e, "StartTurn: action_tx closed on net-exhausted");
                 }
                 return;
             }
-        };
-
-        // 1) 把 assistant 的 tool_call 追加到 history. OpenAI 协议把 assistant 的 tool_call
-        //    序列化为 JSON, content 为空; 我们用更紧凑的 marker 字符串表示, 兼容 ChatMessage
-        //    (无 tool_calls 专用字段). legacy run_tool_call_loop 用 build_native_assistant_history
-        //    做更复杂的格式; 这里 driver 保守降级 — 用 JSON 让 provider 在下一轮收到完整
-        //    assistant tool_call 上下文。后续 provider native 接通时可换为结构化字段.
-        let assistant_payload = serde_json::json!({
-            "tool_calls": pending_tool_calls.iter().map(|tc| serde_json::json!({
-                "id": tc.id,
-                "type": "function",
-                "function": { "name": tc.name, "arguments": tc.args },
-            })).collect::<Vec<_>>(),
-            "content": iter_text,
-        });
-        history.push(crate::providers::traits::ChatMessage {
-            role: "assistant".to_string(),
-            content: assistant_payload.to_string(),
-        });
-
-        // 2) 顺序执行每个 tool call 并把结果追加到 history. 用 select! 与 cancel 竞速,
-        //    保证用户 Ctrl+C 能立即打断长 tool. parallel/scope_ctx/approval 不覆盖.
-        for call in pending_tool_calls {
-            // 发 ToolStarted 让 reducer/UI 感知.
-            let _ = action_tx
-                .send(Action::ToolStarted {
-                    name: call.name.clone(),
-                    args: call.args.clone(),
-                })
-                .await;
-
-            // 解析 args JSON. 失败 → 把错误回填给 LLM 让它自己修正, 而非中断 turn.
-            let args_value: serde_json::Value = match serde_json::from_str(&call.args) {
-                Ok(v) => v,
-                Err(parse_err) => {
-                    let err_msg = format!("tool args JSON parse error: {parse_err}");
-                    let tool_payload = serde_json::json!({
-                        "tool_call_id": call.id,
-                        "content": err_msg,
-                        "success": false,
-                    });
-                    history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
-                    let _ = action_tx
-                        .send(Action::ToolFinished {
-                            name: call.name.clone(),
-                            success: false,
-                            duration_ms: 0,
-                            result: Some(err_msg),
-                        })
-                        .await;
-                    continue;
+            StreamPassOutcome::HardError { err, retryable } => {
+                let action = Action::StreamFailed {
+                    draft_id: draft_id.clone(),
+                    err,
+                    retryable,
+                };
+                if let Err(e) = action_tx.send(action).await {
+                    tracing::debug!(error = %e, "StartTurn: action_tx closed on hard-error");
                 }
-            };
-
-            // 查找 tool. 未找到也走"回填给 LLM"路径.
-            let tool_match = registry.iter().find(|t| t.supports_name(&call.name));
-            let tool = match tool_match {
-                Some(t) => t,
-                None => {
-                    let err_msg = format!("tool not found: {}", call.name);
-                    let tool_payload = serde_json::json!({
-                        "tool_call_id": call.id,
-                        "content": err_msg,
-                        "success": false,
-                    });
-                    history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
-                    let _ = action_tx
-                        .send(Action::ToolFinished {
-                            name: call.name.clone(),
-                            success: false,
-                            duration_ms: 0,
-                            result: Some(err_msg),
-                        })
-                        .await;
-                    continue;
-                }
-            };
-
-            // 执行 tool, 与 cancel 竞速.
-            let start = std::time::Instant::now();
-            let exec_result = tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
-                    if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id: draft_id.clone() }).await {
-                        tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel mid-tool");
+                return;
+            }
+            StreamPassOutcome::Cancelled | StreamPassOutcome::SenderClosed => return,
+            StreamPassOutcome::ToolCallRequested { calls, iter_text } => {
+                // 进入 tool 回合：需要 registry.
+                let registry = match tools_registry.as_ref() {
+                    Some(r) => r,
+                    None => {
+                        let action = Action::StreamFailed {
+                            draft_id: draft_id.clone(),
+                            err: "redux driver: tool_calls received but no tools_registry available (route should have stayed on legacy path)"
+                                .to_string(),
+                            retryable: false,
+                        };
+                        if let Err(e) = action_tx.send(action).await {
+                            tracing::debug!(error = %e, "StartTurn: action_tx closed on missing-registry");
+                        }
+                        return;
                     }
-                    return;
-                }
-                res = tool.execute_named(&call.name, args_value) => res,
-            };
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                };
 
-            let (tool_payload, ok_flag, summary) = match exec_result {
-                Ok(tool_result) => {
-                    let payload = serde_json::json!({
-                        "tool_call_id": call.id,
-                        "content": tool_result.output,
-                        "success": tool_result.success,
-                        "error": tool_result.error,
-                    });
-                    let summary = if tool_result.success {
-                        tool_result.output.clone()
-                    } else {
-                        tool_result.error.clone().unwrap_or_else(|| "tool failed".to_string())
-                    };
-                    (payload, tool_result.success, summary)
+                // 1) 把 assistant 的 tool_call 追加到 history. OpenAI 协议把 assistant 的 tool_call
+                //    序列化为 JSON, content 为空; 我们用更紧凑的 marker 字符串表示, 兼容 ChatMessage
+                //    (无 tool_calls 专用字段). legacy run_tool_call_loop 用 build_native_assistant_history
+                //    做更复杂的格式; 这里 driver 保守降级 — 用 JSON 让 provider 在下一轮收到完整
+                //    assistant tool_call 上下文。后续 provider native 接通时可换为结构化字段.
+                let assistant_payload = serde_json::json!({
+                    "tool_calls": calls.iter().map(|c| serde_json::json!({
+                        "id": c.id,
+                        "type": "function",
+                        "function": { "name": c.name, "arguments": c.args },
+                    })).collect::<Vec<_>>(),
+                    "content": iter_text,
+                });
+                history.push(crate::providers::traits::ChatMessage {
+                    role: "assistant".to_string(),
+                    content: assistant_payload.to_string(),
+                });
+
+                // 2) 顺序执行每个 tool call.
+                for call in calls {
+                    if executed_tool_ids.contains(&call.id) {
+                        tracing::debug!(
+                            tool_id = %call.id,
+                            "drive_start_turn_stream: skipping already-executed tool_id (retry idempotency)"
+                        );
+                        continue;
+                    }
+                    let outcome = execute_single_tool_call(
+                        registry,
+                        &call,
+                        &cancel,
+                        &action_tx,
+                        &draft_id,
+                        approval_router.as_ref(),
+                        approval_manager.as_ref(),
+                        &mut history,
+                    )
+                    .await;
+                    match outcome {
+                        ToolExecOutcome::Done => {
+                            executed_tool_ids.insert(call.id.clone());
+                        }
+                        ToolExecOutcome::Cancelled | ToolExecOutcome::SenderClosed => return,
+                    }
                 }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    let payload = serde_json::json!({
-                        "tool_call_id": call.id,
-                        "content": err_str,
-                        "success": false,
-                    });
-                    (payload, false, err_str)
-                }
-            };
-            history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
-            let _ = action_tx
-                .send(Action::ToolFinished {
-                    name: call.name.clone(),
-                    success: ok_flag,
-                    duration_ms,
-                    result: Some(summary),
-                })
-                .await;
+                // 继续下一轮 LLM 调用. iter_text 已经写入 assistant message, 不计入最终 accumulated.
+            }
         }
-
-        // 继续下一轮 LLM 调用. iter_text 已经写入 assistant message, 不计入最终 accumulated.
     }
 
     let action = Action::StreamCompleted {
@@ -979,6 +1189,405 @@ async fn drive_start_turn_stream(
     };
     if let Err(e) = action_tx.send(action).await {
         tracing::debug!(error = %e, "StartTurn: action_tx closed on completion");
+    }
+}
+
+/// **S3 T3-1**: 单轮工具执行的结果分类.
+enum ToolExecOutcome {
+    /// 工具正常完成（含 success / fail / reject — 都已发 ToolFinished + 回填 history）.
+    Done,
+    /// 用户 cancel — 调用方应立即从 driver 返回.
+    Cancelled,
+    /// action_tx 关闭，driver 应静默退出.
+    SenderClosed,
+}
+
+/// **S3 T3-1**: 执行单个工具调用（含 approval 检查）+ 写回 history + 发 Tool* Action.
+///
+/// 抽出独立函数原因：driver 主循环里嵌套层级太多，且 approval 路径有 oneshot await，
+/// 拆出后逻辑/borrow 都更清晰。返回值告诉调用方下一步行为（继续 / 取消 / 退出）。
+#[allow(clippy::too_many_arguments)]
+async fn execute_single_tool_call(
+    registry: &Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    call: &ResolvedToolCall,
+    cancel: &CancellationToken,
+    action_tx: &mpsc::Sender<Action>,
+    draft_id: &str,
+    approval_router: Option<&Arc<ApprovalRouter>>,
+    approval_manager: Option<&Arc<crate::approval::ApprovalManager>>,
+    history: &mut Vec<crate::providers::traits::ChatMessage>,
+) -> ToolExecOutcome {
+    // 1) Approval — supervised mode 走 oneshot 等响应.
+    let needs_approval = approval_manager.is_some_and(|mgr| mgr.needs_approval(&call.name));
+    if needs_approval {
+        if let Some(router) = approval_router {
+            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+            router.register(call.id.clone(), tx);
+            // 通知 reducer / UI 请求 approval.
+            if let Err(e) = action_tx
+                .send(Action::ToolApprovalRequested {
+                    tool_id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: call.args.clone(),
+                })
+                .await
+            {
+                tracing::debug!(error = %e, "StartTurn: action_tx closed on approval-request");
+                return ToolExecOutcome::SenderClosed;
+            }
+            // 等响应（与 cancel 竞速；cancel 时清理 pending router）.
+            let approved = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    // 主动 take 出 router 内的 entry（即便 dispatcher 还未 resolve）.
+                    let _ = router.resolve(&call.id, false);
+                    if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id: draft_id.to_string() }).await {
+                        tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel-mid-approval");
+                    }
+                    return ToolExecOutcome::Cancelled;
+                }
+                res = rx => res.unwrap_or(false),
+            };
+            if !approved {
+                let err_msg = "User rejected tool approval".to_string();
+                let tool_payload = serde_json::json!({
+                    "tool_call_id": call.id,
+                    "content": err_msg,
+                    "success": false,
+                });
+                history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
+                if let Err(e) = action_tx
+                    .send(Action::ToolFinished {
+                        name: call.name.clone(),
+                        success: false,
+                        duration_ms: 0,
+                        result: Some(err_msg),
+                    })
+                    .await
+                {
+                    tracing::debug!(error = %e, "StartTurn: action_tx closed on tool-rejected");
+                    return ToolExecOutcome::SenderClosed;
+                }
+                return ToolExecOutcome::Done;
+            }
+        } else {
+            tracing::warn!(
+                tool = %call.name,
+                "tool needs_approval=true but no approval_router wired; auto-approving (degraded)"
+            );
+        }
+    }
+
+    // 2) 发 ToolStarted（reducer/UI 感知）.
+    if let Err(e) = action_tx
+        .send(Action::ToolStarted {
+            name: call.name.clone(),
+            args: call.args.clone(),
+        })
+        .await
+    {
+        tracing::debug!(error = %e, "StartTurn: action_tx closed on tool-started");
+        return ToolExecOutcome::SenderClosed;
+    }
+
+    // 3) 解析 args JSON. 失败 → 把错误回填给 LLM 让它自己修正.
+    let args_value: serde_json::Value = match serde_json::from_str(&call.args) {
+        Ok(v) => v,
+        Err(parse_err) => {
+            let err_msg = format!("tool args JSON parse error: {parse_err}");
+            let tool_payload = serde_json::json!({
+                "tool_call_id": call.id,
+                "content": err_msg,
+                "success": false,
+            });
+            history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
+            let _ = action_tx
+                .send(Action::ToolFinished {
+                    name: call.name.clone(),
+                    success: false,
+                    duration_ms: 0,
+                    result: Some(err_msg),
+                })
+                .await;
+            return ToolExecOutcome::Done;
+        }
+    };
+
+    // 4) 查找 tool. 未找到也走"回填给 LLM"路径.
+    let tool_match = registry.iter().find(|t| t.supports_name(&call.name));
+    let tool = match tool_match {
+        Some(t) => t,
+        None => {
+            let err_msg = format!("tool not found: {}", call.name);
+            let tool_payload = serde_json::json!({
+                "tool_call_id": call.id,
+                "content": err_msg,
+                "success": false,
+            });
+            history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
+            let _ = action_tx
+                .send(Action::ToolFinished {
+                    name: call.name.clone(),
+                    success: false,
+                    duration_ms: 0,
+                    result: Some(err_msg),
+                })
+                .await;
+            return ToolExecOutcome::Done;
+        }
+    };
+
+    // 5) 执行 tool, 与 cancel 竞速.
+    let start = std::time::Instant::now();
+    let exec_result = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id: draft_id.to_string() }).await {
+                tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel mid-tool");
+            }
+            return ToolExecOutcome::Cancelled;
+        }
+        res = tool.execute_named(&call.name, args_value) => res,
+    };
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let (tool_payload, ok_flag, summary) = match exec_result {
+        Ok(tool_result) => {
+            let payload = serde_json::json!({
+                "tool_call_id": call.id,
+                "content": tool_result.output,
+                "success": tool_result.success,
+                "error": tool_result.error,
+            });
+            let summary = if tool_result.success {
+                tool_result.output.clone()
+            } else {
+                tool_result.error.clone().unwrap_or_else(|| "tool failed".to_string())
+            };
+            (payload, tool_result.success, summary)
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            let payload = serde_json::json!({
+                "tool_call_id": call.id,
+                "content": err_str,
+                "success": false,
+            });
+            (payload, false, err_str)
+        }
+    };
+    history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
+    let _ = action_tx
+        .send(Action::ToolFinished {
+            name: call.name.clone(),
+            success: ok_flag,
+            duration_ms,
+            result: Some(summary),
+        })
+        .await;
+    ToolExecOutcome::Done
+}
+
+/// **S3 T3-1**: 单轮 stream 调用 + 网络瞬时故障 exponential backoff retry.
+///
+/// 行为：
+/// - 调用 `provider.stream_chat_with_history` 收 chunks，发 `Action::StreamChunkReceived`
+/// - 遇 `is_timeout()` / `is_connect()` 错误：sleep 后重试，最多 [`MAX_NETWORK_RETRIES`] 次
+/// - 遇 context overflow（HTTP 413 / provider 错误消息匹配）：返回 ContextOverflow 让外层 compact + retry
+/// - 遇普通可重试 (`StreamError::Http`) 但非 timeout：当 hard error 返回（不进 retry loop）
+/// - 遇 cancel：发 StreamCancelled 并返回 Cancelled
+#[allow(clippy::too_many_arguments)]
+async fn run_one_stream_pass_with_retry(
+    provider: &dyn Provider,
+    history: &[crate::providers::traits::ChatMessage],
+    model: &str,
+    temperature: f64,
+    cancel: &CancellationToken,
+    draft_id: &str,
+    action_tx: &mpsc::Sender<Action>,
+    version: &mut u64,
+    reasoning_buf: &mut String,
+) -> StreamPassOutcome {
+    let mut attempt: u8 = 0;
+    loop {
+        if cancel.is_cancelled() {
+            if let Err(e) = action_tx
+                .send(Action::StreamCancelled {
+                    draft_id: draft_id.to_string(),
+                })
+                .await
+            {
+                tracing::debug!(error = %e, "StartTurn: action_tx closed on pre-pass cancel");
+                return StreamPassOutcome::SenderClosed;
+            }
+            return StreamPassOutcome::Cancelled;
+        }
+        match run_one_stream_pass(
+            provider,
+            history,
+            model,
+            temperature,
+            cancel,
+            draft_id,
+            action_tx,
+            version,
+            reasoning_buf,
+        )
+        .await
+        {
+            inner @ (StreamPassOutcome::Completed { .. }
+            | StreamPassOutcome::ToolCallRequested { .. }
+            | StreamPassOutcome::ContextOverflow { .. }
+            | StreamPassOutcome::HardError { .. }
+            | StreamPassOutcome::Cancelled
+            | StreamPassOutcome::SenderClosed) => return inner,
+            StreamPassOutcome::TransientNetworkError { err } => {
+                let last_err = err;
+                attempt = attempt.saturating_add(1);
+                if attempt > MAX_NETWORK_RETRIES {
+                    return StreamPassOutcome::TransientNetworkError {
+                        err: format!("network retries exhausted ({MAX_NETWORK_RETRIES}): {last_err}"),
+                    };
+                }
+                // 通知 reducer / UI 重试尝试（可观测性）.
+                if let Err(e) = action_tx
+                    .send(Action::StreamRetryAttempt {
+                        attempt,
+                        reason: last_err.clone(),
+                    })
+                    .await
+                {
+                    tracing::debug!(error = %e, "StartTurn: action_tx closed on retry-notify");
+                    return StreamPassOutcome::SenderClosed;
+                }
+                // 500ms, 1000ms, 2000ms — `<< (attempt-1)` 的乘法等价（u64 不支持 saturating_shl）.
+                let backoff_ms = BACKOFF_BASE_MS.saturating_mul(1u64 << attempt.saturating_sub(1).min(31));
+                tracing::info!(
+                    attempt,
+                    backoff_ms,
+                    err = %last_err,
+                    "drive_start_turn_stream: backoff retry"
+                );
+                let sleep = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms));
+                tokio::pin!(sleep);
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        if let Err(e) = action_tx
+                            .send(Action::StreamCancelled { draft_id: draft_id.to_string() })
+                            .await
+                        {
+                            tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel-mid-backoff");
+                            return StreamPassOutcome::SenderClosed;
+                        }
+                        return StreamPassOutcome::Cancelled;
+                    }
+                    () = &mut sleep => {}
+                }
+            }
+        }
+    }
+}
+
+/// **S3 T3-1**: 真正的单轮 stream 拉取（不含 retry / overflow 重试逻辑）.
+///
+/// 抽出独立函数让 retry/overflow loop 在外层组合；本函数行为：
+/// - chunk-by-chunk consume，按 index 聚合 `ToolCallChunk`
+/// - chunk 内 reasoning 累加到 `reasoning_buf`，文本 chunk 通过 `Action::StreamChunkReceived` 回投
+/// - stream 自然结束 / `is_final` → 返回 Completed 或 ToolCallRequested
+/// - stream 错误 → 按类型返回 ContextOverflow / TransientNetworkError / HardError
+#[allow(clippy::too_many_arguments)]
+async fn run_one_stream_pass(
+    provider: &dyn Provider,
+    history: &[crate::providers::traits::ChatMessage],
+    model: &str,
+    temperature: f64,
+    cancel: &CancellationToken,
+    draft_id: &str,
+    action_tx: &mpsc::Sender<Action>,
+    version: &mut u64,
+    reasoning_buf: &mut String,
+) -> StreamPassOutcome {
+    use crate::providers::traits::{StreamChunk, StreamOptions};
+    use futures::StreamExt;
+
+    let opts = StreamOptions::new(true);
+    let stream = provider.stream_chat_with_history(history, model, temperature, opts);
+    tokio::pin!(stream);
+
+    let mut aggregator = ToolCallAggregator::new();
+    let mut completed_calls: Vec<ResolvedToolCall> = Vec::new();
+    let mut iter_text = String::new();
+
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id: draft_id.to_string() }).await {
+                    tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel");
+                    return StreamPassOutcome::SenderClosed;
+                }
+                return StreamPassOutcome::Cancelled;
+            }
+            next = stream.next() => {
+                match next {
+                    Some(Ok(StreamChunk { delta, reasoning, is_final, tool_calls, .. })) => {
+                        if !tool_calls.is_empty() {
+                            for tc in tool_calls {
+                                if let Some((id, name, args)) = aggregator.ingest(tc) {
+                                    completed_calls.push(ResolvedToolCall { id, name, args });
+                                }
+                            }
+                        }
+                        if let Some(reason_text) = reasoning {
+                            if !reason_text.is_empty() {
+                                reasoning_buf.push_str(&reason_text);
+                            }
+                        }
+                        if !delta.is_empty() {
+                            *version = version.saturating_add(1);
+                            iter_text.push_str(&delta);
+                            let action = Action::StreamChunkReceived {
+                                draft_id: draft_id.to_string(),
+                                delta,
+                                version: *version,
+                            };
+                            if let Err(e) = action_tx.send(action).await {
+                                tracing::debug!(error = %e, "StartTurn: action_tx closed mid-stream");
+                                return StreamPassOutcome::SenderClosed;
+                            }
+                        }
+                        if is_final {
+                            break;
+                        }
+                    }
+                    Some(Err(err)) => {
+                        // S3 T3-1: 错误分类 — overflow / network timeout / hard error.
+                        if stream_error_is_context_overflow(&err) {
+                            return StreamPassOutcome::ContextOverflow { err: err.to_string() };
+                        }
+                        if stream_error_is_network_timeout(&err) {
+                            return StreamPassOutcome::TransientNetworkError { err: err.to_string() };
+                        }
+                        let retryable = stream_error_is_retryable(&err);
+                        return StreamPassOutcome::HardError { err: err.to_string(), retryable };
+                    }
+                    None => {
+                        // Stream ended without explicit final chunk — treat as completion.
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if completed_calls.is_empty() {
+        StreamPassOutcome::Completed { iter_text }
+    } else {
+        StreamPassOutcome::ToolCallRequested {
+            calls: completed_calls,
+            iter_text,
+        }
     }
 }
 
@@ -1034,6 +1643,9 @@ pub fn spawn_dispatcher_task_with_signal(
     executor: EffectExecutor,
     turn_signal: Option<TurnCompletionSignal>,
 ) -> tokio::task::JoinHandle<DispatcherStats> {
+    // S3 T3-1: 提前抽出 approval_router 句柄（Arc clone），后续在 reducer 处理完
+    // `Action::ToolApprovalReceived` 之后用它把决策转交 driver 等待中的 oneshot。
+    let approval_router = executor.approval_router();
     tokio::spawn(async move {
         let mut state = initial_state;
         let mut stats = DispatcherStats::default();
@@ -1049,10 +1661,16 @@ pub fn spawn_dispatcher_task_with_signal(
                     while let Ok(action) = action_rx.try_recv() {
                         stats.actions_seen = stats.actions_seen.saturating_add(1);
                         let outcome = extract_turn_outcome(&action);
+                        let approval_response = extract_approval_response(&action);
                         let effects = state.reduce(action);
                         stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
                         for effect in effects {
                             executor.execute(effect).await;
+                        }
+                        if let (Some((tool_id, approved)), Some(router)) =
+                            (approval_response, approval_router.as_ref())
+                        {
+                            router.resolve(&tool_id, approved);
                         }
                         // Shutdown 阶段也要触发 turn_signal，否则 chat::run await
                         // 会被 shutdown 抢占前最后一轮 turn 永远卡住（导致 round 2 hang
@@ -1080,10 +1698,18 @@ pub fn spawn_dispatcher_task_with_signal(
                         Some(action) => {
                             stats.actions_seen = stats.actions_seen.saturating_add(1);
                             let outcome = extract_turn_outcome(&action);
+                            let approval_response = extract_approval_response(&action);
                             let effects = state.reduce(action);
                             stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
                             for effect in effects {
                                 executor.execute(effect).await;
+                            }
+                            // S3 T3-1: reducer 处理完 ToolApprovalReceived 后，把决策
+                            // 通过 approval_router 转给 driver 的 pending oneshot。
+                            if let (Some((tool_id, approved)), Some(router)) =
+                                (approval_response, approval_router.as_ref())
+                            {
+                                router.resolve(&tool_id, approved);
                             }
                             if let (Some(out), Some(ref sig)) = (outcome, turn_signal.as_ref()) {
                                 sig.record_and_notify(out);
@@ -1109,6 +1735,17 @@ pub fn spawn_dispatcher_task_with_signal(
 
         stats
     })
+}
+
+/// **S3 T3-1**: 提取 `Action::ToolApprovalReceived` 的 (tool_id, approved) 元组.
+///
+/// 仅在 reducer 处理之前 / 之后用于 approval_router 转发；其他 Action 返回 None。
+/// 通过 borrow 避免提前 clone — 元组在 reducer 消费 action 之前抽取。
+fn extract_approval_response(action: &Action) -> Option<(String, bool)> {
+    match action {
+        Action::ToolApprovalReceived { tool_id, approved } => Some((tool_id.clone(), *approved)),
+        _ => None,
+    }
 }
 
 /// Lightweight stats returned by [`spawn_dispatcher_task`] on shutdown
@@ -1918,6 +2555,8 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
+            approval_router: Arc::new(ApprovalRouter::new()),
+            approval_manager: None,
         };
         (deps, action_rx, hooks, temp)
     }
@@ -2002,6 +2641,8 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
+            approval_router: Arc::new(ApprovalRouter::new()),
+            approval_manager: None,
         };
         let executor = EffectExecutor::new_with_deps(deps);
         executor.execute(Effect::RequestRedraw).await;
@@ -2600,6 +3241,8 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
+            approval_router: Arc::new(ApprovalRouter::new()),
+            approval_manager: None,
         };
         (deps, action_rx, temp)
     }
@@ -2750,6 +3393,8 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
+            approval_router: Arc::new(ApprovalRouter::new()),
+            approval_manager: None,
         };
         let executor = EffectExecutor::new_with_deps(deps);
 
@@ -2899,6 +3544,8 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
+            approval_router: Arc::new(ApprovalRouter::new()),
+            approval_manager: None,
         };
 
         let executor = EffectExecutor::new_with_deps(deps);
@@ -3635,5 +4282,1053 @@ mod real_mode_tests {
             matches!(result, DispatchResult::ChannelClosed),
             "after action_rx drop, try_dispatch must return ChannelClosed (got {result:?})"
         );
+    }
+
+    // ─── S3 T3-1 四件套测试 ────────────────────────────────────────────────────
+
+    /// **S3 T3-1 Step 2**: ToolCallAggregator 聚合 Streaming + Completed 协议.
+    ///
+    /// 验证：多个 Streaming 增量 + 一次 Completed 应返回 Completed.args 作为最终参数；
+    /// 重复 Completed 应被识别为幂等 no-op。
+    #[test]
+    fn t31_aggregator_aggregates_streaming_and_completed() {
+        use crate::providers::traits::{ToolCallChunk, ToolCallChunkStatus};
+        let mut agg = ToolCallAggregator::new();
+
+        // 第 1 个 Streaming delta
+        let r1 = agg.ingest(ToolCallChunk {
+            id: "tc-x".to_string(),
+            name: "shell".to_string(),
+            args: String::new(),
+            index: 0,
+            arguments_delta: Some(r#"{"cmd":"#.to_string()),
+            status: ToolCallChunkStatus::Streaming,
+        });
+        assert!(r1.is_none(), "streaming chunk should not yield ready tool call");
+
+        // 第 2 个 Streaming delta
+        let r2 = agg.ingest(ToolCallChunk {
+            id: "tc-x".to_string(),
+            name: "shell".to_string(),
+            args: String::new(),
+            index: 0,
+            arguments_delta: Some(r#""ls"}"#.to_string()),
+            status: ToolCallChunkStatus::Streaming,
+        });
+        assert!(r2.is_none(), "second streaming chunk also no-op");
+
+        // Completed chunk
+        let r3 = agg.ingest(ToolCallChunk {
+            id: "tc-x".to_string(),
+            name: "shell".to_string(),
+            args: r#"{"cmd":"ls"}"#.to_string(),
+            index: 0,
+            arguments_delta: None,
+            status: ToolCallChunkStatus::Completed,
+        });
+        let (id, name, args) = r3.expect("Completed chunk should yield ready tool call");
+        assert_eq!(id, "tc-x");
+        assert_eq!(name, "shell");
+        assert_eq!(args, r#"{"cmd":"ls"}"#);
+
+        // 重复 Completed → 幂等 no-op.
+        let r4 = agg.ingest(ToolCallChunk {
+            id: "tc-x".to_string(),
+            name: "shell".to_string(),
+            args: r#"{"cmd":"ls"}"#.to_string(),
+            index: 0,
+            arguments_delta: None,
+            status: ToolCallChunkStatus::Completed,
+        });
+        assert!(r4.is_none(), "duplicate Completed should be idempotent no-op");
+    }
+
+    /// **S3 T3-1 Step 2**: ToolCallAggregator 并发 index — 多 tool call 同时进行.
+    #[test]
+    fn t31_aggregator_concurrent_indices_yield_each_separately() {
+        use crate::providers::traits::{ToolCallChunk, ToolCallChunkStatus};
+        let mut agg = ToolCallAggregator::new();
+        // 交错 emit: tc-a streaming → tc-b streaming → tc-a complete → tc-b complete.
+        agg.ingest(ToolCallChunk {
+            id: "tc-a".into(),
+            name: "tool_a".into(),
+            args: String::new(),
+            index: 0,
+            arguments_delta: Some("{".into()),
+            status: ToolCallChunkStatus::Streaming,
+        });
+        agg.ingest(ToolCallChunk {
+            id: "tc-b".into(),
+            name: "tool_b".into(),
+            args: String::new(),
+            index: 1,
+            arguments_delta: Some("[".into()),
+            status: ToolCallChunkStatus::Streaming,
+        });
+        let ra = agg
+            .ingest(ToolCallChunk {
+                id: "tc-a".into(),
+                name: "tool_a".into(),
+                args: "{}".into(),
+                index: 0,
+                arguments_delta: None,
+                status: ToolCallChunkStatus::Completed,
+            })
+            .expect("tc-a should complete");
+        let rb = agg
+            .ingest(ToolCallChunk {
+                id: "tc-b".into(),
+                name: "tool_b".into(),
+                args: "[]".into(),
+                index: 1,
+                arguments_delta: None,
+                status: ToolCallChunkStatus::Completed,
+            })
+            .expect("tc-b should complete");
+        assert_eq!(ra.0, "tc-a");
+        assert_eq!(rb.0, "tc-b");
+        assert_eq!(ra.2, "{}");
+        assert_eq!(rb.2, "[]");
+    }
+
+    /// **S3 T3-1 Step 2**: driver 路径：streaming protocol 的 ToolCallChunk 也能驱动 tool 执行.
+    ///
+    /// Provider 发 [Streaming delta, Streaming delta, Completed] 而非单个 Completed —
+    /// driver 应仍然 emit ToolStarted/ToolFinished + 进入下一轮直到 final text.
+    #[tokio::test]
+    async fn t31_driver_streaming_tool_call_protocol_executes_correctly() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult, ToolCallChunk, ToolCallChunkStatus,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct PingTool;
+        #[async_trait]
+        impl crate::tools::Tool for PingTool {
+            fn name(&self) -> &str {
+                "ping"
+            }
+            fn description(&self) -> &str {
+                "ping"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "pong".into(),
+                    error: None,
+                })
+            }
+        }
+
+        struct StreamingToolProvider {
+            counter: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for StreamingToolProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+                if n == 0 {
+                    // 用 streaming 协议发：先 2 个 Streaming delta，再 1 个 Completed.
+                    let s1 = ToolCallChunk {
+                        id: "call-1".into(),
+                        name: "ping".into(),
+                        args: String::new(),
+                        index: 0,
+                        arguments_delta: Some("{".into()),
+                        status: ToolCallChunkStatus::Streaming,
+                    };
+                    let s2 = ToolCallChunk {
+                        id: "call-1".into(),
+                        name: "ping".into(),
+                        args: String::new(),
+                        index: 0,
+                        arguments_delta: Some("}".into()),
+                        status: ToolCallChunkStatus::Streaming,
+                    };
+                    let c = ToolCallChunk {
+                        id: "call-1".into(),
+                        name: "ping".into(),
+                        args: "{}".into(),
+                        index: 0,
+                        arguments_delta: None,
+                        status: ToolCallChunkStatus::Completed,
+                    };
+                    stream::iter(vec![
+                        Ok(StreamChunk::tool_call_chunk(vec![s1])),
+                        Ok(StreamChunk::tool_call_chunk(vec![s2])),
+                        Ok(StreamChunk::tool_call_chunk(vec![c])),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                } else {
+                    stream::iter(vec![Ok(StreamChunk::delta("done")), Ok(StreamChunk::final_chunk())]).boxed()
+                }
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(StreamingToolProvider {
+            counter: Arc::new(AtomicUsize::new(0)),
+        });
+        deps.tools_registry = Some(Arc::new(vec![Box::new(PingTool) as Box<dyn crate::tools::Tool>]));
+        deps.max_tool_iterations = 4;
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-t31-streaming".into(),
+                history: Vec::new(),
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        let mut saw_tool_started = false;
+        let mut saw_tool_finished = false;
+        let mut saw_completion = false;
+        for _ in 0..32 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver action within 2s")
+                .expect("must arrive");
+            match action {
+                Action::ToolStarted { name, .. } => {
+                    assert_eq!(name, "ping");
+                    saw_tool_started = true;
+                }
+                Action::ToolFinished { success, name, .. } => {
+                    assert_eq!(name, "ping");
+                    assert!(success);
+                    saw_tool_finished = true;
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("done"), "want 'done' got {final_text:?}");
+                    saw_completion = true;
+                    break;
+                }
+                Action::StreamFailed { err, .. } => panic!("driver should not fail in happy path: {err}"),
+                _ => {}
+            }
+        }
+        assert!(saw_tool_started, "must see ToolStarted");
+        assert!(saw_tool_finished, "must see ToolFinished");
+        assert!(saw_completion, "must see StreamCompleted");
+    }
+
+    /// **S3 T3-1 Step 3**: context overflow → 自动 compact + 单次重试 → success.
+    ///
+    /// Provider 第 1 次发 StreamError::Provider("maximum context length exceeded")，
+    /// 第 2 次成功完成。driver 应：emit HistoryCompacted{ContextOverflow} → 再调
+    /// stream API → emit StreamCompleted。
+    #[tokio::test]
+    async fn t31_driver_context_overflow_triggers_compact_and_retries() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamError,
+            StreamOptions, StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct OverflowOnceProvider {
+            counter: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for OverflowOnceProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+                if n == 0 {
+                    stream::iter(vec![Err::<StreamChunk, _>(StreamError::Provider(
+                        "Error: maximum context length exceeded for this model".into(),
+                    ))])
+                    .boxed()
+                } else {
+                    stream::iter(vec![
+                        Ok(StreamChunk::delta("recovered")),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                }
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(OverflowOnceProvider {
+            counter: Arc::new(AtomicUsize::new(0)),
+        });
+        let executor = EffectExecutor::new_with_deps(deps);
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-overflow".into(),
+                history: vec![crate::providers::traits::ChatMessage {
+                    role: "user".into(),
+                    content: "hello".into(),
+                }],
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        let mut saw_compacted = false;
+        let mut saw_completion = false;
+        for _ in 0..16 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver action within 2s")
+                .expect("must arrive");
+            match action {
+                Action::HistoryCompacted {
+                    reason: crate::chat::action::CompactReason::ContextOverflow,
+                } => {
+                    saw_compacted = true;
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("recovered"), "want 'recovered' got {final_text:?}");
+                    saw_completion = true;
+                    break;
+                }
+                Action::StreamFailed { err, .. } => {
+                    panic!("driver should retry on overflow, not fail: {err}");
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_compacted, "must emit HistoryCompacted on overflow");
+        assert!(saw_completion, "must complete after compact+retry");
+    }
+
+    /// **S3 T3-1 Step 3**: context overflow 重试超 1 次 → StreamFailed.
+    #[tokio::test]
+    async fn t31_driver_context_overflow_exhausted_emits_stream_failed() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamError,
+            StreamOptions, StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct AlwaysOverflowProvider;
+        #[async_trait]
+        impl Provider for AlwaysOverflowProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![Err::<StreamChunk, _>(StreamError::Provider(
+                    "context_length_exceeded: please reduce input".into(),
+                ))])
+                .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(AlwaysOverflowProvider);
+        let executor = EffectExecutor::new_with_deps(deps);
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-overflow-fail".into(),
+                history: vec![crate::providers::traits::ChatMessage {
+                    role: "user".into(),
+                    content: "x".repeat(1000),
+                }],
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        let mut saw_failed = false;
+        for _ in 0..16 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("action within 2s")
+                .expect("must arrive");
+            if let Action::StreamFailed { err, .. } = &action {
+                assert!(
+                    err.contains("context overflow") || err.contains("context_length_exceeded"),
+                    "err must mention overflow: {err}"
+                );
+                saw_failed = true;
+                break;
+            }
+        }
+        assert!(saw_failed, "must emit StreamFailed after overflow retries exhausted");
+    }
+
+    /// **S3 T3-1 Step 4**: ApprovalRouter resolve / register 基本路径.
+    #[tokio::test]
+    async fn t31_approval_router_register_and_resolve_basic() {
+        let router = ApprovalRouter::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        router.register("call-1".to_string(), tx);
+        assert!(router.resolve("call-1", true), "resolve should find the tx");
+        assert!(rx.await.expect("oneshot rx must resolve"));
+        // 第二次 resolve 相同 id 应返回 false (没有 pending)
+        assert!(!router.resolve("call-1", false), "second resolve must miss");
+    }
+
+    /// **S3 T3-1 Step 4**: approval 路径 — needs_approval=true 时 driver 走 router 等响应；
+    /// stub EffectExecutor::RequestApproval 默认 auto-approve.
+    #[tokio::test]
+    async fn t31_driver_approval_path_auto_approves_via_stub() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult, ToolCallChunk,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct ShellTool;
+        #[async_trait]
+        impl crate::tools::Tool for ShellTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "shell"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "ran".into(),
+                    error: None,
+                })
+            }
+        }
+
+        struct ToolThenText {
+            counter: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for ToolThenText {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+                if n == 0 {
+                    let c = ToolCallChunk::new("call-shell", "shell", "{}", 0);
+                    stream::iter(vec![
+                        Ok(StreamChunk::tool_call_chunk(vec![c])),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                } else {
+                    stream::iter(vec![Ok(StreamChunk::delta("ok")), Ok(StreamChunk::final_chunk())]).boxed()
+                }
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        // ApprovalManager 配置：Supervised + always_ask=[shell] → needs_approval(shell)=true.
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            auto_approve: Vec::new(),
+            always_ask: vec!["shell".to_string()],
+            ..Default::default()
+        };
+        let mgr = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(ToolThenText {
+            counter: Arc::new(AtomicUsize::new(0)),
+        });
+        deps.tools_registry = Some(Arc::new(vec![Box::new(ShellTool) as Box<dyn crate::tools::Tool>]));
+        deps.max_tool_iterations = 4;
+        deps.approval_manager = Some(mgr);
+        // 测试拦截器：当看到 `Action::ToolApprovalRequested` 时主动 router.resolve(true)
+        // 模拟 dispatcher_task + EffectExecutor stub 的端到端 auto-approve 行为。
+        let router_for_resolve = Arc::clone(&deps.approval_router);
+        let executor = EffectExecutor::new_with_deps(deps);
+        let shutdown_d = CancellationToken::new();
+        let (sink_tx, mut sink_rx) = mpsc::channel::<Action>(64);
+        let router_handle = Arc::clone(&router_for_resolve);
+        let shutdown_clone = shutdown_d.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown_clone.cancelled() => break,
+                    maybe = action_rx.recv() => {
+                        match maybe {
+                            Some(action) => {
+                                if let Action::ToolApprovalRequested { tool_id, .. } = &action {
+                                    router_handle.resolve(tool_id, true);
+                                    // 模拟 stub 发回 ToolApprovalReceived 给观察者：
+                                    let _ = sink_tx
+                                        .send(Action::ToolApprovalReceived {
+                                            tool_id: tool_id.clone(),
+                                            approved: true,
+                                        })
+                                        .await;
+                                }
+                                let _ = sink_tx.send(action).await;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-approval".into(),
+                history: Vec::new(),
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        let mut saw_request = false;
+        let mut saw_received = false;
+        let mut saw_tool_started = false;
+        let mut saw_tool_finished = false;
+        let mut saw_completion = false;
+        for _ in 0..32 {
+            let action = tokio::time::timeout(Duration::from_millis(3000), sink_rx.recv())
+                .await
+                .expect("action within 3s")
+                .expect("must arrive");
+            match action {
+                Action::ToolApprovalRequested { tool_id, name, .. } => {
+                    assert_eq!(tool_id, "call-shell");
+                    assert_eq!(name, "shell");
+                    saw_request = true;
+                }
+                Action::ToolApprovalReceived { tool_id, approved } => {
+                    assert_eq!(tool_id, "call-shell");
+                    assert!(approved, "stub should auto-approve");
+                    saw_received = true;
+                }
+                Action::ToolStarted { name, .. } => {
+                    assert_eq!(name, "shell");
+                    saw_tool_started = true;
+                }
+                Action::ToolFinished { success, name, .. } => {
+                    assert_eq!(name, "shell");
+                    assert!(success);
+                    saw_tool_finished = true;
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("ok"));
+                    saw_completion = true;
+                    break;
+                }
+                Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+                _ => {}
+            }
+        }
+        shutdown_d.cancel();
+        assert!(saw_request, "must see ToolApprovalRequested");
+        assert!(saw_received, "must see ToolApprovalReceived");
+        assert!(saw_tool_started, "must see ToolStarted after approval");
+        assert!(saw_tool_finished, "must see ToolFinished after approval");
+        assert!(saw_completion, "must see StreamCompleted after approval");
+    }
+
+    /// **S3 T3-1 Step 4**: approval rejected → tool 不执行 + ToolFinished(success=false, "User rejected").
+    #[tokio::test]
+    async fn t31_driver_approval_rejected_skips_tool_execution() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult, ToolCallChunk,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+        let exec_counter = Arc::new(AtomicBool::new(false));
+        struct RejectableTool {
+            executed: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl crate::tools::Tool for RejectableTool {
+            fn name(&self) -> &str {
+                "danger"
+            }
+            fn description(&self) -> &str {
+                "danger"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                self.executed.store(true, AtomicOrdering::SeqCst);
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "did dangerous thing".into(),
+                    error: None,
+                })
+            }
+        }
+
+        struct ToolThenText {
+            counter: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for ToolThenText {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+                if n == 0 {
+                    let c = ToolCallChunk::new("call-danger", "danger", "{}", 0);
+                    stream::iter(vec![
+                        Ok(StreamChunk::tool_call_chunk(vec![c])),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                } else {
+                    stream::iter(vec![Ok(StreamChunk::delta("declined")), Ok(StreamChunk::final_chunk())]).boxed()
+                }
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            auto_approve: Vec::new(),
+            always_ask: vec!["danger".to_string()],
+            ..Default::default()
+        };
+        let mgr = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(ToolThenText {
+            counter: Arc::new(AtomicUsize::new(0)),
+        });
+        deps.tools_registry = Some(Arc::new(vec![Box::new(RejectableTool {
+            executed: Arc::clone(&exec_counter),
+        }) as Box<dyn crate::tools::Tool>]));
+        deps.max_tool_iterations = 4;
+        deps.approval_manager = Some(mgr);
+        let router_for_resolve = Arc::clone(&deps.approval_router);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        // 拦截 action_rx：截获 ToolApprovalRequested → 直接 resolve(false)，
+        // 让 driver 收到 rejection（绕过 stub auto-approve 的默认行为）。
+        let shutdown_d = CancellationToken::new();
+        let (sink_tx, mut sink_rx) = mpsc::channel::<Action>(64);
+        let router_handle = Arc::clone(&router_for_resolve);
+        let shutdown_clone = shutdown_d.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown_clone.cancelled() => break,
+                    maybe = action_rx.recv() => {
+                        match maybe {
+                            Some(action) => {
+                                // 抢先 reject — 在 stub auto-approve 之前 resolve(false).
+                                if let Action::ToolApprovalRequested { tool_id, .. } = &action {
+                                    router_handle.resolve(tool_id, false);
+                                }
+                                let _ = sink_tx.send(action).await;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-reject".into(),
+                history: Vec::new(),
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        let mut saw_tool_finished_rejected = false;
+        let mut saw_completion = false;
+        for _ in 0..32 {
+            let action = tokio::time::timeout(Duration::from_millis(3000), sink_rx.recv())
+                .await
+                .expect("action within 3s")
+                .expect("must arrive");
+            match action {
+                Action::ToolFinished {
+                    success, result, name, ..
+                } => {
+                    assert_eq!(name, "danger");
+                    assert!(!success, "rejected tool must report success=false");
+                    let r = result.as_deref().unwrap_or_default();
+                    assert!(r.contains("User rejected") || r.contains("rejected"), "result={r:?}");
+                    saw_tool_finished_rejected = true;
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("declined"));
+                    saw_completion = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        shutdown_d.cancel();
+        assert!(
+            saw_tool_finished_rejected,
+            "must see ToolFinished(success=false) on reject"
+        );
+        assert!(saw_completion, "must see StreamCompleted with replacement text");
+        assert!(
+            !exec_counter.load(AtomicOrdering::SeqCst),
+            "rejected tool MUST NOT have executed"
+        );
+    }
+
+    /// **S3 T3-1 Step 5**: stream_error_is_network_timeout 正确识别 reqwest 错误.
+    ///
+    /// 用 reqwest::Client 故意 GET 一个不可达地址触发 connect 错误以构造真错误。
+    #[test]
+    fn t31_stream_error_is_network_timeout_recognises_io_error() {
+        use crate::providers::traits::StreamError;
+        let io_err = StreamError::Io(std::io::Error::other("simulated"));
+        assert!(stream_error_is_network_timeout(&io_err));
+        let json_err = StreamError::Json(serde_json::from_str::<serde_json::Value>("notjson").unwrap_err());
+        assert!(!stream_error_is_network_timeout(&json_err));
+        let provider_err = StreamError::Provider("rate limit".into());
+        assert!(!stream_error_is_network_timeout(&provider_err));
+    }
+
+    /// **S3 T3-1 Step 5**: stream_error_is_context_overflow 子串匹配多 provider.
+    #[test]
+    fn t31_stream_error_is_context_overflow_matches_provider_strings() {
+        use crate::providers::traits::StreamError;
+        for msg in [
+            "Error: maximum context length exceeded",
+            "context_length_exceeded",
+            "the prompt is too long",
+            "input token count is 200000",
+            "exceeds maximum allowed",
+            "Token limit reached",
+        ] {
+            let err = StreamError::Provider(msg.into());
+            assert!(
+                stream_error_is_context_overflow(&err),
+                "expected overflow match for: {msg}"
+            );
+        }
+        let normal = StreamError::Provider("rate limited".into());
+        assert!(!stream_error_is_context_overflow(&normal));
+    }
+
+    /// **S3 T3-1 Step 5**: io error 重试 — driver 第 1, 2 次 io error 后第 3 次成功.
+    ///
+    /// 用 short backoff 避免单测耗时太长（注：当前 BACKOFF_BASE_MS=500ms 已经够小，
+    /// 加上 1s+2s=3.5s 总耗时，单测 timeout 充裕）。
+    #[tokio::test]
+    async fn t31_driver_network_timeout_retries_with_backoff_then_succeeds() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamError,
+            StreamOptions, StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct FlakyProvider {
+            counter: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for FlakyProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+                if n < 2 {
+                    stream::iter(vec![Err::<StreamChunk, _>(StreamError::Io(std::io::Error::other(
+                        "simulated network timeout",
+                    )))])
+                    .boxed()
+                } else {
+                    stream::iter(vec![
+                        Ok(StreamChunk::delta("recovered")),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                }
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(FlakyProvider {
+            counter: Arc::new(AtomicUsize::new(0)),
+        });
+        let executor = EffectExecutor::new_with_deps(deps);
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-flaky".into(),
+                history: Vec::new(),
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        let mut retry_attempts: u8 = 0;
+        let mut saw_completion = false;
+        // 总耗时上限：~3.5s 真 sleep + 一些 RTT，给 8s 余量.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "test deadline exceeded");
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let action = match tokio::time::timeout(remaining.min(Duration::from_secs(4)), action_rx.recv()).await {
+                Ok(Some(a)) => a,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
+            match action {
+                Action::StreamRetryAttempt { attempt, .. } => {
+                    retry_attempts = retry_attempts.max(attempt);
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("recovered"));
+                    saw_completion = true;
+                    break;
+                }
+                Action::StreamFailed { err, .. } => {
+                    panic!("driver should retry, not fail: {err}");
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            retry_attempts >= 1,
+            "must emit at least one StreamRetryAttempt (got {retry_attempts})"
+        );
+        assert!(saw_completion, "must complete after backoff retries");
+    }
+
+    /// **S3 T3-1 Step 5**: io error 持续 → 重试耗尽 → StreamFailed(retryable=false).
+    #[tokio::test]
+    async fn t31_driver_network_timeout_exhausted_emits_stream_failed() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamError,
+            StreamOptions, StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct AlwaysIoErrProvider;
+        #[async_trait]
+        impl Provider for AlwaysIoErrProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![Err::<StreamChunk, _>(StreamError::Io(std::io::Error::other(
+                    "persistent network failure",
+                )))])
+                .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(AlwaysIoErrProvider);
+        let executor = EffectExecutor::new_with_deps(deps);
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-net-fail".into(),
+                history: Vec::new(),
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        let mut saw_failed = false;
+        // backoff = 500ms + 1s + 2s = 3.5s + RTT，给 10s 余量.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "test deadline exceeded");
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let action = match tokio::time::timeout(remaining.min(Duration::from_secs(5)), action_rx.recv()).await {
+                Ok(Some(a)) => a,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
+            if let Action::StreamFailed { err, retryable, .. } = action {
+                assert!(!retryable, "exhausted retries must be non-retryable");
+                assert!(err.contains("network retries exhausted"), "err={err}");
+                saw_failed = true;
+                break;
+            }
+        }
+        assert!(saw_failed, "must emit StreamFailed after exhausting network retries");
     }
 }

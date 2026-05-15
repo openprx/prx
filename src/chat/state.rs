@@ -115,6 +115,20 @@ pub enum Effect {
     AutoTitleSession(String),
     /// 结构化 trace 日志
     LogTrace { level: tracing::Level, msg: String },
+    /// **S3 T3-1**: EffectExecutor 把 approval 请求转发到 UI / CLI prompt.
+    ///
+    /// driver 在执行需 approval 的 tool 前 dispatch [`Action::ToolApprovalRequested`]；
+    /// reducer 据此产生本 Effect；EffectExecutor 在 real 模式下负责把请求转给
+    /// UI 渲染层 / CLI prompt（当前 stub：log + 默认 approve），由 UI 在用户响应后
+    /// 回投 [`Action::ToolApprovalReceived`]。
+    ///
+    /// 数据流为单向 fire-and-forget（driver 通过 `approval_response_tx` mpsc 反向
+    /// 接收响应）。Effect 不要求响应。
+    RequestApproval {
+        tool_id: String,
+        name: String,
+        args: String,
+    },
     /// 优雅退出主循环
     Quit,
 }
@@ -321,6 +335,13 @@ impl ChatState {
                 result,
             } => self.reduce_tool_finished(name, success, duration_ms, result),
             Action::ToolProgress { iteration, max } => self.reduce_tool_progress(iteration, max),
+            Action::ToolApprovalRequested { tool_id, name, args } => {
+                self.reduce_tool_approval_requested(tool_id, name, args)
+            }
+            Action::ToolApprovalReceived { tool_id, approved } => {
+                self.reduce_tool_approval_received(&tool_id, approved)
+            }
+            Action::StreamRetryAttempt { attempt, reason } => self.reduce_stream_retry_attempt(attempt, &reason),
 
             // ── 会话 ──────────────────────────────────────────────
             Action::SessionLoaded(session) => self.reduce_session_loaded(session),
@@ -891,6 +912,47 @@ impl ChatState {
         ]
     }
 
+    /// **S3 T3-1**: `Action::ToolApprovalRequested` — 仅产生 `Effect::RequestApproval`.
+    ///
+    /// driver 在 supervised autonomy 模式下，**先于** ToolStarted 发送该 Action，
+    /// 让 reducer 把请求转给 EffectExecutor / UI；driver 自己通过 oneshot rx
+    /// 等响应（dispatcher 把 `ToolApprovalReceived` 转写到 driver 的接收 channel）。
+    /// reducer 不维护 pending_approvals — driver 是单一拥有者。
+    fn reduce_tool_approval_requested(&self, tool_id: String, name: String, args: String) -> Vec<Effect> {
+        let _ = &self.ui;
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::DEBUG,
+                msg: format!("tool_approval_requested tool_id={tool_id} name={name}"),
+            },
+            Effect::RequestApproval { tool_id, name, args },
+        ]
+    }
+
+    /// **S3 T3-1**: `Action::ToolApprovalReceived` — driver 收到 approval 决策后通过
+    /// 反向 mpsc 走 dispatcher 路径转回 driver；reducer 端仅做 trace 记账.
+    fn reduce_tool_approval_received(&self, tool_id: &str, approved: bool) -> Vec<Effect> {
+        let _ = &self.ui;
+        vec![Effect::LogTrace {
+            level: tracing::Level::DEBUG,
+            msg: format!("tool_approval_received tool_id={tool_id} approved={approved}"),
+        }]
+    }
+
+    /// **S3 T3-1**: `Action::StreamRetryAttempt` — 网络重试尝试，仅 trace + 重绘.
+    ///
+    /// 不 mutate state（driver 自己维护 attempt 计数）；UI 可据此显示 "retrying..." 提示。
+    fn reduce_stream_retry_attempt(&self, attempt: u8, reason: &str) -> Vec<Effect> {
+        let _ = &self.ui;
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: format!("stream_retry_attempt #{attempt} reason={reason}"),
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
     /// Helper：判断当前 draft 的 id 是否匹配传入值（处理 terminal-tui 和占位两种 StreamingDraft 类型）.
     #[cfg(feature = "terminal-tui")]
     fn stream_draft_id_matches(draft: Option<&StreamingDraft>, draft_id: &str) -> bool {
@@ -1194,34 +1256,7 @@ impl ChatState {
                 msg: format!("HistoryCompacted noop reason={reason:?} len={}", history.len()),
             }];
         }
-        let has_system = history.first().is_some_and(|m| m.role == "system");
-        let start = usize::from(has_system);
-
-        // Step 1: 只保留最后 COMPACT_KEEP_MESSAGES 条非 system 消息
-        let turn_count = history.len().saturating_sub(start);
-        if turn_count > COMPACT_KEEP_MESSAGES {
-            let drain_end = start.saturating_add(turn_count.saturating_sub(COMPACT_KEEP_MESSAGES));
-            history.drain(start..drain_end);
-        }
-
-        // Step 2: 单条消息内容截断
-        for msg in history.iter_mut().skip(start) {
-            if msg.content.chars().count() > COMPACT_CONTENT_CHARS {
-                msg.content = truncate_with_ellipsis(&msg.content, COMPACT_CONTENT_CHARS);
-            }
-        }
-
-        // Step 3: 总预算约束（drop oldest first）
-        while history
-            .iter()
-            .skip(start)
-            .map(|m| m.content.chars().count())
-            .sum::<usize>()
-            > COMPACT_TOTAL_CHARS
-            && history.len() > start.saturating_add(1)
-        {
-            history.remove(start);
-        }
+        compact_history_in_place(history);
 
         let final_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
         vec![Effect::LogTrace {
@@ -1242,6 +1277,55 @@ impl ChatState {
     #[cfg(not(feature = "terminal-tui"))]
     fn take_draft_id(stream: &StreamState) -> Option<String> {
         stream.draft.as_ref().map(|d| d.0.clone())
+    }
+}
+
+// ─── Public helpers (shared with dispatcher driver) ──────────────────────────
+
+/// **S3 T3-1**: 与 `Action::HistoryCompacted` reducer 共享的 history 压缩算法.
+///
+/// 抽到 free function 是为了让 `dispatcher::drive_start_turn_stream` 在 context-overflow
+/// 重试路径也能对自己持有的 `history` 副本应用**同一**算法，避免 reducer/driver 两侧
+/// 状态漂移（Codex 审计建议）。
+///
+/// 行为与 `reduce_history_compacted` 完全一致：
+/// 1. 保留 system prompt（首位若 role==system）.
+/// 2. 只保留最后 [`COMPACT_KEEP_MESSAGES`] 条非 system 消息（drain 较老者）.
+/// 3. 单条消息超 [`COMPACT_CONTENT_CHARS`] 字符时 ellipsis 截断.
+/// 4. 总预算超 [`COMPACT_TOTAL_CHARS`] 时按 FIFO drop oldest turn.
+///
+/// `history.len() <= 1` 时为 no-op（保持 system 唯一消息或全空）。
+pub fn compact_history_in_place(history: &mut Vec<ChatMessage>) {
+    if history.len() <= 1 {
+        return;
+    }
+    let has_system = history.first().is_some_and(|m| m.role == "system");
+    let start = usize::from(has_system);
+
+    // Step 1: 只保留最后 COMPACT_KEEP_MESSAGES 条非 system 消息
+    let turn_count = history.len().saturating_sub(start);
+    if turn_count > COMPACT_KEEP_MESSAGES {
+        let drain_end = start.saturating_add(turn_count.saturating_sub(COMPACT_KEEP_MESSAGES));
+        history.drain(start..drain_end);
+    }
+
+    // Step 2: 单条消息内容截断
+    for msg in history.iter_mut().skip(start) {
+        if msg.content.chars().count() > COMPACT_CONTENT_CHARS {
+            msg.content = truncate_with_ellipsis(&msg.content, COMPACT_CONTENT_CHARS);
+        }
+    }
+
+    // Step 3: 总预算约束（drop oldest first）
+    while history
+        .iter()
+        .skip(start)
+        .map(|m| m.content.chars().count())
+        .sum::<usize>()
+        > COMPACT_TOTAL_CHARS
+        && history.len() > start.saturating_add(1)
+    {
+        history.remove(start);
     }
 }
 
