@@ -454,11 +454,16 @@ fn flush_tool_call_buffer(buf: &[ToolCallBuffer]) -> Vec<ToolCallChunk> {
             } else {
                 entry.arguments.clone()
             };
+            // S3 T3-0: OpenAI uses the legacy completion protocol — buffer
+            // all `function.arguments` SSE fragments and emit a single
+            // `Completed` chunk. Incremental streaming will be added in T3-2.
             ToolCallChunk {
                 id,
                 name: entry.name.clone(),
                 args,
                 index: idx,
+                arguments_delta: None,
+                status: crate::providers::traits::ToolCallChunkStatus::Completed,
             }
         })
         .collect()

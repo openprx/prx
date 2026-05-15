@@ -816,11 +816,17 @@ impl AnthropicStreamState {
         } else {
             entry.tool_args
         };
+        // S3 T3-0: Anthropic uses the legacy completion protocol — buffer
+        // `input_json_delta` fragments per content_block and emit a single
+        // `Completed` chunk at content_block_stop. Incremental streaming
+        // will be added in T3-2.
         Some(ToolCallChunk {
             id,
             name: entry.tool_name,
             args,
             index: order,
+            arguments_delta: None,
+            status: crate::providers::traits::ToolCallChunkStatus::Completed,
         })
     }
 }
