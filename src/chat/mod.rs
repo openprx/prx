@@ -141,6 +141,16 @@ fn now_ms() -> u64 {
 ///   `PRX_CHAT_REDUX_DRIVER=1`），legacy 守卫全关，`chat_session.add_*_turn`
 ///   不再执行（由 reducer 的 `RecordUserTurn`/`RecordAssistantTurn` +
 ///   `Effect::SaveSession` 接管）。
+// S2.5 T2.5-4 (T3-3-fixB 后): PRX_CHAT_REDUX 三态环境变量保留至 S5 验收完成。
+//
+// 当前四态实际语义（与字面"三态"区分）:
+// - Off:   reducer 完全静默，旧路径单写（legacy chat_session 是唯一持久化源）
+// - Both:  reducer 并行，dual_write_guard 守卫旧路径（双写防护期间）
+// - Redux: 同 Both（别名，历史兼容）
+// - Pure:  reducer 单路由，旧路径全关闭（T3-3 收官目标态）
+//
+// 移除节奏：S4-B 仅删 chat_mirror/active_cancel 等数据结构，env 守卫保留；
+// S5 验收全 PASS 后再删 enum + 全部守卫调用点。
 #[cfg(feature = "terminal-tui")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReduxMode {
