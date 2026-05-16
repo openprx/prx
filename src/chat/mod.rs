@@ -3,6 +3,22 @@
 //! Wires up the full agent pipeline (memory, tools, providers, security, hooks,
 //! observability) and uses [`TerminalChannel`] for streaming I/O through the
 //! event-driven UI Actor.
+//!
+//! ## S4-A 渲染源切换（已完成 2026-05-16）
+//!
+//! Pure 模式下 ratatui 渲染源从 `chat_mirror: Arc<Mutex<TuiState>>` 切换到
+//! `tokio::sync::watch::Receiver<Arc<state::UiSnapshot>>`. dispatcher 在
+//! reducer 返回 `ui_dirty=true` 后构造新 [`state::UiSnapshot`] 并 send_if_modified
+//! 推送给 watch；`run_tui_unified_loop` 通过 [`RenderSource::Snapshot`] 从
+//! receiver borrow 当前 snapshot，绕过 chat_mirror 锁。
+//!
+//! Off/Both/Redux 模式保留既有 `chat_mirror` 路径 ([`RenderSource::Mirror`])，
+//! 让灰度切换可控。
+//!
+//! S4-A 已完成 commit: 327395d / 84ec8f1 / 0bb93bb / 55a2421 / 8d53140 /
+//! ae3a9af / ae47ddd + 本 commit (Commit 7 docs)。S4-B 计划:
+//! 删 chat_mirror 字段 + 所有 mirror 路径调用，参见任务文档附录 D
+//! (`/opt/worker/task/prx/prx-remaining-plan-2026-05-15.md`)。
 // Chat module: println!/eprintln! are intentional user-facing output (banners, status, errors).
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
