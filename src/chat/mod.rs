@@ -9,6 +9,7 @@
 pub mod action;
 pub mod commands;
 pub mod dispatcher;
+pub mod error;
 pub mod sanitize;
 pub mod session;
 pub mod state;
