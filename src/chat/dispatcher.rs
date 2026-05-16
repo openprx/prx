@@ -2654,6 +2654,130 @@ mod real_mode_tests {
         );
     }
 
+    /// T3-3-fixA P0-2: Exit-after-completed 四模式 reducer 持久化等价性.
+    ///
+    /// 验证 reducer 完成一个完整 turn 后 emit 的 SaveSession 在所有模式下都
+    /// 触发恰好一次 memory.store —— 即 reducer 持久化路径**模式无关**。
+    /// fixA P0-2 修复后，Pure 模式 reducer 是唯一持久化源，本测试确认它
+    /// 与 Off/Both/Redux 在 reducer 持久化语义上对齐（写入次数 + 内容）.
+    ///
+    /// 注：chat::run 主循环退出时的 legacy save_session 由 ReduxMode 守卫开关，
+    /// 守卫真值表已由 pure_mode_skips_legacy_exit_save_via_redux_mode_guard 覆盖.
+    #[tokio::test]
+    async fn t3_3_fix_a_exit_after_completed_persistence_parity() {
+        use crate::chat::action::Action;
+        use crate::chat::state::ChatState;
+
+        for tag in ["off", "both", "redux", "pure"] {
+            let store_count = Arc::new(AtomicUsize::new(0));
+            let memory: Arc<dyn Memory> = Arc::new(CountingMemory {
+                inner: NoneMemory::new(),
+                store_count: Arc::clone(&store_count),
+            });
+            let shutdown = CancellationToken::new();
+            let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+            let executor = EffectExecutor::new_with_deps(deps);
+
+            let mut state = ChatState::new(
+                Arc::from("test-prov"),
+                Arc::from("test-model"),
+                CancellationToken::new(),
+            );
+            state.session.id = format!("sess-fixA-{tag}");
+
+            // 完整 turn: user → turn started → assistant recorded → stream completed
+            let _ = state.reduce(Action::RecordUserTurn("q".to_string()));
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: format!("d-{tag}"),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::RecordAssistantTurn("a".to_string()));
+            let effects = state.reduce(Action::StreamCompleted {
+                draft_id: format!("d-{tag}"),
+                final_text: "a".to_string(),
+                reasoning: String::new(),
+            });
+
+            let mut had_save = false;
+            for effect in effects {
+                if matches!(effect, Effect::SaveSession(_)) {
+                    had_save = true;
+                }
+                executor.execute(effect).await;
+            }
+            assert!(had_save, "[{tag}] reducer 完成 turn 必发 SaveSession");
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert_eq!(
+                store_count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "[{tag}] reducer 持久化路径必须模式无关 — 完整 turn 应触发 memory.store 一次",
+            );
+        }
+    }
+
+    /// T3-3-fixA P0-2: Exit-while-streaming 四模式无 partial save 一致性.
+    ///
+    /// streaming 期间退出（用户没等流完）reducer 不应 emit SaveSession ——
+    /// 这是附录 B 决策表的 Cancelled/Error 行的直接后果。本测试模拟"开始 turn
+    /// 但既没 RecordAssistantTurn 也没 StreamCompleted"的中途退出窗口，
+    /// 验证 memory.store == 0（无 partial state 持久化）.
+    #[tokio::test]
+    async fn t3_3_fix_a_exit_while_streaming_no_partial_save() {
+        use crate::chat::action::Action;
+        use crate::chat::state::ChatState;
+
+        for tag in ["off", "both", "redux", "pure"] {
+            let store_count = Arc::new(AtomicUsize::new(0));
+            let memory: Arc<dyn Memory> = Arc::new(CountingMemory {
+                inner: NoneMemory::new(),
+                store_count: Arc::clone(&store_count),
+            });
+            let shutdown = CancellationToken::new();
+            let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+            let executor = EffectExecutor::new_with_deps(deps);
+
+            let mut state = ChatState::new(
+                Arc::from("test-prov"),
+                Arc::from("test-model"),
+                CancellationToken::new(),
+            );
+            state.session.id = format!("sess-stream-{tag}");
+
+            // user 已 record，turn 已开始流式，但 stream 没 complete（中途退出窗口）
+            let _ = state.reduce(Action::RecordUserTurn("q".to_string()));
+            let user_effects: Vec<Effect> = state
+                .reduce(Action::TurnStarted {
+                    draft_id: format!("d-{tag}"),
+                    cancel: CancellationToken::new(),
+                })
+                .into_iter()
+                .chain(state.reduce(Action::StreamChunkReceived {
+                    draft_id: format!("d-{tag}"),
+                    delta: "partial".to_string(),
+                    version: 1,
+                }))
+                .collect();
+
+            assert!(
+                !user_effects.iter().any(|e| matches!(e, Effect::SaveSession(_))),
+                "[{tag}] streaming 中途 effects 不应含 SaveSession"
+            );
+
+            // 把已 emit 的 effect 都 execute 完（含 LogTrace / RequestRedraw 等)
+            for effect in user_effects {
+                executor.execute(effect).await;
+            }
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert_eq!(
+                store_count.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "[{tag}] streaming 中途退出 memory.store 必须为 0（无 partial save）",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn real_mode_quit_cancels_shutdown_token() {
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());

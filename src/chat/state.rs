@@ -3210,6 +3210,50 @@ mod tests {
             assert_eq!(rev_snap.turns.len(), 1, "反序：snapshot.turns 应只含先前的 user turn");
         }
 
+        /// T3-3-fixA P0-2: StreamFailed 不发 SaveSession（错误路径不写持久化）.
+        ///
+        /// 固化附录 B 决策表中 Error 行：reduce_stream_failed emit
+        /// [LogTrace, NotifyHook(Error), RequestRedraw]，无 SaveSession.
+        /// 防御回归：未来若有人想"把失败也保存"，本测试立刻翻车，强制更新附录 B + 评审.
+        #[test]
+        fn test_t3_3_fix_a_stream_error_no_save() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-err".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let effects = state.reduce(Action::StreamFailed {
+                draft_id: "d-err".to_string(),
+                err: "boom".to_string(),
+                retryable: false,
+            });
+            assert!(
+                !has_save_session(&effects),
+                "StreamFailed 必须不发 SaveSession (T3-3-fixA 附录 B Error 行)"
+            );
+        }
+
+        /// T3-3-fixA P0-2: StreamCancelled 不发 SaveSession（用户取消不写持久化）.
+        ///
+        /// 固化附录 B 决策表中 Cancelled 行：reduce_stream_cancelled emit
+        /// 仅 [RequestRedraw]。phase_f_stream_cancelled_no_save_no_hook 已有覆盖,
+        /// 本测试用 fixA 命名保留，便于按附录 B 决策点定位回归.
+        #[test]
+        fn test_t3_3_fix_a_stream_cancelled_no_save() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-cancel".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let effects = state.reduce(Action::StreamCancelled {
+                draft_id: "d-cancel".to_string(),
+            });
+            assert!(
+                !has_save_session(&effects),
+                "StreamCancelled 必须不发 SaveSession (T3-3-fixA 附录 B Cancelled 行)"
+            );
+        }
+
         /// S2-A test 3: stream_failed_effect_sequence
         ///
         /// Failure 路径（timeout / context-overflow / 其他错误）：chat::mod 主循环按
