@@ -1168,6 +1168,9 @@ impl ChatState {
     /// - `updated_at` 由 effect executor 在构建 `SaveSession` 快照时设置（SessionState 不含时间戳）
     /// - tool_calls 留空（Step 5b 由 ToolStarted/ToolFinished Action 补充）
     // TODO: tool_calls 同步留 Step 5b
+    // FIXME(S2.5): RecordAssistantTurn(content) 忽略 tool_calls 参数，session.turns[i].tool_calls
+    // 一律存 Vec::new()。legacy add_assistant_turn(content, tool_calls) 在 SaveSession 落盘的
+    // turns[i].tool_calls 字段保留，对齐工作挪 S2.5 横切（与 sanitized vs enriched 同批）。
     fn reduce_record_assistant_turn(&mut self, content: String) -> Vec<Effect> {
         self.session.turns.push(crate::chat::session::ChatTurn {
             role: "assistant".to_string(),
