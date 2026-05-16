@@ -152,6 +152,38 @@ impl ChatDispatcher {
         }
     }
 
+    /// S2.5 P1-A: `try_dispatch` + 失败时 tracing::warn + Prometheus 计数.
+    ///
+    /// 主路径调用方应优先用本 helper 而非裸 `try_dispatch`，避免 channel full /
+    /// closed 时静默丢失 Action。`site_tag` 用于失败 log 标注调用点（如
+    /// "chat.banner" / "chat.shutdown_sigint" / "chat.user_input"），便于事后
+    /// 通过 grep 定位漏点。返回原 `DispatchResult` 供调用方按需进一步处理。
+    #[allow(dead_code)]
+    pub fn dispatch_or_log(&self, action: Action, site: &'static str) -> DispatchResult {
+        let action_kind = action.kind();
+        let result = self.try_dispatch(action);
+        match result {
+            DispatchResult::Sent => {}
+            DispatchResult::Backpressured => {
+                tracing::warn!(
+                    site = site,
+                    action_kind = action_kind,
+                    "chat dispatch failed: channel backpressured, action dropped"
+                );
+                crate::observability::chat_metrics::inc_dispatch_drop("backpressured");
+            }
+            DispatchResult::ChannelClosed => {
+                tracing::warn!(
+                    site = site,
+                    action_kind = action_kind,
+                    "chat dispatch failed: channel closed, action dropped"
+                );
+                crate::observability::chat_metrics::inc_dispatch_drop("closed");
+            }
+        }
+        result
+    }
+
     /// 同步阻塞发送（仅在非 async 上下文调用，如 OS 信号 handler 的同步部分）.
     ///
     /// **注意**：tokio runtime 内部不允许 blocking_send，否则 panic。
@@ -4698,6 +4730,70 @@ mod real_mode_tests {
         assert!(
             matches!(result, DispatchResult::ChannelClosed),
             "after action_rx drop, try_dispatch must return ChannelClosed (got {result:?})"
+        );
+    }
+
+    // ─── S2.5 P1-A: dispatch_or_log 失败处理 ─────────────────────────────────
+
+    /// S2.5 P1-A: 正常路径 — dispatch_or_log 返回 Sent，Action 真入队.
+    ///
+    /// 不断言 drops 计数变化（counter 全局共享，并行测试会污染读数）；
+    /// 通过 Backpressured/Closed 两个测试已覆盖 drops 计数 +1 语义。
+    #[tokio::test]
+    async fn s2_5_p1_a_dispatch_or_log_normal_sent() {
+        let (dispatcher, mut rx) = ChatDispatcher::new();
+        let result = dispatcher.dispatch_or_log(Action::CancelRequested, "test.normal");
+        assert!(
+            matches!(result, DispatchResult::Sent),
+            "正常路径必须返回 Sent (got {result:?})"
+        );
+        // 验证 Action 真入队
+        let recv = rx.try_recv().expect("test: action should be in queue");
+        assert!(matches!(recv, Action::CancelRequested));
+    }
+
+    /// S2.5 P1-A: 满 channel — dispatch_or_log 返回 Backpressured 且 backpressured 计数至少 +1.
+    ///
+    /// 由于 backpressured 计数器全局共享，断言 `after > before`（至少 +1）
+    /// 而非精确 +1，避免并行测试干扰；核心契约：本次 dispatch 真触发了 inc.
+    #[tokio::test]
+    async fn s2_5_p1_a_dispatch_or_log_full_warns_and_counts() {
+        use crate::observability::chat_metrics;
+        let (tx, _rx) = mpsc::channel::<Action>(1);
+        let dispatcher = ChatDispatcher { action_tx: tx };
+        // 填满 1 容量.
+        let _ = dispatcher.try_dispatch(Action::CancelRequested);
+
+        let before = chat_metrics::get_dispatch_drops_count("backpressured");
+        let result = dispatcher.dispatch_or_log(Action::CancelRequested, "test.full");
+        assert!(
+            matches!(result, DispatchResult::Backpressured),
+            "channel full → Backpressured (got {result:?})"
+        );
+        let after = chat_metrics::get_dispatch_drops_count("backpressured");
+        assert!(
+            after > before,
+            "backpressured counter should >= before+1 on full dispatch (before={before}, after={after})"
+        );
+    }
+
+    /// S2.5 P1-A: 关闭 channel — dispatch_or_log 返回 ChannelClosed 且 closed 计数至少 +1.
+    #[tokio::test]
+    async fn s2_5_p1_a_dispatch_or_log_closed_warns() {
+        use crate::observability::chat_metrics;
+        let (dispatcher, rx) = ChatDispatcher::new();
+        drop(rx);
+
+        let before = chat_metrics::get_dispatch_drops_count("closed");
+        let result = dispatcher.dispatch_or_log(Action::CancelRequested, "test.closed");
+        assert!(
+            matches!(result, DispatchResult::ChannelClosed),
+            "channel closed → ChannelClosed (got {result:?})"
+        );
+        let after = chat_metrics::get_dispatch_drops_count("closed");
+        assert!(
+            after > before,
+            "closed counter should >= before+1 on channel-closed dispatch (before={before}, after={after})"
         );
     }
 
