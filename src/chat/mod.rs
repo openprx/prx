@@ -2273,9 +2273,22 @@ pub async fn run(
         Err(e) => tracing::warn!(error = %e, "redux dispatcher join failed"),
     }
 
-    // Final session save before exit
-    if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
-        tracing::warn!("Failed to persist session on exit: {e}");
+    // T3-3-fixA P0-2: 退出 save_session Pure 守卫.
+    //
+    // Pure 模式下 chat_session.add_*_turn 被 line 2185 守卫跳过，chat_session.turns
+    // 滞后于 reducer 维护的 SessionState。无条件退出 save 会用旧快照覆盖 reducer
+    // 已落盘的最新 snapshot。守卫表达式与 line 2185 同形结构保持一致.
+    #[cfg(feature = "terminal-tui")]
+    let legacy_exit_save_enabled = !ReduxMode::from_env().is_pure();
+    #[cfg(not(feature = "terminal-tui"))]
+    let legacy_exit_save_enabled = true;
+    if legacy_exit_save_enabled {
+        // Final session save before exit
+        if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
+            tracing::warn!("Failed to persist session on exit: {e}");
+        }
+    } else {
+        tracing::debug!("T3-3-fixA P0-2 Pure mode: skip legacy exit save_session (reducer owns persistence)");
     }
 
     info!("Chat session ended");
@@ -3370,6 +3383,36 @@ mod redux_mode_tests {
                     "Pure mode must always route to ReduxDriver (opt_in={opt_in} tools_empty={tools_empty})"
                 );
             }
+        }
+    }
+
+    /// T3-3-fixA P0-2: Pure 模式跳过 legacy exit save_session 的真值表.
+    ///
+    /// 退出守卫表达式 `!ReduxMode::from_env().is_pure()`：
+    /// - Off / Both / Redux → 守卫为 true，legacy save 兜底
+    /// - Pure → 守卫为 false，跳过 legacy save，reducer 是唯一持久化源
+    ///
+    /// 这是 fixA P0-2 修复的逻辑契约——直接断言 is_pure() 真值表，避免依赖 env state.
+    #[test]
+    fn pure_mode_skips_legacy_exit_save_via_redux_mode_guard() {
+        // Pure 是唯一应跳过 legacy exit save 的模式
+        assert!(ReduxMode::Pure.is_pure(), "Pure.is_pure() 必须 true");
+        assert!(!ReduxMode::Off.is_pure(), "Off.is_pure() 必须 false");
+        assert!(!ReduxMode::Both.is_pure(), "Both.is_pure() 必须 false");
+        assert!(!ReduxMode::Redux.is_pure(), "Redux.is_pure() 必须 false");
+
+        // 守卫表达式 `legacy_exit_save_enabled = !mode.is_pure()` 真值
+        for (mode, expected_legacy_enabled) in [
+            (ReduxMode::Off, true),
+            (ReduxMode::Both, true),
+            (ReduxMode::Redux, true),
+            (ReduxMode::Pure, false),
+        ] {
+            let legacy_exit_save_enabled = !mode.is_pure();
+            assert_eq!(
+                legacy_exit_save_enabled, expected_legacy_enabled,
+                "mode {mode:?}: legacy_exit_save_enabled 应为 {expected_legacy_enabled}"
+            );
         }
     }
 }
