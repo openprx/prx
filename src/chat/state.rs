@@ -3096,6 +3096,11 @@ mod tests {
                 assert_eq!(assistant.role, "assistant");
                 assert_eq!(assistant.content, "answer");
                 assert_eq!(snapshot.title, "question", "auto-title 应来自首条 user turn");
+                // T3-3-fixA P0-1: 显式断言 snapshot.turns 末条是当轮 assistant —
+                // 固化 dispatch 顺序 (RecordAssistantTurn → StreamCompleted) 不变量
+                let last = snapshot.turns.last().expect("test: snapshot.turns 必须含末条");
+                assert_eq!(last.role, "assistant", "snapshot.turns.last() 必须是 assistant");
+                assert_eq!(last.content, "answer", "末条 content 必须是当轮 assistant 内容");
             }
 
             // Effect 顺序契约：NotifyHook 在前，SaveSession 中段，RequestRedraw 收尾
@@ -3139,6 +3144,70 @@ mod tests {
                 reasoning: String::new(),
             });
             assert!(second.is_empty(), "重复 StreamCompleted 应是 no-op");
+        }
+
+        /// T3-3-fixA P0-1: 双向回归防护 — dispatch 顺序决定 snapshot 完整性.
+        ///
+        /// 正序 (RecordAssistantTurn → StreamCompleted)：snapshot.turns 含 assistant 末条.
+        /// 反序 (StreamCompleted → RecordAssistantTurn)：snapshot.turns **不含** assistant,
+        /// 因 SaveSession 快照在 reducer reduce_stream_completed 时同步构造,
+        /// 此时 RecordAssistantTurn 尚未 push 当轮 assistant 到 session.turns.
+        ///
+        /// 任何未来回退 chat::run 主循环 dispatch 顺序的修改都会让本测试翻车,
+        /// 把 P0-1 决策固化到 reducer 层契约里.
+        #[test]
+        fn test_t3_3_fix_a_dispatch_order_snapshot_contract() {
+            // ── 正序：RecordAssistantTurn → StreamCompleted ──
+            let mut state_a = s();
+            state_a.session.id = "sess-fwd".to_string();
+            let _ = state_a.reduce(Action::RecordUserTurn("q".to_string()));
+            let _ = state_a.reduce(Action::TurnStarted {
+                draft_id: "d-fwd".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state_a.reduce(Action::RecordAssistantTurn("a-fwd".to_string()));
+            let fwd_effects = state_a.reduce(Action::StreamCompleted {
+                draft_id: "d-fwd".to_string(),
+                final_text: "a-fwd".to_string(),
+                reasoning: String::new(),
+            });
+            let fwd_snap = fwd_effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::SaveSession(s) => Some(s),
+                    _ => None,
+                })
+                .expect("正序：SaveSession 必发");
+            let last = fwd_snap.turns.last().expect("正序：snapshot.turns 必非空");
+            assert_eq!(last.role, "assistant", "正序：末条 role 必须是 assistant");
+            assert_eq!(last.content, "a-fwd", "正序：末条 content 必须是当轮 assistant");
+
+            // ── 反序：StreamCompleted → RecordAssistantTurn ──
+            let mut state_b = s();
+            state_b.session.id = "sess-rev".to_string();
+            let _ = state_b.reduce(Action::RecordUserTurn("q".to_string()));
+            let _ = state_b.reduce(Action::TurnStarted {
+                draft_id: "d-rev".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let rev_effects = state_b.reduce(Action::StreamCompleted {
+                draft_id: "d-rev".to_string(),
+                final_text: "a-rev".to_string(),
+                reasoning: String::new(),
+            });
+            let _ = state_b.reduce(Action::RecordAssistantTurn("a-rev".to_string()));
+            let rev_snap = rev_effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::SaveSession(s) => Some(s),
+                    _ => None,
+                })
+                .expect("反序：SaveSession 必发");
+            assert!(
+                !rev_snap.turns.iter().any(|t| t.role == "assistant"),
+                "反序：snapshot.turns 不应含 assistant — 这就是 P0-1 修复前的 bug 现场"
+            );
+            assert_eq!(rev_snap.turns.len(), 1, "反序：snapshot.turns 应只含先前的 user turn");
         }
 
         /// S2-A test 3: stream_failed_effect_sequence
