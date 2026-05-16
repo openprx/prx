@@ -2031,16 +2031,12 @@ pub async fn run(
         // context overflow / provider error) surface as `FailedWithError` and
         // map to `StreamFailed { err, retryable }` so the reducer emits the
         // `NotifyHook(Error) + LogTrace + RequestRedraw` effect chain.
+        //
+        // T3-3-fixA P0-1: Success 分支的 StreamCompleted 已下移到 RecordAssistantTurn
+        // 之后 dispatch，确保 reducer 构造 SaveSession 快照时 session.turns 已含当轮
+        // assistant。Cancelled / FailedWithError 不写 assistant turn，dispatch 位置不变。
         match &turn_outcome {
-            TurnOutcome::Success(resp) => {
-                if let Some(ref d_id) = draft_id {
-                    let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::StreamCompleted {
-                        draft_id: d_id.clone(),
-                        final_text: resp.clone(),
-                        reasoning: String::new(),
-                    });
-                }
-            }
+            TurnOutcome::Success(_) => {}
             TurnOutcome::Cancelled => {
                 if let Some(ref d_id) = draft_id {
                     let _ = chat_dispatcher
@@ -2114,6 +2110,19 @@ pub async fn run(
         let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordAssistantTurn(
             history_response.clone(),
         ));
+
+        // T3-3-fixA P0-1: StreamCompleted 必须在 RecordAssistantTurn 之后 dispatch，
+        // reducer 的 reduce_stream_completed 会 emit Effect::SaveSession(snapshot)，
+        // 此时 session.turns 已含当轮 assistant —— 否则 SaveSession 落盘旧快照。
+        // final_text 用 response (UI 展示文案)，与上方 history_response (含 tool_summary
+        // 前缀供 history 写入) 语义不同：reducer 的 conversation_lines 与 UI 对齐.
+        if let Some(ref d_id) = draft_id {
+            let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::StreamCompleted {
+                draft_id: d_id.clone(),
+                final_text: response.clone(),
+                reasoning: String::new(),
+            });
+        }
 
         // ── Extract and display media markers (images, documents, etc.) ──
         let (clean_response, media_items) = extract_outgoing_media(&response);
