@@ -73,10 +73,13 @@ impl StreamBoundaryBuffer {
 
     /// Append a raw delta from the LLM and return any chunk(s) that are now
     /// safe to forward downstream. Returns `None` when nothing is safe yet.
+    #[tracing::instrument(level = "trace", skip_all, fields(delta_len = delta.len()))]
     pub(crate) fn push(&mut self, delta: &str) -> Option<String> {
         if delta.is_empty() {
             return None;
         }
+        // S2.5 T2.5-2: chunk 计数指标（每个 non-empty delta 计 1）.
+        crate::observability::chat_metrics::inc_stream_chunk();
         self.buf.push_str(delta);
         self.advance_scan();
         self.take_flushable()

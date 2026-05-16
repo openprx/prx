@@ -133,6 +133,29 @@ pub enum Effect {
     Quit,
 }
 
+impl Effect {
+    /// S2.5 T2.5-2: 取 Effect 变体名作为 `'static str` 用于 Prometheus label.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::StartTurn { .. } => "StartTurn",
+            Self::SaveSession(_) => "SaveSession",
+            Self::SendDraftFinalize { .. } => "SendDraftFinalize",
+            Self::CancelDraft(_) => "CancelDraft",
+            Self::CancelToken(_) => "CancelToken",
+            Self::EmitChannelMessage(_) => "EmitChannelMessage",
+            Self::PersistToMemory { .. } => "PersistToMemory",
+            Self::NotifyHook { .. } => "NotifyHook",
+            Self::RequestRedraw => "RequestRedraw",
+            Self::DisplayMedia { .. } => "DisplayMedia",
+            Self::AutoTitleSession(_) => "AutoTitleSession",
+            Self::LogTrace { .. } => "LogTrace",
+            Self::RequestApproval { .. } => "RequestApproval",
+            Self::Quit => "Quit",
+        }
+    }
+}
+
 // ─── Sub-states ───────────────────────────────────────────────────────────────
 
 /// 会话持久化相关状态（写入 memory backend）.
@@ -284,6 +307,8 @@ impl ChatState {
 
     /// 与 [`Self::reduce`] 等价，但 `now_ms` 显式注入以便测试构造确定时间.
     pub fn reduce_with_now(&mut self, action: Action, now_ms: u64) -> Vec<Effect> {
+        // S2.5 T2.5-2: 入口埋点 prx_chat_actions_total{action_kind=...}.
+        crate::observability::chat_metrics::inc_action(action.kind());
         match action {
             // ── 输入路径 ──────────────────────────────────────────
             Action::KeyPressed(key) => self.reduce_key_pressed(key, now_ms),
