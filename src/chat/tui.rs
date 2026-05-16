@@ -1137,6 +1137,108 @@ impl crate::channels::terminal::TuiMirrorSink for TuiStateMirrorSink {
     }
 }
 
+// ── S4-A Commit 5: SnapshotDispatcherSink ───────────────────────────────────
+
+/// Pure 模式专用 Sink — UiActor 事件通过 `ChatDispatcher` 翻译为 Redux Action,
+/// 走 reducer 单一持久化路径; 不再写 `chat_mirror`.
+///
+/// 与 [`TuiStateMirrorSink`] 的关系: Pure 模式下两者互斥. Pure 模式的 LLM
+/// turn 主路径由 `drive_start_turn_stream` 直接 dispatch
+/// `Action::TurnStarted` / `Action::StreamChunkReceived` / `Action::StreamCompleted` /
+/// `Action::ToolStarted` / `Action::ToolFinished` 给 reducer; UiActor 收到的
+/// 等价 UiEvent 仅是 channel-layer 镜像广播，若再翻译为 Action 重 dispatch
+/// 会导致 reducer 双写 conversation_lines / draft. 因此本 Sink 主体为 **no-op**
+/// (含 trace) — 真正写 reducer 的源头是 driver，Sink 仅消极 ack UiActor 事件.
+///
+/// `push_system` 是唯一对 chat::run 主循环侧的 fallback 路径:
+/// `UiEvent::ToolProgress` / `UiEvent::DraftCancelled` 经 UiActor 翻译为
+/// "step N/M" / "(cancelled)" 系统提示, 本 Sink 把它转 dispatch
+/// `Action::SystemMessageAdded` 让 reducer 把消息推到 UI 账本.
+pub struct SnapshotDispatcherSink {
+    dispatcher: crate::chat::dispatcher::ChatDispatcher,
+}
+
+impl SnapshotDispatcherSink {
+    pub const fn new(dispatcher: crate::chat::dispatcher::ChatDispatcher) -> Self {
+        Self { dispatcher }
+    }
+}
+
+impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
+    fn push_assistant(&self, content: &str) {
+        // Pure 模式下 assistant 文本由 driver Action::StreamCompleted 经 reducer
+        // push 到 conversation_lines。UiActor 的 push_assistant 是 channel-layer
+        // 旁路镜像，重复 dispatch 会导致重复行。改为 trace 留观察痕迹。
+        tracing::trace!(
+            site = "snapshot_sink.push_assistant",
+            chars = content.chars().count(),
+            "Pure 模式忽略 UiActor 旁路 (reducer 单源)"
+        );
+    }
+    fn push_system(&self, content: &str) {
+        // 系统消息 (ToolProgress / DraftCancelled 等) 通过 reducer 单源写入 UI 账本.
+        let _ = self.dispatcher.dispatch_or_log(
+            crate::chat::action::Action::SystemMessageAdded {
+                text: content.to_string(),
+            },
+            "snapshot_sink.push_system",
+        );
+    }
+    fn push_tool_started(&self, tool_name: &str, args_full: &str) {
+        // driver 已 dispatch Action::ToolStarted；Pure 模式忽略 UiActor 旁路.
+        tracing::trace!(
+            site = "snapshot_sink.push_tool_started",
+            tool = tool_name,
+            args_len = args_full.chars().count(),
+            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch ToolStarted)"
+        );
+    }
+    fn mark_tool_finished(&self, tool_name: &str, success: bool, duration_ms: u64) -> bool {
+        // driver 已 dispatch Action::ToolFinished. 返回 false 让 UiActor 知道
+        // 本 sink 未"独立"更新任何卡片 — 实际更新在 reducer 内由 driver dispatch
+        // 的 Action 触发. UiActor 不再依赖此返回值做 fallback (real path).
+        tracing::trace!(
+            site = "snapshot_sink.mark_tool_finished",
+            tool = tool_name,
+            success,
+            duration_ms,
+            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch ToolFinished)"
+        );
+        false
+    }
+    fn start_stream(&self, draft_id: &str) {
+        tracing::trace!(
+            site = "snapshot_sink.start_stream",
+            draft_id,
+            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch TurnStarted)"
+        );
+    }
+    fn update_stream(&self, draft_id: &str, accumulated: &str, version: u64) {
+        tracing::trace!(
+            site = "snapshot_sink.update_stream",
+            draft_id,
+            version,
+            chars = accumulated.chars().count(),
+            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch StreamChunkReceived)"
+        );
+    }
+    fn finalize_stream(&self, draft_id: &str, final_text: &str) {
+        tracing::trace!(
+            site = "snapshot_sink.finalize_stream",
+            draft_id,
+            chars = final_text.chars().count(),
+            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch StreamCompleted)"
+        );
+    }
+    fn cancel_stream(&self, draft_id: &str) {
+        tracing::trace!(
+            site = "snapshot_sink.cancel_stream",
+            draft_id,
+            "Pure 模式忽略 UiActor 旁路 (driver 已 dispatch StreamCancelled)"
+        );
+    }
+}
+
 /// Logical row count for a [`ConversationLine`], **before** soft-wrap.
 ///
 /// This is the floor used by [`estimate_message_height`]; the real
@@ -3766,6 +3868,117 @@ mod tests {
             assert!(
                 diff.is_empty(),
                 "render_message_for_insert 两次同输入应字节级一致, diff={diff:?}"
+            );
+        }
+    }
+
+    // ─── S4-A Commit 5: SnapshotDispatcherSink ────────────────────────────────
+
+    mod s4_a_5 {
+        use super::*;
+        use crate::channels::terminal::TuiMirrorSink;
+        use crate::chat::action::Action;
+        use crate::chat::dispatcher::ChatDispatcher;
+        use crate::chat::state::ChatState;
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        /// 每个 UiEvent 翻译方法都不 panic, push_system 真 dispatch SystemMessageAdded.
+        #[tokio::test]
+        async fn s4_a_5_snapshot_sink_each_event_maps_to_action() {
+            let (dispatcher, mut rx) = ChatDispatcher::new();
+            let sink = SnapshotDispatcherSink::new(dispatcher);
+
+            // 所有方法都不 panic — 大部分是 no-op trace.
+            sink.push_assistant("hi");
+            sink.push_tool_started("Bash", "{\"cmd\":\"ls\"}");
+            let _ = sink.mark_tool_finished("Bash", true, 123);
+            sink.start_stream("d-1");
+            sink.update_stream("d-1", "He", 1);
+            sink.finalize_stream("d-1", "Hello");
+            sink.cancel_stream("d-1");
+            // push_system 应 dispatch SystemMessageAdded — 验证 channel 收到.
+            sink.push_system("system note");
+
+            let action = rx.recv().await.expect("dispatcher should receive SystemMessageAdded");
+            match action {
+                Action::SystemMessageAdded { text } => assert_eq!(text, "system note"),
+                other => panic!("expected SystemMessageAdded, got {other:?}"),
+            }
+        }
+
+        /// dispatch_or_log 路径在 channel 满时不 panic (Backpressured fallback).
+        #[tokio::test]
+        async fn s4_a_5_sink_handles_dispatcher_full_gracefully() {
+            let (dispatcher, _rx) = ChatDispatcher::new();
+            let sink = SnapshotDispatcherSink::new(dispatcher);
+            // 反复 push_system, channel cap 限制 (ACTION_CHANNEL_CAPACITY) 满后
+            // dispatch_or_log 走 backpressured 路径, 不 panic.
+            for i in 0..2000 {
+                sink.push_system(&format!("note {i}"));
+            }
+            // 通过即可 (不 panic / 不 hang).
+        }
+
+        /// Pure 模式下 Stream UiEvent 经由 driver Action 进 reducer, snapshot.streaming
+        /// 应 Some(...) — Sink 自身不写，但 driver 路径走 reducer.
+        ///
+        /// 此测试模拟 driver-style dispatch (TurnStarted → reducer 写 stream.draft),
+        /// 验证 snapshot.streaming.is_some() — 这是 Pure 模式的核心路径.
+        #[test]
+        fn s4_a_5_pure_streaming_propagates_to_snapshot() {
+            let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+            let token = CancellationToken::new();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-1".to_string(),
+                cancel: token,
+            });
+            let snap = state.build_ui_snapshot(1);
+            assert!(
+                snap.streaming.is_some(),
+                "Pure 模式下 TurnStarted 应让 snapshot.streaming = Some"
+            );
+            let draft = snap.streaming.as_ref().expect("checked above");
+            assert_eq!(draft.draft_id, "d-1");
+        }
+
+        /// Pure 模式下 ToolStarted Action 进 reducer, snapshot.conversation_lines 出现
+        /// ToolResult 卡片 (Running).
+        #[test]
+        fn s4_a_5_pure_tool_card_appears_in_snapshot() {
+            let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+            let _ = state.reduce(Action::ToolStarted {
+                name: "Bash".to_string(),
+                args: "{\"cmd\":\"ls\"}".to_string(),
+            });
+            let snap = state.build_ui_snapshot(1);
+            assert!(
+                snap.conversation_lines
+                    .iter()
+                    .any(|l| matches!(l, ConversationLine::ToolResult { tool_name, .. } if tool_name == "Bash")),
+                "Pure 模式下 ToolStarted 应让 snapshot 出现 Bash ToolResult 卡片"
+            );
+        }
+
+        /// Pure 模式下 banner 走 SystemMessageAdded Action -> reducer push 一行;
+        /// chat_mirror 同时（其他模式）也写 — 但在 Pure 下 chat_mirror 应零写入.
+        ///
+        /// 此测试单元化验证 reducer 路径正确性: SystemMessageAdded → snapshot
+        /// 含 ConversationLine::System.
+        #[test]
+        fn s4_a_5_pure_banner_via_dispatch_not_mirror() {
+            let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+            let _ = state.reduce(Action::SystemMessageAdded {
+                text: "prx 0.3.6 mock/mock".to_string(),
+            });
+            let snap = state.build_ui_snapshot(1);
+            let has_banner = snap
+                .conversation_lines
+                .iter()
+                .any(|l| matches!(l, ConversationLine::System { content } if content.contains("mock/mock")));
+            assert!(
+                has_banner,
+                "Pure 模式 banner 应通过 SystemMessageAdded 进 reducer, snapshot 含 System 行"
             );
         }
     }
