@@ -891,3 +891,108 @@ fn test_chat_redux_pure_double_ctrl_c_exits_cleanly() {
         "Pure 模式下双 Ctrl+C 应在 {exit_deadline:?} 内退出"
     );
 }
+
+// ─── S4-A Commit 0: ratatui 真路径最小 E2E ────────────────────────────────────
+//
+// 现有 14 个 PTY 测试都把 `PRX_TUI=0` 注入子进程，落在 reedline + BufRead
+// fallback；ratatui 真路径（`run_tui_unified_loop`）零回归保护。S4-A 切换
+// 渲染源前必须先有真路径回归保护，故新增 3 个测试覆盖：
+//   - banner 渲染（启动可见）
+//   - mock response 流式渲染
+//   - double Ctrl+C 退出
+//
+// 通过 `extra_env` 注入 `PRX_TUI=1` 覆盖默认 `PRX_TUI=0`，让 chat::run
+// 走 `TerminalGuard::enter()` + `spawn_tui_unified_loop`。ratatui 用
+// `Viewport::Inline` 不进 alt-screen，bytes 仍走主缓冲可被 PTY scraper
+// 抓到。banner 通过 `chat_mirror.lock().push_system_message(&banner)` +
+// 后续 `terminal.insert_before` 写到 stdout（mod.rs:1084 + 2590）.
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_s4_a_0_ratatui_banner_visible_via_real_path() {
+    // PRX_TUI=1 强制走 ratatui 真路径。banner 通过 insert_before 写入主屏
+    // scrollback，PTY scraper 能拿到 "mock/mock" 字串。
+    let (mut sg, _guard) = spawn_chat(&[], &[("PRX_TUI", "1")]);
+    let session = sg.session();
+
+    let captured = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    assert!(captured.contains("prx "), "banner 应以 `prx ` 起头, got:\n{captured}");
+    assert!(
+        captured.contains("mock/mock"),
+        "banner 应包含 `mock/mock`, got:\n{captured}"
+    );
+
+    // 双 Ctrl+C 退出（/exit 在 ratatui 路径下也工作，但发送 \r 后 ratatui
+    // raw mode 的 line discipline 与 reedline 不同，用 SIGINT*2 更稳）.
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("first SIGINT");
+    std::thread::sleep(Duration::from_millis(100));
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("second SIGINT");
+    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_s4_a_0_ratatui_mock_response_via_real_path() {
+    // ratatui 真路径下，用户输入 → mock provider 流式回 sentinel → ratatui
+    // 把 ConversationLine::Assistant insert_before 到主屏。PTY scraper
+    // 应能在主屏看到 sentinel。
+    let sentinel = "[S4A0-RATATUI-MOCK]";
+    let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel), ("PRX_TUI", "1")]);
+    let session = sg.session();
+
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(300));
+
+    // ratatui raw mode 下 Enter 仍是 \r（crossterm KeyCode::Enter）.
+    session.send("hi\r").expect("send hi");
+    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        captured.contains(sentinel),
+        "ratatui 真路径下 mock 回复应渲染. captured:\n{captured}"
+    );
+
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("first SIGINT");
+    std::thread::sleep(Duration::from_millis(100));
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("second SIGINT");
+    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_s4_a_0_ratatui_double_ctrl_c_exit_via_real_path() {
+    // ratatui 真路径下双 Ctrl+C 退出语义 — `run_tui_unified_loop` 内
+    // `KeyDispatch::InterruptTurn` 分支 + shutdown.cancel() 路径.
+    let (mut sg, _guard) = spawn_chat(&[], &[("PRX_TUI", "1")]);
+    let session = sg.session();
+
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("first SIGINT");
+    std::thread::sleep(Duration::from_millis(100));
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("second SIGINT");
+
+    let exit_deadline = Duration::from_secs(6);
+    assert!(
+        wait_for_exit(session, exit_deadline),
+        "ratatui 真路径下双 Ctrl+C 应在 {exit_deadline:?} 内退出"
+    );
+}
