@@ -619,38 +619,38 @@ impl EffectExecutor {
                 });
             }
             Effect::SaveSession(session) => {
-                // 双写抑制：spawn 子任务内创建 RAII scope，任务退出时自动复位.
-                let guard_scope = deps.dual_write_guard.enter_scope();
+                // T3-3-fixB D1：inline await 替代 tokio::spawn，让主循环
+                // executor.execute(effect).await 的串行性贯穿到底，关闭
+                // SaveSession 还在写盘时 RequestRedraw 已刷屏的不一致窗口.
+                // RAII scope 与 inline await 同生命周期，await 完成后 _scope drop
+                // 释放 guard，旧路径才能再次单写（多个 effect 串行不互相覆盖）.
+                let _scope = deps.dual_write_guard.enter_scope();
                 let memory = Arc::clone(&deps.memory);
                 let action_tx = deps.action_tx.clone();
                 let session_id = session.id.clone();
-                tokio::spawn(async move {
-                    // scope 在子任务内持有，子任务退出（含 panic）时自动清除 guard.
-                    let _scope = guard_scope;
-                    let json = match session.to_json() {
-                        Ok(j) => j,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "SaveSession effect: serialize failed");
-                            return;
-                        }
-                    };
-                    match memory
-                        .store(
-                            &session.memory_key(),
-                            &json,
-                            crate::memory::MemoryCategory::Conversation,
-                            Some(&session.id),
-                        )
-                        .await
-                    {
-                        Ok(()) => {
-                            let _ = action_tx.try_send(Action::SessionSaved { id: session_id });
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "SaveSession effect: store failed");
-                        }
+                let json = match session.to_json() {
+                    Ok(j) => j,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "SaveSession effect: serialize failed");
+                        return;
                     }
-                });
+                };
+                match memory
+                    .store(
+                        &session.memory_key(),
+                        &json,
+                        crate::memory::MemoryCategory::Conversation,
+                        Some(&session.id),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = action_tx.try_send(Action::SessionSaved { id: session_id });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "SaveSession effect: store failed");
+                    }
+                }
             }
             Effect::SendDraftFinalize { draft_id, text } => {
                 // 双写抑制 RAII scope：子任务退出时自动复位.
@@ -2876,6 +2876,117 @@ mod real_mode_tests {
         assert_eq!(last.role, "assistant", "snapshot 末条必须是当轮 assistant");
         // 防双写：reducer RecordAssistantTurn 单次 + chat::run 1829 重复 dispatch 已删除.
         assert_eq!(snap.turns.len(), 2, "turns.len() 必须严格 2（user+assistant，零双写）");
+    }
+
+    /// T3-3-fixB D1: SaveSession 完成（写盘 end）必须严格早于 RequestRedraw（刷屏）.
+    ///
+    /// 原 spawn 版本下 SaveSession 子任务与 RequestRedraw 时序不可保证；inline await
+    /// 修复后主循环 executor.execute(effect).await 串行性贯穿到底.
+    ///
+    /// 验证方式：SlowMemory.store sleep 20ms 后 push "save_end"，
+    /// MockRedrawRx try_send 时 push "redraw"，断言 log "save_end" idx < "redraw" idx.
+    /// 重复 N=5 次消除偶然性（spawn 版本下偶尔会"恰好顺序对"，多轮可拉出 race）.
+    #[tokio::test]
+    async fn t3_3_fix_b_effect_save_then_redraw_strict_order() {
+        use crate::memory::MemoryEntry;
+        use parking_lot::Mutex;
+
+        struct SlowMemory {
+            log: Arc<Mutex<Vec<&'static str>>>,
+        }
+        #[async_trait::async_trait]
+        impl Memory for SlowMemory {
+            fn name(&self) -> &str {
+                "slow"
+            }
+            async fn store(&self, _k: &str, _c: &str, _cat: MemoryCategory, _s: Option<&str>) -> anyhow::Result<()> {
+                self.log.lock().push("save_start");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                self.log.lock().push("save_end");
+                Ok(())
+            }
+            async fn recall(&self, _q: &str, _l: usize, _s: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(Vec::new())
+            }
+            async fn get(&self, _k: &str) -> anyhow::Result<Option<MemoryEntry>> {
+                Ok(None)
+            }
+            async fn list(&self, _c: Option<&MemoryCategory>, _s: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(Vec::new())
+            }
+            async fn forget(&self, _k: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn count(&self) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        for trial in 0..5 {
+            let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+            let memory: Arc<dyn Memory> = Arc::new(SlowMemory { log: Arc::clone(&log) });
+            let shutdown = CancellationToken::new();
+
+            // 单独构造 deps：用 SlowMemory + 自定义 redraw_tx 拦截 try_send 顺序.
+            let provider: Arc<dyn Provider> = Arc::new(MockEnvProvider::from_env());
+            let channel: Arc<dyn crate::channels::Channel> = Arc::new(TerminalChannel::new(true));
+            let (hooks, _temp) = build_hook_manager();
+            let observer: Arc<dyn crate::observability::Observer> = Arc::new(NoopObserver);
+            let (action_tx, _action_rx) = mpsc::channel::<Action>(64);
+            let (redraw_tx, mut redraw_rx) = mpsc::channel::<()>(4);
+
+            // 监听 redraw_rx 在独立 task 内 push "redraw" 到 log.
+            let log_for_redraw = Arc::clone(&log);
+            let redraw_listener = tokio::spawn(async move {
+                if redraw_rx.recv().await.is_some() {
+                    log_for_redraw.lock().push("redraw");
+                }
+            });
+
+            let deps = EffectDeps {
+                provider,
+                memory,
+                channel,
+                hooks,
+                observer,
+                action_tx,
+                dual_write_guard: RuntimeDualWriteGuard::new(),
+                redraw_tx: Some(redraw_tx),
+                shutdown: shutdown.clone(),
+                model: Arc::from("test-model"),
+                temperature: 0.0,
+                tools_registry: None,
+                max_tool_iterations: 0,
+                approval_router: Arc::new(ApprovalRouter::new()),
+                approval_manager: None,
+            };
+            let executor = EffectExecutor::new_with_deps(deps);
+
+            let session = ChatSession::new("prov", "model");
+            // 主循环串行：SaveSession → RequestRedraw（reducer 实际顺序）.
+            executor.execute(Effect::SaveSession(session)).await;
+            executor.execute(Effect::RequestRedraw).await;
+
+            // 等 redraw_listener 完成（接 redraw 后退出）.
+            let _ = tokio::time::timeout(Duration::from_millis(500), redraw_listener).await;
+
+            let snap = log.lock().clone();
+            let save_end_idx = snap
+                .iter()
+                .position(|&s| s == "save_end")
+                .unwrap_or_else(|| panic!("[trial {trial}] save_end 未出现：log={snap:?}"));
+            let redraw_idx = snap
+                .iter()
+                .position(|&s| s == "redraw")
+                .unwrap_or_else(|| panic!("[trial {trial}] redraw 未出现：log={snap:?}"));
+            assert!(
+                save_end_idx < redraw_idx,
+                "[trial {trial}] D1 顺序契约：save_end ({save_end_idx}) 必须早于 redraw ({redraw_idx})；log={snap:?}"
+            );
+        }
     }
 
     #[tokio::test]
