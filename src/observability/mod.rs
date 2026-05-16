@@ -1,3 +1,4 @@
+pub mod chat_metrics;
 pub mod log;
 pub mod multi;
 pub mod noop;

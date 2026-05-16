@@ -198,3 +198,50 @@ pub enum Action {
     /// 兜底强制退出
     ForceQuit,
 }
+
+impl Action {
+    /// S2.5 T2.5-2: 取 Action 变体名作为 `'static str` 用于 Prometheus label.
+    ///
+    /// 与 reduce 大 match 对齐，所有变体单字符串，无分配。
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::KeyPressed(_) => "KeyPressed",
+            Self::PasteReceived(_) => "PasteReceived",
+            Self::TerminalResized { .. } => "TerminalResized",
+            Self::InputSubmitted(_) => "InputSubmitted",
+            Self::HistoryNavigated(_) => "HistoryNavigated",
+            Self::InputCancelled => "InputCancelled",
+            Self::SlashCommandIssued { .. } => "SlashCommandIssued",
+            Self::ModeChanged(_) => "ModeChanged",
+            Self::HistoryCleared => "HistoryCleared",
+            Self::TurnStarted { .. } => "TurnStarted",
+            Self::StartLLMTurn { .. } => "StartLLMTurn",
+            Self::StreamChunkReceived { .. } => "StreamChunkReceived",
+            Self::StreamCompleted { .. } => "StreamCompleted",
+            Self::StreamFailed { .. } => "StreamFailed",
+            Self::StreamCancelled { .. } => "StreamCancelled",
+            Self::ToolStarted { .. } => "ToolStarted",
+            Self::ToolFinished { .. } => "ToolFinished",
+            Self::ToolProgress { .. } => "ToolProgress",
+            Self::ToolApprovalRequested { .. } => "ToolApprovalRequested",
+            Self::ToolApprovalReceived { .. } => "ToolApprovalReceived",
+            Self::StreamRetryAttempt { .. } => "StreamRetryAttempt",
+            Self::SessionLoaded(_) => "SessionLoaded",
+            Self::SessionSaved { .. } => "SessionSaved",
+            Self::SessionSwitched { .. } => "SessionSwitched",
+            Self::RecordUserTurn(_) => "RecordUserTurn",
+            Self::RecordAssistantTurn(_) => "RecordAssistantTurn",
+            Self::RecordSystemMessage { .. } => "RecordSystemMessage",
+            Self::SetLeadingSystemPrompt { .. } => "SetLeadingSystemPrompt",
+            Self::HistoryCompacted { .. } => "HistoryCompacted",
+            Self::ToolCardFoldToggled => "ToolCardFoldToggled",
+            Self::ReasoningFoldToggled => "ReasoningFoldToggled",
+            Self::RedrawRequested => "RedrawRequested",
+            Self::SystemMessageAdded { .. } => "SystemMessageAdded",
+            Self::CancelRequested => "CancelRequested",
+            Self::ShutdownRequested => "ShutdownRequested",
+            Self::ForceQuit => "ForceQuit",
+        }
+    }
+}
