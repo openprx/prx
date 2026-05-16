@@ -1255,6 +1255,77 @@ fn build_args_preview(raw: &str, max_chars: usize, ellipsis: &str) -> String {
     format!("{truncated}{ellipsis}")
 }
 
+/// 渲染源抽象：让 `render_bottom_chrome` / `bottom_chrome_height` 同时支持
+/// `TuiState`（chat_mirror 路径）与 `UiSnapshot`（S4-A Pure 模式 watch 路径）.
+///
+/// S4-A Commit 2: 把渲染需要的最小字段集抽出来作为 trait，泛型化所有
+/// `&TuiState` 参数为 `&V: BottomChromeView`。本 commit 暂未切换渲染源，
+/// 仅泛型化函数签名 + 两个 impl，行为不变。
+pub trait BottomChromeView {
+    fn provider(&self) -> &str;
+    fn model(&self) -> &str;
+    fn session_title(&self) -> &str;
+    fn turn_count(&self) -> usize;
+    fn ascii_fallback(&self) -> bool;
+    fn conversation_lines(&self) -> &[ConversationLine];
+    fn streaming(&self) -> Option<&StreamingDraft>;
+    fn input(&self) -> &TuiInput;
+}
+
+impl BottomChromeView for TuiState {
+    fn provider(&self) -> &str {
+        &self.provider
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+    fn session_title(&self) -> &str {
+        &self.session_title
+    }
+    fn turn_count(&self) -> usize {
+        self.turn_count
+    }
+    fn ascii_fallback(&self) -> bool {
+        self.ascii_fallback
+    }
+    fn conversation_lines(&self) -> &[ConversationLine] {
+        &self.conversation_lines
+    }
+    fn streaming(&self) -> Option<&StreamingDraft> {
+        self.streaming.as_ref()
+    }
+    fn input(&self) -> &TuiInput {
+        &self.input
+    }
+}
+
+impl BottomChromeView for crate::chat::state::UiSnapshot {
+    fn provider(&self) -> &str {
+        &self.provider
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+    fn session_title(&self) -> &str {
+        &self.session_title
+    }
+    fn turn_count(&self) -> usize {
+        self.turn_count
+    }
+    fn ascii_fallback(&self) -> bool {
+        self.ascii_fallback
+    }
+    fn conversation_lines(&self) -> &[ConversationLine] {
+        &self.conversation_lines
+    }
+    fn streaming(&self) -> Option<&StreamingDraft> {
+        self.streaming.as_ref()
+    }
+    fn input(&self) -> &TuiInput {
+        &self.input
+    }
+}
+
 /// Minimum height (rows) of the inline viewport. Reserves space for
 /// 1 status line + 1 input row + 1 footer. The unified loop bumps this
 /// up dynamically to accommodate multi-line input and streaming buffers.
@@ -1281,10 +1352,12 @@ pub const STREAMING_VISIBLE_ROWS: u16 = 6;
 /// + 1 footer row
 ///
 /// Clamped to [`BOTTOM_CHROME_MIN_HEIGHT`]..=[`BOTTOM_CHROME_MAX_HEIGHT`].
-pub fn bottom_chrome_height(state: &TuiState) -> u16 {
-    let visible_input_rows = state.input.lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
+///
+/// S4-A Commit 2: 泛型化让 UiSnapshot 与 TuiState 共用同一份高度计算逻辑。
+pub fn bottom_chrome_height<V: BottomChromeView>(state: &V) -> u16 {
+    let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let streaming_rows = if state.streaming.is_some() {
+    let streaming_rows = if state.streaming().is_some() {
         STREAMING_VISIBLE_ROWS
     } else {
         0
@@ -1307,7 +1380,7 @@ pub fn bottom_chrome_height(state: &TuiState) -> u16 {
 ///   2. Streaming preview (optional, up to [`STREAMING_VISIBLE_ROWS`])
 ///   3. Input box (dynamic, border + 1..=[`INPUT_MAX_VISIBLE_ROWS`])
 ///   4. Footer (1 row)
-pub fn render_bottom_chrome(frame: &mut Frame, state: &TuiState) {
+pub fn render_bottom_chrome<V: BottomChromeView>(frame: &mut Frame, state: &V) {
     // The inline viewport reserves `BOTTOM_CHROME_MAX_HEIGHT` rows at the
     // bottom of the host terminal. The dynamic chrome height is usually
     // smaller, so align it to the bottom of the reserved frame so the
@@ -1321,9 +1394,9 @@ pub fn render_bottom_chrome(frame: &mut Frame, state: &TuiState) {
         ..frame_area
     };
 
-    let visible_input_rows = state.input.lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
+    let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let streaming_rows = if state.streaming.is_some() {
+    let streaming_rows = if state.streaming().is_some() {
         STREAMING_VISIBLE_ROWS
     } else {
         0
@@ -1351,16 +1424,20 @@ pub fn render_bottom_chrome(frame: &mut Frame, state: &TuiState) {
     }
 }
 
-fn render_status_bar(frame: &mut Frame, area: Rect, state: &TuiState) {
-    let title = if state.session_title.is_empty() {
-        "(new session)".to_string()
+fn render_status_bar<V: BottomChromeView>(frame: &mut Frame, area: Rect, state: &V) {
+    let title_str = state.session_title();
+    let title = if title_str.is_empty() {
+        "(new session)"
     } else {
-        state.session_title.clone()
+        title_str
     };
 
     let status_text = format!(
         " PRX Chat | {}/{} | {} | {} turns ",
-        state.provider, state.model, title, state.turn_count
+        state.provider(),
+        state.model(),
+        title,
+        state.turn_count()
     );
 
     let status = Paragraph::new(status_text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
@@ -1370,15 +1447,15 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &TuiState) {
 /// Render the in-flight streaming-assistant draft inside the inline
 /// viewport. Trimmed to the last [`STREAMING_VISIBLE_ROWS`] rows so the
 /// most recently arrived tokens stay visible.
-fn render_streaming_preview(frame: &mut Frame, area: Rect, state: &TuiState) {
-    let Some(draft) = state.streaming.as_ref() else {
+fn render_streaming_preview<V: BottomChromeView>(frame: &mut Frame, area: Rect, state: &V) {
+    let Some(draft) = state.streaming() else {
         return;
     };
     let transient = ConversationLine::StreamingAssistant {
         content: draft.accumulated.clone(),
     };
     let mut sink: Vec<Line<'_>> = Vec::new();
-    render_conversation_line(&mut sink, &transient, state.ascii_fallback);
+    render_conversation_line(&mut sink, &transient, state.ascii_fallback());
 
     // If the streaming body wraps beyond `area.height`, scroll the
     // Paragraph so the trailing rows (newest tokens) are visible.
@@ -1698,10 +1775,10 @@ const fn tool_bullet_color(status: ToolStatus) -> Color {
     }
 }
 
-fn render_input(frame: &mut Frame, area: Rect, state: &TuiState) {
+fn render_input<V: BottomChromeView>(frame: &mut Frame, area: Rect, state: &V) {
     // Compose prompt lines: first row gets "> ", continuation rows get "  ".
-    let rendered_lines: Vec<Line<'_>> = state
-        .input
+    let input_ref = state.input();
+    let rendered_lines: Vec<Line<'_>> = input_ref
         .lines
         .iter()
         .enumerate()
@@ -1730,10 +1807,10 @@ fn render_input(frame: &mut Frame, area: Rect, state: &TuiState) {
     // Place the terminal cursor at the visual cursor location inside the box.
     // Borders::TOP consumes the first row of `area`, so the body starts at
     // `area.y + 1` and the prompt prefix takes the first 2 columns.
-    let (cursor_line, cursor_offset) = state.input.cursor;
+    let (cursor_line, cursor_offset) = input_ref.cursor;
     let max_visible_rows = area.height.saturating_sub(1) as usize;
-    if cursor_line < state.input.lines.len() && cursor_line < max_visible_rows {
-        let row_text = state.input.lines.get(cursor_line).map(String::as_str).unwrap_or("");
+    if cursor_line < input_ref.lines.len() && cursor_line < max_visible_rows {
+        let row_text = input_ref.lines.get(cursor_line).map(String::as_str).unwrap_or("");
         // Width-aware column: count *display* columns (not char count) up to
         // the byte offset. CJK and wide East-Asian glyphs occupy 2 columns,
         // so a `chars().count()` here would leave the cursor mid-glyph and
@@ -3534,5 +3611,162 @@ mod tests {
             !trimmed.contains("你 好"),
             "phantom spaces detected in user CJK diff: {trimmed:?}"
         );
+    }
+
+    // ─── S4-A Commit 2: BottomChromeView trait + UiSnapshot parity ────────────
+
+    mod s4_a_2 {
+        use super::*;
+        use crate::chat::state::ChatState;
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        fn make_state_with_lines() -> ChatState {
+            let mut s = ChatState::new(Arc::from("p-x"), Arc::from("m-x"), CancellationToken::new());
+            s.session.title = "demo session".to_string();
+            s.ui.turn_count = 3;
+            s.ui.conversation_lines.push(ConversationLine::User {
+                content: "first".to_string(),
+            });
+            s.ui.conversation_lines.push(ConversationLine::Assistant {
+                content: "second".to_string(),
+            });
+            s
+        }
+
+        /// Parity 检查：相同 ChatState 同时映射到 TuiState（mirror 兼容字段）+ UiSnapshot 后，
+        /// `bottom_chrome_height` 在两种 view 上返回相同值.
+        #[test]
+        fn s4_a_2_bottom_chrome_height_parity_tui_vs_snapshot() {
+            let state = make_state_with_lines();
+            let snap = state.build_ui_snapshot(1);
+
+            // 构造与 snap 字段对齐的 TuiState（mirror 兼容字段集）.
+            let mut tui = TuiState::new(&state.session.provider, &state.session.model);
+            tui.session_title = state.session.title.clone();
+            tui.turn_count = state.ui.turn_count;
+            tui.ascii_fallback = state.ui.ascii_fallback;
+            tui.conversation_lines = state.ui.conversation_lines.clone();
+            tui.streaming.clone_from(&state.stream.draft);
+            tui.input = state.ui.input.clone();
+
+            assert_eq!(
+                bottom_chrome_height(&tui),
+                bottom_chrome_height(&snap),
+                "TuiState vs UiSnapshot 在同 fixture 下高度应一致"
+            );
+        }
+
+        /// Parity 检查：streaming 状态下两种 view 的高度仍一致.
+        #[test]
+        fn s4_a_2_bottom_chrome_height_parity_streaming() {
+            let mut state = make_state_with_lines();
+            state.stream.draft = Some(StreamingDraft {
+                draft_id: "d-1".to_string(),
+                accumulated: "streaming…".to_string(),
+                version: 3,
+            });
+            let snap = state.build_ui_snapshot(2);
+
+            let mut tui = TuiState::new(&state.session.provider, &state.session.model);
+            tui.session_title = state.session.title.clone();
+            tui.turn_count = state.ui.turn_count;
+            tui.ascii_fallback = state.ui.ascii_fallback;
+            tui.conversation_lines = state.ui.conversation_lines.clone();
+            tui.streaming.clone_from(&state.stream.draft);
+            tui.input = state.ui.input.clone();
+
+            let h_tui = bottom_chrome_height(&tui);
+            let h_snap = bottom_chrome_height(&snap);
+            assert_eq!(h_tui, h_snap, "streaming 下高度应一致 (tui={h_tui}, snap={h_snap})");
+            // streaming 加 STREAMING_VISIBLE_ROWS — 高于纯文本.
+            assert!(h_tui > BOTTOM_CHROME_MIN_HEIGHT, "streaming 下高度应高于最小值");
+        }
+
+        /// Parity 检查：BottomChromeView 各 getter 在 TuiState 与 UiSnapshot 上返回相同字段.
+        #[test]
+        fn s4_a_2_view_getters_parity() {
+            let state = make_state_with_lines();
+            let snap = state.build_ui_snapshot(5);
+
+            let mut tui = TuiState::new(&state.session.provider, &state.session.model);
+            tui.session_title = state.session.title.clone();
+            tui.turn_count = state.ui.turn_count;
+            tui.ascii_fallback = state.ui.ascii_fallback;
+            tui.conversation_lines = state.ui.conversation_lines.clone();
+            tui.streaming.clone_from(&state.stream.draft);
+            tui.input = state.ui.input.clone();
+
+            assert_eq!(BottomChromeView::provider(&tui), BottomChromeView::provider(&snap));
+            assert_eq!(BottomChromeView::model(&tui), BottomChromeView::model(&snap));
+            assert_eq!(
+                BottomChromeView::session_title(&tui),
+                BottomChromeView::session_title(&snap)
+            );
+            assert_eq!(BottomChromeView::turn_count(&tui), BottomChromeView::turn_count(&snap));
+            assert_eq!(
+                BottomChromeView::conversation_lines(&tui).len(),
+                BottomChromeView::conversation_lines(&snap).len()
+            );
+            assert_eq!(
+                BottomChromeView::streaming(&tui).is_some(),
+                BottomChromeView::streaming(&snap).is_some()
+            );
+        }
+
+        /// Buffer-level parity: 把同一 view 在小 Buffer 上 render，断言两份 buffer 内容一致.
+        ///
+        /// 通过 `Buffer::diff` 比较；任何字节级偏差都会被捕获.
+        #[test]
+        fn s4_a_2_render_buffer_parity_tool_card() {
+            let mut state = make_state_with_lines();
+            state.ui.conversation_lines.push(ConversationLine::ToolResult {
+                tool_name: "memory_recall".to_string(),
+                args_preview: "{\"q\":\"x\"}".to_string(),
+                args_full: "{\"query\":\"x\"}".to_string(),
+                result: Some("ok".to_string()),
+                status: ToolStatus::Done,
+                elapsed_ms: Some(123),
+                folded: true,
+            });
+            let snap = state.build_ui_snapshot(7);
+            let mut tui = TuiState::new(&state.session.provider, &state.session.model);
+            tui.session_title = state.session.title.clone();
+            tui.turn_count = state.ui.turn_count;
+            tui.ascii_fallback = state.ui.ascii_fallback;
+            tui.conversation_lines = state.ui.conversation_lines.clone();
+            tui.streaming.clone_from(&state.stream.draft);
+            tui.input = state.ui.input.clone();
+
+            // 同时验证 bottom_chrome_height parity（snap & tui 在 tool card 状态下高度一致）.
+            assert_eq!(
+                bottom_chrome_height(&tui),
+                bottom_chrome_height(&snap),
+                "tool card 状态下高度应一致"
+            );
+
+            // 用 render_message_for_insert 验证 tool card 字节级一致.
+            let line = state
+                .ui
+                .conversation_lines
+                .last()
+                .expect("test: just pushed a tool card");
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 4,
+            };
+            let mut buf_tui = Buffer::empty(area);
+            let mut buf_snap = Buffer::empty(area);
+            render_message_for_insert(&mut buf_tui, line, false);
+            render_message_for_insert(&mut buf_snap, line, false);
+            // Buffer 字节级 diff 应为空（两次渲染同一 line 同 ascii_fallback）.
+            let diff = buf_tui.diff(&buf_snap);
+            assert!(
+                diff.is_empty(),
+                "render_message_for_insert 两次同输入应字节级一致, diff={diff:?}"
+            );
+        }
     }
 }
