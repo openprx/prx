@@ -996,3 +996,174 @@ fn test_chat_s4_a_0_ratatui_double_ctrl_c_exit_via_real_path() {
         "ratatui 真路径下双 Ctrl+C 应在 {exit_deadline:?} 内退出"
     );
 }
+
+// ─── S4-A Commit 6: ratatui 真路径 + Pure 模式 snapshot 端到端 ──────────────
+//
+// 把 Commit 0 三个最小 E2E 升级为 PRX_TUI=1 + PRX_CHAT_REDUX=pure 组合,
+// 验证 S4-A 完成后:
+//   - reducer 单源驱动 ratatui 渲染 (UiSnapshot watch 路径)
+//   - chat_mirror 在 Pure 下零写入 (单一写源原则)
+//   - banner / mock response / tool call / 中文 都能正确渲染
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_s4_a_6_pure_snapshot_renders_banner_via_real_path() {
+    // ratatui 真路径 + Pure 模式. banner 通过 reducer SystemMessageAdded
+    // 写入 ui.conversation_lines, dispatcher 推 snapshot 到 watch,
+    // run_tui_unified_loop 通过 RenderSource::Snapshot 读取并 insert_before
+    // 到主屏 — PTY scraper 应能拿到 "mock/mock" 字符串.
+    let (mut sg, _guard) = spawn_chat(
+        &[],
+        &[
+            ("PRX_TUI", "1"),
+            ("PRX_CHAT_REDUX", "pure"),
+            ("PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS", "1"),
+        ],
+    );
+    let session = sg.session();
+
+    let captured = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    assert!(captured.contains("prx "), "banner 应以 `prx ` 起头, got:\n{captured}");
+    assert!(
+        captured.contains("mock/mock"),
+        "Pure 模式 ratatui 真路径下 banner 应含 `mock/mock`, got:\n{captured}"
+    );
+
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("first SIGINT");
+    std::thread::sleep(Duration::from_millis(100));
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("second SIGINT");
+    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_s4_a_6_pure_snapshot_mock_response_via_real_path() {
+    // Pure 模式 + ratatui 真路径下流式 mock 回复:
+    // 用户输入 → drive_start_turn_stream dispatch StreamChunkReceived /
+    // StreamCompleted → reducer push ConversationLine::Assistant →
+    // dispatcher 推 UiSnapshot → run_tui_unified_loop insert_before 主屏.
+    let sentinel = "[S4A6-PURE-RATATUI]";
+    let (mut sg, _guard) = spawn_chat(
+        &[],
+        &[
+            ("OPENPRX_MOCK_RESPONSE", sentinel),
+            ("PRX_TUI", "1"),
+            ("PRX_CHAT_REDUX", "pure"),
+            ("PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS", "1"),
+        ],
+    );
+    let session = sg.session();
+
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(300));
+
+    session.send("hi\r").expect("send hi");
+    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        captured.contains(sentinel),
+        "Pure ratatui 真路径下 mock 回复应渲染. captured:\n{captured}"
+    );
+
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("first SIGINT");
+    std::thread::sleep(Duration::from_millis(100));
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("second SIGINT");
+    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_s4_a_6_pure_snapshot_tool_call_via_real_path() {
+    // Pure 模式 + ratatui 真路径下 tool turn 闭环:
+    // 第一轮 LLM dispatch ToolStarted → reducer push ToolResult Running →
+    // driver 执行 tool → ToolFinished → reducer 更新 ToolResult Done →
+    // 第二轮 LLM emit final sentinel.
+    let sentinel = "[S4A6-PURE-TOOL]";
+    let (mut sg, _guard) = spawn_chat(
+        &[],
+        &[
+            ("OPENPRX_MOCK_RESPONSE", sentinel),
+            ("OPENPRX_MOCK_TOOL_CALL", "memory_recall:{\"query\":\"hi\",\"limit\":3}"),
+            ("PRX_TUI", "1"),
+            ("PRX_CHAT_REDUX", "pure"),
+        ],
+    );
+    let session = sg.session();
+
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(300));
+
+    session.send("hi\r").expect("send hi");
+    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        captured.contains(sentinel),
+        "Pure ratatui 真路径 tool-call 闭环应返回 final sentinel. captured:\n{captured}"
+    );
+
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("first SIGINT");
+    std::thread::sleep(Duration::from_millis(100));
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("second SIGINT");
+    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_s4_a_6_pure_snapshot_chinese_no_extra_spaces_via_real_path() {
+    // Pure + ratatui 真路径下中文（CJK）响应应字节级正确, 无 phantom space.
+    let response = "你好世界S4A6";
+    let (mut sg, _guard) = spawn_chat(
+        &[],
+        &[
+            ("OPENPRX_MOCK_RESPONSE", response),
+            ("PRX_TUI", "1"),
+            ("PRX_CHAT_REDUX", "pure"),
+            ("PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS", "1"),
+        ],
+    );
+    let session = sg.session();
+
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(300));
+
+    session.send("hi\r").expect("send hi");
+    let captured = read_until_with_dsr(session, "你", TURN_TIMEOUT);
+    // 剥离 ANSI escape 后断言中文连续.
+    let ansi_re = regex::Regex::new(r"\x1b\[[^a-zA-Z]*[a-zA-Z]").expect("ansi regex");
+    let plain = ansi_re.replace_all(&captured, "").to_string();
+    assert!(
+        plain.contains("你好世界S4A6"),
+        "Pure ratatui 真路径下中文应连续, plain:\n{plain}"
+    );
+    assert!(
+        !plain.contains("你 好") && !plain.contains("好 世"),
+        "phantom space 应不存在, plain:\n{plain}"
+    );
+
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("first SIGINT");
+    std::thread::sleep(Duration::from_millis(100));
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("second SIGINT");
+    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+}

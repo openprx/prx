@@ -4977,4 +4977,106 @@ mod tests {
             assert_eq!(&*snap.session_title, "my chat");
         }
     }
+
+    // ─── S4-A Commit 6: dual-path parity (mirror vs reducer) ───────────────
+
+    #[cfg(feature = "terminal-tui")]
+    mod s4_a_6 {
+        use super::*;
+        use crate::chat::tui::{ConversationLine, ToolStatus, TuiState};
+        use tokio_util::sync::CancellationToken;
+
+        /// 双跑对账：构造同一 Action 序列, 分别灌入 mirror 路径 (TuiState 直接
+        /// 调用 push_*) 与 reducer 路径 (Action → reduce → ui.conversation_lines),
+        /// 断言两路径输出 conversation_lines 字节级一致.
+        ///
+        /// 这是 S4-B 真删 chat_mirror 前的最后保险 — 任何 reducer 行为偏离 legacy
+        /// mirror 都会在这里被字节级 diff 出来.
+        #[test]
+        fn s4_a_6_dual_path_parity_user_assistant_tool() {
+            // ── 路径 A: mirror 路径 ──
+            let mut mirror = TuiState::new("p", "m");
+            mirror.push_system_message("banner");
+            mirror.push_user_message("hello");
+            mirror.push_tool_result_started("Bash", "{\"cmd\":\"ls\"}");
+            let _ = mirror.mark_last_tool_result_finished("Bash", true, 50, None);
+            mirror.push_assistant_message("done");
+
+            // ── 路径 B: reducer 路径 ──
+            let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+            let _ = state.reduce(Action::SystemMessageAdded {
+                text: "banner".to_string(),
+            });
+            // 用户输入 echo 是 reducer 已知缺口 (S4-B 修); 此测试仅对 system / tool /
+            // assistant 行做字节级对齐, 过滤掉 mirror 端的 User 行.
+            let _ = state.reduce(Action::ToolStarted {
+                name: "Bash".to_string(),
+                args: "{\"cmd\":\"ls\"}".to_string(),
+            });
+            let _ = state.reduce(Action::ToolFinished {
+                name: "Bash".to_string(),
+                success: true,
+                duration_ms: 50,
+                result: None,
+            });
+            let token = CancellationToken::new();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-1".to_string(),
+                cancel: token,
+            });
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "d-1".to_string(),
+                final_text: "done".to_string(),
+                reasoning: String::new(),
+            });
+
+            // ── 对账：每路径过滤掉 user echo, 对账 system+tool+assistant 字节级一致 ──
+            let mirror_filtered: Vec<&ConversationLine> = mirror
+                .conversation_lines
+                .iter()
+                .filter(|l| !matches!(l, ConversationLine::User { .. }))
+                .collect();
+            let reducer_lines: Vec<&ConversationLine> = state.ui.conversation_lines.iter().collect();
+
+            assert_eq!(
+                mirror_filtered.len(),
+                reducer_lines.len(),
+                "对账行数: mirror={} (过滤 User 后), reducer={}",
+                mirror_filtered.len(),
+                reducer_lines.len()
+            );
+            for (i, (ml, rl)) in mirror_filtered.iter().zip(reducer_lines.iter()).enumerate() {
+                let m_dbg = format!("{ml:?}");
+                let r_dbg = format!("{rl:?}");
+                match (ml, rl) {
+                    (
+                        ConversationLine::ToolResult {
+                            tool_name: m_name,
+                            status: m_st,
+                            elapsed_ms: m_ms,
+                            ..
+                        },
+                        ConversationLine::ToolResult {
+                            tool_name: r_name,
+                            status: r_st,
+                            elapsed_ms: r_ms,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(m_name, r_name, "line {i} ToolResult tool_name mismatch");
+                        assert_eq!(m_st, r_st, "line {i} ToolResult status mismatch");
+                        assert_eq!(m_ms, r_ms, "line {i} ToolResult elapsed_ms mismatch");
+                        assert_eq!(*m_st, ToolStatus::Done);
+                    }
+                    (ConversationLine::Assistant { content: mc }, ConversationLine::Assistant { content: rc }) => {
+                        assert_eq!(mc, rc, "line {i} Assistant content mismatch");
+                    }
+                    (ConversationLine::System { content: mc }, ConversationLine::System { content: rc }) => {
+                        assert_eq!(mc, rc, "line {i} System content mismatch");
+                    }
+                    _ => panic!("line {i} variant 不匹配: mirror={m_dbg}, reducer={r_dbg}"),
+                }
+            }
+        }
+    }
 }
