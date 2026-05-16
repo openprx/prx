@@ -1114,13 +1114,16 @@ pub async fn run(
                     // Seed the banner into the mirror state *before* the
                     // first draw, so the user sees it on entry rather than
                     // having it print to the parent shell's scrollback.
-                    chat_mirror.lock().push_system_message(&banner);
-                    // S2-C Step 3: 双写到 Redux UI 镜像。chat_mirror 仍是 TUI 渲染源
-                    // （Codex P0-3：不能用 reducer ui.conversation_lines 替代 mirror，
-                    // 真实可见 TUI 由 mirror 主导）。本 dispatch 仅供 Redux 路径维护
-                    // 一致的 UI 账本 + 测试断言，redraw_tx 此时尚未注入 EffectExecutor
-                    // 故 RequestRedraw 是 no-op，下方 spawn_tui_unified_loop 启动后
-                    // 首屏会自然 redraw。
+                    //
+                    // S4-A Commit 5 (Codex 高危盲点 #1 修复): Pure 模式跳过
+                    // chat_mirror 旁路写，让 reducer 单源 (SystemMessageAdded) 接管.
+                    let is_pure = ReduxMode::from_env().is_pure();
+                    if !is_pure {
+                        chat_mirror.lock().push_system_message(&banner);
+                    }
+                    // S2-C Step 3: 双写到 Redux UI 镜像。Off/Both/Redux 下 chat_mirror
+                    // 仍是 TUI 渲染源（本 dispatch 仅供 Redux 路径维护一致的 UI 账本
+                    // + 测试断言）；Pure 模式下这是 reducer 单源唯一入口.
                     let _ = chat_dispatcher.dispatch_or_log(
                         crate::chat::action::Action::SystemMessageAdded { text: banner.clone() },
                         "chat.banner",
@@ -1143,7 +1146,15 @@ pub async fn run(
                     // mirror instead of writing to stdout (which would tear
                     // the draw loop). Must run BEFORE the unified loop
                     // starts taking events.
-                    let sink = Box::new(tui::TuiStateMirrorSink::new(Arc::clone(&chat_mirror)));
+                    //
+                    // S4-A Commit 5: Pure 模式用 SnapshotDispatcherSink 替代
+                    // TuiStateMirrorSink — UiActor 旁路镜像走 reducer (no-op trace),
+                    // chat_mirror 在 Pure 下零写入 (单一写源原则).
+                    let sink: Box<dyn crate::channels::terminal::TuiMirrorSink> = if is_pure {
+                        Box::new(tui::SnapshotDispatcherSink::new(chat_dispatcher.clone()))
+                    } else {
+                        Box::new(tui::TuiStateMirrorSink::new(Arc::clone(&chat_mirror)))
+                    };
                     terminal.with_tui_mirror(sink, redraw_tx.clone()).await;
 
                     // P3-rearch: single thread owns Terminal/stdout + reads
@@ -1327,7 +1338,19 @@ pub async fn run(
         // `redraw_tx_for_main` is `None` on those paths.
         #[cfg(feature = "terminal-tui")]
         {
-            chat_mirror.lock().push_user_message(&user_input);
+            // S4-A Commit 5 (Codex 高危盲点 #1 修复): Pure 模式 chat_mirror 零写,
+            // 用户输入的视觉 echo 暂时缺失 — reducer 当前的 InputSubmitted Action
+            // 仅维护 ui.input / turn_count，未 push 一行 ConversationLine::User.
+            //
+            // 这是 reducer 已知未覆盖的语义缺口 (legacy push_user_message 路径).
+            // Pure 模式下用户提交 → 1) input box 清空 (reducer 处理) → 2) LLM 回复
+            // 紧接着流式渲染. 中间用户回到的是 "input 已清空 + assistant 在 think"
+            // 的过渡状态，无独立 User bubble. 短期 acceptable；S4-B 可引入
+            // 专用 Action::UserMessageEchoed 让 reducer 写 ConversationLine::User
+            // 完整恢复 echo 行为. 此处 Pure 守卫严格遵守 "Pure 不写 mirror" 原则.
+            if !ReduxMode::from_env().is_pure() {
+                chat_mirror.lock().push_user_message(&user_input);
+            }
             if let Some(tx) = redraw_tx_for_main.as_ref() {
                 // cap=1 + try_send: bursts coalesce into a single deferred
                 // redraw — the unified loop will pick up the latest state.
@@ -1347,10 +1370,12 @@ pub async fn run(
         let emit_chat_output = |text: &str| {
             #[cfg(feature = "terminal-tui")]
             {
-                chat_mirror.lock().push_system_message(text);
-                // S2-C Step 3: 双写到 Redux UI 镜像（chat_mirror 仍是渲染源）。
-                // Codex P0-3：reducer ui.conversation_lines 不能替代 mirror，
-                // 因此 mirror 写不能在 S2-C 阶段加守卫关闭；本 dispatch 仅是观察账本。
+                // S4-A Commit 5 (Codex 高危盲点 #1 修复): Pure 模式跳过 chat_mirror
+                // 旁路写。SystemMessageAdded Action 已是 reducer 单源入口 — Pure
+                // 下 reducer 写 conversation_lines 由 snapshot 推送给 ratatui.
+                if !ReduxMode::from_env().is_pure() {
+                    chat_mirror.lock().push_system_message(text);
+                }
                 let _ = chat_dispatcher.dispatch_or_log(
                     crate::chat::action::Action::SystemMessageAdded { text: text.to_string() },
                     "chat.system_message_slash",
@@ -2171,7 +2196,16 @@ pub async fn run(
             let turn_slice = history.get(history_len_before_tools..).unwrap_or(&[]);
             let aggregated = collect_reasoning_from_history_slice(turn_slice);
             if !aggregated.is_empty() {
-                tui_mirror.lock().push_reasoning(&aggregated);
+                // S4-A Commit 5 (Codex 高危盲点 #1 修复): Pure 模式下 reducer 的
+                // reduce_stream_completed 已经 push 一条 ConversationLine::Reasoning;
+                // 此处 mirror 写在 Pure 下会导致重复. 但 driver 路径 (Pure/Redux+Driver)
+                // 由 drive_start_turn_stream 主导，reasoning 是否被 driver 单独投递
+                // 取决于 provider 是否在 final_text 中嵌入 reasoning. 现状 driver
+                // 直接把 reasoning summary 跟着 final_text 一起 dispatch StreamCompleted,
+                // reducer 内 push Reasoning card. 因此 Pure 下跳过 mirror.push_reasoning.
+                if !ReduxMode::from_env().is_pure() {
+                    tui_mirror.lock().push_reasoning(&aggregated);
+                }
                 // The reasoning card is a folded payload appended after the
                 // tool sequence but before the assistant draft is committed
                 // to scrollback; wake the unified loop so it materialises
