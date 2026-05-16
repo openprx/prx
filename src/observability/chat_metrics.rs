@@ -126,7 +126,7 @@ pub fn get_dispatch_drops_count(reason: &str) -> u64 {
         .unwrap_or_default()
 }
 
-/// 取 chat 模块独立 Registry 引用（暴露给 /metrics 端点合并使用，当前不接线）。
+/// 取 chat 模块独立 Registry 引用（由 gateway /metrics handler 合并到 PrometheusObserver registry 暴露，S2.5 P1-A）。
 #[must_use]
 pub fn chat_registry() -> &'static Registry {
     &CHAT_REGISTRY
