@@ -135,8 +135,9 @@ fn now_ms() -> u64 {
 /// - `Off`:  旧路径单写（默认）。reducer 不构造、不执行。
 /// - `Both`: 双写。Event 同时分发到旧路径和 reducer，两者并行 mutate；
 ///   用于开发/测试期对账 reducer 与旧实现的行为一致。
-/// - `Redux`: 新路径主导关键控制流（Quit / forward-delete 等），保留作为
-///   `Both` 的别名以维持向后兼容（早期用 `PRX_CHAT_REDUX=1` 启用）。
+/// - `Redux`: Both 的超集。reducer 并行构造 + 执行 Effect，同时允许
+///   `PRX_CHAT_REDUX_DRIVER=1` opt-in 切换到 ReduxDriver 路径。
+///   `"1"` 映射到 `Both`（向后兼容），显式 `"redux"` 才到此态。
 /// - `Pure`: S3 T3-3 收官模式，reducer 单路由。driver 路径**默认开启**（无需
 ///   `PRX_CHAT_REDUX_DRIVER=1`），legacy 守卫全关，`chat_session.add_*_turn`
 ///   不再执行（由 reducer 的 `RecordUserTurn`/`RecordAssistantTurn` +
@@ -146,7 +147,7 @@ fn now_ms() -> u64 {
 // 当前四态实际语义（与字面"三态"区分）:
 // - Off:   reducer 完全静默，旧路径单写（legacy chat_session 是唯一持久化源）
 // - Both:  reducer 并行，dual_write_guard 守卫旧路径（双写防护期间）
-// - Redux: 同 Both（别名，历史兼容）
+// - Redux: Both 超集，额外允许 driver opt-in 路由（PRX_CHAT_REDUX_DRIVER=1 + Redux → ReduxDriver）
 // - Pure:  reducer 单路由，旧路径全关闭（T3-3 收官目标态）
 //
 // 移除节奏：S4-B 仅删 chat_mirror/active_cancel 等数据结构，env 守卫保留；
@@ -167,7 +168,7 @@ impl ReduxMode {
     /// 值大小写不敏感，识别规则：
     /// - `""` / `"0"` / `"off"` / `"legacy"` / 未设置 → [`Self::Off`]
     /// - `"1"` / `"both"` → [`Self::Both`]（向后兼容：原 `Redux` 别名也归此）
-    /// - `"redux"` → [`Self::Redux`]（显式别名，等价 `Both` + driver opt-in 语义）
+    /// - `"redux"` → [`Self::Redux`]（显式字符串，不等价 `Both`；可 opt-in driver 路由）
     /// - `"pure"` / `"2"` → [`Self::Pure`]（T3-3 收官模式，reducer 单路由）
     /// - 其他未识别值 → [`Self::Off`]（fail-safe，避免误升级）
     fn from_env() -> Self {
@@ -211,12 +212,13 @@ impl ReduxMode {
 /// Step 5a-4: chat::run 主循环 LLM turn 路由结果.
 ///
 /// "切闸"决策由两个独立环境变量正交控制：
-/// - `PRX_CHAT_REDUX=1` → reducer 模式（[`ReduxMode::Redux`]）— driver 切闸的前置条件
-/// - `PRX_CHAT_REDUX_DRIVER=1` → 在 Redux 模式下显式 opt-in dispatcher driver
+/// - `PRX_CHAT_REDUX=1` → [`ReduxMode::Both`]（向后兼容；要切 driver 须用 `"redux"` 显式值）
+/// - `PRX_CHAT_REDUX=redux` → [`ReduxMode::Redux`]，再加 `PRX_CHAT_REDUX_DRIVER=1` 切 ReduxDriver
+/// - `PRX_CHAT_REDUX_DRIVER=1` → 仅在 `Redux` 模式下生效
 ///
 /// **5a-6 更新**：driver 现已支持 tool turn ( `drive_start_turn_stream` 收到
 /// `ToolCallChunk` 后通过 `EffectDeps::tools_registry` 执行 + 多轮回合).
-/// 命中 [`TurnRoute::ReduxDriver`] 仅需 `PRX_CHAT_REDUX=1` + `PRX_CHAT_REDUX_DRIVER=1`，
+/// 命中 [`TurnRoute::ReduxDriver`] 需 `PRX_CHAT_REDUX=redux` + `PRX_CHAT_REDUX_DRIVER=1`，
 /// `tools_registry` 是否为空不再是路由条件。但 driver 未覆盖 approval / multimodal /
 /// parallel / compaction / tiering 等高级场景，这些需要时仍走 legacy `run_tool_call_loop`
 /// (后续 step 渐进迁移).
@@ -225,7 +227,7 @@ impl ReduxMode {
 pub(crate) enum TurnRoute {
     /// 走旧 `run_tool_call_loop`（生产默认）.
     LegacyToolLoop,
-    /// 走 Redux dispatcher driver（仅当 Redux + driver opt-in + 无 tools）.
+    /// 走 Redux dispatcher driver（Redux + driver opt-in，5a-6 后不再限制 tools 为空）.
     ReduxDriver,
 }
 
