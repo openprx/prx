@@ -1367,11 +1367,18 @@ pub async fn run(
                 commands::CommandResult::Quit => break,
                 commands::CommandResult::SetMode(mode) => {
                     // S2-B Step 4: dispatch `Action::ModeChanged` 让 reducer 写
-                    // `state.session.mode`。legacy `chat_session.set_mode` 仍 unconditional
-                    // 跑——`chat_session.mode` 在 `run_tool_call_loop` 处被读取，
-                    // 是真实业务驱动源，S2-C 删除 legacy 路径前不能跳过。
+                    // `state.session.mode`。T3-3-fixB B4：Pure 模式跳过 legacy
+                    // `chat_session.set_mode`——Pure 下 chat_session 不参与持久化
+                    // (SaveSession 走 reducer 快照)，写 mode 是死写。Off/Both/Redux
+                    // 仍需 legacy 写，run_tool_call_loop 仍读 chat_session.mode。
                     let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::ModeChanged(mode));
-                    chat_session.set_mode(mode);
+                    #[cfg(feature = "terminal-tui")]
+                    let legacy_session_mode_writes_enabled = !ReduxMode::from_env().is_pure();
+                    #[cfg(not(feature = "terminal-tui"))]
+                    let legacy_session_mode_writes_enabled = true;
+                    if legacy_session_mode_writes_enabled {
+                        chat_session.set_mode(mode);
+                    }
                     let msg = match mode {
                         commands::ChatMode::Plan => {
                             "Switched to plan mode (read-only tools only — write/shell/git_commit will be simulated)"
@@ -3412,6 +3419,29 @@ mod redux_mode_tests {
             assert_eq!(
                 legacy_exit_save_enabled, expected_legacy_enabled,
                 "mode {mode:?}: legacy_exit_save_enabled 应为 {expected_legacy_enabled}"
+            );
+        }
+    }
+
+    /// T3-3-fixB B4: Pure 模式跳过 legacy `chat_session.set_mode` 的真值表.
+    ///
+    /// SetMode 命令分支的守卫表达式 `legacy_session_mode_writes_enabled = !ReduxMode::from_env().is_pure()`:
+    /// - Off / Both / Redux → 守卫为 true，legacy set_mode 跑
+    /// - Pure → 守卫为 false，跳过 legacy set_mode（chat_session 不参与持久化，写 mode 是死写）
+    ///
+    /// 与 mod.rs:2197 `legacy_session_writes_enabled` 同形结构.
+    #[test]
+    fn pure_mode_skips_legacy_set_mode_via_redux_mode_guard() {
+        for (mode, expected_legacy_enabled) in [
+            (ReduxMode::Off, true),
+            (ReduxMode::Both, true),
+            (ReduxMode::Redux, true),
+            (ReduxMode::Pure, false),
+        ] {
+            let legacy_session_mode_writes_enabled = !mode.is_pure();
+            assert_eq!(
+                legacy_session_mode_writes_enabled, expected_legacy_enabled,
+                "mode {mode:?}: legacy_session_mode_writes_enabled 应为 {expected_legacy_enabled}"
             );
         }
     }
