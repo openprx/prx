@@ -1687,17 +1687,49 @@ pub fn spawn_dispatcher_task_with_executor(
 #[allow(dead_code)]
 pub fn spawn_dispatcher_task_with_signal(
     initial_state: ChatState,
-    mut action_rx: mpsc::Receiver<Action>,
+    action_rx: mpsc::Receiver<Action>,
     shutdown: CancellationToken,
     executor: EffectExecutor,
     turn_signal: Option<TurnCompletionSignal>,
 ) -> tokio::task::JoinHandle<DispatcherStats> {
+    spawn_dispatcher_task_full(
+        initial_state,
+        action_rx,
+        shutdown,
+        executor,
+        turn_signal,
+        #[cfg(feature = "terminal-tui")]
+        None,
+    )
+}
+
+/// **S4-A Commit 3**: `spawn_dispatcher_task_with_signal` + 可选的 UiSnapshot 推送.
+///
+/// Pure 模式传入 `snapshot_tx: Some(watch::Sender<Arc<UiSnapshot>>)`，dispatcher
+/// 在 reduce 完成且 `ui_dirty=true` 时构造新 snapshot 并 send_if_modified；
+/// Off/Both/Redux 模式传 None 维持 chat_mirror 单源路径。
+///
+/// snapshot_rev: AtomicU64 单调递增。watch send_if_modified 用 revision 比较
+/// 跳过相同帧；revision 不会回退，杜绝 receiver 看到旧帧。
+#[cfg(feature = "terminal-tui")]
+#[allow(dead_code)]
+pub fn spawn_dispatcher_task_full(
+    initial_state: ChatState,
+    mut action_rx: mpsc::Receiver<Action>,
+    shutdown: CancellationToken,
+    executor: EffectExecutor,
+    turn_signal: Option<TurnCompletionSignal>,
+    snapshot_tx: Option<tokio::sync::watch::Sender<Arc<crate::chat::state::UiSnapshot>>>,
+) -> tokio::task::JoinHandle<DispatcherStats> {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     // S3 T3-1: 提前抽出 approval_router 句柄（Arc clone），后续在 reducer 处理完
     // `Action::ToolApprovalReceived` 之后用它把决策转交 driver 等待中的 oneshot。
     let approval_router = executor.approval_router();
     tokio::spawn(async move {
         let mut state = initial_state;
         let mut stats = DispatcherStats::default();
+        // S4-A Commit 3: revision 计数器仅在 snapshot_tx 存在时使用.
+        let snapshot_rev = AtomicU64::new(0);
 
         loop {
             tokio::select! {
@@ -1711,10 +1743,26 @@ pub fn spawn_dispatcher_task_with_signal(
                         stats.actions_seen = stats.actions_seen.saturating_add(1);
                         let outcome = extract_turn_outcome(&action);
                         let approval_response = extract_approval_response(&action);
-                        let effects = state.reduce(action);
+                        let (effects, ui_dirty) = state.reduce_tracked(action);
                         stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
                         for effect in effects {
                             executor.execute(effect).await;
+                        }
+                        // S4-A Commit 3: ui_dirty=true 且 snapshot_tx 存在时，
+                        // 构造新 snapshot 并 send_if_modified 推送 watch.
+                        if ui_dirty {
+                            if let Some(tx) = snapshot_tx.as_ref() {
+                                let next_rev = snapshot_rev.fetch_add(1, AtomicOrdering::Relaxed).saturating_add(1);
+                                let new_snap = Arc::new(state.build_ui_snapshot(next_rev));
+                                tx.send_if_modified(|cur| {
+                                    if cur.revision >= new_snap.revision {
+                                        return false;
+                                    }
+                                    *cur = Arc::clone(&new_snap);
+                                    true
+                                });
+                                tracing::trace!(rev = next_rev, "s4_a snapshot pushed (shutdown drain)");
+                            }
                         }
                         if let (Some((tool_id, approved)), Some(router)) =
                             (approval_response, approval_router.as_ref())
@@ -1748,10 +1796,27 @@ pub fn spawn_dispatcher_task_with_signal(
                             stats.actions_seen = stats.actions_seen.saturating_add(1);
                             let outcome = extract_turn_outcome(&action);
                             let approval_response = extract_approval_response(&action);
-                            let effects = state.reduce(action);
+                            let (effects, ui_dirty) = state.reduce_tracked(action);
                             stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
                             for effect in effects {
                                 executor.execute(effect).await;
+                            }
+                            // S4-A Commit 3: 主循环路径 — Pure 模式（snapshot_tx=Some）
+                            // 时 ui_dirty 推送 snapshot 到 watch；其他模式 None 时
+                            // 整个分支零开销.
+                            if ui_dirty {
+                                if let Some(tx) = snapshot_tx.as_ref() {
+                                    let next_rev = snapshot_rev.fetch_add(1, AtomicOrdering::Relaxed).saturating_add(1);
+                                    let new_snap = Arc::new(state.build_ui_snapshot(next_rev));
+                                    tx.send_if_modified(|cur| {
+                                        if cur.revision >= new_snap.revision {
+                                            return false;
+                                        }
+                                        *cur = Arc::clone(&new_snap);
+                                        true
+                                    });
+                                    tracing::trace!(rev = next_rev, "s4_a snapshot pushed");
+                                }
                             }
                             // S3 T3-1: reducer 处理完 ToolApprovalReceived 后，把决策
                             // 通过 approval_router 转给 driver 的 pending oneshot。
@@ -1775,6 +1840,83 @@ pub fn spawn_dispatcher_task_with_signal(
                                 effects = stats.effects_seen,
                                 "redux dispatcher task: channel closed, exiting"
                             );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        stats
+    })
+}
+
+/// 非 terminal-tui feature 下的 spawn_dispatcher_task_full 占位（无 snapshot 推送）.
+#[cfg(not(feature = "terminal-tui"))]
+#[allow(dead_code)]
+pub fn spawn_dispatcher_task_full(
+    initial_state: ChatState,
+    mut action_rx: mpsc::Receiver<Action>,
+    shutdown: CancellationToken,
+    executor: EffectExecutor,
+    turn_signal: Option<TurnCompletionSignal>,
+) -> tokio::task::JoinHandle<DispatcherStats> {
+    let approval_router = executor.approval_router();
+    tokio::spawn(async move {
+        let mut state = initial_state;
+        let mut stats = DispatcherStats::default();
+
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    while let Ok(action) = action_rx.try_recv() {
+                        stats.actions_seen = stats.actions_seen.saturating_add(1);
+                        let outcome = extract_turn_outcome(&action);
+                        let approval_response = extract_approval_response(&action);
+                        let effects = state.reduce(action);
+                        stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
+                        for effect in effects {
+                            executor.execute(effect).await;
+                        }
+                        if let (Some((tool_id, approved)), Some(router)) =
+                            (approval_response, approval_router.as_ref())
+                        {
+                            router.resolve(&tool_id, approved);
+                        }
+                        if let (Some(out), Some(ref sig)) = (outcome, turn_signal.as_ref()) {
+                            sig.record_and_notify(out);
+                        }
+                    }
+                    if let Some(ref sig) = turn_signal {
+                        sig.notify();
+                    }
+                    break;
+                }
+                maybe_action = action_rx.recv() => {
+                    match maybe_action {
+                        Some(action) => {
+                            stats.actions_seen = stats.actions_seen.saturating_add(1);
+                            let outcome = extract_turn_outcome(&action);
+                            let approval_response = extract_approval_response(&action);
+                            let effects = state.reduce(action);
+                            stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
+                            for effect in effects {
+                                executor.execute(effect).await;
+                            }
+                            if let (Some((tool_id, approved)), Some(router)) =
+                                (approval_response, approval_router.as_ref())
+                            {
+                                router.resolve(&tool_id, approved);
+                            }
+                            if let (Some(out), Some(ref sig)) = (outcome, turn_signal.as_ref()) {
+                                sig.record_and_notify(out);
+                            }
+                        }
+                        None => {
+                            if let Some(ref sig) = turn_signal {
+                                sig.notify();
+                            }
                             break;
                         }
                     }
@@ -6012,6 +6154,175 @@ mod real_mode_tests {
             store_count.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "两个并发 SaveSession 都应触发 memory.store 一次（共两次）"
+        );
+    }
+}
+
+// ─── S4-A Commit 3: dispatcher snapshot 推送 ────────────────────────────────
+
+#[cfg(test)]
+#[cfg(feature = "terminal-tui")]
+mod s4_a_3 {
+    use super::*;
+    use crate::chat::action::Action;
+    use crate::chat::state::{ChatState, UiSnapshot};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+
+    fn make_state() -> ChatState {
+        ChatState::new(Arc::from("p-rx"), Arc::from("m-rx"), CancellationToken::new())
+    }
+
+    #[tokio::test]
+    async fn s4_a_3_dispatcher_pushes_snapshot_on_ui_action() {
+        // UI-affecting Action（SystemMessageAdded）应触发 snapshot 推送.
+        let state = make_state();
+        let initial = Arc::new(UiSnapshot::initial(
+            Arc::clone(&state.session.provider),
+            Arc::clone(&state.session.model),
+        ));
+        let (snap_tx, mut snap_rx) = watch::channel(initial);
+        let (dispatcher, action_rx) = ChatDispatcher::new();
+        let shutdown = CancellationToken::new();
+        let _handle = spawn_dispatcher_task_full(
+            state,
+            action_rx,
+            shutdown.clone(),
+            EffectExecutor::new_shadow(),
+            None,
+            Some(snap_tx),
+        );
+
+        let _ = dispatcher
+            .dispatch(Action::SystemMessageAdded { text: "banner".into() })
+            .await;
+        // wait for watch update
+        tokio::time::timeout(Duration::from_millis(300), snap_rx.changed())
+            .await
+            .expect("snap_rx should receive update within 300ms")
+            .expect("watch send_if_modified should have fired");
+        let snap = snap_rx.borrow();
+        assert!(
+            snap.revision >= 1,
+            "revision should advance to >=1, got {}",
+            snap.revision
+        );
+        assert!(
+            !snap.conversation_lines.is_empty(),
+            "snapshot 应包含 SystemMessageAdded 写入的 conversation line"
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn s4_a_3_dispatcher_skips_unrelated_action() {
+        // ToolProgress 静态判定 dirty=false 且不写 ui 字段 → 不应推 snapshot.
+        let state = make_state();
+        let initial = Arc::new(UiSnapshot::initial(
+            Arc::clone(&state.session.provider),
+            Arc::clone(&state.session.model),
+        ));
+        let initial_rev = initial.revision;
+        let (snap_tx, mut snap_rx) = watch::channel(initial);
+        let (dispatcher, action_rx) = ChatDispatcher::new();
+        let shutdown = CancellationToken::new();
+        let _handle = spawn_dispatcher_task_full(
+            state,
+            action_rx,
+            shutdown.clone(),
+            EffectExecutor::new_shadow(),
+            None,
+            Some(snap_tx),
+        );
+
+        let _ = dispatcher.dispatch(Action::ToolProgress { iteration: 1, max: 3 }).await;
+        // 应在 200ms 内不出现 changed 信号.
+        let result = tokio::time::timeout(Duration::from_millis(200), snap_rx.changed()).await;
+        assert!(
+            result.is_err(),
+            "ToolProgress 不应触发 snapshot 推送 (changed 返回={:?})",
+            result.map(|r| r.is_ok())
+        );
+        assert_eq!(snap_rx.borrow().revision, initial_rev, "revision 应保持不变");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn s4_a_3_revision_strict_monotonic_in_pure() {
+        // 多个 UI Action 后 revision 应严格单调递增.
+        let state = make_state();
+        let initial = Arc::new(UiSnapshot::initial(
+            Arc::clone(&state.session.provider),
+            Arc::clone(&state.session.model),
+        ));
+        let (snap_tx, mut snap_rx) = watch::channel(initial);
+        let (dispatcher, action_rx) = ChatDispatcher::new();
+        let shutdown = CancellationToken::new();
+        let _handle = spawn_dispatcher_task_full(
+            state,
+            action_rx,
+            shutdown.clone(),
+            EffectExecutor::new_shadow(),
+            None,
+            Some(snap_tx),
+        );
+
+        let mut prev_rev = snap_rx.borrow().revision;
+        for i in 0..3 {
+            let _ = dispatcher
+                .dispatch(Action::SystemMessageAdded {
+                    text: format!("msg-{i}"),
+                })
+                .await;
+            tokio::time::timeout(Duration::from_millis(300), snap_rx.changed())
+                .await
+                .expect("changed within 300ms")
+                .expect("watch send");
+            let cur = snap_rx.borrow().revision;
+            assert!(cur > prev_rev, "revision 应严格递增: prev={prev_rev}, cur={cur}");
+            prev_rev = cur;
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn s4_a_3_off_mode_no_snapshot_push() {
+        // snapshot_tx=None 时（Off/Both/Redux），即使 ui_dirty 也不构造 snapshot
+        // — 验证零开销契约.
+        let state = make_state();
+        let (dispatcher, action_rx) = ChatDispatcher::new();
+        let shutdown = CancellationToken::new();
+        let handle = spawn_dispatcher_task_full(
+            state,
+            action_rx,
+            shutdown.clone(),
+            EffectExecutor::new_shadow(),
+            None,
+            None, // 关键：snapshot_tx=None
+        );
+
+        // 推送多个 UI Action，dispatcher 不应 panic / hang.
+        for i in 0..5 {
+            let _ = dispatcher
+                .dispatch(Action::SystemMessageAdded { text: format!("m{i}") })
+                .await;
+        }
+        // 给 dispatcher 处理时间.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.cancel();
+        let stats = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle should complete within 2s after shutdown")
+            .expect("task join");
+        assert!(
+            stats.actions_seen >= 5,
+            "应至少处理 5 个 actions, got {}",
+            stats.actions_seen
         );
     }
 }

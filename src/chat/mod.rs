@@ -1028,6 +1028,41 @@ pub async fn run(
     // Off / legacy 路径不读 signal，构造成本极低（Arc<Notify>）。
     let turn_signal = dispatcher::TurnCompletionSignal::new();
 
+    // S4-A Commit 3: Pure 模式构造 watch::channel<Arc<UiSnapshot>>，dispatcher
+    // 在 ui_dirty=true 时推送新 snapshot；其他模式（Off/Both/Redux）传 None
+    // 维持 chat_mirror 单源路径。
+    //
+    // rx 在 Commit 4 接入 run_tui_unified_loop；本 commit 仅 trace 观察推送频率，
+    // rx 保留为 `Option` 留给 spawn_tui_unified_loop 使用。
+    #[cfg(feature = "terminal-tui")]
+    let (snapshot_tx_for_dispatcher, snapshot_rx_for_tui) = {
+        let mode = ReduxMode::from_env();
+        if mode.is_pure() {
+            let initial = std::sync::Arc::new(crate::chat::state::UiSnapshot::initial(
+                std::sync::Arc::from(provider_name),
+                std::sync::Arc::from(model_name),
+            ));
+            let (tx, rx) = tokio::sync::watch::channel(initial);
+            tracing::info!(mode = ?mode, "S4-A Commit 3: snapshot_tx constructed for Pure mode");
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        }
+    };
+    // 防止 Commit 3 阶段未消费 rx 导致 unused 警告；Commit 4 接入 run_tui_unified_loop 后真消费.
+    #[cfg(feature = "terminal-tui")]
+    let _snapshot_rx_for_tui = snapshot_rx_for_tui;
+
+    #[cfg(feature = "terminal-tui")]
+    let dispatcher_handle = dispatcher::spawn_dispatcher_task_full(
+        dispatcher_shadow_state,
+        chat_action_rx,
+        shutdown.clone(),
+        effect_executor,
+        Some(turn_signal.clone()),
+        snapshot_tx_for_dispatcher,
+    );
+    #[cfg(not(feature = "terminal-tui"))]
     let dispatcher_handle = dispatcher::spawn_dispatcher_task_with_signal(
         dispatcher_shadow_state,
         chat_action_rx,
