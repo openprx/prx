@@ -193,6 +193,12 @@ pub struct ControlState {
     pub shutdown: CancellationToken,
     /// 是否正在生成（用于 CancelRequested 分支判断）
     pub generating: bool,
+    /// S2.5 P1-B: 本轮累积的 tool_calls — ToolStarted/Finished 期间累积，
+    /// RecordAssistantTurn 用 mem::take 回填到 session.turns.last_mut().tool_calls.
+    pub current_turn_tool_calls: Vec<crate::chat::session::ToolCallSummary>,
+    /// S2.5 P1-B: ToolStarted 的 args_preview 暂存 — ToolFinished 时 remove 并 push
+    /// 到 current_turn_tool_calls（key 用 tool name，回避 ToolStarted 缺 id 的局限）.
+    pub current_turn_tool_args: std::collections::HashMap<String, String>,
 }
 
 // ─── ChatState ────────────────────────────────────────────────────────────────
@@ -245,6 +251,8 @@ impl ChatState {
                 active_cancel: None,
                 shutdown,
                 generating: false,
+                current_turn_tool_calls: Vec::new(),
+                current_turn_tool_args: std::collections::HashMap::new(),
             },
         }
     }
@@ -451,6 +459,10 @@ impl ChatState {
         self.ui.turn_count = self.ui.turn_count.saturating_add(1);
         let log_msg = format!("input_submitted len={}", text.chars().count());
         self.ui.last_submitted = Some(text);
+        // S2.5 P1-B: 兜底清理本轮 tool_calls 缓冲（幂等：新一轮 turn 入口前清空，
+        // 防御上一轮 stream 异常终止时未走 Completed/Cancelled/Failed 清理路径）.
+        self.control.current_turn_tool_calls.clear();
+        self.control.current_turn_tool_args.clear();
         vec![
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
@@ -720,7 +732,7 @@ impl ChatState {
             });
         }
         let chars = final_text.chars().count();
-        vec![
+        let effects = vec![
             Effect::NotifyHook {
                 event: HookEvent::TurnComplete,
                 payload: serde_json::json!({
@@ -730,7 +742,12 @@ impl ChatState {
             },
             Effect::SaveSession(self.build_session_snapshot()),
             Effect::RequestRedraw,
-        ]
+        ];
+        // S2.5 P1-B: 兜底清理本轮 tool 缓冲（RecordAssistantTurn 正常已 mem::take 清空，
+        // 此处防御 driver 漏发 RecordAssistantTurn 的边缘情况）.
+        self.control.current_turn_tool_calls.clear();
+        self.control.current_turn_tool_args.clear();
+        effects
     }
 
     #[cfg(not(feature = "terminal-tui"))]
@@ -750,7 +767,7 @@ impl ChatState {
             self.ui.conversation_lines.push(reasoning);
         }
         let chars = final_text.chars().count();
-        vec![
+        let effects = vec![
             Effect::NotifyHook {
                 event: HookEvent::TurnComplete,
                 payload: serde_json::json!({
@@ -760,7 +777,11 @@ impl ChatState {
             },
             Effect::SaveSession(self.build_session_snapshot()),
             Effect::RequestRedraw,
-        ]
+        ];
+        // S2.5 P1-B: 同 terminal-tui 分支兜底清理.
+        self.control.current_turn_tool_calls.clear();
+        self.control.current_turn_tool_args.clear();
+        effects
     }
 
     /// `Action::StreamFailed` — 清除 draft + LogTrace + NotifyHook(Error).
@@ -778,6 +799,10 @@ impl ChatState {
         self.stream.pending_tool_cards.clear();
         self.control.active_cancel = None;
         self.control.generating = false;
+        // S2.5 P1-B: stream 失败丢弃本轮 tool 缓冲（无 RecordAssistantTurn 可回填，
+        // 失败后本轮 tool_calls 不可信，下轮入口由 reduce_input_submitted 兜底再清一次）.
+        self.control.current_turn_tool_calls.clear();
+        self.control.current_turn_tool_args.clear();
         vec![
             Effect::LogTrace {
                 level: tracing::Level::WARN,
@@ -806,6 +831,9 @@ impl ChatState {
         self.stream.pending_tool_cards.clear();
         self.control.active_cancel = None;
         self.control.generating = false;
+        // S2.5 P1-B: cancel 丢弃本轮 tool 缓冲（同 failed 路径语义）.
+        self.control.current_turn_tool_calls.clear();
+        self.control.current_turn_tool_args.clear();
         vec![Effect::RequestRedraw]
     }
 
@@ -819,6 +847,10 @@ impl ChatState {
         } else {
             args.clone()
         };
+        // S2.5 P1-B: 暂存 args_preview，ToolFinished 时取出 push 到 current_turn_tool_calls.
+        self.control
+            .current_turn_tool_args
+            .insert(name.clone(), args_preview.clone());
         self.ui.conversation_lines.push(ConversationLine::ToolResult {
             tool_name: name,
             args_preview,
@@ -835,6 +867,14 @@ impl ChatState {
 
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_tool_started(&mut self, name: String, args: String) -> Vec<Effect> {
+        // S2.5 P1-B: 占位 feature 下也累积 args_preview，便于 parity 测试在两种 feature 走通.
+        let args_preview = if args.chars().count() > 80 {
+            let prefix: String = args.chars().take(80).collect();
+            format!("{prefix}…")
+        } else {
+            args.clone()
+        };
+        self.control.current_turn_tool_args.insert(name.clone(), args_preview);
         self.ui.conversation_lines.push(format!("tool_started:{name}:{args}"));
         let idx = self.ui.conversation_lines.len().saturating_sub(1);
         self.stream.pending_tool_cards.push(idx);
@@ -850,7 +890,16 @@ impl ChatState {
         duration_ms: u64,
         result: Option<String>,
     ) -> Vec<Effect> {
+        use crate::chat::session::ToolCallSummary;
         use crate::chat::tui::{ConversationLine, ToolStatus};
+        // S2.5 P1-B: 取出 ToolStarted 暂存的 args_preview（没有则空串，例如 driver
+        // 在 supervised 模式下漏发 ToolStarted 的边缘情况），push 到本轮累积列表.
+        let args_preview = self.control.current_turn_tool_args.remove(&name).unwrap_or_default();
+        self.control.current_turn_tool_calls.push(ToolCallSummary {
+            name: name.clone(),
+            args_preview,
+            success,
+        });
         // 第 1 步：从 pending_tool_cards 反向查找最近一个 name 匹配 + Running 的卡片
         // （只借用 conversation_lines，不持 mut 引用，避免 result 跨循环 move 冲突）
         let target_pos = self
@@ -899,6 +948,14 @@ impl ChatState {
         duration_ms: u64,
         _result: Option<String>,
     ) -> Vec<Effect> {
+        use crate::chat::session::ToolCallSummary;
+        // S2.5 P1-B: 同 terminal-tui 分支，回填本轮累积列表.
+        let args_preview = self.control.current_turn_tool_args.remove(&name).unwrap_or_default();
+        self.control.current_turn_tool_calls.push(ToolCallSummary {
+            name: name.clone(),
+            args_preview,
+            success,
+        });
         // 占位 feature 下仅记录 + 弹出最后一个 pending 索引
         if !self.stream.pending_tool_cards.is_empty() {
             self.stream.pending_tool_cards.pop();
@@ -1166,17 +1223,16 @@ impl ChatState {
     ///
     /// 对齐 `session.add_assistant_turn` 语义：
     /// - `updated_at` 由 effect executor 在构建 `SaveSession` 快照时设置（SessionState 不含时间戳）
-    /// - tool_calls 留空（Step 5b 由 ToolStarted/ToolFinished Action 补充）
-    // TODO: tool_calls 同步留 Step 5b
-    // FIXME(S2.5): RecordAssistantTurn(content) 忽略 tool_calls 参数，session.turns[i].tool_calls
-    // 一律存 Vec::new()。legacy add_assistant_turn(content, tool_calls) 在 SaveSession 落盘的
-    // turns[i].tool_calls 字段保留，对齐工作挪 S2.5 横切（与 sanitized vs enriched 同批）。
+    /// - S2.5 P1-B: tool_calls 由 reducer 内 ControlState.current_turn_tool_calls
+    ///   缓冲 mem::take 回填（关闭原 FIXME(S2.5)，方案 C reducer 回填，不改 Action 签名）.
     fn reduce_record_assistant_turn(&mut self, content: String) -> Vec<Effect> {
+        let tool_calls = std::mem::take(&mut self.control.current_turn_tool_calls);
+        self.control.current_turn_tool_args.clear();
         self.session.turns.push(crate::chat::session::ChatTurn {
             role: "assistant".to_string(),
             content: content.clone(),
             timestamp: chrono::Utc::now(),
-            tool_calls: Vec::new(),
+            tool_calls,
         });
         self.session.history.push(ChatMessage::assistant(content));
         vec![Effect::LogTrace {
@@ -4317,6 +4373,251 @@ mod tests {
             assert_eq!(h1.content, "user1");
             let h2 = state.session.history.get(2).expect("test: history[2] = assistant1");
             assert_eq!(h2.role, "assistant");
+        }
+    }
+
+    // ─── S2.5 P1-B: tool_calls parity via reducer 内回填 ─────────────────────
+    //
+    // 方案 C 用 ControlState.current_turn_tool_calls 在 reducer 内缓冲：
+    //   ToolStarted/Finished 累积，RecordAssistantTurn 用 mem::take 回填到
+    //   session.turns.last_mut().tool_calls，stream 终态 + InputSubmitted 兜底清空.
+    // 关闭 state.rs:1171 原 FIXME(S2.5)，零 Action 签名变更，零 callsite 破坏.
+    #[cfg(test)]
+    mod p1_b_tool_calls_parity {
+        use super::super::*;
+        use crate::chat::action::Action;
+        use crate::chat::session::ToolCallSummary;
+        use tokio_util::sync::CancellationToken;
+
+        fn s() -> ChatState {
+            ChatState::new(Arc::from("openai"), Arc::from("gpt-4o-mini"), CancellationToken::new())
+        }
+
+        /// S2.5 P1-B: RecordAssistantTurn 回填 tool_calls 到 session.turns.last_mut().tool_calls.
+        #[test]
+        fn s2_5_p1_b_assistant_turn_carries_tool_calls() {
+            let mut state = s();
+            let _ = state.reduce(Action::RecordUserTurn("question".to_string()));
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-p1b-1".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                name: "shell".to_string(),
+                args: r#"{"cmd":"ls"}"#.to_string(),
+            });
+            let _ = state.reduce(Action::ToolFinished {
+                name: "shell".to_string(),
+                success: true,
+                duration_ms: 12,
+                result: Some("ok".to_string()),
+            });
+            let _ = state.reduce(Action::RecordAssistantTurn("answer".to_string()));
+
+            let last = state.session.turns.last().expect("test: assistant turn");
+            assert_eq!(last.role, "assistant");
+            assert_eq!(last.tool_calls.len(), 1, "本轮 1 个 tool_call 必须回填");
+            let call: &ToolCallSummary = last.tool_calls.first().expect("test: tool_calls[0]");
+            assert_eq!(call.name, "shell");
+            assert!(call.success);
+            assert_eq!(call.args_preview, r#"{"cmd":"ls"}"#);
+
+            // 回填后 ControlState 缓冲必须清空（mem::take + clear）.
+            assert!(state.control.current_turn_tool_calls.is_empty());
+            assert!(state.control.current_turn_tool_args.is_empty());
+        }
+
+        /// S2.5 P1-B: 多个 tool 在同一 turn 内按顺序聚合.
+        #[test]
+        fn s2_5_p1_b_multi_tool_aggregates_in_turn() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-p1b-2".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            for (i, ok) in [(1u8, true), (2, false), (3, true)] {
+                let name = format!("tool{i}");
+                let _ = state.reduce(Action::ToolStarted {
+                    name: name.clone(),
+                    args: format!("args-{i}"),
+                });
+                let _ = state.reduce(Action::ToolFinished {
+                    name,
+                    success: ok,
+                    duration_ms: 10,
+                    result: None,
+                });
+            }
+            let _ = state.reduce(Action::RecordAssistantTurn("a".to_string()));
+
+            let last = state.session.turns.last().expect("test: assistant turn");
+            assert_eq!(last.tool_calls.len(), 3);
+            let t0 = last.tool_calls.first().expect("test: tool_calls[0]");
+            assert_eq!(t0.name, "tool1");
+            assert!(t0.success);
+            let t1 = last.tool_calls.get(1).expect("test: tool_calls[1]");
+            assert_eq!(t1.name, "tool2");
+            assert!(!t1.success);
+            let t2 = last.tool_calls.get(2).expect("test: tool_calls[2]");
+            assert_eq!(t2.name, "tool3");
+            assert!(t2.success);
+        }
+
+        /// S2.5 P1-B: turn 边界 (StreamCompleted) 清空缓冲，跨轮不污染.
+        #[test]
+        fn s2_5_p1_b_turn_boundary_clears_buffer() {
+            let mut state = s();
+
+            // Turn 1：tool 累积，但故意不发 RecordAssistantTurn，直接 StreamCompleted.
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-p1b-3a".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                name: "leftover".to_string(),
+                args: "x".to_string(),
+            });
+            let _ = state.reduce(Action::ToolFinished {
+                name: "leftover".to_string(),
+                success: true,
+                duration_ms: 1,
+                result: None,
+            });
+            assert_eq!(state.control.current_turn_tool_calls.len(), 1);
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "d-p1b-3a".to_string(),
+                final_text: "x".to_string(),
+                reasoning: String::new(),
+            });
+            // StreamCompleted 兜底 clear 后缓冲为空.
+            assert!(state.control.current_turn_tool_calls.is_empty());
+            assert!(state.control.current_turn_tool_args.is_empty());
+
+            // Turn 2：RecordAssistantTurn 应得到空 tool_calls（未被 Turn 1 残留污染）.
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-p1b-3b".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::RecordAssistantTurn("clean".to_string()));
+            let last = state.session.turns.last().expect("test: turn 2 assistant");
+            assert_eq!(last.tool_calls.len(), 0, "Turn 2 不能继承 Turn 1 残留 tool_calls");
+        }
+
+        /// S2.5 P1-B: stream cancelled 清空缓冲（用户中途 Ctrl+C）.
+        #[test]
+        fn s2_5_p1_b_stream_cancelled_clears_buffer() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-p1b-4".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                name: "partial".to_string(),
+                args: "...".to_string(),
+            });
+            // 此时 args 暂存有内容
+            assert_eq!(state.control.current_turn_tool_args.len(), 1);
+
+            let _ = state.reduce(Action::StreamCancelled {
+                draft_id: "d-p1b-4".to_string(),
+            });
+            assert!(
+                state.control.current_turn_tool_calls.is_empty(),
+                "cancel 后缓冲必须清空"
+            );
+            assert!(
+                state.control.current_turn_tool_args.is_empty(),
+                "cancel 后 args 暂存必须清空"
+            );
+
+            // 同理验证 StreamFailed.
+            let mut state2 = s();
+            let _ = state2.reduce(Action::TurnStarted {
+                draft_id: "d-p1b-4b".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state2.reduce(Action::ToolStarted {
+                name: "partial2".to_string(),
+                args: "...".to_string(),
+            });
+            let _ = state2.reduce(Action::StreamFailed {
+                draft_id: "d-p1b-4b".to_string(),
+                err: "timeout".to_string(),
+                retryable: true,
+            });
+            assert!(state2.control.current_turn_tool_calls.is_empty());
+            assert!(state2.control.current_turn_tool_args.is_empty());
+        }
+
+        /// S2.5 P1-B: 扩展 fixB C1 parity 模式 — RecordAssistantTurn 后
+        /// session.turns.last().tool_calls 必须包含本轮 ToolFinished 累计.
+        /// 模拟 Both 模式下 reducer 路径的 enriched 包路径，验证 reducer 持久化
+        /// 路径已含 tool_calls（关闭 FIXME(S2.5) gap）。
+        #[test]
+        fn s2_5_p1_b_both_parity_includes_tool_calls() {
+            let mut state = s();
+            // 模拟完整 turn 包：user → turn started → 多个 tool → assistant.
+            let _ = state.reduce(Action::RecordUserTurn("ask".to_string()));
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-parity".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                name: "search".to_string(),
+                args: r#"{"q":"x"}"#.to_string(),
+            });
+            let _ = state.reduce(Action::ToolFinished {
+                name: "search".to_string(),
+                success: true,
+                duration_ms: 5,
+                result: Some("hit".to_string()),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                name: "fetch".to_string(),
+                args: "url".to_string(),
+            });
+            let _ = state.reduce(Action::ToolFinished {
+                name: "fetch".to_string(),
+                success: false,
+                duration_ms: 30,
+                result: Some("404".to_string()),
+            });
+            let _ = state.reduce(Action::RecordAssistantTurn("done".to_string()));
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "d-parity".to_string(),
+                final_text: "done".to_string(),
+                reasoning: String::new(),
+            });
+
+            // legacy session.add_assistant_turn(content, tool_calls) 等价镜像.
+            let assistant_turn = state
+                .session
+                .turns
+                .iter()
+                .rev()
+                .find(|t| t.role == "assistant")
+                .expect("test: assistant turn exists");
+            assert_eq!(assistant_turn.tool_calls.len(), 2);
+            let c0 = assistant_turn.tool_calls.first().expect("test: tool_calls[0]");
+            assert_eq!(c0.name, "search");
+            assert!(c0.success);
+            let c1 = assistant_turn.tool_calls.get(1).expect("test: tool_calls[1]");
+            assert_eq!(c1.name, "fetch");
+            assert!(!c1.success);
+
+            // 验证 build_session_snapshot 落盘的 turns 也含 tool_calls.
+            let snap = state.build_session_snapshot();
+            let snap_assistant = snap
+                .turns
+                .iter()
+                .rev()
+                .find(|t| t.role == "assistant")
+                .expect("test: snapshot assistant turn");
+            assert_eq!(
+                snap_assistant.tool_calls.len(),
+                2,
+                "build_session_snapshot 落盘的 turns 必须携带 tool_calls"
+            );
         }
     }
 }
