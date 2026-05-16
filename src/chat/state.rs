@@ -3633,6 +3633,65 @@ mod tests {
             );
         }
 
+        /// T3-3-fixB C1: reducer `session.history` 在 system 维度与 legacy 手动 history
+        /// 字节级 parity. t3_3d_both_mode_history_byte_level_parity 只覆盖 user/assistant,
+        /// 这里补 SetLeadingSystemPrompt (upsert) + RecordSystemMessage (append) 维度.
+        ///
+        /// legacy 侧用 `Vec<ChatMessage>` 手动镜像（ChatSession 没有专用 add_system_turn,
+        /// chat::run 主循环直接操作 history 切片），保持 reducer 与 chat::run 字节级对齐.
+        ///
+        /// 注：tool_calls parity gap 仍在（reducer RecordAssistantTurn 忽略 tool_calls
+        /// 参数，session.turns[i].tool_calls 一律 Vec::new()），挂 S2.5 横切统一处理.
+        #[test]
+        fn t3_3_fix_b_both_parity_system_history() {
+            use crate::providers::ChatMessage;
+            let mut state = s();
+            let mut legacy: Vec<ChatMessage> = Vec::new();
+
+            // 1) SetLeadingSystemPrompt 空 history → push system v1
+            let _ = state.reduce(Action::SetLeadingSystemPrompt {
+                content: "rules v1".to_string(),
+            });
+            legacy.push(ChatMessage::system("rules v1"));
+
+            // 2) RecordUserTurn → append user
+            let _ = state.reduce(Action::RecordUserTurn("u1".to_string()));
+            legacy.push(ChatMessage::user("u1"));
+
+            // 3) SetLeadingSystemPrompt 非空 history → 替换 history[0]
+            let _ = state.reduce(Action::SetLeadingSystemPrompt {
+                content: "rules v2".to_string(),
+            });
+            if let Some(first) = legacy.first_mut() {
+                *first = ChatMessage::system("rules v2");
+            }
+
+            // 4) RecordAssistantTurn → append assistant
+            let _ = state.reduce(Action::RecordAssistantTurn("a1".to_string()));
+            legacy.push(ChatMessage::assistant("a1"));
+
+            // 5) RecordSystemMessage → append system 到末尾（/clear 后场景）
+            let _ = state.reduce(Action::RecordSystemMessage {
+                content: "context note".to_string(),
+            });
+            legacy.push(ChatMessage::system("context note"));
+
+            // ── 字节级 parity ──
+            assert_eq!(
+                state.session.history.len(),
+                legacy.len(),
+                "history.len() 与 legacy 手动镜像应一致"
+            );
+            for (i, (lhs, rhs)) in state.session.history.iter().zip(legacy.iter()).enumerate() {
+                assert_eq!(lhs.role, rhs.role, "history[{i}] role 不一致");
+                assert_eq!(
+                    lhs.content.as_bytes(),
+                    rhs.content.as_bytes(),
+                    "history[{i}] content 字节级不一致"
+                );
+            }
+        }
+
         /// S2-B-3: redux_record_turns_single_write_no_duplicate_session_turns
         ///
         /// dispatch `RecordUserTurn` + `RecordAssistantTurn` 各一次后，
