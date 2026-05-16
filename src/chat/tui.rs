@@ -1354,7 +1354,7 @@ pub const STREAMING_VISIBLE_ROWS: u16 = 6;
 /// Clamped to [`BOTTOM_CHROME_MIN_HEIGHT`]..=[`BOTTOM_CHROME_MAX_HEIGHT`].
 ///
 /// S4-A Commit 2: 泛型化让 UiSnapshot 与 TuiState 共用同一份高度计算逻辑。
-pub fn bottom_chrome_height<V: BottomChromeView>(state: &V) -> u16 {
+pub fn bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
     let streaming_rows = if state.streaming().is_some() {
@@ -1380,7 +1380,7 @@ pub fn bottom_chrome_height<V: BottomChromeView>(state: &V) -> u16 {
 ///   2. Streaming preview (optional, up to [`STREAMING_VISIBLE_ROWS`])
 ///   3. Input box (dynamic, border + 1..=[`INPUT_MAX_VISIBLE_ROWS`])
 ///   4. Footer (1 row)
-pub fn render_bottom_chrome<V: BottomChromeView>(frame: &mut Frame, state: &V) {
+pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, state: &V) {
     // The inline viewport reserves `BOTTOM_CHROME_MAX_HEIGHT` rows at the
     // bottom of the host terminal. The dynamic chrome height is usually
     // smaller, so align it to the bottom of the reserved frame so the
@@ -1424,7 +1424,7 @@ pub fn render_bottom_chrome<V: BottomChromeView>(frame: &mut Frame, state: &V) {
     }
 }
 
-fn render_status_bar<V: BottomChromeView>(frame: &mut Frame, area: Rect, state: &V) {
+fn render_status_bar<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
     let title_str = state.session_title();
     let title = if title_str.is_empty() {
         "(new session)"
@@ -1447,7 +1447,7 @@ fn render_status_bar<V: BottomChromeView>(frame: &mut Frame, area: Rect, state: 
 /// Render the in-flight streaming-assistant draft inside the inline
 /// viewport. Trimmed to the last [`STREAMING_VISIBLE_ROWS`] rows so the
 /// most recently arrived tokens stay visible.
-fn render_streaming_preview<V: BottomChromeView>(frame: &mut Frame, area: Rect, state: &V) {
+fn render_streaming_preview<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
     let Some(draft) = state.streaming() else {
         return;
     };
@@ -1775,7 +1775,7 @@ const fn tool_bullet_color(status: ToolStatus) -> Color {
     }
 }
 
-fn render_input<V: BottomChromeView>(frame: &mut Frame, area: Rect, state: &V) {
+fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
     // Compose prompt lines: first row gets "> ", continuation rows get "  ".
     let input_ref = state.input();
     let rendered_lines: Vec<Line<'_>> = input_ref

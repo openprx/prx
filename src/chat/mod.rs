@@ -1049,9 +1049,7 @@ pub async fn run(
             (None, None)
         }
     };
-    // 防止 Commit 3 阶段未消费 rx 导致 unused 警告；Commit 4 接入 run_tui_unified_loop 后真消费.
-    #[cfg(feature = "terminal-tui")]
-    let _snapshot_rx_for_tui = snapshot_rx_for_tui;
+    // Commit 4: snapshot_rx_for_tui 传给 run_tui_unified_loop（见 TUI 分支 spawn_tui_unified_loop 调用）.
 
     #[cfg(feature = "terminal-tui")]
     let dispatcher_handle = dispatcher::spawn_dispatcher_task_full(
@@ -1157,6 +1155,9 @@ pub async fn run(
                     // into `chat_mirror`.
                     let redraw_tx_main = redraw_tx.clone();
                     let redraw_tx_loop = redraw_tx.clone();
+                    // S4-A Commit 4: Pure 模式把 snapshot_rx 传给 unified loop，
+                    // 让其从 watch::Receiver borrow snapshot 替代 chat_mirror.lock()。
+                    // Off/Both/Redux 模式 snapshot_rx_for_tui=None，loop 走 mirror.
                     spawn_tui_unified_loop(
                         input_tx,
                         Arc::clone(&chat_mirror),
@@ -1166,6 +1167,7 @@ pub async fn run(
                         Arc::clone(&last_ctrlc_ms),
                         Arc::clone(&active_cancel),
                         chat_dispatcher.clone(),
+                        snapshot_rx_for_tui.clone(),
                     );
                     (Some(guard), Some(redraw_tx_main))
                 }
@@ -2437,6 +2439,59 @@ fn render_response(response: &str) -> String {
 /// of capacity 1 used as a coalescer (multiple `try_send(())` calls collapse
 /// into a single deferred redraw).
 ///
+/// S4-A Commit 4: RenderSource — Pure 模式从 `watch::Receiver` 读 snapshot；
+/// Off/Both/Redux 模式从 mirror 锁读 TuiState。
+///
+/// 渲染 hot path 通过 [`Self::with_view`] 闭包统一拿 `&dyn BottomChromeView`，
+/// 避免两条路径重复代码；pending 行 flush 通过 [`Self::read_pending`] 单独拿
+/// `(Vec<ConversationLine>, ascii_fallback)` 元组（mirror 路径用 lock，
+/// snapshot 路径 borrow Arc Vec 内容）.
+#[cfg(feature = "terminal-tui")]
+pub(crate) enum RenderSource {
+    Mirror(Arc<parking_lot::Mutex<tui::TuiState>>),
+    Snapshot(tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>),
+}
+
+#[cfg(feature = "terminal-tui")]
+impl RenderSource {
+    pub(crate) fn with_view<R>(&self, f: impl FnOnce(&dyn tui::BottomChromeView) -> R) -> R {
+        match self {
+            Self::Mirror(arc) => {
+                let guard = arc.lock();
+                f(&*guard)
+            }
+            Self::Snapshot(rx) => {
+                let snap_arc = rx.borrow();
+                f(&**snap_arc)
+            }
+        }
+    }
+
+    /// 返回 (从 `from_idx` 起的 pending 行的 clone, ascii_fallback).
+    pub(crate) fn read_pending(&self, from_idx: usize) -> (Vec<tui::ConversationLine>, bool) {
+        match self {
+            Self::Mirror(arc) => {
+                let guard = arc.lock();
+                let slice: Vec<tui::ConversationLine> = guard
+                    .conversation_lines
+                    .get(from_idx..)
+                    .map(<[tui::ConversationLine]>::to_vec)
+                    .unwrap_or_default();
+                (slice, guard.ascii_fallback)
+            }
+            Self::Snapshot(rx) => {
+                let snap_arc = rx.borrow();
+                let slice: Vec<tui::ConversationLine> = snap_arc
+                    .conversation_lines
+                    .get(from_idx..)
+                    .map(<[tui::ConversationLine]>::to_vec)
+                    .unwrap_or_default();
+                (slice, snap_arc.ascii_fallback)
+            }
+        }
+    }
+}
+
 /// Runs inside `tokio::task::spawn_blocking` because `terminal.draw()`
 /// performs synchronous I/O and `mpsc::Receiver::blocking_recv()` blocks the
 /// caller. Returning a `JoinHandle` lets the caller observe panics if
@@ -2489,6 +2544,7 @@ fn spawn_tui_unified_loop(
     last_ctrlc_ms: Arc<AtomicU64>,
     active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
     chat_dispatcher: dispatcher::ChatDispatcher,
+    snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = run_tui_unified_loop(
@@ -2500,6 +2556,7 @@ fn spawn_tui_unified_loop(
             last_ctrlc_ms,
             active_cancel,
             &chat_dispatcher,
+            snapshot_rx,
         );
         if let Err(e) = result {
             tracing::error!("TUI unified loop error: {e}");
@@ -2528,12 +2585,21 @@ fn run_tui_unified_loop(
     last_ctrlc_ms: Arc<AtomicU64>,
     active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
     chat_dispatcher: &dispatcher::ChatDispatcher,
+    snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
     use crate::chat::action::Action;
     use crate::chat::state::{ChatState, Effect};
     use crossterm::event::{Event, KeyEventKind};
     use ratatui::{TerminalOptions, Viewport};
+
+    let render_source = snapshot_rx.map_or_else(
+        || RenderSource::Mirror(Arc::clone(&mirror)),
+        |rx| {
+            tracing::info!("S4-A Commit 4: run_tui_unified_loop using RenderSource::Snapshot");
+            RenderSource::Snapshot(rx)
+        },
+    );
 
     // Step 2: 双写灰度 — `PRX_CHAT_REDUX` 控制 reducer 路径是否生效
     //   未设 / "0"  → 旧路径单写（默认；reducer 不构造）
@@ -2581,8 +2647,11 @@ fn run_tui_unified_loop(
     // Materialise the inline viewport immediately so the chrome (status
     // bar + input box + footer) is visible the moment the session opens,
     // rather than only after the first event-loop iteration draws.
+    //
+    // S4-A Commit 4: 通过 RenderSource::with_view 拿 &dyn BottomChromeView,
+    // Pure/non-Pure 双路径共用 render_bottom_chrome 泛型.
     terminal
-        .draw(|f| tui::render_bottom_chrome(f, &*mirror.lock()))
+        .draw(|f| render_source.with_view(|view| tui::render_bottom_chrome(f, view)))
         .map_err(|e| anyhow::anyhow!("initial TUI draw failed: {e}"))?;
 
     // Number of `conversation_lines` already flushed to the host
@@ -2605,15 +2674,11 @@ fn run_tui_unified_loop(
         // `insert_before` (which performs blocking I/O). This avoids
         // holding the lock across stdout writes — producers can keep
         // pushing into `conversation_lines` while we drain.
-        let (pending, ascii_fallback) = {
-            let guard = mirror.lock();
-            let slice: Vec<tui::ConversationLine> = guard
-                .conversation_lines
-                .get(last_pushed_idx..)
-                .map(<[tui::ConversationLine]>::to_vec)
-                .unwrap_or_default();
-            (slice, guard.ascii_fallback)
-        };
+        //
+        // S4-A Commit 4: Snapshot 路径 borrow_and_update Arc<UiSnapshot>，
+        // Mirror 路径走原有 lock。两种路径都按 `last_pushed_idx` 切片以增量
+        // 推送，同语义.
+        let (pending, ascii_fallback) = render_source.read_pending(last_pushed_idx);
         let pending_count = pending.len();
         let term_width = terminal.size().map(|s| s.width).unwrap_or(80).max(1);
         for line in &pending {
@@ -2639,7 +2704,7 @@ fn run_tui_unified_loop(
         // of the reserved frame area, so unused rows above stay blank
         // without disturbing scrollback.
         while redraw_rx.try_recv().is_ok() {}
-        if let Err(e) = terminal.draw(|f| tui::render_bottom_chrome(f, &*mirror.lock())) {
+        if let Err(e) = terminal.draw(|f| render_source.with_view(|view| tui::render_bottom_chrome(f, view))) {
             tracing::warn!(error = %e, "TUI draw failed");
         }
 
@@ -3541,5 +3606,99 @@ mod redux_mode_tests {
                 "mode {mode:?}: legacy_session_mode_writes_enabled 应为 {expected_legacy_enabled}"
             );
         }
+    }
+}
+
+// ─── S4-A Commit 4: RenderSource enum 双路径 ──────────────────────────────────
+
+#[cfg(test)]
+#[cfg(feature = "terminal-tui")]
+mod s4_a_4 {
+    use super::*;
+    use crate::chat::state::{ChatState, UiSnapshot};
+    use crate::chat::tui::{ConversationLine, TuiState};
+    use std::sync::Arc;
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+
+    fn build_state_with_lines() -> ChatState {
+        let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+        state.ui.conversation_lines.push(ConversationLine::User {
+            content: "a".to_string(),
+        });
+        state.ui.conversation_lines.push(ConversationLine::Assistant {
+            content: "b".to_string(),
+        });
+        state
+    }
+
+    /// RenderSource enum dispatch：mirror & snapshot 两种构造方式各自正确分支.
+    #[test]
+    fn s4_a_4_render_source_enum_dispatch() {
+        // Mirror 路径.
+        let tui = TuiState::new("p", "m");
+        let mirror = Arc::new(parking_lot::Mutex::new(tui));
+        let src_mirror = RenderSource::Mirror(Arc::clone(&mirror));
+        src_mirror.with_view(|view| {
+            assert_eq!(view.provider(), "p");
+            assert_eq!(view.model(), "m");
+        });
+
+        // Snapshot 路径.
+        let snap = Arc::new(UiSnapshot::initial(Arc::from("ps"), Arc::from("ms")));
+        let (_tx, rx) = watch::channel(snap);
+        let src_snap = RenderSource::Snapshot(rx);
+        src_snap.with_view(|view| {
+            assert_eq!(view.provider(), "ps");
+            assert_eq!(view.model(), "ms");
+        });
+    }
+
+    /// read_pending：snapshot 路径返回正确切片.
+    #[test]
+    fn s4_a_4_pending_lines_drain_from_snapshot() {
+        let state = build_state_with_lines();
+        let snap = Arc::new(state.build_ui_snapshot(1));
+        let (_tx, rx) = watch::channel(snap);
+        let src = RenderSource::Snapshot(rx);
+        // from_idx=0 → 全部 2 行.
+        let (pending, ascii) = src.read_pending(0);
+        assert_eq!(pending.len(), 2);
+        assert!(!ascii);
+        // from_idx=1 → 1 行.
+        let (pending2, _) = src.read_pending(1);
+        assert_eq!(pending2.len(), 1);
+        // from_idx=10（越界）→ 空.
+        let (pending3, _) = src.read_pending(10);
+        assert!(pending3.is_empty());
+    }
+
+    /// 验证 snapshot 路径在 watch 推送新值后 with_view 看到新内容.
+    #[tokio::test]
+    async fn s4_a_4_unified_loop_redraw_on_snapshot_change() {
+        let state = build_state_with_lines();
+        let snap0 = Arc::new(state.build_ui_snapshot(1));
+        let (tx, rx) = watch::channel(Arc::clone(&snap0));
+        let src = RenderSource::Snapshot(rx);
+
+        // 初始：2 行.
+        src.with_view(|view| assert_eq!(view.conversation_lines().len(), 2));
+
+        // 推送新 snapshot：3 行.
+        let mut state2 = state;
+        state2.ui.conversation_lines.push(ConversationLine::System {
+            content: "c".to_string(),
+        });
+        let snap1 = Arc::new(state2.build_ui_snapshot(2));
+        tx.send(snap1).expect("send snap1");
+
+        // 新视图应看到 3 行.
+        src.with_view(|view| {
+            assert_eq!(view.conversation_lines().len(), 3, "watch 推送后应看到新行");
+            // 验证 revision 单调.
+            // (revision 不在 BottomChromeView trait 上, 用 read_pending 间接验证).
+        });
+        let (pending, _) = src.read_pending(0);
+        assert_eq!(pending.len(), 3);
     }
 }
