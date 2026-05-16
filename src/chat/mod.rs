@@ -2113,6 +2113,8 @@ pub async fn run(
         // session.history 与 legacy history 字节级对齐。下方 line 2055 处的
         // 旧 dispatch 用 sanitized_response，与 history.push 内容不同 — S2-B Step 4
         // 起改在此处 dispatch 用 history_response，下方旧 dispatch 删除。
+        // FIXME(S2.5): try_dispatch 失败被忽略，channel full/closed 时状态静默丢失。
+        // 统一错误处理挪 S2.5 横切（错误分层 + tracing 埋点）。
         let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordAssistantTurn(
             history_response.clone(),
         ));
