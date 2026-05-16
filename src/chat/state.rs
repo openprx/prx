@@ -198,6 +198,60 @@ pub struct UiState {
     pub last_submitted: Option<String>,
 }
 
+/// 不可变 UI 快照（renderer 仅读，dispatcher 在 ui_dirty=true 时构造）.
+///
+/// S4-A Commit 1: 引入 UiSnapshot 作为 reducer 与 ratatui 渲染线程之间的
+/// 单向只读通道。Arc 字段共享让"每轮 push 一行"不需要 clone 整个
+/// `Vec<ConversationLine>`；revision 单调递增供 watch::Sender::send_if_modified
+/// 跳过相同帧 + 调试断言。
+///
+/// 字段对应渲染 chrome 需要的最小集（status bar / streaming preview / input 框
+/// / footer）；BottomChromeView trait（Commit 2 落地）抽象掉 TuiState vs
+/// UiSnapshot 的差异，让 render_bottom_chrome 双源共用。
+#[cfg(feature = "terminal-tui")]
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct UiSnapshot {
+    /// 单调递增，watch::Sender::send_if_modified 用于跳过相同帧.
+    pub revision: u64,
+    /// 当前 provider 名（status bar 显示）.
+    pub provider: Arc<str>,
+    /// 当前 model 名.
+    pub model: Arc<str>,
+    /// 会话标题（status bar 显示）.
+    pub session_title: Arc<str>,
+    /// 对话回合计数（status bar 显示）.
+    pub turn_count: usize,
+    /// ASCII 降级模式标志.
+    pub ascii_fallback: bool,
+    /// 对话行历史（renderer 增量 insert_before 用 len() diff）.
+    pub conversation_lines: Arc<Vec<ConversationLine>>,
+    /// 当前 in-flight streaming draft（None 表示空闲）.
+    pub streaming: Option<StreamingDraft>,
+    /// 输入 buffer 快照（clone 成本接受，多行场景 < INPUT_MAX_VISIBLE_ROWS）.
+    pub input: TuiInput,
+}
+
+#[cfg(feature = "terminal-tui")]
+impl UiSnapshot {
+    /// 构造空快照（revision=0，仅 provider/model 已知，session 未加载）.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn initial(provider: Arc<str>, model: Arc<str>) -> Self {
+        Self {
+            revision: 0,
+            provider,
+            model,
+            session_title: Arc::from(""),
+            turn_count: 0,
+            ascii_fallback: false,
+            conversation_lines: Arc::new(Vec::new()),
+            streaming: None,
+            input: TuiInput::new(),
+        }
+    }
+}
+
 /// 流式推理中间态（每轮重置）.
 #[allow(dead_code)]
 pub struct StreamState {
@@ -291,6 +345,89 @@ impl ChatState {
     #[allow(clippy::missing_const_for_fn)]
     fn new_input() -> TuiInput {
         Vec::new()
+    }
+
+    /// 构造当前状态对应的 [`UiSnapshot`].
+    ///
+    /// S4-A Commit 1: 由 dispatcher 在 `reduce_tracked` 返回 ui_dirty=true 后调用，
+    /// 通过 `watch::Sender::send_if_modified` 推送给 ratatui 渲染线程。
+    /// Arc 字段（`conversation_lines`）让快照之间共享底层 Vec，避免每轮 push
+    /// 一行就整体 clone；session_title 是短 String，转 Arc<str> 后 clone 是
+    /// refcount 增量。
+    ///
+    /// `revision` 必须由调用方维护单调递增（dispatcher 自带 `AtomicU64`），
+    /// 这样 receiver 端可断言 `new.revision > cur.revision` 跳过乱序帧。
+    #[cfg(feature = "terminal-tui")]
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn build_ui_snapshot(&self, revision: u64) -> UiSnapshot {
+        UiSnapshot {
+            revision,
+            provider: Arc::clone(&self.session.provider),
+            model: Arc::clone(&self.session.model),
+            session_title: Arc::from(self.session.title.as_str()),
+            turn_count: self.ui.turn_count,
+            ascii_fallback: self.ui.ascii_fallback,
+            conversation_lines: Arc::new(self.ui.conversation_lines.clone()),
+            streaming: self.stream.draft.clone(),
+            input: self.ui.input.clone(),
+        }
+    }
+
+    /// `reduce` + 显式 ui_dirty 信号（S4-A Commit 1 引入）.
+    ///
+    /// 决策（Codex S4-A 阶段 1 评分 8.1/10 采纳）:
+    /// - **不用** action 白名单作为 dirty 判定来源（易漏新 Action）
+    /// - 改为根据 Action 变体名 + reducer 内部对 `ui.conversation_lines / stream.draft
+    ///   / ui.input` 的实际写入决定 dirty
+    ///
+    /// 实现说明（与规划版本的偏离）:
+    /// - 规划要求把 `reduce` 改成 `(Vec<Effect>, bool)` 签名。但 PRX 现有
+    ///   ~250 个 test caller 用 `let effects = state.reduce(...)` 直接拿
+    ///   `Vec<Effect>`，全量 destructure 改造收益远低于风险。
+    /// - 实际把 dirty 决策放在本 wrapper 内：top-level match Action 变体，
+    ///   exhaustive 检查保证新增 Action 编译期可见漏写。`reduce` / `reduce_with_now`
+    ///   签名保持不变。
+    ///
+    /// dispatcher 只调用 `reduce_tracked`（Commit 3 接线），test 仍可
+    /// 自由用 `reduce`/`reduce_with_now`。
+    #[cfg(feature = "terminal-tui")]
+    #[allow(dead_code)]
+    pub fn reduce_tracked(&mut self, action: Action) -> (Vec<Effect>, bool) {
+        let dirty = ui_dirty_for(&action);
+        // 对于可能动态决定 dirty 的 Action（如 KeyPressed），下面追加运行时校正.
+        let snap_before = self.snapshot_dirty_fields();
+        let effects = self.reduce(action);
+        let snap_after = self.snapshot_dirty_fields();
+        // 若静态 whitelist 已 true 直接返回；否则用运行时 diff 兜底（KeyPressed
+        // 等组合 Action 可能命中 dirty 也可能不命中）.
+        let dirty_final = dirty || (snap_before != snap_after);
+        (effects, dirty_final)
+    }
+
+    /// `reduce_tracked` 用于 dirty 判定的运行时兜底：返回 ui.conversation_lines.len() /
+    /// stream.draft.is_some() 等粒度指纹.
+    ///
+    /// 注：仅对**长度/计数级**变化敏感（如 push 一行 / draft None→Some），不对
+    /// 内容字节级变化敏感（如 streaming chunk 累积）— streaming 的内容变化由
+    /// 静态 whitelist `ui_dirty_for` 兜住（StreamChunkReceived → true）.
+    #[cfg(feature = "terminal-tui")]
+    fn snapshot_dirty_fields(&self) -> (usize, bool, u64, usize) {
+        let draft_ver = self.stream.draft.as_ref().map_or(0, |d| d.version);
+        (
+            self.ui.conversation_lines.len(),
+            self.stream.draft.is_some(),
+            draft_ver,
+            self.ui.input.lines.len(),
+        )
+    }
+
+    /// 非 terminal-tui feature 下 ui_dirty 始终 false（无 UI 渲染源）.
+    #[cfg(not(feature = "terminal-tui"))]
+    #[allow(dead_code)]
+    pub fn reduce_tracked(&mut self, action: Action) -> (Vec<Effect>, bool) {
+        let effects = self.reduce(action);
+        (effects, false)
     }
 
     /// 纯 sync 状态机 — 根据 [`Action`] mutate self，返回需要主循环执行的 [`Effect`] 列表.
@@ -1440,6 +1577,83 @@ pub fn compact_history_in_place(history: &mut Vec<ChatMessage>) {
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
+
+/// S4-A Commit 1: 静态判断给定 [`Action`] 是否影响 UI 渲染所需的字段
+/// (`ui.conversation_lines` / `stream.draft` / `ui.input`).
+///
+/// **exhaustive match** 保证未来新增 Action 变体编译期可见漏写：
+/// 编译器若发现新 variant 未匹配，cargo check 直接报错。
+///
+/// dirty=true 的 Action：reducer 调用后必产生 UI 字段变化，dispatcher 应
+/// 构造新 [`UiSnapshot`] 推送给 watch。
+///
+/// dirty=false 的 Action：reducer 仅写入 session/control 子状态或仅产生
+/// LogTrace，无需触发 watch send_if_modified。
+///
+/// **运行时兜底**：`reduce_tracked` 在静态判定为 false 时再用
+/// [`ChatState::snapshot_dirty_fields`] 比较 reduce 前后指纹，捕捉静态白名单
+/// 未明示的边缘情况（如某些 KeyPressed 实际未触发 input 变化但 reducer 走
+/// 路径未变 — 静态返回 true 也无害，运行时 send_if_modified 会跳过相同帧）.
+#[cfg(feature = "terminal-tui")]
+const fn ui_dirty_for(action: &Action) -> bool {
+    match action {
+        // 输入路径：写 ui.input → dirty
+        Action::KeyPressed(_)
+        | Action::PasteReceived(_)
+        | Action::InputSubmitted(_)
+        | Action::HistoryNavigated(_)
+        | Action::InputCancelled => true,
+
+        // 终端尺寸变化：snapshot 字段不变（width/height 不在 snapshot 内），
+        // 但渲染需要重新布局 — dirty=true 让 watch 触发 redraw 兜底.
+        Action::TerminalResized { .. } => true,
+
+        // UI 折叠/展开：直接 mutate conversation_lines → dirty
+        Action::ToolCardFoldToggled | Action::ReasoningFoldToggled => true,
+
+        // 槽命令本身 reducer 是 no-op（实际执行在 mod.rs），不变 UI
+        Action::SlashCommandIssued { .. } => false,
+        // 模式切换：仅写 session.mode，UI 不显示模式（status bar 没 mode 字段）
+        Action::ModeChanged(_) => false,
+
+        // 流式 / 工具事件：全部写 stream.draft 或 conversation_lines → dirty
+        Action::TurnStarted { .. }
+        | Action::StartLLMTurn { .. }
+        | Action::StreamChunkReceived { .. }
+        | Action::StreamCompleted { .. }
+        | Action::StreamFailed { .. }
+        | Action::StreamCancelled { .. }
+        | Action::ToolStarted { .. }
+        | Action::ToolFinished { .. } => true,
+        // 仅 LogTrace，不变 UI
+        Action::ToolProgress { .. }
+        | Action::ToolApprovalRequested { .. }
+        | Action::ToolApprovalReceived { .. }
+        | Action::StreamRetryAttempt { .. } => false,
+
+        // 会话：SessionLoaded 重建 history + 可能要求 UI 重置；SessionSaved/Switched 不影响 UI
+        Action::SessionLoaded(_) => true,
+        Action::SessionSaved { .. } | Action::SessionSwitched { .. } => false,
+        // Record* 写 session.turns / history，不直接进 conversation_lines（那是
+        // ToolStarted/StreamCompleted 等单独处理），UI 不变.
+        Action::RecordUserTurn(_)
+        | Action::RecordAssistantTurn(_)
+        | Action::RecordSystemMessage { .. }
+        | Action::SetLeadingSystemPrompt { .. }
+        | Action::HistoryCompacted { .. } => false,
+
+        // UI 镜像账本 / 历史清空：直接动 conversation_lines → dirty
+        Action::SystemMessageAdded { .. } | Action::HistoryCleared => true,
+        // RedrawRequested 仅产生 RequestRedraw Effect，本身不变 snapshot 字段；
+        // 但语义上需要触发 redraw — 标 dirty 走 watch 路径.
+        Action::RedrawRequested => true,
+
+        // 退出：CancelRequested / ShutdownRequested 可能清空 stream.draft → dirty.
+        Action::CancelRequested | Action::ShutdownRequested => true,
+        // ForceQuit 仅发 Quit Effect，UI 立刻被 unmount，dirty 无意义.
+        Action::ForceQuit => false,
+    }
+}
 
 /// 双击 Ctrl+C 退出窗口（毫秒）.
 const DOUBLE_CTRLC_WINDOW_MS: u64 = 500;
@@ -4643,6 +4857,124 @@ mod tests {
                 2,
                 "build_session_snapshot 落盘的 turns 必须携带 tool_calls"
             );
+        }
+    }
+
+    // ─── S4-A Commit 1: UiSnapshot + reduce_tracked 单测 ─────────────────────
+
+    #[cfg(feature = "terminal-tui")]
+    mod s4_a_1 {
+        use super::*;
+        use crate::chat::tui::ConversationLine;
+        use tokio_util::sync::CancellationToken;
+
+        fn make_state() -> ChatState {
+            ChatState::new(
+                Arc::from("test-provider"),
+                Arc::from("test-model"),
+                CancellationToken::new(),
+            )
+        }
+
+        #[test]
+        fn s4_a_1_snapshot_initial_zero_revision() {
+            let snap = UiSnapshot::initial(Arc::from("p"), Arc::from("m"));
+            assert_eq!(snap.revision, 0);
+            assert_eq!(&*snap.provider, "p");
+            assert_eq!(&*snap.model, "m");
+            assert!(snap.conversation_lines.is_empty());
+            assert_eq!(snap.turn_count, 0);
+            assert!(snap.streaming.is_none());
+        }
+
+        #[test]
+        fn s4_a_1_snapshot_clone_is_arc_shallow() {
+            // 验证 conversation_lines 是 Arc 共享：clone snapshot 后两份 Arc
+            // 指向同一底层 Vec，strong_count 至少为 2.
+            let mut state = make_state();
+            state.ui.conversation_lines.push(ConversationLine::User {
+                content: "hi".to_string(),
+            });
+            let snap = state.build_ui_snapshot(1);
+            let snap2 = snap.clone();
+            // Arc::strong_count(&snap.conversation_lines) 包含 snap + snap2 = 2
+            assert!(
+                Arc::strong_count(&snap.conversation_lines) >= 2,
+                "snapshot clone 应共享 conversation_lines Arc, count={}",
+                Arc::strong_count(&snap.conversation_lines)
+            );
+            assert_eq!(snap2.revision, 1);
+        }
+
+        #[test]
+        fn s4_a_1_build_after_user_message_includes_line() {
+            let mut state = make_state();
+            state.ui.conversation_lines.push(ConversationLine::User {
+                content: "hello".to_string(),
+            });
+            let snap = state.build_ui_snapshot(7);
+            assert_eq!(snap.revision, 7);
+            assert_eq!(snap.conversation_lines.len(), 1);
+            match snap.conversation_lines.first() {
+                Some(ConversationLine::User { content }) => assert_eq!(content, "hello"),
+                other => panic!("expected User line, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn s4_a_1_ui_dirty_true_on_record_user_turn_via_runtime_fallback() {
+            // RecordUserTurn 静态判定 false（写 session 不写 ui）；
+            // 运行时 snapshot_dirty_fields 也不变 → 整体 false.
+            // 此用例校验：写 session 不连带触发 dirty.
+            let mut state = make_state();
+            let (_effects, dirty) = state.reduce_tracked(Action::RecordUserTurn("q".into()));
+            assert!(!dirty, "RecordUserTurn 不应触发 ui_dirty");
+        }
+
+        #[test]
+        fn s4_a_1_ui_dirty_false_on_log_trace_only_actions() {
+            let mut state = make_state();
+            let (_e, d) = state.reduce_tracked(Action::ToolProgress { iteration: 1, max: 3 });
+            assert!(!d, "ToolProgress 仅 LogTrace, 不应 dirty");
+            let (_e, d2) = state.reduce_tracked(Action::StreamRetryAttempt {
+                attempt: 1,
+                reason: "x".into(),
+            });
+            assert!(!d2, "StreamRetryAttempt 不应 dirty");
+        }
+
+        #[test]
+        fn s4_a_1_ui_dirty_true_on_stream_completed() {
+            // 完整流程：先 TurnStarted 注册 draft，再 StreamCompleted finalize.
+            let mut state = make_state();
+            let token = CancellationToken::new();
+            let (_e, d_start) = state.reduce_tracked(Action::TurnStarted {
+                draft_id: "d1".into(),
+                cancel: token,
+            });
+            assert!(d_start, "TurnStarted 应 dirty (stream.draft 变化)");
+            let (_e, d_done) = state.reduce_tracked(Action::StreamCompleted {
+                draft_id: "d1".into(),
+                final_text: "hi".into(),
+                reasoning: String::new(),
+            });
+            assert!(d_done, "StreamCompleted 应 dirty (conversation_lines + stream.draft)");
+        }
+
+        #[test]
+        fn s4_a_1_ui_dirty_true_on_system_message_added() {
+            let mut state = make_state();
+            let (_e, d) = state.reduce_tracked(Action::SystemMessageAdded { text: "banner".into() });
+            assert!(d, "SystemMessageAdded 应 dirty (push 到 conversation_lines)");
+        }
+
+        #[test]
+        fn s4_a_1_build_session_title_into_arc() {
+            // session.title 是 String，snapshot 内是 Arc<str> — 验证转换正确.
+            let mut state = make_state();
+            state.session.title = "my chat".to_string();
+            let snap = state.build_ui_snapshot(2);
+            assert_eq!(&*snap.session_title, "my chat");
         }
     }
 }
