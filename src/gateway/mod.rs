@@ -839,6 +839,9 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 
 /// GET /metrics — Prometheus text exposition format
 async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    // 合并 PrometheusObserver 主 registry + chat_metrics 独立 registry (S2.5 P1-A).
+    // chat 4 个 counter 独立于 observer 物理隔离，必须显式合并才能被 scrape 到。
+    let chat_reg = crate::observability::chat_metrics::chat_registry();
     let body = state
         .observer
         .as_ref()
@@ -846,11 +849,13 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
         .downcast_ref::<crate::observability::PrometheusObserver>()
         .map_or_else(
             || {
-                String::from(
-                    "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n",
+                // observer 非 Prometheus 时，chat 指标仍需暴露。
+                format!(
+                    "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n{}",
+                    crate::observability::prometheus::encode_registries(&[chat_reg])
                 )
             },
-            |prom| prom.encode(),
+            |prom| prom.encode_with_extras(&[chat_reg]),
         );
 
     (StatusCode::OK, [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)], body)
@@ -3076,5 +3081,159 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert!(!keys.contains_key("old-key"));
         assert!(keys.contains_key("new-key"));
+    }
+
+    /// S2.5 P1-A: /metrics 端点在 PrometheusObserver 模式下包含 chat counter 指标.
+    #[tokio::test]
+    async fn s2_5_p1c_metrics_endpoint_exposes_chat_counters() {
+        let prom = Arc::new(crate::observability::PrometheusObserver::try_new().unwrap());
+        crate::observability::Observer::record_event(
+            prom.as_ref(),
+            &crate::observability::ObserverEvent::HeartbeatTick,
+        );
+        // 递增 4 个 chat counter（使用唯一 label 避免与其他测试累计值干扰）
+        crate::observability::chat_metrics::inc_action("s2_5_p1c_test_kind");
+        crate::observability::chat_metrics::inc_effect("s2_5_p1c_test_effect");
+        crate::observability::chat_metrics::inc_stream_chunk();
+        crate::observability::chat_metrics::inc_dispatch_drop("s2_5_p1c_test_drop");
+
+        let observer: Arc<dyn crate::observability::Observer> = prom;
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            signal: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer,
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
+        };
+
+        let response = handle_metrics(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // PrometheusObserver 自身指标仍在
+        assert!(
+            text.contains("prx_heartbeat_ticks_total"),
+            "observer metrics must be present"
+        );
+        // chat 4 个 counter 名都要出现
+        assert!(text.contains("prx_chat_actions_total"), "chat actions counter missing");
+        assert!(text.contains("prx_chat_effects_total"), "chat effects counter missing");
+        assert!(
+            text.contains("prx_chat_stream_chunks_total"),
+            "chat stream chunks counter missing"
+        );
+        assert!(
+            text.contains("prx_chat_dispatch_drops_total"),
+            "chat dispatch drops counter missing"
+        );
+    }
+
+    /// S2.5 P1-A: /metrics 端点在 NoopObserver 模式下仍暴露 chat counter 指标.
+    #[tokio::test]
+    async fn s2_5_p1c_metrics_endpoint_exposes_chat_when_observer_noop() {
+        // 触发 LazyLock 初始化，确保 4 个 counter 注册到 CHAT_REGISTRY
+        crate::observability::chat_metrics::inc_action("s2_5_p1c_noop_kind");
+        crate::observability::chat_metrics::inc_effect("s2_5_p1c_noop_effect");
+        crate::observability::chat_metrics::inc_stream_chunk();
+        crate::observability::chat_metrics::inc_dispatch_drop("s2_5_p1c_noop_drop");
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            signal: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
+        };
+
+        let response = handle_metrics(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // noop observer 降级路径：仍含 hint 前缀
+        assert!(
+            text.contains("Prometheus backend not enabled"),
+            "hint prefix must be present"
+        );
+        // chat counter 名也要出现（即使 noop observer）
+        assert!(
+            text.contains("prx_chat_actions_total"),
+            "chat actions counter missing with noop observer"
+        );
+        assert!(
+            text.contains("prx_chat_effects_total"),
+            "chat effects counter missing with noop observer"
+        );
+        assert!(
+            text.contains("prx_chat_stream_chunks_total"),
+            "chat stream chunks counter missing with noop observer"
+        );
+        assert!(
+            text.contains("prx_chat_dispatch_drops_total"),
+            "chat dispatch drops counter missing with noop observer"
+        );
     }
 }
