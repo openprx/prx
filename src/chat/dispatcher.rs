@@ -5739,4 +5739,174 @@ mod real_mode_tests {
         }
         assert!(saw_failed, "must emit StreamFailed after exhausting network retries");
     }
+
+    // ─── S2.5 T2.5-3: Effect 重放幂等性测试 ────────────────────────────────────
+
+    /// S2.5 T2.5-3: 同 snapshot 连续 dispatch SaveSession 两次 store_count == 2，
+    /// 状态收敛（idempotent-overwrite 语义：每次都覆盖，最终一致）。
+    #[tokio::test]
+    async fn s2_5_t2_5_3_save_session_dispatch_idempotent() {
+        let store_count = Arc::new(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(CountingMemory {
+            inner: NoneMemory::new(),
+            store_count: Arc::clone(&store_count),
+        });
+        let shutdown = CancellationToken::new();
+        let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let session = ChatSession::new("prov", "model");
+        executor.execute(Effect::SaveSession(session.clone())).await;
+        executor.execute(Effect::SaveSession(session)).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            store_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "两次 SaveSession 应触发 memory.store 两次（idempotent-overwrite，非去重）"
+        );
+    }
+
+    /// S2.5 T2.5-3: 同 event 两次 NotifyHook 命中真 hook 两次（fire-and-forget 不抑制重复）.
+    ///
+    /// 通过真注册 hook + touch 哨兵 + 计数文件大小验证（touch 第二次会 update mtime
+    /// 但不改大小），用 `>>` append 行更可靠：第一次创建，第二次扩 1 字节。
+    #[tokio::test]
+    async fn s2_5_t2_5_3_notify_hook_repeat_no_double_fire() {
+        use crate::hooks::HookEvent;
+
+        let temp = TempDir::new().expect("tempdir");
+        let counter = temp.path().join("hook_counter.log");
+        let counter_str = counter.to_str().expect("valid path");
+
+        // 每次触发 append 一个字符到计数文件（用 sh -c 实现 append）.
+        let hooks_json = serde_json::json!({
+            "enabled": true,
+            "hooks": {
+                "turn_complete": [
+                    {
+                        "command": "sh",
+                        "args": ["-c", format!("printf x >> {counter_str}")],
+                        "stdin_json": false
+                    }
+                ]
+            }
+        });
+        std::fs::write(temp.path().join("hooks.json"), hooks_json.to_string()).expect("write hooks.json");
+
+        let hooks = Arc::new(HookManager::new(temp.path().to_path_buf()));
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let provider: Arc<dyn Provider> = Arc::new(MockEnvProvider::from_env());
+        let channel: Arc<dyn crate::channels::Channel> = Arc::new(TerminalChannel::new(true));
+        let observer: Arc<dyn crate::observability::Observer> = Arc::new(NoopObserver);
+        let (action_tx, _action_rx) = mpsc::channel::<Action>(64);
+        let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
+        let shutdown = CancellationToken::new();
+        let deps = EffectDeps {
+            provider,
+            memory,
+            channel,
+            hooks: Arc::clone(&hooks),
+            observer,
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+            redraw_tx: Some(redraw_tx),
+            shutdown,
+            model: Arc::from("test-model"),
+            temperature: 0.0,
+            tools_registry: None,
+            max_tool_iterations: 0,
+            approval_router: Arc::new(ApprovalRouter::new()),
+            approval_manager: None,
+        };
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::NotifyHook {
+                event: HookEvent::TurnComplete,
+                payload: serde_json::json!({"seq": 1}),
+            })
+            .await;
+        executor
+            .execute(Effect::NotifyHook {
+                event: HookEvent::TurnComplete,
+                payload: serde_json::json!({"seq": 2}),
+            })
+            .await;
+
+        // hook 命令是 spawn，给足时间.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let bytes = std::fs::read(&counter).unwrap_or_default();
+        assert_eq!(
+            bytes.len(),
+            2,
+            "两次 NotifyHook 应让 hook command 执行两次 → 计数器累计 2 字节，实测 {} 字节",
+            bytes.len()
+        );
+    }
+
+    /// S2.5 T2.5-3: CancelToken 三次 cancel 无 panic（token 内部幂等）.
+    ///
+    /// 首次 cancel 触发 token.is_cancelled() == true；后续 dispatch 应保持 true
+    /// 且无 panic / 无新副作用。
+    #[tokio::test]
+    async fn s2_5_t2_5_3_cancel_token_triple_cancel_no_panic() {
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled(), "token initially not cancelled");
+
+        for _ in 0..3 {
+            executor.execute(Effect::CancelToken(token.clone())).await;
+        }
+        // 三次都应将 token 保持在 cancelled = true，且无 panic.
+        assert!(token.is_cancelled(), "cancel 三次后 token 应保持 cancelled");
+    }
+
+    /// S2.5 T2.5-3: 并发 dispatch 两个 SaveSession 无 race / 无 deadlock
+    /// (T3-3-fixB D1 inline await 后的回归防护).
+    ///
+    /// 两个 spawn 调用 execute，等任务完成后 store_count == 2，无 panic / 无 hang.
+    #[tokio::test]
+    async fn s2_5_t2_5_3_save_session_concurrent_dispatch_no_race() {
+        let store_count = Arc::new(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(CountingMemory {
+            inner: NoneMemory::new(),
+            store_count: Arc::clone(&store_count),
+        });
+        let shutdown = CancellationToken::new();
+        let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = Arc::new(EffectExecutor::new_with_deps(deps));
+
+        let session = ChatSession::new("prov", "model");
+        let exec1 = Arc::clone(&executor);
+        let sess1 = session.clone();
+        let h1 = tokio::spawn(async move {
+            exec1.execute(Effect::SaveSession(sess1)).await;
+        });
+        let exec2 = Arc::clone(&executor);
+        let sess2 = session;
+        let h2 = tokio::spawn(async move {
+            exec2.execute(Effect::SaveSession(sess2)).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let _ = h1.await;
+            let _ = h2.await;
+        })
+        .await
+        .expect("test: concurrent dispatch should not deadlock");
+
+        // SaveSession 子任务异步 spawn，等其完成.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            store_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "两个并发 SaveSession 都应触发 memory.store 一次（共两次）"
+        );
+    }
 }
