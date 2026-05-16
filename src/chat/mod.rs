@@ -2547,7 +2547,7 @@ fn run_tui_unified_loop(
     // bar + input box + footer) is visible the moment the session opens,
     // rather than only after the first event-loop iteration draws.
     terminal
-        .draw(|f| tui::render_bottom_chrome(f, &mirror.lock()))
+        .draw(|f| tui::render_bottom_chrome(f, &*mirror.lock()))
         .map_err(|e| anyhow::anyhow!("initial TUI draw failed: {e}"))?;
 
     // Number of `conversation_lines` already flushed to the host
@@ -2604,7 +2604,7 @@ fn run_tui_unified_loop(
         // of the reserved frame area, so unused rows above stay blank
         // without disturbing scrollback.
         while redraw_rx.try_recv().is_ok() {}
-        if let Err(e) = terminal.draw(|f| tui::render_bottom_chrome(f, &mirror.lock())) {
+        if let Err(e) = terminal.draw(|f| tui::render_bottom_chrome(f, &*mirror.lock())) {
             tracing::warn!(error = %e, "TUI draw failed");
         }
 
