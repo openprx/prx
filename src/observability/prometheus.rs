@@ -180,11 +180,44 @@ impl PrometheusObserver {
 
     /// Encode all registered metrics into Prometheus text exposition format.
     pub fn encode(&self) -> String {
-        let encoder = TextEncoder::new();
-        let families = self.registry.gather();
-        let mut buf = Vec::new();
-        encoder.encode(&families, &mut buf).unwrap_or_default();
-        String::from_utf8(buf).unwrap_or_default()
+        self.encode_with_extras(&[])
+    }
+
+    /// Encode this observer's registry plus any extra registries into one Prometheus output.
+    ///
+    /// 用于 /metrics 端点将 `chat_metrics::CHAT_REGISTRY` 等物理独立的 registry
+    /// 合并暴露，避免 scrape 丢失 (S2.5 P1-A).
+    pub(crate) fn encode_with_extras(&self, extras: &[&Registry]) -> String {
+        let mut all_families = self.registry.gather();
+        for reg in extras {
+            all_families.extend(reg.gather());
+        }
+        encode_families(&all_families)
+    }
+}
+
+/// 将多个 registry 的 metrics 合并成 Prometheus 文本格式（供 noop observer 降级路径使用）.
+pub(crate) fn encode_registries(registries: &[&Registry]) -> String {
+    let families: Vec<_> = registries.iter().flat_map(|r| r.gather()).collect();
+    encode_families(&families)
+}
+
+/// 内部：将 MetricFamily 列表编码为 Prometheus 文本格式；编码失败时 warn + 返回空串.
+fn encode_families(families: &[prometheus::proto::MetricFamily]) -> String {
+    let encoder = TextEncoder::new();
+    let mut buf = Vec::new();
+    match encoder.encode(families, &mut buf) {
+        Ok(()) => match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("prometheus encode: UTF-8 conversion failed: {e}");
+                String::new()
+            }
+        },
+        Err(e) => {
+            tracing::warn!("prometheus encode: TextEncoder failed: {e}");
+            String::new()
+        }
     }
 }
 
