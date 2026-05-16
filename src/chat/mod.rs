@@ -1831,9 +1831,8 @@ pub async fn run(
                     if let Err(e) = terminal.finalize_draft("user", &d_id, &final_text).await {
                         tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
                     }
-                    // 3) RecordAssistantTurn 让 reducer 单写 session.turns
-                    //    （旧路径不跑 → 不会双写）。
-                    let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordAssistantTurn(final_text));
+                    // driver 路径 RecordAssistantTurn 已由 dispatcher.rs send（fixB B5）
+                    let _ = final_text;
                 }
                 Some(dispatcher::TurnOutcomeKind::Failed { err, retryable: _ }) => {
                     // reducer NotifyHook(Error) 已发；这里不再 hooks.emit 避免双发.

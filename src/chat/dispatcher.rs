@@ -1182,6 +1182,14 @@ async fn drive_start_turn_stream(
         }
     }
 
+    // T3-3-fixB B5：先 RecordAssistantTurn 再 StreamCompleted，让 reducer
+    // reduce_stream_completed emit Effect::SaveSession 时 session.turns 已
+    // 含本轮 assistant。与 fixA P0-1 legacy 路径修同款时序契约。
+    let record = Action::RecordAssistantTurn(accumulated.clone());
+    if let Err(e) = action_tx.send(record).await {
+        tracing::debug!(error = %e, "StartTurn: action_tx closed before RecordAssistantTurn");
+        return;
+    }
     let action = Action::StreamCompleted {
         draft_id,
         final_text: accumulated,
@@ -2778,6 +2786,98 @@ mod real_mode_tests {
         }
     }
 
+    /// T3-3-fixB B5: driver 路径 SaveSession 快照必须包含本轮 assistant.
+    ///
+    /// 端到端：用 MockEnvProvider 默认 stream（发一个 final chunk），驱 driver 跑完整流，
+    /// 把回投的 Action 序列依次喂给 reducer，断言：
+    ///   1. driver 先发 RecordAssistantTurn，再发 StreamCompleted（B5 顺序契约）
+    ///   2. StreamCompleted 触发的 SaveSession.turns.last() 是当轮 assistant（fixA P0-1 契约）
+    ///   3. turns.len() 严格等于 2（user + assistant，无双写）
+    ///
+    /// fixB B5 修复前：driver 直接发 StreamCompleted，reducer 构造 SaveSession 快照时
+    /// session.turns 缺当轮 assistant；本测试翻车即可定位回退.
+    #[tokio::test]
+    async fn t3_3_fix_b_driver_path_save_session_includes_assistant() {
+        use crate::chat::action::Action;
+        use crate::chat::state::ChatState;
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        // ── 启动 driver ──
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-fixB-B5".to_string(),
+                history: Vec::new(),
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        // ── 收 driver 回投的 Action，喂给 reducer ──
+        let mut state = ChatState::new(
+            Arc::from("test-prov"),
+            Arc::from("test-model"),
+            CancellationToken::new(),
+        );
+        state.session.id = "sess-fixB-B5".to_string();
+        // user turn 是 chat::run 主循环在 driver 起跑前 dispatch 的，这里手工补.
+        let _ = state.reduce(Action::RecordUserTurn("q".to_string()));
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "draft-fixB-B5".to_string(),
+            cancel: CancellationToken::new(),
+        });
+
+        let mut saw_record = false;
+        let mut save_snapshot: Option<crate::chat::session::ChatSession> = None;
+        for _ in 0..8 {
+            let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                .await
+                .expect("driver action within 1.5s")
+                .expect("action received");
+            match action {
+                Action::RecordAssistantTurn(text) => {
+                    assert!(!saw_record, "RecordAssistantTurn 应只发一次");
+                    saw_record = true;
+                    let _ = state.reduce(Action::RecordAssistantTurn(text));
+                }
+                Action::StreamCompleted {
+                    draft_id,
+                    final_text,
+                    reasoning,
+                } => {
+                    assert!(
+                        saw_record,
+                        "B5 顺序契约：StreamCompleted 必须在 RecordAssistantTurn 之后"
+                    );
+                    let effects = state.reduce(Action::StreamCompleted {
+                        draft_id,
+                        final_text,
+                        reasoning,
+                    });
+                    for e in effects {
+                        if let Effect::SaveSession(session) = e {
+                            save_snapshot = Some(session);
+                            break;
+                        }
+                    }
+                    break;
+                }
+                _ => {
+                    // 其他 actions（StreamChunkReceived 等）不影响顺序契约判定.
+                }
+            }
+        }
+
+        assert!(saw_record, "driver 必须发 RecordAssistantTurn");
+        let snap = save_snapshot.expect("StreamCompleted 必须 emit SaveSession");
+        let last = snap.turns.last().expect("SaveSession.turns 不应为空");
+        assert_eq!(last.role, "assistant", "snapshot 末条必须是当轮 assistant");
+        // 防双写：reducer RecordAssistantTurn 单次 + chat::run 1829 重复 dispatch 已删除.
+        assert_eq!(snap.turns.len(), 2, "turns.len() 必须严格 2（user+assistant，零双写）");
+    }
+
     #[tokio::test]
     async fn real_mode_quit_cancels_shutdown_token() {
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
@@ -2868,7 +2968,17 @@ mod real_mode_tests {
             other => panic!("expected StreamChunkReceived, got {other:?}"),
         }
 
-        // 第二条：is_final=true 进入 break，发送 StreamCompleted.
+        // T3-3-fixB B5: 第二条是 RecordAssistantTurn（在 StreamCompleted 前发出）.
+        let action = tokio::time::timeout(Duration::from_millis(1000), action_rx.recv())
+            .await
+            .expect("RecordAssistantTurn within 1s")
+            .expect("RecordAssistantTurn received");
+        match action {
+            Action::RecordAssistantTurn(_) => {}
+            other => panic!("expected RecordAssistantTurn (fixB B5 前置), got {other:?}"),
+        }
+
+        // 第三条：is_final=true 进入 break，发送 StreamCompleted.
         let action = tokio::time::timeout(Duration::from_millis(1000), action_rx.recv())
             .await
             .expect("completion within 1s")
@@ -3014,6 +3124,19 @@ mod real_mode_tests {
                 assert_eq!(version, 2, "second delta version must strictly increase");
             }
             other => panic!("expected StreamChunkReceived#2, got {other:?}"),
+        }
+
+        // T3-3-fixB B5: RecordAssistantTurn 在 StreamCompleted 之前发，
+        // final_text 与 RecordAssistantTurn 内容一致.
+        let a_record = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+            .await
+            .expect("RecordAssistantTurn within 1.5s")
+            .expect("RecordAssistantTurn received");
+        match a_record {
+            Action::RecordAssistantTurn(text) => {
+                assert_eq!(text, "hello world", "RecordAssistantTurn 内容应与 final_text 一致");
+            }
+            other => panic!("expected RecordAssistantTurn (fixB B5 前置), got {other:?}"),
         }
 
         // 最终 StreamCompleted，final_text 累计，reasoning 包含 thinking 文本.
