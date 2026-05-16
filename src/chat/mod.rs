@@ -1086,8 +1086,10 @@ pub async fn run(
                     // 一致的 UI 账本 + 测试断言，redraw_tx 此时尚未注入 EffectExecutor
                     // 故 RequestRedraw 是 no-op，下方 spawn_tui_unified_loop 启动后
                     // 首屏会自然 redraw。
-                    let _ = chat_dispatcher
-                        .try_dispatch(crate::chat::action::Action::SystemMessageAdded { text: banner.clone() });
+                    let _ = chat_dispatcher.dispatch_or_log(
+                        crate::chat::action::Action::SystemMessageAdded { text: banner.clone() },
+                        "chat.banner",
+                    );
 
                     // The redraw channel exists solely so the UiActor and
                     // background tasks can wake the unified loop on
@@ -1205,14 +1207,18 @@ pub async fn run(
                     // Double Ctrl+C → graceful shutdown
                     eprintln!("\nExiting...");
                     // Step 5b shadow: 同步投递 ShutdownRequested.
-                    let _ = dispatcher_for_signal.try_dispatch(crate::chat::action::Action::ShutdownRequested);
+                    let _ = dispatcher_for_signal.dispatch_or_log(
+                        crate::chat::action::Action::ShutdownRequested,
+                        "chat.shutdown_double_ctrlc",
+                    );
                     shutdown_signal.cancel();
                     break;
                 }
 
                 // Single Ctrl+C → cancel active generation if any
                 // Step 5b shadow: 同步投递 CancelRequested 给 reducer 观察。
-                let _ = dispatcher_for_signal.try_dispatch(crate::chat::action::Action::CancelRequested);
+                let _ = dispatcher_for_signal
+                    .dispatch_or_log(crate::chat::action::Action::CancelRequested, "chat.cancel_single_ctrlc");
                 if let Some(token) = cancel_ref.lock().as_ref() {
                     token.cancel();
                 }
@@ -1240,7 +1246,8 @@ pub async fn run(
                             // 主路径已 shutdown，无需再触发；退出释放 sender clone。
                         }
                         _ = sigterm.recv() => {
-                            let _ = dispatcher_for_sigterm.try_dispatch(crate::chat::action::Action::ShutdownRequested);
+                            let _ = dispatcher_for_sigterm
+                                .dispatch_or_log(crate::chat::action::Action::ShutdownRequested, "chat.shutdown_sigterm");
                             shutdown_signal.cancel();
                         }
                     }
@@ -1263,7 +1270,10 @@ pub async fn run(
         // InputSubmitted 仅记 UI/LogTrace；RecordUserTurn 真写 history + session.turns，
         // 必须在 mem_context 注入后才 dispatch（用 `enriched` 与 legacy `history.push`
         // 字节级对齐 — 见 S2-B Step 4 risk notes）.
-        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::InputSubmitted(user_input.clone()));
+        let _ = chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::InputSubmitted(user_input.clone()),
+            "chat.input_submitted",
+        );
 
         // Echo the user's input into the TUI conversation pane.
         //
@@ -1302,8 +1312,10 @@ pub async fn run(
                 // S2-C Step 3: 双写到 Redux UI 镜像（chat_mirror 仍是渲染源）。
                 // Codex P0-3：reducer ui.conversation_lines 不能替代 mirror，
                 // 因此 mirror 写不能在 S2-C 阶段加守卫关闭；本 dispatch 仅是观察账本。
-                let _ = chat_dispatcher
-                    .try_dispatch(crate::chat::action::Action::SystemMessageAdded { text: text.to_string() });
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::SystemMessageAdded { text: text.to_string() },
+                    "chat.system_message_slash",
+                );
                 // Nudge the unified loop so the slash-command echo shows up
                 // immediately rather than waiting up to 50 ms for the next
                 // crossterm poll cycle. `try_send` + cap=1 coalesces bursts.
@@ -1329,7 +1341,8 @@ pub async fn run(
             // 实际生产路径 legacy 后续会 push 新构造的 system（覆盖旧 system 的
             // skill 列表），reducer 这边的 system 仍是上一轮的。本 S2-C 阶段
             // 不做修正——legacy 仍是 LLM 真上下文源，reducer 是观察账本。
-            let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::HistoryCleared);
+            let _ =
+                chat_dispatcher.dispatch_or_log(crate::chat::action::Action::HistoryCleared, "chat.history_cleared");
             if !config.skill_rag.enabled {
                 let cleared_system = build_runtime_system_prompt(
                     &config,
@@ -1346,9 +1359,12 @@ pub async fn run(
                 // (append) 会产生重复 system，长期累计多条。SetLeadingSystemPrompt
                 // 是 upsert：替换已有首位 system 或 push 到空 history，与 legacy
                 // `clear + push` 终态等价（≤ 1 条 system）。
-                let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::SetLeadingSystemPrompt {
-                    content: cleared_system,
-                });
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::SetLeadingSystemPrompt {
+                        content: cleared_system,
+                    },
+                    "chat.system_prompt_after_clear",
+                );
             }
             let cleared = commands::handle_clear(mem.as_ref(), Some(&chat_session.id)).await;
             let msg = if cleared > 0 {
@@ -1382,7 +1398,8 @@ pub async fn run(
                     // `chat_session.set_mode`——Pure 下 chat_session 不参与持久化
                     // (SaveSession 走 reducer 快照)，写 mode 是死写。Off/Both/Redux
                     // 仍需 legacy 写，run_tool_call_loop 仍读 chat_session.mode。
-                    let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::ModeChanged(mode));
+                    let _ = chat_dispatcher
+                        .dispatch_or_log(crate::chat::action::Action::ModeChanged(mode), "chat.mode_changed");
                     #[cfg(feature = "terminal-tui")]
                     let legacy_session_mode_writes_enabled = !ReduxMode::from_env().is_pure();
                     #[cfg(not(feature = "terminal-tui"))]
@@ -1442,8 +1459,10 @@ pub async fn run(
         // S2-C Step 4: 双写 SetLeadingSystemPrompt 到 reducer — 与 legacy
         // `if empty { push } else { first_mut = ... }` 字节级语义对齐（reducer
         // 内部走同样分支）。每轮 turn 都会跑，append 表达会让 system 堆积。
-        let _ = chat_dispatcher
-            .try_dispatch(crate::chat::action::Action::SetLeadingSystemPrompt { content: system_prompt });
+        let _ = chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::SetLeadingSystemPrompt { content: system_prompt },
+            "chat.system_prompt_per_turn",
+        );
         history.push(ChatMessage::user(&enriched));
 
         // S2-B Step 4: 在与 legacy `history.push(ChatMessage::user(&enriched))` 同一点
@@ -1451,7 +1470,10 @@ pub async fn run(
         // history 字节级对齐，session.turns 也用 enriched（与 legacy
         // `chat_session.add_user_turn(&sanitized_input)` 略有 sanitization 差异；
         // S2-C 阶段统一持久化路径时再合并）。
-        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordUserTurn(enriched.clone()));
+        let _ = chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::RecordUserTurn(enriched.clone()),
+            "chat.record_user_turn",
+        );
 
         // ── Set active recipient/channel on tools (for proactive messaging) ──
         for tool in tools_registry.iter() {
@@ -1493,10 +1515,13 @@ pub async fn run(
         // shadow 模式下 reducer 设置 stream.draft + control.generating=true；
         // 无外部副作用（业务 Effect no-op）。
         if let Some(ref d_id) = draft_id {
-            let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::TurnStarted {
-                draft_id: d_id.clone(),
-                cancel: cancellation.clone(),
-            });
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::TurnStarted {
+                    draft_id: d_id.clone(),
+                    cancel: cancellation.clone(),
+                },
+                "chat.turn_started",
+            );
         }
 
         // Spawn background task: accumulate deltas → channel.update_draft()
@@ -1773,12 +1798,17 @@ pub async fn run(
             let notify_fut = turn_signal.notified();
             let _ = turn_signal.consume_outcome();
 
-            let dispatch_result = chat_dispatcher.try_dispatch(crate::chat::action::Action::StartLLMTurn {
-                draft_id: d_id.clone(),
-                history: history.clone(),
-                cancel: cancellation.clone(),
-            });
-            // Codex P1：try_dispatch 可能 Backpressured / ChannelClosed。任一失败
+            // S2.5 P1-A: 显式分支处理 dispatch_result（StartLLMTurn 失败必须 fall-through
+            // 否则 notify_fut 永挂）；dispatch_or_log 同时埋点 + warn，无需重复 tracing.
+            let dispatch_result = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::StartLLMTurn {
+                    draft_id: d_id.clone(),
+                    history: history.clone(),
+                    cancel: cancellation.clone(),
+                },
+                "chat.start_llm_turn",
+            );
+            // Codex P1：dispatch 可能 Backpressured / ChannelClosed。任一失败
             // 都意味着 dispatcher task 不会产生 turn outcome，chat::run 必须立即
             // 视为 Failed 并 fall-through 到 cleanup，否则 notify_fut 永远不被 fire。
             if !matches!(dispatch_result, dispatcher::DispatchResult::Sent) {
@@ -1789,8 +1819,10 @@ pub async fn run(
                 // S2-B Step 3: 同步发 StreamCancelled 让 reducer 清 active_cancel，
                 // 旧字段仅在 Off/Both 兜底（与 register 处的守卫对称）。
                 if let Some(ref d_id) = draft_id {
-                    let _ = chat_dispatcher
-                        .try_dispatch(crate::chat::action::Action::StreamCancelled { draft_id: d_id.clone() });
+                    let _ = chat_dispatcher.dispatch_or_log(
+                        crate::chat::action::Action::StreamCancelled { draft_id: d_id.clone() },
+                        "chat.stream_cancelled_dispatch_failed",
+                    );
                 }
                 if legacy_active_cancel_enabled {
                     *active_cancel.lock() = None;
@@ -1958,9 +1990,12 @@ pub async fn run(
                     // 因为 `history` 是真实喂给 `run_tool_call_loop` 的 LLM 上下文 Vec —
                     // S2-C 删除 legacy 路径前不能跳过它，否则 Redux 模式下 overflow
                     // 重试会拿同一份未压缩的 history 二次失败。
-                    let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::HistoryCompacted {
-                        reason: crate::chat::action::CompactReason::ContextOverflow,
-                    });
+                    let _ = chat_dispatcher.dispatch_or_log(
+                        crate::chat::action::Action::HistoryCompacted {
+                            reason: crate::chat::action::CompactReason::ContextOverflow,
+                        },
+                        "chat.history_compacted_overflow",
+                    );
                     compact_chat_history(&mut history);
                     let compacted_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
                     tracing::warn!(
@@ -2056,17 +2091,22 @@ pub async fn run(
             TurnOutcome::Success(_) => {}
             TurnOutcome::Cancelled => {
                 if let Some(ref d_id) = draft_id {
-                    let _ = chat_dispatcher
-                        .try_dispatch(crate::chat::action::Action::StreamCancelled { draft_id: d_id.clone() });
+                    let _ = chat_dispatcher.dispatch_or_log(
+                        crate::chat::action::Action::StreamCancelled { draft_id: d_id.clone() },
+                        "chat.stream_cancelled",
+                    );
                 }
             }
             TurnOutcome::FailedWithError { err, retryable } => {
                 if let Some(ref d_id) = draft_id {
-                    let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::StreamFailed {
-                        draft_id: d_id.clone(),
-                        err: err.clone(),
-                        retryable: *retryable,
-                    });
+                    let _ = chat_dispatcher.dispatch_or_log(
+                        crate::chat::action::Action::StreamFailed {
+                            draft_id: d_id.clone(),
+                            err: err.clone(),
+                            retryable: *retryable,
+                        },
+                        "chat.stream_failed",
+                    );
                 }
             }
         }
@@ -2124,11 +2164,10 @@ pub async fn run(
         // session.history 与 legacy history 字节级对齐。下方 line 2055 处的
         // 旧 dispatch 用 sanitized_response，与 history.push 内容不同 — S2-B Step 4
         // 起改在此处 dispatch 用 history_response，下方旧 dispatch 删除。
-        // FIXME(S2.5): try_dispatch 失败被忽略，channel full/closed 时状态静默丢失。
-        // 统一错误处理挪 S2.5 横切（错误分层 + tracing 埋点）。
-        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::RecordAssistantTurn(
-            history_response.clone(),
-        ));
+        let _ = chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::RecordAssistantTurn(history_response.clone()),
+            "chat.record_assistant_turn",
+        );
 
         // T3-3-fixA P0-1: StreamCompleted 必须在 RecordAssistantTurn 之后 dispatch，
         // reducer 的 reduce_stream_completed 会 emit Effect::SaveSession(snapshot)，
@@ -2136,11 +2175,14 @@ pub async fn run(
         // final_text 用 response (UI 展示文案)，与上方 history_response (含 tool_summary
         // 前缀供 history 写入) 语义不同：reducer 的 conversation_lines 与 UI 对齐.
         if let Some(ref d_id) = draft_id {
-            let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::StreamCompleted {
-                draft_id: d_id.clone(),
-                final_text: response.clone(),
-                reasoning: String::new(),
-            });
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::StreamCompleted {
+                    draft_id: d_id.clone(),
+                    final_text: response.clone(),
+                    reasoning: String::new(),
+                },
+                "chat.stream_completed",
+            );
         }
 
         // ── Extract and display media markers (images, documents, etc.) ──
@@ -2668,7 +2710,10 @@ fn run_tui_unified_loop(
                             // S2-B Step 3: 双击 — 同时 dispatch ShutdownRequested
                             // 让 reducer 真发 CancelToken/Quit (Off/Both 模式仍 fallback
                             // 到 shutdown.cancel()).
-                            let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::ShutdownRequested);
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::ShutdownRequested,
+                                "chat.shutdown_tui_double_ctrlc",
+                            );
                             shutdown.cancel();
                             return Ok(());
                         }
@@ -2676,7 +2721,10 @@ fn run_tui_unified_loop(
                         // (Action::CancelRequested → Effect::CancelToken → 真 cancel)；
                         // legacy token.cancel() 在 Off/Both 模式兜底，避免漏取消。
                         // Pure / Redux 模式由 reducer 单源负责取消（已 dispatch 到上）。
-                        let _ = chat_dispatcher.try_dispatch(crate::chat::action::Action::CancelRequested);
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::CancelRequested,
+                            "chat.cancel_tui_single_ctrlc",
+                        );
                         if matches!(redux_mode, ReduxMode::Off | ReduxMode::Both)
                             && let Some(token) = active_cancel.lock().as_ref()
                         {
