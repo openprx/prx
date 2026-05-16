@@ -522,6 +522,8 @@ impl EffectExecutor {
     /// effect 完成后由调用方控制复位（典型在 turn 结束）。
     #[allow(dead_code)]
     pub async fn execute(&self, effect: Effect) {
+        // S2.5 T2.5-2: 每个 Effect 入口埋点 prx_chat_effects_total{effect_kind=...}.
+        crate::observability::chat_metrics::inc_effect(effect.kind());
         // LogTrace 在两种模式下都真执行（可观测性）
         if let Effect::LogTrace { level, msg } = &effect {
             Self::emit_trace(*level, msg);
@@ -998,6 +1000,13 @@ enum StreamPassOutcome {
 /// **S3 T3-1**: 四件套扩展（工具回合状态机 / context overflow compact / approval 桥接 /
 /// timeout backoff retry）。详见 `task/prx/T3-1.md`.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    skip_all,
+    fields(
+        draft_id = %draft_id,
+        model = %model,
+    )
+)]
 async fn drive_start_turn_stream(
     provider: Arc<dyn Provider>,
     mut history: Vec<crate::providers::traits::ChatMessage>,
