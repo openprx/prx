@@ -3740,7 +3740,7 @@ mod tests {
         /// `bottom_chrome_height` 在两种 view 上返回相同值.
         #[test]
         fn s4_a_2_bottom_chrome_height_parity_tui_vs_snapshot() {
-            let state = make_state_with_lines();
+            let mut state = make_state_with_lines();
             let snap = state.build_ui_snapshot(1);
 
             // 构造与 snap 字段对齐的 TuiState（mirror 兼容字段集）.
@@ -3788,7 +3788,7 @@ mod tests {
         /// Parity 检查：BottomChromeView 各 getter 在 TuiState 与 UiSnapshot 上返回相同字段.
         #[test]
         fn s4_a_2_view_getters_parity() {
-            let state = make_state_with_lines();
+            let mut state = make_state_with_lines();
             let snap = state.build_ui_snapshot(5);
 
             let mut tui = TuiState::new(&state.session.provider, &state.session.model);

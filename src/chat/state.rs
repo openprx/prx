@@ -294,6 +294,9 @@ pub struct ChatState {
     pub stream: StreamState,
     /// 取消/关停控制
     pub control: ControlState,
+    /// build_ui_snapshot 的 conversation_lines Arc 缓存，dirty 时清空
+    #[cfg(feature = "terminal-tui")]
+    cached_lines_arc: Option<Arc<Vec<ConversationLine>>>,
 }
 
 impl ChatState {
@@ -331,6 +334,8 @@ impl ChatState {
                 current_turn_tool_calls: Vec::new(),
                 current_turn_tool_args: std::collections::HashMap::new(),
             },
+            #[cfg(feature = "terminal-tui")]
+            cached_lines_arc: None,
         }
     }
 
@@ -349,18 +354,22 @@ impl ChatState {
 
     /// 构造当前状态对应的 [`UiSnapshot`].
     ///
-    /// S4-A Commit 1: 由 dispatcher 在 `reduce_tracked` 返回 ui_dirty=true 后调用，
-    /// 通过 `watch::Sender::send_if_modified` 推送给 ratatui 渲染线程。
-    /// Arc 字段（`conversation_lines`）让快照之间共享底层 Vec，避免每轮 push
-    /// 一行就整体 clone；session_title 是短 String，转 Arc<str> 后 clone 是
-    /// refcount 增量。
+    /// Arc 字段（`conversation_lines`）让相邻未变 ui 的两次快照真正共享底层 Vec：
+    /// `cached_lines_arc` 记录上次构造的 Arc，reduce_tracked 在 dirty=true 时清缓存，
+    /// build_ui_snapshot 在缓存命中时 `Arc::clone` 复用（refcount 增量 + 0 拷贝）。
     ///
-    /// `revision` 必须由调用方维护单调递增（dispatcher 自带 `AtomicU64`），
-    /// 这样 receiver 端可断言 `new.revision > cur.revision` 跳过乱序帧。
+    /// `revision` 由调用方维护单调递增。
     #[cfg(feature = "terminal-tui")]
     #[must_use]
     #[allow(dead_code)]
-    pub fn build_ui_snapshot(&self, revision: u64) -> UiSnapshot {
+    pub fn build_ui_snapshot(&mut self, revision: u64) -> UiSnapshot {
+        let lines = if let Some(ref cached) = self.cached_lines_arc {
+            Arc::clone(cached)
+        } else {
+            let arc = Arc::new(self.ui.conversation_lines.clone());
+            self.cached_lines_arc = Some(Arc::clone(&arc));
+            arc
+        };
         UiSnapshot {
             revision,
             provider: Arc::clone(&self.session.provider),
@@ -368,7 +377,7 @@ impl ChatState {
             session_title: Arc::from(self.session.title.as_str()),
             turn_count: self.ui.turn_count,
             ascii_fallback: self.ui.ascii_fallback,
-            conversation_lines: Arc::new(self.ui.conversation_lines.clone()),
+            conversation_lines: lines,
             streaming: self.stream.draft.clone(),
             input: self.ui.input.clone(),
         }
@@ -395,13 +404,14 @@ impl ChatState {
     #[allow(dead_code)]
     pub fn reduce_tracked(&mut self, action: Action) -> (Vec<Effect>, bool) {
         let dirty = ui_dirty_for(&action);
-        // 对于可能动态决定 dirty 的 Action（如 KeyPressed），下面追加运行时校正.
         let snap_before = self.snapshot_dirty_fields();
         let effects = self.reduce(action);
         let snap_after = self.snapshot_dirty_fields();
-        // 若静态 whitelist 已 true 直接返回；否则用运行时 diff 兜底（KeyPressed
-        // 等组合 Action 可能命中 dirty 也可能不命中）.
         let dirty_final = dirty || (snap_before != snap_after);
+        if dirty_final {
+            // ui 变化时清缓存，下次 build_ui_snapshot 重建 Arc<Vec<ConversationLine>>
+            self.cached_lines_arc = None;
+        }
         (effects, dirty_final)
     }
 
@@ -5112,6 +5122,33 @@ mod tests {
                 })
                 .expect("snapshot 应含 User 行");
             assert_eq!(last_user, "hello echo");
+        }
+
+        /// S4-A Commit B: 连续两次 build_ui_snapshot 未变 ui 时 Arc::ptr_eq 共享
+        #[test]
+        fn s4_a_post_p1_arc_shared_no_clone() {
+            let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+            // 先 push 一行让 conversation_lines 非空 + 缓存命中
+            let _ = state.reduce(Action::SystemMessageAdded {
+                text: "banner".to_string(),
+            });
+            let snap1 = state.build_ui_snapshot(1);
+            let snap2 = state.build_ui_snapshot(2);
+            assert!(
+                Arc::ptr_eq(&snap1.conversation_lines, &snap2.conversation_lines),
+                "未变 ui 时连续 build_ui_snapshot 应共享 Arc，避免每帧 O(n) 克隆"
+            );
+
+            // dirty Action 后缓存应被清空，新 Arc 指针不同
+            let _ = state.reduce_tracked(Action::SystemMessageAdded {
+                text: "second".to_string(),
+            });
+            let snap3 = state.build_ui_snapshot(3);
+            assert!(
+                !Arc::ptr_eq(&snap2.conversation_lines, &snap3.conversation_lines),
+                "ui 变更后缓存失效，新快照应是新 Arc"
+            );
+            assert_eq!(snap3.conversation_lines.len(), 2, "新快照应含两行");
         }
     }
 }
