@@ -217,6 +217,14 @@ pub(crate) struct MockEnvProvider {
     tool_call_spec: Option<MockToolCallSpec>,
     /// 流式调用计数器，决定本次 emit tool_call 还是 final text。
     call_counter: Arc<AtomicUsize>,
+    /// S5 P0-1: 完整流式脚本（JSON 序列化 chunks 列表）。设置后 stream 按
+    /// 脚本逐 chunk emit，绕过 response / tool_call_spec 路径。
+    script: Option<MockScript>,
+    /// S5 P0-1: provider flavor hint — 仅用于日志识别，不改变 chunk 内容
+    /// (anthropic / openai / gemini)，方便 PTY 测试覆盖不同协议路径的回归。
+    flavor: Option<String>,
+    /// S5 P0-1: 每个 chunk 间的延迟（ms），cancel-mid-stream 测试窗口用。
+    delay_ms_per_chunk: u64,
 }
 
 #[cfg(any(test, feature = "test-mock"))]
@@ -224,6 +232,66 @@ pub(crate) struct MockEnvProvider {
 struct MockToolCallSpec {
     name: String,
     args: String,
+}
+
+/// S5 P0-1: 完整脚本，描述一次 stream 中按顺序 emit 的 chunks.
+///
+/// JSON 序列化形态：
+/// ```json
+/// {"chunks":[
+///   {"delta":"Hello "},
+///   {"reasoning":"thinking..."},
+///   {"tool":{"id":"t1","name":"shell","args":"{\"cmd\":\"ls\"}"}},
+///   {"delta":"done"},
+///   {"is_final":true}
+/// ]}
+/// ```
+#[cfg(any(test, feature = "test-mock"))]
+#[derive(Clone, Debug, serde::Deserialize)]
+struct MockScript {
+    chunks: Vec<MockChunk>,
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+#[derive(Clone, Debug, serde::Deserialize)]
+struct MockChunk {
+    #[serde(default)]
+    delta: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    tool: Option<MockScriptTool>,
+    #[serde(default)]
+    is_final: bool,
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+#[derive(Clone, Debug, serde::Deserialize)]
+struct MockScriptTool {
+    id: String,
+    name: String,
+    args: String,
+}
+
+/// S5 P0-1: 把单个 `MockChunk` 映射到 `StreamChunk`（按优先级：tool > final > reasoning > delta）.
+#[cfg(any(test, feature = "test-mock"))]
+fn script_chunk_to_stream(mc: &MockChunk, idx: usize) -> StreamChunk {
+    use crate::providers::traits::ToolCallChunk;
+    if let Some(tool) = mc.tool.as_ref() {
+        return StreamChunk::tool_call_chunk(vec![ToolCallChunk::new(
+            tool.id.clone(),
+            tool.name.clone(),
+            tool.args.clone(),
+            idx,
+        )]);
+    }
+    if mc.is_final {
+        return StreamChunk::final_chunk();
+    }
+    if let Some(r) = mc.reasoning.as_ref() {
+        return StreamChunk::reasoning_delta(r.clone());
+    }
+    StreamChunk::delta(mc.delta.clone().unwrap_or_default())
 }
 
 #[cfg(any(test, feature = "test-mock"))]
@@ -259,10 +327,39 @@ impl MockEnvProvider {
                 args: args.to_string(),
             })
         });
+        // S5 P0-1: 完整流式脚本，优先级最高（绕过 response / tool_call_spec）
+        let script = std::env::var("OPENPRX_MOCK_SCRIPT").ok().and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            match serde_json::from_str::<MockScript>(trimmed) {
+                Ok(s) if !s.chunks.is_empty() => Some(s),
+                Ok(_) => {
+                    tracing::warn!("OPENPRX_MOCK_SCRIPT 解析成功但 chunks 为空，忽略");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "OPENPRX_MOCK_SCRIPT 解析失败，回退默认路径");
+                    None
+                }
+            }
+        });
+        let flavor = std::env::var("OPENPRX_MOCK_PROVIDER_FLAVOR")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| matches!(v.as_str(), "anthropic" | "openai" | "gemini"));
+        let delay_ms_per_chunk = std::env::var("OPENPRX_MOCK_DELAY_MS_PER_CHUNK")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         Self {
             response,
             tool_call_spec,
             call_counter: Arc::new(AtomicUsize::new(0)),
+            script,
+            flavor,
+            delay_ms_per_chunk,
         }
     }
 }
@@ -343,6 +440,44 @@ impl Provider for MockEnvProvider {
 
         let counter_val = self.call_counter.fetch_add(1, Ordering::SeqCst);
         let response = self.response.clone();
+
+        // S5 P0-1: SCRIPT 路径优先 — 按脚本顺序 emit chunks，支持 reasoning / tool / delta /
+        // is_final 混搭。flavor 仅记日志（实际协议适配由 driver 与各 provider impl 负责）。
+        //
+        // 关键：第一次调用按脚本 emit，**第二次及以后**只输出 final（避免 tool_call 无限重放
+        // 导致 driver max_tool_iterations 触发）。脚本含 tool_call 时尤其重要：driver
+        // 执行 tool → 喂回 tool_result → 再次调 stream_chat_with_history，本次不该再发 tool_call.
+        if let Some(script) = self.script.as_ref() {
+            if let Some(flavor) = &self.flavor {
+                tracing::debug!(flavor = %flavor, call = counter_val, "mock SCRIPT stream start");
+            }
+            let chunks: Vec<StreamResult<StreamChunk>> = if counter_val == 0 {
+                script
+                    .chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, mc)| Ok(script_chunk_to_stream(mc, idx)))
+                    .collect()
+            } else {
+                // 续轮：emit 脚本里的所有 delta（拼回 sentinel）+ final，不重放 tool.
+                let mut out: Vec<StreamResult<StreamChunk>> = script
+                    .chunks
+                    .iter()
+                    .filter_map(|mc| mc.delta.as_ref().map(|d| Ok(StreamChunk::delta(d.clone()))))
+                    .collect();
+                out.push(Ok(StreamChunk::final_chunk()));
+                out
+            };
+            let delay = self.delay_ms_per_chunk;
+            return futures::stream::iter(chunks)
+                .then(move |c| async move {
+                    if delay > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
+                    c
+                })
+                .boxed();
+        }
 
         // First call + tool_call_spec configured → emit ToolCallChunk.
         if counter_val == 0
