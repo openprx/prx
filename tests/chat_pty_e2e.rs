@@ -855,6 +855,41 @@ fn test_chat_redux_pure_tool_call_completes() {
     );
 }
 
+/// fixA P1-5: chat::run 级集成测试 — Pure 模式跑完整 turn + /exit，验证 exit save
+/// 守卫整条路径（top_redux_mode → legacy_exit_save_enabled=false → reducer 单源持久化）.
+/// 单独的 reducer 单测无法触达 chat::run 主循环的退出分支；本测试通过真 PTY 走完整路径.
+#[test]
+#[serial(prx_chat_pty)]
+fn s4_a_p1_pure_exit_after_turn_chat_run_level() {
+    let sentinel = "[MOCK-PURE-EXIT]";
+    let (mut sg, _guard) = spawn_chat(
+        &[],
+        &[
+            ("OPENPRX_MOCK_RESPONSE", sentinel),
+            ("PRX_CHAT_REDUX", "pure"),
+            ("PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS", "1"),
+        ],
+    );
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+
+    // turn 1: 完整 user → assistant final
+    session.send("hi\r").expect("send hi");
+    let captured1 = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        captured1.contains(sentinel),
+        "Pure chat::run 应渲染 turn 1 sentinel. captured:\n{captured1}"
+    );
+
+    // /exit 必须穿过 chat::run 主循环 break + legacy_exit_save_enabled=false 路径
+    session.send("/exit\r").expect("send /exit");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "Pure chat::run 完整 turn 后 /exit 应在 {EXIT_TIMEOUT:?} 内干净退出（reducer-only save 路径）"
+    );
+}
+
 #[test]
 #[serial(prx_chat_pty)]
 fn test_chat_redux_pure_double_ctrl_c_exits_cleanly() {
