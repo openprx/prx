@@ -761,31 +761,22 @@ impl EffectExecutor {
                 tracing::debug!(title = %title, "AutoTitleSession effect");
             }
             Effect::RequestApproval { tool_id, name, args } => {
-                // **S3 T3-1**: 当前 stub — 立即回投 `Action::ToolApprovalReceived { approved=true }`，
-                // 让 driver 不被挂起。后续任务（UI 接线）会替换为真实的 prompt 路径。
-                //
-                // 设计原因：
-                // - Effect 单向 fire-and-forget；响应路径必须走反向 Action。
-                // - dispatcher 内任何接收 ToolApprovalReceived 的 task 会把决策通过
-                //   `EffectDeps::approval_response_tx` 转发给 driver 内部的 mpsc rx。
-                // - 默认放行（approved=true）保证旧 autonomy=full 路径行为不变；
-                //   supervised 模式下真接 UI prompt 时由真实路径覆盖该 stub。
+                // S5 T5-1 (降级): TUI 卡片渲染 + Y/N 键盘接线工作量超本轮预算，保留 stub
+                // 自动放行；新增 OPENPRX_APPROVAL_OVERRIDE=deny 让测试可断言拒绝路径
+                let approved = std::env::var("OPENPRX_APPROVAL_OVERRIDE").ok().map_or(true, |v| {
+                    !matches!(v.trim().to_ascii_lowercase().as_str(), "deny" | "n" | "no" | "0")
+                });
                 tracing::info!(
                     tool_id = %tool_id,
                     name = %name,
                     args_len = args.len(),
-                    "RequestApproval effect (stub): auto-approving (UI not wired yet)"
+                    approved,
+                    "RequestApproval effect (stub): respecting OPENPRX_APPROVAL_OVERRIDE (UI not wired yet)"
                 );
-                let _ = args; // 留 args 用于未来 prompt
+                let _ = args;
                 let action_tx = deps.action_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = action_tx
-                        .send(Action::ToolApprovalReceived {
-                            tool_id,
-                            approved: true,
-                        })
-                        .await
-                    {
+                    if let Err(e) = action_tx.send(Action::ToolApprovalReceived { tool_id, approved }).await {
                         tracing::debug!(error = %e, "RequestApproval stub: action_tx closed");
                     }
                 });
