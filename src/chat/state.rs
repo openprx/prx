@@ -527,6 +527,7 @@ impl ChatState {
             Action::ReasoningFoldToggled => self.reduce_reasoning_fold_toggled(),
             Action::RedrawRequested => vec![Effect::RequestRedraw],
             Action::SystemMessageAdded { text } => self.reduce_system_message_added(text),
+            Action::UserMessageEchoed(text) => self.reduce_user_message_echoed(text),
 
             // ── 退出 ──────────────────────────────────────────────
             Action::CancelRequested => self.reduce_cancel_requested(),
@@ -1466,6 +1467,21 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    /// `Action::UserMessageEchoed` — Pure 模式下用户提交的视觉 echo
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_user_message_echoed(&mut self, text: String) -> Vec<Effect> {
+        self.ui
+            .conversation_lines
+            .push(crate::chat::tui::ConversationLine::User { content: text });
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn reduce_user_message_echoed(&mut self, _text: String) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
+    }
+
     /// `Action::HistoryCleared` — 清除 LLM context history（保留 system prompt）+ 清 UI.
     ///
     /// session.turns 不清除（持久化记录不可逆）；只重置 LLM context（下次请求
@@ -1642,8 +1658,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::SetLeadingSystemPrompt { .. }
         | Action::HistoryCompacted { .. } => false,
 
-        // UI 镜像账本 / 历史清空：直接动 conversation_lines → dirty
-        Action::SystemMessageAdded { .. } | Action::HistoryCleared => true,
+        // UI 镜像账本 / 历史清空 / Pure 模式用户 echo：直接动 conversation_lines → dirty
+        Action::SystemMessageAdded { .. } | Action::HistoryCleared | Action::UserMessageEchoed(_) => true,
         // RedrawRequested 仅产生 RequestRedraw Effect，本身不变 snapshot 字段；
         // 但语义上需要触发 redraw — 标 dirty 走 watch 路径.
         Action::RedrawRequested => true,
@@ -5002,13 +5018,12 @@ mod tests {
             let _ = mirror.mark_last_tool_result_finished("Bash", true, 50, None);
             mirror.push_assistant_message("done");
 
-            // ── 路径 B: reducer 路径 ──
+            // ── 路径 B: reducer 路径 (S4-A Commit A: UserMessageEchoed 闭合 User echo) ──
             let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
             let _ = state.reduce(Action::SystemMessageAdded {
                 text: "banner".to_string(),
             });
-            // 用户输入 echo 是 reducer 已知缺口 (S4-B 修); 此测试仅对 system / tool /
-            // assistant 行做字节级对齐, 过滤掉 mirror 端的 User 行.
+            let _ = state.reduce(Action::UserMessageEchoed("hello".to_string()));
             let _ = state.reduce(Action::ToolStarted {
                 name: "Bash".to_string(),
                 args: "{\"cmd\":\"ls\"}".to_string(),
@@ -5030,22 +5045,18 @@ mod tests {
                 reasoning: String::new(),
             });
 
-            // ── 对账：每路径过滤掉 user echo, 对账 system+tool+assistant 字节级一致 ──
-            let mirror_filtered: Vec<&ConversationLine> = mirror
-                .conversation_lines
-                .iter()
-                .filter(|l| !matches!(l, ConversationLine::User { .. }))
-                .collect();
+            // 字节级对账：四类 ConversationLine (System/User/ToolResult/Assistant) 全对齐
+            let mirror_lines: Vec<&ConversationLine> = mirror.conversation_lines.iter().collect();
             let reducer_lines: Vec<&ConversationLine> = state.ui.conversation_lines.iter().collect();
 
             assert_eq!(
-                mirror_filtered.len(),
+                mirror_lines.len(),
                 reducer_lines.len(),
-                "对账行数: mirror={} (过滤 User 后), reducer={}",
-                mirror_filtered.len(),
+                "对账行数: mirror={}, reducer={}",
+                mirror_lines.len(),
                 reducer_lines.len()
             );
-            for (i, (ml, rl)) in mirror_filtered.iter().zip(reducer_lines.iter()).enumerate() {
+            for (i, (ml, rl)) in mirror_lines.iter().zip(reducer_lines.iter()).enumerate() {
                 let m_dbg = format!("{ml:?}");
                 let r_dbg = format!("{rl:?}");
                 match (ml, rl) {
@@ -5074,9 +5085,33 @@ mod tests {
                     (ConversationLine::System { content: mc }, ConversationLine::System { content: rc }) => {
                         assert_eq!(mc, rc, "line {i} System content mismatch");
                     }
+                    (ConversationLine::User { content: mc }, ConversationLine::User { content: rc }) => {
+                        assert_eq!(mc, rc, "line {i} User content mismatch");
+                    }
                     _ => panic!("line {i} variant 不匹配: mirror={m_dbg}, reducer={r_dbg}"),
                 }
             }
+        }
+
+        /// S4-A Commit A: Pure 模式下 UserMessageEchoed 把 User 行写入 conversation_lines
+        #[test]
+        fn s4_a_post_p0_pure_user_echo_appears_in_snapshot() {
+            let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+            let effects = state.reduce(Action::UserMessageEchoed("hello echo".to_string()));
+            assert!(
+                effects.iter().any(|e| matches!(e, Effect::RequestRedraw)),
+                "UserMessageEchoed 应 emit RequestRedraw"
+            );
+            let snap = state.build_ui_snapshot(0);
+            let last_user = snap
+                .conversation_lines
+                .iter()
+                .find_map(|l| match l {
+                    ConversationLine::User { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .expect("snapshot 应含 User 行");
+            assert_eq!(last_user, "hello echo");
         }
     }
 }

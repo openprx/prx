@@ -1356,18 +1356,17 @@ pub async fn run(
         // `redraw_tx_for_main` is `None` on those paths.
         #[cfg(feature = "terminal-tui")]
         {
-            // S4-A Commit 5 (Codex 高危盲点 #1 修复): Pure 模式 chat_mirror 零写,
-            // 用户输入的视觉 echo 暂时缺失 — reducer 当前的 InputSubmitted Action
-            // 仅维护 ui.input / turn_count，未 push 一行 ConversationLine::User.
-            //
-            // Pure 模式下用 Action::UserMessageEchoed 让 reducer 写 ConversationLine::User，
-            // legacy 模式继续 mirror 旁路写
-            if !top_redux_mode.is_pure() {
+            // Pure 模式 reducer 单源 echo (UserMessageEchoed)，legacy 旁路 mirror
+            if top_redux_mode.is_pure() {
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::UserMessageEchoed(user_input.clone()),
+                    "chat.user_message_echoed",
+                );
+            } else {
                 chat_mirror.lock().push_user_message(&user_input);
             }
             if let Some(tx) = redraw_tx_for_main.as_ref() {
-                // cap=1 + try_send: bursts coalesce into a single deferred
-                // redraw — the unified loop will pick up the latest state.
+                // cap=1 + try_send: bursts coalesce into a single deferred redraw
                 let _ = tx.try_send(());
             }
         }
