@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING** — `OPENPRX_APPROVAL_OVERRIDE` env unset 不再静默 auto-approve
+  supervised 模式下的 tool approval。TUI 卡片 + Y/N 键盘 (T5-1 完整版) 留
+  Task #11；在 UI 接通前 fail-safe deny。显式设置 `OPENPRX_APPROVAL_OVERRIDE=allow`
+  可恢复旧行为；`deny` / `no` / `n` / `0` 与未设置一致拒绝。Codex S5 P0-3 反馈
+  "绝不静默 auto-approve"。`autonomy_level=Full` 不走此路径，行为不变。
+
 ## [0.3.0] - 2026-03-19
 
 ### Added
