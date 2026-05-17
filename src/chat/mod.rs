@@ -3684,7 +3684,7 @@ mod s4_a_4 {
     /// read_pending：snapshot 路径返回正确切片.
     #[test]
     fn s4_a_4_pending_lines_drain_from_snapshot() {
-        let state = build_state_with_lines();
+        let mut state = build_state_with_lines();
         let snap = Arc::new(state.build_ui_snapshot(1));
         let (_tx, rx) = watch::channel(snap);
         let src = RenderSource::Snapshot(rx);
@@ -3703,7 +3703,7 @@ mod s4_a_4 {
     /// 验证 snapshot 路径在 watch 推送新值后 with_view 看到新内容.
     #[tokio::test]
     async fn s4_a_4_unified_loop_redraw_on_snapshot_change() {
-        let state = build_state_with_lines();
+        let mut state = build_state_with_lines();
         let snap0 = Arc::new(state.build_ui_snapshot(1));
         let (tx, rx) = watch::channel(Arc::clone(&snap0));
         let src = RenderSource::Snapshot(rx);
