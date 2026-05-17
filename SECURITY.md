@@ -4,7 +4,32 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+| 0.4.x   | :white_check_mark: |
+| < 0.4   | :x:                |
+
+## Known Vulnerability Status (v0.4.0)
+
+As of v0.4.0 (2026-05), all reachable CVEs are closed via dependency upgrades. Remaining
+advisories are explicitly ignored in `deny.toml` with documented justification.
+
+### Closed in v0.4.0
+
+| Advisory | Crate | Severity | Resolution |
+|----------|-------|----------|------------|
+| RUSTSEC-2026-0085..0096 (13 entries) | wasmtime | 2.3 low — 9.0 critical | Upgraded 42.0.1 → 44.0.1 |
+| RUSTSEC-2026-0114 | wasmtime | 5.9 medium | Upgraded 42.0.1 → 44.0.1 |
+| RUSTSEC-2026-0098, 0099, 0104 | rustls-webpki | medium/high | Upgraded 0.103.10 → 0.103.13 |
+
+### Suppressed (Unreachable / Transitive Wasm-Only)
+
+| Advisory | Crate | Reason |
+|----------|-------|--------|
+| RUSTSEC-2026-0141 | lettre 0.11.19 | `boring-tls` path not enabled; PRX uses `rustls-tls` feature — CVE unreachable |
+| RUSTSEC-2024-0388 | derivative 2.2.0 | Transitive via matrix-sdk-indexeddb, only used on wasm browser target |
+| RUSTSEC-2025-0141 | bincode 2.0.1 | Transitive via probe-rs; upstream project considered complete |
+
+CI enforcement: `sec-audit.yml` job `deny / advisories` runs `cargo deny check advisories`
+without `continue-on-error` (S5 P0-4) — any new unsuppressed advisory blocks `main` merges.
 
 ## Reporting a Vulnerability
 
