@@ -189,6 +189,10 @@ pub enum Action {
     /// **注意**: 真实可见的 TUI 仍由 `chat_mirror` 渲染，本 Action 仅供 Redux 路径
     /// 维护一致的 UI 状态镜像 + 测试断言；S2-D/E 切闸到 Redux 单源时再删除 legacy mirror.
     SystemMessageAdded { text: String },
+    /// Pure 模式下用户提交内容的视觉 echo — reducer push 一条 ConversationLine::User
+    /// 到 ui.conversation_lines。legacy 模式由 chat_mirror.push_user_message 承担，
+    /// Pure 模式守卫跳过 mirror 写后用此 Action 让 reducer 单源接管 echo。
+    UserMessageEchoed(String),
 
     // ── 退出 ────────────────────────────────────────────────────
     /// 单击 Ctrl+C — 取消当前生成
@@ -239,6 +243,7 @@ impl Action {
             Self::ReasoningFoldToggled => "ReasoningFoldToggled",
             Self::RedrawRequested => "RedrawRequested",
             Self::SystemMessageAdded { .. } => "SystemMessageAdded",
+            Self::UserMessageEchoed(_) => "UserMessageEchoed",
             Self::CancelRequested => "CancelRequested",
             Self::ShutdownRequested => "ShutdownRequested",
             Self::ForceQuit => "ForceQuit",
