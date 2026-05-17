@@ -1703,6 +1703,29 @@ pub fn spawn_dispatcher_task_with_signal(
     )
 }
 
+/// S4-A 收尾 P1: 抽出 dispatcher 两处重复的 snapshot 构造 + 推送块.
+/// send_replace 直接覆盖；snapshot_rev 单调递增由 reduce 顺序保证.
+#[cfg(feature = "terminal-tui")]
+#[allow(dead_code)]
+fn push_snapshot_if_dirty(
+    state: &mut ChatState,
+    snapshot_tx: &Option<tokio::sync::watch::Sender<Arc<crate::chat::state::UiSnapshot>>>,
+    snapshot_rev: &std::sync::atomic::AtomicU64,
+    dirty: bool,
+) {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    if !dirty {
+        return;
+    }
+    let Some(tx) = snapshot_tx.as_ref() else {
+        return;
+    };
+    let next_rev = snapshot_rev.fetch_add(1, AtomicOrdering::Relaxed).saturating_add(1);
+    let new_snap = Arc::new(state.build_ui_snapshot(next_rev));
+    tx.send_replace(new_snap);
+    tracing::trace!(rev = next_rev, "s4_a snapshot pushed");
+}
+
 /// **S4-A Commit 3**: `spawn_dispatcher_task_with_signal` + 可选的 UiSnapshot 推送.
 ///
 /// Pure 模式传入 `snapshot_tx: Some(watch::Sender<Arc<UiSnapshot>>)`，dispatcher
@@ -1721,7 +1744,7 @@ pub fn spawn_dispatcher_task_full(
     turn_signal: Option<TurnCompletionSignal>,
     snapshot_tx: Option<tokio::sync::watch::Sender<Arc<crate::chat::state::UiSnapshot>>>,
 ) -> tokio::task::JoinHandle<DispatcherStats> {
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::atomic::AtomicU64;
     // S3 T3-1: 提前抽出 approval_router 句柄（Arc clone），后续在 reducer 处理完
     // `Action::ToolApprovalReceived` 之后用它把决策转交 driver 等待中的 oneshot。
     let approval_router = executor.approval_router();
@@ -1748,22 +1771,7 @@ pub fn spawn_dispatcher_task_full(
                         for effect in effects {
                             executor.execute(effect).await;
                         }
-                        // S4-A Commit 3: ui_dirty=true 且 snapshot_tx 存在时，
-                        // 构造新 snapshot 并 send_if_modified 推送 watch.
-                        if ui_dirty {
-                            if let Some(tx) = snapshot_tx.as_ref() {
-                                let next_rev = snapshot_rev.fetch_add(1, AtomicOrdering::Relaxed).saturating_add(1);
-                                let new_snap = Arc::new(state.build_ui_snapshot(next_rev));
-                                tx.send_if_modified(|cur| {
-                                    if cur.revision >= new_snap.revision {
-                                        return false;
-                                    }
-                                    *cur = Arc::clone(&new_snap);
-                                    true
-                                });
-                                tracing::trace!(rev = next_rev, "s4_a snapshot pushed (shutdown drain)");
-                            }
-                        }
+                        push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, ui_dirty);
                         if let (Some((tool_id, approved)), Some(router)) =
                             (approval_response, approval_router.as_ref())
                         {
@@ -1801,23 +1809,7 @@ pub fn spawn_dispatcher_task_full(
                             for effect in effects {
                                 executor.execute(effect).await;
                             }
-                            // S4-A Commit 3: 主循环路径 — Pure 模式（snapshot_tx=Some）
-                            // 时 ui_dirty 推送 snapshot 到 watch；其他模式 None 时
-                            // 整个分支零开销.
-                            if ui_dirty {
-                                if let Some(tx) = snapshot_tx.as_ref() {
-                                    let next_rev = snapshot_rev.fetch_add(1, AtomicOrdering::Relaxed).saturating_add(1);
-                                    let new_snap = Arc::new(state.build_ui_snapshot(next_rev));
-                                    tx.send_if_modified(|cur| {
-                                        if cur.revision >= new_snap.revision {
-                                            return false;
-                                        }
-                                        *cur = Arc::clone(&new_snap);
-                                        true
-                                    });
-                                    tracing::trace!(rev = next_rev, "s4_a snapshot pushed");
-                                }
-                            }
+                            push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, ui_dirty);
                             // S3 T3-1: reducer 处理完 ToolApprovalReceived 后，把决策
                             // 通过 approval_router 转给 driver 的 pending oneshot。
                             if let (Some((tool_id, approved)), Some(router)) =
