@@ -761,18 +761,24 @@ impl EffectExecutor {
                 tracing::debug!(title = %title, "AutoTitleSession effect");
             }
             Effect::RequestApproval { tool_id, name, args } => {
-                // S5 T5-1 (降级): TUI 卡片渲染 + Y/N 键盘接线工作量超本轮预算，保留 stub
-                // 自动放行；新增 OPENPRX_APPROVAL_OVERRIDE=deny 让测试可断言拒绝路径
-                let approved = std::env::var("OPENPRX_APPROVAL_OVERRIDE").ok().map_or(true, |v| {
-                    !matches!(v.trim().to_ascii_lowercase().as_str(), "deny" | "n" | "no" | "0")
-                });
-                tracing::info!(
-                    tool_id = %tool_id,
-                    name = %name,
-                    args_len = args.len(),
-                    approved,
-                    "RequestApproval effect (stub): respecting OPENPRX_APPROVAL_OVERRIDE (UI not wired yet)"
-                );
+                let env_value = std::env::var("OPENPRX_APPROVAL_OVERRIDE").ok();
+                let approved = resolve_supervised_approval_override(env_value.as_deref());
+                if env_value.is_none() {
+                    tracing::warn!(
+                        tool_id = %tool_id,
+                        name = %name,
+                        args_len = args.len(),
+                        "supervised approval UI 未接通，默认拒绝。设置 OPENPRX_APPROVAL_OVERRIDE=allow 显式放行"
+                    );
+                } else {
+                    tracing::info!(
+                        tool_id = %tool_id,
+                        name = %name,
+                        args_len = args.len(),
+                        approved,
+                        "RequestApproval effect (stub): OPENPRX_APPROVAL_OVERRIDE applied"
+                    );
+                }
                 let _ = args;
                 let action_tx = deps.action_tx.clone();
                 tokio::spawn(async move {
@@ -806,6 +812,26 @@ impl EffectExecutor {
             tracing::trace!("{}", msg);
         }
     }
+}
+
+// ─── S5 P0-3: supervised approval override ────────────────────────────────────
+
+/// 解析 `OPENPRX_APPROVAL_OVERRIDE` env 决定 supervised 模式下的批准结果.
+///
+/// S5 P0-3 (BREAKING): TUI 卡片渲染 + Y/N 键盘接线 (T5-1 完整版) 留 Task #11；
+/// 在 UI 接通前静默 auto-approve 是安全缺口 (Codex 反馈 "绝不静默 auto-approve")。
+///
+/// - `Some("allow" | "y" | "yes" | "1")` → `true` (显式允许)
+/// - `Some("deny" | "n" | "no" | "0")` → `false` (显式拒绝)
+/// - `None` 或其他值 → `false` (fail-safe deny，BREAKING — 原行为为 true)
+///
+/// 大小写不敏感，前后空白被忽略。
+#[must_use]
+pub(crate) fn resolve_supervised_approval_override(raw: Option<&str>) -> bool {
+    let Some(value) = raw else {
+        return false;
+    };
+    matches!(value.trim().to_ascii_lowercase().as_str(), "allow" | "y" | "yes" | "1")
 }
 
 // ─── StartTurn streaming driver (Step 5a-2) ────────────────────────────────────
@@ -2278,6 +2304,43 @@ mod tests {
                 text: "hello".to_string(),
             })
             .await;
+    }
+
+    // ── S5 P0-3 supervised approval fail-safe deny ──────────────────────────
+
+    #[test]
+    fn s5_release_p0_3_supervised_unset_env_denies_by_default() {
+        // env 未设置 → fail-safe deny (BREAKING — 原为 auto-approve)
+        assert!(!resolve_supervised_approval_override(None));
+    }
+
+    #[test]
+    fn s5_release_p0_3_supervised_env_allow_approves() {
+        for v in ["allow", "ALLOW", " allow ", "y", "Y", "yes", "YES", "1"] {
+            assert!(resolve_supervised_approval_override(Some(v)), "{v:?} 应当批准");
+        }
+    }
+
+    #[test]
+    fn s5_release_p0_3_supervised_env_deny_rejects() {
+        for v in ["deny", "DENY", " deny ", "n", "N", "no", "NO", "0", "", "garbage"] {
+            assert!(!resolve_supervised_approval_override(Some(v)), "{v:?} 应当拒绝");
+        }
+    }
+
+    #[test]
+    fn s5_release_p0_3_full_autonomy_skips_approval_entirely() {
+        use crate::approval::ApprovalManager;
+        use crate::config::AutonomyConfig;
+        use crate::security::AutonomyLevel;
+        let config = AutonomyConfig {
+            level: AutonomyLevel::Full,
+            ..AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&config);
+        // Full autonomy 完全跳过 approval — 不走 Effect::RequestApproval 路径
+        assert!(!mgr.needs_approval("shell"));
+        assert!(!mgr.needs_approval("file_write"));
     }
 }
 
