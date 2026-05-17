@@ -1130,15 +1130,7 @@ pub async fn run(
             // prompt.
             match TerminalGuard::enter() {
                 Ok(guard) => {
-                    // Seed the banner into the mirror state *before* the
-                    // first draw, so the user sees it on entry rather than
-                    // having it print to the parent shell's scrollback.
-                    //
-                    // Pure 模式跳过 chat_mirror 旁路写，由 reducer 单源接管
-                    let is_pure = top_redux_mode.is_pure();
-                    if !is_pure {
-                        chat_mirror.lock().push_system_message(&banner);
-                    }
+                    // S4-B: 删除 chat_mirror 旁路写，Pure 模式下 reducer 单源接管 banner
                     // S2-C Step 3: 双写到 Redux UI 镜像。Off/Both/Redux 下 chat_mirror
                     // 仍是 TUI 渲染源（本 dispatch 仅供 Redux 路径维护一致的 UI 账本
                     // + 测试断言）；Pure 模式下这是 reducer 单源唯一入口.
@@ -1160,19 +1152,9 @@ pub async fn run(
                     *executor_redraw_slot.lock() = Some(redraw_tx.clone());
                     tracing::debug!("P0-2: redraw_tx injected into EffectExecutor redraw_slot");
 
-                    // P3-4: route every UiActor event into the shared TUI
-                    // mirror instead of writing to stdout (which would tear
-                    // the draw loop). Must run BEFORE the unified loop
-                    // starts taking events.
-                    //
-                    // S4-A Commit 5: Pure 模式用 SnapshotDispatcherSink 替代
-                    // TuiStateMirrorSink — UiActor 旁路镜像走 reducer (no-op trace),
-                    // chat_mirror 在 Pure 下零写入 (单一写源原则).
-                    let sink: Box<dyn crate::channels::terminal::TuiMirrorSink> = if is_pure {
-                        Box::new(tui::SnapshotDispatcherSink::new(chat_dispatcher.clone()))
-                    } else {
-                        Box::new(tui::TuiStateMirrorSink::new(Arc::clone(&chat_mirror)))
-                    };
+                    // S4-B: 删除 TuiStateMirrorSink 路径，Pure 模式统一用 SnapshotDispatcherSink
+                    let sink: Box<dyn crate::channels::terminal::TuiMirrorSink> =
+                        Box::new(tui::SnapshotDispatcherSink::new(chat_dispatcher.clone()));
                     terminal.with_tui_mirror(sink, redraw_tx.clone()).await;
 
                     // P3-rearch: single thread owns Terminal/stdout + reads
@@ -1356,17 +1338,12 @@ pub async fn run(
         // `redraw_tx_for_main` is `None` on those paths.
         #[cfg(feature = "terminal-tui")]
         {
-            // Pure 模式 reducer 单源 echo (UserMessageEchoed)，legacy 旁路 mirror
-            if top_redux_mode.is_pure() {
-                let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::UserMessageEchoed(user_input.clone()),
-                    "chat.user_message_echoed",
-                );
-            } else {
-                chat_mirror.lock().push_user_message(&user_input);
-            }
+            // S4-B: 删除 legacy mirror push，reducer 单源 UserMessageEchoed
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::UserMessageEchoed(user_input.clone()),
+                "chat.user_message_echoed",
+            );
             if let Some(tx) = redraw_tx_for_main.as_ref() {
-                // cap=1 + try_send: bursts coalesce into a single deferred redraw
                 let _ = tx.try_send(());
             }
         }
@@ -1383,17 +1360,11 @@ pub async fn run(
         let emit_chat_output = |text: &str| {
             #[cfg(feature = "terminal-tui")]
             {
-                // Pure 模式跳过 mirror 旁路写，由 reducer 单源接管
-                if !top_redux_mode.is_pure() {
-                    chat_mirror.lock().push_system_message(text);
-                }
+                // S4-B: 删除 mirror 旁路写，reducer 单源 SystemMessageAdded
                 let _ = chat_dispatcher.dispatch_or_log(
                     crate::chat::action::Action::SystemMessageAdded { text: text.to_string() },
                     "chat.system_message_slash",
                 );
-                // Nudge the unified loop so the slash-command echo shows up
-                // immediately rather than waiting up to 50 ms for the next
-                // crossterm poll cycle. `try_send` + cap=1 coalesces bursts.
                 if let Some(tx) = redraw_tx_for_main.as_ref() {
                     let _ = tx.try_send(());
                 }
@@ -2192,17 +2163,7 @@ pub async fn run(
             let turn_slice = history.get(history_len_before_tools..).unwrap_or(&[]);
             let aggregated = collect_reasoning_from_history_slice(turn_slice);
             if !aggregated.is_empty() {
-                // S4-A Commit 5 (Codex 高危盲点 #1 修复): Pure 模式下 reducer 的
-                // reduce_stream_completed 已经 push 一条 ConversationLine::Reasoning;
-                // 此处 mirror 写在 Pure 下会导致重复. 但 driver 路径 (Pure/Redux+Driver)
-                // Pure 模式 reasoning 由 driver 跟 StreamCompleted 一起 dispatch，reducer 单源 push Reasoning card
-                if !top_redux_mode.is_pure() {
-                    tui_mirror.lock().push_reasoning(&aggregated);
-                }
-                // The reasoning card is a folded payload appended after the
-                // tool sequence but before the assistant draft is committed
-                // to scrollback; wake the unified loop so it materialises
-                // on the next iteration instead of after a 50 ms poll.
+                // S4-B: 删除 mirror push_reasoning，reducer (reduce_stream_completed) 单源 push Reasoning card
                 if let Some(tx) = redraw_tx_for_main.as_ref() {
                     let _ = tx.try_send(());
                 }
@@ -3711,11 +3672,14 @@ mod s4_a_4 {
         // 初始：2 行.
         src.with_view(|view| assert_eq!(view.conversation_lines().len(), 2));
 
-        // 推送新 snapshot：3 行.
+        // 推送新 snapshot：3 行（直接 push 不走 reduce，需手动清缓存让 build_ui_snapshot 重建 Arc）
         let mut state2 = state;
         state2.ui.conversation_lines.push(ConversationLine::System {
             content: "c".to_string(),
         });
+        // 直接绕过 reduce 写 lines 后必须清缓存（S4-A Commit B 引入的 Arc 共享缓存）
+        let _ = state2.reduce_tracked(crate::chat::action::Action::RedrawRequested);
+        // RedrawRequested 标 dirty=true 会清 cached_lines_arc，下次 build 重建 Arc 反映新 push
         let snap1 = Arc::new(state2.build_ui_snapshot(2));
         tx.send(snap1).expect("send snap1");
 
