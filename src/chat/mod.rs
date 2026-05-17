@@ -1443,7 +1443,7 @@ pub async fn run(
                     let _ = chat_dispatcher
                         .dispatch_or_log(crate::chat::action::Action::ModeChanged(mode), "chat.mode_changed");
                     #[cfg(feature = "terminal-tui")]
-                    let legacy_session_mode_writes_enabled = !top_redux_mode.is_pure();
+                    let legacy_session_mode_writes_enabled = false; // S4-B: Pure 单源
                     #[cfg(not(feature = "terminal-tui"))]
                     let legacy_session_mode_writes_enabled = true;
                     if legacy_session_mode_writes_enabled {
@@ -2281,7 +2281,7 @@ pub async fn run(
         let sanitized_input = sanitize::sanitize_for_persistence(&user_input);
         let sanitized_response = sanitize::sanitize_for_persistence(&response);
         #[cfg(feature = "terminal-tui")]
-        let legacy_session_writes_enabled = !top_redux_mode.is_pure();
+        let legacy_session_writes_enabled = false; // S4-B: Pure 单源
         #[cfg(not(feature = "terminal-tui"))]
         let legacy_session_writes_enabled = true;
         if legacy_session_writes_enabled {
@@ -2369,7 +2369,7 @@ pub async fn run(
     // 滞后于 reducer 维护的 SessionState。无条件退出 save 会用旧快照覆盖 reducer
     // 已落盘的最新 snapshot。守卫表达式与 line 2185 同形结构保持一致.
     #[cfg(feature = "terminal-tui")]
-    let legacy_exit_save_enabled = !top_redux_mode.is_pure();
+    let legacy_exit_save_enabled = false; // S4-B: Pure 单源
     #[cfg(not(feature = "terminal-tui"))]
     let legacy_exit_save_enabled = true;
     if legacy_exit_save_enabled {
