@@ -53,7 +53,7 @@ jobs:
         checks:
           - advisories
           - bans licenses sources
-    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    # S5 P0-4: advisories 分支移除 continue-on-error，发布门真正阻断
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2

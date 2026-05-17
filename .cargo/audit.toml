@@ -1,6 +1,11 @@
 [advisories]
 ignore = [
+    # bincode v2.0.1 via probe-rs — project considered complete
     "RUSTSEC-2025-0141",
+    # lettre 0.11.19 boring-tls path 未启用 (rustls-tls used) — 详见 SECURITY.md
+    "RUSTSEC-2026-0141",
+    # derivative unmaintained — matrix-sdk-indexeddb transitive，仅 wasm 路径
+    "RUSTSEC-2024-0388",
 ]
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"
