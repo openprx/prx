@@ -3454,7 +3454,7 @@ mod tests {
         /// 任何未来回退 chat::run 主循环 dispatch 顺序的修改都会让本测试翻车,
         /// 把 P0-1 决策固化到 reducer 层契约里.
         #[test]
-        fn test_t3_3_fix_a_dispatch_order_snapshot_contract() {
+        fn t3_3_fix_a_dispatch_order_snapshot_contract() {
             // ── 正序：RecordAssistantTurn → StreamCompleted ──
             let mut state_a = s();
             state_a.session.id = "sess-fwd".to_string();
@@ -3514,7 +3514,7 @@ mod tests {
         /// [LogTrace, NotifyHook(Error), RequestRedraw]，无 SaveSession.
         /// 防御回归：未来若有人想"把失败也保存"，本测试立刻翻车，强制更新附录 B + 评审.
         #[test]
-        fn test_t3_3_fix_a_stream_error_no_save() {
+        fn t3_3_fix_a_stream_error_no_save() {
             let mut state = s();
             let _ = state.reduce(Action::TurnStarted {
                 draft_id: "d-err".to_string(),
@@ -3537,7 +3537,7 @@ mod tests {
         /// 仅 [RequestRedraw]。phase_f_stream_cancelled_no_save_no_hook 已有覆盖,
         /// 本测试用 fixA 命名保留，便于按附录 B 决策点定位回归.
         #[test]
-        fn test_t3_3_fix_a_stream_cancelled_no_save() {
+        fn t3_3_fix_a_stream_cancelled_no_save() {
             let mut state = s();
             let _ = state.reduce(Action::TurnStarted {
                 draft_id: "d-cancel".to_string(),

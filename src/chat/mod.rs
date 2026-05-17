@@ -998,10 +998,13 @@ pub async fn run(
     // 两种 feature 配置下都确保真正使用）
     let dual_write_guard = dispatcher::RuntimeDualWriteGuard::new();
 
+    // 入口统一读 PRX_CHAT_REDUX，函数体内复用此值避免多点解析环境变量
+    let top_redux_mode = ReduxMode::from_env();
+
     // 根据 redux mode 选择 EffectExecutor 模式（TUI feature only）
     #[cfg(feature = "terminal-tui")]
     let effect_executor = {
-        let mode = ReduxMode::from_env();
+        let mode = top_redux_mode;
         if matches!(mode, ReduxMode::Off) {
             dispatcher::EffectExecutor::new_shadow()
         } else {
@@ -1052,7 +1055,7 @@ pub async fn run(
     // rx 保留为 `Option` 留给 spawn_tui_unified_loop 使用。
     #[cfg(feature = "terminal-tui")]
     let (snapshot_tx_for_dispatcher, snapshot_rx_for_tui) = {
-        let mode = ReduxMode::from_env();
+        let mode = top_redux_mode;
         if mode.is_pure() {
             let initial = std::sync::Arc::new(crate::chat::state::UiSnapshot::initial(
                 std::sync::Arc::from(provider_name),
@@ -1131,9 +1134,8 @@ pub async fn run(
                     // first draw, so the user sees it on entry rather than
                     // having it print to the parent shell's scrollback.
                     //
-                    // S4-A Commit 5 (Codex 高危盲点 #1 修复): Pure 模式跳过
-                    // chat_mirror 旁路写，让 reducer 单源 (SystemMessageAdded) 接管.
-                    let is_pure = ReduxMode::from_env().is_pure();
+                    // Pure 模式跳过 chat_mirror 旁路写，由 reducer 单源接管
+                    let is_pure = top_redux_mode.is_pure();
                     if !is_pure {
                         chat_mirror.lock().push_system_message(&banner);
                     }
@@ -1358,13 +1360,9 @@ pub async fn run(
             // 用户输入的视觉 echo 暂时缺失 — reducer 当前的 InputSubmitted Action
             // 仅维护 ui.input / turn_count，未 push 一行 ConversationLine::User.
             //
-            // 这是 reducer 已知未覆盖的语义缺口 (legacy push_user_message 路径).
-            // Pure 模式下用户提交 → 1) input box 清空 (reducer 处理) → 2) LLM 回复
-            // 紧接着流式渲染. 中间用户回到的是 "input 已清空 + assistant 在 think"
-            // 的过渡状态，无独立 User bubble. 短期 acceptable；S4-B 可引入
-            // 专用 Action::UserMessageEchoed 让 reducer 写 ConversationLine::User
-            // 完整恢复 echo 行为. 此处 Pure 守卫严格遵守 "Pure 不写 mirror" 原则.
-            if !ReduxMode::from_env().is_pure() {
+            // Pure 模式下用 Action::UserMessageEchoed 让 reducer 写 ConversationLine::User，
+            // legacy 模式继续 mirror 旁路写
+            if !top_redux_mode.is_pure() {
                 chat_mirror.lock().push_user_message(&user_input);
             }
             if let Some(tx) = redraw_tx_for_main.as_ref() {
@@ -1386,10 +1384,8 @@ pub async fn run(
         let emit_chat_output = |text: &str| {
             #[cfg(feature = "terminal-tui")]
             {
-                // S4-A Commit 5 (Codex 高危盲点 #1 修复): Pure 模式跳过 chat_mirror
-                // 旁路写。SystemMessageAdded Action 已是 reducer 单源入口 — Pure
-                // 下 reducer 写 conversation_lines 由 snapshot 推送给 ratatui.
-                if !ReduxMode::from_env().is_pure() {
+                // Pure 模式跳过 mirror 旁路写，由 reducer 单源接管
+                if !top_redux_mode.is_pure() {
                     chat_mirror.lock().push_system_message(text);
                 }
                 let _ = chat_dispatcher.dispatch_or_log(
@@ -1473,15 +1469,11 @@ pub async fn run(
                 }
                 commands::CommandResult::Quit => break,
                 commands::CommandResult::SetMode(mode) => {
-                    // S2-B Step 4: dispatch `Action::ModeChanged` 让 reducer 写
-                    // `state.session.mode`。T3-3-fixB B4：Pure 模式跳过 legacy
-                    // `chat_session.set_mode`——Pure 下 chat_session 不参与持久化
-                    // (SaveSession 走 reducer 快照)，写 mode 是死写。Off/Both/Redux
-                    // 仍需 legacy 写，run_tool_call_loop 仍读 chat_session.mode。
+                    // Pure 跳过 legacy chat_session.set_mode；legacy 模式下 run_tool_call_loop 仍读
                     let _ = chat_dispatcher
                         .dispatch_or_log(crate::chat::action::Action::ModeChanged(mode), "chat.mode_changed");
                     #[cfg(feature = "terminal-tui")]
-                    let legacy_session_mode_writes_enabled = !ReduxMode::from_env().is_pure();
+                    let legacy_session_mode_writes_enabled = !top_redux_mode.is_pure();
                     #[cfg(not(feature = "terminal-tui"))]
                     let legacy_session_mode_writes_enabled = true;
                     if legacy_session_mode_writes_enabled {
@@ -1574,13 +1566,9 @@ pub async fn run(
         let cancellation = CancellationToken::new();
         let (delta_tx, delta_rx) = mpsc::channel::<String>(DELTA_CHANNEL_CAPACITY);
 
-        // S2-A: per-turn Redux mode snapshot. Read once here so the
-        // `draft_updater` closure (and any future per-turn gating) sees a
-        // consistent view even if env changes mid-process. Off/Both keep the
-        // legacy `update_draft(accumulated)` UI writer; pure Redux mode lets
-        // the reducer-driven renderer own UI text exclusively.
+        // 复用 chat::run 入口读取的 top_redux_mode（环境不会在进程内变化）
         #[cfg(feature = "terminal-tui")]
-        let redux_mode = ReduxMode::from_env();
+        let redux_mode = top_redux_mode;
 
         // Start a streaming draft on the terminal
         let draft_id = match terminal.send_draft(&SendMessage::new("", "user")).await {
@@ -1818,7 +1806,7 @@ pub async fn run(
         // 刻意保守的"测试/演进闸"，确保零回归。tool 协议迁移在 5a-5。
         #[cfg(feature = "terminal-tui")]
         let turn_route = {
-            let mode = ReduxMode::from_env();
+            let mode = top_redux_mode;
             let driver_opt_in = driver_opt_in_from_env();
             // 路由判定中允许测试 env 强制把 tools_registry 视为空（5a-4 PTY 验证用）。
             // Codex P2: 生产环境若误开此 env 会丢失工具能力，因此首次命中时 WARN
@@ -2215,11 +2203,8 @@ pub async fn run(
                 // S4-A Commit 5 (Codex 高危盲点 #1 修复): Pure 模式下 reducer 的
                 // reduce_stream_completed 已经 push 一条 ConversationLine::Reasoning;
                 // 此处 mirror 写在 Pure 下会导致重复. 但 driver 路径 (Pure/Redux+Driver)
-                // 由 drive_start_turn_stream 主导，reasoning 是否被 driver 单独投递
-                // 取决于 provider 是否在 final_text 中嵌入 reasoning. 现状 driver
-                // 直接把 reasoning summary 跟着 final_text 一起 dispatch StreamCompleted,
-                // reducer 内 push Reasoning card. 因此 Pure 下跳过 mirror.push_reasoning.
-                if !ReduxMode::from_env().is_pure() {
+                // Pure 模式 reasoning 由 driver 跟 StreamCompleted 一起 dispatch，reducer 单源 push Reasoning card
+                if !top_redux_mode.is_pure() {
                     tui_mirror.lock().push_reasoning(&aggregated);
                 }
                 // The reasoning card is a folded payload appended after the
@@ -2341,14 +2326,14 @@ pub async fn run(
         let sanitized_input = sanitize::sanitize_for_persistence(&user_input);
         let sanitized_response = sanitize::sanitize_for_persistence(&response);
         #[cfg(feature = "terminal-tui")]
-        let legacy_session_writes_enabled = !ReduxMode::from_env().is_pure();
+        let legacy_session_writes_enabled = !top_redux_mode.is_pure();
         #[cfg(not(feature = "terminal-tui"))]
         let legacy_session_writes_enabled = true;
         if legacy_session_writes_enabled {
             chat_session.add_user_turn(&sanitized_input);
             chat_session.add_assistant_turn(&sanitized_response, Vec::new());
         } else {
-            tracing::debug!("T3-3-c Pure mode: skip legacy chat_session.add_*_turn (reducer owns persistence)");
+            tracing::debug!("Pure mode: skip legacy chat_session.add_*_turn (reducer owns persistence)");
         }
 
         // P0-1 fix: 旧路径在 Both/Redux 模式下受 dual_write_guard 守卫。
@@ -2429,7 +2414,7 @@ pub async fn run(
     // 滞后于 reducer 维护的 SessionState。无条件退出 save 会用旧快照覆盖 reducer
     // 已落盘的最新 snapshot。守卫表达式与 line 2185 同形结构保持一致.
     #[cfg(feature = "terminal-tui")]
-    let legacy_exit_save_enabled = !ReduxMode::from_env().is_pure();
+    let legacy_exit_save_enabled = !top_redux_mode.is_pure();
     #[cfg(not(feature = "terminal-tui"))]
     let legacy_exit_save_enabled = true;
     if legacy_exit_save_enabled {
@@ -2438,7 +2423,7 @@ pub async fn run(
             tracing::warn!("Failed to persist session on exit: {e}");
         }
     } else {
-        tracing::debug!("T3-3-fixA P0-2 Pure mode: skip legacy exit save_session (reducer owns persistence)");
+        tracing::debug!("Pure mode: skip legacy exit save_session (reducer owns persistence)");
     }
 
     info!("Chat session ended");
