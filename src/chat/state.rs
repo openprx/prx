@@ -175,6 +175,8 @@ pub struct SessionState {
     pub turns: Vec<ChatTurn>,
     /// LLM 上下文消息列表（system+user+assistant，用于下一次请求）
     pub history: Vec<ChatMessage>,
+    /// 会话创建时间（首次 RecordUserTurn 时延迟初始化；build_session_snapshot 不再覆盖）
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// TUI UI 临时状态（退出即弃，不持久化）.
@@ -314,6 +316,7 @@ impl ChatState {
                 mode: ChatMode::default(),
                 turns: Vec::new(),
                 history: Vec::new(),
+                created_at: None,
             },
             ui: UiState {
                 conversation_lines: Vec::new(),
@@ -1293,6 +1296,8 @@ impl ChatState {
         self.session.model = Arc::from(loaded.model.as_str());
         self.session.mode = loaded.mode;
         self.session.turns = loaded.turns;
+        // S4-B T4-B-6: 保留原 session 的 created_at，避免下次 save_session 覆盖
+        self.session.created_at = Some(loaded.created_at);
         // history 从 turns 重建（仅 user/assistant 角色进 LLM context）
         self.session.history = self
             .session
@@ -1355,14 +1360,17 @@ impl ChatState {
     /// 抽出独立 fn 让 `reduce_session_switched` / `reduce_stream_completed` 等多处共用同一
     /// 构造路径，避免字段错漏。
     fn build_session_snapshot(&self) -> ChatSession {
+        let now = chrono::Utc::now();
         ChatSession {
             id: self.session.id.clone(),
             schema_version: crate::chat::session::SCHEMA_VERSION,
             title: self.session.title.clone(),
             provider: self.session.provider.as_ref().to_owned(),
             model: self.session.model.as_ref().to_owned(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            // S4-B T4-B-6: created_at 严格语义 — 取 SessionState.created_at（首次 RecordUserTurn 初始化），
+            // 兜底用 now，保证不会反向覆盖既有创建时间
+            created_at: self.session.created_at.unwrap_or(now),
+            updated_at: now,
             turns: self.session.turns.clone(),
             mode: self.session.mode,
         }
@@ -1375,10 +1383,15 @@ impl ChatState {
     /// - 首条 user turn 时若 title 为空则自动 set_title（截断前 50 字符，对齐 ChatSession 逻辑）
     /// - tool_calls 留空，tool 同步由 `ToolStarted`/`ToolFinished` 单独处理（Step 5b）
     fn reduce_record_user_turn(&mut self, content: String) -> Vec<Effect> {
+        let now = chrono::Utc::now();
+        // S4-B T4-B-6: 首次 RecordUserTurn 延迟初始化 created_at
+        if self.session.created_at.is_none() {
+            self.session.created_at = Some(now);
+        }
         self.session.turns.push(crate::chat::session::ChatTurn {
             role: "user".to_string(),
             content: content.clone(),
-            timestamp: chrono::Utc::now(),
+            timestamp: now,
             tool_calls: Vec::new(),
         });
         // 首条 user turn 且 title 为空时自动设置标题（对齐 session.add_user_turn 行为）
@@ -5121,6 +5134,48 @@ mod tests {
                 })
                 .expect("snapshot 应含 User 行");
             assert_eq!(last_user, "hello echo");
+        }
+
+        /// S4-B T4-B-6: created_at 严格语义 — 首次 RecordUserTurn 初始化 + 多 turn 保持不变
+        #[test]
+        fn s4_b_created_at_stable_across_turns() {
+            let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+            state.session.id = "sess1".to_string();
+            assert!(state.session.created_at.is_none(), "初始 created_at 应为 None");
+
+            let _ = state.reduce(Action::RecordUserTurn("q1".to_string()));
+            let created_first = state.session.created_at.expect("首次 RecordUserTurn 应设置 created_at");
+
+            // 第二次 RecordUserTurn 不应覆盖 created_at
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let _ = state.reduce(Action::RecordUserTurn("q2".to_string()));
+            assert_eq!(
+                state.session.created_at,
+                Some(created_first),
+                "多 turn 不应覆盖 created_at"
+            );
+
+            // build_session_snapshot 应使用 SessionState.created_at
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let effects = state.reduce(Action::StreamCompleted {
+                draft_id: "d".to_string(),
+                final_text: "ok".to_string(),
+                reasoning: String::new(),
+            });
+            let snap_session = effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::SaveSession(s) => Some(s),
+                    _ => None,
+                })
+                .expect("StreamCompleted 应 emit SaveSession");
+            assert_eq!(
+                snap_session.created_at, created_first,
+                "build_session_snapshot 应继承 SessionState.created_at 不覆盖"
+            );
         }
 
         /// S4-B T4-B-4：route_turn 在 Pure 模式下总返回 ReduxDriver
