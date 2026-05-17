@@ -5123,6 +5123,41 @@ mod tests {
             assert_eq!(last_user, "hello echo");
         }
 
+        /// S4-B 删除清理：mirror push 全删后 reducer 单源接管 4 类 ConversationLine push
+        #[test]
+        fn s4_b_reducer_sole_source_for_conversation_lines() {
+            let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+            let _ = state.reduce(Action::SystemMessageAdded {
+                text: "banner".to_string(),
+            });
+            let _ = state.reduce(Action::UserMessageEchoed("hi".to_string()));
+            let _ = state.reduce(Action::ToolStarted {
+                name: "Bash".to_string(),
+                args: "{}".to_string(),
+            });
+            let _ = state.reduce(Action::ToolFinished {
+                name: "Bash".to_string(),
+                success: true,
+                duration_ms: 10,
+                result: None,
+            });
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "d".to_string(),
+                final_text: "ok".to_string(),
+                reasoning: String::new(),
+            });
+            assert_eq!(state.ui.conversation_lines.len(), 4, "reducer 单源应 push 4 行");
+            let mut iter = state.ui.conversation_lines.iter();
+            assert!(matches!(iter.next(), Some(ConversationLine::System { .. })));
+            assert!(matches!(iter.next(), Some(ConversationLine::User { .. })));
+            assert!(matches!(iter.next(), Some(ConversationLine::ToolResult { .. })));
+            assert!(matches!(iter.next(), Some(ConversationLine::Assistant { .. })));
+        }
+
         /// S4-A Commit E: TerminalResized 不应标 ui_dirty (snapshot 字段集不变, redraw 走 Effect 路径)
         #[test]
         fn s4_a_post_p2_terminal_resized_not_dirty() {
