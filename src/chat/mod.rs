@@ -1798,12 +1798,7 @@ pub async fn run(
             },
         }
 
-        // ── Step 5a-4: Route — Redux driver vs Legacy tool loop ──
-        //
-        // 路由契约：仅当 PRX_CHAT_REDUX=1 + PRX_CHAT_REDUX_DRIVER=1 +
-        // tools_registry 为空时切到 dispatcher driver。生产环境核心工具
-        // 总会注册，故路由几乎总命中 LegacyToolLoop —— 这是 5a-4 阶段
-        // 刻意保守的"测试/演进闸"，确保零回归。tool 协议迁移在 5a-5。
+        // 路由 Redux driver vs Legacy tool loop，决策矩阵见 route_turn
         #[cfg(feature = "terminal-tui")]
         let turn_route = {
             let mode = top_redux_mode;
@@ -1855,8 +1850,6 @@ pub async fn run(
         //   * 无 history 双写（reducer 通过 RecordAssistantTurn 单写）
         //   * round 2 hang 防御：tokio::select! 上 shutdown.cancelled() 兜底
         //
-        // 进入条件 `tools_registry.is_empty()` 保证不会丢失工具调用——driver
-        // 协议（StreamChunk）天然不承载 tool_calls，5a-5 推进 tool 协议迁移。
         #[cfg(feature = "terminal-tui")]
         if matches!(turn_route, TurnRoute::ReduxDriver)
             && let Some(d_id) = draft_id.clone()
@@ -3511,7 +3504,7 @@ mod redux_mode_tests {
         assert_eq!(ReduxMode::parse(" both "), ReduxMode::Both, "trim 应生效");
     }
 
-    /// T3-3-a-3: "redux" 显式别名（保留向后兼容）
+    /// "redux" 显式值/显式模式
     #[test]
     fn parse_redux_value() {
         assert_eq!(ReduxMode::parse("redux"), ReduxMode::Redux);
