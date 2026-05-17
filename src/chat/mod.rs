@@ -999,7 +999,17 @@ pub async fn run(
     let dual_write_guard = dispatcher::RuntimeDualWriteGuard::new();
 
     // 入口统一读 PRX_CHAT_REDUX，函数体内复用此值避免多点解析环境变量
-    let top_redux_mode = ReduxMode::from_env();
+    // S4-B: Pure 是唯一支持的运行路径；非 Pure 值 warning 后强制升级
+    let top_redux_mode = {
+        let parsed = ReduxMode::from_env();
+        if !parsed.is_pure() {
+            tracing::warn!(
+                requested = ?parsed,
+                "S4-B: PRX_CHAT_REDUX 仅 Pure 是受支持模式; 非 Pure 值已强制升级为 Pure"
+            );
+        }
+        ReduxMode::Pure
+    };
 
     // 根据 redux mode 选择 EffectExecutor 模式（TUI feature only）
     #[cfg(feature = "terminal-tui")]
