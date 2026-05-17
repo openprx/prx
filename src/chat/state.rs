@@ -1630,9 +1630,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::HistoryNavigated(_)
         | Action::InputCancelled => true,
 
-        // 终端尺寸变化：snapshot 字段不变（width/height 不在 snapshot 内），
-        // 但渲染需要重新布局 — dirty=true 让 watch 触发 redraw 兜底.
-        Action::TerminalResized { .. } => true,
+        // 终端尺寸变化不影响 snapshot 字段集，redraw 经 Effect::RequestRedraw → redraw_tx 走
+        Action::TerminalResized { .. } => false,
 
         // UI 折叠/展开：直接 mutate conversation_lines → dirty
         Action::ToolCardFoldToggled | Action::ReasoningFoldToggled => true,
@@ -5122,6 +5121,21 @@ mod tests {
                 })
                 .expect("snapshot 应含 User 行");
             assert_eq!(last_user, "hello echo");
+        }
+
+        /// S4-A Commit E: TerminalResized 不应标 ui_dirty (snapshot 字段集不变, redraw 走 Effect 路径)
+        #[test]
+        fn s4_a_post_p2_terminal_resized_not_dirty() {
+            let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+            let (effects, dirty) = state.reduce_tracked(Action::TerminalResized { w: 120, h: 40 });
+            assert!(
+                effects.iter().any(|e| matches!(e, Effect::RequestRedraw)),
+                "TerminalResized 仍应 emit RequestRedraw (redraw 走 redraw_tx)"
+            );
+            assert!(
+                !dirty,
+                "TerminalResized 不动 snapshot 字段，dirty 应 false 避免无意义 watch push"
+            );
         }
 
         /// S4-A Commit B: 连续两次 build_ui_snapshot 未变 ui 时 Arc::ptr_eq 共享
