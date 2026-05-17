@@ -5123,6 +5123,22 @@ mod tests {
             assert_eq!(last_user, "hello echo");
         }
 
+        /// S4-B T4-B-4：route_turn 在 Pure 模式下总返回 ReduxDriver
+        #[test]
+        fn s4_b_route_turn_pure_always_redux_driver() {
+            use crate::chat::{ReduxMode, TurnRoute, route_turn};
+            assert_eq!(
+                route_turn(ReduxMode::Pure, false, true),
+                TurnRoute::ReduxDriver,
+                "Pure 模式无需 driver_opt_in 也应路由到 ReduxDriver"
+            );
+            assert_eq!(
+                route_turn(ReduxMode::Pure, true, false),
+                TurnRoute::ReduxDriver,
+                "Pure 模式无论 tools_empty=false 也应路由到 ReduxDriver"
+            );
+        }
+
         /// S4-B 删除清理：mirror push 全删后 reducer 单源接管 4 类 ConversationLine push
         #[test]
         fn s4_b_reducer_sole_source_for_conversation_lines() {
