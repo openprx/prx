@@ -2328,6 +2328,65 @@ mod tests {
         }
     }
 
+    // ── S5 P0-1: stream error 分类回归 (driver 协议层) ──────────────────────
+
+    #[test]
+    fn s5_release_p0_1_retryable_http_io_triggers_retry() {
+        // StreamError::Io 总是 retryable（与 driver retry-loop 同源判定）.
+        let io_err =
+            crate::providers::traits::StreamError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "boom"));
+        assert!(
+            stream_error_is_retryable(&io_err),
+            "Io 错误必须可重试 (driver retry loop 依赖)"
+        );
+        // Provider 错误（语义错）不可重试.
+        let provider_err = crate::providers::traits::StreamError::Provider("invalid api key".to_string());
+        assert!(!stream_error_is_retryable(&provider_err), "Provider 语义错不可重试");
+    }
+
+    #[test]
+    fn s5_release_p0_1_context_overflow_triggers_compact() {
+        // 三家 provider 不同错误措辞都应被识别为 context overflow.
+        let cases = [
+            "This model's maximum context length is 8192 tokens",
+            "prompt is too long",
+            "request exceed the maximum input token count",
+            "context_length_exceeded",
+        ];
+        for msg in cases {
+            let err = crate::providers::traits::StreamError::Provider(msg.to_string());
+            assert!(
+                stream_error_is_context_overflow(&err),
+                "应识别为 context overflow: {msg:?}"
+            );
+        }
+        // 非 overflow 错误不能触发 compact.
+        let other = crate::providers::traits::StreamError::Provider("rate limited".to_string());
+        assert!(!stream_error_is_context_overflow(&other), "rate limit 不应当 compact");
+    }
+
+    #[tokio::test]
+    async fn s5_release_p0_1_parallel_tool_calls_serialize() {
+        // SCRIPT 在同一 stream 内 emit 两个 tool_call chunk + final.
+        // StreamChunkCoalescer 用 ToolCallChunk 模拟串行场景；这里直接验证
+        // StreamChunk::tool_call_chunk 能携带多个 ToolCallChunk 且 has_tool_calls()=true.
+        use crate::providers::traits::{StreamChunk, ToolCallChunk};
+        let calls = vec![
+            ToolCallChunk::new("t1".to_string(), "shell".to_string(), "{}".to_string(), 0),
+            ToolCallChunk::new("t2".to_string(), "file_read".to_string(), "{}".to_string(), 1),
+        ];
+        let chunk = StreamChunk::tool_call_chunk(calls);
+        assert!(chunk.has_tool_calls(), "并行 tool calls 应当被 chunk 识别");
+        assert_eq!(chunk.tool_calls.len(), 2, "应该携带 2 个 tool call");
+        let first = chunk.tool_calls.first().expect("tool[0]");
+        let second = chunk.tool_calls.get(1).expect("tool[1]");
+        assert_eq!(first.id, "t1");
+        assert_eq!(second.id, "t2");
+        // 顺序保留：driver 用 index 字段串行化执行（这里只断言数据结构层).
+        assert_eq!(first.index, 0);
+        assert_eq!(second.index, 1);
+    }
+
     #[test]
     fn s5_release_p0_3_full_autonomy_skips_approval_entirely() {
         use crate::approval::ApprovalManager;

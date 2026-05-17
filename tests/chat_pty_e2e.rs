@@ -1202,3 +1202,130 @@ fn test_chat_s4_a_6_pure_snapshot_chinese_no_extra_spaces_via_real_path() {
         .expect("second SIGINT");
     let _ = wait_for_exit(session, EXIT_TIMEOUT);
 }
+
+// ─── S5 P0-1: 协议级 PTY 回归 (anthropic / openai / gemini flavor) ─────────────
+//
+// 无 API key 时真实 LLM 不可达，本组测试通过 MockEnvProvider OPENPRX_MOCK_SCRIPT
+// 在 streaming 路径 emit 完整脚本（delta + reasoning + tool + final），覆盖
+// driver 在不同 provider flavor 下的协议层回归。详见 docs/release-notes-0.4.0.md。
+
+/// S5 P0-1: anthropic flavor 完整 turn — 多个 delta + reasoning + final.
+#[test]
+#[serial(prx_chat_pty)]
+fn s5_release_p0_1_anthropic_full_turn_via_real_path() {
+    let sentinel = "[MOCK-S5-P0-1-ANTHROPIC]";
+    let script = format!(
+        r#"{{"chunks":[
+            {{"delta":"Hello "}},
+            {{"delta":"from "}},
+            {{"delta":"anthropic "}},
+            {{"delta":"flavor "}},
+            {{"delta":"{sentinel}"}},
+            {{"is_final":true}}
+        ]}}"#
+    );
+    let (mut sg, _guard) = spawn_chat(
+        &[],
+        &[
+            ("OPENPRX_MOCK_SCRIPT", script.as_str()),
+            ("OPENPRX_MOCK_PROVIDER_FLAVOR", "anthropic"),
+            ("PRX_CHAT_REDUX", "pure"),
+            ("PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS", "1"),
+        ],
+    );
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+    session.send("hi\r").expect("send hi");
+    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        captured.contains(sentinel),
+        "anthropic flavor 应汇出 sentinel. captured:\n{captured}"
+    );
+    session.send("/exit\r").expect("send /exit");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "anthropic flavor /exit 应干净退出"
+    );
+}
+
+/// S5 P0-1: openai flavor 含 tool_call 的 turn — driver 必须执行 tool 再续 text.
+#[test]
+#[serial(prx_chat_pty)]
+fn s5_release_p0_1_openai_tool_call_turn_via_real_path() {
+    let sentinel = "[MOCK-S5-P0-1-OPENAI-DONE]";
+    let script = format!(
+        r#"{{"chunks":[
+            {{"tool":{{"id":"t1","name":"memory_recall","args":"{{\"query\":\"x\",\"limit\":1}}"}}}},
+            {{"delta":"{sentinel}"}},
+            {{"is_final":true}}
+        ]}}"#
+    );
+    let (mut sg, _guard) = spawn_chat(
+        &[],
+        &[
+            ("OPENPRX_MOCK_SCRIPT", script.as_str()),
+            ("OPENPRX_MOCK_PROVIDER_FLAVOR", "openai"),
+            ("PRX_CHAT_REDUX", "pure"),
+        ],
+    );
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+    session.send("hi\r").expect("send hi");
+    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        captured.contains(sentinel),
+        "openai flavor tool turn 应最终汇出 sentinel. captured:\n{captured}"
+    );
+    session.send("/exit\r").expect("send /exit");
+    assert!(wait_for_exit(session, EXIT_TIMEOUT), "openai flavor /exit 应干净退出");
+}
+
+/// S5 P0-1: gemini flavor cancel-mid-stream — 第一个 chunk 出现后双 Ctrl+C.
+#[test]
+#[serial(prx_chat_pty)]
+fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
+    // 10 chunks * 100ms = 1s 总时长，足够双 Ctrl+C 落在中间.
+    let script = r#"{"chunks":[
+        {"delta":"g1 "},
+        {"delta":"g2 "},
+        {"delta":"g3 "},
+        {"delta":"g4 "},
+        {"delta":"g5 "},
+        {"delta":"g6 "},
+        {"delta":"g7 "},
+        {"delta":"g8 "},
+        {"delta":"g9 "},
+        {"delta":"g10"},
+        {"is_final":true}
+    ]}"#;
+    let (mut sg, _guard) = spawn_chat(
+        &[],
+        &[
+            ("OPENPRX_MOCK_SCRIPT", script),
+            ("OPENPRX_MOCK_PROVIDER_FLAVOR", "gemini"),
+            ("OPENPRX_MOCK_DELAY_MS_PER_CHUNK", "100"),
+            ("PRX_CHAT_REDUX", "pure"),
+            ("PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS", "1"),
+        ],
+    );
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+    session.send("hi\r").expect("send hi");
+    read_until_with_dsr(session, "g1 ", TURN_TIMEOUT);
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("first SIGINT");
+    std::thread::sleep(Duration::from_millis(100));
+    session
+        .get_process_mut()
+        .signal(expectrl::Signal::SIGINT)
+        .expect("second SIGINT");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "gemini flavor cancel-mid-stream 应在 {EXIT_TIMEOUT:?} 内退出"
+    );
+}
