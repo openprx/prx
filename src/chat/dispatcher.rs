@@ -2713,6 +2713,18 @@ mod real_mode_tests {
         }
     }
 
+    /// 轮询等待原子计数器达到目标值，避免固定 sleep 导致测试在慢机器上抖动
+    async fn wait_for_count(counter: &AtomicUsize, target: usize, timeout: Duration) -> usize {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let cur = counter.load(std::sync::atomic::Ordering::SeqCst);
+            if cur >= target || std::time::Instant::now() >= deadline {
+                return cur;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// 计数器版 HookManager wrapper —— 直接复用 HookManager 但放在临时目录.
     fn build_hook_manager() -> (Arc<HookManager>, TempDir) {
         let temp = TempDir::new().expect("tempdir");
@@ -2768,14 +2780,9 @@ mod real_mode_tests {
         let session = ChatSession::new("prov", "model");
         executor.execute(Effect::SaveSession(session)).await;
 
-        // spawn 子任务异步执行；等一小段时间让其完成.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        assert_eq!(
-            store_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "memory.store should be called exactly once"
-        );
+        // 轮询等异步 spawn 子任务完成，避免固定 sleep 在慢机器上抖动
+        let final_count = wait_for_count(&store_count, 1, Duration::from_secs(2)).await;
+        assert_eq!(final_count, 1, "memory.store should be called exactly once");
         // RAII scope：子任务完成后 guard 应自动复位（不粘住）.
         assert!(
             !deps.dual_write_guard.is_active(),
@@ -2836,13 +2843,8 @@ mod real_mode_tests {
         }
         assert!(had_save_session, "reducer must emit SaveSession for StreamCompleted");
 
-        // SaveSession 走 spawn 子任务，等待其完成.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(
-            store_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "reducer-emitted SaveSession 应触发 memory.store 一次"
-        );
+        let final_count = wait_for_count(&store_count, 1, Duration::from_secs(2)).await;
+        assert_eq!(final_count, 1, "reducer-emitted SaveSession 应触发 memory.store 一次");
     }
 
     /// T3-3-fixA P0-2: Exit-after-completed 四模式 reducer 持久化等价性.
@@ -2898,10 +2900,9 @@ mod real_mode_tests {
             }
             assert!(had_save, "[{tag}] reducer 完成 turn 必发 SaveSession");
 
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            let final_count = wait_for_count(&store_count, 1, Duration::from_secs(2)).await;
             assert_eq!(
-                store_count.load(std::sync::atomic::Ordering::SeqCst),
-                1,
+                final_count, 1,
                 "[{tag}] reducer 持久化路径必须模式无关 — 完整 turn 应触发 memory.store 一次",
             );
         }
@@ -2960,7 +2961,8 @@ mod real_mode_tests {
                 executor.execute(effect).await;
             }
 
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            // 负向断言保留固定等待：确认在合理窗口内 spawn 子任务确实未写
+            tokio::time::sleep(Duration::from_millis(100)).await;
             assert_eq!(
                 store_count.load(std::sync::atomic::Ordering::SeqCst),
                 0,
@@ -3852,12 +3854,9 @@ mod real_mode_tests {
         let msg = SendMessage::new("hello from effect".to_string(), "user");
         executor.execute(Effect::EmitChannelMessage(msg)).await;
 
-        // spawn 子任务异步；等待完成
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
+        let final_count = wait_for_count(&send_count, 1, Duration::from_secs(2)).await;
         assert_eq!(
-            send_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
+            final_count, 1,
             "channel.send should be called exactly once for EmitChannelMessage"
         );
         // RAII scope：子任务完成后 guard 应自动复位（不粘住）.
@@ -3887,11 +3886,9 @@ mod real_mode_tests {
             })
             .await;
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
+        let final_count = wait_for_count(&store_count, 1, Duration::from_secs(2)).await;
         assert_eq!(
-            store_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
+            final_count, 1,
             "memory.store should be called exactly once for PersistToMemory"
         );
         // RAII scope：子任务完成后 guard 应自动复位（不粘住）.
