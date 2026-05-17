@@ -1657,7 +1657,9 @@ pub async fn run(
         // 路径无法直接访问 ChatState，所以 legacy 字段在 Off/Both 模式下必须保留写
         // 以确保兜底。Redux / Pure 模式下 legacy 字段不必再写（reducer 是单一真源）。
         #[cfg(feature = "terminal-tui")]
-        let legacy_active_cancel_enabled = matches!(redux_mode, ReduxMode::Off | ReduxMode::Both);
+        // S4-B: Pure 模式取消 token 完全由 reducer + Effect::CancelToken 接管
+        #[cfg(feature = "terminal-tui")]
+        let legacy_active_cancel_enabled = false;
         #[cfg(not(feature = "terminal-tui"))]
         let legacy_active_cancel_enabled = true;
         if legacy_active_cancel_enabled {
