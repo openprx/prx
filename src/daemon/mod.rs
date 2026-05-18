@@ -7,7 +7,7 @@ use crate::self_system::evolution::{
     PromptEvolutionEngine, StrategyEvolutionEngine, new_shared_evolution_config,
 };
 use anyhow::{Context, Result};
-use chrono::{Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,8 +15,11 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
+const MANUAL_DAEMON_STALE_SECONDS: i64 = 30;
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+    ensure_manual_daemon_start_allowed(&config)?;
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config.reliability.channel_max_backoff_secs.max(initial_backoff);
 
@@ -250,6 +253,7 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(STATUS_FLUSH_SECONDS));
         loop {
             interval.tick().await;
+            crate::health::mark_component_ok("daemon");
             let mut json = crate::health::snapshot_json();
             if let Some(obj) = json.as_object_mut() {
                 obj.insert("written_at".into(), serde_json::json!(Utc::now().to_rfc3339()));
@@ -261,6 +265,83 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
             systemd_notify::watchdog();
         }
     })
+}
+
+fn ensure_manual_daemon_start_allowed(config: &Config) -> Result<()> {
+    if is_systemd_managed_start() {
+        return Ok(());
+    }
+
+    let state_path = state_file_path(config);
+    let Some(active) = active_daemon_from_state_file(&state_path) else {
+        return Ok(());
+    };
+
+    anyhow::bail!(
+        "Refusing to start `prx daemon` outside systemd because an active daemon appears to be running \
+         (pid {}, state file {}). Use `systemctl --user restart prx.service` to restart it, or \
+         `systemctl --user stop prx.service` before manual debugging.",
+        active.pid,
+        state_path.display()
+    )
+}
+
+fn is_systemd_managed_start() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some()
+        || std::env::var_os("JOURNAL_STREAM").is_some()
+        || std::env::var_os("NOTIFY_SOCKET").is_some()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveDaemonState {
+    pid: u32,
+}
+
+fn active_daemon_from_state_file(path: &Path) -> Option<ActiveDaemonState> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    active_daemon_from_state_json(&raw, Utc::now())
+}
+
+fn active_daemon_from_state_json(raw: &str, now: DateTime<Utc>) -> Option<ActiveDaemonState> {
+    let json: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let pid = json.get("pid")?.as_u64().and_then(|value| u32::try_from(value).ok())?;
+
+    let daemon_last_ok = json
+        .get("components")
+        .and_then(|components| components.get("daemon"))
+        .and_then(|daemon| daemon.get("last_ok"))
+        .and_then(serde_json::Value::as_str);
+    let written_at = json.get("written_at").and_then(serde_json::Value::as_str);
+
+    if !is_recent_timestamp(daemon_last_ok, now) && !is_recent_timestamp(written_at, now) {
+        return None;
+    }
+    if !process_appears_alive(pid) {
+        return None;
+    }
+
+    Some(ActiveDaemonState { pid })
+}
+
+fn is_recent_timestamp(raw: Option<&str>, now: DateTime<Utc>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    let Ok(parsed) = DateTime::parse_from_rfc3339(raw) else {
+        return false;
+    };
+    let age = now.signed_duration_since(parsed.with_timezone(&Utc));
+    age.num_seconds() >= 0 && age.num_seconds() <= MANUAL_DAEMON_STALE_SECONDS
+}
+
+#[cfg(target_os = "linux")]
+fn process_appears_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn process_appears_alive(_pid: u32) -> bool {
+    true
 }
 
 fn spawn_component_supervisor<F, Fut>(
@@ -687,6 +768,91 @@ mod tests {
 
         let path = state_file_path(&config);
         assert_eq!(path, tmp.path().join("daemon_state.json"));
+    }
+
+    #[test]
+    fn active_daemon_state_detects_recent_live_pid() {
+        let now = Utc::now();
+        let raw = serde_json::json!({
+            "pid": std::process::id(),
+            "written_at": now.to_rfc3339(),
+            "components": {
+                "daemon": {
+                    "status": "ok",
+                    "last_ok": now.to_rfc3339()
+                }
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            active_daemon_from_state_json(&raw, now),
+            Some(ActiveDaemonState {
+                pid: std::process::id()
+            })
+        );
+    }
+
+    #[test]
+    fn active_daemon_state_ignores_stale_timestamp() {
+        let now = Utc::now();
+        let stale = now - chrono::Duration::seconds(MANUAL_DAEMON_STALE_SECONDS + 1);
+        let raw = serde_json::json!({
+            "pid": std::process::id(),
+            "written_at": stale.to_rfc3339(),
+            "components": {
+                "daemon": {
+                    "status": "ok",
+                    "last_ok": stale.to_rfc3339()
+                }
+            }
+        })
+        .to_string();
+
+        assert_eq!(active_daemon_from_state_json(&raw, now), None);
+    }
+
+    #[test]
+    fn active_daemon_state_accepts_fresh_written_at_when_last_ok_is_stale() {
+        let now = Utc::now();
+        let stale = now - chrono::Duration::seconds(MANUAL_DAEMON_STALE_SECONDS + 1);
+        let raw = serde_json::json!({
+            "pid": std::process::id(),
+            "written_at": now.to_rfc3339(),
+            "components": {
+                "daemon": {
+                    "status": "ok",
+                    "last_ok": stale.to_rfc3339()
+                }
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            active_daemon_from_state_json(&raw, now),
+            Some(ActiveDaemonState {
+                pid: std::process::id()
+            })
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_daemon_state_ignores_dead_pid() {
+        let now = Utc::now();
+        let raw = serde_json::json!({
+            "pid": u32::MAX,
+            "written_at": now.to_rfc3339(),
+            "components": {
+                "daemon": {
+                    "status": "ok",
+                    "last_ok": now.to_rfc3339()
+                }
+            }
+        })
+        .to_string();
+
+        assert_eq!(active_daemon_from_state_json(&raw, now), None);
     }
 
     #[test]
