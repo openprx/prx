@@ -2,12 +2,12 @@ use crate::auth::AuthService;
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::providers::ProviderRuntimeOptions;
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
-    ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
+    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -596,6 +596,219 @@ fn contains_terminal_response_event(text: &str) -> bool {
     })
 }
 
+fn response_tool_call_chunks(item: ResponsesOutputItem, tool_name_map: &HashMap<String, String>) -> Vec<ToolCallChunk> {
+    let response = ResponsesResponse {
+        output: vec![item],
+        output_text: None,
+    };
+    extract_tool_calls(&response, tool_name_map)
+        .into_iter()
+        .enumerate()
+        .map(|(index, call)| ToolCallChunk::new(call.id, call.name, call.arguments, index))
+        .collect()
+}
+
+async fn send_counted_stream_chunk(
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamChunk>>,
+    mut chunk: StreamChunk,
+    count_tokens: bool,
+) -> bool {
+    if count_tokens {
+        chunk = chunk.with_token_estimate();
+    }
+    tx.send(Ok(chunk)).await.is_ok()
+}
+
+async fn process_responses_stream_event(
+    event: Value,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamChunk>>,
+    saw_delta: &mut bool,
+    count_tokens: bool,
+    tool_name_map: &HashMap<String, String>,
+) -> bool {
+    if let Some(message) = extract_stream_error_message(&event) {
+        let _ = tx.send(Err(StreamError::Provider(message))).await;
+        return true;
+    }
+
+    if let Some(item) = extract_stream_output_item(&event) {
+        let calls = response_tool_call_chunks(item, tool_name_map);
+        if !calls.is_empty() && tx.send(Ok(StreamChunk::tool_call_chunk(calls))).await.is_err() {
+            return true;
+        }
+    }
+
+    match event.get("type").and_then(Value::as_str) {
+        Some("response.output_text.delta") => {
+            if let Some(text) = nonempty_preserve(event.get("delta").and_then(Value::as_str)) {
+                *saw_delta = true;
+                if !send_counted_stream_chunk(tx, StreamChunk::delta(text), count_tokens).await {
+                    return true;
+                }
+            }
+        }
+        Some("response.output_text.done") if !*saw_delta => {
+            if let Some(text) = nonempty_preserve(event.get("text").and_then(Value::as_str))
+                && !send_counted_stream_chunk(tx, StreamChunk::delta(text), count_tokens).await
+            {
+                return true;
+            }
+        }
+        Some(kind) if kind.contains("reasoning") && kind.ends_with(".delta") => {
+            if let Some(text) = nonempty_preserve(event.get("delta").and_then(Value::as_str))
+                && !send_counted_stream_chunk(tx, StreamChunk::reasoning_delta(text), count_tokens).await
+            {
+                return true;
+            }
+        }
+        Some("response.completed" | "response.done") => {
+            if !*saw_delta
+                && let Some(response) = event
+                    .get("response")
+                    .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
+                && let Some(text) = extract_responses_text(&response)
+                && !send_counted_stream_chunk(tx, StreamChunk::delta(text), count_tokens).await
+            {
+                return true;
+            }
+            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+            return true;
+        }
+        _ => {}
+    }
+
+    false
+}
+
+async fn process_responses_stream_block(
+    block: &str,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamChunk>>,
+    saw_delta: &mut bool,
+    count_tokens: bool,
+    tool_name_map: &HashMap<String, String>,
+) -> bool {
+    let data_lines = block
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if data_lines.is_empty() {
+        return false;
+    }
+
+    let joined = data_lines.join("\n");
+    if joined == "[DONE]" {
+        let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+        return true;
+    }
+
+    if let Ok(event) = serde_json::from_str::<Value>(&joined) {
+        return process_responses_stream_event(event, tx, saw_delta, count_tokens, tool_name_map).await;
+    }
+
+    for line in data_lines {
+        if line == "[DONE]" {
+            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+            return true;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(event) => {
+                if process_responses_stream_event(event, tx, saw_delta, count_tokens, tool_name_map).await {
+                    return true;
+                }
+            }
+            Err(err) => {
+                let _ = tx
+                    .send(Err(StreamError::InvalidSse(format!(
+                        "Invalid OpenAI Codex stream JSON: {err}"
+                    ))))
+                    .await;
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn responses_stream_to_chunks(
+    response: reqwest::Response,
+    idle_timeout: Duration,
+    count_tokens: bool,
+    tool_name_map: HashMap<String, String>,
+) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+    tokio::spawn(async move {
+        let normalized_content_type = normalize_content_type(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+        );
+        let mut bytes_stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut saw_delta = false;
+        let mut sent_final = false;
+
+        while let Some(next) = tokio::time::timeout(idle_timeout, bytes_stream.next())
+            .await
+            .transpose()
+        {
+            let item = match next {
+                Ok(item) => item,
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(StreamError::Provider(format!(
+                            "OpenAI Codex provider_response_timeout kind=stream_idle_timeout timeout_ms={} content_type={}",
+                            idle_timeout.as_millis(),
+                            normalized_content_type
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+            let bytes = match item {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    let _ = tx.send(Err(StreamError::Http(err))).await;
+                    return;
+                }
+            };
+            let text = match String::from_utf8(bytes.to_vec()) {
+                Ok(text) => text,
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(StreamError::InvalidSse(format!("Invalid UTF-8: {err}"))))
+                        .await;
+                    return;
+                }
+            };
+            buffer.push_str(&text);
+
+            while let Some(idx) = buffer.find("\n\n") {
+                let block = buffer.drain(..idx + 2).collect::<String>();
+                sent_final =
+                    process_responses_stream_block(&block, &tx, &mut saw_delta, count_tokens, &tool_name_map).await;
+                if sent_final {
+                    return;
+                }
+            }
+        }
+
+        if !buffer.trim().is_empty() {
+            sent_final =
+                process_responses_stream_block(&buffer, &tx, &mut saw_delta, count_tokens, &tool_name_map).await;
+        }
+        if !sent_final {
+            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+        }
+    });
+
+    stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
+}
+
 fn normalize_content_type(value: Option<&str>) -> String {
     first_nonempty(value)
         .map(|raw| raw.to_ascii_lowercase())
@@ -793,6 +1006,123 @@ impl OpenAiCodexProvider {
             .await?;
         extract_responses_text(&response).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
     }
+
+    fn stream_responses_request(
+        &self,
+        input: Vec<ResponsesInput>,
+        instructions: String,
+        model: &str,
+        tools: Option<Vec<serde_json::Value>>,
+        tool_name_map: HashMap<String, String>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let auth = self.auth.clone();
+        let auth_profile_override = self.auth_profile_override.clone();
+        let client = self.client.clone();
+        let idle_timeout = self.stream_idle_timeout;
+        let reasoning_effort_override = self.reasoning_effort_override.clone();
+        let model = model.to_string();
+        let count_tokens = options.count_tokens;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+        tokio::spawn(async move {
+            let access_token = match auth
+                .get_valid_openai_access_token(auth_profile_override.as_deref())
+                .await
+            {
+                Ok(Some(token)) => token,
+                Ok(None) => {
+                    let _ = tx
+                        .send(Err(StreamError::Provider(
+                            "OpenAI Codex auth profile not found. Run `prx auth login --provider openai-codex`."
+                                .to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                    return;
+                }
+            };
+            let profile = match auth.get_profile("openai-codex", auth_profile_override.as_deref()) {
+                Ok(profile) => profile,
+                Err(err) => {
+                    let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                    return;
+                }
+            };
+            let account_id = match profile
+                .and_then(|profile| profile.account_id)
+                .or_else(|| extract_account_id_from_jwt(&access_token))
+            {
+                Some(account_id) => account_id,
+                None => {
+                    let _ = tx
+                        .send(Err(StreamError::Provider(
+                            "OpenAI Codex account id not found in auth profile/token. Run `prx auth login --provider openai-codex` again."
+                                .to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            let normalized_model = normalize_model_id(&model);
+            let request = ResponsesRequest {
+                model: normalized_model.to_string(),
+                input,
+                instructions,
+                store: false,
+                stream: true,
+                text: ResponsesTextOptions {
+                    verbosity: "medium".to_string(),
+                },
+                reasoning: ResponsesReasoningOptions {
+                    effort: resolve_reasoning_effort(normalized_model, reasoning_effort_override.as_deref()),
+                    summary: "auto".to_string(),
+                },
+                include: vec!["reasoning.encrypted_content".to_string()],
+                tool_choice: "auto".to_string(),
+                parallel_tool_calls: true,
+                tools,
+            };
+
+            let response = match client
+                .post(CODEX_RESPONSES_URL)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("chatgpt-account-id", account_id)
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "pi")
+                .header("accept", "text/event-stream")
+                .header("accept-encoding", "identity")
+                .header("Content-Type", "application/json")
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    let _ = tx.send(Err(StreamError::Http(err))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let err = super::api_error("OpenAI Codex", response).await;
+                let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                return;
+            }
+
+            let mut chunks = responses_stream_to_chunks(response, idle_timeout, count_tokens, tool_name_map);
+            while let Some(chunk) = chunks.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
+    }
 }
 
 #[async_trait]
@@ -878,6 +1208,50 @@ impl Provider for OpenAiCodexProvider {
             tool_calls: extract_tool_calls(&parsed, &tool_name_map),
             reasoning_content: None,
         })
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        _temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let (instructions, input) = build_responses_input(messages);
+        let (tools, tool_name_map) = match sanitize_codex_tools(convert_tools(options.tools.as_deref())) {
+            Ok(value) => value,
+            Err(err) => return stream::once(async move { Err(StreamError::Provider(err.to_string())) }).boxed(),
+        };
+        self.stream_responses_request(input, instructions, model, tools, tool_name_map, options)
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        _temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let input = vec![ResponsesInput {
+            role: "user".to_string(),
+            content: vec![ResponsesInputContent {
+                kind: "input_text".to_string(),
+                text: message.to_string(),
+            }],
+        }];
+        self.stream_responses_request(
+            input,
+            resolve_instructions(system_prompt),
+            model,
+            None,
+            HashMap::new(),
+            options,
+        )
     }
 }
 
@@ -1089,6 +1463,40 @@ data: [DONE]
         assert_eq!(tool_calls[0].arguments, "{\"path\":\".\"}");
     }
 
+    #[tokio::test]
+    async fn stream_block_emits_text_reasoning_tool_and_final_chunks() {
+        let block = r#"data: {"type":"response.output_text.delta","delta":"Hello"}
+data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_123","name":"email_execute","arguments":"{\"to\":\"x@example.com\"}"}}
+data: {"type":"response.completed","response":{"output_text":"Hello"}}
+"#;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(10);
+        let mut saw_delta = false;
+        let mut mapping = HashMap::new();
+        mapping.insert("email_execute".to_string(), "email.execute".to_string());
+
+        let done = process_responses_stream_block(block, &tx, &mut saw_delta, false, &mapping).await;
+        drop(tx);
+
+        assert!(done);
+        assert!(saw_delta);
+        let text = rx.recv().await.unwrap().unwrap();
+        assert_eq!(text.delta, "Hello");
+
+        let reasoning = rx.recv().await.unwrap().unwrap();
+        assert_eq!(reasoning.reasoning.as_deref(), Some("thinking"));
+
+        let tool = rx.recv().await.unwrap().unwrap();
+        assert_eq!(tool.tool_calls.len(), 1);
+        assert_eq!(tool.tool_calls[0].id, "call_123");
+        assert_eq!(tool.tool_calls[0].name, "email.execute");
+        assert_eq!(tool.tool_calls[0].args, "{\"to\":\"x@example.com\"}");
+
+        let final_chunk = rx.recv().await.unwrap().unwrap();
+        assert!(final_chunk.is_final);
+        assert!(rx.recv().await.is_none());
+    }
+
     #[test]
     fn sanitize_codex_tools_rewrites_dot_name_and_tracks_reverse_mapping() {
         let tools = Some(vec![serde_json::json!({
@@ -1128,5 +1536,11 @@ data: [DONE]
 data: {\"type\":\"response.completed\",\"response\":\n\
 data: {\"output_text\":\"final\"}}\n\n";
         assert!(contains_terminal_response_event(body));
+    }
+
+    #[test]
+    fn supports_streaming_returns_true() {
+        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default());
+        assert!(provider.supports_streaming());
     }
 }
