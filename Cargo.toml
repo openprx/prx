@@ -161,6 +161,7 @@ async-imap = { version = "0.11",features = ["runtime-tokio"], default-features =
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio", "query", "ws", "macros", "multipart"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
 http-body-util = "0.1"
@@ -260,6 +261,7 @@ panic = "abort"
 [dev-dependencies]
 # PTY-driven end-to-end tests for `prx chat` (see tests/chat_pty_e2e.rs).
 expectrl = "0.7"
+rcgen = "0.14"
 # Serialize PTY tests that share controlling-tty resources, without forcing
 # `--test-threads=1` on the whole test binary.
 serial_test = "3"
