@@ -2066,7 +2066,6 @@ mod tests {
     /// with a multi-turn conversation + tools, and verify the request body contains
     /// ALL conversation turns and native tool definitions.
     #[tokio::test]
-    #[ignore = "environment-coupled (local network bind timing)"]
     async fn chat_with_tools_sends_full_history_and_native_tools() {
         use axum::{Json, Router, routing::post};
         use std::sync::{Arc, Mutex};
