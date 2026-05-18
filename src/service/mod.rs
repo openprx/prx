@@ -411,10 +411,7 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let unit = format!(
-        "[Unit]\nDescription=PRX daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
-        exe.display()
-    );
+    let unit = generate_systemd_unit(&exe);
 
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
@@ -422,6 +419,13 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     println!("✅ Installed systemd user service: {}", file.display());
     println!("   Start with: prx service start");
     Ok(())
+}
+
+fn generate_systemd_unit(exe: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=PRX daemon\nAfter=network.target\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=30s\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        exe.display()
+    )
 }
 
 /// Check if the current process is running as root (Unix only)
@@ -1058,6 +1062,17 @@ mod tests {
         let file = linux_service_file(&Config::default()).unwrap();
         let path = file.to_string_lossy();
         assert!(path.ends_with(".config/systemd/user/prx.service"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn systemd_unit_uses_notify_and_watchdog() {
+        let unit = generate_systemd_unit(Path::new("/usr/local/bin/prx"));
+        assert!(unit.contains("Type=notify"));
+        assert!(unit.contains("NotifyAccess=main"));
+        assert!(unit.contains("WatchdogSec=30s"));
+        assert!(unit.contains("ExecStart=/usr/local/bin/prx daemon"));
+        assert!(!unit.contains("Type=simple"));
     }
 
     #[test]

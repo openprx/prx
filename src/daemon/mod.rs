@@ -214,9 +214,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         "   Components: gateway, channels, heartbeat, scheduler, xin, self_system_fitness, evolution_scheduler, webhook_receiver"
     );
     println!("   Ctrl+C to stop");
+    systemd_notify::ready();
 
     tokio::signal::ctrl_c().await?;
     crate::health::mark_component_error("daemon", "shutdown requested");
+    systemd_notify::stopping();
 
     for handle in &handles {
         handle.abort();
@@ -256,6 +258,7 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
             if let Err(e) = tokio::fs::write(&path, &data).await {
                 tracing::warn!("Failed to write daemon state file: {e}");
             }
+            systemd_notify::watchdog();
         }
     })
 }
@@ -533,6 +536,132 @@ const fn has_supervised_channels(config: &Config) -> bool {
         || linq.is_some()
         || nextcloud_talk.is_some()
         || qq.is_some()
+}
+
+mod systemd_notify {
+    pub fn ready() {
+        notify("READY=1\nSTATUS=PRX daemon ready");
+    }
+
+    pub fn watchdog() {
+        notify("WATCHDOG=1");
+    }
+
+    pub fn stopping() {
+        notify("STOPPING=1\nSTATUS=PRX daemon stopping");
+    }
+
+    fn notify(payload: &str) {
+        match send(payload) {
+            Ok(true) => tracing::trace!("Sent systemd notify payload"),
+            Ok(false) => {}
+            Err(error) => tracing::debug!("Failed to send systemd notify payload: {error}"),
+        }
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    #[allow(unsafe_code)]
+    fn send(payload: &str) -> std::io::Result<bool> {
+        let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+            return Ok(false);
+        };
+        let socket = socket.to_string_lossy();
+        if socket.is_empty() {
+            return Ok(false);
+        }
+
+        // Linux abstract namespace sockets are encoded by systemd as '@name'.
+        // libc is used because std UnixDatagram only accepts filesystem paths.
+        // SAFETY: send_linux_datagram validates NOTIFY_SOCKET length and builds a bounded sockaddr_un.
+        unsafe { send_linux_datagram(&socket, payload.as_bytes()) }?;
+        Ok(true)
+    }
+
+    #[cfg(not(all(unix, target_os = "linux")))]
+    fn send(_payload: &str) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    #[allow(unsafe_code)]
+    unsafe fn send_linux_datagram(socket: &str, payload: &[u8]) -> std::io::Result<()> {
+        use std::ffi::CString;
+        use std::mem::{MaybeUninit, size_of};
+        use std::os::fd::RawFd;
+
+        struct Fd(RawFd);
+        impl Drop for Fd {
+            fn drop(&mut self) {
+                // SAFETY: this type owns the file descriptor.
+                unsafe {
+                    libc::close(self.0);
+                }
+            }
+        }
+
+        // SAFETY: constants form a valid AF_UNIX datagram socket request.
+        let raw_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        if raw_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = Fd(raw_fd);
+
+        let addr = MaybeUninit::<libc::sockaddr_un>::zeroed();
+        // SAFETY: zeroed sockaddr_un is initialized below before sendto.
+        let mut addr = unsafe { addr.assume_init() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+
+        let name_len = if let Some(abstract_name) = socket.strip_prefix('@') {
+            let bytes = abstract_name.as_bytes();
+            if bytes.len() + 1 > addr.sun_path.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "NOTIFY_SOCKET abstract path is too long",
+                ));
+            }
+            addr.sun_path[0] = 0;
+            for (idx, byte) in bytes.iter().enumerate() {
+                if let Some(slot) = addr.sun_path.get_mut(idx + 1) {
+                    *slot = *byte as libc::c_char;
+                }
+            }
+            bytes.len() + 1
+        } else {
+            let c_socket = CString::new(socket).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "NOTIFY_SOCKET contains interior NUL")
+            })?;
+            let bytes = c_socket.as_bytes_with_nul();
+            if bytes.len() > addr.sun_path.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "NOTIFY_SOCKET path is too long",
+                ));
+            }
+            for (idx, byte) in bytes.iter().enumerate() {
+                if let Some(slot) = addr.sun_path.get_mut(idx) {
+                    *slot = *byte as libc::c_char;
+                }
+            }
+            bytes.len()
+        };
+
+        let addr_len = (size_of::<libc::sa_family_t>() + name_len) as libc::socklen_t;
+        // SAFETY: fd is valid; addr points to initialized sockaddr_un bytes of addr_len.
+        let sent = unsafe {
+            libc::sendto(
+                fd.0,
+                payload.as_ptr().cast(),
+                payload.len(),
+                libc::MSG_NOSIGNAL,
+                (&raw const addr).cast(),
+                addr_len,
+            )
+        };
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 #[allow(clippy::indexing_slicing)]
