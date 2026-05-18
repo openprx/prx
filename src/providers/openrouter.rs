@@ -1,9 +1,10 @@
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
-    ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
+    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
+use futures_util::{StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +45,7 @@ struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
     temperature: f64,
+    stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -370,6 +372,7 @@ impl Provider for OpenRouterProvider {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature,
+            stream: false,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
@@ -446,6 +449,7 @@ impl Provider for OpenRouterProvider {
             model: model.to_string(),
             messages: native_messages,
             temperature,
+            stream: false,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
         };
@@ -472,6 +476,99 @@ impl Provider for OpenRouterProvider {
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
         Ok(Self::parse_native_response(message))
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let credential = match self.credential.as_ref() {
+            Some(value) => value.clone(),
+            None => {
+                return stream::once(async {
+                    Err(StreamError::Provider(
+                        "OpenRouter API key not set. Run `prx onboard` or set OPENROUTER_API_KEY env var.".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+        };
+
+        let request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(messages),
+            temperature,
+            stream: true,
+            tool_choice: options.tools.as_ref().map(|_| "auto".to_string()),
+            tools: Self::convert_tools(options.tools.as_deref()),
+        };
+        let client = self.http_client();
+        let count_tokens = options.count_tokens;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+        tokio::spawn(async move {
+            let response = match client
+                .post("https://openrouter.ai/api/v1/chat/completions")
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("HTTP-Referer", "https://github.com/theonlyhennygod/openprx")
+                .header("X-Title", "OpenPRX")
+                .header("Accept", "text/event-stream")
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    let _ = tx.send(Err(StreamError::Http(err))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let sanitized = super::sanitize_api_error(&body);
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{status}: {sanitized}"))))
+                    .await;
+                return;
+            }
+
+            let mut chunks = crate::providers::compatible::sse_bytes_to_chunks(response, count_tokens);
+            while let Some(chunk) = chunks.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let mut messages = Vec::new();
+        if let Some(system) = system_prompt {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(ChatMessage::user(message));
+        self.stream_chat_with_history(&messages, model, temperature, options)
     }
 }
 
@@ -735,5 +832,31 @@ mod tests {
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_xyz"));
         assert_eq!(converted[0].content.as_deref(), Some("done"));
         assert!(converted[0].tool_calls.is_none());
+    }
+
+    #[test]
+    fn native_stream_request_serializes_stream_true() {
+        let request = NativeChatRequest {
+            model: "openai/gpt-4o".to_string(),
+            messages: vec![NativeMessage {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            temperature: 0.2,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json.get("stream"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn supports_streaming_returns_true() {
+        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"));
+        assert!(provider.supports_streaming());
     }
 }
