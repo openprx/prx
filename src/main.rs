@@ -118,12 +118,94 @@ pub(crate) static CHAT_TRACING_RELOAD: std::sync::OnceLock<
     tracing_subscriber::reload::Handle<ChatFmtLayer, ChatSubscriber>,
 > = std::sync::OnceLock::new();
 
+const CONFIG_REDACTION_MASK: &str = "***";
+
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if !(0.0..=2.0).contains(&t) {
         return Err("temperature must be between 0.0 and 2.0".to_string());
     }
     Ok(t)
+}
+
+fn redact_config_show_value(value: &mut toml::Value) {
+    redact_config_show_value_with_key(None, value);
+}
+
+fn redact_config_show_value_with_key(key: Option<&str>, value: &mut toml::Value) {
+    if key.is_some_and(is_config_show_sensitive_key) {
+        redact_config_show_sensitive_value(value);
+        return;
+    }
+
+    match value {
+        toml::Value::Array(items) => {
+            for item in items {
+                redact_config_show_value_with_key(key, item);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (child_key, child_value) in table {
+                redact_config_show_value_with_key(Some(child_key.as_str()), child_value);
+            }
+        }
+        toml::Value::String(_)
+        | toml::Value::Integer(_)
+        | toml::Value::Float(_)
+        | toml::Value::Boolean(_)
+        | toml::Value::Datetime(_) => {}
+    }
+}
+
+fn redact_config_show_sensitive_value(value: &mut toml::Value) {
+    match value {
+        toml::Value::Array(items) => {
+            for item in items {
+                redact_config_show_sensitive_value(item);
+            }
+        }
+        toml::Value::Table(table) => {
+            for (_, item) in table {
+                redact_config_show_sensitive_value(item);
+            }
+        }
+        toml::Value::String(_)
+        | toml::Value::Integer(_)
+        | toml::Value::Float(_)
+        | toml::Value::Boolean(_)
+        | toml::Value::Datetime(_) => *value = toml::Value::String(CONFIG_REDACTION_MASK.to_string()),
+    }
+}
+
+fn is_config_show_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "api_key"
+        || key == "api_keys"
+        || key == "auth_token"
+        || key == "token"
+        || key == "secret"
+        || key == "password"
+        || key == "paired_tokens"
+        || key == "db_url"
+        || key == "private_key"
+        || key == "access_key"
+        || key == "credential"
+        || key == "credentials"
+        || key == "connection_string"
+        || key == "signing_secret"
+        || key == "webhook_secret"
+        || key == "app_secret"
+        || key.ends_with("_api_key")
+        || key.ends_with("_api_keys")
+        || key.ends_with("_token")
+        || key.ends_with("_secret")
+        || key.ends_with("_password")
+        || key.ends_with("_key")
+        || key.ends_with("_credential")
+        || key.ends_with("_credentials")
+        || key.contains("password")
+        || key.contains("secret")
+        || key.contains("private_key")
 }
 
 mod agent;
@@ -1317,7 +1399,8 @@ async fn async_main() -> Result<()> {
 
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Show { format } => {
-                let value = config.to_stored_toml_value()?;
+                let mut value = config.to_stored_toml_value()?;
+                redact_config_show_value(&mut value);
                 match format {
                     ConfigShowFormat::Toml => {
                         println!(
@@ -1874,6 +1957,67 @@ mod tests {
             } => assert_eq!(format, ConfigShowFormat::Json),
             other => panic!("expected config show json command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn config_show_redacts_sensitive_toml_values() {
+        let mut value = toml::Value::Table(toml::toml! {
+            default_provider = "kimi-code"
+            api_key = "enc2:encrypted-root"
+
+            [storage.provider.config]
+            db_url = "postgres://user:secret@example/prx"
+
+            [agents.worker]
+            api_key = "sk-agent"
+            model = "kimi-k2"
+
+            [channels.slack]
+            bot_token = "xoxb-token"
+            allowed_users = ["alice"]
+
+            [nested]
+            api_keys = ["sk-one", "sk-two"]
+            credential = { username = "user", password = "pass" }
+        });
+
+        redact_config_show_value(&mut value);
+
+        let root = value.as_table().expect("redacted value should remain a table");
+        assert_eq!(root.get("api_key").and_then(toml::Value::as_str), Some("***"));
+        assert_eq!(
+            root.get("default_provider").and_then(toml::Value::as_str),
+            Some("kimi-code")
+        );
+
+        let nested = root
+            .get("nested")
+            .and_then(toml::Value::as_table)
+            .expect("nested table should remain");
+        assert_eq!(
+            nested
+                .get("api_keys")
+                .and_then(toml::Value::as_array)
+                .expect("api_keys should remain an array")
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["***", "***"]
+        );
+
+        let rendered = toml::to_string_pretty(&value).expect("redacted config should serialize");
+        assert!(rendered.contains("default_provider = \"kimi-code\""));
+        assert!(rendered.contains("model = \"kimi-k2\""));
+        assert!(rendered.contains("allowed_users = [\"alice\"]"));
+        assert!(rendered.contains("api_key = \"***\""));
+        assert!(rendered.contains("db_url = \"***\""));
+        assert!(rendered.contains("bot_token = \"***\""));
+        assert!(!rendered.contains("enc2:encrypted-root"));
+        assert!(!rendered.contains("postgres://user:secret@example/prx"));
+        assert!(!rendered.contains("sk-agent"));
+        assert!(!rendered.contains("xoxb-token"));
+        assert!(!rendered.contains("sk-one"));
+        assert!(!rendered.contains("password = \"pass\""));
     }
 
     #[test]
