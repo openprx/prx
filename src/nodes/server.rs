@@ -9,6 +9,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing::get, routing::post};
+use axum_server::tls_rustls::RustlsConfig;
 use chrono::Utc;
 use constant_time_eq::constant_time_eq;
 use hmac::{Hmac, Mac};
@@ -160,22 +161,35 @@ pub async fn run_node_server(config: NodeServerConfig) -> Result<()> {
         .route("/health", get(handle_health))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&config.listen_addr)
-        .await
-        .with_context(|| format!("failed to bind {}", config.listen_addr))?;
+    if let Some(tls_config) = load_tls_config(&config).await? {
+        let addr = parse_listen_addr(&config.listen_addr)?;
+        tracing::info!(
+            "prx-node listening with TLS on {}, sandbox_root={}",
+            config.listen_addr,
+            config.sandbox_root
+        );
+        axum_server::bind_rustls(addr, tls_config)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .context("node TLS server exited with error")
+    } else {
+        let listener = tokio::net::TcpListener::bind(&config.listen_addr)
+            .await
+            .with_context(|| format!("failed to bind {}", config.listen_addr))?;
 
-    tracing::info!(
-        "prx-node listening on {}, sandbox_root={}",
-        config.listen_addr,
-        config.sandbox_root
-    );
+        tracing::info!(
+            "prx-node listening without TLS on {}, sandbox_root={}",
+            config.listen_addr,
+            config.sandbox_root
+        );
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .context("node server exited with error")
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            .context("node TCP server exited with error")
+    }
 }
 
 async fn handle_health() -> impl IntoResponse {
@@ -834,10 +848,6 @@ fn is_loopback_bind(bind: &str) -> bool {
 }
 
 fn validate_tls_requirements(config: &NodeServerConfig) -> Result<()> {
-    if !config.tls_required || is_loopback_bind(&config.listen_addr) {
-        return Ok(());
-    }
-
     let cert_ok = config
         .tls_cert
         .as_deref()
@@ -848,13 +858,68 @@ fn validate_tls_requirements(config: &NodeServerConfig) -> Result<()> {
         .as_deref()
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
+
+    if cert_ok != key_ok {
+        bail!("node server TLS requires both nodes.server.tls_cert and nodes.server.tls_key");
+    }
+
     if cert_ok && key_ok {
+        return Ok(());
+    }
+
+    if !config.tls_required || is_loopback_bind(&config.listen_addr) {
         return Ok(());
     }
 
     bail!(
         "node server refuses non-loopback bind without TLS material: set nodes.server.tls_cert and nodes.server.tls_key, or bind to 127.0.0.1/localhost"
     );
+}
+
+fn configured_tls_paths(config: &NodeServerConfig) -> Result<Option<(PathBuf, PathBuf)>> {
+    let cert = config
+        .tls_cert
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let key = config
+        .tls_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (cert, key) {
+        (Some(cert), Some(key)) => Ok(Some((PathBuf::from(cert), PathBuf::from(key)))),
+        (None, None) => Ok(None),
+        _ => bail!("node server TLS requires both nodes.server.tls_cert and nodes.server.tls_key"),
+    }
+}
+
+async fn load_tls_config(config: &NodeServerConfig) -> Result<Option<RustlsConfig>> {
+    let Some((cert, key)) = configured_tls_paths(config)? else {
+        return Ok(None);
+    };
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    match RustlsConfig::from_pem_file(&cert, &key).await {
+        Ok(tls_config) => Ok(Some(tls_config)),
+        Err(error) => {
+            tracing::error!(error = %error, cert = %cert.display(), key = %key.display(), "TLS configured but cert/key load failed");
+            Err(error).with_context(|| {
+                format!(
+                    "TLS configured but cert/key load failed: cert={}, key={}",
+                    cert.display(),
+                    key.display()
+                )
+            })
+        }
+    }
+}
+
+fn parse_listen_addr(listen_addr: &str) -> Result<SocketAddr> {
+    listen_addr
+        .parse::<SocketAddr>()
+        .with_context(|| format!("failed to parse listen address {listen_addr}"))
 }
 
 fn prepare_sandbox_root(path: &str) -> Result<PathBuf> {
@@ -1080,5 +1145,78 @@ mod tests {
         cfg.tls_cert = None;
         cfg.tls_key = None;
         assert!(validate_tls_requirements(&cfg).is_ok());
+    }
+
+    #[test]
+    fn tls_partial_material_fails_validation_even_on_loopback() {
+        let mut cfg = NodeServerConfig::default();
+        cfg.listen_addr = "127.0.0.1:8787".to_string();
+        cfg.tls_required = false;
+        cfg.tls_cert = Some("cert.pem".to_string());
+        cfg.tls_key = None;
+        assert!(validate_tls_requirements(&cfg).is_err());
+    }
+
+    #[tokio::test]
+    async fn loopback_allows_tcp_without_tls() {
+        let mut cfg = NodeServerConfig::default();
+        cfg.listen_addr = "127.0.0.1:8787".to_string();
+        cfg.tls_required = true;
+        cfg.tls_cert = None;
+        cfg.tls_key = None;
+
+        assert!(validate_tls_requirements(&cfg).is_ok());
+        assert!(
+            load_tls_config(&cfg)
+                .await
+                .expect("no tls config should be ok")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_load_failure_aborts_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let cert_path = temp.path().join("bad-cert.pem");
+        let key_path = temp.path().join("bad-key.pem");
+        std::fs::write(&cert_path, "not a certificate").unwrap();
+        std::fs::write(&key_path, "not a private key").unwrap();
+
+        let mut cfg = NodeServerConfig::default();
+        cfg.listen_addr = "127.0.0.1:8787".to_string();
+        cfg.tls_required = true;
+        cfg.tls_cert = Some(cert_path.display().to_string());
+        cfg.tls_key = Some(key_path.display().to_string());
+
+        let err = load_tls_config(&cfg)
+            .await
+            .expect_err("corrupt TLS material must fail closed");
+        assert!(
+            err.to_string().contains("TLS configured but cert/key load failed"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_config_loads_pem_file_pair() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cert_path = temp.path().join("cert.pem");
+        let key_path = temp.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+
+        let mut cfg = NodeServerConfig::default();
+        cfg.listen_addr = "127.0.0.1:8787".to_string();
+        cfg.tls_required = true;
+        cfg.tls_cert = Some(cert_path.display().to_string());
+        cfg.tls_key = Some(key_path.display().to_string());
+
+        assert!(
+            load_tls_config(&cfg)
+                .await
+                .expect("valid TLS material should load")
+                .is_some()
+        );
     }
 }
