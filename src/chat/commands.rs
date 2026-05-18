@@ -80,13 +80,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
         "/plan" => CommandResult::SetMode(ChatMode::Plan),
         "/edit" => CommandResult::SetMode(ChatMode::Edit),
         "/auto" => CommandResult::SetMode(ChatMode::Auto),
-        "/tools" => {
-            let mut out = String::from("Available tools:\n");
-            for tool in ctx.tools_registry {
-                out.push_str(&format!("  {:<20} {}\n", tool.name(), tool.description()));
-            }
-            CommandResult::HandledWithOutput(out)
-        }
+        "/tools" => CommandResult::HandledWithOutput(format_tools_feedback(ctx.tools_registry)),
         "/cost" => {
             let total_chars: usize = ctx.chat_session.turns.iter().map(|t| t.content.chars().count()).sum();
             let est_tokens = total_chars / 4;
@@ -96,7 +90,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
             );
             CommandResult::HandledWithOutput(out)
         }
-        "/model" => CommandResult::HandledWithOutput(format!("Current model: {}", ctx.model_name)),
+        "/model" => CommandResult::HandledWithOutput(format_model_feedback(ctx.model_name)),
         "/provider" => CommandResult::HandledWithOutput(format!("Current provider: {}", ctx.provider_name)),
         _ if input.starts_with("/model ") => {
             let new_model = input["/model ".len()..].trim();
@@ -149,6 +143,26 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
         }
         _ => CommandResult::NotACommand,
     }
+}
+
+pub fn format_clear_feedback(cleared: u32) -> String {
+    if cleared > 0 {
+        format!("Conversation cleared (kept system prompt; {cleared} memory entries removed).")
+    } else {
+        "Conversation cleared (kept system prompt).".to_string()
+    }
+}
+
+fn format_model_feedback(model_name: &str) -> String {
+    format!("Current model: {model_name}\nAvailable: restart with `prx chat -m <model>` to switch models")
+}
+
+fn format_tools_feedback(tools_registry: &[Box<dyn Tool>]) -> String {
+    let mut out = format!("Available tools ({}):\n", tools_registry.len());
+    for tool in tools_registry {
+        out.push_str(&format!("  {:<20} {}\n", tool.name(), tool.description()));
+    }
+    out
 }
 
 /// Handle the /clear command (needs mutable access to history, so handled separately).
@@ -230,7 +244,65 @@ mod mode_tests {
     //! these tests exercise the pure mode-classification helpers, plus a
     //! pattern-match shim that mirrors what `dispatch` returns for the three
     //! mode-switching commands.
+    #[cfg(feature = "terminal-tui")]
+    use super::CommandContext;
     use super::{ChatMode, CommandResult};
+    #[cfg(feature = "terminal-tui")]
+    use crate::memory::NoneMemory;
+    use crate::tools::{Tool, ToolResult};
+    use async_trait::async_trait;
+
+    struct TestTool;
+
+    #[async_trait]
+    impl Tool for TestTool {
+        fn name(&self) -> &str {
+            "test_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Test tool description"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+    }
+
+    fn command_output(result: CommandResult) -> String {
+        match result {
+            CommandResult::HandledWithOutput(text) => text,
+            _ => panic!("expected slash command to produce user-visible output"),
+        }
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn assert_system_message_added(text: String, expected: &str) {
+        use crate::chat::action::Action;
+        use crate::chat::state::ChatState;
+        use crate::chat::tui::ConversationLine;
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        let mut state = ChatState::new(Arc::from("provider"), Arc::from("model"), CancellationToken::new());
+        let _ = state.reduce(Action::SystemMessageAdded { text });
+        assert!(
+            state
+                .ui
+                .conversation_lines
+                .iter()
+                .any(|line| matches!(line, ConversationLine::System { content } if content.contains(expected))),
+            "SystemMessageAdded should render expected slash feedback"
+        );
+    }
 
     /// Pure classification helper mirroring the `dispatch` match arms for the
     /// mode-switching commands. Returns `Some(mode)` for `/plan|/edit|/auto`,
@@ -310,5 +382,58 @@ mod mode_tests {
             CommandResult::HandledWithOutput(s) => assert_eq!(s, "hello"),
             _ => panic!("expected HandledWithOutput variant"),
         }
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn slash_clear_emits_system_message() {
+        let text = super::format_clear_feedback(0);
+
+        assert!(text.contains("Conversation cleared"));
+        assert!(text.contains("kept system prompt"));
+        assert_system_message_added(text, "Conversation cleared");
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn slash_model_show_current_emits_system_message() {
+        let memory = NoneMemory::new();
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let session = crate::chat::session::ChatSession::new("kimi-code", "kimi-code");
+        let ctx = CommandContext {
+            model_name: "kimi-code",
+            provider_name: "kimi-code",
+            chat_session: &session,
+            tools_registry: &tools,
+            mem: &memory,
+        };
+
+        let text = command_output(super::dispatch("/model", &ctx).await);
+
+        assert!(text.contains("Current model: kimi-code"));
+        assert!(text.contains("Available:"));
+        assert_system_message_added(text, "Current model: kimi-code");
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn slash_tools_lists_registered_emits_system_message() {
+        let memory = NoneMemory::new();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
+        let session = crate::chat::session::ChatSession::new("kimi-code", "kimi-code");
+        let ctx = CommandContext {
+            model_name: "kimi-code",
+            provider_name: "kimi-code",
+            chat_session: &session,
+            tools_registry: &tools,
+            mem: &memory,
+        };
+
+        let text = command_output(super::dispatch("/tools", &ctx).await);
+
+        assert!(text.contains("Available tools (1):"));
+        assert!(text.contains("test_tool"));
+        assert!(text.contains("Test tool description"));
+        assert_system_message_added(text, "Available tools (1):");
     }
 }

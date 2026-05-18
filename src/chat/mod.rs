@@ -1423,11 +1423,7 @@ pub async fn run(
                 );
             }
             let cleared = commands::handle_clear(mem.as_ref(), Some(&chat_session.id)).await;
-            let msg = if cleared > 0 {
-                format!("Conversation cleared ({cleared} memory entries removed).")
-            } else {
-                "Conversation cleared.".to_string()
-            };
+            let msg = commands::format_clear_feedback(cleared);
             emit_chat_output(&msg);
             continue;
         }
