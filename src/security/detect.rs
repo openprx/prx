@@ -1,7 +1,7 @@
 //! Auto-detection of available security features
 
 use crate::config::{SandboxBackend, SecurityConfig};
-use crate::security::traits::Sandbox;
+use crate::security::traits::{Sandbox, UnavailableSandbox};
 use std::sync::Arc;
 
 /// Create a sandbox based on auto-detection or explicit config
@@ -25,11 +25,7 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     }
                 }
             }
-            tracing::error!(
-                "SECURITY DEGRADED: Landlock sandbox explicitly requested but not available \
-                 — falling back to NoopSandbox (no OS-level isolation)"
-            );
-            Arc::new(super::traits::NoopSandbox)
+            explicit_unavailable("landlock", "Landlock sandbox explicitly requested but not available")
         }
         SandboxBackend::Firejail => {
             #[cfg(target_os = "linux")]
@@ -38,11 +34,7 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     return Arc::new(sandbox);
                 }
             }
-            tracing::error!(
-                "SECURITY DEGRADED: Firejail sandbox explicitly requested but not available \
-                 — falling back to NoopSandbox (no OS-level isolation)"
-            );
-            Arc::new(super::traits::NoopSandbox)
+            explicit_unavailable("firejail", "Firejail sandbox explicitly requested but not available")
         }
         SandboxBackend::Bubblewrap => {
             #[cfg(feature = "sandbox-bubblewrap")]
@@ -54,27 +46,27 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     }
                 }
             }
-            tracing::error!(
-                "SECURITY DEGRADED: Bubblewrap sandbox explicitly requested but not available \
-                 — falling back to NoopSandbox (no OS-level isolation)"
-            );
-            Arc::new(super::traits::NoopSandbox)
+            explicit_unavailable(
+                "bubblewrap",
+                "Bubblewrap sandbox explicitly requested but not available",
+            )
         }
         SandboxBackend::Docker => {
             if let Ok(sandbox) = super::docker::DockerSandbox::new() {
                 return Arc::new(sandbox);
             }
-            tracing::error!(
-                "SECURITY DEGRADED: Docker sandbox explicitly requested but not available \
-                 — falling back to NoopSandbox (no OS-level isolation)"
-            );
-            Arc::new(super::traits::NoopSandbox)
+            explicit_unavailable("docker", "Docker sandbox explicitly requested but not available")
         }
         SandboxBackend::Auto | SandboxBackend::None => {
             // Auto-detect best available
             detect_best_sandbox()
         }
     }
+}
+
+fn explicit_unavailable(backend: &str, reason: &str) -> Arc<dyn Sandbox> {
+    tracing::error!("{reason} — refusing to fall back to NoopSandbox");
+    Arc::new(UnavailableSandbox::new(backend, reason))
 }
 
 /// Auto-detect the best available sandbox
@@ -159,5 +151,36 @@ mod tests {
         let sandbox = create_sandbox(&config);
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_firejail_unavailable_fails_closed_when_missing() {
+        let firejail_installed = std::process::Command::new("firejail")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if firejail_installed {
+            return;
+        }
+
+        let config = SecurityConfig {
+            sandbox: SandboxConfig {
+                enabled: Some(true),
+                backend: SandboxBackend::Firejail,
+                firejail_args: Vec::new(),
+            },
+            ..Default::default()
+        };
+        let sandbox = create_sandbox(&config);
+        assert_eq!(sandbox.name(), "firejail");
+        assert!(!sandbox.is_available());
+
+        let mut cmd = std::process::Command::new("echo");
+        let error = sandbox
+            .wrap_command(&mut cmd)
+            .expect_err("explicit unavailable sandbox must block command execution");
+        assert!(error.to_string().contains("refusing to run without OS-level isolation"));
     }
 }
