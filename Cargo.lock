@@ -4707,6 +4707,7 @@ dependencies = [
  "clap_complete",
  "console",
  "constant_time_eq",
+ "crc32fast",
  "cron",
  "crossterm 0.28.1",
  "dialoguer",
