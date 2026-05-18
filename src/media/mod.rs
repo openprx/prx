@@ -143,10 +143,7 @@ async fn transcribe_cli(path: &str) -> Option<String> {
 
 // ── Video ──────────────────────────────────────────────────────────
 
-/// Extract frames from a video using ffmpeg and return `[IMAGE:]` markers.
-///
-/// Frames are saved to a temp directory and referenced as `[IMAGE:path]`
-/// so the existing multimodal pipeline can process them via vision LLM.
+/// Extract frames from a video using ffmpeg and return `[IMAGE:]` data-URI markers.
 async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
     if config.video_provider == "none" {
         return None;
@@ -158,8 +155,7 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
     }
 
     let max_frames = config.video_max_frames.clamp(1, 10);
-    let output_dir = format!("/tmp/openprx-video-{}", uuid::Uuid::new_v4());
-    std::fs::create_dir_all(&output_dir).ok()?;
+    let output_dir = tempfile::Builder::new().prefix("openprx-video-").tempdir().ok()?;
 
     // Get video duration via ffprobe
     let duration: f64 = if which_bin("ffprobe") {
@@ -186,7 +182,8 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
     // Extract frames at evenly spaced intervals
     for i in 0..max_frames {
         let timestamp = interval * (i as f64 + 1.0);
-        let frame_path = format!("{output_dir}/frame_{i:03}.jpg");
+        let frame_path = output_dir.path().join(format!("frame_{i:03}.jpg"));
+        let frame_path_str = frame_path.to_string_lossy().to_string();
 
         let Ok(result) = tokio::process::Command::new("ffmpeg")
             .args([
@@ -199,7 +196,7 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
                 "1",
                 "-q:v",
                 "2",
-                &frame_path,
+                &frame_path_str,
             ])
             .output()
             .await
@@ -213,12 +210,15 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
         }
     }
 
-    // Collect extracted frame paths
-    let mut frame_paths: Vec<String> = std::fs::read_dir(&output_dir)
+    collect_video_frame_markers(output_dir.path(), duration)
+}
+
+fn collect_video_frame_markers(output_dir: &std::path::Path, duration: f64) -> Option<String> {
+    let mut frame_paths: Vec<std::path::PathBuf> = std::fs::read_dir(output_dir)
         .ok()?
         .filter_map(|e| e.ok())
-        .map(|e| e.path().to_string_lossy().to_string())
-        .filter(|p| p.ends_with(".jpg"))
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|value| value.to_str()) == Some("jpg"))
         .collect();
     frame_paths.sort();
 
@@ -233,15 +233,10 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
         duration
     ));
     for fp in &frame_paths {
-        markers.push_str(&format!("[IMAGE:{fp}]\n"));
+        let bytes = std::fs::read(fp).ok()?;
+        let payload = base64::engine::general_purpose::STANDARD.encode(bytes);
+        markers.push_str(&format!("[IMAGE:data:image/jpeg;base64,{payload}]\n"));
     }
-
-    // Schedule cleanup of temp frames after a delay (gives multimodal pipeline time to read them)
-    let cleanup_dir = output_dir.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-        let _ = std::fs::remove_dir_all(&cleanup_dir);
-    });
 
     Some(markers.trim_end().to_string())
 }
@@ -251,4 +246,21 @@ async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
 /// Return `true` if `cmd` is available somewhere on `$PATH`.
 fn which_bin(cmd: &str) -> bool {
     which::which(cmd).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_frame_markers_embed_data_uris_without_temp_paths() {
+        let dir = tempfile::tempdir().expect("test: tempdir");
+        std::fs::write(dir.path().join("frame_001.jpg"), [0xff, 0xd8, 0xff]).expect("test: write frame");
+
+        let markers = collect_video_frame_markers(dir.path(), 12.0).expect("test: frame markers");
+
+        assert!(markers.contains("[Video: 1 frames extracted from 12s video]"));
+        assert!(markers.contains("[IMAGE:data:image/jpeg;base64,"));
+        assert!(!markers.contains(dir.path().to_string_lossy().as_ref()));
+    }
 }
