@@ -2486,6 +2486,13 @@ impl RenderSource {
             }
         }
     }
+
+    pub(crate) fn conversation_len(&self) -> usize {
+        match self {
+            Self::Mirror(arc) => arc.lock().conversation_lines.len(),
+            Self::Snapshot(rx) => rx.borrow().conversation_lines.len(),
+        }
+    }
 }
 
 /// Runs inside `tokio::task::spawn_blocking` because `terminal.draw()`
@@ -2654,6 +2661,10 @@ fn run_tui_unified_loop(
         // S4-A Commit 4: Snapshot 路径 borrow_and_update Arc<UiSnapshot>，
         // Mirror 路径走原有 lock。两种路径都按 `last_pushed_idx` 切片以增量
         // 推送，同语义.
+        let visible_len = render_source.conversation_len();
+        if visible_len < last_pushed_idx {
+            last_pushed_idx = 0;
+        }
         let (pending, ascii_fallback) = render_source.read_pending(last_pushed_idx);
         let pending_count = pending.len();
         let term_width = terminal.size().map(|s| s.width).unwrap_or(80).max(1);
@@ -3627,6 +3638,33 @@ mod s4_a_4 {
         // from_idx=10（越界）→ 空.
         let (pending3, _) = src.read_pending(10);
         assert!(pending3.is_empty());
+    }
+
+    #[test]
+    fn s4_a_4_pending_index_resets_after_history_clear() {
+        let mut state = build_state_with_lines();
+        let snap0 = Arc::new(state.build_ui_snapshot(1));
+        let (tx, rx) = watch::channel(snap0);
+        let src = RenderSource::Snapshot(rx);
+
+        let mut last_pushed_idx = 2;
+        let _ = state.reduce_tracked(crate::chat::action::Action::HistoryCleared);
+        let _ = state.reduce_tracked(crate::chat::action::Action::SystemMessageAdded {
+            text: "Conversation cleared (kept system prompt).".to_string(),
+        });
+        let snap1 = Arc::new(state.build_ui_snapshot(2));
+        tx.send(snap1).expect("send cleared snap");
+
+        if src.conversation_len() < last_pushed_idx {
+            last_pushed_idx = 0;
+        }
+        let (pending, _) = src.read_pending(last_pushed_idx);
+
+        assert_eq!(pending.len(), 1);
+        assert!(
+            matches!(&pending[0], ConversationLine::System { content } if content.contains("Conversation cleared")),
+            "clear feedback must be flushed after conversation_lines shrink"
+        );
     }
 
     /// 验证 snapshot 路径在 watch 推送新值后 with_view 看到新内容.
