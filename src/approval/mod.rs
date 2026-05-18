@@ -80,19 +80,19 @@ impl ApprovalManager {
     ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
-        // Full autonomy never prompts.
-        if self.autonomy_level == AutonomyLevel::Full {
-            return false;
-        }
-
         // ReadOnly blocks everything — handled elsewhere; no prompt needed.
         if self.autonomy_level == AutonomyLevel::ReadOnly {
             return false;
         }
 
-        // always_ask overrides everything.
+        // always_ask is an explicit safety override, even in Full autonomy.
         if self.always_ask.contains(tool_name) {
             return true;
+        }
+
+        // Full autonomy skips prompts unless always_ask matched above.
+        if self.autonomy_level == AutonomyLevel::Full {
+            return false;
         }
 
         // auto_approve skips the prompt.
@@ -272,11 +272,23 @@ mod tests {
     }
 
     #[test]
-    fn full_autonomy_never_prompts() {
+    fn full_autonomy_skips_non_always_ask_prompts() {
         let mgr = ApprovalManager::from_config(&full_config());
         assert!(!mgr.needs_approval("shell"));
         assert!(!mgr.needs_approval("file_write"));
         assert!(!mgr.needs_approval("anything"));
+    }
+
+    #[test]
+    fn full_autonomy_honors_always_ask() {
+        let config = AutonomyConfig {
+            level: AutonomyLevel::Full,
+            always_ask: vec!["shell".into()],
+            ..AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&config);
+        assert!(mgr.needs_approval("shell"));
+        assert!(!mgr.needs_approval("file_write"));
     }
 
     #[test]
