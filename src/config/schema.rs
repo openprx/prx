@@ -4107,7 +4107,7 @@ pub struct LarkConfig {
 /// Example:
 /// ```toml
 /// [security.tool_policy]
-/// default = "allow"
+/// default = "supervised"
 ///
 /// [security.tool_policy.groups]
 /// hardware = "deny"
@@ -4120,7 +4120,7 @@ pub struct LarkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ToolPolicyConfig {
     /// Default policy when no more-specific rule matches.
-    /// "allow" (default), "deny", or "supervised".
+    /// "supervised" (default), "allow", or "deny".
     #[serde(default = "default_tool_policy_default")]
     pub default: String,
 
@@ -4135,7 +4135,7 @@ pub struct ToolPolicyConfig {
 }
 
 fn default_tool_policy_default() -> String {
-    "allow".into()
+    "supervised".into()
 }
 
 impl ToolPolicyConfig {
