@@ -6,14 +6,17 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
-    ProviderCapabilities, ToolCall as ProviderToolCall, ToolsPayload,
+    ProviderCapabilities, StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
+    ToolCallChunk, ToolsPayload,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
+use futures_util::{StreamExt, stream};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 /// Hostname prefix for the Bedrock Runtime endpoint.
 const ENDPOINT_PREFIX: &str = "bedrock-runtime";
@@ -25,6 +28,7 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 // ── AWS Credentials ─────────────────────────────────────────────
 
 /// Resolved AWS credentials for SigV4 signing.
+#[derive(Clone)]
 struct AwsCredentials {
     access_key_id: String,
     secret_access_key: String,
@@ -416,6 +420,390 @@ struct ResponseToolUseWrapper {
     tool_use: ToolUseBlock,
 }
 
+// ── Bedrock ConverseStream event-stream decoding ────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventStreamMessage {
+    event_type: Option<String>,
+    message_type: Option<String>,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct EventStreamDecode {
+    message: EventStreamMessage,
+    consumed: usize,
+}
+
+fn read_u32_be(bytes: &[u8]) -> anyhow::Result<u32> {
+    let array: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid eventstream u32 width"))?;
+    Ok(u32::from_be_bytes(array))
+}
+
+fn eventstream_crc(bytes: &[u8]) -> u32 {
+    crc32fast::hash(bytes)
+}
+
+fn parse_eventstream_string_header(bytes: &[u8], pos: &mut usize) -> anyhow::Result<String> {
+    let len_bytes = bytes
+        .get(*pos..*pos + 2)
+        .ok_or_else(|| anyhow::anyhow!("truncated eventstream string header length"))?;
+    let len = u16::from_be_bytes(
+        len_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid eventstream string header length width"))?,
+    ) as usize;
+    *pos += 2;
+    let value_bytes = bytes
+        .get(*pos..*pos + len)
+        .ok_or_else(|| anyhow::anyhow!("truncated eventstream string header value"))?;
+    let value = std::str::from_utf8(value_bytes)
+        .map_err(|err| anyhow::anyhow!("invalid eventstream string header utf8: {err}"))?
+        .to_string();
+    *pos += len;
+    Ok(value)
+}
+
+fn skip_eventstream_header_value(bytes: &[u8], pos: &mut usize, value_type: u8) -> anyhow::Result<()> {
+    let len = match value_type {
+        0 | 1 => 0,
+        2 => 1,
+        3 => 2,
+        4 => 4,
+        5 | 8 => 8,
+        6 | 7 => {
+            let len_bytes = bytes
+                .get(*pos..*pos + 2)
+                .ok_or_else(|| anyhow::anyhow!("truncated eventstream variable header length"))?;
+            let len = u16::from_be_bytes(
+                len_bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid eventstream variable header length width"))?,
+            ) as usize;
+            *pos += 2;
+            len
+        }
+        9 => 16,
+        other => anyhow::bail!("unsupported eventstream header value type {other}"),
+    };
+    if bytes.len().saturating_sub(*pos) < len {
+        anyhow::bail!("truncated eventstream header value");
+    }
+    *pos += len;
+    Ok(())
+}
+
+fn parse_eventstream_headers(bytes: &[u8]) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let mut pos = 0;
+    let mut event_type = None;
+    let mut message_type = None;
+
+    while pos < bytes.len() {
+        let name_len = usize::from(
+            *bytes
+                .get(pos)
+                .ok_or_else(|| anyhow::anyhow!("truncated eventstream header name length"))?,
+        );
+        pos += 1;
+        let name_bytes = bytes
+            .get(pos..pos + name_len)
+            .ok_or_else(|| anyhow::anyhow!("truncated eventstream header name"))?;
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|err| anyhow::anyhow!("invalid eventstream header name utf8: {err}"))?;
+        pos += name_len;
+        let value_type = *bytes
+            .get(pos)
+            .ok_or_else(|| anyhow::anyhow!("truncated eventstream header value type"))?;
+        pos += 1;
+
+        if value_type == 7 && (name == ":event-type" || name == ":message-type") {
+            let value = parse_eventstream_string_header(bytes, &mut pos)?;
+            if name == ":event-type" {
+                event_type = Some(value);
+            } else {
+                message_type = Some(value);
+            }
+        } else {
+            skip_eventstream_header_value(bytes, &mut pos, value_type)?;
+        }
+    }
+
+    Ok((event_type, message_type))
+}
+
+fn try_parse_eventstream_message(buffer: &[u8]) -> anyhow::Result<Option<EventStreamDecode>> {
+    if buffer.len() < 12 {
+        return Ok(None);
+    }
+
+    let total_len = read_u32_be(
+        buffer
+            .get(0..4)
+            .ok_or_else(|| anyhow::anyhow!("truncated eventstream total length"))?,
+    )? as usize;
+    let headers_len = read_u32_be(
+        buffer
+            .get(4..8)
+            .ok_or_else(|| anyhow::anyhow!("truncated eventstream headers length"))?,
+    )? as usize;
+    if total_len < 16 || headers_len > total_len.saturating_sub(16) {
+        anyhow::bail!("invalid eventstream prelude lengths");
+    }
+    if buffer.len() < total_len {
+        return Ok(None);
+    }
+
+    let expected_prelude_crc = read_u32_be(
+        buffer
+            .get(8..12)
+            .ok_or_else(|| anyhow::anyhow!("truncated eventstream prelude crc"))?,
+    )?;
+    let actual_prelude_crc = eventstream_crc(
+        buffer
+            .get(0..8)
+            .ok_or_else(|| anyhow::anyhow!("truncated eventstream prelude"))?,
+    );
+    if expected_prelude_crc != actual_prelude_crc {
+        anyhow::bail!("invalid eventstream prelude crc");
+    }
+
+    let expected_message_crc = read_u32_be(
+        buffer
+            .get(total_len - 4..total_len)
+            .ok_or_else(|| anyhow::anyhow!("truncated eventstream message crc"))?,
+    )?;
+    let actual_message_crc = eventstream_crc(
+        buffer
+            .get(0..total_len - 4)
+            .ok_or_else(|| anyhow::anyhow!("truncated eventstream message"))?,
+    );
+    if expected_message_crc != actual_message_crc {
+        anyhow::bail!("invalid eventstream message crc");
+    }
+
+    let headers_start = 12;
+    let headers_end = headers_start + headers_len;
+    let payload_end = total_len - 4;
+    let header_bytes = buffer
+        .get(headers_start..headers_end)
+        .ok_or_else(|| anyhow::anyhow!("truncated eventstream headers"))?;
+    let payload = buffer
+        .get(headers_end..payload_end)
+        .ok_or_else(|| anyhow::anyhow!("truncated eventstream payload"))?;
+    let (event_type, message_type) = parse_eventstream_headers(header_bytes)?;
+    Ok(Some(EventStreamDecode {
+        message: EventStreamMessage {
+            event_type,
+            message_type,
+            payload: payload.to_vec(),
+        },
+        consumed: total_len,
+    }))
+}
+
+#[derive(Debug, Default)]
+struct BedrockToolCallBuffer {
+    id: String,
+    name: String,
+    args: String,
+    order: usize,
+}
+
+#[derive(Debug, Default)]
+struct BedrockStreamState {
+    tools: HashMap<usize, BedrockToolCallBuffer>,
+    next_tool_order: usize,
+}
+
+impl BedrockStreamState {
+    fn start_tool(&mut self, block_index: usize, id: String, name: String) -> Option<ToolCallChunk> {
+        if id.is_empty() || name.is_empty() {
+            return None;
+        }
+        let order = self.next_tool_order;
+        self.next_tool_order += 1;
+        self.tools.insert(
+            block_index,
+            BedrockToolCallBuffer {
+                id: id.clone(),
+                name: name.clone(),
+                args: String::new(),
+                order,
+            },
+        );
+        Some(ToolCallChunk::streaming_delta(id, name, "", order))
+    }
+
+    fn push_tool_delta(&mut self, block_index: usize, delta: String) -> Option<ToolCallChunk> {
+        let tool = self.tools.get_mut(&block_index)?;
+        tool.args.push_str(&delta);
+        Some(ToolCallChunk::streaming_delta(
+            tool.id.clone(),
+            tool.name.clone(),
+            delta,
+            tool.order,
+        ))
+    }
+
+    fn finish_tool(&mut self, block_index: usize) -> Option<ToolCallChunk> {
+        let tool = self.tools.remove(&block_index)?;
+        Some(ToolCallChunk::new(tool.id, tool.name, tool.args, tool.order))
+    }
+}
+
+fn bedrock_event_error_message(event_type: &str, payload: &[u8]) -> String {
+    let value = serde_json::from_slice::<serde_json::Value>(payload).unwrap_or_default();
+    let message = value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("Message").and_then(serde_json::Value::as_str))
+        .unwrap_or("Bedrock stream error");
+    format!("{event_type}: {}", super::sanitize_api_error(message))
+}
+
+fn bedrock_reasoning_delta(delta: &serde_json::Value) -> Option<String> {
+    delta
+        .get("reasoningContent")
+        .and_then(|reasoning| {
+            reasoning.get("text").and_then(serde_json::Value::as_str).or_else(|| {
+                reasoning
+                    .get("reasoningText")
+                    .and_then(|value| value.get("text"))
+                    .and_then(serde_json::Value::as_str)
+            })
+        })
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+async fn handle_bedrock_stream_message(
+    message: EventStreamMessage,
+    state: &mut BedrockStreamState,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamChunk>>,
+    count_tokens: bool,
+) -> bool {
+    if message.message_type.as_deref() == Some("exception") {
+        let event = message.event_type.as_deref().unwrap_or("exception");
+        let _ = tx
+            .send(Err(StreamError::Provider(bedrock_event_error_message(
+                event,
+                &message.payload,
+            ))))
+            .await;
+        return true;
+    }
+
+    let Some(event_type) = message.event_type.as_deref() else {
+        return false;
+    };
+
+    if event_type.ends_with("Exception") {
+        let _ = tx
+            .send(Err(StreamError::Provider(bedrock_event_error_message(
+                event_type,
+                &message.payload,
+            ))))
+            .await;
+        return true;
+    }
+
+    let payload = match serde_json::from_slice::<serde_json::Value>(&message.payload) {
+        Ok(value) => value,
+        Err(err) => {
+            let _ = tx.send(Err(StreamError::Json(err))).await;
+            return true;
+        }
+    };
+
+    match event_type {
+        "contentBlockStart" => {
+            let block_index = payload
+                .get("contentBlockIndex")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            if let Some(tool_use) = payload.get("start").and_then(|start| start.get("toolUse")) {
+                let id = tool_use
+                    .get("toolUseId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let name = tool_use
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(call) = state.start_tool(block_index, id, name)
+                    && tx.send(Ok(StreamChunk::tool_call_chunk(vec![call]))).await.is_err()
+                {
+                    return true;
+                }
+            }
+        }
+        "contentBlockDelta" => {
+            let block_index = payload
+                .get("contentBlockIndex")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let Some(delta) = payload.get("delta") else {
+                return false;
+            };
+
+            if let Some(text) = delta
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                let mut chunk = StreamChunk::delta(text.to_string());
+                if count_tokens {
+                    chunk = chunk.with_token_estimate();
+                }
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return true;
+                }
+            }
+            if let Some(reasoning) = bedrock_reasoning_delta(delta) {
+                let mut chunk = StreamChunk::reasoning_delta(reasoning);
+                if count_tokens {
+                    chunk = chunk.with_token_estimate();
+                }
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return true;
+                }
+            }
+            if let Some(input) = delta
+                .get("toolUse")
+                .and_then(|tool_use| tool_use.get("input"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|input| !input.is_empty())
+                && let Some(call) = state.push_tool_delta(block_index, input.to_string())
+                && tx.send(Ok(StreamChunk::tool_call_chunk(vec![call]))).await.is_err()
+            {
+                return true;
+            }
+        }
+        "contentBlockStop" => {
+            let block_index = payload
+                .get("contentBlockIndex")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            if let Some(call) = state.finish_tool(block_index)
+                && tx.send(Ok(StreamChunk::tool_call_chunk(vec![call]))).await.is_err()
+            {
+                return true;
+            }
+        }
+        "messageStop" => {
+            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+            return true;
+        }
+        _ => {}
+    }
+
+    false
+}
+
 // ── BedrockProvider ─────────────────────────────────────────────
 
 pub struct BedrockProvider {
@@ -450,12 +838,21 @@ impl BedrockProvider {
         format!("https://{ENDPOINT_PREFIX}.{region}.amazonaws.com/model/{model_id}/converse")
     }
 
+    fn stream_endpoint_url(region: &str, model_id: &str) -> String {
+        format!("https://{ENDPOINT_PREFIX}.{region}.amazonaws.com/model/{model_id}/converse-stream")
+    }
+
     /// Build the canonical URI for SigV4 signing. Must URI-encode the path
     /// per SigV4 spec: colons become `%3A`. AWS verifies the signature against
     /// the encoded form even though the wire request uses raw colons.
     fn canonical_uri(model_id: &str) -> String {
         let encoded = Self::encode_model_path(model_id);
         format!("/model/{encoded}/converse")
+    }
+
+    fn stream_canonical_uri(model_id: &str) -> String {
+        let encoded = Self::encode_model_path(model_id);
+        format!("/model/{encoded}/converse-stream")
     }
 
     fn require_credentials(&self) -> anyhow::Result<&AwsCredentials> {
@@ -715,6 +1112,95 @@ impl BedrockProvider {
         let converse_response: ConverseResponse = response.json().await?;
         Ok(converse_response)
     }
+
+    async fn send_converse_stream_request(
+        client: Client,
+        credentials: AwsCredentials,
+        model: String,
+        request_body: ConverseRequest,
+    ) -> anyhow::Result<reqwest::Response> {
+        let payload = serde_json::to_vec(&request_body)?;
+        let url = Self::stream_endpoint_url(&credentials.region, &model);
+        let canonical_uri = Self::stream_canonical_uri(&model);
+        let now = chrono::Utc::now();
+        let host = credentials.host();
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+
+        let mut headers_to_sign = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("host".to_string(), host),
+            ("x-amz-date".to_string(), amz_date.clone()),
+        ];
+        if let Some(ref token) = credentials.session_token {
+            headers_to_sign.push(("x-amz-security-token".to_string(), token.clone()));
+        }
+        headers_to_sign.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let authorization = build_authorization_header(
+            &credentials,
+            "POST",
+            &canonical_uri,
+            "",
+            &headers_to_sign,
+            &payload,
+            &now,
+        )?;
+
+        let mut request = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "application/vnd.amazon.eventstream")
+            .header("x-amz-date", &amz_date)
+            .header("authorization", &authorization);
+
+        if let Some(ref token) = credentials.session_token {
+            request = request.header("x-amz-security-token", token);
+        }
+
+        let response = request.body(payload).send().await?;
+        if !response.status().is_success() {
+            return Err(super::api_error("Bedrock", response).await);
+        }
+        Ok(response)
+    }
+
+    fn build_converse_request(
+        messages: &[ChatMessage],
+        tools: Option<&[ToolSpec]>,
+        temperature: f64,
+    ) -> ConverseRequest {
+        let (system_blocks, mut converse_messages) = Self::convert_messages(messages);
+
+        let system = system_blocks.map(|mut blocks| {
+            let has_large_system = blocks
+                .iter()
+                .any(|b| matches!(b, SystemBlock::Text(tb) if Self::should_cache_system(&tb.text)));
+            if has_large_system {
+                blocks.push(SystemBlock::CachePoint(CachePointWrapper {
+                    cache_point: CachePoint::default_cache(),
+                }));
+            }
+            blocks
+        });
+
+        if Self::should_cache_conversation(messages)
+            && let Some(last_msg) = converse_messages.last_mut()
+        {
+            last_msg.content.push(ContentBlock::CachePointBlock(CachePointWrapper {
+                cache_point: CachePoint::default_cache(),
+            }));
+        }
+
+        ConverseRequest {
+            system,
+            messages: converse_messages,
+            inference_config: Some(InferenceConfig {
+                max_tokens: DEFAULT_MAX_TOKENS,
+                temperature,
+            }),
+            tool_config: Self::convert_tools_to_converse(tools),
+        }
+    }
 }
 
 // ── Provider trait implementation ───────────────────────────────
@@ -729,6 +1215,10 @@ impl Provider for BedrockProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming(&self) -> bool {
         true
     }
 
@@ -838,6 +1328,93 @@ impl Provider for BedrockProvider {
             .await?;
 
         Ok(Self::parse_converse_response(response))
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let credentials = match self.require_credentials() {
+            Ok(credentials) => credentials.clone(),
+            Err(err) => return stream::once(async move { Err(StreamError::Provider(err.to_string())) }).boxed(),
+        };
+        let request = Self::build_converse_request(messages, options.tools.as_deref(), temperature);
+        let client = self.http_client();
+        let model = model.to_string();
+        let count_tokens = options.count_tokens;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+        tokio::spawn(async move {
+            let response = match Self::send_converse_stream_request(client, credentials, model, request).await {
+                Ok(response) => response,
+                Err(err) => {
+                    let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                    return;
+                }
+            };
+
+            let mut bytes_stream = response.bytes_stream();
+            let mut buffer = Vec::<u8>::new();
+            let mut state = BedrockStreamState::default();
+
+            while let Some(item) = bytes_stream.next().await {
+                let bytes = match item {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        let _ = tx.send(Err(StreamError::Http(err))).await;
+                        return;
+                    }
+                };
+                buffer.extend_from_slice(&bytes);
+
+                loop {
+                    let decoded = match try_parse_eventstream_message(&buffer) {
+                        Ok(Some(decoded)) => decoded,
+                        Ok(None) => break,
+                        Err(err) => {
+                            let _ = tx.send(Err(StreamError::InvalidSse(err.to_string()))).await;
+                            return;
+                        }
+                    };
+                    buffer.drain(..decoded.consumed);
+                    if handle_bedrock_stream_message(decoded.message, &mut state, &tx, count_tokens).await {
+                        return;
+                    }
+                }
+            }
+
+            for call in state
+                .tools
+                .into_values()
+                .map(|tool| ToolCallChunk::new(tool.id, tool.name, tool.args, tool.order))
+            {
+                if tx.send(Ok(StreamChunk::tool_call_chunk(vec![call]))).await.is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+        });
+
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let mut messages = Vec::new();
+        if let Some(system) = system_prompt {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(ChatMessage::user(message));
+        self.stream_chat_with_history(&messages, model, temperature, options)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -1088,6 +1665,15 @@ mod tests {
     }
 
     #[test]
+    fn stream_endpoint_url_formats_correctly() {
+        let url = BedrockProvider::stream_endpoint_url("us-east-1", "anthropic.claude-sonnet-4-6");
+        assert_eq!(
+            url,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-sonnet-4-6/converse-stream"
+        );
+    }
+
+    #[test]
     fn canonical_uri_encodes_colon() {
         // Canonical URI must encode `:` as `%3A` for SigV4 signing.
         let uri = BedrockProvider::canonical_uri("anthropic.claude-3-5-haiku-20241022-v1:0");
@@ -1098,6 +1684,12 @@ mod tests {
     fn canonical_uri_no_colon_unchanged() {
         let uri = BedrockProvider::canonical_uri("anthropic.claude-sonnet-4-6");
         assert_eq!(uri, "/model/anthropic.claude-sonnet-4-6/converse");
+    }
+
+    #[test]
+    fn stream_canonical_uri_encodes_colon() {
+        let uri = BedrockProvider::stream_canonical_uri("anthropic.claude-3-5-haiku-20241022-v1:0");
+        assert_eq!(uri, "/model/anthropic.claude-3-5-haiku-20241022-v1%3A0/converse-stream");
     }
 
     // ── Message conversion tests ────────────────────────────────
@@ -1214,6 +1806,149 @@ mod tests {
     fn convert_tools_to_converse_empty_returns_none() {
         assert!(BedrockProvider::convert_tools_to_converse(Some(&[])).is_none());
         assert!(BedrockProvider::convert_tools_to_converse(None).is_none());
+    }
+
+    fn test_eventstream_header(name: &str, value: &str) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.push(name.len() as u8);
+        header.extend_from_slice(name.as_bytes());
+        header.push(7);
+        header.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        header.extend_from_slice(value.as_bytes());
+        header
+    }
+
+    fn test_eventstream_message(event_type: &str, payload: &[u8]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        headers.extend(test_eventstream_header(":message-type", "event"));
+        headers.extend(test_eventstream_header(":event-type", event_type));
+        headers.extend(test_eventstream_header(":content-type", "application/json"));
+
+        let total_len = 16 + headers.len() + payload.len();
+        let headers_len = headers.len();
+        let mut message = Vec::new();
+        message.extend_from_slice(&(total_len as u32).to_be_bytes());
+        message.extend_from_slice(&(headers_len as u32).to_be_bytes());
+        let prelude_crc = eventstream_crc(&message);
+        message.extend_from_slice(&prelude_crc.to_be_bytes());
+        message.extend_from_slice(&headers);
+        message.extend_from_slice(payload);
+        let message_crc = eventstream_crc(&message);
+        message.extend_from_slice(&message_crc.to_be_bytes());
+        message
+    }
+
+    #[test]
+    fn parses_eventstream_message_headers_and_payload() {
+        let payload = br#"{"contentBlockDelta":{"delta":{"text":"hi"}}}"#;
+        let message = test_eventstream_message("contentBlockDelta", payload);
+
+        let parsed = try_parse_eventstream_message(&message)
+            .unwrap()
+            .expect("complete message");
+
+        assert_eq!(parsed.consumed, message.len());
+        assert_eq!(parsed.message.event_type.as_deref(), Some("contentBlockDelta"));
+        assert_eq!(parsed.message.message_type.as_deref(), Some("event"));
+        assert_eq!(parsed.message.payload, payload);
+    }
+
+    #[test]
+    fn eventstream_message_waits_for_complete_frame() {
+        let payload = br#"{"messageStop":{"stopReason":"end_turn"}}"#;
+        let message = test_eventstream_message("messageStop", payload);
+        let partial = &message[..message.len() - 2];
+
+        assert!(try_parse_eventstream_message(partial).unwrap().is_none());
+    }
+
+    #[test]
+    fn eventstream_message_rejects_bad_crc() {
+        let payload = br#"{"messageStop":{"stopReason":"end_turn"}}"#;
+        let mut message = test_eventstream_message("messageStop", payload);
+        let last = message.len() - 1;
+        message[last] ^= 0xff;
+
+        let err = try_parse_eventstream_message(&message).unwrap_err().to_string();
+        assert!(err.contains("crc"));
+    }
+
+    #[tokio::test]
+    async fn handles_bedrock_text_reasoning_tool_and_final_events() {
+        let mut state = BedrockStreamState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(10);
+
+        let text_event = EventStreamMessage {
+            event_type: Some("contentBlockDelta".to_string()),
+            message_type: Some("event".to_string()),
+            payload: br#"{"contentBlockIndex":0,"delta":{"text":"hello"}}"#.to_vec(),
+        };
+        assert!(!handle_bedrock_stream_message(text_event, &mut state, &tx, false).await);
+
+        let reasoning_event = EventStreamMessage {
+            event_type: Some("contentBlockDelta".to_string()),
+            message_type: Some("event".to_string()),
+            payload: br#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"text":"thinking"}}}"#.to_vec(),
+        };
+        assert!(!handle_bedrock_stream_message(reasoning_event, &mut state, &tx, false).await);
+
+        let tool_start = EventStreamMessage {
+            event_type: Some("contentBlockStart".to_string()),
+            message_type: Some("event".to_string()),
+            payload: br#"{"contentBlockIndex":1,"start":{"toolUse":{"toolUseId":"tool_1","name":"shell"}}}"#.to_vec(),
+        };
+        assert!(!handle_bedrock_stream_message(tool_start, &mut state, &tx, false).await);
+
+        let tool_delta = EventStreamMessage {
+            event_type: Some("contentBlockDelta".to_string()),
+            message_type: Some("event".to_string()),
+            payload: br#"{"contentBlockIndex":1,"delta":{"toolUse":{"input":"{\"command\":\"ls\"}"}}}"#.to_vec(),
+        };
+        assert!(!handle_bedrock_stream_message(tool_delta, &mut state, &tx, false).await);
+
+        let tool_stop = EventStreamMessage {
+            event_type: Some("contentBlockStop".to_string()),
+            message_type: Some("event".to_string()),
+            payload: br#"{"contentBlockIndex":1}"#.to_vec(),
+        };
+        assert!(!handle_bedrock_stream_message(tool_stop, &mut state, &tx, false).await);
+
+        let stop = EventStreamMessage {
+            event_type: Some("messageStop".to_string()),
+            message_type: Some("event".to_string()),
+            payload: br#"{"stopReason":"tool_use"}"#.to_vec(),
+        };
+        assert!(handle_bedrock_stream_message(stop, &mut state, &tx, false).await);
+        drop(tx);
+
+        let text = rx.recv().await.unwrap().unwrap();
+        assert_eq!(text.delta, "hello");
+
+        let reasoning = rx.recv().await.unwrap().unwrap();
+        assert_eq!(reasoning.reasoning.as_deref(), Some("thinking"));
+
+        let tool_initial = rx.recv().await.unwrap().unwrap();
+        assert_eq!(tool_initial.tool_calls[0].id, "tool_1");
+        assert_eq!(tool_initial.tool_calls[0].name, "shell");
+
+        let tool_delta = rx.recv().await.unwrap().unwrap();
+        assert_eq!(
+            tool_delta.tool_calls[0].arguments_delta.as_deref(),
+            Some("{\"command\":\"ls\"}")
+        );
+
+        let tool_completed = rx.recv().await.unwrap().unwrap();
+        assert_eq!(tool_completed.tool_calls[0].args, "{\"command\":\"ls\"}");
+
+        let final_chunk = rx.recv().await.unwrap().unwrap();
+        assert!(final_chunk.is_final);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn supports_streaming_returns_true() {
+        let provider = BedrockProvider { credentials: None };
+        assert!(provider.supports_streaming());
     }
 
     // ── Serde tests ─────────────────────────────────────────────
