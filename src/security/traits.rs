@@ -79,6 +79,46 @@ impl Sandbox for NoopSandbox {
     }
 }
 
+/// Fail-closed sandbox returned when an explicitly requested backend is unavailable.
+#[derive(Debug, Clone)]
+pub struct UnavailableSandbox {
+    backend: String,
+    reason: String,
+}
+
+impl UnavailableSandbox {
+    pub fn new(backend: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            backend: backend.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+impl Sandbox for UnavailableSandbox {
+    fn wrap_command(&self, _cmd: &mut Command) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "explicit sandbox '{}' is unavailable; refusing to run without OS-level isolation: {}",
+                self.backend, self.reason
+            ),
+        ))
+    }
+
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn name(&self) -> &str {
+        &self.backend
+    }
+
+    fn description(&self) -> &str {
+        &self.reason
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +151,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             original_args
         );
+    }
+
+    #[test]
+    fn unavailable_sandbox_fails_closed() {
+        let sandbox = UnavailableSandbox::new("docker", "Docker not found");
+        assert!(!sandbox.is_available());
+        assert_eq!(sandbox.name(), "docker");
+
+        let mut cmd = Command::new("echo");
+        let error = sandbox
+            .wrap_command(&mut cmd)
+            .expect_err("unavailable sandbox must block command wrapping");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("refusing to run without OS-level isolation"));
     }
 }
