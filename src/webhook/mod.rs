@@ -271,25 +271,13 @@ async fn handle_webhook_event(
             .into_response();
     }
 
-    let db_path = (*state.db_path).clone();
-    let acl_enabled = state.acl_enabled;
-    let saved = tokio::task::spawn_blocking(move || persist_event(&db_path, &event, acl_enabled)).await;
-
-    match saved {
-        Ok(Ok(topic_id)) => (StatusCode::OK, Json(serde_json::json!(WebhookAck { topic_id }))).into_response(),
-        Ok(Err(error)) => {
+    match persist_event(&state.db_path, &event, state.acl_enabled).await {
+        Ok(topic_id) => (StatusCode::OK, Json(serde_json::json!(WebhookAck { topic_id }))).into_response(),
+        Err(error) => {
             tracing::error!("failed to persist webhook event: {error}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "Failed to persist event" })),
-            )
-                .into_response()
-        }
-        Err(join_error) => {
-            tracing::error!("webhook worker panicked: {join_error}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "Webhook worker failure" })),
             )
                 .into_response()
         }
@@ -497,7 +485,67 @@ fn normalize_openpr_event_type(raw: &str) -> String {
     format!("issue.{normalized}")
 }
 
-fn persist_event(db_path: &Path, event: &WebhookEvent, acl_enabled: bool) -> Result<String> {
+async fn persist_event(db_path: &Path, event: &WebhookEvent, acl_enabled: bool) -> Result<String> {
+    let topic_id = {
+        let db_path = db_path.to_path_buf();
+        let event = event.clone();
+        tokio::task::spawn_blocking(move || persist_event_topic(&db_path, &event))
+            .await
+            .context("webhook topic worker panicked")??
+    };
+
+    let system_sender = format!("system:{}", event.source);
+    let memory_key = format!("webhook:{}:{}:{}", event.source, event.external_id, Uuid::new_v4());
+    let content = format_event_memory(event);
+    let memory_ctx = MemoryWriteContext {
+        channel: Some("webhook".to_string()),
+        chat_type: Some("webhook".to_string()),
+        chat_id: Some(format!("{}:{}", event.source, event.external_id)),
+        sender_id: None,
+        raw_sender: Some(system_sender),
+    };
+
+    let is_group_event = memory_ctx
+        .chat_id
+        .as_deref()
+        .is_some_and(|chat_id| chat_id.contains("group:") || chat_id.contains("@g.us"));
+    let mut memory_saved = !is_group_event && crate::memory::should_autosave_content(&content);
+    if memory_saved {
+        let memory = SqliteMemory::new_with_path_and_acl(db_path.to_path_buf(), acl_enabled)?;
+        if let Err(error) = memory
+            .store_with_context(
+                &memory_key,
+                &content,
+                MemoryCategory::Conversation,
+                None,
+                Some(&memory_ctx),
+            )
+            .await
+        {
+            if error.to_string().contains("memory safety rejected write") {
+                tracing::warn!("webhook memory autosave skipped by safety filter: {error}");
+                memory_saved = false;
+            } else {
+                return Err(error);
+            }
+        }
+    }
+
+    {
+        let db_path = db_path.to_path_buf();
+        let event = event.clone();
+        let topic_id_for_worker = topic_id.clone();
+        tokio::task::spawn_blocking(move || {
+            finalize_persisted_event(&db_path, &event, &topic_id_for_worker, memory_saved, &memory_key)
+        })
+        .await
+        .context("webhook finalization worker panicked")??;
+    }
+
+    Ok(topic_id)
+}
+
+fn persist_event_topic(db_path: &Path, event: &WebhookEvent) -> Result<String> {
     let conn = Connection::open(db_path).with_context(|| format!("failed to open webhook db {}", db_path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))
         .context("failed to configure webhook sqlite busy_timeout")?;
@@ -532,48 +580,37 @@ fn persist_event(db_path: &Path, event: &WebhookEvent, acl_enabled: bool) -> Res
 
     let system_sender = format!("system:{}", event.source);
     crate::memory::topic::add_participant(&conn, &topic_id, &system_sender, "observer")?;
+    Ok(topic_id)
+}
 
-    let memory_key = format!("webhook:{}:{}:{}", event.source, event.external_id, Uuid::new_v4());
-    let content = format_event_memory(event);
-    let memory_ctx = MemoryWriteContext {
-        channel: Some("webhook".to_string()),
-        chat_type: Some("webhook".to_string()),
-        chat_id: Some(format!("{}:{}", event.source, event.external_id)),
-        sender_id: None,
-        raw_sender: Some(system_sender),
-    };
+fn finalize_persisted_event(
+    db_path: &Path,
+    event: &WebhookEvent,
+    topic_id: &str,
+    memory_saved: bool,
+    memory_key: &str,
+) -> Result<()> {
+    let conn = Connection::open(db_path).with_context(|| format!("failed to open webhook db {}", db_path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("failed to configure webhook sqlite busy_timeout")?;
 
-    // Persist via memory classification path to keep ACL policy consistent.
-    let is_group_event = memory_ctx
-        .chat_id
-        .as_deref()
-        .is_some_and(|chat_id| chat_id.contains("group:") || chat_id.contains("@g.us"));
-    if !is_group_event && crate::memory::should_autosave_content(&content) {
-        let memory = SqliteMemory::new_with_path_and_acl(db_path.to_path_buf(), acl_enabled)?;
-        futures::executor::block_on(memory.store_with_context(
-            &memory_key,
-            &content,
-            MemoryCategory::Conversation,
-            None,
-            Some(&memory_ctx),
-        ))?;
+    if memory_saved {
+        conn.execute(
+            "UPDATE memories
+             SET topic_id = ?1,
+                 created_at = ?2,
+                 updated_at = ?2
+             WHERE key = ?3",
+            params![topic_id, &event.timestamp, memory_key],
+        )?;
     }
-
-    conn.execute(
-        "UPDATE memories
-         SET topic_id = ?1,
-             created_at = ?2,
-             updated_at = ?2
-         WHERE key = ?3",
-        params![&topic_id, &event.timestamp, &memory_key],
-    )?;
 
     match event.event_type.as_str() {
-        "issue.closed" => crate::memory::topic::update_topic_status(&conn, &topic_id, "resolved")?,
-        "issue.reopened" => crate::memory::topic::update_topic_status(&conn, &topic_id, "open")?,
-        _ => crate::memory::topic::touch_topic(&conn, &topic_id)?,
+        "issue.closed" => crate::memory::topic::update_topic_status(&conn, topic_id, "resolved")?,
+        "issue.reopened" => crate::memory::topic::update_topic_status(&conn, topic_id, "open")?,
+        _ => crate::memory::topic::touch_topic(&conn, topic_id)?,
     }
-    Ok(topic_id)
+    Ok(())
 }
 
 fn format_event_memory(event: &WebhookEvent) -> String {
@@ -583,7 +620,7 @@ fn format_event_memory(event: &WebhookEvent) -> String {
         format!("external_id: {}", event.external_id),
         format!("title: {}", event.title),
         format!("content: {}", event.content),
-        format!("timestamp: {}", event.timestamp),
+        format!("event_date: {}", webhook_event_date(&event.timestamp)),
     ];
 
     if let Some(project) = &event.project {
@@ -597,6 +634,10 @@ fn format_event_memory(event: &WebhookEvent) -> String {
     }
 
     lines.join("\n")
+}
+
+fn webhook_event_date(timestamp: &str) -> &str {
+    timestamp.split_once('T').map_or(timestamp, |(date, _)| date)
 }
 
 fn webhook_topic_fingerprint(project: Option<&str>, external_id: &str, title: &str) -> String {
