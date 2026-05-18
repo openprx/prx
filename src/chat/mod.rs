@@ -357,6 +357,7 @@ pub fn reset_redux_diff_count() {
 /// P2-5: 补充字段级比对——检测 Quit 语义差异（旧路径 Exit vs 新路径 Quit）和
 /// Submitted 语义差异（旧路径 Submitted vs 新路径含 LogTrace）。
 #[cfg(feature = "terminal-tui")]
+#[allow(dead_code)]
 fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
     use state::Effect;
     let old_kind = match old {
@@ -2588,7 +2589,6 @@ fn run_tui_unified_loop(
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
     use crate::chat::action::Action;
-    use crate::chat::state::{ChatState, Effect};
     use crossterm::event::{Event, KeyEventKind};
     use ratatui::{TerminalOptions, Viewport};
 
@@ -2600,28 +2600,9 @@ fn run_tui_unified_loop(
         },
     );
 
-    // Step 2: 双写灰度 — `PRX_CHAT_REDUX` 控制 reducer 路径是否生效
-    //   未设 / "0"  → 旧路径单写（默认；reducer 不构造）
-    //   "both"      → 双写（旧路径 + reducer，比对效果用于回归排查）
-    //   "1"         → 新路径影响关键控制流（仅 Quit / Ctrl+D 空 buffer 走 reducer；
-    //                   InterruptTurn / cancel 仍走旧路径，Step 4 才完整迁移）
     let redux_mode = ReduxMode::from_env();
-    // shadow ChatState 仅在 redux_mode != Off 时构造；占位用 dummy provider/model
-    let mut shadow: Option<ChatState> = if matches!(redux_mode, ReduxMode::Off) {
-        None
-    } else {
-        let (provider_name, model_name) = {
-            let guard = mirror.lock();
-            (guard.provider.clone(), guard.model.clone())
-        };
-        Some(ChatState::new(
-            Arc::from(provider_name.as_str()),
-            Arc::from(model_name.as_str()),
-            shutdown.clone(),
-        ))
-    };
     if !matches!(redux_mode, ReduxMode::Off) {
-        tracing::info!(mode = ?redux_mode, "PRX_CHAT_REDUX active — Step 2 双写模式");
+        tracing::info!(mode = ?redux_mode, "PRX_CHAT_REDUX active — TUI input dispatched to main reducer");
     }
 
     let stdout = std::io::stdout();
@@ -2749,13 +2730,7 @@ fn run_tui_unified_loop(
                 if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     continue;
                 }
-                // Step 2 双写: 如果 redux 模式启用，并行 reduce 到 shadow state。
-                // 旧路径仍执行（dispatch_global_key）；shadow 输出的 Effect 仅在
-                // Redux mode 下参与控制流（Quit）。Both mode 仅记录用于对账。
-                let shadow_effects: Vec<Effect> = shadow
-                    .as_mut()
-                    .map_or_else(Vec::new, |state| state.reduce(Action::KeyPressed(key)));
-                let shadow_wants_quit = shadow_effects.iter().any(|e| matches!(e, Effect::Quit));
+                let _ = chat_dispatcher.dispatch_or_log(Action::KeyPressed(key), "chat.tui_key_pressed");
 
                 let dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
                 // C1 fix: any consumed keystroke may have mutated visible
@@ -2766,9 +2741,6 @@ fn run_tui_unified_loop(
                 // crossterm event (worst case 50 ms idle poll). cap=1 +
                 // try_send coalesces, so this is cheap on key floods.
                 let _ = redraw_tx.try_send(());
-                if matches!(redux_mode, ReduxMode::Both) {
-                    log_redux_key_diff(&dispatch, &shadow_effects);
-                }
                 match dispatch {
                     tui::KeyDispatch::Submitted(text) => {
                         let trimmed = text.trim().to_string();
@@ -2834,13 +2806,6 @@ fn run_tui_unified_loop(
                     }
                     tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed => {}
                 }
-                // Redux / Pure mode: shadow 的 Effect::Quit 也能触发退出（用于灰度验证
-                // 新路径的 Ctrl+D 空 buffer / 双 Ctrl+C 语义）。Both 模式仅记录差异。
-                if matches!(redux_mode, ReduxMode::Redux | ReduxMode::Pure) && shadow_wants_quit {
-                    tracing::info!(mode = ?redux_mode, "redux: shadow requested Quit; shutting down");
-                    shutdown.cancel();
-                    return Ok(());
-                }
             }
             Event::Paste(text) => {
                 // P3 rearch: bracketed-paste mode (enabled in
@@ -2849,9 +2814,7 @@ fn run_tui_unified_loop(
                 // it, IME commit strings are shredded into per-byte
                 // KeyEvents with random modifier bits that
                 // `dispatch_global_key` filters out.
-                if let Some(state) = shadow.as_mut() {
-                    let _ = state.reduce(Action::PasteReceived(text.clone()));
-                }
+                let _ = chat_dispatcher.dispatch_or_log(Action::PasteReceived(text.clone()), "chat.tui_paste");
                 mirror.lock().input.paste(&text);
                 // Paste mutates `input.lines` directly so the chrome must
                 // repaint; without this kick the next redraw is gated on
@@ -2859,9 +2822,7 @@ fn run_tui_unified_loop(
                 let _ = redraw_tx.try_send(());
             }
             Event::Resize(w, h) => {
-                if let Some(state) = shadow.as_mut() {
-                    let _ = state.reduce(Action::TerminalResized { w, h });
-                }
+                let _ = chat_dispatcher.dispatch_or_log(Action::TerminalResized { w, h }, "chat.tui_resize");
                 // crossterm forwards the new size to ratatui automatically
                 // on the next `draw()` call; we just nudge the loop so the
                 // redraw happens immediately rather than waiting up to
