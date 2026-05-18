@@ -10,13 +10,20 @@
 //! | Type | Behaviour |
 //! |------|-----------|
 //! | [`LogFeedbackWriter`] | Structured `tracing::info!` log; never blocks the caller. |
+//! | [`SelfSystemFeedbackWriter`] | Append-only JSONL under the workspace self-system tree. |
 //! | `NoopFeedbackWriter` (test-only) | Silent no-op; intended for unit tests. |
 
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 
 use super::branch::{CausalBranch, PathCommitDecision};
 use super::error::CausalTreeError;
 use super::state::CausalState;
+use crate::self_system::evolution::safety_utils::acquire_file_lock;
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -72,9 +79,11 @@ pub trait FeedbackWriter: Send + Sync {
 /// | `rejected_count` | `decision.rejected_branch_ids.len()` |
 /// | `total_branches` | `all_branches.len()` |
 /// | `reasons` | `decision.reasons` joined with `"; "` |
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct LogFeedbackWriter;
 
+#[allow(dead_code)]
 impl LogFeedbackWriter {
     /// Create a new [`LogFeedbackWriter`].
     pub const fn new() -> Self {
@@ -105,6 +114,106 @@ impl FeedbackWriter for LogFeedbackWriter {
         );
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SelfSystemFeedbackWriter
+// ---------------------------------------------------------------------------
+
+/// JSONL record written for a CTE branch decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalTreeFeedbackRecord {
+    pub timestamp: String,
+    pub session_id: String,
+    pub request_id: String,
+    pub goal: String,
+    pub user_intent: String,
+    pub chosen_branch_id: String,
+    pub chosen_rank: Option<usize>,
+    pub fallback_branch_ids: Vec<String>,
+    pub rejected_branch_ids: Vec<String>,
+    pub total_branches: usize,
+    pub cache_ttl_seconds: u32,
+    pub reasons: Vec<String>,
+    pub branches: Vec<CausalBranch>,
+}
+
+impl CausalTreeFeedbackRecord {
+    fn from_decision(state: &CausalState, decision: &PathCommitDecision, all_branches: &[CausalBranch]) -> Self {
+        Self {
+            timestamp: Utc::now().to_rfc3339(),
+            session_id: state.session_id.clone(),
+            request_id: state.request_id.clone(),
+            goal: state.goal.clone(),
+            user_intent: state.user_intent.clone(),
+            chosen_branch_id: decision.chosen_branch_id.clone(),
+            chosen_rank: all_branches
+                .iter()
+                .position(|branch| branch.branch_id == decision.chosen_branch_id),
+            fallback_branch_ids: decision.fallback_branch_ids.clone(),
+            rejected_branch_ids: decision.rejected_branch_ids.clone(),
+            total_branches: all_branches.len(),
+            cache_ttl_seconds: decision.cache_ttl_seconds,
+            reasons: decision.reasons.clone(),
+            branches: all_branches.to_vec(),
+        }
+    }
+}
+
+/// Feedback writer that appends CTE decisions into the SelfSystem workspace.
+#[derive(Debug, Clone)]
+pub struct SelfSystemFeedbackWriter {
+    feedback_dir: PathBuf,
+}
+
+impl SelfSystemFeedbackWriter {
+    /// Create a writer rooted at `workspace_dir/self/causal_tree/feedback`.
+    pub fn new(workspace_dir: impl AsRef<Path>) -> Self {
+        Self {
+            feedback_dir: workspace_dir.as_ref().join("self").join("causal_tree").join("feedback"),
+        }
+    }
+
+    fn file_path(&self, timestamp: &str) -> PathBuf {
+        let date = chrono::DateTime::parse_from_rfc3339(timestamp)
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|_| Utc::now().format("%Y-%m-%d").to_string());
+        self.feedback_dir.join(format!("{date}.jsonl"))
+    }
+}
+
+#[async_trait]
+impl FeedbackWriter for SelfSystemFeedbackWriter {
+    async fn write_decision(
+        &self,
+        state: &CausalState,
+        decision: &PathCommitDecision,
+        all_branches: &[CausalBranch],
+    ) -> Result<(), CausalTreeError> {
+        let record = CausalTreeFeedbackRecord::from_decision(state, decision, all_branches);
+        let path = self.file_path(&record.timestamp);
+        let line =
+            serde_json::to_string(&record).map_err(|err| CausalTreeError::FeedbackWriteFailed(err.to_string()))?;
+
+        async {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let _lock = acquire_file_lock(&path).await?;
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await?;
+            file.write_all(line.as_bytes()).await?;
+            file.write_all(b"\n").await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            anyhow::Ok(())
+        }
+        .await
+        .map_err(|err| CausalTreeError::FeedbackWriteFailed(err.to_string()))
     }
 }
 
@@ -256,5 +365,36 @@ mod tests {
             let result = writer.write_decision(&state, &decision, &branches).await;
             assert!(result.is_ok(), "test: trait object dispatch must succeed");
         }
+    }
+
+    #[tokio::test]
+    async fn test_self_system_writer_appends_jsonl_feedback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let writer = SelfSystemFeedbackWriter::new(tmp.path());
+        let state = make_state();
+        let decision = make_decision("b1");
+        let branches = vec![make_branch("b1"), make_branch("b2")];
+
+        writer
+            .write_decision(&state, &decision, &branches)
+            .await
+            .expect("test: self-system writer should append");
+
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let path = tmp
+            .path()
+            .join("self")
+            .join("causal_tree")
+            .join("feedback")
+            .join(format!("{date}.jsonl"));
+        let raw = tokio::fs::read_to_string(path).await.unwrap();
+        let lines: Vec<_> = raw.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let record: CausalTreeFeedbackRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(record.session_id, "sess-fb-test");
+        assert_eq!(record.request_id, "req-fb-test");
+        assert_eq!(record.chosen_branch_id, "b1");
+        assert_eq!(record.chosen_rank, Some(0));
+        assert_eq!(record.total_branches, 2);
     }
 }

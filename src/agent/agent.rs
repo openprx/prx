@@ -435,7 +435,9 @@ impl Agent {
                 Arc::new(crate::causal_tree::rehearsal::DefaultRehearsalEngine::new()),
                 Arc::new(crate::causal_tree::scorer::DefaultBranchScorer::new()),
                 Arc::new(crate::causal_tree::selector::DefaultPathSelector::new()),
-                Arc::new(crate::causal_tree::feedback::LogFeedbackWriter::new()),
+                Arc::new(crate::causal_tree::feedback::SelfSystemFeedbackWriter::new(
+                    &config.workspace_dir,
+                )),
                 cte_observer.clone(),
                 config.causal_tree.clone(),
             );

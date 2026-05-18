@@ -227,14 +227,22 @@ impl CausalTreeEngine {
         let decision = self.selector.select(state, &sorted, policy).await?;
 
         // Find the chosen branch for the caller.
-        let chosen_branch = sorted
+        let chosen_rank = sorted
             .iter()
-            .find(|(b, _, _)| b.branch_id == decision.chosen_branch_id)
-            .map(|(b, _, _)| b.clone())
+            .position(|(b, _, _)| b.branch_id == decision.chosen_branch_id)
             .ok_or_else(|| {
                 CausalTreeError::ExpansionFailed(format!(
                     "chosen branch '{}' not found in scored set",
                     decision.chosen_branch_id,
+                ))
+            })?;
+        let chosen_branch = sorted
+            .get(chosen_rank)
+            .map(|(branch, _, _)| branch.clone())
+            .ok_or_else(|| {
+                CausalTreeError::ExpansionFailed(format!(
+                    "chosen branch '{}' rank {} out of range",
+                    decision.chosen_branch_id, chosen_rank,
                 ))
             })?;
 
@@ -251,8 +259,8 @@ impl CausalTreeEngine {
         {
             let mut m = self.metrics.lock();
             m.record(&RunObservation {
-                hit_at_1: true, // first version: assume hit (real tracking requires post-hoc)
-                hit_at_3: true,
+                hit_at_1: chosen_rank == 0,
+                hit_at_3: chosen_rank < 3,
                 rehearsals_performed,
                 rehearsals_wasted,
                 extra_latency_ms: elapsed_ms,
@@ -290,6 +298,38 @@ mod tests {
     use crate::causal_tree::selector::DefaultPathSelector;
     use crate::causal_tree::state::{BudgetState, SideEffectMode};
     use crate::observability::noop::NoopObserver;
+
+    struct SecondBranchSelector;
+
+    #[async_trait::async_trait]
+    impl PathSelector for SecondBranchSelector {
+        async fn select(
+            &self,
+            _state: &CausalState,
+            scored_branches: &[(CausalBranch, f32, Option<RehearsalArtifact>)],
+            _policy: &CausalPolicy,
+        ) -> Result<PathCommitDecision, CausalTreeError> {
+            let chosen = scored_branches
+                .get(1)
+                .ok_or_else(|| CausalTreeError::ExpansionFailed("expected second branch".to_string()))?;
+            let fallback_branch_ids = scored_branches
+                .first()
+                .map(|(branch, _, _)| vec![branch.branch_id.clone()])
+                .unwrap_or_default();
+
+            Ok(PathCommitDecision {
+                chosen_branch_id: chosen.0.branch_id.clone(),
+                rejected_branch_ids: scored_branches
+                    .iter()
+                    .skip(2)
+                    .map(|(branch, _, _)| branch.branch_id.clone())
+                    .collect(),
+                fallback_branch_ids,
+                reasons: vec!["test selector chose the second-ranked branch".to_string()],
+                cache_ttl_seconds: 60,
+            })
+        }
+    }
 
     fn make_state(intent: &str) -> CausalState {
         CausalState {
@@ -404,5 +444,37 @@ mod tests {
 
         let metrics = engine.snapshot_metrics();
         assert!(metrics.total_runs >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_engine_metrics_use_selected_rank_not_assumed_hit() {
+        let config = CausalTreeConfig {
+            enabled: true,
+            policy: CausalPolicy {
+                commit_threshold: 0.30,
+                max_branches: 2,
+                extra_latency_budget_ms: 5000,
+                ..CausalPolicy::default()
+            },
+            ..CausalTreeConfig::default()
+        };
+        let engine = CausalTreeEngine::new(
+            Arc::new(DefaultTreeExpander::new()),
+            Arc::new(DefaultRehearsalEngine::new()),
+            Arc::new(DefaultBranchScorer::new()),
+            Arc::new(SecondBranchSelector),
+            Arc::new(NoopFeedbackWriter::new()),
+            Arc::new(NoopObserver),
+            config,
+        );
+        let state = make_state("ambiguous request");
+
+        let result = engine.run(&state).await;
+        assert!(result.is_ok(), "second-ranked selector should still commit: {result:?}");
+
+        let metrics = engine.snapshot_metrics();
+        assert_eq!(metrics.total_runs, 1);
+        assert_eq!(metrics.hits_at_1, 0);
+        assert_eq!(metrics.hits_at_3, 1);
     }
 }
