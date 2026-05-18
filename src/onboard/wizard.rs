@@ -1445,6 +1445,53 @@ fn print_model_preview(models: &[String]) {
     }
 }
 
+pub fn run_models_list(config: &Config, provider_override: Option<&str>) -> Result<()> {
+    let provider_name = provider_override
+        .or(config.default_provider.as_deref())
+        .unwrap_or("openrouter")
+        .trim()
+        .to_string();
+
+    if provider_name.is_empty() {
+        anyhow::bail!("Provider name cannot be empty");
+    }
+
+    let canonical = canonical_provider_name(&provider_name).to_string();
+    let cached = load_any_cached_models_for_provider(&config.workspace_dir, &canonical)?.or_else(|| {
+        load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)
+            .ok()
+            .flatten()
+    });
+    let curated = curated_models_for_provider(&canonical);
+
+    println!("Model catalog for '{}':", provider_name);
+    if let Some(cached) = cached {
+        println!(
+            "  Source: cached live catalog (updated {} ago)",
+            humanize_age(cached.age_secs)
+        );
+        println!("  Models: {}", cached.models.len());
+        print_model_preview(&cached.models);
+        if cached.models.len() > MODEL_PREVIEW_LIMIT {
+            println!("  Tip: use `prx models refresh --provider {provider_name} --force` to refresh this cache.");
+        }
+    } else if !curated.is_empty() {
+        println!("  Source: curated defaults (no live cache found)");
+        println!("  Models: {}", curated.len());
+        for (model, label) in curated.iter().take(MODEL_PREVIEW_LIMIT) {
+            println!("  {} {model} — {label}", style("-"));
+        }
+        println!("  Tip: run `prx models refresh --provider {provider_name}` to cache a live catalog when supported.");
+    } else {
+        println!("  No cached or curated models found.");
+        println!(
+            "  Tip: run `prx providers` to see supported providers, then `prx models refresh --provider <provider>`."
+        );
+    }
+
+    Ok(())
+}
+
 pub fn run_models_refresh(config: &Config, provider_override: Option<&str>, force: bool) -> Result<()> {
     let provider_name = provider_override
         .or(config.default_provider.as_deref())

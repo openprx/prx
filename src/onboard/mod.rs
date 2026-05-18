@@ -1,7 +1,7 @@
 pub mod auto_detect;
 pub mod wizard;
 
-pub use wizard::run_models_refresh;
+pub use wizard::{run_models_list, run_models_refresh};
 
 #[cfg(test)]
 mod tests {
@@ -14,6 +14,7 @@ mod tests {
         assert_reexport_exists(wizard::run_wizard);
         assert_reexport_exists(wizard::run_channels_repair_wizard);
         assert_reexport_exists(wizard::run_quick_setup);
+        assert_reexport_exists(run_models_list);
         assert_reexport_exists(run_models_refresh);
     }
 }

@@ -71,7 +71,50 @@ pub struct IntegrationEntry {
 /// Handle the `integrations` CLI command
 pub fn handle_command(command: crate::IntegrationCommands, config: &Config) -> Result<()> {
     match command {
+        crate::IntegrationCommands::List => {
+            list_integrations(config);
+            Ok(())
+        }
         crate::IntegrationCommands::Info { name } => show_integration_info(config, &name),
+    }
+}
+
+fn list_integrations(config: &Config) {
+    let entries = registry::all_integrations();
+    let active = entries
+        .iter()
+        .filter(|entry| (entry.status_fn)(config) == IntegrationStatus::Active)
+        .count();
+    let available = entries
+        .iter()
+        .filter(|entry| (entry.status_fn)(config) == IntegrationStatus::Available)
+        .count();
+    let coming_soon = entries
+        .iter()
+        .filter(|entry| (entry.status_fn)(config) == IntegrationStatus::ComingSoon)
+        .count();
+
+    println!("Integrations ({} total):", entries.len());
+    println!("  Active: {active}  Available: {available}  Coming soon: {coming_soon}");
+    println!();
+
+    for category in IntegrationCategory::all() {
+        let category_entries: Vec<_> = entries.iter().filter(|entry| entry.category == *category).collect();
+        if category_entries.is_empty() {
+            continue;
+        }
+
+        println!("{}:", category.label());
+        for entry in category_entries {
+            let status = (entry.status_fn)(config);
+            let label = match status {
+                IntegrationStatus::Active => "active",
+                IntegrationStatus::Available => "available",
+                IntegrationStatus::ComingSoon => "coming-soon",
+            };
+            println!("  {:<18} {:<12} {}", entry.name, label, entry.description);
+        }
+        println!();
     }
 }
 
@@ -222,5 +265,13 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Unknown integration"));
+    }
+
+    #[test]
+    fn handle_command_list_succeeds() {
+        let config = Config::default();
+        let result = handle_command(crate::IntegrationCommands::List, &config);
+
+        assert!(result.is_ok());
     }
 }
