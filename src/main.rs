@@ -466,7 +466,7 @@ Examples:
     /// Manage provider model catalogs
     Models {
         #[command(subcommand)]
-        model_command: ModelCommands,
+        model_command: Option<ModelCommands>,
     },
 
     /// List supported AI providers
@@ -494,7 +494,7 @@ Examples:
     /// Browse 50+ integrations
     Integrations {
         #[command(subcommand)]
-        integration_command: IntegrationCommands,
+        integration_command: Option<IntegrationCommands>,
     },
 
     /// Manage skills (user-defined capabilities)
@@ -799,6 +799,12 @@ enum CronCommands {
 
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
+    /// List model catalogs
+    List {
+        /// Provider name (defaults to configured default provider)
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// Refresh and cache provider models
     Refresh {
         /// Provider name (defaults to configured default provider)
@@ -870,6 +876,8 @@ enum SkillCommands {
 
 #[derive(Subcommand, Debug)]
 enum IntegrationCommands {
+    /// List integrations
+    List,
     /// Show details about a specific integration
     Info {
         /// Integration name
@@ -965,7 +973,10 @@ async fn async_main() -> Result<()> {
     // chat handler can redirect tracing to ~/.openprx/chat.log once the TUI
     // takes over the terminal. Until then logs still go to stderr so startup
     // diagnostics (config errors, etc.) remain visible to the user.
-    let use_stderr = matches!(cli.command, Commands::Chat { .. } | Commands::Config { .. });
+    let use_stderr = matches!(
+        cli.command,
+        Commands::Chat { .. } | Commands::Config { .. } | Commands::Models { .. } | Commands::Integrations { .. }
+    );
     if use_stderr {
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
@@ -1228,7 +1239,8 @@ async fn async_main() -> Result<()> {
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
-        Commands::Models { model_command } => match model_command {
+        Commands::Models { model_command } => match model_command.unwrap_or(ModelCommands::List { provider: None }) {
+            ModelCommands::List { provider } => onboard::run_models_list(&config, provider.as_deref()),
             ModelCommands::Refresh { provider, force } => {
                 let config_for_refresh = config.clone();
                 tokio::task::spawn_blocking(move || {
@@ -1293,7 +1305,9 @@ async fn async_main() -> Result<()> {
             other => channels::handle_command(other, &config).await,
         },
 
-        Commands::Integrations { integration_command } => integrations::handle_command(integration_command, &config),
+        Commands::Integrations { integration_command } => {
+            integrations::handle_command(integration_command.unwrap_or(IntegrationCommands::List), &config)
+        }
 
         Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
 
@@ -1859,6 +1873,38 @@ mod tests {
                 config_command: ConfigCommands::Show { format },
             } => assert_eq!(format, ConfigShowFormat::Json),
             other => panic!("expected config show json command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn models_and_integrations_accept_bare_and_list_commands() {
+        let cli = Cli::try_parse_from(["prx", "models"]).expect("bare models should parse");
+        match cli.command {
+            Commands::Models { model_command } => assert!(model_command.is_none()),
+            other => panic!("expected bare models command, got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["prx", "models", "list", "--provider", "openai"]).expect("models list should parse");
+        match cli.command {
+            Commands::Models {
+                model_command: Some(ModelCommands::List { provider }),
+            } => assert_eq!(provider.as_deref(), Some("openai")),
+            other => panic!("expected models list command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["prx", "integrations"]).expect("bare integrations should parse");
+        match cli.command {
+            Commands::Integrations { integration_command } => assert!(integration_command.is_none()),
+            other => panic!("expected bare integrations command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["prx", "integrations", "list"]).expect("integrations list should parse");
+        match cli.command {
+            Commands::Integrations {
+                integration_command: Some(IntegrationCommands::List),
+            } => {}
+            other => panic!("expected integrations list command, got {other:?}"),
         }
     }
 
