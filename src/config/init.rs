@@ -769,10 +769,10 @@ max_size_mb = 100
 
 # Tool-level policy overrides
 # [security.tool_policy]
-# default_action = "allow"            # allow | deny | ask
-# [security.tool_policy.overrides]
-# "shell" = "ask"
-# "file_write" = "ask"
+# default = "supervised"             # supervised | allow | deny
+# [security.tool_policy.tools]
+# shell = "supervised"
+# file_write = "supervised"
 "#
         .into(),
     }

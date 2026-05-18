@@ -12,7 +12,7 @@ use std::collections::HashMap;
 /// Hierarchy of policy layers, from broadest to most specific.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyLayer {
-    /// Global default (e.g. `default = "allow"`)
+    /// Global default (e.g. `default = "supervised"`)
     Global,
     /// User profile / channel-level overrides
     Profile,
@@ -155,7 +155,7 @@ impl PolicyPipeline {
     pub fn evaluate(&self, tool_name: &str, _ctx: &EvalContext) -> PolicyDecision {
         let mut layers = Vec::new();
         let mut current_allowed = self.config.default_allow();
-        let mut reason = format!("global default: {}", if current_allowed { "allow" } else { "deny" });
+        let mut reason = format!("global default: {}", self.config.default.trim());
         layers.push(PolicyLayer::Global);
 
         // Profile layer (future: check per-user/channel overrides)
@@ -231,6 +231,17 @@ mod tests {
         let d = p.evaluate("shell", &Default::default());
         assert!(d.allowed);
         assert!(d.layers_applied.contains(&PolicyLayer::Global));
+    }
+
+    #[test]
+    fn config_default_is_supervised() {
+        let config = ToolPolicyConfig::default();
+        assert_eq!(config.default, "supervised");
+
+        let p = PolicyPipeline::new(config);
+        let d = p.evaluate("shell", &Default::default());
+        assert!(d.allowed);
+        assert_eq!(d.reason, "global default: supervised");
     }
 
     #[test]
