@@ -1086,6 +1086,9 @@ async fn drive_start_turn_stream(
     let mut overflow_retries: u8 = 0;
     // 已经执行过的 tool_call_id（防 context overflow 重试后重复执行同一工具）.
     let mut executed_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let stream_tool_specs: Vec<crate::tools::ToolSpec> = tools_registry.as_ref().map_or_else(Vec::new, |registry| {
+        registry.iter().flat_map(|tool| tool.specs()).collect()
+    });
 
     'outer: loop {
         iteration = iteration.saturating_add(1);
@@ -1112,6 +1115,7 @@ async fn drive_start_turn_stream(
             &action_tx,
             &mut version,
             &mut reasoning_buf,
+            &stream_tool_specs,
         )
         .await;
 
@@ -1473,6 +1477,7 @@ async fn run_one_stream_pass_with_retry(
     action_tx: &mpsc::Sender<Action>,
     version: &mut u64,
     reasoning_buf: &mut String,
+    tool_specs: &[crate::tools::ToolSpec],
 ) -> StreamPassOutcome {
     let mut attempt: u8 = 0;
     loop {
@@ -1498,6 +1503,7 @@ async fn run_one_stream_pass_with_retry(
             action_tx,
             version,
             reasoning_buf,
+            tool_specs,
         )
         .await
         {
@@ -1573,11 +1579,12 @@ async fn run_one_stream_pass(
     action_tx: &mpsc::Sender<Action>,
     version: &mut u64,
     reasoning_buf: &mut String,
+    tool_specs: &[crate::tools::ToolSpec],
 ) -> StreamPassOutcome {
     use crate::providers::traits::{StreamChunk, StreamOptions};
     use futures::StreamExt;
 
-    let opts = StreamOptions::new(true);
+    let opts = StreamOptions::new(true).with_tools(tool_specs.to_vec());
     let stream = provider.stream_chat_with_history(history, model, temperature, opts);
     tokio::pin!(stream);
 
@@ -4603,6 +4610,7 @@ mod real_mode_tests {
         };
         use async_trait::async_trait;
         use futures::stream::{self, BoxStream, StreamExt};
+        use parking_lot::Mutex as PMutex;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
         // ── Echo tool: 返回 args["text"] 原样, 让 driver 把它喂回 provider 验证 history 流转. ──
@@ -4635,6 +4643,7 @@ mod real_mode_tests {
         // ── Provider: 第 1 次 stream 发 tool_call, 第 2 次发 final 文本. ──
         struct ToolThenTextProvider {
             counter: Arc<AtomicUsize>,
+            captured_tool_counts: Arc<PMutex<Vec<usize>>>,
         }
         #[async_trait]
         impl Provider for ToolThenTextProvider {
@@ -4665,8 +4674,11 @@ mod real_mode_tests {
                 _messages: &[PMsg],
                 _model: &str,
                 _temp: f64,
-                _options: StreamOptions,
+                options: StreamOptions,
             ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                self.captured_tool_counts
+                    .lock()
+                    .push(options.tools.as_ref().map_or(0, Vec::len));
                 let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
                 if n == 0 {
                     let calls = vec![ToolCallChunk::new("tc-1", "echo-tool", r#"{"text":"echoed"}"#, 0)];
@@ -4687,8 +4699,10 @@ mod real_mode_tests {
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let captured_tool_counts = Arc::new(PMutex::new(Vec::new()));
         deps.provider = Arc::new(ToolThenTextProvider {
             counter: Arc::new(AtomicUsize::new(0)),
+            captured_tool_counts: Arc::clone(&captured_tool_counts),
         });
         deps.tools_registry = Some(Arc::new(vec![Box::new(EchoTool) as Box<dyn crate::tools::Tool>]));
         deps.max_tool_iterations = 4;
@@ -4752,6 +4766,11 @@ mod real_mode_tests {
         assert!(
             final_text_seen.contains("done"),
             "streaming delta must include 'done' (got {final_text_seen:?})"
+        );
+        assert_eq!(
+            *captured_tool_counts.lock(),
+            vec![1, 1],
+            "driver must pass registered tool specs to each streaming request"
         );
     }
 

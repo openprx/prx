@@ -323,12 +323,17 @@ impl StreamChunk {
 }
 
 /// Options for streaming chat requests.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
     /// Whether to enable streaming (default: true).
     pub enabled: bool,
     /// Whether to include token counts in chunks.
     pub count_tokens: bool,
+    /// Tool specs to register for native streaming tool calling.
+    ///
+    /// `None` means do not send tools. `Some(empty)` is normalized to `None`
+    /// by [`Self::with_tools`] for the current providers.
+    pub tools: Option<Vec<crate::tools::ToolSpec>>,
 }
 
 impl StreamOptions {
@@ -337,12 +342,20 @@ impl StreamOptions {
         Self {
             enabled,
             count_tokens: false,
+            tools: None,
         }
     }
 
     /// Enable token counting.
     pub const fn with_token_count(mut self) -> Self {
         self.count_tokens = true;
+        self
+    }
+
+    /// Attach native tool specs to a streaming request.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<crate::tools::ToolSpec>) -> Self {
+        self.tools = if tools.is_empty() { None } else { Some(tools) };
         self
     }
 }
