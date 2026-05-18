@@ -3642,6 +3642,7 @@ mod tests {
 
     struct VisionProvider {
         calls: Arc<AtomicUsize>,
+        expected_user_text: Option<&'static str>,
     }
 
     #[async_trait]
@@ -3674,6 +3675,16 @@ mod tests {
             let marker_count = crate::multimodal::count_image_markers(request.messages);
             if marker_count == 0 {
                 anyhow::bail!("expected image markers in request messages");
+            }
+
+            if let Some(expected_text) = self.expected_user_text {
+                let user_text_found = request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == "user" && message.content.contains(expected_text));
+                if !user_text_found {
+                    anyhow::bail!("expected user text '{expected_text}' in multimodal request messages");
+                }
             }
 
             if request.tools.is_some() {
@@ -3847,6 +3858,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = VisionProvider {
             calls: Arc::clone(&calls),
+            expected_user_text: None,
         };
 
         let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
@@ -3902,6 +3914,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = VisionProvider {
             calls: Arc::clone(&calls),
+            expected_user_text: None,
         };
 
         let mut history = vec![ChatMessage::user(
@@ -3940,6 +3953,57 @@ mod tests {
         )
         .await
         .expect("valid multimodal payload should pass");
+
+        assert_eq!(result, "vision-ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_forwards_audio_transcript_with_image_payload() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = VisionProvider {
+            calls: Arc::clone(&calls),
+            expected_user_text: Some("Audio transcript: the package label says fragile"),
+        };
+
+        let mut history = vec![ChatMessage::user(
+            "Audio transcript: the package label says fragile\nAnalyze the attached image too \
+             [IMAGE:data:image/png;base64,iVBORw0KGgo=]"
+                .to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            &crate::hooks::HookManager::new(std::env::temp_dir()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            3,
+            false,
+            2,
+            30,
+            false,
+            Vec::new(),
+            ToolConcurrencyGovernanceConfig::default(),
+            None,
+            None,
+            None,
+            None, // no scope context
+            None,
+            None, // no tool tiering
+            ChatMode::default(),
+        )
+        .await
+        .expect("image plus audio transcript should reach the vision provider");
 
         assert_eq!(result, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
