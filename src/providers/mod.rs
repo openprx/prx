@@ -2661,6 +2661,12 @@ mod tests {
     }
 
     #[test]
+    fn factory_glm_routes_to_streaming_compatible_provider() {
+        let provider = create_provider("glm", Some("key")).unwrap();
+        assert!(provider.supports_streaming());
+    }
+
+    #[test]
     fn factory_minimax() {
         assert!(create_provider("minimax", Some("key")).is_ok());
         assert!(create_provider("minimax-intl", Some("key")).is_ok());
@@ -2795,6 +2801,12 @@ mod tests {
     fn factory_copilot() {
         assert!(create_provider("copilot", Some("key")).is_ok());
         assert!(create_provider("github-copilot", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_copilot_supports_streaming() {
+        let provider = create_provider("copilot", Some("key")).unwrap();
+        assert!(provider.supports_streaming());
     }
 
     #[test]

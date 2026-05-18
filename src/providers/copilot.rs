@@ -14,11 +14,12 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider,
-    ToolCall as ProviderToolCall,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
+    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
+use futures_util::{StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -83,12 +84,13 @@ struct CachedApiKey {
 // ── Chat completions types ───────────────────────────────────────
 
 #[derive(Debug, Serialize)]
-struct ApiChatRequest<'a> {
+struct ApiChatRequest {
     model: String,
     messages: Vec<ApiMessage>,
     temperature: f64,
+    stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<NativeToolSpec<'a>>>,
+    tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
 }
@@ -105,17 +107,17 @@ struct ApiMessage {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeToolSpec<'a> {
+struct NativeToolSpec {
     #[serde(rename = "type")]
     kind: &'static str,
-    function: NativeToolFunctionSpec<'a>,
+    function: NativeToolFunctionSpec,
 }
 
 #[derive(Debug, Serialize)]
-struct NativeToolFunctionSpec<'a> {
-    name: &'a str,
-    description: &'a str,
-    parameters: &'a serde_json::Value,
+struct NativeToolFunctionSpec {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -222,16 +224,16 @@ impl CopilotProvider {
         ("Accept", "application/json"),
     ];
 
-    fn convert_tools<'a>(tools: Option<&'a [ToolSpec]>) -> Option<Vec<NativeToolSpec<'a>>> {
+    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         tools.map(|items| {
             items
                 .iter()
                 .map(|tool| NativeToolSpec {
                     kind: "function",
                     function: NativeToolFunctionSpec {
-                        name: &tool.name,
-                        description: &tool.description,
-                        parameters: &tool.parameters,
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters: tool.parameters.clone(),
                     },
                 })
                 .collect()
@@ -322,6 +324,7 @@ impl CopilotProvider {
             model: model.to_string(),
             messages,
             temperature,
+            stream: false,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
         };
@@ -649,9 +652,112 @@ impl Provider for CopilotProvider {
         true
     }
 
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let messages = Self::convert_messages(messages);
+        let native_tools = Self::convert_tools(options.tools.as_deref());
+        let request = ApiChatRequest {
+            model: model.to_string(),
+            messages,
+            temperature,
+            stream: true,
+            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            tools: native_tools,
+        };
+        let count_tokens = options.count_tokens;
+        let this = self.clone_for_stream();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+        tokio::spawn(async move {
+            let (token, endpoint) = match this.get_api_key().await {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                    return;
+                }
+            };
+            let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
+            let mut req = this
+                .http_client()
+                .post(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Accept", "text/event-stream")
+                .json(&request);
+
+            for (header, value) in &Self::COPILOT_HEADERS {
+                req = req.header(*header, *value);
+            }
+
+            let response = match req.send().await {
+                Ok(response) => response,
+                Err(err) => {
+                    let _ = tx.send(Err(StreamError::Http(err))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let sanitized = super::sanitize_api_error(&body);
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{status}: {sanitized}"))))
+                    .await;
+                return;
+            }
+
+            let mut chunks = crate::providers::compatible::sse_bytes_to_chunks(response, count_tokens);
+            while let Some(chunk) = chunks.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let mut messages = Vec::new();
+        if let Some(system) = system_prompt {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(ChatMessage::user(message));
+        self.stream_chat_with_history(&messages, model, temperature, options)
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         let _ = self.get_api_key().await?;
         Ok(())
+    }
+}
+
+impl CopilotProvider {
+    fn clone_for_stream(&self) -> Self {
+        Self {
+            github_token: self.github_token.clone(),
+            refresh_lock: Arc::clone(&self.refresh_lock),
+            token_dir: self.token_dir.clone(),
+        }
     }
 }
 
@@ -702,5 +808,31 @@ mod tests {
     fn supports_native_tools() {
         let provider = CopilotProvider::new(None);
         assert!(provider.supports_native_tools());
+    }
+
+    #[test]
+    fn api_chat_request_serializes_stream_true() {
+        let request = ApiChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![ApiMessage {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            temperature: 0.2,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json.get("stream"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn supports_streaming_returns_true() {
+        let provider = CopilotProvider::new(None);
+        assert!(provider.supports_streaming());
     }
 }
