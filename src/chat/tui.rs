@@ -3157,6 +3157,25 @@ mod tests {
     }
 
     #[test]
+    fn p2_10_large_paste_100kb_submits_without_truncation() {
+        let mut input = TuiInput::new();
+        let line = "a".repeat(1024);
+        let pasted = std::iter::repeat_n(line.as_str(), 100).collect::<Vec<_>>().join("\n");
+
+        input.paste(&pasted);
+
+        assert_eq!(pasted.len(), 102_499);
+        assert_eq!(input.lines.len(), 100);
+        assert_eq!(input.text(), pasted);
+        assert_eq!(input.cursor, (99, 1024));
+
+        let out = input.handle_key(key(KeyCode::Enter));
+        assert_eq!(out, InputOutcome::Submitted(pasted.clone()));
+        assert_eq!(input.history, vec![pasted]);
+        assert!(input.is_empty(), "buffer cleared after large submit");
+    }
+
+    #[test]
     fn p2_10_multi_line_up_down_moves_cursor_not_history() {
         let mut input = TuiInput::new();
         type_str(&mut input, "x");
