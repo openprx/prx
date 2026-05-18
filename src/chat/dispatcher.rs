@@ -1353,10 +1353,31 @@ async fn execute_single_tool_call(
                 return ToolExecOutcome::Done;
             }
         } else {
-            tracing::warn!(
+            tracing::error!(
                 tool = %call.name,
-                "tool needs_approval=true but no approval_router wired; auto-approving (degraded)"
+                tool_id = %call.id,
+                "tool needs_approval=true but no approval_router wired; rejecting (fail-CLOSED)"
             );
+            let err_msg = "approval system not available; tool rejected for safety".to_string();
+            let tool_payload = serde_json::json!({
+                "tool_call_id": call.id,
+                "content": err_msg,
+                "success": false,
+            });
+            history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
+            if let Err(e) = action_tx
+                .send(Action::ToolFinished {
+                    name: call.name.clone(),
+                    success: false,
+                    duration_ms: 0,
+                    result: Some(err_msg),
+                })
+                .await
+            {
+                tracing::debug!(error = %e, "StartTurn: action_tx closed on tool-rejected-fail-closed");
+                return ToolExecOutcome::SenderClosed;
+            }
+            return ToolExecOutcome::Done;
         }
     }
 
@@ -6076,6 +6097,206 @@ mod real_mode_tests {
             !exec_counter.load(AtomicOrdering::SeqCst),
             "rejected tool MUST NOT have executed"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_tool_with_missing_approval_router_rejects() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        struct DangerousTool {
+            executed: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for DangerousTool {
+            fn name(&self) -> &str {
+                "danger"
+            }
+            fn description(&self) -> &str {
+                "danger"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                self.executed.store(true, AtomicOrdering::SeqCst);
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "ran".into(),
+                    error: None,
+                })
+            }
+        }
+
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            auto_approve: Vec::new(),
+            always_ask: vec!["danger".to_string()],
+            ..Default::default()
+        };
+        let approval_manager = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));
+        let executed = Arc::new(AtomicBool::new(false));
+        let registry = Arc::new(vec![Box::new(DangerousTool {
+            executed: Arc::clone(&executed),
+        }) as Box<dyn crate::tools::Tool>]);
+        let call = ResolvedToolCall {
+            id: "call-danger".into(),
+            name: "danger".into(),
+            args: "{}".into(),
+        };
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
+        let mut history = Vec::new();
+
+        let outcome = execute_single_tool_call(
+            &registry,
+            &call,
+            &CancellationToken::new(),
+            &action_tx,
+            "draft-missing-router",
+            None,
+            Some(&approval_manager),
+            &mut history,
+        )
+        .await;
+
+        assert!(matches!(outcome, ToolExecOutcome::Done));
+        assert!(
+            !executed.load(AtomicOrdering::SeqCst),
+            "tool requiring approval must not execute without router"
+        );
+        let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+            .await
+            .expect("ToolFinished action")
+            .expect("action present");
+        match action {
+            Action::ToolFinished {
+                name, success, result, ..
+            } => {
+                assert_eq!(name, "danger");
+                assert!(!success);
+                assert!(
+                    result
+                        .as_deref()
+                        .is_some_and(|value| value.contains("approval system not available")),
+                    "unexpected result: {result:?}"
+                );
+            }
+            other => panic!("expected ToolFinished fail-CLOSED action, got {other:?}"),
+        }
+        assert!(
+            action_rx.try_recv().is_err(),
+            "fail-CLOSED path must not start the tool"
+        );
+        let tool_message = history.last().expect("tool rejection history expected");
+        assert_eq!(tool_message.role, "tool");
+        let payload: serde_json::Value = serde_json::from_str(&tool_message.content).expect("tool payload JSON");
+        assert_eq!(
+            payload.get("tool_call_id").and_then(serde_json::Value::as_str),
+            Some("call-danger")
+        );
+        assert_eq!(payload.get("success").and_then(serde_json::Value::as_bool), Some(false));
+        assert!(
+            payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains("approval system not available"))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_tool_with_approval_router_works_normally() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        struct DangerousTool {
+            executed: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for DangerousTool {
+            fn name(&self) -> &str {
+                "danger"
+            }
+            fn description(&self) -> &str {
+                "danger"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                self.executed.store(true, AtomicOrdering::SeqCst);
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "ran".into(),
+                    error: None,
+                })
+            }
+        }
+
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            auto_approve: Vec::new(),
+            always_ask: vec!["danger".to_string()],
+            ..Default::default()
+        };
+        let approval_manager = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));
+        let approval_router = Arc::new(ApprovalRouter::new());
+        let executed = Arc::new(AtomicBool::new(false));
+        let registry = Arc::new(vec![Box::new(DangerousTool {
+            executed: Arc::clone(&executed),
+        }) as Box<dyn crate::tools::Tool>]);
+        let call = ResolvedToolCall {
+            id: "call-danger".into(),
+            name: "danger".into(),
+            args: "{}".into(),
+        };
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
+        let mut history = Vec::new();
+
+        let router_handle = Arc::clone(&approval_router);
+        let resolver = tokio::spawn(async move {
+            let action = action_rx.recv().await.expect("approval request action");
+            match action {
+                Action::ToolApprovalRequested { tool_id, name, .. } => {
+                    assert_eq!(tool_id, "call-danger");
+                    assert_eq!(name, "danger");
+                    assert!(router_handle.resolve(&tool_id, true));
+                }
+                other => panic!("expected approval request, got {other:?}"),
+            }
+
+            let started = action_rx.recv().await.expect("tool started action");
+            assert!(matches!(started, Action::ToolStarted { ref name, .. } if name == "danger"));
+            let finished = action_rx.recv().await.expect("tool finished action");
+            match finished {
+                Action::ToolFinished { name, success, .. } => {
+                    assert_eq!(name, "danger");
+                    assert!(success);
+                }
+                other => panic!("expected ToolFinished success, got {other:?}"),
+            }
+        });
+
+        let outcome = execute_single_tool_call(
+            &registry,
+            &call,
+            &CancellationToken::new(),
+            &action_tx,
+            "draft-router",
+            Some(&approval_router),
+            Some(&approval_manager),
+            &mut history,
+        )
+        .await;
+
+        assert!(matches!(outcome, ToolExecOutcome::Done));
+        assert!(executed.load(AtomicOrdering::SeqCst));
+        resolver.await.expect("resolver task should complete");
+        let tool_message = history.last().expect("tool result history expected");
+        assert_eq!(tool_message.role, "tool");
+        let payload: serde_json::Value = serde_json::from_str(&tool_message.content).expect("tool payload JSON");
+        assert_eq!(
+            payload.get("tool_call_id").and_then(serde_json::Value::as_str),
+            Some("call-danger")
+        );
+        assert_eq!(payload.get("success").and_then(serde_json::Value::as_bool), Some(true));
     }
 
     /// **S3 T3-1 Step 5**: stream_error_is_network_timeout 正确识别 reqwest 错误.
