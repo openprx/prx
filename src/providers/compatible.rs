@@ -827,7 +827,7 @@ fn flush_tool_call_buffer(buf: &[ToolCallBuffer]) -> Vec<ToolCallChunk> {
 /// `Streaming` [`ToolCallChunk`]. When `finish_reason == "tool_calls"` is
 /// observed, the buffer is flushed into a single terminal `tool_call_chunk`
 /// carrying one `Completed` entry per accumulated index.
-fn sse_bytes_to_chunks(
+pub(crate) fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {

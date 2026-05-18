@@ -1,6 +1,10 @@
 use crate::multimodal;
-use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ProviderCapabilities, ToolCall};
+use crate::providers::traits::{
+    ChatMessage, ChatResponse, Provider, ProviderCapabilities, StreamChunk, StreamError, StreamOptions, StreamResult,
+    ToolCall, ToolCallChunk,
+};
 use async_trait::async_trait;
+use futures_util::{StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,6 +65,14 @@ struct Options {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     message: ResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChatResponse {
+    #[serde(default)]
+    message: Option<ResponseMessage>,
+    #[serde(default)]
+    done: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,16 +170,39 @@ impl OllamaProvider {
         messages: Vec<Message>,
         model: &str,
         temperature: f64,
+        stream: bool,
         tools: Option<&[serde_json::Value]>,
     ) -> ChatRequest {
         ChatRequest {
             model: model.to_string(),
             messages,
-            stream: false,
+            stream,
             options: Options { temperature },
             think: self.reasoning_enabled,
             tools: tools.map(|t| t.to_vec()),
         }
+    }
+
+    fn convert_stream_tools(tools: Option<&[crate::tools::ToolSpec]>) -> Option<Vec<serde_json::Value>> {
+        let tools = tools?;
+        if tools.is_empty() {
+            return None;
+        }
+        Some(
+            tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
+                    })
+                })
+                .collect(),
+        )
     }
 
     fn convert_user_message_content(&self, content: &str) -> (Option<String>, Option<Vec<String>>) {
@@ -301,7 +336,7 @@ impl OllamaProvider {
         should_auth: bool,
         tools: Option<&[serde_json::Value]>,
     ) -> anyhow::Result<ApiChatResponse> {
-        let request = self.build_chat_request(messages, model, temperature, tools);
+        let request = self.build_chat_request(messages, model, temperature, false, tools);
 
         let url = format!("{}/api/chat", self.base_url);
 
@@ -422,6 +457,23 @@ impl OllamaProvider {
 
         // Pattern 3: Normal tool call
         (name.clone(), args.clone())
+    }
+
+    fn tool_call_chunks_from_ollama(tool_calls: Vec<OllamaToolCall>) -> Vec<ToolCallChunk> {
+        let helper = Self::new(None, None);
+        tool_calls
+            .iter()
+            .enumerate()
+            .map(|(index, tc)| {
+                let (name, args) = helper.extract_tool_name_and_args(tc);
+                ToolCallChunk::new(
+                    tc.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    name,
+                    serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
+                    index,
+                )
+            })
+            .collect()
     }
 }
 
@@ -654,6 +706,162 @@ impl Provider for OllamaProvider {
         // definitions in the request and returns structured ToolCall objects.
         true
     }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let (normalized_model, should_auth) = match self.resolve_request_details(model) {
+            Ok(details) => details,
+            Err(err) => {
+                return stream::once(async move { Err(StreamError::Provider(err.to_string())) }).boxed();
+            }
+        };
+        let request = self.build_chat_request(
+            self.convert_messages(messages),
+            &normalized_model,
+            temperature,
+            true,
+            Self::convert_stream_tools(options.tools.as_deref()).as_deref(),
+        );
+        let url = format!("{}/api/chat", self.base_url);
+        let client = self.http_client();
+        let api_key = self.api_key.clone();
+        let count_tokens = options.count_tokens;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+        tokio::spawn(async move {
+            let mut req_builder = client.post(&url).json(&request);
+            if should_auth {
+                if let Some(key) = api_key.as_ref() {
+                    req_builder = req_builder.bearer_auth(key);
+                }
+            }
+
+            let response = match req_builder.send().await {
+                Ok(response) => response,
+                Err(err) => {
+                    let _ = tx.send(Err(StreamError::Http(err))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let sanitized = super::sanitize_api_error(&body);
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{status}: {sanitized}"))))
+                    .await;
+                return;
+            }
+
+            let mut buffer = String::new();
+            let mut bytes_stream = response.bytes_stream();
+            while let Some(item) = bytes_stream.next().await {
+                let bytes = match item {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        let _ = tx.send(Err(StreamError::Http(err))).await;
+                        return;
+                    }
+                };
+                let text = match String::from_utf8(bytes.to_vec()) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        let _ = tx
+                            .send(Err(StreamError::InvalidSse(format!("Invalid UTF-8: {err}"))))
+                            .await;
+                        return;
+                    }
+                };
+                buffer.push_str(&text);
+
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer.drain(..=pos).collect::<String>();
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let parsed: StreamChatResponse = match serde_json::from_str(line) {
+                        Ok(parsed) => parsed,
+                        Err(err) => {
+                            let _ = tx
+                                .send(Err(StreamError::InvalidSse(format!(
+                                    "Invalid Ollama stream JSON: {err}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    };
+
+                    if let Some(message) = parsed.message {
+                        if !message.content.is_empty() {
+                            let mut chunk = StreamChunk::delta(message.content);
+                            if count_tokens {
+                                chunk = chunk.with_token_estimate();
+                            }
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                return;
+                            }
+                        }
+                        if let Some(thinking) = message.thinking.filter(|value| !value.is_empty()) {
+                            let mut chunk = StreamChunk::reasoning_delta(thinking);
+                            if count_tokens {
+                                chunk = chunk.with_token_estimate();
+                            }
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                return;
+                            }
+                        }
+                        if !message.tool_calls.is_empty() {
+                            let chunk =
+                                StreamChunk::tool_call_chunk(Self::tool_call_chunks_from_ollama(message.tool_calls));
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+
+                    if parsed.done {
+                        let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+                        return;
+                    }
+                }
+            }
+
+            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+        });
+
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let mut messages = Vec::new();
+        if let Some(system) = system_prompt {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(ChatMessage::user(message));
+        self.stream_chat_with_history(&messages, model, temperature, options)
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -748,6 +956,7 @@ mod tests {
             }],
             "llama3",
             0.7,
+            false,
             None,
         );
 
@@ -768,11 +977,39 @@ mod tests {
             }],
             "llama3",
             0.7,
+            false,
             None,
         );
 
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json.get("think"), Some(&serde_json::json!(false)));
+    }
+
+    #[test]
+    fn request_includes_stream_when_enabled() {
+        let provider = OllamaProvider::new(None, None);
+        let request = provider.build_chat_request(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }],
+            "llama3",
+            0.7,
+            true,
+            None,
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json.get("stream"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn supports_streaming_returns_true() {
+        let provider = OllamaProvider::new(None, None);
+        assert!(provider.supports_streaming());
     }
 
     #[test]
