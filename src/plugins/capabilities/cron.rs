@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use wasmtime::AsContextMut;
 
 use crate::plugins::error::{PluginError, PluginResult};
-use crate::plugins::host::{HostState, apply_store_resource_limits};
+use crate::plugins::host::{HostState, apply_store_epoch_deadline, apply_store_resource_limits};
 use crate::plugins::manifest::PluginManifest;
 
 /// A loaded cron plugin instance.
@@ -97,6 +97,7 @@ impl WasmCronJob {
         let params = [];
         let mut results = [wasmtime::component::Val::Bool(false)];
 
+        apply_store_epoch_deadline(store, self.timeout_ms);
         let call_result = tokio::time::timeout(
             std::time::Duration::from_millis(self.timeout_ms),
             func.call_async(&mut *store, &params, &mut results),

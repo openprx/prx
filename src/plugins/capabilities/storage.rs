@@ -12,7 +12,7 @@ use wasmtime::AsContextMut;
 
 use crate::memory::traits::{MemoryCategory, MemoryEntry, validate_memory_write_target};
 use crate::plugins::error::{PluginError, PluginResult};
-use crate::plugins::host::{HostState, apply_store_resource_limits};
+use crate::plugins::host::{HostState, apply_store_epoch_deadline, apply_store_resource_limits};
 use crate::plugins::manifest::PluginManifest;
 
 /// A loaded WASM storage plugin instance.
@@ -82,6 +82,7 @@ impl WasmStorage {
             .map_err(|e| PluginError::Instantiation(format!("failed to instantiate storage plugin: {e}")))?;
 
         // Cache the storage backend name at load time.
+        apply_store_epoch_deadline(&mut store, timeout_ms);
         let storage_name = Self::call_name(&instance, &mut store).await?;
 
         tracing::info!(
@@ -187,6 +188,7 @@ impl WasmStorage {
         ];
         let mut results = vec![wasmtime::component::Val::Bool(false)];
 
+        apply_store_epoch_deadline(store, self.timeout_ms);
         store_fn
             .call_async(store.as_context_mut(), &params, &mut results)
             .await
@@ -255,6 +257,7 @@ impl WasmStorage {
         ];
         let mut results = vec![wasmtime::component::Val::Bool(false)];
 
+        apply_store_epoch_deadline(store, self.timeout_ms);
         recall_fn
             .call_async(store.as_context_mut(), &params, &mut results)
             .await
@@ -311,6 +314,7 @@ impl WasmStorage {
         let params = [wasmtime::component::Val::String(key.into())];
         let mut results = vec![wasmtime::component::Val::Bool(false)];
 
+        apply_store_epoch_deadline(store, self.timeout_ms);
         forget_fn
             .call_async(store.as_context_mut(), &params, &mut results)
             .await
@@ -369,6 +373,7 @@ impl WasmStorage {
 
         let mut results = vec![wasmtime::component::Val::Bool(false)];
 
+        apply_store_epoch_deadline(store, self.timeout_ms);
         count_fn
             .call_async(store.as_context_mut(), &[], &mut results)
             .await
@@ -427,6 +432,7 @@ impl WasmStorage {
 
         let mut results = vec![wasmtime::component::Val::Bool(false)];
 
+        apply_store_epoch_deadline(store, self.timeout_ms);
         health_fn
             .call_async(store.as_context_mut(), &[], &mut results)
             .await
