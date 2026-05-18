@@ -111,6 +111,8 @@ const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
+const CHANNEL_CIRCUIT_BREAKER_FAILURES: u32 = 5;
+const CHANNEL_CIRCUIT_BREAKER_BACKOFF_MULTIPLIER: u32 = 5;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
@@ -1893,6 +1895,7 @@ fn spawn_supervised_listener_with_health_interval(
         let component = format!("channel:{}", ch.name());
         let mut backoff = initial_backoff_secs.max(1);
         let max_backoff = max_backoff_secs.max(backoff);
+        let mut consecutive_failures = 0_u32;
 
         loop {
             crate::health::mark_component_ok(&component);
@@ -1922,19 +1925,45 @@ fn spawn_supervised_listener_with_health_interval(
                     crate::health::mark_component_error(&component, "listener exited unexpectedly");
                     // Clean exit — reset backoff since the listener ran successfully
                     backoff = initial_backoff_secs.max(1);
+                    consecutive_failures = 0;
                 }
                 Err(e) => {
                     tracing::error!("Channel {} error: {e}; restarting", ch.name());
                     crate::health::mark_component_error(&component, e.to_string());
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                 }
             }
 
             crate::health::bump_component_restart(&component);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            let sleep_duration = channel_supervisor_sleep_duration(consecutive_failures, backoff, max_backoff);
+            if consecutive_failures >= CHANNEL_CIRCUIT_BREAKER_FAILURES {
+                tracing::warn!(
+                    channel = %ch.name(),
+                    consecutive_failures,
+                    sleep_secs = sleep_duration.as_secs(),
+                    "Channel supervisor circuit open; diluting restart attempts"
+                );
+                crate::health::mark_component_error(
+                    &component,
+                    format!("listener circuit open after {consecutive_failures} consecutive failures"),
+                );
+            }
+            tokio::time::sleep(sleep_duration).await;
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
+}
+
+fn channel_supervisor_sleep_duration(consecutive_failures: u32, backoff: u64, max_backoff: u64) -> Duration {
+    if consecutive_failures >= CHANNEL_CIRCUIT_BREAKER_FAILURES {
+        return Duration::from_secs(
+            max_backoff
+                .max(1)
+                .saturating_mul(u64::from(CHANNEL_CIRCUIT_BREAKER_BACKOFF_MULTIPLIER)),
+        );
+    }
+    Duration::from_secs(backoff.max(1))
 }
 
 fn compute_max_in_flight_messages(channel_count: usize) -> usize {
@@ -7418,6 +7447,23 @@ After"#;
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
         assert!(component["last_error"].as_str().unwrap_or("").contains("listen boom"));
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn channel_supervisor_opens_circuit_after_consecutive_failures() {
+        assert_eq!(channel_supervisor_sleep_duration(0, 2, 60), Duration::from_secs(2));
+        assert_eq!(
+            channel_supervisor_sleep_duration(CHANNEL_CIRCUIT_BREAKER_FAILURES - 1, 16, 60),
+            Duration::from_secs(16)
+        );
+        assert_eq!(
+            channel_supervisor_sleep_duration(CHANNEL_CIRCUIT_BREAKER_FAILURES, 16, 60),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            channel_supervisor_sleep_duration(CHANNEL_CIRCUIT_BREAKER_FAILURES + 10, 60, 60),
+            Duration::from_secs(300)
+        );
     }
 
     #[tokio::test]
