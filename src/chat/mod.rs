@@ -951,17 +951,20 @@ pub async fn run(
     );
 
     // ── Conversation history ─────────────────────────────────────
+    let resumed_history = session_turns_to_history(&chat_session);
     let mut history = if config.skill_rag.enabled {
-        Vec::new()
+        resumed_history
     } else {
-        vec![ChatMessage::system(build_runtime_system_prompt(
+        let mut h = vec![ChatMessage::system(build_runtime_system_prompt(
             &config,
             model_name,
             &tool_descs,
             &skills,
             native_tools,
             &tools_registry,
-        ))]
+        ))];
+        h.extend(resumed_history);
+        h
     };
 
     // ── P3-3: shared TuiState mirror ─────────────────────────────
@@ -1004,8 +1007,11 @@ pub async fn run(
     // 工具事件 + 信号），同时在反压时通过 [`StreamChunkCoalescer`] 合并 delta，
     // 避免无界增长导致 OOM。
     let (chat_dispatcher, chat_action_rx) = dispatcher::ChatDispatcher::new();
-    let dispatcher_shadow_state =
+    let mut dispatcher_shadow_state =
         state::ChatState::new(Arc::from(provider_name), Arc::from(model_name), shutdown.clone());
+    if chat_session.turn_count() > 0 {
+        let _ = dispatcher_shadow_state.reduce(crate::chat::action::Action::SessionLoaded(chat_session.clone()));
+    }
 
     // 共享 dual-write guard（在 Both/Redux 模式下被 EffectExecutor 置位；旧路径
     // 检查 guard 决定是否跳过持久化。即使 Off 模式也构造，旧路径检查总是 false 零开销。
@@ -2892,6 +2898,18 @@ async fn load_latest_session(mem: &dyn Memory) -> Option<session::ChatSession> {
         .collect();
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     sessions.into_iter().next()
+}
+
+fn session_turns_to_history(session: &session::ChatSession) -> Vec<ChatMessage> {
+    session
+        .turns
+        .iter()
+        .filter(|turn| turn.role == "user" || turn.role == "assistant")
+        .map(|turn| ChatMessage {
+            role: turn.role.clone(),
+            content: turn.content.clone(),
+        })
+        .collect()
 }
 
 /// List all saved sessions.

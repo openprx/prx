@@ -51,6 +51,7 @@
 )]
 
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -73,6 +74,13 @@ const DSR_QUERY: &[u8] = b"\x1b[6n";
 /// when the test ends).
 struct HarnessGuard {
     _tempdir: TempDir,
+    config_dir: PathBuf,
+    workspace_dir: PathBuf,
+    home_dir: PathBuf,
+    xdg_data: PathBuf,
+    xdg_cache: PathBuf,
+    xdg_state: PathBuf,
+    xdg_config: PathBuf,
 }
 
 /// Locate the test-built `prx` binary. Cargo provides this via
@@ -86,7 +94,7 @@ fn prx_binary() -> &'static str {
 ///
 /// Caller is responsible for keeping the returned `HarnessGuard` alive for
 /// the duration of the session (the `TempDir` is dropped together with it).
-fn build_chat_command(extra_args: &[&str], extra_env: &[(&str, &str)]) -> std::io::Result<(Command, HarnessGuard)> {
+fn new_harness_guard() -> std::io::Result<HarnessGuard> {
     let tempdir = TempDir::new()?;
     let base = tempdir.path();
     let config_dir = base.join("config");
@@ -108,6 +116,19 @@ fn build_chat_command(extra_args: &[&str], extra_env: &[(&str, &str)]) -> std::i
         std::fs::create_dir_all(dir)?;
     }
 
+    Ok(HarnessGuard {
+        _tempdir: tempdir,
+        config_dir,
+        workspace_dir,
+        home_dir,
+        xdg_data,
+        xdg_cache,
+        xdg_state,
+        xdg_config,
+    })
+}
+
+fn build_chat_command_in(guard: &HarnessGuard, extra_args: &[&str], extra_env: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(prx_binary());
     cmd.arg("chat");
     cmd.arg("-p").arg("mock");
@@ -120,13 +141,13 @@ fn build_chat_command(extra_args: &[&str], extra_env: &[(&str, &str)]) -> std::i
     // env on top.
     cmd.env_clear();
     cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default());
-    cmd.env("OPENPRX_CONFIG_DIR", &config_dir);
-    cmd.env("OPENPRX_WORKSPACE", &workspace_dir);
-    cmd.env("HOME", &home_dir);
-    cmd.env("XDG_DATA_HOME", &xdg_data);
-    cmd.env("XDG_CACHE_HOME", &xdg_cache);
-    cmd.env("XDG_STATE_HOME", &xdg_state);
-    cmd.env("XDG_CONFIG_HOME", &xdg_config);
+    cmd.env("OPENPRX_CONFIG_DIR", &guard.config_dir);
+    cmd.env("OPENPRX_WORKSPACE", &guard.workspace_dir);
+    cmd.env("HOME", &guard.home_dir);
+    cmd.env("XDG_DATA_HOME", &guard.xdg_data);
+    cmd.env("XDG_CACHE_HOME", &guard.xdg_cache);
+    cmd.env("XDG_STATE_HOME", &guard.xdg_state);
+    cmd.env("XDG_CONFIG_HOME", &guard.xdg_config);
     // Force reedline + BufRead fallback so banner lands on stdout.
     cmd.env("PRX_TUI", "0");
     cmd.env("NO_COLOR", "1");
@@ -139,7 +160,13 @@ fn build_chat_command(extra_args: &[&str], extra_env: &[(&str, &str)]) -> std::i
         cmd.env(k, v);
     }
 
-    Ok((cmd, HarnessGuard { _tempdir: tempdir }))
+    cmd
+}
+
+fn build_chat_command(extra_args: &[&str], extra_env: &[(&str, &str)]) -> std::io::Result<(Command, HarnessGuard)> {
+    let guard = new_harness_guard()?;
+    let cmd = build_chat_command_in(&guard, extra_args, extra_env);
+    Ok((cmd, guard))
 }
 
 /// Spawn a `prx chat` PTY session, set a fixed 120x40 window, and configure
@@ -148,6 +175,16 @@ fn build_chat_command(extra_args: &[&str], extra_env: &[(&str, &str)]) -> std::i
 /// actually exercised the binary".
 fn spawn_chat(extra_args: &[&str], extra_env: &[(&str, &str)]) -> (SessionGuard, HarnessGuard) {
     let (cmd, guard) = build_chat_command(extra_args, extra_env).expect("build chat command");
+    let session = spawn_chat_command(cmd);
+    (SessionGuard::new(session), guard)
+}
+
+fn spawn_chat_in(guard: &HarnessGuard, extra_args: &[&str], extra_env: &[(&str, &str)]) -> SessionGuard {
+    let cmd = build_chat_command_in(guard, extra_args, extra_env);
+    SessionGuard::new(spawn_chat_command(cmd))
+}
+
+fn spawn_chat_command(cmd: Command) -> Session {
     let mut session = match Session::spawn(cmd) {
         Ok(s) => s,
         Err(e) => {
@@ -176,7 +213,7 @@ fn spawn_chat(extra_args: &[&str], extra_env: &[(&str, &str)]) -> (SessionGuard,
         eprintln!("warning: set_window_size failed: {e}; continuing with default size");
     }
     session.set_expect_timeout(Some(TURN_TIMEOUT));
-    (SessionGuard::new(session), guard)
+    session
 }
 
 /// RAII wrapper: guarantees `cleanup` runs even if the test panics during
@@ -887,6 +924,81 @@ fn s4_a_p1_pure_exit_after_turn_chat_run_level() {
     assert!(
         wait_for_exit(session, EXIT_TIMEOUT),
         "Pure chat::run 完整 turn 后 /exit 应在 {EXIT_TIMEOUT:?} 内干净退出（reducer-only save 路径）"
+    );
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_session_resume_last_restores_saved_turns() {
+    let first_response = "[MOCK-RESUME-FIRST]";
+    let second_response = "[MOCK-RESUME-SECOND]";
+    let first_message = format!("resume-check-{}", std::process::id());
+
+    let (mut sg, guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", first_response)]);
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+    session
+        .send(format!("{first_message}\r").as_str())
+        .expect("send first message");
+    let captured = read_until_with_dsr(session, first_response, TURN_TIMEOUT);
+    assert!(
+        captured.contains(first_response),
+        "first chat process should complete turn before resume test. captured:\n{captured}"
+    );
+    session.send("/exit\r").expect("send /exit");
+    assert!(wait_for_exit(session, EXIT_TIMEOUT), "first chat process should exit");
+    drop(sg);
+
+    let before_resume = build_chat_command_in(&guard, &["--list-sessions"], &[])
+        .output()
+        .expect("list sessions before resume");
+    assert!(
+        before_resume.status.success(),
+        "list sessions before resume failed: status={:?}, stderr={}",
+        before_resume.status,
+        String::from_utf8_lossy(&before_resume.stderr)
+    );
+    let before_stdout = String::from_utf8_lossy(&before_resume.stdout);
+    assert!(
+        before_stdout.contains(&first_message) && before_stdout.contains("2 turns"),
+        "first session should be saved with one user/assistant pair. stdout:\n{before_stdout}"
+    );
+
+    let mut sg2 = spawn_chat_in(
+        &guard,
+        &["--session", "last"],
+        &[("OPENPRX_MOCK_RESPONSE", second_response)],
+    );
+    let session2 = sg2.session();
+    read_until_with_dsr(session2, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session2, Duration::from_millis(200));
+    session2.send("resume followup\r").expect("send second message");
+    let captured2 = read_until_with_dsr(session2, second_response, TURN_TIMEOUT);
+    assert!(
+        captured2.contains(second_response),
+        "resumed chat process should complete follow-up turn. captured:\n{captured2}"
+    );
+    session2.send("/exit\r").expect("send /exit resumed");
+    assert!(
+        wait_for_exit(session2, EXIT_TIMEOUT),
+        "resumed chat process should exit"
+    );
+    drop(sg2);
+
+    let after_resume = build_chat_command_in(&guard, &["--list-sessions"], &[])
+        .output()
+        .expect("list sessions after resume");
+    assert!(
+        after_resume.status.success(),
+        "list sessions after resume failed: status={:?}, stderr={}",
+        after_resume.status,
+        String::from_utf8_lossy(&after_resume.stderr)
+    );
+    let after_stdout = String::from_utf8_lossy(&after_resume.stdout);
+    assert!(
+        after_stdout.contains(&first_message) && after_stdout.contains("4 turns"),
+        "`--session last` should append the follow-up to the original saved session. stdout:\n{after_stdout}"
     );
 }
 

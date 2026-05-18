@@ -1465,11 +1465,19 @@ impl ChatState {
     /// 行为:
     /// - history 为空 → push 一条 system
     /// - history 非空且首位为 system → 替换 `history[0]` 内容（与 legacy `*first = ...` 一致）
-    /// - history 非空但首位**不**是 system → 仍然替换 `history[0]`（与 legacy `first_mut`
-    ///   一致；理论上首位应为 system，若不是已是 invariant 违反但 reducer 保持兼容）
+    /// - history 非空但首位**不**是 system → insert system at the front. This keeps
+    ///   resumed user/assistant turns intact when a loaded session rebuilds history
+    ///   without a runtime system prompt.
     fn reduce_set_leading_system_prompt(&mut self, content: String) -> Vec<Effect> {
         if self.session.history.is_empty() {
             self.session.history.push(ChatMessage::system(content));
+        } else if self
+            .session
+            .history
+            .first()
+            .is_some_and(|message| message.role != "system")
+        {
+            self.session.history.insert(0, ChatMessage::system(content));
         } else if let Some(first) = self.session.history.first_mut() {
             *first = ChatMessage::system(content);
         }
@@ -4678,6 +4686,28 @@ mod tests {
             assert_eq!(h1.content, "user1");
             let h2 = state.session.history.get(2).expect("test: history[2] = assistant1");
             assert_eq!(h2.role, "assistant");
+        }
+
+        #[test]
+        fn set_leading_system_prompt_preserves_resumed_history_without_system() {
+            let mut state = s();
+            state.session.history.push(ChatMessage::user("resumed-user"));
+            state.session.history.push(ChatMessage::assistant("resumed-assistant"));
+
+            let _ = state.reduce(Action::SetLeadingSystemPrompt {
+                content: "system-new".to_string(),
+            });
+
+            assert_eq!(state.session.history.len(), 3);
+            let h0 = state.session.history.first().expect("test: inserted system prompt");
+            assert_eq!(h0.role, "system");
+            assert_eq!(h0.content, "system-new");
+            let h1 = state.session.history.get(1).expect("test: resumed user preserved");
+            assert_eq!(h1.role, "user");
+            assert_eq!(h1.content, "resumed-user");
+            let h2 = state.session.history.get(2).expect("test: resumed assistant preserved");
+            assert_eq!(h2.role, "assistant");
+            assert_eq!(h2.content, "resumed-assistant");
         }
     }
 
