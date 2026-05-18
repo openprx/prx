@@ -31,7 +31,12 @@ pub type ConversationLine = String;
 
 /// 占位：StreamingDraft（非 terminal-tui feature）
 #[cfg(not(feature = "terminal-tui"))]
-pub type StreamingDraft = (String, String, u64);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamingDraft {
+    pub draft_id: String,
+    pub accumulated: String,
+    pub version: u64,
+}
 
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -753,8 +758,11 @@ impl ChatState {
 
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
-        // 占位 feature 下 StreamingDraft = (String, String, u64)
-        self.stream.draft = Some((draft_id.clone(), String::new(), 0));
+        self.stream.draft = Some(StreamingDraft {
+            draft_id: draft_id.clone(),
+            accumulated: String::new(),
+            version: 0,
+        });
         self.control.active_cancel = Some(cancel);
         self.control.generating = true;
         vec![
@@ -811,7 +819,11 @@ impl ChatState {
         history: Vec<crate::providers::ChatMessage>,
         cancel: CancellationToken,
     ) -> Vec<Effect> {
-        self.stream.draft = Some((draft_id.clone(), String::new(), 0));
+        self.stream.draft = Some(StreamingDraft {
+            draft_id: draft_id.clone(),
+            accumulated: String::new(),
+            version: 0,
+        });
         self.control.active_cancel = Some(cancel.clone());
         self.control.generating = true;
         vec![
@@ -857,14 +869,14 @@ impl ChatState {
         let Some(draft) = self.stream.draft.as_mut() else {
             return vec![];
         };
-        if draft.0 != draft_id {
+        if draft.draft_id != draft_id {
             return vec![];
         }
-        if version <= draft.2 {
+        if version <= draft.version {
             return vec![];
         }
-        draft.1.push_str(delta);
-        draft.2 = version;
+        draft.accumulated.push_str(delta);
+        draft.version = version;
         vec![Effect::RequestRedraw]
     }
 
@@ -928,7 +940,7 @@ impl ChatState {
 
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_stream_completed(&mut self, draft_id: &str, final_text: String, reasoning: String) -> Vec<Effect> {
-        let matches = self.stream.draft.as_ref().is_some_and(|d| d.0 == draft_id);
+        let matches = self.stream.draft.as_ref().is_some_and(|d| d.draft_id == draft_id);
         if !matches {
             return vec![];
         }
@@ -1210,7 +1222,7 @@ impl ChatState {
 
     #[cfg(not(feature = "terminal-tui"))]
     fn stream_draft_id_matches(draft: Option<&StreamingDraft>, draft_id: &str) -> bool {
-        draft.is_some_and(|d| d.0 == draft_id)
+        draft.is_some_and(|d| d.draft_id == draft_id)
     }
 
     // ── Step 4 子函数（退出 + 会话） ─────────────────────────────────────────────
@@ -1562,7 +1574,7 @@ impl ChatState {
 
     #[cfg(not(feature = "terminal-tui"))]
     fn take_draft_id(stream: &StreamState) -> Option<String> {
-        stream.draft.as_ref().map(|d| d.0.clone())
+        stream.draft.as_ref().map(|d| d.draft_id.clone())
     }
 }
 
