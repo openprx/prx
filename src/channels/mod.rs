@@ -3682,11 +3682,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref sl) = config.channels_config.slack {
-        channels.push(Arc::new(SlackChannel::new(
-            sl.bot_token.clone(),
-            sl.channel_id.clone(),
-            sl.allowed_users.clone(),
-        )));
+        channels.push(Arc::new(
+            SlackChannel::new(sl.bot_token.clone(), sl.channel_id.clone(), sl.allowed_users.clone())
+                .with_workspace_dir(config.workspace_dir.clone()),
+        ));
     }
 
     if let Some(ref mm) = config.channels_config.mattermost {
