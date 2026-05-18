@@ -944,14 +944,20 @@ impl ToolCallAggregator {
                     args_buffer: String::new(),
                     final_args: None,
                 });
-                // ID / name 不变性校验：provider 协议禁止改名换 ID
-                if !chunk.id.is_empty() && slot.id != chunk.id {
-                    tracing::warn!(
-                        index = chunk.index,
-                        prev_id = %slot.id,
-                        new_id = %chunk.id,
-                        "ToolCallAggregator: streaming chunk changed id; keeping first id"
-                    );
+                // ID / name 不变性校验：provider 协议禁止改名换 ID.
+                // Some compatible providers may emit an opening chunk before the
+                // id is known, then fill it in later; preserve that first real id.
+                if !chunk.id.is_empty() {
+                    if slot.id.is_empty() {
+                        slot.id = chunk.id.clone();
+                    } else if slot.id != chunk.id {
+                        tracing::warn!(
+                            index = chunk.index,
+                            prev_id = %slot.id,
+                            new_id = %chunk.id,
+                            "ToolCallAggregator: streaming chunk changed id; keeping first id"
+                        );
+                    }
                 }
                 if !chunk.name.is_empty() && slot.name != chunk.name {
                     tracing::warn!(
@@ -1018,6 +1024,7 @@ enum StreamPassOutcome {
     ToolCallRequested {
         calls: Vec<ResolvedToolCall>,
         iter_text: String,
+        reasoning_content: String,
     },
     /// 网络瞬时错误（可走 backoff retry，不消耗 iteration 配额）.
     TransientNetworkError { err: String },
@@ -1176,7 +1183,11 @@ async fn drive_start_turn_stream(
                 return;
             }
             StreamPassOutcome::Cancelled | StreamPassOutcome::SenderClosed => return,
-            StreamPassOutcome::ToolCallRequested { calls, iter_text } => {
+            StreamPassOutcome::ToolCallRequested {
+                calls,
+                iter_text,
+                reasoning_content,
+            } => {
                 // 进入 tool 回合：需要 registry.
                 let registry = match tools_registry.as_ref() {
                     Some(r) => r,
@@ -1206,6 +1217,7 @@ async fn drive_start_turn_stream(
                         "function": { "name": c.name, "arguments": c.args },
                     })).collect::<Vec<_>>(),
                     "content": iter_text,
+                    "reasoning_content": reasoning_content,
                 });
                 history.push(crate::providers::traits::ChatMessage {
                     role: "assistant".to_string(),
@@ -1591,6 +1603,7 @@ async fn run_one_stream_pass(
     let mut aggregator = ToolCallAggregator::new();
     let mut completed_calls: Vec<ResolvedToolCall> = Vec::new();
     let mut iter_text = String::new();
+    let mut iter_reasoning = String::new();
 
     loop {
         tokio::select! {
@@ -1614,6 +1627,7 @@ async fn run_one_stream_pass(
                         }
                         if let Some(reason_text) = reasoning {
                             if !reason_text.is_empty() {
+                                iter_reasoning.push_str(&reason_text);
                                 reasoning_buf.push_str(&reason_text);
                             }
                         }
@@ -1660,6 +1674,7 @@ async fn run_one_stream_pass(
         StreamPassOutcome::ToolCallRequested {
             calls: completed_calls,
             iter_text,
+            reasoning_content: iter_reasoning,
         }
     }
 }
@@ -5119,6 +5134,49 @@ mod real_mode_tests {
         assert!(r4.is_none(), "duplicate Completed should be idempotent no-op");
     }
 
+    #[test]
+    fn aggregator_backfills_slot_id_when_empty() {
+        use crate::providers::traits::{ToolCallChunk, ToolCallChunkStatus};
+        let mut agg = ToolCallAggregator::new();
+
+        assert!(
+            agg.ingest(ToolCallChunk {
+                id: String::new(),
+                name: "shell".into(),
+                args: String::new(),
+                index: 0,
+                arguments_delta: Some("{".into()),
+                status: ToolCallChunkStatus::Streaming,
+            })
+            .is_none()
+        );
+        assert!(
+            agg.ingest(ToolCallChunk {
+                id: "call_abc".into(),
+                name: "shell".into(),
+                args: String::new(),
+                index: 0,
+                arguments_delta: Some("}".into()),
+                status: ToolCallChunkStatus::Streaming,
+            })
+            .is_none()
+        );
+
+        let (id, name, args) = agg
+            .ingest(ToolCallChunk {
+                id: String::new(),
+                name: "shell".into(),
+                args: "{}".into(),
+                index: 0,
+                arguments_delta: None,
+                status: ToolCallChunkStatus::Completed,
+            })
+            .expect("completed chunk should resolve");
+        assert_eq!(id, "call_abc");
+        assert_eq!(name, "shell");
+        assert_eq!(args, "{}");
+    }
+
     /// **S3 T3-1 Step 2**: ToolCallAggregator 并发 index — 多 tool call 同时进行.
     #[test]
     fn t31_aggregator_concurrent_indices_yield_each_separately() {
@@ -5321,6 +5379,144 @@ mod real_mode_tests {
         assert!(saw_tool_started, "must see ToolStarted");
         assert!(saw_tool_finished, "must see ToolFinished");
         assert!(saw_completion, "must see StreamCompleted");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_tool_call_request_includes_reasoning_in_history() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult, ToolCallChunk,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use parking_lot::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct PingTool;
+        #[async_trait]
+        impl crate::tools::Tool for PingTool {
+            fn name(&self) -> &str {
+                "ping"
+            }
+            fn description(&self) -> &str {
+                "ping"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "pong".into(),
+                    error: None,
+                })
+            }
+        }
+
+        struct ReasoningToolProvider {
+            counter: Arc<AtomicUsize>,
+            second_history: Arc<Mutex<Option<Vec<PMsg>>>>,
+        }
+        #[async_trait]
+        impl Provider for ReasoningToolProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                messages: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+                if n == 0 {
+                    stream::iter(vec![
+                        Ok(StreamChunk::reasoning_delta("Need to call ping.")),
+                        Ok(StreamChunk::tool_call_chunk(vec![ToolCallChunk::new(
+                            "call-ping",
+                            "ping",
+                            "{}",
+                            0,
+                        )])),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                } else {
+                    *self.second_history.lock() = Some(messages.to_vec());
+                    stream::iter(vec![Ok(StreamChunk::delta("done")), Ok(StreamChunk::final_chunk())]).boxed()
+                }
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let second_history = Arc::new(Mutex::new(None));
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(ReasoningToolProvider {
+            counter: Arc::new(AtomicUsize::new(0)),
+            second_history: Arc::clone(&second_history),
+        });
+        deps.tools_registry = Some(Arc::new(vec![Box::new(PingTool) as Box<dyn crate::tools::Tool>]));
+        deps.max_tool_iterations = 4;
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-reasoning-tool-history".into(),
+                history: Vec::new(),
+                cancel: CancellationToken::new(),
+            })
+            .await;
+
+        for _ in 0..32 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver action within 2s")
+                .expect("must arrive");
+            match action {
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("done"));
+                    break;
+                }
+                Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+                _ => {}
+            }
+        }
+
+        let history = second_history.lock().clone().expect("second request history captured");
+        let assistant = history
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("assistant tool-call history expected");
+        let value: serde_json::Value = serde_json::from_str(&assistant.content).expect("assistant payload JSON");
+        assert_eq!(
+            value.get("reasoning_content").and_then(serde_json::Value::as_str),
+            Some("Need to call ping.")
+        );
+        let call_id = value
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|calls| calls.first())
+            .and_then(|call| call.get("id"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(call_id, Some("call-ping"));
     }
 
     /// **S3 T3-1 Step 3**: context overflow → 自动 compact + 单次重试 → success.

@@ -1119,50 +1119,78 @@ impl OpenAiCompatibleProvider {
         })
     }
 
+    fn parse_assistant_tool_calls(value: &serde_json::Value) -> Option<Vec<ToolCall>> {
+        let tool_calls_value = value.get("tool_calls")?;
+
+        if let Ok(parsed_calls) = serde_json::from_value::<Vec<ToolCall>>(tool_calls_value.clone()) {
+            let tool_calls = parsed_calls
+                .into_iter()
+                .filter_map(|tc| {
+                    let function = tc.function?;
+                    let name = function.name?;
+                    let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
+                    Some(ToolCall {
+                        id: tc.id,
+                        kind: tc.kind.or_else(|| Some("function".to_string())),
+                        function: Some(Function {
+                            name: Some(name),
+                            arguments: Some(arguments),
+                        }),
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            if !tool_calls.is_empty() {
+                return Some(tool_calls);
+            }
+        }
+
+        serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
+            .ok()
+            .map(|parsed_calls| {
+                parsed_calls
+                    .into_iter()
+                    .map(|tc| ToolCall {
+                        id: Some(tc.id),
+                        kind: Some("function".to_string()),
+                        function: Some(Function {
+                            name: Some(tc.name),
+                            arguments: Some(tc.arguments),
+                        }),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|tool_calls| !tool_calls.is_empty())
+    }
+
     fn convert_messages_for_native(messages: &[ChatMessage]) -> Vec<NativeMessage> {
         messages
             .iter()
             .map(|message| {
                 if message.role == "assistant" {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) {
-                        if let Some(tool_calls_value) = value.get("tool_calls") {
-                            if let Ok(parsed_calls) =
-                                serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
-                            {
-                                let tool_calls = parsed_calls
-                                    .into_iter()
-                                    .map(|tc| ToolCall {
-                                        id: Some(tc.id),
-                                        kind: Some("function".to_string()),
-                                        function: Some(Function {
-                                            name: Some(tc.name),
-                                            arguments: Some(tc.arguments),
-                                        }),
-                                    })
-                                    .collect::<Vec<_>>();
+                        if let Some(tool_calls) = Self::parse_assistant_tool_calls(&value) {
+                            let content = value
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|content| NativeMessageContent::Text(content.to_string()));
 
-                                let content = value
-                                    .get("content")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(|content| NativeMessageContent::Text(content.to_string()));
+                            // Thinking-mode providers (e.g. Kimi Code) require
+                            // `reasoning_content` on every assistant message that
+                            // carries tool_calls. Preserve the actual value from
+                            // history so it can be re-sent to the provider.
+                            let reasoning_content = value
+                                .get("reasoning_content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|s| s.to_string());
 
-                                // Thinking-mode providers (e.g. Kimi Code) require
-                                // `reasoning_content` on every assistant message that
-                                // carries tool_calls. Preserve the actual value from
-                                // history so it can be re-sent to the provider.
-                                let reasoning_content = value
-                                    .get("reasoning_content")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(|s| s.to_string());
-
-                                return NativeMessage {
-                                    role: "assistant".to_string(),
-                                    content,
-                                    reasoning_content,
-                                    tool_call_id: None,
-                                    tool_calls: Some(tool_calls),
-                                };
-                            }
+                            return NativeMessage {
+                                role: "assistant".to_string(),
+                                content,
+                                reasoning_content,
+                                tool_call_id: None,
+                                tool_calls: Some(tool_calls),
+                            };
                         }
                     }
                 }
@@ -2424,6 +2452,67 @@ mod tests {
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
         match converted[0].content.as_ref() {
             Some(NativeMessageContent::Text(text)) => assert_eq!(text, "done"),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compatible_parses_openai_nested_tool_calls_assistant_history() {
+        let input = vec![ChatMessage::assistant(
+            serde_json::json!({
+                "content": "",
+                "reasoning_content": "Need to inspect the system.",
+                "tool_calls": [{
+                    "id": "call_nested",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": "{\"command\":\"pwd\"}"
+                    }
+                }]
+            })
+            .to_string(),
+        )];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "assistant");
+        assert_eq!(
+            converted[0].reasoning_content.as_deref(),
+            Some("Need to inspect the system.")
+        );
+        let tool_calls = converted[0].tool_calls.as_ref().expect("tool_calls expected");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_nested"));
+        assert_eq!(tool_calls[0].kind.as_deref(), Some("function"));
+        let function = tool_calls[0].function.as_ref().expect("function expected");
+        assert_eq!(function.name.as_deref(), Some("shell"));
+        assert_eq!(function.arguments.as_deref(), Some(r#"{"command":"pwd"}"#));
+    }
+
+    #[test]
+    fn compatible_falls_back_to_provider_tool_call_schema() {
+        let input = vec![ChatMessage::assistant(
+            serde_json::json!({
+                "content": "checking",
+                "tool_calls": [{
+                    "id": "call_flat",
+                    "name": "file_read",
+                    "arguments": "{\"path\":\"README.md\"}"
+                }]
+            })
+            .to_string(),
+        )];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
+        let tool_calls = converted[0].tool_calls.as_ref().expect("tool_calls expected");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_flat"));
+        let function = tool_calls[0].function.as_ref().expect("function expected");
+        assert_eq!(function.name.as_deref(), Some("file_read"));
+        assert_eq!(function.arguments.as_deref(), Some(r#"{"path":"README.md"}"#));
+        match converted[0].content.as_ref() {
+            Some(NativeMessageContent::Text(text)) => assert_eq!(text, "checking"),
             other => panic!("expected text content, got {other:?}"),
         }
     }
