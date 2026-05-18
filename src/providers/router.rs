@@ -184,6 +184,31 @@ impl Provider for RouterProvider {
         provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
     }
 
+    /// Keep system-prompt streaming behavior symmetric with history streaming by
+    /// converting the system prompt and user message into chat history, then
+    /// routing through `stream_chat_with_history`.
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> futures::stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let mut messages = Vec::with_capacity(usize::from(system_prompt.is_some()) + 1);
+        if let Some(system) = system_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: system.to_string(),
+            });
+        }
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: message.to_string(),
+        });
+        self.stream_chat_with_history(&messages, model, temperature, options)
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up routed provider");
@@ -580,6 +605,41 @@ mod tests {
         }
     }
 
+    struct StreamingCaptureProvider {
+        seen_messages: Arc<parking_lot::Mutex<Vec<ChatMessage>>>,
+        seen_model: Arc<parking_lot::Mutex<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for StreamingCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> futures::stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            use futures::StreamExt as _;
+            *self.seen_messages.lock() = messages.to_vec();
+            *self.seen_model.lock() = model.to_string();
+            futures::stream::iter(vec![Ok(StreamChunk::delta("ok")), Ok(StreamChunk::final_chunk())]).boxed()
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+    }
+
     fn make_router(
         providers: Vec<(&'static str, &'static str)>,
         routes: Vec<(&str, &str, &str)>,
@@ -791,6 +851,49 @@ mod tests {
         assert_eq!(mocks[1].call_count(), 1);
         assert_eq!(mocks[1].last_model(), "claude-opus");
         assert_eq!(mocks[0].call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_system_routes_through_history() {
+        use futures::StreamExt as _;
+
+        let seen_messages = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_model = Arc::new(parking_lot::Mutex::new(String::new()));
+        let provider = StreamingCaptureProvider {
+            seen_messages: Arc::clone(&seen_messages),
+            seen_model: Arc::clone(&seen_model),
+        };
+        let router = RouterProvider::new(
+            vec![("default".into(), Box::new(provider) as Box<dyn Provider>)],
+            vec![(
+                "stream".into(),
+                Route {
+                    provider_name: "default".into(),
+                    model: "routed-model".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        let chunks: Vec<_> = router
+            .stream_chat_with_system(
+                Some("system prompt"),
+                "hello",
+                "hint:stream",
+                0.5,
+                StreamOptions::new(false),
+            )
+            .collect()
+            .await;
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(*seen_model.lock(), "routed-model");
+        let messages = seen_messages.lock();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content, "system prompt");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, "hello");
     }
 
     #[test]
