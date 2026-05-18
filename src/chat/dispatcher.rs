@@ -6320,6 +6320,41 @@ mod s4_a_3 {
     }
 
     #[tokio::test]
+    async fn s4_a_3_dispatched_keypress_updates_snapshot_input() {
+        let state = make_state();
+        let initial = Arc::new(UiSnapshot::initial(
+            Arc::clone(&state.session.provider),
+            Arc::clone(&state.session.model),
+        ));
+        let (snap_tx, mut snap_rx) = watch::channel(initial);
+        let (dispatcher, action_rx) = ChatDispatcher::new();
+        let shutdown = CancellationToken::new();
+        let _handle = spawn_dispatcher_task_full(
+            state,
+            action_rx,
+            shutdown.clone(),
+            EffectExecutor::new_shadow(),
+            None,
+            Some(snap_tx),
+        );
+
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = dispatcher.dispatch(Action::KeyPressed(key)).await;
+        tokio::time::timeout(Duration::from_millis(300), snap_rx.changed())
+            .await
+            .expect("snap_rx should receive input update within 300ms")
+            .expect("watch send_if_modified should have fired");
+
+        let snap = snap_rx.borrow();
+        assert_eq!(snap.input.text(), "x");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
     async fn s4_a_3_dispatcher_skips_unrelated_action() {
         // ToolProgress 静态判定 dirty=false 且不写 ui 字段 → 不应推 snapshot.
         let state = make_state();
