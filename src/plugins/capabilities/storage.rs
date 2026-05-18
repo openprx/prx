@@ -12,7 +12,7 @@ use wasmtime::AsContextMut;
 
 use crate::memory::traits::{MemoryCategory, MemoryEntry, validate_memory_write_target};
 use crate::plugins::error::{PluginError, PluginResult};
-use crate::plugins::host::HostState;
+use crate::plugins::host::{HostState, apply_store_resource_limits};
 use crate::plugins::manifest::PluginManifest;
 
 /// A loaded WASM storage plugin instance.
@@ -68,6 +68,7 @@ impl WasmStorage {
         }
 
         let mut store = wasmtime::Store::new(engine, host_state);
+        apply_store_resource_limits(&mut store, manifest.resources.max_memory_mb);
         store
             .set_fuel(manifest.resources.max_fuel)
             .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;
