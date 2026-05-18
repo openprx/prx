@@ -1301,13 +1301,15 @@ impl OpenAiCompatibleProvider {
         } else {
             messages.to_vec()
         };
+        let tools = Self::convert_tool_specs(options.tools.as_deref());
+        let tool_choice = tools.as_ref().map(|_| "auto".to_string());
         NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages_for_native(&effective_messages),
             temperature,
             stream: Some(options.enabled),
-            tools: None,
-            tool_choice: None,
+            tools,
+            tool_choice,
         }
     }
 
@@ -1957,6 +1959,7 @@ impl Provider for OpenAiCompatibleProvider {
             }
         };
 
+        let count_tokens = options.count_tokens;
         let request = self.build_streaming_history_request(messages, model, temperature, options);
         let url = self.chat_completions_url();
         let client = self.http_client();
@@ -1994,7 +1997,7 @@ impl Provider for OpenAiCompatibleProvider {
                 return;
             }
 
-            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break;
@@ -2509,6 +2512,50 @@ mod tests {
         assert_eq!(serialized_messages[2]["content"], "first answer");
         assert_eq!(serialized_messages[3]["role"], "user");
         assert_eq!(serialized_messages[3]["content"], "second user");
+    }
+
+    #[test]
+    fn streaming_history_request_includes_tools_when_provided() {
+        let provider = make_provider("kimi-code", "https://api.kimi.com/coding/v1", Some("test-key"));
+        let messages = vec![ChatMessage::user("inspect local system")];
+        let tools = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Execute terminal commands.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                },
+                "required": ["command"]
+            }),
+        }];
+
+        let request = provider.build_streaming_history_request(
+            &messages,
+            "kimi-k2",
+            0.3,
+            StreamOptions::new(true).with_tools(tools),
+        );
+        let value = serde_json::to_value(&request).unwrap();
+        let tools = value["tools"].as_array().unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(value["tool_choice"], "auto");
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "shell");
+        assert_eq!(tools[0]["function"]["parameters"]["required"][0], "command");
+    }
+
+    #[test]
+    fn streaming_history_request_omits_tools_when_none() {
+        let provider = make_provider("kimi-code", "https://api.kimi.com/coding/v1", Some("test-key"));
+        let messages = vec![ChatMessage::user("hello")];
+
+        let request = provider.build_streaming_history_request(&messages, "kimi-k2", 0.3, StreamOptions::new(true));
+        let value = serde_json::to_value(&request).unwrap();
+
+        assert!(value["tools"].is_null());
+        assert!(value["tool_choice"].is_null());
     }
 
     #[test]
