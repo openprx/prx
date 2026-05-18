@@ -400,6 +400,15 @@ impl AuthProfilesStore {
         fs::rename(&tmp_path, &self.path)
             .with_context(|| format!("Failed to replace auth profile store at {}", self.path.display()))?;
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let permissions = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&self.path, permissions)
+                .with_context(|| format!("Failed to chmod {} to 0o600", self.path.display()))?;
+        }
+
         Ok(())
     }
 
@@ -636,5 +645,20 @@ mod tests {
 
         let contents = tokio::fs::read_to_string(path).await.unwrap();
         assert!(contents.contains("\"schema_version\": 1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_profiles_sets_owner_only_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+
+        let profile = AuthProfile::new_token("anthropic", "default", "token-abc".into());
+        store.upsert_profile(profile, true).unwrap();
+
+        let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "auth-profiles.json must be 0o600, got {mode:o}");
     }
 }
