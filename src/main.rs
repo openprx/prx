@@ -524,6 +524,8 @@ the full JSON Schema for the config file, which documents every \
 available key, type, and default value.
 
 Examples:
+  prx config show                # print effective config as TOML
+  prx config show --format json  # print effective config as JSON
   prx config schema              # print JSON Schema to stdout
   prx config schema > schema.json")]
     Config {
@@ -569,6 +571,12 @@ Examples:
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
+    /// Print the effective merged configuration
+    Show {
+        /// Output format
+        #[arg(long, value_enum, default_value_t = ConfigShowFormat::Toml)]
+        format: ConfigShowFormat,
+    },
     /// Dump the full configuration JSON Schema to stdout
     Schema,
     /// Split config.toml into config.d/*.toml fragments
@@ -579,6 +587,12 @@ enum ConfigCommands {
     },
     /// Merge config.d/*.toml back into a single config.toml
     Merge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ConfigShowFormat {
+    Toml,
+    Json,
 }
 
 #[derive(Subcommand, Debug)]
@@ -951,7 +965,7 @@ async fn async_main() -> Result<()> {
     // chat handler can redirect tracing to ~/.openprx/chat.log once the TUI
     // takes over the terminal. Until then logs still go to stderr so startup
     // diagnostics (config errors, etc.) remain visible to the user.
-    let use_stderr = matches!(cli.command, Commands::Chat { .. });
+    let use_stderr = matches!(cli.command, Commands::Chat { .. } | Commands::Config { .. });
     if use_stderr {
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
@@ -1288,6 +1302,22 @@ async fn async_main() -> Result<()> {
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
 
         Commands::Config { config_command } => match config_command {
+            ConfigCommands::Show { format } => {
+                let value = config.to_stored_toml_value()?;
+                match format {
+                    ConfigShowFormat::Toml => {
+                        println!(
+                            "{}",
+                            toml::to_string_pretty(&value).context("Failed to serialize config as TOML")?
+                        );
+                    }
+                    ConfigShowFormat::Json => {
+                        let json = serde_json::to_value(&value).context("Failed to convert config to JSON")?;
+                        println!("{}", serde_json::to_string_pretty(&json)?);
+                    }
+                }
+                Ok(())
+            }
             ConfigCommands::Schema => {
                 let schema = schemars::schema_for!(config::Config);
                 println!("{}", serde_json::to_string_pretty(&schema)?);
@@ -1809,6 +1839,26 @@ mod tests {
                 Commands::Completions { .. } => {}
                 other => panic!("expected completions command, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn config_show_cli_parses_default_and_json_format() {
+        let cli = Cli::try_parse_from(["prx", "config", "show"]).expect("config show should parse");
+        match cli.command {
+            Commands::Config {
+                config_command: ConfigCommands::Show { format },
+            } => assert_eq!(format, ConfigShowFormat::Toml),
+            other => panic!("expected config show command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["prx", "config", "show", "--format", "json"])
+            .expect("config show --format json should parse");
+        match cli.command {
+            Commands::Config {
+                config_command: ConfigCommands::Show { format },
+            } => assert_eq!(format, ConfigShowFormat::Json),
+            other => panic!("expected config show json command, got {other:?}"),
         }
     }
 
