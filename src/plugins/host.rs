@@ -24,6 +24,9 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
 
 pub(crate) type WebSocketSessionMap = Arc<Mutex<HashMap<u64, Arc<Mutex<Box<dyn WebSocketConnection>>>>>>;
 
+#[cfg(feature = "wasm-plugins")]
+pub(crate) const WASM_EPOCH_TICK_MS: u64 = 10;
+
 #[async_trait]
 pub trait WebSocketConnection: Send + Sync {
     async fn send_text(&mut self, message: String) -> Result<(), String>;
@@ -255,6 +258,20 @@ pub(crate) fn apply_store_resource_limits(store: &mut wasmtime::Store<HostState>
         .build();
     store.limiter(|state| &mut state.store_limits);
 }
+
+#[cfg(all(feature = "wasm-plugins", target_has_atomic = "64"))]
+fn epoch_deadline_ticks(timeout_ms: u64) -> u64 {
+    timeout_ms.max(1).div_ceil(WASM_EPOCH_TICK_MS).max(1)
+}
+
+#[cfg(all(feature = "wasm-plugins", target_has_atomic = "64"))]
+pub(crate) fn apply_store_epoch_deadline(store: &mut wasmtime::Store<HostState>, timeout_ms: u64) {
+    store.set_epoch_deadline(epoch_deadline_ticks(timeout_ms));
+    store.epoch_deadline_trap();
+}
+
+#[cfg(all(feature = "wasm-plugins", not(target_has_atomic = "64")))]
+pub(crate) fn apply_store_epoch_deadline(_store: &mut wasmtime::Store<HostState>, _timeout_ms: u64) {}
 
 fn websocket_timeout(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms.max(1))
@@ -672,6 +689,16 @@ mod tests {
     fn max_memory_bytes_saturates_to_usize_max() {
         assert_eq!(max_memory_bytes(1), 1024 * 1024);
         assert_eq!(max_memory_bytes(u64::MAX), usize::MAX);
+    }
+
+    #[test]
+    #[cfg(target_has_atomic = "64")]
+    fn epoch_deadline_ticks_rounds_up_and_never_zero() {
+        assert_eq!(epoch_deadline_ticks(0), 1);
+        assert_eq!(epoch_deadline_ticks(1), 1);
+        assert_eq!(epoch_deadline_ticks(10), 1);
+        assert_eq!(epoch_deadline_ticks(11), 2);
+        assert_eq!(epoch_deadline_ticks(30_000), 3_000);
     }
 
     #[test]

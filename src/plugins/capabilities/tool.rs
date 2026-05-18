@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use wasmtime::AsContextMut;
 
 use crate::plugins::error::PluginError;
-use crate::plugins::host::{HostState, apply_store_resource_limits};
+use crate::plugins::host::{HostState, apply_store_epoch_deadline, apply_store_resource_limits};
 use crate::plugins::manifest::PluginManifest;
 use crate::tools::traits::{Tool, ToolResult, ToolSpec};
 
@@ -102,6 +102,7 @@ impl WasmToolAdapter {
             .map_err(|e| PluginError::Instantiation(format!("failed to instantiate component: {e}")))?;
 
         // Call get-spec to cache the tool specification
+        apply_store_epoch_deadline(&mut store, timeout_ms);
         let spec = Self::call_get_spec(&instance, &mut store).await?;
 
         let inner = WasmToolInner { store, instance };
@@ -505,6 +506,7 @@ impl WasmToolAdapter {
             .ok_or_else(|| PluginError::Runtime("execute is not a function".to_string()))?;
 
         // Call execute(args: string) -> plugin-result
+        apply_store_epoch_deadline(store, self.timeout_ms);
         let args_val = wasmtime::component::Val::String(args_str.into());
         let mut results = vec![wasmtime::component::Val::Bool(false)];
         execute_fn

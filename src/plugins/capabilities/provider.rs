@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use wasmtime::AsContextMut;
 
 use crate::plugins::error::{PluginError, PluginResult};
-use crate::plugins::host::{HostState, apply_store_resource_limits};
+use crate::plugins::host::{HostState, apply_store_epoch_deadline, apply_store_resource_limits};
 use crate::plugins::manifest::PluginManifest;
 use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ToolCall};
 
@@ -84,6 +84,7 @@ impl WasmProvider {
             .map_err(|e| PluginError::Instantiation(format!("failed to instantiate provider: {e}")))?;
 
         // Cache the provider name at load time.
+        apply_store_epoch_deadline(&mut store, timeout_ms);
         let provider_name = Self::call_name(&instance, &mut store).await?;
 
         tracing::info!(
@@ -198,6 +199,7 @@ impl WasmProvider {
         ];
         let mut results = vec![wasmtime::component::Val::Bool(false)];
 
+        apply_store_epoch_deadline(store, self.timeout_ms);
         chat_fn
             .call_async(store.as_context_mut(), &params, &mut results)
             .await

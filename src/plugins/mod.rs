@@ -36,6 +36,7 @@ pub mod registry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use error::{PluginError, PluginResult};
 use manifest::PluginManifest;
@@ -135,9 +136,12 @@ impl PluginManager {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
         config.consume_fuel(true);
+        #[cfg(target_has_atomic = "64")]
+        config.epoch_interruption(true);
 
         let engine = wasmtime::Engine::new(&config)
             .map_err(|e| PluginError::Compilation(format!("failed to create wasmtime engine: {e}")))?;
+        spawn_epoch_ticker(&engine);
 
         let cache_dir = plugins_dir.join(".cwasm-cache");
         let precompile_cache = PrecompileCache::new(cache_dir).map_err(PluginError::Io)?;
@@ -743,6 +747,23 @@ impl PluginManager {
         self.metrics.snapshot()
     }
 }
+
+#[cfg(target_has_atomic = "64")]
+fn spawn_epoch_ticker(engine: &wasmtime::Engine) {
+    let weak = engine.weak();
+    let tick = Duration::from_millis(host::WASM_EPOCH_TICK_MS);
+    let _ = std::thread::Builder::new()
+        .name("prx-wasm-epoch-ticker".to_string())
+        .spawn(move || {
+            while let Some(engine) = weak.upgrade() {
+                std::thread::sleep(tick);
+                engine.increment_epoch();
+            }
+        });
+}
+
+#[cfg(not(target_has_atomic = "64"))]
+fn spawn_epoch_ticker(_engine: &wasmtime::Engine) {}
 
 /// Initialize the plugin manager if configured.
 ///
