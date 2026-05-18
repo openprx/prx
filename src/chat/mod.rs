@@ -168,7 +168,6 @@ fn now_ms() -> u64 {
 //
 // 移除节奏：S4-B 仅删 chat_mirror/active_cancel 等数据结构，env 守卫保留；
 // S5 验收全 PASS 后再删 enum + 全部守卫调用点。
-#[cfg(feature = "terminal-tui")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReduxMode {
     Off,
@@ -177,7 +176,6 @@ pub(crate) enum ReduxMode {
     Pure,
 }
 
-#[cfg(feature = "terminal-tui")]
 impl ReduxMode {
     /// 解析环境变量 `PRX_CHAT_REDUX`. 默认 `Off`.
     ///
@@ -1000,6 +998,7 @@ pub async fn run(
 
     // 入口统一读 PRX_CHAT_REDUX，函数体内复用此值避免多点解析环境变量
     // S4-B: Pure 是唯一支持的运行路径；非 Pure 值 warning 后强制升级
+    #[cfg(feature = "terminal-tui")]
     let top_redux_mode = {
         let parsed = ReduxMode::from_env();
         if !parsed.is_pure() {
