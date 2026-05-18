@@ -1998,6 +1998,22 @@ mod tests {
             assert_eq!(state.ui.input.text(), "pasted-text");
         }
 
+        #[test]
+        fn test_large_paste_can_be_submitted_without_truncation() {
+            let mut state = s();
+            let line = "b".repeat(1024);
+            let pasted = std::iter::repeat_n(line.as_str(), 100).collect::<Vec<_>>().join("\n");
+
+            let effects = state.reduce(Action::PasteReceived(pasted.clone()));
+            assert!(has_request_redraw(&effects));
+            assert_eq!(state.ui.input.text(), pasted);
+
+            let effects = state.reduce(Action::InputSubmitted(state.ui.input.text()));
+            assert!(has_request_redraw(&effects));
+            assert!(has_log_trace(&effects));
+            assert_eq!(state.ui.last_submitted.as_deref(), Some(pasted.as_str()));
+        }
+
         /// 9. TerminalResized → RequestRedraw
         #[test]
         fn test_reduce_terminal_resized_returns_redraw() {
