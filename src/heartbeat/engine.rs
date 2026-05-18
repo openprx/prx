@@ -60,9 +60,9 @@ impl HeartbeatEngine {
         }
     }
 
-    /// Single heartbeat tick — read HEARTBEAT.md and return task count
+    /// Single heartbeat tick — read HEARTBEAT.md, build task prompts, and return task count.
     async fn tick(&self) -> Result<usize> {
-        Ok(self.collect_tasks().await?.len())
+        Ok(self.collect_task_prompts().await?.len())
     }
 
     /// Read HEARTBEAT.md and return all parsed tasks.
@@ -73,6 +73,21 @@ impl HeartbeatEngine {
         }
         let content = tokio::fs::read_to_string(&heartbeat_path).await?;
         Ok(Self::parse_tasks(&content))
+    }
+
+    /// Read HEARTBEAT.md and return executable agent prompts for each parsed task.
+    pub async fn collect_task_prompts(&self) -> Result<Vec<String>> {
+        Ok(self
+            .collect_tasks()
+            .await?
+            .into_iter()
+            .map(|task| self.task_prompt(&task))
+            .collect())
+    }
+
+    /// Build the agent prompt for a single heartbeat task.
+    pub fn task_prompt(&self, task: &str) -> String {
+        format!("{}\n\n[Heartbeat Task] {task}", self.config.prompt)
     }
 
     /// Parse tasks from HEARTBEAT.md (lines starting with `- `)
@@ -353,6 +368,37 @@ mod tests {
         );
         let count = engine.tick().await.unwrap();
         assert_eq!(count, 3);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn collect_task_prompts_uses_config_prompt() {
+        let dir = std::env::temp_dir().join("openprx_test_heartbeat_prompts");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        tokio::fs::write(dir.join("HEARTBEAT.md"), "- Check queue\n- Send digest")
+            .await
+            .unwrap();
+
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let engine = HeartbeatEngine::new(
+            HeartbeatConfig {
+                enabled: true,
+                interval_minutes: 30,
+                prompt: "Use the configured heartbeat prompt.".to_string(),
+                ..HeartbeatConfig::default()
+            },
+            dir.clone(),
+            observer,
+        );
+
+        let prompts = engine.collect_task_prompts().await.unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains("Use the configured heartbeat prompt."));
+        assert!(prompts[0].contains("[Heartbeat Task] Check queue"));
+        assert!(prompts[1].contains("[Heartbeat Task] Send digest"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
