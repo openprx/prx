@@ -58,6 +58,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -144,6 +145,21 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn print_fallback_chat_output(text: &str) {
+    let mut out = String::with_capacity(text.len() + 2);
+    let mut prev_was_cr = false;
+    for ch in text.chars() {
+        if ch == '\n' && !prev_was_cr {
+            out.push('\r');
+        }
+        out.push(ch);
+        prev_was_cr = ch == '\r';
+    }
+    out.push_str("\r\n");
+    print!("{out}");
+    let _ = std::io::stdout().flush();
 }
 
 /// Chat 输入路径的 Redux 灰度模式. 由环境变量 `PRX_CHAT_REDUX` 控制.
@@ -1377,11 +1393,13 @@ pub async fn run(
                 );
                 if let Some(tx) = redraw_tx_for_main.as_ref() {
                     let _ = tx.try_send(());
+                } else {
+                    print_fallback_chat_output(text);
                 }
             }
             #[cfg(not(feature = "terminal-tui"))]
             {
-                println!("{text}");
+                print_fallback_chat_output(text);
             }
         };
 

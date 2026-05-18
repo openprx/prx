@@ -90,6 +90,28 @@ fn sanitize_terminal_output(text: &str) -> String {
     result
 }
 
+fn normalize_terminal_newlines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_was_cr = false;
+    for ch in text.chars() {
+        if ch == '\n' && !prev_was_cr {
+            out.push('\r');
+        }
+        out.push(ch);
+        prev_was_cr = ch == '\r';
+    }
+    out
+}
+
+fn print_terminal_text(text: &str) {
+    print!("{}", normalize_terminal_newlines(text));
+}
+
+fn println_terminal_text(text: &str) {
+    print_terminal_text(text);
+    print_terminal_text("\n");
+}
+
 // ── UI Event types ──────────────────────────────────────────────────────────
 
 /// All events that can affect terminal display.
@@ -413,7 +435,7 @@ impl UiActor {
                 // Throttle repaints
                 let elapsed = self.last_repaint.elapsed().as_millis() as u64;
                 if elapsed >= self.repaint_interval_ms || safe_content.contains('\n') {
-                    print!("{safe_content}");
+                    print_terminal_text(&safe_content);
                     let _ = io::stdout().flush();
                     self.last_repaint = Instant::now();
                 }
@@ -431,7 +453,9 @@ impl UiActor {
                     // Stale finalize — just print as a final message
                     if !full_text.is_empty() {
                         let safe = sanitize_terminal_output(&full_text);
-                        println!("\n{safe}\n");
+                        print_terminal_text("\n");
+                        println_terminal_text(&safe);
+                        print_terminal_text("\n");
                     }
                     return;
                 }
@@ -441,10 +465,9 @@ impl UiActor {
                 // Flush any remaining un-rendered delta (safe char-boundary + sanitize)
                 if full_text.len() > self.draft_buffer.len() && full_text.is_char_boundary(self.draft_buffer.len()) {
                     let remaining = sanitize_terminal_output(&full_text[self.draft_buffer.len()..]);
-                    print!("{remaining}");
+                    print_terminal_text(&remaining);
                 }
-                println!();
-                println!();
+                print_terminal_text("\n\n");
                 let _ = io::stdout().flush();
 
                 self.draft_buffer.clear();
@@ -463,9 +486,9 @@ impl UiActor {
                     print!("\r");
                     let _ = execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine));
                     if !self.draft_buffer.is_empty() {
-                        println!();
+                        print_terminal_text("\n");
                         if !self.plain_mode {
-                            println!("  (cancelled)");
+                            println_terminal_text("  (cancelled)");
                         }
                     }
                     self.draft_buffer.clear();
@@ -543,7 +566,9 @@ impl UiActor {
             UiEvent::FinalMessage { text } => {
                 if !text.is_empty() {
                     let safe = sanitize_terminal_output(&text);
-                    println!("\n{safe}\n");
+                    print_terminal_text("\n");
+                    println_terminal_text(&safe);
+                    print_terminal_text("\n");
                 }
             }
 
@@ -951,111 +976,56 @@ impl Drop for TerminalChannel {
 
 // ── Input loop ──────────────────────────────────────────────────────────────
 
-/// Interactive input loop using reedline.
+/// Interactive input loop.
 ///
 /// Reads user input, recognizes slash-commands, and sends `ChannelMessage`s
 /// to the agent pipeline.
 async fn terminal_input_loop(tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
-    use reedline::{DefaultPrompt, DefaultPromptSegment, FileBackedHistory, Reedline, Signal};
-
-    // Run reedline on a blocking thread since it blocks on stdin
+    // Run stdin reads on a blocking thread. The legacy fallback deliberately
+    // uses a simple prompt instead of reedline: reedline consumes Ctrl+C and
+    // redraws over concurrent chat output unless wired through its optional
+    // external-printer feature.
     let handle = tokio::task::spawn_blocking(move || -> Result<()> {
-        // Non-TTY fallback: read lines from stdin via BufRead when not attached to a terminal.
-        // Reedline requires a real TTY; on pipes/heredocs it immediately returns Err and the
-        // entire input loop would silently break before processing any user input.
-        if !io::stdin().is_terminal() {
-            use std::io::BufRead as _;
-            let stdin = io::stdin();
-            for line_result in stdin.lock().lines() {
-                let line = match line_result {
-                    Ok(l) => l,
-                    Err(_) => break,
-                };
-                let trimmed = line.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if trimmed == "/quit" || trimmed == "/exit" {
-                    break;
-                }
+        use std::io::BufRead as _;
 
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-
-                let msg = ChannelMessage {
-                    id: Uuid::new_v4().to_string(),
-                    sender: "user".to_string(),
-                    reply_target: "user".to_string(),
-                    content: trimmed,
-                    channel: "terminal".to_string(),
-                    timestamp,
-                    thread_ts: None,
-                    mentioned_uuids: vec![],
-                };
-
-                if tx.blocking_send(msg).is_err() {
-                    break;
-                }
-            }
-            return Ok(());
-        }
-
-        // Set up file-backed input history
-        let history_path = directories::ProjectDirs::from("dev", "openprx", "prx")
-            .map(|dirs| dirs.data_dir().join("chat_history"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".prx_chat_history"));
-        let mut editor = FileBackedHistory::with_file(1000, history_path).map_or_else(
-            |_| Reedline::create(),
-            |history| Reedline::create().with_history(Box::new(history)),
-        );
-        let prompt = DefaultPrompt::new(
-            DefaultPromptSegment::Basic("prx".to_string()),
-            DefaultPromptSegment::Empty,
-        );
-
+        let stdin_is_tty = io::stdin().is_terminal();
+        let stdin = io::stdin();
+        let mut lines = stdin.lock().lines();
         loop {
-            match editor.read_line(&prompt) {
-                Ok(Signal::Success(line)) => {
-                    let trimmed = line.trim().to_string();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if trimmed == "/quit" || trimmed == "/exit" {
-                        break;
-                    }
+            if stdin_is_tty {
+                print!("prx〉");
+                let _ = io::stdout().flush();
+            }
+            let line = match lines.next() {
+                Some(Ok(line)) => line,
+                Some(Err(_)) | None => break,
+            };
+            let trimmed = line.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed == "/quit" || trimmed == "/exit" {
+                break;
+            }
 
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
 
-                    let msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
-                        sender: "user".to_string(),
-                        reply_target: "user".to_string(),
-                        content: trimmed,
-                        channel: "terminal".to_string(),
-                        timestamp,
-                        thread_ts: None,
-                        mentioned_uuids: vec![],
-                    };
+            let msg = ChannelMessage {
+                id: Uuid::new_v4().to_string(),
+                sender: "user".to_string(),
+                reply_target: "user".to_string(),
+                content: trimmed,
+                channel: "terminal".to_string(),
+                timestamp,
+                thread_ts: None,
+                mentioned_uuids: vec![],
+            };
 
-                    // Use blocking send via a new runtime-less channel
-                    if tx.blocking_send(msg).is_err() {
-                        break;
-                    }
-                }
-                Ok(Signal::CtrlC) => {
-                    // Cancel current input, continue
-                    continue;
-                }
-                Ok(Signal::CtrlD) => {
-                    // Exit
-                    break;
-                }
-                Err(_) => break,
+            if tx.blocking_send(msg).is_err() {
+                break;
             }
         }
         Ok(())
@@ -1086,6 +1056,13 @@ mod tests {
         let debug = format!("{event:?}");
         assert!(debug.contains("DraftStarted"));
         assert!(debug.contains("test-123"));
+    }
+
+    #[test]
+    fn terminal_output_newlines_use_carriage_return() {
+        assert_eq!(normalize_terminal_newlines("a\nb"), "a\r\nb");
+        assert_eq!(normalize_terminal_newlines("a\r\nb"), "a\r\nb");
+        assert_eq!(normalize_terminal_newlines("a\nb\n"), "a\r\nb\r\n");
     }
 
     #[tokio::test]
