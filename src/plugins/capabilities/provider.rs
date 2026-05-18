@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use wasmtime::AsContextMut;
 
 use crate::plugins::error::{PluginError, PluginResult};
-use crate::plugins::host::HostState;
+use crate::plugins::host::{HostState, apply_store_resource_limits};
 use crate::plugins::manifest::PluginManifest;
 use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ToolCall};
 
@@ -70,6 +70,7 @@ impl WasmProvider {
         }
 
         let mut store = wasmtime::Store::new(engine, host_state);
+        apply_store_resource_limits(&mut store, manifest.resources.max_memory_mb);
         store
             .set_fuel(manifest.resources.max_fuel)
             .map_err(|e| PluginError::Instantiation(format!("failed to set fuel: {e}")))?;

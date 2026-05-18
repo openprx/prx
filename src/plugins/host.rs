@@ -16,6 +16,8 @@ use crate::plugins::event_bus::EventBus;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 #[cfg(feature = "wasm-plugins")]
+use wasmtime::StoreLimits;
+#[cfg(feature = "wasm-plugins")]
 use wasmtime::component::ResourceTable;
 #[cfg(feature = "wasm-plugins")]
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
@@ -117,6 +119,10 @@ pub struct HostState {
     /// Resource limits.
     pub timeout_ms: u64,
 
+    /// Wasmtime resource limiter backing linear-memory/table/instance caps.
+    #[cfg(feature = "wasm-plugins")]
+    pub store_limits: StoreLimits,
+
     /// Active outbound WebSocket sessions owned by this plugin instance.
     pub websocket_sessions: WebSocketSessionMap,
 
@@ -159,6 +165,8 @@ impl HostState {
             http_allowlist,
             kv_store: Arc::new(RwLock::new(HashMap::new())),
             timeout_ms,
+            #[cfg(feature = "wasm-plugins")]
+            store_limits: wasmtime::StoreLimitsBuilder::new().build(),
             websocket_sessions: Arc::new(Mutex::new(HashMap::new())),
             next_websocket_session_id: Arc::new(AtomicU64::new(1)),
             websocket_connector: Arc::new(TungsteniteConnector),
@@ -230,6 +238,22 @@ impl HostState {
         }
         false
     }
+}
+
+#[cfg(feature = "wasm-plugins")]
+fn max_memory_bytes(max_memory_mb: u64) -> usize {
+    let bytes = max_memory_mb.saturating_mul(1024).saturating_mul(1024);
+    bytes.min(usize::MAX as u64) as usize
+}
+
+/// Attach manifest resource limits to a wasmtime Store.
+#[cfg(feature = "wasm-plugins")]
+pub(crate) fn apply_store_resource_limits(store: &mut wasmtime::Store<HostState>, max_memory_mb: u64) {
+    store.data_mut().store_limits = wasmtime::StoreLimitsBuilder::new()
+        .memory_size(max_memory_bytes(max_memory_mb))
+        .trap_on_grow_failure(true)
+        .build();
+    store.limiter(|state| &mut state.store_limits);
 }
 
 fn websocket_timeout(timeout_ms: u64) -> Duration {
@@ -626,6 +650,28 @@ mod tests {
             5000,
         );
         assert!(state.check_url_allowed("https://anything.com"));
+    }
+
+    #[test]
+    fn store_resource_limits_reject_large_linear_memory() {
+        let engine = wasmtime::Engine::default();
+        let mut store = wasmtime::Store::new(&engine, test_state());
+        apply_store_resource_limits(&mut store, 1);
+
+        let one_page = wasmtime::MemoryType::new(1, None);
+        let too_large = wasmtime::MemoryType::new(32, None);
+
+        assert!(wasmtime::Memory::new(&mut store, one_page).is_ok());
+        assert!(
+            wasmtime::Memory::new(&mut store, too_large).is_err(),
+            "2 MiB memory must be rejected when max_memory_mb is 1"
+        );
+    }
+
+    #[test]
+    fn max_memory_bytes_saturates_to_usize_max() {
+        assert_eq!(max_memory_bytes(1), 1024 * 1024);
+        assert_eq!(max_memory_bytes(u64::MAX), usize::MAX);
     }
 
     #[test]
