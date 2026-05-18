@@ -1,11 +1,17 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
+use std::path::{Path, PathBuf};
+
+const SLACK_POLL_INTERVAL_SECS: u64 = 3;
+const SLACK_MAX_BACKOFF_SECS: u64 = 60;
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
     bot_token: String,
     channel_id: Option<String>,
     allowed_users: Vec<String>,
+    workspace_dir: Option<PathBuf>,
 }
 
 impl SlackChannel {
@@ -14,7 +20,13 @@ impl SlackChannel {
             bot_token,
             channel_id,
             allowed_users,
+            workspace_dir: None,
         }
+    }
+
+    pub fn with_workspace_dir(mut self, workspace_dir: PathBuf) -> Self {
+        self.workspace_dir = Some(workspace_dir);
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -34,19 +46,26 @@ impl SlackChannel {
     }
 
     /// Get the bot's own user ID so we can ignore our own messages
-    async fn get_bot_user_id(&self) -> Option<String> {
+    async fn get_bot_user_id(&self) -> anyhow::Result<String> {
         let resp: serde_json::Value = self
             .http_client()
             .get("https://slack.com/api/auth.test")
             .bearer_auth(&self.bot_token)
             .send()
-            .await
-            .ok()?
+            .await?
             .json()
-            .await
-            .ok()?;
+            .await?;
 
-        resp.get("user_id").and_then(|u| u.as_str()).map(String::from)
+        if resp.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = resp.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+            anyhow::bail!("Slack auth.test failed: {err}");
+        }
+
+        resp.get("user_id")
+            .and_then(|u| u.as_str())
+            .filter(|id| !id.trim().is_empty())
+            .map(String::from)
+            .ok_or_else(|| anyhow!("Slack auth.test response did not include user_id"))
     }
 
     /// Resolve the thread identifier for inbound Slack messages.
@@ -56,6 +75,65 @@ impl SlackChannel {
             .and_then(|t| t.as_str())
             .or(if ts.is_empty() { None } else { Some(ts) })
             .map(str::to_string)
+    }
+
+    fn cursor_path_for(workspace_dir: &Path, channel_id: &str) -> PathBuf {
+        let safe_channel_id: String = channel_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        workspace_dir.join(format!("slack_cursor_{safe_channel_id}.txt"))
+    }
+
+    fn cursor_path(&self, channel_id: &str) -> Option<PathBuf> {
+        self.workspace_dir
+            .as_ref()
+            .map(|dir| Self::cursor_path_for(dir, channel_id))
+    }
+
+    async fn load_last_ts(&self, channel_id: &str) -> anyhow::Result<String> {
+        let Some(path) = self.cursor_path(channel_id) else {
+            return Ok(String::new());
+        };
+        match tokio::fs::read_to_string(&path).await {
+            Ok(value) => Ok(value.trim().to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e).with_context(|| format!("failed to read Slack cursor {}", path.display())),
+        }
+    }
+
+    async fn store_last_ts(&self, channel_id: &str, ts: &str) -> anyhow::Result<()> {
+        if ts.trim().is_empty() {
+            return Ok(());
+        }
+        let Some(path) = self.cursor_path(channel_id) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create Slack cursor directory {}", parent.display()))?;
+        }
+        let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+        tokio::fs::write(&tmp_path, format!("{ts}\n"))
+            .await
+            .with_context(|| format!("failed to write temporary Slack cursor {}", tmp_path.display()))?;
+        tokio::fs::rename(&tmp_path, &path)
+            .await
+            .with_context(|| format!("failed to replace Slack cursor {}", path.display()))?;
+        Ok(())
+    }
+
+    fn poll_backoff_duration(consecutive_errors: u32) -> std::time::Duration {
+        let exponent = consecutive_errors.clamp(1, 6);
+        let secs = 2_u64.saturating_pow(exponent).min(SLACK_MAX_BACKOFF_SECS);
+        std::time::Duration::from_secs(secs)
     }
 }
 
@@ -111,13 +189,17 @@ impl Channel for SlackChannel {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Slack channel_id required for listening"))?;
 
-        let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
-        let mut last_ts = String::new();
+        let bot_user_id = self
+            .get_bot_user_id()
+            .await
+            .map_err(|e| anyhow!("cannot get Slack bot_user_id: {e}"))?;
+        let mut last_ts = self.load_last_ts(&channel_id).await?;
+        let mut consecutive_errors = 0_u32;
 
         tracing::info!("Slack channel listening on #{channel_id}...");
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(SLACK_POLL_INTERVAL_SECS)).await;
 
             let mut params = vec![("channel", channel_id.clone()), ("limit", "10".to_string())];
             if !last_ts.is_empty() {
@@ -135,6 +217,8 @@ impl Channel for SlackChannel {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("Slack poll error: {e}");
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    tokio::time::sleep(Self::poll_backoff_duration(consecutive_errors)).await;
                     continue;
                 }
             };
@@ -143,9 +227,21 @@ impl Channel for SlackChannel {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!("Slack parse error: {e}");
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    tokio::time::sleep(Self::poll_backoff_duration(consecutive_errors)).await;
                     continue;
                 }
             };
+
+            if data.get("ok") == Some(&serde_json::Value::Bool(false)) {
+                let err = data.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+                tracing::warn!("Slack conversations.history failed: {err}");
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                tokio::time::sleep(Self::poll_backoff_duration(consecutive_errors)).await;
+                continue;
+            }
+
+            consecutive_errors = 0;
 
             if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                 // Messages come newest-first, reverse to process oldest first
@@ -156,21 +252,33 @@ impl Channel for SlackChannel {
 
                     // Skip bot's own messages
                     if user == bot_user_id {
+                        if !ts.is_empty() && ts > last_ts.as_str() {
+                            last_ts = ts.to_string();
+                            self.store_last_ts(&channel_id, &last_ts).await?;
+                        }
                         continue;
                     }
 
                     // Sender validation
                     if !self.is_user_allowed(user) {
                         tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
+                        if !ts.is_empty() && ts > last_ts.as_str() {
+                            last_ts = ts.to_string();
+                            self.store_last_ts(&channel_id, &last_ts).await?;
+                        }
                         continue;
                     }
 
-                    // Skip empty or already-seen
-                    if text.is_empty() || ts <= last_ts.as_str() {
+                    // Skip already-seen messages. Slack `oldest` is inclusive.
+                    if ts.is_empty() || ts <= last_ts.as_str() {
                         continue;
                     }
 
-                    last_ts = ts.to_string();
+                    if text.is_empty() {
+                        last_ts = ts.to_string();
+                        self.store_last_ts(&channel_id, &last_ts).await?;
+                        continue;
+                    }
 
                     let channel_msg = ChannelMessage {
                         id: format!("slack_{channel_id}_{ts}"),
@@ -189,6 +297,9 @@ impl Channel for SlackChannel {
                     if tx.send(channel_msg).await.is_err() {
                         return Ok(());
                     }
+
+                    last_ts = ts.to_string();
+                    self.store_last_ts(&channel_id, &last_ts).await?;
                 }
             }
         }
@@ -345,5 +456,58 @@ mod tests {
 
         let thread_ts = SlackChannel::inbound_thread_ts(&msg, "");
         assert_eq!(thread_ts, None);
+    }
+
+    #[test]
+    fn slack_cursor_path_sanitizes_channel_id() {
+        let workspace = PathBuf::from("/tmp/openprx-workspace");
+        let path = SlackChannel::cursor_path_for(&workspace, "C12/../bad channel");
+        assert_eq!(path, workspace.join("slack_cursor_C12____bad_channel.txt"));
+    }
+
+    #[tokio::test]
+    async fn slack_cursor_roundtrips_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ch = SlackChannel::new("xoxb-fake".into(), Some("C12345".into()), vec![])
+            .with_workspace_dir(tmp.path().to_path_buf());
+
+        assert_eq!(ch.load_last_ts("C12345").await.unwrap(), "");
+
+        ch.store_last_ts("C12345", "1716040000.123456").await.unwrap();
+
+        assert_eq!(ch.load_last_ts("C12345").await.unwrap(), "1716040000.123456");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("slack_cursor_C12345.txt")).unwrap(),
+            "1716040000.123456\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_cursor_noops_without_workspace_dir() {
+        let ch = SlackChannel::new("xoxb-fake".into(), Some("C12345".into()), vec![]);
+
+        ch.store_last_ts("C12345", "1716040000.123456").await.unwrap();
+
+        assert_eq!(ch.load_last_ts("C12345").await.unwrap(), "");
+    }
+
+    #[test]
+    fn slack_poll_backoff_caps_at_sixty_seconds() {
+        assert_eq!(
+            SlackChannel::poll_backoff_duration(1),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            SlackChannel::poll_backoff_duration(2),
+            std::time::Duration::from_secs(4)
+        );
+        assert_eq!(
+            SlackChannel::poll_backoff_duration(7),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            SlackChannel::poll_backoff_duration(99),
+            std::time::Duration::from_secs(60)
+        );
     }
 }
