@@ -2,12 +2,20 @@
 //!
 //! Landlock provides unprivileged sandboxing through the Linux kernel.
 //! This module uses the pure-Rust `landlock` crate for filesystem access control.
+//!
+//! Landlock's `restrict_self()` affects the calling process and its future
+//! descendants.  PRX therefore installs the ruleset through `Command::pre_exec`
+//! so only the shell child process is restricted; the long-running daemon keeps
+//! its gateway, memory, and channel permissions unchanged.
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
-use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr};
+use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr};
 
 use crate::security::traits::Sandbox;
 use std::path::Path;
+
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+use std::os::unix::process::CommandExt;
 
 /// Landlock sandbox backend for Linux
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
@@ -47,11 +55,15 @@ impl LandlockSandbox {
         Self::new()
     }
 
-    /// Apply Landlock restrictions to the current process
-    fn apply_restrictions(&self) -> std::io::Result<()> {
+    /// Build a Landlock ruleset in the parent process.
+    ///
+    /// The returned ruleset is later consumed by `restrict_self()` in the
+    /// forked child through `Command::pre_exec`.
+    fn build_ruleset(workspace_dir: Option<&Path>) -> std::io::Result<RulesetCreated> {
         let mut ruleset = Ruleset::default()
             .handle_access(
-                AccessFs::ReadFile
+                AccessFs::Execute
+                    | AccessFs::ReadFile
                     | AccessFs::WriteFile
                     | AccessFs::ReadDir
                     | AccessFs::RemoveDir
@@ -67,13 +79,13 @@ impl LandlockSandbox {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Allow workspace directory (read/write)
-        if let Some(ref workspace) = self.workspace_dir {
+        if let Some(workspace) = workspace_dir {
             if workspace.exists() {
                 let workspace_fd = PathFd::new(workspace).map_err(|e| std::io::Error::other(e.to_string()))?;
                 ruleset = ruleset
                     .add_rule(PathBeneath::new(
                         workspace_fd,
-                        AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
+                        AccessFs::Execute | AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
                     ))
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
             }
@@ -85,38 +97,53 @@ impl LandlockSandbox {
             .add_rule(PathBeneath::new(tmp_fd, AccessFs::ReadFile | AccessFs::WriteFile))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        // Allow /usr and /bin for executing commands
-        let usr_fd = PathFd::new(Path::new("/usr")).map_err(|e| std::io::Error::other(e.to_string()))?;
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(usr_fd, AccessFs::ReadFile | AccessFs::ReadDir))
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // Allow system executable and library paths for command startup.
+        for path in ["/usr", "/bin", "/lib", "/lib64"] {
+            let path = Path::new(path);
+            if !path.exists() {
+                continue;
+            }
+            let fd = PathFd::new(path).map_err(|e| std::io::Error::other(e.to_string()))?;
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(
+                    fd,
+                    AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
+                ))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
 
-        let bin_fd = PathFd::new(Path::new("/bin")).map_err(|e| std::io::Error::other(e.to_string()))?;
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(bin_fd, AccessFs::ReadFile | AccessFs::ReadDir))
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(ruleset)
+    }
 
+    /// Apply Landlock restrictions to the current process.
+    ///
+    /// This is only called from the `pre_exec` child hook.
+    fn restrict_child(ruleset: RulesetCreated) -> std::io::Result<()> {
         // Apply the ruleset
         match ruleset.restrict_self() {
-            Ok(_) => {
-                tracing::debug!("Landlock restrictions applied successfully");
-                Ok(())
-            }
-            Err(e) => {
-                tracing::warn!("Failed to apply Landlock restrictions: {}", e);
-                Err(std::io::Error::other(e.to_string()))
-            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(std::io::Error::other(e.to_string())),
         }
     }
 }
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 impl Sandbox for LandlockSandbox {
-    fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
-        // Apply Landlock restrictions before executing the command
-        // Note: This affects the current process, not the child process
-        // Child processes inherit the Landlock restrictions
-        self.apply_restrictions()
+    #[allow(unsafe_code)]
+    fn wrap_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+        let mut ruleset = Some(Self::build_ruleset(self.workspace_dir.as_deref())?);
+        // SAFETY: `pre_exec` runs in the forked child immediately before exec.
+        // The closure only consumes the prebuilt Landlock ruleset and performs
+        // the kernel restriction call, leaving the daemon parent unrestricted.
+        unsafe {
+            cmd.pre_exec(move || {
+                let ruleset = ruleset
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("Landlock ruleset already consumed"))?;
+                Self::restrict_child(ruleset)
+            });
+        }
+        Ok(())
     }
 
     fn is_available(&self) -> bool {
@@ -214,6 +241,34 @@ mod tests {
             Ok(sandbox) => assert!(sandbox.is_available()),
             Err(_) => assert!(!cfg!(all(feature = "sandbox-landlock", target_os = "linux"))),
         }
+    }
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn landlock_wrap_command_does_not_restrict_parent_process() {
+        let Ok(sandbox) = LandlockSandbox::with_workspace(None) else {
+            return;
+        };
+        let cargo_toml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+
+        let mut cmd = std::process::Command::new("true");
+        sandbox.wrap_command(&mut cmd).unwrap();
+        let status = cmd.status().unwrap();
+        assert!(status.success());
+
+        let cat = if std::path::Path::new("/bin/cat").exists() {
+            "/bin/cat"
+        } else {
+            "/usr/bin/cat"
+        };
+        let mut denied_cmd = std::process::Command::new(cat);
+        denied_cmd.arg(&cargo_toml);
+        sandbox.wrap_command(&mut denied_cmd).unwrap();
+        let denied = denied_cmd.output().unwrap();
+        assert!(!denied.status.success());
+
+        let contents = std::fs::read_to_string(cargo_toml).unwrap();
+        assert!(contents.contains("[package]"));
     }
 
     // ── §1.1 Landlock stub tests ──────────────────────────────
