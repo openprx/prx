@@ -1289,6 +1289,28 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    fn build_streaming_history_request(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> NativeChatRequest {
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(messages)
+        } else {
+            messages.to_vec()
+        };
+        NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages_for_native(&effective_messages),
+            temperature,
+            stream: Some(options.enabled),
+            tools: None,
+            tool_choice: None,
+        }
+    }
+
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
         if !matches!(
             status,
@@ -1917,6 +1939,72 @@ impl Provider for OpenAiCompatibleProvider {
         stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
     }
 
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let credential = match self.credential.as_ref() {
+            Some(value) => value.clone(),
+            None => {
+                let provider_name = self.name.clone();
+                return stream::once(async move {
+                    Err(StreamError::Provider(format!("{} API key not set", provider_name)))
+                })
+                .boxed();
+            }
+        };
+
+        let request = self.build_streaming_history_request(messages, model, temperature, options);
+        let url = self.chat_completions_url();
+        let client = self.http_client();
+        let auth_header = self.auth_header.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+        tokio::spawn(async move {
+            let mut req_builder = client.post(&url).json(&request);
+            req_builder = match &auth_header {
+                AuthStyle::Bearer => req_builder.header("Authorization", format!("Bearer {}", credential)),
+                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
+                AuthStyle::Custom(header) => req_builder.header(header, &credential),
+            };
+            req_builder = req_builder.header("Accept", "text/event-stream");
+
+            let response = match req_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP error: {}", status));
+                let sanitized = super::sanitize_api_error(&error);
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{}: {}", status, sanitized))))
+                    .await;
+                return;
+            }
+
+            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
+            while let Some(chunk) = chunk_stream.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) }).boxed()
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         if self.should_skip_warmup() {
             return Ok(());
@@ -2393,6 +2481,53 @@ mod tests {
         assert_eq!(output[0].content, "core policy");
         assert_eq!(output[1].role, "assistant");
         assert_eq!(output[1].content, "ack");
+    }
+
+    #[test]
+    fn streaming_history_request_preserves_full_message_history() {
+        let provider = make_provider("kimi-code", "https://api.kimi.com/coding/v1", Some("test-key"));
+        let messages = vec![
+            ChatMessage::system("system policy"),
+            ChatMessage::user("first user"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second user"),
+        ];
+
+        let request = provider.build_streaming_history_request(&messages, "kimi-k2", 0.3, StreamOptions::new(true));
+        let value = serde_json::to_value(&request).unwrap();
+        let serialized_messages = value["messages"].as_array().unwrap();
+
+        assert_eq!(value["model"], "kimi-k2");
+        assert_eq!(value["temperature"], 0.3);
+        assert_eq!(value["stream"], true);
+        assert_eq!(serialized_messages.len(), 4);
+        assert_eq!(serialized_messages[0]["role"], "system");
+        assert_eq!(serialized_messages[0]["content"], "system policy");
+        assert_eq!(serialized_messages[1]["role"], "user");
+        assert_eq!(serialized_messages[1]["content"], "first user");
+        assert_eq!(serialized_messages[2]["role"], "assistant");
+        assert_eq!(serialized_messages[2]["content"], "first answer");
+        assert_eq!(serialized_messages[3]["role"], "user");
+        assert_eq!(serialized_messages[3]["content"], "second user");
+    }
+
+    #[test]
+    fn streaming_history_request_honors_merge_system_into_user() {
+        let provider = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "minimax",
+            "https://api.minimax.example/v1",
+            Some("test-key"),
+            AuthStyle::Bearer,
+        );
+        let messages = vec![ChatMessage::system("core policy"), ChatMessage::user("hello")];
+
+        let request = provider.build_streaming_history_request(&messages, "abab", 0.7, StreamOptions::new(true));
+        let value = serde_json::to_value(&request).unwrap();
+        let serialized_messages = value["messages"].as_array().unwrap();
+
+        assert_eq!(serialized_messages.len(), 1);
+        assert_eq!(serialized_messages[0]["role"], "user");
+        assert_eq!(serialized_messages[0]["content"], "core policy\n\nhello");
     }
 
     #[test]
