@@ -167,19 +167,16 @@ fn format_tools_feedback(tools_registry: &[Box<dyn Tool>]) -> String {
 
 /// Handle the /clear command (needs mutable access to history, so handled separately).
 ///
-/// When `session_id` is provided, only deletes conversation-scoped memory entries
-/// that do **not** belong to other saved sessions (`chat_session:*` keys for other IDs
-/// are preserved). This prevents `/clear` from wiping unrelated sessions.
-pub async fn handle_clear(mem: &dyn Memory, session_id: Option<&str>) -> u32 {
+/// Saved chat sessions (`chat_session:*`) are never deleted by `/clear`.
+/// The command clears transient conversation/daily memory while preserving the
+/// user's resumeable session list.
+pub async fn handle_clear(mem: &dyn Memory, _session_id: Option<&str>) -> u32 {
     let mut cleared = 0u32;
     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
         let entries = mem.list(Some(&category), None).await.unwrap_or_default();
         for entry in entries {
-            // When session-scoped, preserve other sessions' data.
-            if let Some(sid) = session_id {
-                if entry.key.starts_with(super::session::SESSION_MEMORY_PREFIX) && !entry.key.ends_with(sid) {
-                    continue; // belongs to a different session — skip
-                }
+            if entry.key.starts_with(super::session::SESSION_MEMORY_PREFIX) {
+                continue;
             }
             if mem.forget(&entry.key).await.unwrap_or(false) {
                 cleared += 1;
@@ -249,10 +246,107 @@ mod mode_tests {
     use super::{ChatMode, CommandResult};
     #[cfg(feature = "terminal-tui")]
     use crate::memory::NoneMemory;
+    use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::tools::{Tool, ToolResult};
     use async_trait::async_trait;
+    use parking_lot::Mutex;
+    use std::collections::BTreeSet;
 
     struct TestTool;
+
+    struct ClearTestMemory {
+        entries: Vec<MemoryEntry>,
+        forgotten: Mutex<BTreeSet<String>>,
+    }
+
+    impl ClearTestMemory {
+        fn new(entries: Vec<MemoryEntry>) -> Self {
+            Self {
+                entries,
+                forgotten: Mutex::new(BTreeSet::new()),
+            }
+        }
+
+        fn was_forgotten(&self, key: &str) -> bool {
+            self.forgotten.lock().contains(key)
+        }
+    }
+
+    fn test_entry(key: &str, category: MemoryCategory) -> MemoryEntry {
+        MemoryEntry {
+            id: key.to_string(),
+            key: key.to_string(),
+            content: String::new(),
+            category,
+            timestamp: "2026-05-19T00:00:00Z".to_string(),
+            session_id: None,
+            score: None,
+            tags: None,
+            access_count: None,
+            useful_count: None,
+            source: None,
+            source_confidence: None,
+            verification_status: None,
+            lifecycle_state: None,
+            compressed_from: None,
+        }
+    }
+
+    #[async_trait]
+    impl Memory for ClearTestMemory {
+        fn name(&self) -> &str {
+            "clear-test"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(self
+                .entries
+                .iter()
+                .filter(|entry| category.is_none_or(|cat| &entry.category == cat))
+                .cloned()
+                .collect())
+        }
+
+        async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+            self.forgotten.lock().insert(key.to_string());
+            Ok(true)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.entries.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
 
     #[async_trait]
     impl Tool for TestTool {
@@ -382,6 +476,30 @@ mod mode_tests {
             CommandResult::HandledWithOutput(s) => assert_eq!(s, "hello"),
             _ => panic!("expected HandledWithOutput variant"),
         }
+    }
+
+    #[tokio::test]
+    async fn slash_clear_preserves_saved_chat_sessions() {
+        let memory = ClearTestMemory::new(vec![
+            test_entry(
+                &format!("{}:current", crate::chat::session::SESSION_MEMORY_PREFIX),
+                MemoryCategory::Conversation,
+            ),
+            test_entry(
+                &format!("{}:other", crate::chat::session::SESSION_MEMORY_PREFIX),
+                MemoryCategory::Conversation,
+            ),
+            test_entry("transient-conversation", MemoryCategory::Conversation),
+            test_entry("daily-note", MemoryCategory::Daily),
+        ]);
+
+        let cleared = super::handle_clear(&memory, Some("current")).await;
+
+        assert_eq!(cleared, 2);
+        assert!(!memory.was_forgotten("chat_session:current"));
+        assert!(!memory.was_forgotten("chat_session:other"));
+        assert!(memory.was_forgotten("transient-conversation"));
+        assert!(memory.was_forgotten("daily-note"));
     }
 
     #[cfg(feature = "terminal-tui")]

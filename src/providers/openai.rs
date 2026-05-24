@@ -791,6 +791,8 @@ impl Provider for OpenAiProvider {
             let mut byte_stream = response.bytes_stream();
             let mut text_buf = String::new();
             let mut sent_final = false;
+            let mut saw_sse_event = false;
+            let mut saw_non_sse_line = false;
             'outer: while let Some(bytes_res) = byte_stream.next().await {
                 let bytes = match bytes_res {
                     Ok(b) => b,
@@ -814,6 +816,10 @@ impl Provider for OpenAiProvider {
 
                 while let Some(pos) = text_buf.find('\n') {
                     let line: String = text_buf.drain(..=pos).collect();
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() && !trimmed.starts_with(':') && !trimmed.starts_with("data:") {
+                        saw_non_sse_line = true;
+                    }
                     let event = match parse_openai_sse_line(&line) {
                         Ok(Some(ev)) => ev,
                         Ok(None) => continue,
@@ -822,6 +828,7 @@ impl Provider for OpenAiProvider {
                             return;
                         }
                     };
+                    saw_sse_event = true;
 
                     if event.done_sentinel {
                         let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
@@ -875,6 +882,26 @@ impl Provider for OpenAiProvider {
             }
 
             if !sent_final {
+                let trailing = text_buf.trim();
+                if !trailing.is_empty() {
+                    let preview = trailing.chars().take(200).collect::<String>();
+                    let _ = tx
+                        .send(Err(StreamError::InvalidSse(format!(
+                            "OpenAI SSE stream ended with incomplete trailing data: {preview}"
+                        ))))
+                        .await;
+                    return;
+                }
+
+                if !saw_sse_event && saw_non_sse_line {
+                    let _ = tx
+                        .send(Err(StreamError::InvalidSse(
+                            "OpenAI streaming response did not contain any SSE data events".to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+
                 // Defensive tail flush: some upstream gateways close the byte
                 // stream without ever delivering `finish_reason == "tool_calls"`
                 // (and without `[DONE]`). Surface any buffered tool calls so the
@@ -1629,5 +1656,32 @@ mod tests {
         let err = first.expect_err("must surface 401 as StreamError");
         let msg = err.to_string();
         assert!(msg.contains("401"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn openai_streaming_rejects_malformed_non_sse_success_body() {
+        use crate::providers::traits::StreamOptions;
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn malformed() -> &'static str {
+            "{not valid json"
+        }
+        let app = Router::new().route("/chat/completions", post(malformed));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let addr = listener.local_addr().expect("test: addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = OpenAiProvider::with_base_url(Some(&format!("http://{addr}")), Some("test-key"));
+        let messages = vec![ChatMessage::user("hi".to_string())];
+        let mut stream = provider.stream_chat_with_history(&messages, "gpt-4o", 0.0, StreamOptions::new(false));
+        let first = stream.next().await.expect("chunk");
+        let err = first.expect_err("malformed 200 response must not become empty success");
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid SSE format"), "got: {msg}");
+        assert!(msg.contains("incomplete trailing data"), "got: {msg}");
     }
 }

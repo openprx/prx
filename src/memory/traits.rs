@@ -111,6 +111,215 @@ pub struct ConversationTurn {
     pub message_id: Option<String>,
 }
 
+/// Visibility scope for message and memory fabric events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryVisibility {
+    Global,
+    Workspace,
+    Agent,
+    Session,
+    Private,
+    System,
+}
+
+impl MemoryVisibility {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Workspace => "workspace",
+            Self::Agent => "agent",
+            Self::Session => "session",
+            Self::Private => "private",
+            Self::System => "system",
+        }
+    }
+}
+
+impl std::fmt::Display for MemoryVisibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MemoryVisibility {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "global" => Ok(Self::Global),
+            "workspace" => Ok(Self::Workspace),
+            "agent" => Ok(Self::Agent),
+            "session" => Ok(Self::Session),
+            "private" => Ok(Self::Private),
+            "system" => Ok(Self::System),
+            other => anyhow::bail!("unknown memory visibility '{other}'"),
+        }
+    }
+}
+
+/// Principal used to filter shared message events for a concrete agent turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryPrincipal {
+    pub workspace_id: String,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub session_key: Option<String>,
+    pub channel: Option<String>,
+    pub sender: Option<String>,
+}
+
+/// Input used to append an event into the shared message fabric.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageEventInput {
+    pub event_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub workspace_id: String,
+    pub source: String,
+    pub channel: Option<String>,
+    pub session_key: Option<String>,
+    pub parent_session_key: Option<String>,
+    pub run_id: Option<String>,
+    pub parent_run_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub sender: Option<String>,
+    pub recipient: Option<String>,
+    pub role: String,
+    pub content: String,
+    pub raw_payload_json: Option<String>,
+    pub visibility: MemoryVisibility,
+}
+
+/// Persisted shared message event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageEvent {
+    pub id: i64,
+    pub event_id: String,
+    pub idempotency_key: Option<String>,
+    pub workspace_id: String,
+    pub source: String,
+    pub channel: Option<String>,
+    pub session_key: Option<String>,
+    pub parent_session_key: Option<String>,
+    pub run_id: Option<String>,
+    pub parent_run_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub sender: Option<String>,
+    pub recipient: Option<String>,
+    pub role: String,
+    pub content: String,
+    pub content_hash: Option<String>,
+    pub raw_payload_json: Option<String>,
+    pub visibility: MemoryVisibility,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Query for recent shared events visible to an agent turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedContextQuery {
+    pub principal: MemoryPrincipal,
+    pub since_event_id: Option<i64>,
+    pub limit: usize,
+    pub include_roles: Vec<String>,
+}
+
+/// Query for recent current-session events visible to an agent turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionContextQuery {
+    pub principal: MemoryPrincipal,
+    pub since_event_id: Option<i64>,
+    pub limit: usize,
+    pub include_roles: Vec<String>,
+}
+
+/// Input used to append a lightweight outbox event for memory fabric changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEventInput {
+    pub event_id: Option<String>,
+    pub workspace_id: String,
+    pub event_type: String,
+    pub subject_table: String,
+    pub subject_id: String,
+    pub session_key: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub visibility: MemoryVisibility,
+    pub payload_json: Option<String>,
+}
+
+/// Persisted memory fabric outbox event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEvent {
+    pub id: i64,
+    pub event_id: String,
+    pub workspace_id: String,
+    pub event_type: String,
+    pub subject_table: String,
+    pub subject_id: String,
+    pub session_key: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub visibility: MemoryVisibility,
+    pub payload_json: Option<String>,
+    pub created_at: String,
+}
+
+/// Optional metadata persisted with semantic memory entries.
+///
+/// This is intentionally backend-neutral so SQLite can persist it now and
+/// Postgres can implement the same contract without changing entrypoint code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryStoreMetadata {
+    pub workspace_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub source_event_id: Option<String>,
+    pub source: Option<String>,
+}
+
+/// A private worker memory draft waiting for parent merge/reject.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryDraftInput {
+    pub draft_id: Option<String>,
+    pub workspace_id: String,
+    pub worker_run_id: String,
+    pub parent_run_id: Option<String>,
+    pub session_key: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub key: String,
+    pub content: String,
+    pub category: MemoryCategory,
+    pub source_event_id: Option<String>,
+    pub visibility: MemoryVisibility,
+    pub payload_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryDraft {
+    pub id: i64,
+    pub draft_id: String,
+    pub workspace_id: String,
+    pub worker_run_id: String,
+    pub parent_run_id: Option<String>,
+    pub session_key: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub key: String,
+    pub content: String,
+    pub category: MemoryCategory,
+    pub source_event_id: Option<String>,
+    pub visibility: MemoryVisibility,
+    pub status: String,
+    pub payload_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -140,6 +349,38 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<()> {
         let _ = context;
         self.store(key, content, category, session_id).await
+    }
+
+    /// Store a memory entry with portable fabric metadata.
+    ///
+    /// Backends that have not implemented metadata persistence can safely fall
+    /// back to `store`, preserving compatibility while SQLite/Postgres converge
+    /// on the same schema.
+    async fn store_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        metadata: MemoryStoreMetadata,
+    ) -> anyhow::Result<()> {
+        let _ = metadata;
+        self.store(key, content, category, session_id).await
+    }
+
+    /// Store a memory entry with both channel/tool context and fabric metadata.
+    async fn store_with_context_and_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+        metadata: MemoryStoreMetadata,
+    ) -> anyhow::Result<()> {
+        let _ = metadata;
+        self.store_with_context(key, content, category, session_id, context)
+            .await
     }
 
     /// Recall memories matching a query (keyword search), optionally scoped to a session
@@ -226,6 +467,132 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<HashMap<String, Vec<ConversationTurn>>> {
         let _ = (max_turns_per_session, max_sessions);
         Ok(HashMap::new())
+    }
+
+    /// Append a normalized message event into the shared memory fabric.
+    ///
+    /// Backends without event-log support can no-op and return a synthetic event
+    /// so callers can be wired before every backend is upgraded.
+    async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
+        let now = chrono::Utc::now().to_rfc3339();
+        Ok(MessageEvent {
+            id: 0,
+            event_id: input.event_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            idempotency_key: input.idempotency_key,
+            workspace_id: input.workspace_id,
+            source: input.source,
+            channel: input.channel,
+            session_key: input.session_key,
+            parent_session_key: input.parent_session_key,
+            run_id: input.run_id,
+            parent_run_id: input.parent_run_id,
+            agent_id: input.agent_id,
+            persona_id: input.persona_id,
+            sender: input.sender,
+            recipient: input.recipient,
+            role: input.role,
+            content: input.content,
+            content_hash: None,
+            raw_payload_json: input.raw_payload_json,
+            visibility: input.visibility,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    /// List message events visible to `principal` after a cursor.
+    async fn list_message_events_since(
+        &self,
+        principal: &MemoryPrincipal,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let _ = (principal, after_id, limit);
+        Ok(Vec::new())
+    }
+
+    /// Load recent shared context events visible to an agent turn.
+    async fn load_recent_shared_context(&self, query: SharedContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
+        let _ = query;
+        Ok(Vec::new())
+    }
+
+    /// Load recent current-session context events visible to an agent turn.
+    async fn load_recent_session_context(&self, query: SessionContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
+        let _ = query;
+        Ok(Vec::new())
+    }
+
+    /// Append a memory outbox event.
+    async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
+        let now = chrono::Utc::now().to_rfc3339();
+        Ok(MemoryEvent {
+            id: 0,
+            event_id: input.event_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            workspace_id: input.workspace_id,
+            event_type: input.event_type,
+            subject_table: input.subject_table,
+            subject_id: input.subject_id,
+            session_key: input.session_key,
+            agent_id: input.agent_id,
+            persona_id: input.persona_id,
+            visibility: input.visibility,
+            payload_json: input.payload_json,
+            created_at: now,
+        })
+    }
+
+    /// List memory outbox events visible to `principal` after a cursor.
+    async fn list_memory_events_since(
+        &self,
+        principal: &MemoryPrincipal,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEvent>> {
+        let _ = (principal, after_id, limit);
+        Ok(Vec::new())
+    }
+
+    /// Create a private worker memory draft.
+    async fn create_memory_draft(&self, input: MemoryDraftInput) -> anyhow::Result<MemoryDraft> {
+        let now = chrono::Utc::now().to_rfc3339();
+        Ok(MemoryDraft {
+            id: 0,
+            draft_id: input.draft_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            workspace_id: input.workspace_id,
+            worker_run_id: input.worker_run_id,
+            parent_run_id: input.parent_run_id,
+            session_key: input.session_key,
+            agent_id: input.agent_id,
+            persona_id: input.persona_id,
+            key: input.key,
+            content: input.content,
+            category: input.category,
+            source_event_id: input.source_event_id,
+            visibility: input.visibility,
+            status: "pending".to_string(),
+            payload_json: input.payload_json,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    /// List memory drafts produced by a worker run.
+    async fn list_memory_drafts_for_run(&self, worker_run_id: &str) -> anyhow::Result<Vec<MemoryDraft>> {
+        let _ = worker_run_id;
+        Ok(Vec::new())
+    }
+
+    /// Mark a draft as merged into semantic memory.
+    async fn merge_memory_draft(&self, draft_id: &str) -> anyhow::Result<Option<MemoryDraft>> {
+        let _ = draft_id;
+        Ok(None)
+    }
+
+    /// Reject a draft without merging it into semantic memory.
+    async fn reject_memory_draft(&self, draft_id: &str, reason: Option<&str>) -> anyhow::Result<Option<MemoryDraft>> {
+        let _ = (draft_id, reason);
+        Ok(None)
     }
 }
 

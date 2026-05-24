@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod chunker;
 pub mod embeddings;
+pub mod fabric;
 pub mod filter;
 pub mod hygiene;
 pub mod lucid;
@@ -18,7 +19,9 @@ pub use backend::{
     MemoryBackendKind, classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends,
 };
-pub use filter::should_autosave_content;
+#[allow(unused_imports)]
+pub use fabric::{MemoryEventRecording, MemoryEventWatcher, MemoryFabric, MessageEventScope};
+pub use filter::{should_autosave_content, should_autosave_content_with_min};
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -27,7 +30,12 @@ pub use principal::MemoryWriteContext;
 pub use sqlite::SqliteMemory;
 pub use traits::LifecycleState;
 pub use traits::Memory;
-pub use traits::{ConversationSessionSummary, MemoryCategory, MemoryEntry};
+#[allow(unused_imports)]
+pub use traits::{
+    ConversationSessionSummary, ConversationTurn, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry,
+    MemoryEvent, MemoryEventInput, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent,
+    MessageEventInput, SessionContextQuery, SharedContextQuery,
+};
 
 use crate::config::{
     EmbeddingRouteConfig, IdentityBindingConfig, MemoryConfig, StorageProviderConfig, UserPolicyConfig,

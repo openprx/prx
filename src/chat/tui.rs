@@ -202,6 +202,12 @@ impl ConversationLine {
 /// (Lines beyond this still exist in the buffer; future work can add scroll.)
 pub const INPUT_MAX_VISIBLE_ROWS: usize = 10;
 
+/// Maximum bytes accepted into the TUI draft buffer.
+///
+/// This keeps tmux key-flood paste paths bounded while still allowing the
+/// 10 KB manual paste scenario to pass with margin.
+pub const INPUT_MAX_BYTES: usize = 32 * 1024;
+
 /// Maximum number of submitted entries kept in the history ring.
 pub const INPUT_HISTORY_CAPACITY: usize = 200;
 
@@ -219,6 +225,8 @@ pub const INPUT_HISTORY_CAPACITY: usize = 200;
 pub enum InputOutcome {
     /// Key was consumed; no externally observable change beyond the buffer.
     Consumed,
+    /// Key was ignored because it would not change the buffer.
+    Ignored,
     /// User pressed Enter on a non-empty buffer. The full multi-line text is
     /// returned, the buffer has been cleared, and history advanced.
     Submitted(String),
@@ -254,6 +262,8 @@ pub enum KeyDispatch {
     /// Global shortcut handled or input-only change. The event loop should
     /// re-render but otherwise continue waiting for input.
     Consumed,
+    /// Event was intentionally ignored and does not need a redraw.
+    Ignored,
     /// User pressed Enter on a non-empty buffer. The full multi-line text is
     /// the value to deliver to the agent pipeline.
     Submitted(String),
@@ -332,6 +342,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         InputOutcome::Submitted(text) => KeyDispatch::Submitted(text),
         InputOutcome::Cancelled => KeyDispatch::Cancelled,
         InputOutcome::Consumed | InputOutcome::Unhandled => KeyDispatch::Consumed,
+        InputOutcome::Ignored => KeyDispatch::Ignored,
     }
 }
 
@@ -358,6 +369,8 @@ pub struct TuiInput {
     /// Snapshot of the in-flight buffer saved when entering history nav, so we
     /// can restore it when the user scrolls past the end of history.
     pending_draft: Option<Vec<String>>,
+    /// True when text was ignored because the input reached INPUT_MAX_BYTES.
+    pub truncated: bool,
 }
 
 impl Default for TuiInput {
@@ -375,6 +388,7 @@ impl TuiInput {
             history: Vec::new(),
             history_pos: None,
             pending_draft: None,
+            truncated: false,
         }
     }
 
@@ -386,6 +400,12 @@ impl TuiInput {
     /// True when the buffer is logically empty (single empty line).
     pub fn is_empty(&self) -> bool {
         self.lines.len() == 1 && self.lines.first().is_none_or(String::is_empty)
+    }
+
+    /// Current draft size in bytes, counting newline separators between rows.
+    pub fn byte_len(&self) -> usize {
+        let content_bytes: usize = self.lines.iter().map(String::len).sum();
+        content_bytes.saturating_add(self.lines.len().saturating_sub(1))
     }
 
     /// True if the user is currently editing a single logical line — used to
@@ -407,6 +427,7 @@ impl TuiInput {
         let last_line_idx = self.lines.len().saturating_sub(1);
         let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
         self.cursor = (last_line_idx, last_len);
+        self.truncated = false;
     }
 
     /// Clear the buffer back to a single empty line.
@@ -415,10 +436,15 @@ impl TuiInput {
         self.cursor = (0, 0);
         self.history_pos = None;
         self.pending_draft = None;
+        self.truncated = false;
     }
 
     /// Insert a single grapheme (`ch`) at the cursor.
-    fn insert_char(&mut self, ch: char) {
+    fn insert_char(&mut self, ch: char) -> bool {
+        if self.byte_len().saturating_add(ch.len_utf8()) > INPUT_MAX_BYTES {
+            self.truncated = true;
+            return false;
+        }
         let (li, off) = self.cursor;
         if let Some(line) = self.lines.get_mut(li) {
             // `off` is always at a char boundary because we only ever advance
@@ -426,11 +452,26 @@ impl TuiInput {
             let clamped = off.min(line.len());
             line.insert(clamped, ch);
             self.cursor = (li, clamped + ch.len_utf8());
+            if self.byte_len() >= INPUT_MAX_BYTES {
+                self.truncated = true;
+            }
+            return true;
         }
+        false
     }
 
     /// Insert a literal string at the cursor. Newlines split into rows.
     fn insert_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let remaining = INPUT_MAX_BYTES.saturating_sub(self.byte_len());
+        let text = if text.len() > remaining {
+            self.truncated = true;
+            clamp_str_to_byte_len(text, remaining)
+        } else {
+            text
+        };
         if text.is_empty() {
             return;
         }
@@ -466,6 +507,10 @@ impl TuiInput {
 
     /// Split the current line at the cursor (`Shift+Enter`).
     fn insert_newline(&mut self) {
+        if self.byte_len().saturating_add(1) > INPUT_MAX_BYTES {
+            self.truncated = true;
+            return;
+        }
         let (li, off) = self.cursor;
         if let Some(line) = self.lines.get_mut(li) {
             let clamped = off.min(line.len());
@@ -495,6 +540,9 @@ impl TuiInput {
                 self.cursor = (prev_idx, new_off);
             }
         }
+        if self.byte_len() < INPUT_MAX_BYTES {
+            self.truncated = false;
+        }
     }
 
     /// Delete the character at the cursor; join next line if at end of line.
@@ -516,6 +564,9 @@ impl TuiInput {
             if let Some(line) = self.lines.get_mut(li) {
                 line.push_str(&next);
             }
+        }
+        if self.byte_len() < INPUT_MAX_BYTES {
+            self.truncated = false;
         }
     }
 
@@ -601,6 +652,9 @@ impl TuiInput {
         if let Some(line) = self.lines.get_mut(li) {
             line.replace_range(0..off.min(line.len()), "");
             self.cursor = (li, 0);
+            if self.byte_len() < INPUT_MAX_BYTES {
+                self.truncated = false;
+            }
         }
     }
 
@@ -657,6 +711,7 @@ impl TuiInput {
             let last_line_idx = self.lines.len().saturating_sub(1);
             let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
             self.cursor = (last_line_idx, last_len);
+            self.truncated = false;
         } else {
             self.history_pos = Some(next_pos);
             if let Some(entry) = self.history.get(next_pos) {
@@ -705,8 +760,11 @@ impl TuiInput {
                 InputOutcome::Consumed
             }
             KeyCode::Char(ch) if !ctrl => {
-                self.insert_char(ch);
-                InputOutcome::Consumed
+                if self.insert_char(ch) {
+                    InputOutcome::Consumed
+                } else {
+                    InputOutcome::Ignored
+                }
             }
             KeyCode::Backspace => {
                 self.backspace();
@@ -777,6 +835,17 @@ impl TuiInput {
     pub fn paste(&mut self, text: &str) {
         self.insert_str(text);
     }
+}
+
+fn clamp_str_to_byte_len(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Round `idx` down to the nearest UTF-8 char boundary in `s`. Saturates at 0.
@@ -1896,11 +1965,16 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
         })
         .collect();
 
+    let input_title = if input_ref.truncated {
+        " Input - max 32768 bytes, extra ignored "
+    } else {
+        " Input "
+    };
     let input = Paragraph::new(Text::from(rendered_lines))
         .block(
             Block::default()
                 .borders(Borders::TOP)
-                .title(" Input ")
+                .title(input_title)
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
         .style(Style::default().fg(Color::White));
@@ -3157,7 +3231,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_10_large_paste_100kb_submits_without_truncation() {
+    fn p2_10_large_paste_100kb_is_bounded_and_recoverable() {
         let mut input = TuiInput::new();
         let line = "a".repeat(1024);
         let pasted = std::iter::repeat_n(line.as_str(), 100).collect::<Vec<_>>().join("\n");
@@ -3165,14 +3239,48 @@ mod tests {
         input.paste(&pasted);
 
         assert_eq!(pasted.len(), 102_499);
-        assert_eq!(input.lines.len(), 100);
-        assert_eq!(input.text(), pasted);
-        assert_eq!(input.cursor, (99, 1024));
+        assert_eq!(input.byte_len(), INPUT_MAX_BYTES);
+        assert!(input.truncated, "input should report ignored overflow bytes");
+        assert!(pasted.starts_with(&input.text()));
 
         let out = input.handle_key(key(KeyCode::Enter));
-        assert_eq!(out, InputOutcome::Submitted(pasted.clone()));
-        assert_eq!(input.history, vec![pasted]);
+        match out {
+            InputOutcome::Submitted(submitted) => {
+                assert_eq!(submitted.len(), INPUT_MAX_BYTES);
+                assert_eq!(input.history, vec![submitted]);
+            }
+            other => panic!("expected bounded large input to submit, got {other:?}"),
+        }
         assert!(input.is_empty(), "buffer cleared after large submit");
+    }
+
+    #[test]
+    fn p2_10_key_flood_stops_at_input_cap_and_ctrl_u_recovers() {
+        let mut input = TuiInput::new();
+        for _ in 0..(INPUT_MAX_BYTES + 1024) {
+            input.handle_key(key(KeyCode::Char('p')));
+        }
+
+        assert_eq!(input.byte_len(), INPUT_MAX_BYTES);
+        assert!(input.truncated);
+        assert_eq!(input.cursor, (0, INPUT_MAX_BYTES));
+
+        let out = input.handle_key(key_mod(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(out, InputOutcome::Consumed);
+        assert!(input.is_empty());
+        assert!(!input.truncated);
+    }
+
+    #[test]
+    fn p2_10_over_cap_plain_key_is_ignored_without_redraw() {
+        let mut state = TuiState::new("provider", "model");
+        state.input.paste(&"p".repeat(INPUT_MAX_BYTES));
+
+        let out = dispatch_global_key(key(KeyCode::Char('p')), &mut state);
+
+        assert_eq!(out, KeyDispatch::Ignored);
+        assert_eq!(state.input.byte_len(), INPUT_MAX_BYTES);
+        assert!(state.input.truncated);
     }
 
     #[test]

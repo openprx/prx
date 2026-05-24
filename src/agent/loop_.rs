@@ -3,7 +3,10 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
-use crate::memory::{self, Memory, MemoryCategory};
+use crate::memory::{
+    self, ConversationTurn, Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryVisibility, MessageEvent,
+    MessageEventScope, SessionContextQuery, SharedContextQuery,
+};
 use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall};
@@ -129,9 +132,6 @@ impl Default for ToolConcurrencyGovernanceConfig {
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
-/// Minimum user-message length (in chars) for auto-save to memory.
-/// Matches the channel-side constant in `channels/mod.rs`.
-const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 const TOOL_PARSE_LOG_PREVIEW_CHARS: usize = 200;
 
 /// Maximum characters allowed for a single tool result before truncation.
@@ -280,9 +280,29 @@ const MAX_MEMORY_PREAMBLE_BYTES: usize = 4096;
 /// Maximum bytes for a single memory entry within the preamble.
 const MAX_MEMORY_ENTRY_BYTES: usize = 512;
 
+/// Maximum bytes for recent shared message events injected into prompts.
+#[allow(dead_code)]
+const MAX_SHARED_EVENTS_PREAMBLE_BYTES: usize = 2048;
+
 pub(crate) struct RecalledMemoryContext {
     pub(crate) preamble: String,
     pub(crate) ids: Vec<String>,
+}
+
+pub(crate) struct AgentContextBundle {
+    pub(crate) current_session_context: String,
+    pub(crate) recent_shared_context: String,
+    pub(crate) semantic_memory_context: String,
+    pub(crate) recalled_memory_ids: Vec<String>,
+}
+
+impl AgentContextBundle {
+    pub(crate) fn preamble(&self) -> String {
+        format!(
+            "{}{}{}",
+            self.current_session_context, self.recent_shared_context, self.semantic_memory_context
+        )
+    }
 }
 
 fn autosave_memory_key(prefix: &str) -> String {
@@ -715,6 +735,207 @@ pub(crate) async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevanc
     }
 
     RecalledMemoryContext { preamble: context, ids }
+}
+
+#[allow(dead_code)]
+fn format_shared_event_line(event: &MessageEvent) -> String {
+    let channel = event.channel.as_deref().unwrap_or("unknown");
+    let actor = event
+        .sender
+        .as_deref()
+        .or(event.agent_id.as_deref())
+        .or(event.persona_id.as_deref())
+        .unwrap_or("unknown");
+    let mut content = event.content.trim().replace('\n', " ");
+    if content.len() > MAX_MEMORY_ENTRY_BYTES {
+        let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
+        content = format!("{}...", &content[..end]);
+    }
+    format!("- [{}:{}:{}] {}\n", event.source, channel, actor, content)
+}
+
+#[allow(dead_code)]
+fn format_session_event_line(event: &MessageEvent) -> String {
+    let actor = event
+        .sender
+        .as_deref()
+        .or(event.agent_id.as_deref())
+        .or(event.persona_id.as_deref())
+        .unwrap_or("unknown");
+    let mut content = event.content.trim().replace('\n', " ");
+    if content.len() > MAX_MEMORY_ENTRY_BYTES {
+        let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
+        content = format!("{}...", &content[..end]);
+    }
+    format!("- [{}:{}] {}\n", event.role, actor, content)
+}
+
+#[allow(dead_code)]
+fn build_shared_events_preamble(principal: &MemoryPrincipal, events: &[MessageEvent]) -> String {
+    let mut context = String::new();
+    for event in events {
+        if principal
+            .session_key
+            .as_ref()
+            .is_some_and(|session_key| event.session_key.as_ref() == Some(session_key))
+        {
+            continue;
+        }
+        if event.role == "tool" || event.role == "system" {
+            continue;
+        }
+        if context.is_empty() {
+            context.push_str("[Recent shared workspace events]\n");
+        }
+        let line = format_shared_event_line(event);
+        if context.len() + line.len() > MAX_SHARED_EVENTS_PREAMBLE_BYTES {
+            break;
+        }
+        context.push_str(&line);
+    }
+    if !context.is_empty() {
+        context.push('\n');
+    }
+    context
+}
+
+#[allow(dead_code)]
+fn build_current_session_events_preamble(
+    principal: &MemoryPrincipal,
+    events: &[MessageEvent],
+    user_msg: &str,
+) -> String {
+    let Some(session_key) = principal.session_key.as_deref() else {
+        return String::new();
+    };
+    let mut context = String::new();
+    for event in events {
+        if event.session_key.as_deref() != Some(session_key) {
+            continue;
+        }
+        if event.role == "tool" || event.role == "system" {
+            continue;
+        }
+        if event.role == "user" && event.content.trim() == user_msg.trim() {
+            continue;
+        }
+        if context.is_empty() {
+            context.push_str("[Current session context]\n");
+        }
+        let line = format_session_event_line(event);
+        if context.len() + line.len() > MAX_SHARED_EVENTS_PREAMBLE_BYTES {
+            break;
+        }
+        context.push_str(&line);
+    }
+    if !context.is_empty() {
+        context.push('\n');
+    }
+    context
+}
+
+#[allow(dead_code)]
+fn format_session_turn_line(turn: &ConversationTurn) -> String {
+    let mut content = turn.content.trim().replace('\n', " ");
+    if content.len() > MAX_MEMORY_ENTRY_BYTES {
+        let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
+        content = format!("{}...", &content[..end]);
+    }
+    format!("- [{}] {}\n", turn.role, content)
+}
+
+#[allow(dead_code)]
+fn build_current_session_preamble(turns: &[ConversationTurn], user_msg: &str) -> String {
+    let mut context = String::new();
+    for turn in turns {
+        if turn.role == "tool" || turn.role == "system" {
+            continue;
+        }
+        if turn.role == "user" && turn.content.trim() == user_msg.trim() {
+            continue;
+        }
+        if context.is_empty() {
+            context.push_str("[Current session context]\n");
+        }
+        let line = format_session_turn_line(turn);
+        if context.len() + line.len() > MAX_SHARED_EVENTS_PREAMBLE_BYTES {
+            break;
+        }
+        context.push_str(&line);
+    }
+    if !context.is_empty() {
+        context.push('\n');
+    }
+    context
+}
+
+#[allow(dead_code)]
+pub(crate) async fn build_agent_context(
+    mem: &dyn Memory,
+    principal: MemoryPrincipal,
+    user_msg: &str,
+    min_relevance_score: f64,
+) -> AgentContextBundle {
+    let semantic = build_context(mem, user_msg, min_relevance_score).await;
+    let current_session_turns = match principal.session_key.as_deref() {
+        Some(session_key) => mem
+            .list_conversation_turns(session_key, 12, 0)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let current_session_events = mem
+        .load_recent_session_context(SessionContextQuery {
+            principal: principal.clone(),
+            since_event_id: None,
+            limit: 24,
+            include_roles: vec!["user".to_string(), "assistant".to_string(), "event".to_string()],
+        })
+        .await
+        .unwrap_or_default();
+    let shared_events = mem
+        .load_recent_shared_context(SharedContextQuery {
+            principal: principal.clone(),
+            since_event_id: None,
+            limit: 24,
+            include_roles: vec!["user".to_string(), "assistant".to_string(), "event".to_string()],
+        })
+        .await
+        .unwrap_or_default();
+    let current_session_context = {
+        let from_events = build_current_session_events_preamble(&principal, &current_session_events, user_msg);
+        if from_events.is_empty() {
+            build_current_session_preamble(&current_session_turns, user_msg)
+        } else {
+            from_events
+        }
+    };
+
+    AgentContextBundle {
+        current_session_context,
+        recent_shared_context: build_shared_events_preamble(&principal, &shared_events),
+        semantic_memory_context: semantic.preamble,
+        recalled_memory_ids: semantic.ids,
+    }
+}
+
+/// Build context with recent shared message events plus semantic memory recall.
+///
+/// The original `build_context` remains the semantic-memory helper. This wrapper
+/// preserves the existing call shape while the structured [`AgentContextBundle`]
+/// becomes the canonical context-builder output.
+#[allow(dead_code)]
+pub(crate) async fn build_context_with_shared_events(
+    mem: &dyn Memory,
+    principal: MemoryPrincipal,
+    user_msg: &str,
+    min_relevance_score: f64,
+) -> RecalledMemoryContext {
+    let bundle = build_agent_context(mem, principal, user_msg, min_relevance_score).await;
+    RecalledMemoryContext {
+        preamble: bundle.preamble(),
+        ids: bundle.recalled_memory_ids,
+    }
 }
 
 pub(crate) async fn increment_recalled_useful_counts(mem: &dyn Memory, recalled_ids: &[String]) {
@@ -2935,6 +3156,11 @@ pub async fn run(
         &config.user_policies,
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
+    let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
+        .with_event_recording(config.memory.event_recording_config());
+    let agent_run_id = Uuid::new_v4().to_string();
+    let agent_session_key = format!("agent:{agent_run_id}");
+    let mut fabric_turn_seq: u64 = 0;
 
     // ── Tools ────────────────────────────────────────────────────
     let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -3094,6 +3320,29 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
+        fabric_turn_seq += 1;
+        let fabric_scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
+            .with_channel("cli")
+            .with_session_key(agent_session_key.clone())
+            .with_run_id(agent_run_id.clone())
+            .with_sender("local-user")
+            .with_recipient(format!("{provider_name}/{model_name}"));
+        let agent_user_event = match memory_fabric
+            .record_inbound_user_message(
+                fabric_scope.clone(),
+                msg.clone(),
+                Some(format!("agent:{agent_run_id}:{fabric_turn_seq}:user")),
+                None,
+            )
+            .await
+        {
+            Ok(event) => Some(event),
+            Err(error) => {
+                tracing::warn!(error = %error, "Failed to append agent user message event");
+                None
+            }
+        };
+
         let selected_skills = select_prompt_skills(&msg, &skills, &config, skill_embedder.as_ref()).await;
         let system_prompt = build_runtime_system_prompt(
             &config,
@@ -3105,16 +3354,36 @@ pub async fn run(
         );
 
         // Auto-save user message to memory (skip short/trivial messages)
-        if config.memory.auto_save
-            && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-            && memory::should_autosave_content(&msg)
-        {
+        if config.memory.should_auto_promote_user_message(&msg) {
             let user_key = autosave_memory_key("user_msg");
-            let _ = mem.store(&user_key, &msg, MemoryCategory::Conversation, None).await;
+            let _ = memory_fabric
+                .record_semantic_memory_from_event(
+                    &user_key,
+                    &msg,
+                    MemoryCategory::Conversation,
+                    None,
+                    agent_user_event.as_ref().map(|event| event.event_id.as_str()),
+                    None,
+                    None,
+                )
+                .await;
         }
 
         // Inject memory context into user message
-        let mem_context = build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+        let mem_context = build_context_with_shared_events(
+            mem.as_ref(),
+            MemoryPrincipal {
+                workspace_id: memory_fabric.workspace_id().to_string(),
+                agent_id: None,
+                persona_id: None,
+                session_key: Some(agent_session_key.clone()),
+                channel: Some("cli".to_string()),
+                sender: Some("local-user".to_string()),
+            },
+            &msg,
+            config.memory.min_relevance_score,
+        )
+        .await;
         let context = mem_context.preamble.clone();
         let enriched = if context.is_empty() {
             msg.clone()
@@ -3162,6 +3431,18 @@ pub async fn run(
             ChatMode::default(),
         )
         .await?;
+        if let Err(error) = memory_fabric
+            .record_assistant_message(
+                fabric_scope
+                    .clone()
+                    .with_sender(format!("{provider_name}/{model_name}"))
+                    .with_recipient("local-user"),
+                response.clone(),
+            )
+            .await
+        {
+            tracing::warn!(error = %error, "Failed to append agent assistant message event");
+        }
         increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
         final_output = response.clone();
         println!("{response}");
@@ -3267,19 +3548,60 @@ pub async fn run(
                 _ => {}
             }
 
-            // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save
-                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                && memory::should_autosave_content(&user_input)
+            fabric_turn_seq += 1;
+            let fabric_scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
+                .with_channel("cli")
+                .with_session_key(agent_session_key.clone())
+                .with_run_id(agent_run_id.clone())
+                .with_sender("local-user")
+                .with_recipient(format!("{provider_name}/{model_name}"));
+            let agent_user_event = match memory_fabric
+                .record_inbound_user_message(
+                    fabric_scope.clone(),
+                    user_input.clone(),
+                    Some(format!("agent:{agent_run_id}:{fabric_turn_seq}:user")),
+                    None,
+                )
+                .await
             {
+                Ok(event) => Some(event),
+                Err(error) => {
+                    tracing::warn!(error = %error, "Failed to append agent user message event");
+                    None
+                }
+            };
+
+            // Auto-save conversation turns (skip short/trivial messages)
+            if config.memory.should_auto_promote_user_message(&user_input) {
                 let user_key = autosave_memory_key("user_msg");
-                let _ = mem
-                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
+                let _ = memory_fabric
+                    .record_semantic_memory_from_event(
+                        &user_key,
+                        &user_input,
+                        MemoryCategory::Conversation,
+                        None,
+                        agent_user_event.as_ref().map(|event| event.event_id.as_str()),
+                        None,
+                        None,
+                    )
                     .await;
             }
 
             // Inject memory context into user message
-            let mem_context = build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+            let mem_context = build_context_with_shared_events(
+                mem.as_ref(),
+                MemoryPrincipal {
+                    workspace_id: memory_fabric.workspace_id().to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some(agent_session_key.clone()),
+                    channel: Some("cli".to_string()),
+                    sender: Some("local-user".to_string()),
+                },
+                &user_input,
+                config.memory.min_relevance_score,
+            )
+            .await;
             let context = mem_context.preamble.clone();
             let enriched = if context.is_empty() {
                 user_input.clone()
@@ -3352,6 +3674,18 @@ pub async fn run(
                 }
             };
             increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
+            if let Err(error) = memory_fabric
+                .record_assistant_message(
+                    fabric_scope
+                        .clone()
+                        .with_sender(format!("{provider_name}/{model_name}"))
+                        .with_recipient("local-user"),
+                    response.clone(),
+                )
+                .await
+            {
+                tracing::warn!(error = %error, "Failed to append agent assistant message event");
+            }
             final_output = response.clone();
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
@@ -3429,6 +3763,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.identity_bindings,
         &config.user_policies,
     )?);
+    let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
+        .with_event_recording(config.memory.event_recording_config());
+    let agent_run_id = Uuid::new_v4().to_string();
+    let agent_session_key = format!("agent:{agent_run_id}");
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -3510,7 +3848,38 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &tools_registry,
     );
 
-    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
+    let fabric_scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
+        .with_channel("process_message")
+        .with_session_key(agent_session_key.clone())
+        .with_run_id(agent_run_id.clone())
+        .with_sender("local-user")
+        .with_recipient(format!("{provider_name}/{model_name}"));
+    if let Err(error) = memory_fabric
+        .record_inbound_user_message(
+            fabric_scope.clone(),
+            message.to_string(),
+            Some(format!("agent:{agent_run_id}:process:user")),
+            None,
+        )
+        .await
+    {
+        tracing::warn!(error = %error, "Failed to append process_message user event");
+    }
+
+    let mem_context = build_context_with_shared_events(
+        mem.as_ref(),
+        MemoryPrincipal {
+            workspace_id: memory_fabric.workspace_id().to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some(agent_session_key.clone()),
+            channel: Some("process_message".to_string()),
+            sender: Some("local-user".to_string()),
+        },
+        message,
+        config.memory.min_relevance_score,
+    )
+    .await;
     let context = mem_context.preamble.clone();
     let enriched = if context.is_empty() {
         message.to_string()
@@ -3549,6 +3918,17 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         },
     )
     .await?;
+    if let Err(error) = memory_fabric
+        .record_assistant_message(
+            fabric_scope
+                .with_sender(format!("{provider_name}/{model_name}"))
+                .with_recipient("local-user"),
+            response.clone(),
+        )
+        .await
+    {
+        tracing::warn!(error = %error, "Failed to append process_message assistant event");
+    }
     increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
     hooks
         .emit(
@@ -3616,7 +3996,7 @@ mod tests {
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
     }
-    use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use crate::memory::{Memory, MemoryCategory, MemoryVisibility, MessageEventInput, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::ChatResponse;
     use crate::providers::traits::ProviderCapabilities;
@@ -5258,6 +5638,271 @@ ls -la
         assert!(!context.preamble.contains("assistant_resp_poisoned"));
         assert!(!context.preamble.contains("fabricated event"));
         assert_eq!(context.ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn build_context_with_shared_events_includes_external_visible_events() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        mem.append_message_event(MessageEventInput {
+            event_id: None,
+            idempotency_key: None,
+            workspace_id: "workspace-a".to_string(),
+            source: "channel".to_string(),
+            channel: Some("telegram".to_string()),
+            session_key: Some("telegram:chat-1".to_string()),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: Some("tg-user".to_string()),
+            recipient: None,
+            role: "user".to_string(),
+            content: "telegram status update".to_string(),
+            raw_payload_json: None,
+            visibility: MemoryVisibility::Workspace,
+        })
+        .await
+        .unwrap();
+        mem.append_message_event(MessageEventInput {
+            event_id: None,
+            idempotency_key: None,
+            workspace_id: "workspace-a".to_string(),
+            source: "chat".to_string(),
+            channel: Some("terminal".to_string()),
+            session_key: Some("chat:current".to_string()),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: Some("local-user".to_string()),
+            recipient: None,
+            role: "user".to_string(),
+            content: "what changed".to_string(),
+            raw_payload_json: None,
+            visibility: MemoryVisibility::Workspace,
+        })
+        .await
+        .unwrap();
+
+        let context = build_context_with_shared_events(
+            &mem,
+            MemoryPrincipal {
+                workspace_id: "workspace-a".to_string(),
+                agent_id: None,
+                persona_id: None,
+                session_key: Some("chat:current".to_string()),
+                channel: Some("terminal".to_string()),
+                sender: Some("local-user".to_string()),
+            },
+            "what changed",
+            0.0,
+        )
+        .await;
+
+        assert!(context.preamble.contains("[Recent shared workspace events]"));
+        assert!(context.preamble.contains("telegram status update"));
+        assert!(!context.preamble.contains("[Current session context]"));
+    }
+
+    #[tokio::test]
+    async fn build_agent_context_returns_structured_bundle() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "user_msg_pref",
+            "User prefers terse operational summaries",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.append_message_event(MessageEventInput {
+            event_id: None,
+            idempotency_key: None,
+            workspace_id: "workspace-a".to_string(),
+            source: "chat".to_string(),
+            channel: Some("terminal".to_string()),
+            session_key: Some("chat:current".to_string()),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: Some("local-user".to_string()),
+            recipient: None,
+            role: "user".to_string(),
+            content: "previous current-session request".to_string(),
+            raw_payload_json: None,
+            visibility: MemoryVisibility::Workspace,
+        })
+        .await
+        .unwrap();
+        mem.append_message_event(MessageEventInput {
+            event_id: None,
+            idempotency_key: None,
+            workspace_id: "workspace-a".to_string(),
+            source: "chat".to_string(),
+            channel: Some("terminal".to_string()),
+            session_key: Some("chat:current".to_string()),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: None,
+            recipient: None,
+            role: "assistant".to_string(),
+            content: "previous current-session answer".to_string(),
+            raw_payload_json: None,
+            visibility: MemoryVisibility::Workspace,
+        })
+        .await
+        .unwrap();
+        mem.append_conversation_turn(
+            "chat:current",
+            "terminal",
+            "local-user",
+            "user",
+            "previous current-session request",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.append_conversation_turn(
+            "chat:current",
+            "terminal",
+            "local-user",
+            "assistant",
+            "previous current-session answer",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.append_message_event(MessageEventInput {
+            event_id: None,
+            idempotency_key: None,
+            workspace_id: "workspace-a".to_string(),
+            source: "gateway".to_string(),
+            channel: Some("webhook".to_string()),
+            session_key: Some("gateway:webhook:client-a".to_string()),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: Some("client-a".to_string()),
+            recipient: None,
+            role: "user".to_string(),
+            content: "gateway shared status".to_string(),
+            raw_payload_json: None,
+            visibility: MemoryVisibility::Workspace,
+        })
+        .await
+        .unwrap();
+
+        let bundle = build_agent_context(
+            &mem,
+            MemoryPrincipal {
+                workspace_id: "workspace-a".to_string(),
+                agent_id: None,
+                persona_id: None,
+                session_key: Some("chat:current".to_string()),
+                channel: Some("terminal".to_string()),
+                sender: Some("local-user".to_string()),
+            },
+            "operational summaries",
+            0.0,
+        )
+        .await;
+
+        assert!(bundle.current_session_context.contains("[Current session context]"));
+        assert!(
+            bundle
+                .current_session_context
+                .contains("previous current-session request")
+        );
+        assert!(bundle.recent_shared_context.contains("gateway shared status"));
+        assert!(bundle.semantic_memory_context.contains("user_msg_pref"));
+        assert!(!bundle.recalled_memory_ids.is_empty());
+        assert!(bundle.preamble().contains("[Recent shared workspace events]"));
+        assert!(bundle.preamble().contains("[Memory context]"));
+    }
+
+    #[tokio::test]
+    async fn build_agent_context_keeps_current_session_when_shared_events_are_noisy() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.append_message_event(MessageEventInput {
+            event_id: None,
+            idempotency_key: None,
+            workspace_id: "workspace-a".to_string(),
+            source: "chat".to_string(),
+            channel: Some("terminal".to_string()),
+            session_key: Some("chat:current".to_string()),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: Some("local-user".to_string()),
+            recipient: None,
+            role: "user".to_string(),
+            content: "important current-session fact".to_string(),
+            raw_payload_json: None,
+            visibility: MemoryVisibility::Workspace,
+        })
+        .await
+        .unwrap();
+        for index in 0..40 {
+            mem.append_message_event(MessageEventInput {
+                event_id: None,
+                idempotency_key: None,
+                workspace_id: "workspace-a".to_string(),
+                source: "gateway".to_string(),
+                channel: Some("webhook".to_string()),
+                session_key: Some(format!("gateway:external:{index}")),
+                parent_session_key: None,
+                run_id: None,
+                parent_run_id: None,
+                agent_id: None,
+                persona_id: None,
+                sender: Some(format!("client-{index}")),
+                recipient: None,
+                role: "user".to_string(),
+                content: format!("external noisy event {index}"),
+                raw_payload_json: None,
+                visibility: MemoryVisibility::Workspace,
+            })
+            .await
+            .unwrap();
+        }
+
+        let bundle = build_agent_context(
+            &mem,
+            MemoryPrincipal {
+                workspace_id: "workspace-a".to_string(),
+                agent_id: None,
+                persona_id: None,
+                session_key: Some("chat:current".to_string()),
+                channel: Some("terminal".to_string()),
+                sender: Some("local-user".to_string()),
+            },
+            "what is current",
+            0.0,
+        )
+        .await;
+
+        assert!(
+            bundle
+                .current_session_context
+                .contains("important current-session fact")
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════

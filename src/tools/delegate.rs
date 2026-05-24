@@ -2,6 +2,7 @@ use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::agent::loop_::{ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
 use crate::config::DelegateAgentConfig;
 use crate::hooks::HookManager;
+use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MemoryVisibility, MessageEventScope};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::SecurityPolicy;
@@ -36,6 +37,9 @@ pub struct DelegateTool {
     multimodal_config: crate::config::MultimodalConfig,
     /// Compaction config inherited from root agent config.
     compaction_config: crate::config::AgentCompactionConfig,
+    /// Shared memory fabric backend for normalized delegation events.
+    memory: Option<Arc<dyn Memory>>,
+    event_recording: MemoryEventRecording,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +122,8 @@ impl DelegateTool {
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
             compaction_config: crate::config::AgentCompactionConfig::default(),
+            memory: None,
+            event_recording: MemoryEventRecording::default(),
         }
     }
 
@@ -155,6 +161,8 @@ impl DelegateTool {
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
             compaction_config: crate::config::AgentCompactionConfig::default(),
+            memory: None,
+            event_recording: MemoryEventRecording::default(),
         }
     }
 
@@ -175,6 +183,23 @@ impl DelegateTool {
         self.compaction_config = config;
         self
     }
+
+    /// Attach shared memory so delegate requests/results join the live fabric.
+    pub fn with_shared_memory(mut self, memory: Arc<dyn Memory>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    pub const fn with_event_recording(mut self, event_recording: MemoryEventRecording) -> Self {
+        self.event_recording = event_recording;
+        self
+    }
+}
+
+fn delegate_session_key(scope: Option<&DelegateScope>) -> String {
+    scope
+        .map(|scope| format!("delegate:{}:{}:{}", scope.channel, scope.chat_id, scope.sender))
+        .unwrap_or_else(|| "delegate:global".to_string())
 }
 
 #[async_trait]
@@ -333,10 +358,48 @@ impl Tool for DelegateTool {
         };
 
         let temperature = agent_config.temperature.unwrap_or(0.7);
+        let delegate_run_id = uuid::Uuid::new_v4().to_string();
+        let memory_fabric = self.memory.as_ref().map(|memory| {
+            MemoryFabric::new(memory.clone(), self.security.workspace_dir.to_string_lossy())
+                .with_event_recording(self.event_recording)
+        });
+        let session_key = delegate_session_key(scope.as_ref());
+        let mut event_scope = MessageEventScope::new("delegate", MemoryVisibility::Workspace)
+            .with_channel(scope.as_ref().map_or("delegate", |scope| scope.channel.as_str()))
+            .with_session_key(session_key.clone())
+            .with_run_id(delegate_run_id.clone())
+            .with_agent_id(agent_name);
+        if let Some(scope) = scope.as_ref() {
+            event_scope = event_scope
+                .with_sender(scope.sender.as_str())
+                .with_recipient(scope.chat_id.as_str());
+        }
+        if let Some(fabric) = memory_fabric.as_ref() {
+            if let Err(error) = fabric
+                .record_inbound_user_message(
+                    event_scope.clone(),
+                    prompt,
+                    Some(format!("delegate:{delegate_run_id}:request")),
+                    Some(
+                        json!({
+                            "agent": agent_name,
+                            "provider": agent_config.provider,
+                            "model": agent_config.model,
+                            "agentic": agent_config.agentic,
+                            "has_context": !context.is_empty()
+                        })
+                        .to_string(),
+                    ),
+                )
+                .await
+            {
+                tracing::warn!(agent = agent_name, "failed to record delegate request event: {error}");
+            }
+        }
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agent_config.agentic {
-            return self
+            let result = self
                 .execute_agentic(
                     agent_name,
                     agent_config,
@@ -346,6 +409,10 @@ impl Tool for DelegateTool {
                     scope.as_ref(),
                 )
                 .await;
+            if let Some(fabric) = memory_fabric.as_ref() {
+                record_delegate_result_event(fabric, event_scope, &result).await;
+            }
+            return result;
         }
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
@@ -378,7 +445,7 @@ impl Tool for DelegateTool {
                     rendered = "[Empty response]".to_string();
                 }
 
-                Ok(ToolResult {
+                let tool_result = ToolResult {
                     success: true,
                     output: format!(
                         "[Agent '{agent_name}' ({provider}/{model})]\n{rendered}",
@@ -386,13 +453,23 @@ impl Tool for DelegateTool {
                         model = agent_config.model
                     ),
                     error: None,
-                })
+                };
+                if let Some(fabric) = memory_fabric.as_ref() {
+                    record_delegate_result_event(fabric, event_scope, &Ok(tool_result.clone())).await;
+                }
+                Ok(tool_result)
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}",)),
-            }),
+            Err(e) => {
+                let tool_result = ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Agent '{agent_name}' failed: {e}",)),
+                };
+                if let Some(fabric) = memory_fabric.as_ref() {
+                    record_delegate_result_event(fabric, event_scope, &Ok(tool_result.clone())).await;
+                }
+                Ok(tool_result)
+            }
         }
     }
 
@@ -402,6 +479,38 @@ impl Tool for DelegateTool {
 
     fn categories(&self) -> &'static [ToolCategory] {
         &[ToolCategory::Automation]
+    }
+}
+
+async fn record_delegate_result_event(
+    fabric: &MemoryFabric,
+    scope: MessageEventScope,
+    result: &anyhow::Result<ToolResult>,
+) {
+    let (success, content, error) = match result {
+        Ok(result) => (
+            result.success,
+            if result.output.trim().is_empty() {
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "[delegate produced no output]".to_string())
+            } else {
+                result.output.clone()
+            },
+            result.error.clone(),
+        ),
+        Err(error) => (false, String::new(), Some(error.to_string())),
+    };
+    if let Err(error) = fabric
+        .record_worker_result(
+            scope,
+            content,
+            Some(json!({ "success": success, "error": error }).to_string()),
+        )
+        .await
+    {
+        tracing::warn!("failed to record delegate result event: {error}");
     }
 }
 
@@ -591,6 +700,7 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{MemoryPrincipal, SqliteMemory};
     use crate::providers::{ChatRequest, ChatResponse, ToolCall};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use anyhow::anyhow;
@@ -1001,6 +1111,75 @@ mod tests {
                 .unwrap_or("")
                 .contains("Failed to create provider")
         );
+    }
+
+    #[tokio::test]
+    async fn delegate_records_request_and_result_message_events() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let mut agents = HashMap::new();
+        agents.insert(
+            "tester".to_string(),
+            DelegateAgentConfig {
+                provider: "mock".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
+            },
+        );
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(agents, None, security).with_shared_memory(memory.clone());
+
+        let result = tool
+            .execute(json!({
+                "agent": "tester",
+                "prompt": "delegate through fabric",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "sender": "alice",
+                    "channel": "telegram",
+                    "chat_type": "direct",
+                    "chat_id": "chat-1"
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: tmp.path().to_string_lossy().to_string(),
+                    agent_id: Some("tester".to_string()),
+                    persona_id: None,
+                    session_key: Some("delegate:telegram:chat-1:alice".to_string()),
+                    channel: Some("telegram".to_string()),
+                    sender: Some("alice".to_string()),
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].source, "delegate");
+        assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].content, "delegate through fabric");
+        assert_eq!(events[1].source, "delegate");
+        assert_eq!(events[1].role, "event");
+        assert!(events[1].content.contains("tester"));
     }
 
     #[tokio::test]

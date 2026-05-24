@@ -64,6 +64,8 @@ pub enum Action {
     ModeChanged(ChatMode),
     /// 清除历史（/clear /new）
     HistoryCleared,
+    /// 清除历史并在同一 UI snapshot 中追加用户可见回执。
+    HistoryClearedWithNotice { notice: String },
 
     // ── LLM 流式 ────────────────────────────────────────────────
     /// 新一轮 LLM 推理开始，携带 draft_id 和取消令牌
@@ -219,6 +221,7 @@ impl Action {
             Self::SlashCommandIssued { .. } => "SlashCommandIssued",
             Self::ModeChanged(_) => "ModeChanged",
             Self::HistoryCleared => "HistoryCleared",
+            Self::HistoryClearedWithNotice { .. } => "HistoryClearedWithNotice",
             Self::TurnStarted { .. } => "TurnStarted",
             Self::StartLLMTurn { .. } => "StartLLMTurn",
             Self::StreamChunkReceived { .. } => "StreamChunkReceived",

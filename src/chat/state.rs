@@ -192,6 +192,8 @@ pub struct SessionState {
 pub struct UiState {
     /// 渲染好的对话行
     pub conversation_lines: Vec<ConversationLine>,
+    /// Incremented when conversation_lines is replaced wholesale.
+    pub conversation_generation: u64,
     /// 多行输入 buffer + 历史
     pub input: TuiInput,
     /// 当前对话回合计数（用于状态栏）
@@ -233,6 +235,8 @@ pub struct UiSnapshot {
     pub ascii_fallback: bool,
     /// 对话行历史（renderer 增量 insert_before 用 len() diff）.
     pub conversation_lines: Arc<Vec<ConversationLine>>,
+    /// Generation marker for wholesale conversation history replacement.
+    pub conversation_generation: u64,
     /// 当前 in-flight streaming draft（None 表示空闲）.
     pub streaming: Option<StreamingDraft>,
     /// 输入 buffer 快照（clone 成本接受，多行场景 < INPUT_MAX_VISIBLE_ROWS）.
@@ -253,6 +257,7 @@ impl UiSnapshot {
             turn_count: 0,
             ascii_fallback: false,
             conversation_lines: Arc::new(Vec::new()),
+            conversation_generation: 0,
             streaming: None,
             input: TuiInput::new(),
         }
@@ -314,7 +319,7 @@ impl ChatState {
     pub fn new(provider: Arc<str>, model: Arc<str>, shutdown: CancellationToken) -> Self {
         Self {
             session: SessionState {
-                id: String::new(),
+                id: uuid::Uuid::new_v4().to_string(),
                 title: String::new(),
                 provider,
                 model,
@@ -325,6 +330,7 @@ impl ChatState {
             },
             ui: UiState {
                 conversation_lines: Vec::new(),
+                conversation_generation: 0,
                 input: Self::new_input(),
                 turn_count: 0,
                 ascii_fallback: false,
@@ -386,6 +392,7 @@ impl ChatState {
             turn_count: self.ui.turn_count,
             ascii_fallback: self.ui.ascii_fallback,
             conversation_lines: lines,
+            conversation_generation: self.ui.conversation_generation,
             streaming: self.stream.draft.clone(),
             input: self.ui.input.clone(),
         }
@@ -430,10 +437,11 @@ impl ChatState {
     /// 内容字节级变化敏感（如 streaming chunk 累积）— streaming 的内容变化由
     /// 静态 whitelist `ui_dirty_for` 兜住（StreamChunkReceived → true）.
     #[cfg(feature = "terminal-tui")]
-    fn snapshot_dirty_fields(&self) -> (usize, bool, u64, usize) {
+    fn snapshot_dirty_fields(&self) -> (usize, u64, bool, u64, usize) {
         let draft_ver = self.stream.draft.as_ref().map_or(0, |d| d.version);
         (
             self.ui.conversation_lines.len(),
+            self.ui.conversation_generation,
             self.stream.draft.is_some(),
             draft_ver,
             self.ui.input.lines.len(),
@@ -488,6 +496,7 @@ impl ChatState {
                 vec![Effect::RequestRedraw]
             }
             Action::HistoryCleared => self.reduce_history_cleared(),
+            Action::HistoryClearedWithNotice { notice } => self.reduce_history_cleared_with_notice(notice),
             Action::HistoryCompacted { reason } => self.reduce_history_compacted(reason),
 
             // ── LLM 流式 (Step 3) ─────────────────────────────────
@@ -608,6 +617,7 @@ impl ChatState {
             crate::chat::tui::InputOutcome::Consumed | crate::chat::tui::InputOutcome::Unhandled => {
                 vec![Effect::RequestRedraw]
             }
+            crate::chat::tui::InputOutcome::Ignored => Vec::new(),
         }
     }
 
@@ -991,6 +1001,12 @@ impl ChatState {
         // 失败后本轮 tool_calls 不可信，下轮入口由 reduce_input_submitted 兜底再清一次）.
         self.control.current_turn_tool_calls.clear();
         self.control.current_turn_tool_args.clear();
+        #[cfg(feature = "terminal-tui")]
+        self.ui
+            .conversation_lines
+            .push(crate::chat::tui::ConversationLine::System {
+                content: format!("Error: {err}"),
+            });
         vec![
             Effect::LogTrace {
                 level: tracing::Level::WARN,
@@ -1536,6 +1552,7 @@ impl ChatState {
         self.session.history.extend(system_msgs);
         // 注: 当前 input buffer 不清理，由 InputCancelled 单独处理
         self.ui.conversation_lines.clear();
+        self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         vec![
             Effect::RequestRedraw,
             Effect::LogTrace {
@@ -1543,6 +1560,22 @@ impl ChatState {
                 msg: "History cleared".to_string(),
             },
         ]
+    }
+
+    fn reduce_history_cleared_with_notice(&mut self, notice: String) -> Vec<Effect> {
+        let mut effects = self.reduce_history_cleared();
+        #[cfg(feature = "terminal-tui")]
+        {
+            self.ui
+                .conversation_lines
+                .push(crate::chat::tui::ConversationLine::System { content: notice });
+        }
+        #[cfg(not(feature = "terminal-tui"))]
+        {
+            let _ = notice;
+        }
+        effects.push(Effect::RequestRedraw);
+        effects
     }
 
     /// `Action::HistoryCompacted` — 对 LLM context history 做 compaction.
@@ -1701,7 +1734,10 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::HistoryCompacted { .. } => false,
 
         // UI 镜像账本 / 历史清空 / Pure 模式用户 echo：直接动 conversation_lines → dirty
-        Action::SystemMessageAdded { .. } | Action::HistoryCleared | Action::UserMessageEchoed(_) => true,
+        Action::SystemMessageAdded { .. }
+        | Action::HistoryCleared
+        | Action::HistoryClearedWithNotice { .. }
+        | Action::UserMessageEchoed(_) => true,
         // RedrawRequested 仅产生 RequestRedraw Effect，本身不变 snapshot 字段；
         // 但语义上需要触发 redraw — 标 dirty 走 watch 路径.
         Action::RedrawRequested => true,
@@ -1740,7 +1776,7 @@ mod tests {
     #[test]
     fn test_chatstate_new_default_session() {
         let state = make_state();
-        assert!(state.session.id.is_empty());
+        assert!(uuid::Uuid::parse_str(&state.session.id).is_ok());
         assert!(state.session.title.is_empty());
         assert_eq!(&*state.session.provider, "test-provider");
         assert_eq!(&*state.session.model, "test-model");
@@ -2007,19 +2043,22 @@ mod tests {
         }
 
         #[test]
-        fn test_large_paste_can_be_submitted_without_truncation() {
+        fn test_large_paste_is_bounded_before_submit() {
             let mut state = s();
             let line = "b".repeat(1024);
             let pasted = std::iter::repeat_n(line.as_str(), 100).collect::<Vec<_>>().join("\n");
 
             let effects = state.reduce(Action::PasteReceived(pasted.clone()));
             assert!(has_request_redraw(&effects));
-            assert_eq!(state.ui.input.text(), pasted);
+            assert_eq!(state.ui.input.byte_len(), crate::chat::tui::INPUT_MAX_BYTES);
+            assert!(state.ui.input.truncated);
+            assert!(pasted.starts_with(&state.ui.input.text()));
+            let bounded = state.ui.input.text();
 
             let effects = state.reduce(Action::InputSubmitted(state.ui.input.text()));
             assert!(has_request_redraw(&effects));
             assert!(has_log_trace(&effects));
-            assert_eq!(state.ui.last_submitted.as_deref(), Some(pasted.as_str()));
+            assert_eq!(state.ui.last_submitted.as_deref(), Some(bounded.as_str()));
         }
 
         /// 9. TerminalResized → RequestRedraw
@@ -4303,128 +4342,6 @@ mod tests {
                 "Shutdown 后 generating=false，CancelRequested 必须 no-op，实际: {second_effects:?}"
             );
         }
-
-        /// S2-B-7 (Codex 阻塞): both_mode_legacy_arc_cancel_token_sync
-        ///
-        /// ReduxMode::Both 期间，chat::run 同时:
-        /// - 把 `cancellation.clone()` 写入 legacy `Arc<Mutex<Option<CancellationToken>>>`
-        ///   (mod.rs:1529 `*active_cancel.lock() = Some(cancellation.clone())`)
-        /// - 把 `cancellation.clone()` 通过 `Action::TurnStarted { cancel }` 写入
-        ///   `state.control.active_cancel`
-        ///
-        /// 这两个 token 必须是**同一个 cancellation 实例的克隆**（共享 internal
-        /// cancellation state），否则会出现"UI 取消了但底层仍跑"的窗口 —
-        /// 用户按 Ctrl+C → reducer 发 `Effect::CancelToken(state_clone)` →
-        /// executor 调 `state_clone.cancel()` →
-        /// 但旧顶层 Ctrl+C handler 读 `legacy_arc.lock().as_ref().cancel()`
-        /// 必须**也**看到 cancelled。
-        ///
-        /// 本测试模拟 Both 模式的双写，验证：
-        /// 1. 双写后 legacy Arc 与 state 各自持有 Some(token)
-        /// 2. 取消 Effect::CancelToken 携带的 token 后，legacy Arc 中的 token
-        ///    `is_cancelled()` 也变 true（共享 cancellation）
-        /// 3. 反向同样：取消 legacy Arc 中的 token，state 内的 token 也立即取消
-        #[test]
-        fn test_s2b_both_mode_legacy_arc_cancel_token_sync() {
-            // 模拟 Both 模式：chat::run 创建一份 cancellation，clone 给两条路径
-            let cancellation = CancellationToken::new();
-            let legacy_arc: Arc<parking_lot::Mutex<Option<CancellationToken>>> =
-                Arc::new(parking_lot::Mutex::new(None));
-
-            // 双写 1：写入 legacy Arc（mod.rs:1529 路径）
-            *legacy_arc.lock() = Some(cancellation.clone());
-
-            // 双写 2：写入 reducer state（Action::TurnStarted 路径）
-            let mut state = s();
-            let _ = state.reduce(Action::TurnStarted {
-                draft_id: "d-both".to_string(),
-                cancel: cancellation.clone(),
-            });
-
-            // 契约 1：双写后两边都持有 Some(token)
-            assert!(legacy_arc.lock().is_some(), "legacy Arc 应持有 Some(token)");
-            assert!(
-                state.control.active_cancel.is_some(),
-                "state.control.active_cancel 应持有 Some(token)"
-            );
-            // 两边都还没 cancel
-            assert!(
-                legacy_arc
-                    .lock()
-                    .as_ref()
-                    .is_some_and(|t| !CancellationToken::is_cancelled(t)),
-                "legacy Arc 中的 token 应处于未取消状态"
-            );
-            assert!(
-                state
-                    .control
-                    .active_cancel
-                    .as_ref()
-                    .is_some_and(|t| !CancellationToken::is_cancelled(t)),
-                "state 端 token 应处于未取消状态"
-            );
-
-            // 触发 CancelRequested → reducer take 走 state 端 token、发 Effect::CancelToken
-            let effects = state.reduce(Action::CancelRequested);
-            let token_from_effect = effects
-                .iter()
-                .find_map(|e| match e {
-                    Effect::CancelToken(t) => Some(t.clone()),
-                    _ => None,
-                })
-                .expect("test: Effect::CancelToken must be present");
-
-            // 关键断言：reducer 已 take 走 state 端，但 legacy Arc 仍持有 Some
-            // （Both 模式下 legacy 字段独立写/清，reducer 不动它）
-            assert!(state.control.active_cancel.is_none(), "reducer take 后 state 端清空");
-            assert!(
-                legacy_arc.lock().is_some(),
-                "Both 模式下 legacy Arc 仍持有 token（独立轴），不被 reducer 清空"
-            );
-
-            // 契约 2：EffectExecutor 真调 token.cancel() —
-            // legacy Arc 中的 token 必须**同步**变 cancelled（共享 cancellation 状态）
-            token_from_effect.cancel();
-            let legacy_is_cancelled = legacy_arc.lock().as_ref().map(CancellationToken::is_cancelled);
-            assert_eq!(
-                legacy_is_cancelled,
-                Some(true),
-                "legacy Arc 中的 token 必须与 Effect::CancelToken 的 token 共享 cancellation — \
-                 否则会出现 'UI 取消了但底层仍跑' 的窗口"
-            );
-            // 原始 cancellation 也应同步 cancelled
-            assert!(
-                cancellation.is_cancelled(),
-                "原始 cancellation handle 也应 cancelled（同一 token 克隆）"
-            );
-
-            // 契约 3：反向同步 — 新一轮 turn，从 legacy Arc 端 cancel，state 端应同步
-            let cancellation_b = CancellationToken::new();
-            let legacy_arc_b: Arc<parking_lot::Mutex<Option<CancellationToken>>> =
-                Arc::new(parking_lot::Mutex::new(Some(cancellation_b.clone())));
-            let mut state_b = s();
-            let _ = state_b.reduce(Action::TurnStarted {
-                draft_id: "d-both-b".to_string(),
-                cancel: cancellation_b.clone(),
-            });
-            // legacy 端调 cancel
-            if let Some(t) = legacy_arc_b.lock().as_ref() {
-                t.cancel();
-            }
-            // state 端应同步 cancelled
-            assert!(
-                state_b
-                    .control
-                    .active_cancel
-                    .as_ref()
-                    .is_some_and(CancellationToken::is_cancelled),
-                "legacy 端 cancel 后 state 端 token 应同步 cancelled（同一 cancellation 克隆）"
-            );
-            assert!(
-                cancellation_b.is_cancelled(),
-                "原始 cancellation handle B 也应同步 cancelled"
-            );
-        }
     }
 
     // ─── S2-C 集成测试 (3 个新增测试) ─────────────────────────────────────────
@@ -4487,6 +4404,28 @@ mod tests {
             // 边界：连续 /clear 应幂等（system 仍只一条）
             let _ = state.reduce(Action::HistoryCleared);
             assert_eq!(state.session.history.len(), 1, "二次 /clear 仍保留 1 条 system");
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn redux_history_cleared_with_notice_keeps_visible_feedback() {
+            let mut state = s();
+            state.session.history.push(ChatMessage::system("sys-prompt-v1"));
+            state.ui.conversation_lines.push(ConversationLine::User {
+                content: "/clear".to_string(),
+            });
+
+            let effects = state.reduce(Action::HistoryClearedWithNotice {
+                notice: "Conversation cleared (kept system prompt).".to_string(),
+            });
+
+            assert_eq!(state.session.history.len(), 1);
+            assert_eq!(state.ui.conversation_lines.len(), 1);
+            assert!(
+                matches!(state.ui.conversation_lines.first(), Some(ConversationLine::System { content }) if content.contains("Conversation cleared")),
+                "clear notice must survive the same reducer step that clears conversation_lines"
+            );
+            assert!(effects.iter().any(|e| matches!(e, Effect::RequestRedraw)));
         }
 
         /// S2-C-2: redux_history_append_order_user_assistant_stable
@@ -5241,14 +5180,9 @@ mod tests {
         fn s4_b_route_turn_pure_always_redux_driver() {
             use crate::chat::{ReduxMode, TurnRoute, route_turn};
             assert_eq!(
-                route_turn(ReduxMode::Pure, false, true),
+                route_turn(ReduxMode::Pure),
                 TurnRoute::ReduxDriver,
                 "Pure 模式无需 driver_opt_in 也应路由到 ReduxDriver"
-            );
-            assert_eq!(
-                route_turn(ReduxMode::Pure, true, false),
-                TurnRoute::ReduxDriver,
-                "Pure 模式无论 tools_empty=false 也应路由到 ReduxDriver"
             );
         }
 

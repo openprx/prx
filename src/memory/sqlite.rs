@@ -3,7 +3,9 @@ use super::filter::{MemorySafetyFilter, SourceMetadata, safety_rejection_message
 use super::principal::{ChatType, MemoryWriteContext, Principal, Role, Visibility, classify_memory, resolve_principal};
 use super::topic::resolve_topic;
 use super::traits::{
-    ConversationSessionSummary, ConversationTurn, Memory, MemoryCategory, MemoryEntry, validate_memory_write_target,
+    ConversationSessionSummary, ConversationTurn, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry,
+    MemoryEvent, MemoryEventInput, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent,
+    MessageEventInput, SessionContextQuery, SharedContextQuery, validate_memory_write_target,
 };
 use super::vector;
 use crate::self_system::evolution::record::Actor;
@@ -11,7 +13,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Local, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Row, params};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -255,6 +257,12 @@ impl SqliteMemory {
         }
     }
 
+    fn is_system_principal(principal: &MemoryPrincipal) -> bool {
+        let is_system_id = |value: &str| matches!(value, "self_system" | "router" | "internal" | "system");
+        principal.agent_id.as_deref().is_some_and(is_system_id)
+            || principal.persona_id.as_deref().is_some_and(is_system_id)
+    }
+
     /// Initialize all tables: memories, FTS5, `embedding_cache`
     fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
@@ -267,6 +275,11 @@ impl SqliteMemory {
                 embedding   BLOB,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL,
+                workspace_id TEXT,
+                agent_id     TEXT,
+                persona_id   TEXT,
+                source_event_id TEXT,
+                source       TEXT,
                 channel      TEXT,
                 chat_type    TEXT,
                 chat_id      TEXT,
@@ -423,16 +436,103 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_sessions_channel_updated_at ON sessions(channel, updated_at DESC);
 
             CREATE TABLE IF NOT EXISTS conversation_turns (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_key TEXT NOT NULL,
-                role        TEXT NOT NULL,
-                content     TEXT NOT NULL,
-                timestamp   TEXT NOT NULL,
-                message_id  TEXT,
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_key      TEXT NOT NULL,
+                role             TEXT NOT NULL,
+                content          TEXT NOT NULL,
+                timestamp        TEXT NOT NULL,
+                message_id       TEXT,
+                message_event_id TEXT,
+                agent_id         TEXT,
+                persona_id       TEXT,
+                visibility       TEXT,
                 FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_conversation_turns_session_key ON conversation_turns(session_key);
-            CREATE INDEX IF NOT EXISTS idx_conversation_turns_timestamp ON conversation_turns(timestamp DESC);",
+            CREATE INDEX IF NOT EXISTS idx_conversation_turns_timestamp ON conversation_turns(timestamp DESC);
+
+            CREATE TABLE IF NOT EXISTS message_events (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id           TEXT NOT NULL UNIQUE,
+                idempotency_key    TEXT UNIQUE,
+                workspace_id       TEXT NOT NULL,
+                source             TEXT NOT NULL,
+                channel            TEXT,
+                session_key        TEXT,
+                parent_session_key TEXT,
+                run_id             TEXT,
+                parent_run_id      TEXT,
+                agent_id           TEXT,
+                persona_id         TEXT,
+                sender             TEXT,
+                recipient          TEXT,
+                role               TEXT NOT NULL,
+                content            TEXT NOT NULL,
+                content_hash       TEXT,
+                raw_payload_json   TEXT,
+                visibility         TEXT NOT NULL DEFAULT 'workspace',
+                created_at         TEXT NOT NULL,
+                updated_at         TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_events_workspace_id
+                ON message_events(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_message_events_session
+                ON message_events(workspace_id, session_key, id);
+            CREATE INDEX IF NOT EXISTS idx_message_events_agent
+                ON message_events(workspace_id, agent_id, id);
+            CREATE INDEX IF NOT EXISTS idx_message_events_channel_sender
+                ON message_events(workspace_id, channel, sender, id);
+            CREATE INDEX IF NOT EXISTS idx_message_events_visibility
+                ON message_events(workspace_id, visibility, id);
+            CREATE INDEX IF NOT EXISTS idx_message_events_created_at
+                ON message_events(created_at);
+
+            CREATE TABLE IF NOT EXISTS memory_events (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id      TEXT NOT NULL UNIQUE,
+                workspace_id  TEXT NOT NULL,
+                event_type    TEXT NOT NULL,
+                subject_table TEXT NOT NULL,
+                subject_id    TEXT NOT NULL,
+                session_key   TEXT,
+                agent_id      TEXT,
+                persona_id    TEXT,
+                visibility    TEXT NOT NULL DEFAULT 'workspace',
+                payload_json  TEXT,
+                created_at    TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_events_workspace_id
+                ON memory_events(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_events_type
+                ON memory_events(workspace_id, event_type, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_events_session
+                ON memory_events(workspace_id, session_key, id);
+
+            CREATE TABLE IF NOT EXISTS memory_drafts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_id        TEXT NOT NULL UNIQUE,
+                workspace_id    TEXT NOT NULL,
+                worker_run_id   TEXT NOT NULL,
+                parent_run_id   TEXT,
+                session_key     TEXT,
+                agent_id        TEXT,
+                persona_id      TEXT,
+                key             TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                category        TEXT NOT NULL,
+                source_event_id TEXT,
+                visibility      TEXT NOT NULL DEFAULT 'workspace',
+                status          TEXT NOT NULL DEFAULT 'pending',
+                payload_json    TEXT,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_drafts_worker_run
+                ON memory_drafts(worker_run_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_drafts_status
+                ON memory_drafts(status, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_drafts_source_event
+                ON memory_drafts(source_event_id);",
         )?;
 
         let mut column_stmt = conn.prepare("PRAGMA table_info(memories)")?;
@@ -445,6 +545,14 @@ impl SqliteMemory {
         // Migration: add missing columns for backward compatibility.
         let missing_columns = [
             ("session_id", "ALTER TABLE memories ADD COLUMN session_id TEXT"),
+            ("workspace_id", "ALTER TABLE memories ADD COLUMN workspace_id TEXT"),
+            ("agent_id", "ALTER TABLE memories ADD COLUMN agent_id TEXT"),
+            ("persona_id", "ALTER TABLE memories ADD COLUMN persona_id TEXT"),
+            (
+                "source_event_id",
+                "ALTER TABLE memories ADD COLUMN source_event_id TEXT",
+            ),
+            ("source", "ALTER TABLE memories ADD COLUMN source TEXT"),
             ("channel", "ALTER TABLE memories ADD COLUMN channel TEXT"),
             ("chat_type", "ALTER TABLE memories ADD COLUMN chat_type TEXT"),
             ("chat_id", "ALTER TABLE memories ADD COLUMN chat_id TEXT"),
@@ -488,13 +596,101 @@ impl SqliteMemory {
             }
         }
 
+        let mut turn_column_stmt = conn.prepare("PRAGMA table_info(conversation_turns)")?;
+        let existing_turn_columns = turn_column_stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut turn_names = std::collections::HashSet::new();
+        for column in existing_turn_columns {
+            turn_names.insert(column?);
+        }
+        let missing_turn_columns = [
+            (
+                "message_event_id",
+                "ALTER TABLE conversation_turns ADD COLUMN message_event_id TEXT",
+            ),
+            ("agent_id", "ALTER TABLE conversation_turns ADD COLUMN agent_id TEXT"),
+            (
+                "persona_id",
+                "ALTER TABLE conversation_turns ADD COLUMN persona_id TEXT",
+            ),
+            (
+                "visibility",
+                "ALTER TABLE conversation_turns ADD COLUMN visibility TEXT",
+            ),
+        ];
+        for (name, alter_sql) in missing_turn_columns {
+            if !turn_names.contains(name) {
+                match conn.execute_batch(alter_sql) {
+                    Ok(()) => {}
+                    Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
+                        if msg.contains("duplicate column name") =>
+                    {
+                        tracing::debug!(
+                            "Column conversation_turns.{name} already exists (concurrent migration): {err}"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to add conversation_turns.{name}: {e}"));
+                    }
+                }
+            }
+        }
+
+        let mut draft_column_stmt = conn.prepare("PRAGMA table_info(memory_drafts)")?;
+        let existing_draft_columns = draft_column_stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut draft_names = std::collections::HashSet::new();
+        for column in existing_draft_columns {
+            draft_names.insert(column?);
+        }
+        let missing_draft_columns = [
+            (
+                "parent_run_id",
+                "ALTER TABLE memory_drafts ADD COLUMN parent_run_id TEXT",
+            ),
+            ("agent_id", "ALTER TABLE memory_drafts ADD COLUMN agent_id TEXT"),
+            ("persona_id", "ALTER TABLE memory_drafts ADD COLUMN persona_id TEXT"),
+            (
+                "source_event_id",
+                "ALTER TABLE memory_drafts ADD COLUMN source_event_id TEXT",
+            ),
+            (
+                "visibility",
+                "ALTER TABLE memory_drafts ADD COLUMN visibility TEXT NOT NULL DEFAULT 'workspace'",
+            ),
+            ("payload_json", "ALTER TABLE memory_drafts ADD COLUMN payload_json TEXT"),
+        ];
+        for (name, alter_sql) in missing_draft_columns {
+            if !draft_names.contains(name) {
+                match conn.execute_batch(alter_sql) {
+                    Ok(()) => {}
+                    Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
+                        if msg.contains("duplicate column name") =>
+                    {
+                        tracing::debug!("Column memory_drafts.{name} already exists (concurrent migration): {err}");
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to add memory_drafts.{name}: {e}"));
+                    }
+                }
+            }
+        }
+
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
              CREATE INDEX IF NOT EXISTS idx_mem_vis_chan_type_chat
                  ON memories(visibility, channel, chat_type, chat_id, sensitivity, created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_mem_sender ON memories(sender_id);
              CREATE INDEX IF NOT EXISTS idx_mem_topic_time ON memories(topic_id, created_at DESC);
-             CREATE INDEX IF NOT EXISTS idx_mem_channel ON memories(channel);",
+             CREATE INDEX IF NOT EXISTS idx_mem_channel ON memories(channel);
+             CREATE INDEX IF NOT EXISTS idx_mem_workspace_agent ON memories(workspace_id, agent_id, persona_id);
+             CREATE INDEX IF NOT EXISTS idx_mem_source_event ON memories(source_event_id);
+             CREATE INDEX IF NOT EXISTS idx_conversation_turns_message_event
+                 ON conversation_turns(message_event_id);
+             CREATE INDEX IF NOT EXISTS idx_memory_drafts_worker_run
+                 ON memory_drafts(worker_run_id, id);
+             CREATE INDEX IF NOT EXISTS idx_memory_drafts_status
+                 ON memory_drafts(status, id);
+             CREATE INDEX IF NOT EXISTS idx_memory_drafts_source_event
+                 ON memory_drafts(source_event_id);",
         )?;
 
         Ok(())
@@ -516,6 +712,75 @@ impl SqliteMemory {
             "conversation" => MemoryCategory::Conversation,
             other => MemoryCategory::Custom(other.to_string()),
         }
+    }
+
+    fn message_event_from_row(row: &Row<'_>) -> rusqlite::Result<MessageEvent> {
+        let visibility_raw: String = row.get(18)?;
+        Ok(MessageEvent {
+            id: row.get(0)?,
+            event_id: row.get(1)?,
+            idempotency_key: row.get(2)?,
+            workspace_id: row.get(3)?,
+            source: row.get(4)?,
+            channel: row.get(5)?,
+            session_key: row.get(6)?,
+            parent_session_key: row.get(7)?,
+            run_id: row.get(8)?,
+            parent_run_id: row.get(9)?,
+            agent_id: row.get(10)?,
+            persona_id: row.get(11)?,
+            sender: row.get(12)?,
+            recipient: row.get(13)?,
+            role: row.get(14)?,
+            content: row.get(15)?,
+            content_hash: row.get(16)?,
+            raw_payload_json: row.get(17)?,
+            visibility: visibility_raw.parse().unwrap_or(MemoryVisibility::Workspace),
+            created_at: row.get(19)?,
+            updated_at: row.get(20)?,
+        })
+    }
+
+    fn memory_event_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryEvent> {
+        let visibility_raw: String = row.get(9)?;
+        Ok(MemoryEvent {
+            id: row.get(0)?,
+            event_id: row.get(1)?,
+            workspace_id: row.get(2)?,
+            event_type: row.get(3)?,
+            subject_table: row.get(4)?,
+            subject_id: row.get(5)?,
+            session_key: row.get(6)?,
+            agent_id: row.get(7)?,
+            persona_id: row.get(8)?,
+            visibility: visibility_raw.parse().unwrap_or(MemoryVisibility::Workspace),
+            payload_json: row.get(10)?,
+            created_at: row.get(11)?,
+        })
+    }
+
+    fn memory_draft_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryDraft> {
+        let category_raw: String = row.get(10)?;
+        let visibility_raw: String = row.get(12)?;
+        Ok(MemoryDraft {
+            id: row.get(0)?,
+            draft_id: row.get(1)?,
+            workspace_id: row.get(2)?,
+            worker_run_id: row.get(3)?,
+            parent_run_id: row.get(4)?,
+            session_key: row.get(5)?,
+            agent_id: row.get(6)?,
+            persona_id: row.get(7)?,
+            key: row.get(8)?,
+            content: row.get(9)?,
+            category: Self::str_to_category(&category_raw),
+            source_event_id: row.get(11)?,
+            visibility: visibility_raw.parse().unwrap_or(MemoryVisibility::Workspace),
+            status: row.get(13)?,
+            payload_json: row.get(14)?,
+            created_at: row.get(15)?,
+            updated_at: row.get(16)?,
+        })
     }
 
     fn backup_file_path(db_path: &Path, category: &MemoryCategory) -> PathBuf {
@@ -590,6 +855,7 @@ impl SqliteMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
         context: Option<&MemoryWriteContext>,
+        metadata: Option<MemoryStoreMetadata>,
     ) -> anyhow::Result<()> {
         validate_memory_write_target(key, session_id)?;
         self.check_memory_safety(content, context).await?;
@@ -611,6 +877,7 @@ impl SqliteMemory {
         let content = content.to_string();
         let sid = session_id.map(String::from);
         let write_ctx = context.cloned();
+        let metadata = metadata.unwrap_or_default();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
@@ -709,6 +976,33 @@ impl SqliteMemory {
                         updated_at = excluded.updated_at,
                         session_id = excluded.session_id",
                     params![id, &key, &content, cat, embedding_bytes, now, now, sid],
+                )?;
+            }
+
+            if metadata.workspace_id.is_some()
+                || metadata.agent_id.is_some()
+                || metadata.persona_id.is_some()
+                || metadata.source_event_id.is_some()
+                || metadata.source.is_some()
+            {
+                conn.execute(
+                    "UPDATE memories
+                     SET workspace_id = ?1,
+                         agent_id = ?2,
+                         persona_id = ?3,
+                         source_event_id = ?4,
+                         source = ?5,
+                         updated_at = ?6
+                     WHERE key = ?7",
+                    params![
+                        metadata.workspace_id,
+                        metadata.agent_id,
+                        metadata.persona_id,
+                        metadata.source_event_id,
+                        metadata.source,
+                        Local::now().to_rfc3339(),
+                        &key,
+                    ],
                 )?;
             }
 
@@ -975,7 +1269,8 @@ impl Memory for SqliteMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.store_internal(key, content, category, session_id, None).await
+        self.store_internal(key, content, category, session_id, None, None)
+            .await
     }
 
     async fn store_with_context(
@@ -986,7 +1281,33 @@ impl Memory for SqliteMemory {
         session_id: Option<&str>,
         context: Option<&MemoryWriteContext>,
     ) -> anyhow::Result<()> {
-        self.store_internal(key, content, category, session_id, context).await
+        self.store_internal(key, content, category, session_id, context, None)
+            .await
+    }
+
+    async fn store_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        metadata: MemoryStoreMetadata,
+    ) -> anyhow::Result<()> {
+        self.store_internal(key, content, category, session_id, None, Some(metadata))
+            .await
+    }
+
+    async fn store_with_context_and_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+        metadata: MemoryStoreMetadata,
+    ) -> anyhow::Result<()> {
+        self.store_internal(key, content, category, session_id, context, Some(metadata))
+            .await
     }
 
     async fn recall(&self, query: &str, limit: usize, session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
@@ -1588,6 +1909,683 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<MessageEvent> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            let now = Utc::now().to_rfc3339();
+            let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let content_hash = Self::content_hash(&input.content);
+            let visibility = input.visibility.as_str().to_string();
+
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO message_events (
+                    event_id, idempotency_key, workspace_id, source, channel, session_key,
+                    parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                    sender, recipient, role, content, content_hash, raw_payload_json,
+                    visibility, created_at, updated_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                params![
+                    event_id,
+                    input.idempotency_key,
+                    input.workspace_id,
+                    input.source,
+                    input.channel,
+                    input.session_key,
+                    input.parent_session_key,
+                    input.run_id,
+                    input.parent_run_id,
+                    input.agent_id,
+                    input.persona_id,
+                    input.sender,
+                    input.recipient,
+                    input.role,
+                    input.content,
+                    content_hash,
+                    input.raw_payload_json,
+                    visibility,
+                    now,
+                    now
+                ],
+            )?;
+
+            let event = if let Some(ref idempotency_key) = input.idempotency_key {
+                tx.query_row(
+                    "SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                            parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                            sender, recipient, role, content, content_hash, raw_payload_json,
+                            visibility, created_at, updated_at
+                     FROM message_events
+                     WHERE event_id = ?1 OR idempotency_key = ?2
+                     ORDER BY CASE WHEN event_id = ?1 THEN 0 ELSE 1 END
+                     LIMIT 1",
+                    params![event_id, idempotency_key],
+                    Self::message_event_from_row,
+                )?
+            } else {
+                tx.query_row(
+                    "SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                            parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                            sender, recipient, role, content, content_hash, raw_payload_json,
+                            visibility, created_at, updated_at
+                     FROM message_events
+                     WHERE event_id = ?1
+                     LIMIT 1",
+                    params![event_id],
+                    Self::message_event_from_row,
+                )?
+            };
+
+            if inserted > 0 {
+                let outbox_event_type = if event.role == "event" {
+                    "worker.result.created"
+                } else {
+                    "message.created"
+                };
+                tx.execute(
+                    "INSERT INTO memory_events (
+                        event_id, workspace_id, event_type, subject_table, subject_id, session_key,
+                        agent_id, persona_id, visibility, payload_json, created_at
+                     )
+                     VALUES (?1, ?2, ?3, 'message_events', ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        event.workspace_id,
+                        outbox_event_type,
+                        event.event_id,
+                        event.session_key,
+                        event.agent_id,
+                        event.persona_id,
+                        event.visibility.as_str(),
+                        Utc::now().to_rfc3339()
+                    ],
+                )?;
+            }
+
+            tx.commit()?;
+            Ok(event)
+        })
+        .await?
+    }
+
+    async fn list_message_events_since(
+        &self,
+        principal: &MemoryPrincipal,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let conn = self.conn.clone();
+        let principal = principal.clone();
+        let limit = Self::sanitize_conversation_limit(limit);
+        let system_allowed = Self::is_system_principal(&principal);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, content, content_hash, raw_payload_json,
+                        visibility, created_at, updated_at
+                 FROM message_events
+                 WHERE id > ?1
+                   AND (
+                       visibility = 'global'
+                       OR (
+                           workspace_id = ?2
+                           AND (
+                               visibility = 'workspace'
+                               OR (visibility = 'agent' AND (
+                                   (?3 IS NOT NULL AND agent_id = ?3)
+                                   OR (?4 IS NOT NULL AND persona_id = ?4)
+                               ))
+                               OR (visibility = 'session' AND ?5 IS NOT NULL AND session_key = ?5)
+                               OR (visibility = 'private' AND (
+                                   (?3 IS NOT NULL AND agent_id = ?3)
+                                   OR (?4 IS NOT NULL AND persona_id = ?4)
+                                   OR (?6 IS NOT NULL AND sender = ?6)
+                               ))
+                               OR (visibility = 'system' AND ?7)
+                           )
+                       )
+                   )
+                 ORDER BY id ASC
+                 LIMIT ?8",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    after_id,
+                    principal.workspace_id,
+                    principal.agent_id,
+                    principal.persona_id,
+                    principal.session_key,
+                    principal.sender,
+                    system_allowed,
+                    limit
+                ],
+                Self::message_event_from_row,
+            )?;
+
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await?
+    }
+
+    async fn load_recent_shared_context(&self, query: SharedContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
+        let conn = self.conn.clone();
+        let principal = query.principal;
+        let limit = Self::sanitize_conversation_limit(query.limit);
+        let after_id = query.since_event_id.unwrap_or(0);
+        let system_allowed = Self::is_system_principal(&principal);
+        let include_roles = query
+            .include_roles
+            .into_iter()
+            .map(|role| role.trim().to_ascii_lowercase())
+            .filter(|role| !role.is_empty())
+            .collect::<std::collections::HashSet<_>>();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, content, content_hash, raw_payload_json,
+                        visibility, created_at, updated_at
+                 FROM message_events
+                 WHERE id > ?1
+                   AND (
+                       visibility = 'global'
+                       OR (
+                           workspace_id = ?2
+                           AND (
+                               visibility = 'workspace'
+                               OR (visibility = 'agent' AND (
+                                   (?3 IS NOT NULL AND agent_id = ?3)
+                                   OR (?4 IS NOT NULL AND persona_id = ?4)
+                               ))
+                               OR (visibility = 'session' AND ?5 IS NOT NULL AND session_key = ?5)
+                               OR (visibility = 'private' AND (
+                                   (?3 IS NOT NULL AND agent_id = ?3)
+                                   OR (?4 IS NOT NULL AND persona_id = ?4)
+                                   OR (?6 IS NOT NULL AND sender = ?6)
+                               ))
+                               OR (visibility = 'system' AND ?7)
+                           )
+                       )
+                   )
+                 ORDER BY id DESC
+                 LIMIT ?8",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    after_id,
+                    principal.workspace_id,
+                    principal.agent_id,
+                    principal.persona_id,
+                    principal.session_key,
+                    principal.sender,
+                    system_allowed,
+                    limit
+                ],
+                Self::message_event_from_row,
+            )?;
+
+            let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+            events.reverse();
+            if include_roles.is_empty() {
+                return Ok(events);
+            }
+            Ok(events
+                .into_iter()
+                .filter(|event| include_roles.contains(&event.role.to_ascii_lowercase()))
+                .collect())
+        })
+        .await?
+    }
+
+    async fn load_recent_session_context(&self, query: SessionContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
+        let Some(session_key) = query.principal.session_key.clone() else {
+            return Ok(Vec::new());
+        };
+        let conn = self.conn.clone();
+        let principal = query.principal;
+        let limit = Self::sanitize_conversation_limit(query.limit);
+        let after_id = query.since_event_id.unwrap_or(0);
+        let system_allowed = Self::is_system_principal(&principal);
+        let include_roles = query
+            .include_roles
+            .into_iter()
+            .map(|role| role.trim().to_ascii_lowercase())
+            .filter(|role| !role.is_empty())
+            .collect::<std::collections::HashSet<_>>();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, content, content_hash, raw_payload_json,
+                        visibility, created_at, updated_at
+                 FROM message_events
+                 WHERE id > ?1
+                   AND workspace_id = ?2
+                   AND session_key = ?3
+                   AND (
+                       visibility IN ('global', 'workspace')
+                       OR (visibility = 'agent' AND (
+                           (?4 IS NOT NULL AND agent_id = ?4)
+                           OR (?5 IS NOT NULL AND persona_id = ?5)
+                       ))
+                       OR visibility = 'session'
+                       OR (visibility = 'private' AND (
+                           (?4 IS NOT NULL AND agent_id = ?4)
+                           OR (?5 IS NOT NULL AND persona_id = ?5)
+                           OR (?6 IS NOT NULL AND sender = ?6)
+                       ))
+                       OR (visibility = 'system' AND ?7)
+                   )
+                 ORDER BY id DESC
+                 LIMIT ?8",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    after_id,
+                    principal.workspace_id,
+                    session_key,
+                    principal.agent_id,
+                    principal.persona_id,
+                    principal.sender,
+                    system_allowed,
+                    limit
+                ],
+                Self::message_event_from_row,
+            )?;
+
+            let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+            events.reverse();
+            if include_roles.is_empty() {
+                return Ok(events);
+            }
+            Ok(events
+                .into_iter()
+                .filter(|event| include_roles.contains(&event.role.to_ascii_lowercase()))
+                .collect())
+        })
+        .await?
+    }
+
+    async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryEvent> {
+            let conn = conn.lock();
+            let now = Utc::now().to_rfc3339();
+            let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_events (
+                    event_id, workspace_id, event_type, subject_table, subject_id,
+                    session_key, agent_id, persona_id, visibility, payload_json, created_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    event_id,
+                    input.workspace_id,
+                    input.event_type,
+                    input.subject_table,
+                    input.subject_id,
+                    input.session_key,
+                    input.agent_id,
+                    input.persona_id,
+                    input.visibility.as_str(),
+                    input.payload_json,
+                    now
+                ],
+            )?;
+
+            let event = conn.query_row(
+                "SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
+                        session_key, agent_id, persona_id, visibility, payload_json, created_at
+                 FROM memory_events
+                 WHERE event_id = ?1
+                 LIMIT 1",
+                params![event_id],
+                Self::memory_event_from_row,
+            )?;
+            Ok(event)
+        })
+        .await?
+    }
+
+    async fn list_memory_events_since(
+        &self,
+        principal: &MemoryPrincipal,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEvent>> {
+        let conn = self.conn.clone();
+        let principal = principal.clone();
+        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
+            let conn = conn.lock();
+            let system_allowed =
+                principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system");
+            let mut stmt = conn.prepare(
+                "SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
+                        session_key, agent_id, persona_id, visibility, payload_json, created_at
+                   FROM memory_events
+                  WHERE id > ?1
+                    AND (
+                        visibility = 'global'
+                        OR (
+                            workspace_id = ?2
+                            AND (
+                                visibility = 'workspace'
+                                OR (visibility = 'agent' AND (
+                                    (?3 IS NOT NULL AND agent_id = ?3)
+                                    OR (?4 IS NOT NULL AND persona_id = ?4)
+                                ))
+                                OR (visibility = 'session' AND ?5 IS NOT NULL AND session_key = ?5)
+                                OR (visibility = 'private' AND (
+                                    (?3 IS NOT NULL AND agent_id = ?3)
+                                    OR (?4 IS NOT NULL AND persona_id = ?4)
+                                ))
+                                OR (visibility = 'system' AND ?6)
+                            )
+                        )
+                    )
+                  ORDER BY id ASC
+                  LIMIT ?7",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    after_id,
+                    principal.workspace_id,
+                    principal.agent_id,
+                    principal.persona_id,
+                    principal.session_key,
+                    system_allowed,
+                    limit
+                ],
+                Self::memory_event_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await?
+    }
+
+    async fn create_memory_draft(&self, input: MemoryDraftInput) -> anyhow::Result<MemoryDraft> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryDraft> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            let now = Utc::now().to_rfc3339();
+            let draft_id = input.draft_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let category = Self::category_to_str(&input.category);
+            let visibility = input.visibility.as_str().to_string();
+
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_drafts (
+                    draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                    agent_id, persona_id, key, content, category, source_event_id,
+                    visibility, status, payload_json, created_at, updated_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'pending', ?13, ?14, ?14)",
+                params![
+                    draft_id,
+                    input.workspace_id,
+                    input.worker_run_id,
+                    input.parent_run_id,
+                    input.session_key,
+                    input.agent_id,
+                    input.persona_id,
+                    input.key,
+                    input.content,
+                    category,
+                    input.source_event_id,
+                    visibility,
+                    input.payload_json,
+                    now,
+                ],
+            )?;
+
+            let draft = tx.query_row(
+                "SELECT id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                        agent_id, persona_id, key, content, category, source_event_id,
+                        visibility, status, payload_json, created_at, updated_at
+                   FROM memory_drafts
+                  WHERE draft_id = ?1
+                  LIMIT 1",
+                params![draft_id],
+                Self::memory_draft_from_row,
+            )?;
+
+            tx.execute(
+                "INSERT INTO memory_events (
+                    event_id, workspace_id, event_type, subject_table, subject_id,
+                    session_key, agent_id, persona_id, visibility, payload_json, created_at
+                 )
+                 VALUES (?1, ?2, 'memory.draft.created', 'memory_drafts', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    draft.workspace_id,
+                    draft.draft_id,
+                    draft.session_key,
+                    draft.agent_id,
+                    draft.persona_id,
+                    draft.visibility.as_str(),
+                    serde_json::json!({
+                        "worker_run_id": draft.worker_run_id,
+                        "parent_run_id": draft.parent_run_id,
+                        "key": draft.key
+                    })
+                    .to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+
+            tx.commit()?;
+            Ok(draft)
+        })
+        .await?
+    }
+
+    async fn list_memory_drafts_for_run(&self, worker_run_id: &str) -> anyhow::Result<Vec<MemoryDraft>> {
+        let conn = self.conn.clone();
+        let worker_run_id = worker_run_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryDraft>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                        agent_id, persona_id, key, content, category, source_event_id,
+                        visibility, status, payload_json, created_at, updated_at
+                   FROM memory_drafts
+                  WHERE worker_run_id = ?1
+                  ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(params![worker_run_id], Self::memory_draft_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await?
+    }
+
+    async fn merge_memory_draft(&self, draft_id: &str) -> anyhow::Result<Option<MemoryDraft>> {
+        let conn = self.conn.clone();
+        let draft_id = draft_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            let mut draft = match tx.query_row(
+                "SELECT id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                        agent_id, persona_id, key, content, category, source_event_id,
+                        visibility, status, payload_json, created_at, updated_at
+                   FROM memory_drafts
+                  WHERE draft_id = ?1
+                  LIMIT 1",
+                params![draft_id],
+                Self::memory_draft_from_row,
+            ) {
+                Ok(draft) => draft,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+
+            if draft.status != "pending" && draft.status != "merge_requested" {
+                return Ok(Some(draft));
+            }
+
+            let now = Utc::now().to_rfc3339();
+            let category = Self::category_to_str(&draft.category);
+            let memory_id = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO memories (
+                    id, key, content, category, created_at, updated_at, session_id,
+                    workspace_id, agent_id, persona_id, source_event_id, source, visibility
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, 'memory_draft', ?11)
+                 ON CONFLICT(key) DO UPDATE SET
+                    content = excluded.content,
+                    category = excluded.category,
+                    updated_at = excluded.updated_at,
+                    session_id = excluded.session_id,
+                    workspace_id = excluded.workspace_id,
+                    agent_id = excluded.agent_id,
+                    persona_id = excluded.persona_id,
+                    source_event_id = excluded.source_event_id,
+                    source = excluded.source,
+                    visibility = excluded.visibility",
+                params![
+                    memory_id,
+                    draft.key,
+                    draft.content,
+                    category,
+                    now,
+                    draft.session_key,
+                    draft.workspace_id,
+                    draft.agent_id,
+                    draft.persona_id,
+                    draft.source_event_id,
+                    draft.visibility.as_str(),
+                ],
+            )?;
+
+            tx.execute(
+                "UPDATE memory_drafts SET status = 'merged', updated_at = ?2 WHERE draft_id = ?1",
+                params![draft.draft_id, now],
+            )?;
+            draft.status = "merged".to_string();
+            draft.updated_at = now;
+
+            for (event_type, subject_table, subject_id) in [
+                ("memory.draft.merged", "memory_drafts", draft.draft_id.as_str()),
+                ("memory.stored", "memories", draft.key.as_str()),
+            ] {
+                tx.execute(
+                    "INSERT INTO memory_events (
+                        event_id, workspace_id, event_type, subject_table, subject_id,
+                        session_key, agent_id, persona_id, visibility, payload_json, created_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        draft.workspace_id,
+                        event_type,
+                        subject_table,
+                        subject_id,
+                        draft.session_key,
+                        draft.agent_id,
+                        draft.persona_id,
+                        draft.visibility.as_str(),
+                        serde_json::json!({
+                            "draft_id": draft.draft_id,
+                            "worker_run_id": draft.worker_run_id,
+                            "parent_run_id": draft.parent_run_id,
+                            "key": draft.key
+                        })
+                        .to_string(),
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+            }
+
+            tx.commit()?;
+            Ok(Some(draft))
+        })
+        .await?
+    }
+
+    async fn reject_memory_draft(&self, draft_id: &str, reason: Option<&str>) -> anyhow::Result<Option<MemoryDraft>> {
+        let conn = self.conn.clone();
+        let draft_id = draft_id.to_string();
+        let reason = reason.map(str::to_string);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            let mut draft = match tx.query_row(
+                "SELECT id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                        agent_id, persona_id, key, content, category, source_event_id,
+                        visibility, status, payload_json, created_at, updated_at
+                   FROM memory_drafts
+                  WHERE draft_id = ?1
+                  LIMIT 1",
+                params![draft_id],
+                Self::memory_draft_from_row,
+            ) {
+                Ok(draft) => draft,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+
+            if draft.status == "merged" || draft.status == "rejected" {
+                return Ok(Some(draft));
+            }
+
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "UPDATE memory_drafts SET status = 'rejected', updated_at = ?2 WHERE draft_id = ?1",
+                params![draft.draft_id, now],
+            )?;
+            draft.status = "rejected".to_string();
+            draft.updated_at = now;
+
+            tx.execute(
+                "INSERT INTO memory_events (
+                    event_id, workspace_id, event_type, subject_table, subject_id,
+                    session_key, agent_id, persona_id, visibility, payload_json, created_at
+                 )
+                 VALUES (?1, ?2, 'memory.draft.rejected', 'memory_drafts', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    draft.workspace_id,
+                    draft.draft_id,
+                    draft.session_key,
+                    draft.agent_id,
+                    draft.persona_id,
+                    draft.visibility.as_str(),
+                    serde_json::json!({
+                        "draft_id": draft.draft_id,
+                        "worker_run_id": draft.worker_run_id,
+                        "parent_run_id": draft.parent_run_id,
+                        "key": draft.key,
+                        "reason": reason
+                    })
+                    .to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+
+            tx.commit()?;
+            Ok(Some(draft))
+        })
+        .await?
+    }
+
     async fn health_check(&self) -> bool {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
@@ -1617,6 +2615,56 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
         (tmp, mem)
+    }
+
+    fn message_input(
+        workspace_id: &str,
+        content: &str,
+        visibility: MemoryVisibility,
+        agent_id: Option<&str>,
+        session_key: Option<&str>,
+        sender: Option<&str>,
+    ) -> MessageEventInput {
+        MessageEventInput {
+            event_id: None,
+            idempotency_key: None,
+            workspace_id: workspace_id.to_string(),
+            source: "test".to_string(),
+            channel: Some("terminal".to_string()),
+            session_key: session_key.map(str::to_string),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: agent_id.map(str::to_string),
+            persona_id: None,
+            sender: sender.map(str::to_string),
+            recipient: None,
+            role: "user".to_string(),
+            content: content.to_string(),
+            raw_payload_json: None,
+            visibility,
+        }
+    }
+
+    fn memory_event_input(
+        workspace_id: &str,
+        event_type: &str,
+        visibility: MemoryVisibility,
+        agent_id: Option<&str>,
+        session_key: Option<&str>,
+    ) -> MemoryEventInput {
+        MemoryEventInput {
+            event_id: None,
+            workspace_id: workspace_id.to_string(),
+            event_type: event_type.to_string(),
+            subject_table: "message_events".to_string(),
+            subject_id: format!("{event_type}:subject"),
+            session_key: session_key.map(str::to_string),
+            agent_id: agent_id.map(str::to_string),
+            persona_id: None,
+            visibility,
+            payload_json: None,
+        }
     }
 
     struct CountingEmbedding {
@@ -1673,6 +2721,629 @@ mod tests {
     async fn sqlite_health() {
         let (_tmp, mem) = temp_sqlite();
         assert!(mem.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn message_events_schema_is_created() {
+        let (_tmp, mem) = temp_sqlite();
+        let conn = mem.conn.lock();
+
+        let message_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'message_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let memory_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let memory_drafts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_drafts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(message_events, 1);
+        assert_eq!(memory_events, 1);
+        assert_eq!(memory_drafts, 1);
+
+        for (table, column) in [
+            ("memories", "workspace_id"),
+            ("memories", "agent_id"),
+            ("memories", "persona_id"),
+            ("memories", "source_event_id"),
+            ("memories", "source"),
+            ("conversation_turns", "message_event_id"),
+            ("conversation_turns", "agent_id"),
+            ("conversation_turns", "persona_id"),
+            ("conversation_turns", "visibility"),
+            ("memory_drafts", "parent_run_id"),
+            ("memory_drafts", "source_event_id"),
+            ("memory_drafts", "visibility"),
+            ("memory_drafts", "payload_json"),
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    [column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing {table}.{column}");
+        }
+    }
+
+    #[tokio::test]
+    async fn store_with_metadata_persists_fabric_source_fields() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_metadata(
+            "semantic-key",
+            "semantic value",
+            MemoryCategory::Core,
+            Some("chat:session"),
+            MemoryStoreMetadata {
+                workspace_id: Some("workspace-a".to_string()),
+                agent_id: Some("agent-a".to_string()),
+                persona_id: Some("persona-a".to_string()),
+                source_event_id: Some("event-123".to_string()),
+                source: Some("semantic_promotion".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let row: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = mem
+            .conn
+            .lock()
+            .query_row(
+                "SELECT workspace_id, agent_id, persona_id, source_event_id, source
+                 FROM memories WHERE key = 'semantic-key'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+
+        assert_eq!(row.0.as_deref(), Some("workspace-a"));
+        assert_eq!(row.1.as_deref(), Some("agent-a"));
+        assert_eq!(row.2.as_deref(), Some("persona-a"));
+        assert_eq!(row.3.as_deref(), Some("event-123"));
+        assert_eq!(row.4.as_deref(), Some("semantic_promotion"));
+    }
+
+    #[tokio::test]
+    async fn memory_draft_lifecycle_creates_merges_and_rejects_with_outbox() {
+        let (_tmp, mem) = temp_sqlite();
+
+        let draft = mem
+            .create_memory_draft(MemoryDraftInput {
+                draft_id: Some("draft-1".to_string()),
+                workspace_id: "workspace-a".to_string(),
+                worker_run_id: "run-worker".to_string(),
+                parent_run_id: Some("run-parent".to_string()),
+                session_key: Some("session-a".to_string()),
+                agent_id: Some("agent-a".to_string()),
+                persona_id: Some("persona-a".to_string()),
+                key: "draft-key".to_string(),
+                content: "draft memory".to_string(),
+                category: MemoryCategory::Conversation,
+                source_event_id: Some("event-worker-result".to_string()),
+                visibility: MemoryVisibility::Workspace,
+                payload_json: Some("{\"kind\":\"worker_result\"}".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(draft.status, "pending");
+
+        let drafts = mem.list_memory_drafts_for_run("run-worker").await.unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].draft_id, "draft-1");
+
+        let merged = mem.merge_memory_draft("draft-1").await.unwrap().unwrap();
+        assert_eq!(merged.status, "merged");
+        let memory = mem.get("draft-key").await.unwrap().unwrap();
+        assert_eq!(memory.content, "draft memory");
+
+        let rejected = mem
+            .create_memory_draft(MemoryDraftInput {
+                draft_id: Some("draft-2".to_string()),
+                workspace_id: "workspace-a".to_string(),
+                worker_run_id: "run-worker".to_string(),
+                parent_run_id: Some("run-parent".to_string()),
+                session_key: Some("session-a".to_string()),
+                agent_id: Some("agent-a".to_string()),
+                persona_id: Some("persona-a".to_string()),
+                key: "rejected-key".to_string(),
+                content: "do not merge".to_string(),
+                category: MemoryCategory::Conversation,
+                source_event_id: None,
+                visibility: MemoryVisibility::Workspace,
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rejected.status, "pending");
+        let rejected = mem
+            .reject_memory_draft("draft-2", Some("duplicate"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.status, "rejected");
+        assert!(mem.get("rejected-key").await.unwrap().is_none());
+
+        let event_types: Vec<String> = mem
+            .conn
+            .lock()
+            .prepare("SELECT event_type FROM memory_events ORDER BY id ASC")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(event_types.contains(&"memory.draft.created".to_string()));
+        assert!(event_types.contains(&"memory.draft.merged".to_string()));
+        assert!(event_types.contains(&"memory.draft.rejected".to_string()));
+        assert!(event_types.contains(&"memory.stored".to_string()));
+    }
+
+    #[tokio::test]
+    async fn append_message_event_inserts_event_and_outbox_row() {
+        let (_tmp, mem) = temp_sqlite();
+
+        let event = mem
+            .append_message_event(message_input(
+                "workspace-a",
+                "hello from terminal",
+                MemoryVisibility::Workspace,
+                None,
+                Some("chat:1"),
+                Some("alice"),
+            ))
+            .await
+            .unwrap();
+
+        assert!(event.id > 0);
+        assert_eq!(event.workspace_id, "workspace-a");
+        assert_eq!(event.visibility, MemoryVisibility::Workspace);
+        assert!(event.content_hash.is_some());
+
+        let outbox_count: i64 = mem
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE event_type = 'message.created' AND subject_id = ?1",
+                [event.event_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_count, 1);
+    }
+
+    #[tokio::test]
+    async fn append_message_event_is_idempotent_by_key() {
+        let (_tmp, mem) = temp_sqlite();
+        let mut first = message_input(
+            "workspace-a",
+            "first content",
+            MemoryVisibility::Workspace,
+            None,
+            Some("chat:1"),
+            Some("alice"),
+        );
+        first.idempotency_key = Some("telegram:message:42".to_string());
+
+        let mut second = message_input(
+            "workspace-a",
+            "second content should not overwrite",
+            MemoryVisibility::Workspace,
+            None,
+            Some("chat:1"),
+            Some("alice"),
+        );
+        second.idempotency_key = Some("telegram:message:42".to_string());
+
+        let first_event = mem.append_message_event(first).await.unwrap();
+        let second_event = mem.append_message_event(second).await.unwrap();
+
+        assert_eq!(first_event.id, second_event.id);
+        assert_eq!(second_event.content, "first content");
+
+        let conn = mem.conn.lock();
+        let message_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message_events", [], |row| row.get(0))
+            .unwrap();
+        let outbox_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(message_count, 1);
+        assert_eq!(outbox_count, 1);
+    }
+
+    #[tokio::test]
+    async fn append_worker_result_message_event_emits_worker_outbox_type() {
+        let (_tmp, mem) = temp_sqlite();
+        let mut input = message_input(
+            "workspace-a",
+            "worker result",
+            MemoryVisibility::Workspace,
+            Some("agent-a"),
+            Some("session-a"),
+            None,
+        );
+        input.source = "sessions_spawn".to_string();
+        input.role = "event".to_string();
+
+        let event = mem.append_message_event(input).await.unwrap();
+        let outbox = mem
+            .list_memory_events_since(
+                &MemoryPrincipal {
+                    workspace_id: "workspace-a".to_string(),
+                    agent_id: Some("agent-a".to_string()),
+                    persona_id: None,
+                    session_key: Some("session-a".to_string()),
+                    channel: None,
+                    sender: None,
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(event.role, "event");
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].event_type, "worker.result.created");
+        assert_eq!(outbox[0].subject_id, event.event_id);
+    }
+
+    #[tokio::test]
+    async fn list_message_events_since_applies_visibility_policy() {
+        let (_tmp, mem) = temp_sqlite();
+        for input in [
+            message_input(
+                "workspace-a",
+                "workspace visible",
+                MemoryVisibility::Workspace,
+                None,
+                None,
+                None,
+            ),
+            message_input(
+                "workspace-a",
+                "agent visible",
+                MemoryVisibility::Agent,
+                Some("agent-a"),
+                None,
+                None,
+            ),
+            message_input(
+                "workspace-a",
+                "session visible",
+                MemoryVisibility::Session,
+                None,
+                Some("session-a"),
+                None,
+            ),
+            message_input(
+                "workspace-a",
+                "private visible",
+                MemoryVisibility::Private,
+                None,
+                None,
+                Some("alice"),
+            ),
+            message_input(
+                "workspace-a",
+                "system hidden",
+                MemoryVisibility::System,
+                None,
+                None,
+                None,
+            ),
+            message_input(
+                "workspace-b",
+                "other workspace",
+                MemoryVisibility::Workspace,
+                None,
+                None,
+                None,
+            ),
+        ] {
+            mem.append_message_event(input).await.unwrap();
+        }
+
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-a".to_string(),
+            agent_id: Some("agent-a".to_string()),
+            persona_id: None,
+            session_key: Some("session-a".to_string()),
+            channel: None,
+            sender: Some("alice".to_string()),
+        };
+        let visible = mem.list_message_events_since(&principal, 0, 20).await.unwrap();
+        let contents = visible.iter().map(|event| event.content.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(
+            contents,
+            vec![
+                "workspace visible",
+                "agent visible",
+                "session visible",
+                "private visible"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn global_message_events_are_visible_across_workspaces() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.append_message_event(message_input(
+            "workspace-a",
+            "global visible everywhere",
+            MemoryVisibility::Global,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+        mem.append_message_event(message_input(
+            "workspace-a",
+            "workspace local only",
+            MemoryVisibility::Workspace,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let visible = mem
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: "workspace-b".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: None,
+                    channel: None,
+                    sender: None,
+                },
+                0,
+                20,
+            )
+            .await
+            .unwrap();
+        let contents = visible.iter().map(|event| event.content.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(contents, vec!["global visible everywhere"]);
+    }
+
+    #[tokio::test]
+    async fn load_recent_session_context_is_not_evicted_by_external_events() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.append_message_event(message_input(
+            "workspace-a",
+            "current session survives",
+            MemoryVisibility::Workspace,
+            None,
+            Some("chat:current"),
+            None,
+        ))
+        .await
+        .unwrap();
+        for index in 0..40 {
+            mem.append_message_event(message_input(
+                "workspace-a",
+                &format!("external event {index}"),
+                MemoryVisibility::Workspace,
+                None,
+                Some("gateway:external"),
+                None,
+            ))
+            .await
+            .unwrap();
+        }
+
+        let events = mem
+            .load_recent_session_context(SessionContextQuery {
+                principal: MemoryPrincipal {
+                    workspace_id: "workspace-a".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("chat:current".to_string()),
+                    channel: Some("terminal".to_string()),
+                    sender: None,
+                },
+                since_event_id: None,
+                limit: 10,
+                include_roles: vec!["user".to_string()],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.iter().map(|event| event.content.as_str()).collect::<Vec<_>>(),
+            vec!["current session survives"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_memory_events_since_applies_cursor_and_visibility_policy() {
+        let (_tmp, mem) = temp_sqlite();
+        let hidden = mem
+            .append_memory_event(memory_event_input(
+                "workspace-a",
+                "hidden.before_cursor",
+                MemoryVisibility::Workspace,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        for input in [
+            memory_event_input(
+                "workspace-a",
+                "workspace.visible",
+                MemoryVisibility::Workspace,
+                None,
+                None,
+            ),
+            memory_event_input(
+                "workspace-a",
+                "agent.visible",
+                MemoryVisibility::Agent,
+                Some("agent-a"),
+                None,
+            ),
+            memory_event_input(
+                "workspace-a",
+                "session.visible",
+                MemoryVisibility::Session,
+                None,
+                Some("session-a"),
+            ),
+            memory_event_input("workspace-a", "system.hidden", MemoryVisibility::System, None, None),
+            memory_event_input(
+                "workspace-b",
+                "other_workspace.hidden",
+                MemoryVisibility::Workspace,
+                None,
+                None,
+            ),
+        ] {
+            mem.append_memory_event(input).await.unwrap();
+        }
+
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-a".to_string(),
+            agent_id: Some("agent-a".to_string()),
+            persona_id: None,
+            session_key: Some("session-a".to_string()),
+            channel: None,
+            sender: None,
+        };
+        let visible = mem.list_memory_events_since(&principal, hidden.id, 20).await.unwrap();
+        let event_types = visible
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            event_types,
+            vec!["workspace.visible", "agent.visible", "session.visible"]
+        );
+    }
+
+    #[tokio::test]
+    async fn global_memory_events_are_visible_across_workspaces() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.append_memory_event(memory_event_input(
+            "workspace-a",
+            "global.event",
+            MemoryVisibility::Global,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+        mem.append_memory_event(memory_event_input(
+            "workspace-a",
+            "workspace.event",
+            MemoryVisibility::Workspace,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let visible = mem
+            .list_memory_events_since(
+                &MemoryPrincipal {
+                    workspace_id: "workspace-b".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: None,
+                    channel: None,
+                    sender: None,
+                },
+                0,
+                20,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].event_type, "global.event");
+    }
+
+    #[tokio::test]
+    async fn load_recent_shared_context_filters_roles_and_orders_chronologically() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.append_message_event(message_input(
+            "workspace-a",
+            "first user",
+            MemoryVisibility::Workspace,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+        let mut assistant = message_input(
+            "workspace-a",
+            "assistant reply",
+            MemoryVisibility::Workspace,
+            None,
+            None,
+            None,
+        );
+        assistant.role = "assistant".to_string();
+        mem.append_message_event(assistant).await.unwrap();
+        mem.append_message_event(message_input(
+            "workspace-a",
+            "second user",
+            MemoryVisibility::Workspace,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let events = mem
+            .load_recent_shared_context(SharedContextQuery {
+                principal: MemoryPrincipal {
+                    workspace_id: "workspace-a".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: None,
+                    channel: None,
+                    sender: None,
+                },
+                since_event_id: None,
+                limit: 10,
+                include_roles: vec!["user".to_string()],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.iter().map(|event| event.content.as_str()).collect::<Vec<_>>(),
+            vec!["first user", "second user"]
+        );
     }
 
     #[tokio::test]

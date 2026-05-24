@@ -387,7 +387,7 @@ impl Agent {
             .model_routes(config.model_routes.clone())
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills_with_config(&config.workspace_dir, config))
-            .auto_save(config.memory.auto_save);
+            .auto_save(config.memory.auto_save && config.memory.semantic.auto_promote_user_messages);
 
         #[cfg(not(feature = "llm-router"))]
         let builder = Agent::builder()
@@ -409,7 +409,7 @@ impl Agent {
             .available_hints(available_hints)
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills_with_config(&config.workspace_dir, config))
-            .auto_save(config.memory.auto_save);
+            .auto_save(config.memory.auto_save && config.memory.semantic.auto_promote_user_messages);
 
         #[cfg(feature = "llm-router")]
         if config.router.enabled {

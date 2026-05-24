@@ -241,15 +241,30 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         items.push(DiagItem::error(cat, "no default_provider configured"));
     }
 
-    // API key presence
+    // API key / auth profile presence
     if config.default_provider.as_deref() != Some("ollama") {
         if config.api_key.is_some() {
             items.push(DiagItem::ok(cat, "API key configured"));
+        } else if let Some(provider) = config.default_provider.as_deref() {
+            match active_auth_profile_credential_status(config, provider) {
+                AuthProfileCredentialStatus::Present { profile_id } => {
+                    items.push(DiagItem::ok(
+                        cat,
+                        format!("auth profile credential configured for \"{provider}\" ({profile_id})"),
+                    ));
+                }
+                AuthProfileCredentialStatus::Unreadable(error) => {
+                    items.push(DiagItem::warn(
+                        cat,
+                        format!("auth profile check failed for \"{provider}\": {error}"),
+                    ));
+                }
+                AuthProfileCredentialStatus::Missing => {
+                    items.push(DiagItem::warn(cat, "no api_key or active auth profile credential set"));
+                }
+            }
         } else {
-            items.push(DiagItem::warn(
-                cat,
-                "no api_key set (may rely on env vars or provider defaults)",
-            ));
+            items.push(DiagItem::warn(cat, "no api_key or default provider set"));
         }
     }
 
@@ -334,6 +349,16 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
         &config.reliability,
+        &crate::providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
+            secrets_encrypt: config.secrets.encrypt,
+            codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
+            codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
+            reasoning_enabled: config.runtime.reasoning_enabled,
+            codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
+            codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
+        },
     );
     if availability.degraded {
         items.push(DiagItem::warn(
@@ -475,6 +500,45 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 ),
             ));
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthProfileCredentialStatus {
+    Present { profile_id: String },
+    Missing,
+    Unreadable(String),
+}
+
+fn active_auth_profile_credential_status(config: &Config, provider: &str) -> AuthProfileCredentialStatus {
+    let Some(openprx_dir) = config.config_path.parent() else {
+        return AuthProfileCredentialStatus::Missing;
+    };
+    let canonical_provider = crate::providers::canonical_china_provider_name(provider)
+        .unwrap_or(provider)
+        .to_string();
+    let store = crate::auth::profiles::AuthProfilesStore::new(openprx_dir, config.secrets.encrypt);
+    let data = match store.load() {
+        Ok(data) => data,
+        Err(error) => return AuthProfileCredentialStatus::Unreadable(error.to_string()),
+    };
+    let Some(profile_id) = data.active_profiles.get(&canonical_provider) else {
+        return AuthProfileCredentialStatus::Missing;
+    };
+    let Some(profile) = data.profiles.get(profile_id) else {
+        return AuthProfileCredentialStatus::Missing;
+    };
+    let credential = profile
+        .token
+        .as_deref()
+        .or_else(|| profile.token_set.as_ref().map(|tokens| tokens.access_token.as_str()))
+        .map(str::trim);
+    if credential.is_some_and(|token| !token.is_empty()) {
+        AuthProfileCredentialStatus::Present {
+            profile_id: profile_id.clone(),
+        }
+    } else {
+        AuthProfileCredentialStatus::Missing
     }
 }
 
@@ -664,26 +728,30 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
     if let Some(components) = snapshot.get("components").and_then(serde_json::Value::as_object) {
         // Scheduler
         if let Some(scheduler) = components.get("scheduler") {
-            let scheduler_ok = scheduler
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|s| s == "ok");
-            let scheduler_age = scheduler
-                .get("last_ok")
-                .and_then(serde_json::Value::as_str)
-                .and_then(parse_rfc3339)
-                .map_or(i64::MAX, |dt| Utc::now().signed_duration_since(dt).num_seconds());
-
-            if scheduler_ok && scheduler_age <= SCHEDULER_STALE_SECONDS {
-                items.push(DiagItem::ok(
-                    cat,
-                    format!("scheduler healthy (last ok {scheduler_age}s ago)"),
-                ));
+            if !config.modules.scheduler {
+                items.push(DiagItem::ok(cat, "scheduler module disabled"));
             } else {
-                items.push(DiagItem::error(
-                    cat,
-                    format!("scheduler unhealthy (ok={scheduler_ok}, age={scheduler_age}s)"),
-                ));
+                let scheduler_ok = scheduler
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| s == "ok");
+                let scheduler_age = scheduler
+                    .get("last_ok")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_rfc3339)
+                    .map_or(i64::MAX, |dt| Utc::now().signed_duration_since(dt).num_seconds());
+
+                if scheduler_ok && scheduler_age <= SCHEDULER_STALE_SECONDS {
+                    items.push(DiagItem::ok(
+                        cat,
+                        format!("scheduler healthy (last ok {scheduler_age}s ago)"),
+                    ));
+                } else {
+                    items.push(DiagItem::error(
+                        cat,
+                        format!("scheduler unhealthy (ok={scheduler_ok}, age={scheduler_age}s)"),
+                    ));
+                }
             }
         } else {
             items.push(DiagItem::warn(cat, "scheduler component not tracked yet"));
@@ -931,6 +999,44 @@ mod tests {
     }
 
     #[test]
+    fn daemon_state_treats_disabled_scheduler_as_ok_even_when_stale() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.config_path = temp.path().join("config.toml");
+        config.modules.scheduler = false;
+
+        let stale = (Utc::now() - chrono::Duration::seconds(SCHEDULER_STALE_SECONDS + 60)).to_rfc3339();
+        let state = serde_json::json!({
+            "pid": std::process::id(),
+            "updated_at": Utc::now().to_rfc3339(),
+            "components": {
+                "scheduler": {
+                    "status": "ok",
+                    "updated_at": stale,
+                    "last_ok": stale,
+                    "last_error": null,
+                    "restart_count": 0
+                }
+            }
+        });
+        std::fs::write(
+            crate::daemon::state_file_path(&config),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        let mut items = Vec::new();
+        check_daemon_state(&config, &mut items);
+
+        let scheduler_item = items
+            .iter()
+            .find(|item| item.message == "scheduler module disabled")
+            .expect("disabled scheduler should be reported");
+        assert_eq!(scheduler_item.severity, Severity::Ok);
+        assert!(items.iter().all(|item| !item.message.contains("scheduler unhealthy")));
+    }
+
+    #[test]
     fn config_validation_catches_unknown_provider() {
         let mut config = Config::default();
         config.default_provider = Some("totally-fake".into());
@@ -964,6 +1070,74 @@ mod tests {
         let prov_item = items.iter().find(|i| i.message.contains("is valid"));
         assert!(prov_item.is_some());
         assert_eq!(prov_item.unwrap().severity, Severity::Ok);
+    }
+
+    #[test]
+    fn config_validation_accepts_active_auth_profile_credential() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "").unwrap();
+        let store = crate::auth::profiles::AuthProfilesStore::new(tmp.path(), false);
+        store
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile::new_token("moonshot", "default", "moonshot-test-key".to_string()),
+                true,
+            )
+            .unwrap();
+
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.default_provider = Some("moonshot".into());
+        config.api_key = None;
+        config.secrets.encrypt = false;
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let auth_item = items
+            .iter()
+            .find(|item| item.message.contains("auth profile credential configured"));
+        assert!(
+            auth_item.is_some(),
+            "items: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert_eq!(auth_item.unwrap().severity, Severity::Ok);
+        assert!(
+            !items.iter().any(|item| item.message.contains("no api_key")),
+            "active auth profile should suppress missing api_key warning"
+        );
+    }
+
+    #[test]
+    fn config_validation_maps_kimi_alias_to_moonshot_auth_profile() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "").unwrap();
+        let store = crate::auth::profiles::AuthProfilesStore::new(tmp.path(), false);
+        store
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile::new_token("moonshot", "default", "moonshot-test-key".to_string()),
+                true,
+            )
+            .unwrap();
+
+        let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.default_provider = Some("kimi".into());
+        config.api_key = None;
+        config.secrets.encrypt = false;
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let auth_item = items
+            .iter()
+            .find(|item| item.message.contains("auth profile credential configured"));
+        assert!(
+            auth_item.is_some(),
+            "items: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert_eq!(auth_item.unwrap().severity, Severity::Ok);
     }
 
     #[test]

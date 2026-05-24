@@ -1,5 +1,8 @@
 use super::sqlite::SqliteMemory;
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{
+    Memory, MemoryCategory, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryPrincipal, MessageEvent,
+    MessageEventInput, SessionContextQuery, SharedContextQuery,
+};
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
@@ -339,6 +342,40 @@ impl Memory for LucidMemory {
 
     async fn health_check(&self) -> bool {
         self.local.health_check().await
+    }
+
+    async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
+        self.local.append_message_event(input).await
+    }
+
+    async fn list_message_events_since(
+        &self,
+        principal: &MemoryPrincipal,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.local.list_message_events_since(principal, after_id, limit).await
+    }
+
+    async fn load_recent_shared_context(&self, query: SharedContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
+        self.local.load_recent_shared_context(query).await
+    }
+
+    async fn load_recent_session_context(&self, query: SessionContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
+        self.local.load_recent_session_context(query).await
+    }
+
+    async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
+        self.local.append_memory_event(input).await
+    }
+
+    async fn list_memory_events_since(
+        &self,
+        principal: &MemoryPrincipal,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEvent>> {
+        self.local.list_memory_events_since(principal, after_id, limit).await
     }
 }
 

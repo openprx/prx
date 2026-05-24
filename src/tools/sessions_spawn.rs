@@ -14,6 +14,7 @@ use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
 use crate::config::{AgentCompactionConfig, DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
 use crate::hooks::HookManager;
+use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MemoryVisibility, MessageEventScope};
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::SecurityPolicy;
@@ -35,6 +36,9 @@ const DEFAULT_SUB_AGENT_SYSTEM_PROMPT: &str = "\
 You are a sub-agent handling a specific delegated task. \
 Complete the task thoroughly and report results concisely. \
 Focus only on the assigned task; do not ask clarifying questions.";
+const PROCESS_MEMORY_STRATEGY_SHARED: &str = "shared_fabric";
+const PROCESS_MEMORY_STRATEGY_ISOLATED: &str = "isolated_private";
+const PROCESS_MEMORY_STRATEGY_HYBRID: &str = "hybrid";
 
 /// Status of a spawned sub-agent run.
 #[derive(Debug, Clone)]
@@ -194,6 +198,9 @@ pub struct SessionsSpawnTool {
     provider_runtime_options: providers::ProviderRuntimeOptions,
     /// Process-mode controls for workspace lifecycle.
     spawn_config: SessionsSpawnConfig,
+    /// Shared memory backend for normalized spawn lifecycle events.
+    memory: Option<Arc<dyn Memory>>,
+    event_recording: MemoryEventRecording,
 }
 
 impl SessionsSpawnTool {
@@ -230,6 +237,8 @@ impl SessionsSpawnTool {
             fallback_api_key,
             provider_runtime_options,
             spawn_config,
+            memory: None,
+            event_recording: MemoryEventRecording::default(),
         }
     }
 
@@ -259,6 +268,101 @@ impl SessionsSpawnTool {
     /// Used by sessions_list, sessions_send, and session_status to share state.
     pub fn active_runs_arc(&self) -> Arc<RwLock<Vec<SubAgentRun>>> {
         self.active_runs.clone()
+    }
+
+    /// Attach shared memory so spawned runs are visible in the live fabric.
+    pub fn with_shared_memory(mut self, memory: Arc<dyn Memory>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    pub const fn with_event_recording(mut self, event_recording: MemoryEventRecording) -> Self {
+        self.event_recording = event_recording;
+        self
+    }
+}
+
+fn spawn_event_scope(
+    run_id: &str,
+    session_scope_key: &str,
+    parent_run_id: Option<&str>,
+    agent_name: Option<&str>,
+    scope: Option<&SpawnScope>,
+) -> MessageEventScope {
+    let mut event_scope = MessageEventScope::new("sessions_spawn", MemoryVisibility::Workspace)
+        .with_channel(scope.map_or("sessions_spawn", |scope| scope.channel.as_str()))
+        .with_session_key(session_scope_key)
+        .with_run_id(run_id);
+    if let Some(parent_run_id) = parent_run_id {
+        event_scope = event_scope.with_parent_run_id(parent_run_id);
+    }
+    if let Some(agent_name) = agent_name {
+        event_scope = event_scope.with_agent_id(agent_name);
+    }
+    if let Some(scope) = scope {
+        event_scope = event_scope
+            .with_sender(scope.sender.as_str())
+            .with_recipient(scope.chat_id.as_str());
+    }
+    event_scope
+}
+
+async fn record_spawn_request_event(
+    fabric: Option<&MemoryFabric>,
+    scope: MessageEventScope,
+    task: &str,
+    mode: &str,
+    provider_name: &str,
+    model: &str,
+    max_iterations: usize,
+) {
+    let Some(fabric) = fabric else {
+        return;
+    };
+    if let Err(error) = fabric
+        .record_inbound_user_message(
+            scope,
+            task,
+            None,
+            Some(
+                json!({
+                    "mode": mode,
+                    "provider": provider_name,
+                    "model": model,
+                    "max_iterations": max_iterations
+                })
+                .to_string(),
+            ),
+        )
+        .await
+    {
+        tracing::warn!("failed to record sessions_spawn request event: {error}");
+    }
+}
+
+async fn record_spawn_result_event(
+    fabric: Option<&MemoryFabric>,
+    scope: MessageEventScope,
+    result_text: &str,
+    status: &SubAgentStatus,
+) {
+    let Some(fabric) = fabric else {
+        return;
+    };
+    let (success, error) = match status {
+        SubAgentStatus::Completed(_) => (true, None),
+        SubAgentStatus::Running => (false, Some("still running".to_string())),
+        SubAgentStatus::Failed(error) => (false, Some(error.clone())),
+    };
+    if let Err(error) = fabric
+        .record_worker_result(
+            scope,
+            result_text,
+            Some(json!({ "success": success, "error": error }).to_string()),
+        )
+        .await
+    {
+        tracing::warn!("failed to record sessions_spawn result event: {error}");
     }
 }
 
@@ -605,6 +709,27 @@ impl Tool for SessionsSpawnTool {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .map_or(configured_max, |dynamic_max| dynamic_max.max(1).min(configured_max));
+        let memory_fabric = self.memory.as_ref().map(|memory| {
+            MemoryFabric::new(memory.clone(), self.workspace_dir.to_string_lossy())
+                .with_event_recording(self.event_recording)
+        });
+        let spawn_scope_for_event = spawn_event_scope(
+            &run_id,
+            &session_scope_key,
+            parent_run_id.as_deref(),
+            agent_name.as_deref(),
+            spawn_scope.as_ref(),
+        );
+        record_spawn_request_event(
+            memory_fabric.as_ref(),
+            spawn_scope_for_event.clone(),
+            task,
+            &mode,
+            &resolved_provider_name,
+            &resolved_model,
+            resolved_max_iterations,
+        )
+        .await;
 
         if mode == "process" {
             let temperature = resolved_temperature;
@@ -660,6 +785,7 @@ impl Tool for SessionsSpawnTool {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            let process_agent_id = selected_agent.as_ref().map(|(name, _)| name.clone());
             let identity_dir = selected_agent.as_ref().and_then(|(_, cfg)| {
                 cfg.identity_dir
                     .as_deref()
@@ -674,11 +800,16 @@ impl Tool for SessionsSpawnTool {
             let process_session_scope_key = session_scope_key.clone();
             let process_spawn_depth = spawn_depth;
             let process_compaction_config = self.compaction_config.clone();
+            let process_event_recording = self.event_recording;
+            let process_memory_strategy =
+                normalize_process_memory_strategy(&self.spawn_config.process_memory_strategy)?.to_string();
             let process_execution_ctx = SpawnExecutionContext {
                 run_id: rid.clone(),
                 session_scope_key: session_scope_key.clone(),
                 spawn_depth,
             };
+            let process_memory_fabric = memory_fabric.clone();
+            let process_result_scope = spawn_scope_for_event.clone();
 
             let jh = tokio::spawn(SPAWN_EXECUTION_CONTEXT.scope(process_execution_ctx, async move {
                 tracing::info!(run_id = %rid, "Sub-agent process starting");
@@ -701,6 +832,9 @@ impl Tool for SessionsSpawnTool {
                     process_spawn_depth,
                     &process_session_scope_key,
                     process_parent_run_id.as_deref(),
+                    process_agent_id.as_deref(),
+                    &process_memory_strategy,
+                    process_event_recording,
                     &process_compaction_config,
                 )
                 .await;
@@ -719,6 +853,13 @@ impl Tool for SessionsSpawnTool {
                 };
 
                 let announce = format_announce_message(&rid, &status, &result_text);
+                record_spawn_result_event(
+                    process_memory_fabric.as_ref(),
+                    process_result_scope,
+                    &result_text,
+                    &status,
+                )
+                .await;
 
                 {
                     let mut runs = active_runs.write().await;
@@ -819,6 +960,8 @@ impl Tool for SessionsSpawnTool {
             session_scope_key: session_scope_key.clone(),
             spawn_depth,
         };
+        let task_memory_fabric = memory_fabric.clone();
+        let task_result_scope = spawn_scope_for_event.clone();
         let (system_prompt, filtered_tools) = if let Some((agent, cfg)) = selected_agent {
             let identity_prompt = cfg
                 .identity_dir
@@ -889,6 +1032,7 @@ impl Tool for SessionsSpawnTool {
             };
 
             let announce = format_announce_message(&rid, &status, &result_text);
+            record_spawn_result_event(task_memory_fabric.as_ref(), task_result_scope, &result_text, &status).await;
 
             // Update run status
             {
@@ -1511,6 +1655,25 @@ fn build_session_worker_cli_args(manifest: &WorkerManifest) -> anyhow::Result<Ve
     ])
 }
 
+fn shared_worker_memory_db_path(workspace_root: &std::path::Path) -> std::path::PathBuf {
+    workspace_root.join("memory").join("brain.db")
+}
+
+fn private_worker_memory_db_path(worker_workspace: &std::path::Path) -> std::path::PathBuf {
+    worker_workspace.join("brain.db")
+}
+
+fn normalize_process_memory_strategy(strategy: &str) -> anyhow::Result<&'static str> {
+    match strategy.trim() {
+        "" | PROCESS_MEMORY_STRATEGY_SHARED => Ok(PROCESS_MEMORY_STRATEGY_SHARED),
+        PROCESS_MEMORY_STRATEGY_ISOLATED => Ok(PROCESS_MEMORY_STRATEGY_ISOLATED),
+        PROCESS_MEMORY_STRATEGY_HYBRID => Ok(PROCESS_MEMORY_STRATEGY_HYBRID),
+        other => anyhow::bail!(
+            "Invalid sessions_spawn.process_memory_strategy '{other}'. Expected 'shared_fabric', 'isolated_private', or 'hybrid'."
+        ),
+    }
+}
+
 async fn wait_with_parent_timeout(
     child: &mut tokio::process::Child,
     parent_timeout: std::time::Duration,
@@ -1546,12 +1709,29 @@ async fn run_sub_agent_process(
     spawn_depth: usize,
     session_scope_key: &str,
     parent_run_id: Option<&str>,
+    agent_id: Option<&str>,
+    memory_strategy: &str,
+    event_recording: MemoryEventRecording,
     compaction_config: &AgentCompactionConfig,
 ) -> anyhow::Result<WorkerResult> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let worker_workspace = worker_workspace_root.join(run_id);
     std::fs::create_dir_all(&worker_workspace)?;
+    let shared_memory_db_path = shared_worker_memory_db_path(workspace_root);
+    let worker_memory_db_path = private_worker_memory_db_path(&worker_workspace);
+    let normalized_memory_strategy = normalize_process_memory_strategy(memory_strategy)?;
+    let (memory_db_path, memory_workspace_id) = match normalized_memory_strategy {
+        PROCESS_MEMORY_STRATEGY_SHARED => (
+            shared_memory_db_path.clone(),
+            workspace_root.to_string_lossy().to_string(),
+        ),
+        PROCESS_MEMORY_STRATEGY_ISOLATED | PROCESS_MEMORY_STRATEGY_HYBRID => (
+            worker_memory_db_path.clone(),
+            worker_workspace.to_string_lossy().to_string(),
+        ),
+        other => anyhow::bail!("invalid normalized process memory strategy '{other}'"),
+    };
 
     let identity_dir = if let Some(identity_dir) = agent_identity_dir {
         let source_identity = workspace_root.join(identity_dir);
@@ -1584,7 +1764,14 @@ async fn run_sub_agent_process(
         api_key: api_key.map(str::to_string),
         temperature,
         workspace_dir: worker_workspace.clone(),
-        memory_db_path: worker_workspace.join("brain.db"),
+        memory_db_path,
+        memory_workspace_id: Some(memory_workspace_id),
+        memory_strategy: Some(normalized_memory_strategy.to_string()),
+        shared_memory_db_path: Some(shared_memory_db_path),
+        worker_memory_db_path: Some(worker_memory_db_path),
+        agent_id: agent_id.map(str::to_string),
+        persona_id: None,
+        memory_event_recording: event_recording,
         allowed_tools: allowed_tools.to_vec(),
         timeout_seconds: timeout_secs,
         max_iterations,
@@ -1731,6 +1918,7 @@ mod tests {
     )]
     use super::*;
     use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+    use crate::memory::{MemoryPrincipal, SqliteMemory};
     use crate::security::SecurityPolicy;
     use anyhow::anyhow;
     use std::collections::HashMap;
@@ -1971,6 +2159,61 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("Sub-agent"));
         assert!(messages[0].contains("chicken"));
+    }
+
+    #[tokio::test]
+    async fn spawn_records_request_and_result_message_events() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "fabric result".into(),
+            }),
+        )
+        .with_shared_memory(memory.clone());
+
+        let result = tool
+            .execute(json!({
+                "task": "write through fabric",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "sender": "alice",
+                    "channel": "telegram",
+                    "chat_type": "direct",
+                    "chat_id": "chat-1"
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: "/tmp".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("telegram:chat-1:alice".to_string()),
+                    channel: Some("telegram".to_string()),
+                    sender: Some("alice".to_string()),
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].source, "sessions_spawn");
+        assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].content, "write through fabric");
+        assert_eq!(events[1].source, "sessions_spawn");
+        assert_eq!(events[1].role, "event");
+        assert!(events[1].content.contains("fabric result"));
     }
 
     #[tokio::test]
@@ -2323,6 +2566,13 @@ mod tests {
             temperature: 0.7,
             workspace_dir: std::path::PathBuf::from("/tmp/ws"),
             memory_db_path: std::path::PathBuf::from("/tmp/ws/brain.db"),
+            memory_workspace_id: Some("/tmp/ws".to_string()),
+            memory_strategy: Some("shared_fabric".to_string()),
+            shared_memory_db_path: Some(std::path::PathBuf::from("/tmp/ws/memory/brain.db")),
+            worker_memory_db_path: Some(std::path::PathBuf::from("/tmp/worker/brain.db")),
+            agent_id: Some("agent-a".to_string()),
+            persona_id: None,
+            memory_event_recording: MemoryEventRecording::default(),
             allowed_tools: vec!["shell".to_string()],
             timeout_seconds: 30,
             max_iterations: 20,
@@ -2341,6 +2591,34 @@ mod tests {
         let args = build_session_worker_cli_args(&manifest).unwrap();
         let task_index = args.iter().position(|arg| arg == "--task").unwrap();
         assert_eq!(args[task_index + 1], manifest.task);
+    }
+
+    #[test]
+    fn process_mode_manifest_uses_parent_workspace_memory_db() {
+        let workspace = std::path::Path::new("/tmp/openprx-workspace");
+        assert_eq!(
+            shared_worker_memory_db_path(workspace),
+            workspace.join("memory").join("brain.db")
+        );
+        assert_eq!(
+            private_worker_memory_db_path(std::path::Path::new("/tmp/openprx-worker")),
+            std::path::Path::new("/tmp/openprx-worker").join("brain.db")
+        );
+    }
+
+    #[test]
+    fn process_memory_strategy_is_explicitly_validated() {
+        assert_eq!(normalize_process_memory_strategy("").unwrap(), "shared_fabric");
+        assert_eq!(
+            normalize_process_memory_strategy("shared_fabric").unwrap(),
+            "shared_fabric"
+        );
+        assert_eq!(
+            normalize_process_memory_strategy("isolated_private").unwrap(),
+            "isolated_private"
+        );
+        assert_eq!(normalize_process_memory_strategy("hybrid").unwrap(), "hybrid");
+        assert!(normalize_process_memory_strategy("worker-only").is_err());
     }
 
     #[tokio::test]

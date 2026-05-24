@@ -12,6 +12,20 @@ pub struct WorkerManifest {
     pub temperature: f64,
     pub workspace_dir: PathBuf,
     pub memory_db_path: PathBuf,
+    #[serde(default)]
+    pub memory_workspace_id: Option<String>,
+    #[serde(default)]
+    pub memory_strategy: Option<String>,
+    #[serde(default)]
+    pub shared_memory_db_path: Option<PathBuf>,
+    #[serde(default)]
+    pub worker_memory_db_path: Option<PathBuf>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub persona_id: Option<String>,
+    #[serde(default)]
+    pub memory_event_recording: crate::memory::MemoryEventRecording,
     pub allowed_tools: Vec<String>,
     pub timeout_seconds: u64,
     pub max_iterations: usize,
@@ -54,6 +68,18 @@ mod tests {
             temperature: 0.7,
             workspace_dir: PathBuf::from("/tmp/ws"),
             memory_db_path: PathBuf::from("/tmp/ws/brain.db"),
+            memory_workspace_id: Some("/tmp/parent-ws".into()),
+            memory_strategy: Some("shared_fabric".into()),
+            shared_memory_db_path: Some(PathBuf::from("/tmp/parent-ws/memory/brain.db")),
+            worker_memory_db_path: Some(PathBuf::from("/tmp/ws/brain.db")),
+            agent_id: Some("worker-agent".into()),
+            persona_id: Some("persona-a".into()),
+            memory_event_recording: crate::memory::MemoryEventRecording {
+                enabled: true,
+                record_user_messages: true,
+                record_assistant_messages: true,
+                record_tool_events: true,
+            },
             allowed_tools: vec!["shell".into(), "file_read".into()],
             timeout_seconds: 0,
             max_iterations: 24,
@@ -74,6 +100,15 @@ mod tests {
 
         assert_eq!(parsed.run_id, "run-1");
         assert_eq!(parsed.allowed_tools.len(), 2);
+        assert_eq!(parsed.memory_workspace_id.as_deref(), Some("/tmp/parent-ws"));
+        assert_eq!(parsed.memory_strategy.as_deref(), Some("shared_fabric"));
+        assert_eq!(
+            parsed.shared_memory_db_path.as_deref(),
+            Some(PathBuf::from("/tmp/parent-ws/memory/brain.db").as_path())
+        );
+        assert_eq!(parsed.agent_id.as_deref(), Some("worker-agent"));
+        assert_eq!(parsed.persona_id.as_deref(), Some("persona-a"));
+        assert!(parsed.memory_event_recording.record_tool_events);
         assert_eq!(parsed.identity_dir.as_deref(), Some("identity/worker"));
         assert_eq!(parsed.scope_sender.as_deref(), Some("openprx_user"));
         assert_eq!(parsed.spawn_depth, 1);

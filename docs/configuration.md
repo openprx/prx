@@ -26,6 +26,23 @@ max_history = 200
 [gateway]
 request_timeout_secs = 180
 
+[memory]
+backend = "sqlite"
+# Compatibility gate for semantic promotion. Message events are controlled below.
+auto_save = true
+
+[memory.events]
+enabled = true
+record_user_messages = true
+record_assistant_messages = true
+record_tool_events = false
+retention_days = 14
+
+[memory.semantic]
+auto_promote_user_messages = true
+auto_promote_assistant_messages = false
+min_chars = 30
+
 [channels_config.signal]
 enabled = true
 account = "+1234567890"
@@ -89,6 +106,21 @@ claude-opus-4-6 = ["claude-sonnet-4-6"]
 # Provider fallbacks
 fallback_providers = ["xai"]
 ```
+
+## Shared Memory Fabric
+
+PRX treats `chat`, `agent`, `gateway`, `channel`, `delegate`, and `sessions_spawn` as different message entrypoints over one workspace memory fabric.
+
+- `message_events` stores normalized user, assistant, tool, and worker events.
+- `memory_events` is the outbox/cursor stream used by SQLite polling watchers.
+- `memories` stores promoted long-term semantic facts.
+- `auto_save` no longer controls the base message log; it gates semantic promotion for backward compatibility.
+
+`[memory.events]` controls raw/quasi-raw event recording. Turning it off stops new fabric event rows for entrypoints wired through `MemoryFabric`.
+
+`[memory.semantic]` controls promotion from event/message content into durable semantic memory. Assistant promotion is disabled by default to reduce noisy self-generated memory.
+
+For `sessions_spawn`, `task` runs an in-process sub-agent and `process` launches a worker process. Process mode uses a manifest with `memory_strategy`, `shared_memory_db_path`, and `worker_memory_db_path`; the default `shared_fabric` strategy writes worker events into the parent workspace fabric while still keeping the execution boundary explicit. Set `[sessions_spawn].process_memory_strategy = "isolated_private"` for a private worker DB, or `"hybrid"` for private worker draft state with parent-recorded spawn/result events.
 
 ## Agent Concurrency Env Overrides
 

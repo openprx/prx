@@ -12,11 +12,11 @@
 mod api;
 mod ui;
 
-use crate::agent::loop_::{ToolConcurrencyGovernanceConfig, run_tool_call_loop};
+use crate::agent::loop_::{ToolConcurrencyGovernanceConfig, build_context_with_shared_events, run_tool_call_loop};
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, SignalChannel, WhatsAppChannel};
 use crate::config::Config;
 use crate::hooks::HookManager;
-use crate::memory::{self, Memory, MemoryCategory};
+use crate::memory::{self, Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryVisibility, MessageEventScope};
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
 use crate::runtime;
@@ -80,6 +80,38 @@ fn should_autosave_gateway_message(reply_target: Option<&str>, content: &str) ->
         return false;
     }
     !reply_target.is_some_and(is_group_reply_target)
+}
+
+#[derive(Debug, Clone)]
+struct GatewayFabricContext {
+    channel: String,
+    session_key: String,
+    sender: String,
+    recipient: String,
+    idempotency_key: Option<String>,
+}
+
+impl GatewayFabricContext {
+    fn generic_webhook(reply_target: Option<&str>, idempotency_key: Option<String>) -> Self {
+        let target = reply_target.unwrap_or("webhook-client");
+        Self {
+            channel: "webhook".to_string(),
+            session_key: format!("gateway:webhook:{target}"),
+            sender: target.to_string(),
+            recipient: "prx".to_string(),
+            idempotency_key,
+        }
+    }
+
+    fn channel_message(msg: &crate::channels::traits::ChannelMessage) -> Self {
+        Self {
+            channel: msg.channel.clone(),
+            session_key: format!("gateway:{}:{}", msg.channel, msg.sender),
+            sender: msg.sender.clone(),
+            recipient: msg.reply_target.clone(),
+            idempotency_key: Some(format!("gateway:{}:{}", msg.channel, msg.id)),
+        }
+    }
 }
 
 pub(super) fn hash_webhook_secret(value: &str) -> String {
@@ -535,7 +567,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             config.api_key.clone(),
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
-        );
+        )
+        .with_shared_memory(Arc::clone(&mem))
+        .with_event_recording(config.memory.event_recording_config());
         let handle = spawn_tool.tools_handle();
         tools_list.push(Box::new(spawn_tool));
         Some(handle)
@@ -745,7 +779,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         model,
         temperature,
         mem,
-        auto_save: config.memory.auto_save,
+        auto_save: config.memory.auto_save && config.memory.semantic.auto_promote_user_messages,
         tools_registry,
         mcp_tool,
         hooks,
@@ -941,8 +975,56 @@ async fn run_gateway_chat_with_multimodal(
     state: &AppState,
     provider_label: &str,
     message: &str,
+    fabric_ctx: &GatewayFabricContext,
 ) -> anyhow::Result<String> {
-    let user_messages = vec![ChatMessage::user(message)];
+    let workspace_id = state.config.lock().workspace_dir.to_string_lossy().to_string();
+    let event_recording = state.config.lock().memory.event_recording_config();
+    let fabric = MemoryFabric::new(state.mem.clone(), workspace_id.clone()).with_event_recording(event_recording);
+    let run_id = Uuid::new_v4().to_string();
+    let base_scope = MessageEventScope::new("gateway", MemoryVisibility::Workspace)
+        .with_channel(fabric_ctx.channel.clone())
+        .with_session_key(fabric_ctx.session_key.clone())
+        .with_run_id(run_id)
+        .with_sender(fabric_ctx.sender.clone())
+        .with_recipient(fabric_ctx.recipient.clone());
+    if let Err(error) = fabric
+        .record_inbound_user_message(
+            base_scope.clone(),
+            message.to_string(),
+            fabric_ctx.idempotency_key.clone(),
+            None,
+        )
+        .await
+    {
+        tracing::warn!(
+            channel = %fabric_ctx.channel,
+            session_key = %fabric_ctx.session_key,
+            "Failed to append gateway user message event: {error}"
+        );
+    }
+
+    let min_relevance_score = state.config.lock().memory.min_relevance_score;
+    let mem_context = build_context_with_shared_events(
+        state.mem.as_ref(),
+        MemoryPrincipal {
+            workspace_id,
+            agent_id: None,
+            persona_id: None,
+            session_key: Some(fabric_ctx.session_key.clone()),
+            channel: Some(fabric_ctx.channel.clone()),
+            sender: Some(fabric_ctx.sender.clone()),
+        },
+        message,
+        min_relevance_score,
+    )
+    .await;
+    let enriched_message = if mem_context.preamble.is_empty() {
+        message.to_string()
+    } else {
+        format!("{}{}", mem_context.preamble, message)
+    };
+
+    let user_messages = vec![ChatMessage::user(&enriched_message)];
     let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
     if image_marker_count > 0 && !state.provider.supports_vision() {
         return Err(ProviderCapabilityError {
@@ -1009,7 +1091,7 @@ async fn run_gateway_chat_with_multimodal(
 
     let noop_observer = NoopObserver;
 
-    run_tool_call_loop(
+    let response = run_tool_call_loop(
         state.provider.as_ref(),
         &mut history,
         state.tools_registry.as_ref(),
@@ -1046,7 +1128,24 @@ async fn run_gateway_chat_with_multimodal(
         Some(&config_snapshot.tool_tiering),
         crate::agent::loop_::ChatMode::default(),
     )
-    .await
+    .await?;
+
+    if let Err(error) = fabric
+        .record_assistant_message(
+            base_scope
+                .with_sender(format!("{provider_label}/{}", state.model))
+                .with_recipient(fabric_ctx.sender.clone()),
+            response.clone(),
+        )
+        .await
+    {
+        tracing::warn!(
+            channel = %fabric_ctx.channel,
+            session_key = %fabric_ctx.session_key,
+            "Failed to append gateway assistant message event: {error}"
+        );
+    }
+    Ok(response)
 }
 
 /// Webhook request body
@@ -1159,12 +1258,13 @@ async fn handle_webhook(
     };
 
     // ── Idempotency (optional) ──
-    if let Some(idempotency_key) = headers
+    let request_idempotency_key = headers
         .get("X-Idempotency-Key")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
+        .map(str::to_string);
+    if let Some(idempotency_key) = request_idempotency_key.as_deref() {
         if !state.idempotency_store.record_if_new(idempotency_key) {
             tracing::info!("Webhook duplicate ignored (idempotency key: {idempotency_key})");
             let body = serde_json::json!({
@@ -1206,7 +1306,11 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message).await {
+    let fabric_ctx = GatewayFabricContext::generic_webhook(
+        webhook_body.reply_target.as_deref(),
+        request_idempotency_key.map(|key| format!("gateway:webhook:{key}")),
+    );
+    match run_gateway_chat_with_multimodal(&state, &provider_label, message, &fabric_ctx).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -1415,7 +1519,8 @@ async fn handle_whatsapp_message(State(state): State<AppState>, headers: HeaderM
                 .await;
         }
 
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        let fabric_ctx = GatewayFabricContext::channel_message(msg);
+        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content, &fabric_ctx).await {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa.send(&SendMessage::new(response, &msg.reply_target)).await {
@@ -1523,7 +1628,8 @@ async fn handle_linq_webhook(State(state): State<AppState>, headers: HeaderMap, 
         }
 
         // Call the LLM
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        let fabric_ctx = GatewayFabricContext::channel_message(msg);
+        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content, &fabric_ctx).await {
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq.send(&SendMessage::new(response, &msg.reply_target)).await {
@@ -1637,7 +1743,8 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
+        let fabric_ctx = GatewayFabricContext::channel_message(msg);
+        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content, &fabric_ctx).await {
             Ok(response) => {
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1675,7 +1782,7 @@ mod tests {
     )]
     use super::*;
     use crate::channels::traits::ChannelMessage;
-    use crate::memory::{Memory, MemoryCategory, MemoryEntry};
+    use crate::memory::{Memory, MemoryCategory, MemoryEntry, MemoryPrincipal, SqliteMemory};
     use crate::providers::Provider;
     use async_trait::async_trait;
     use axum::http::HeaderValue;
@@ -2276,6 +2383,97 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(parsed["status"], "duplicate");
         assert_eq!(parsed["idempotent"], true);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_records_gateway_message_events() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config.clone())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(config)),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::clone(&memory),
+            auto_save: false,
+            tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
+            hooks: Arc::new(HookManager::new(tmp.path().to_path_buf())),
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            signal: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("gateway-event-1"));
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            headers,
+            Bytes::from_static(br#"{"message":"hello gateway","reply_target":"client-a"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: tmp.path().to_string_lossy().to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("gateway:webhook:client-a".to_string()),
+                    channel: Some("webhook".to_string()),
+                    sender: Some("client-a".to_string()),
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].source, "gateway");
+        assert_eq!(events[0].channel.as_deref(), Some("webhook"));
+        assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].content, "hello gateway");
+        assert_eq!(
+            events[0].idempotency_key.as_deref(),
+            Some("gateway:webhook:gateway-event-1")
+        );
+        assert_eq!(events[1].role, "assistant");
+        assert_eq!(events[1].content, "ok");
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
