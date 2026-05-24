@@ -2655,6 +2655,9 @@ mod integration_tests {
             Action::CancelRequested,
             Action::ShutdownRequested,
             Action::HistoryCleared,
+            Action::HistoryClearedWithNotice {
+                notice: "Conversation cleared".to_string(),
+            },
             Action::ForceQuit,
             Action::ToolCardFoldToggled,
             Action::ReasoningFoldToggled,

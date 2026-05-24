@@ -7,6 +7,11 @@ use std::sync::{Arc, LazyLock};
 /// Filter out content that should not be auto-saved to memory.
 /// Heartbeat prompts, cron triggers, trivial acks, and very short messages are noise.
 pub fn should_autosave_content(content: &str) -> bool {
+    should_autosave_content_with_min(content, 30)
+}
+
+/// Filter out content below a caller-defined semantic promotion threshold.
+pub fn should_autosave_content_with_min(content: &str, min_chars: usize) -> bool {
     let noise_patterns = [
         "HEARTBEAT",
         "heartbeat",
@@ -22,7 +27,7 @@ pub fn should_autosave_content(content: &str) -> bool {
     if noise_patterns.iter().any(|p| content.contains(p)) {
         return false;
     }
-    if content.chars().count() < 30 {
+    if content.chars().count() < min_chars {
         return false;
     }
     true

@@ -99,31 +99,59 @@ async fn ensure_atomic_tmp_dir(canonical_root: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
-fn atomic_write_test_hook_cell() -> &'static std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> {
-    use std::sync::{Mutex, OnceLock};
-    static HOOK: OnceLock<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = OnceLock::new();
-    HOOK.get_or_init(|| Mutex::new(None))
+struct AtomicWriteTestHook {
+    target: PathBuf,
+    callback: Box<dyn Fn() + Send + Sync>,
 }
 
 #[cfg(test)]
-fn run_atomic_write_test_hook() {
-    if let Some(callback) = atomic_write_test_hook_cell()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-    {
-        callback();
+struct AtomicWriteTestHookGuard;
+
+#[cfg(test)]
+impl Drop for AtomicWriteTestHookGuard {
+    fn drop(&mut self) {
+        clear_atomic_write_test_hook();
     }
 }
 
 #[cfg(test)]
-fn set_atomic_write_test_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
-    *atomic_write_test_hook_cell().lock().unwrap_or_else(|e| e.into_inner()) = hook;
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+fn atomic_write_test_hook_cell() -> &'static std::sync::Mutex<Option<AtomicWriteTestHook>> {
+    use std::sync::{Mutex, OnceLock};
+    static HOOK: OnceLock<Mutex<Option<AtomicWriteTestHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn run_atomic_write_test_hook(target: &Path) {
+    let hook = {
+        let mut guard = atomic_write_test_hook_cell().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(|hook| hook.target == target) {
+            guard.take()
+        } else {
+            None
+        }
+    };
+
+    if let Some(hook) = hook {
+        (hook.callback)();
+    }
+}
+
+#[cfg(test)]
+fn set_atomic_write_test_hook(target: PathBuf, callback: Box<dyn Fn() + Send + Sync>) -> AtomicWriteTestHookGuard {
+    *atomic_write_test_hook_cell().lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(AtomicWriteTestHook { target, callback });
+    AtomicWriteTestHookGuard
+}
+
+#[cfg(test)]
+fn clear_atomic_write_test_hook() {
+    *atomic_write_test_hook_cell().lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 #[cfg(not(test))]
-const fn run_atomic_write_test_hook() {}
+const fn run_atomic_write_test_hook(_target: &Path) {}
 
 /// Atomically write content to target within workspace boundary.
 pub async fn atomic_write(workspace_root: &Path, path: &Path, content: &[u8]) -> Result<()> {
@@ -155,7 +183,7 @@ pub async fn atomic_write(workspace_root: &Path, path: &Path, content: &[u8]) ->
     file.sync_all().await?;
     drop(file);
 
-    run_atomic_write_test_hook();
+    run_atomic_write_test_hook(&canonical_target);
 
     let (_, latest_target) = normalize_target_in_workspace(&canonical_root, path)?;
     canonical_target = latest_target;
@@ -287,13 +315,15 @@ mod tests {
 
         let nested = target.parent().unwrap().to_path_buf();
         let outside_link = outside.path().join("escaped");
-        set_atomic_write_test_hook(Some(Box::new(move || {
-            let _ = std::fs::remove_dir_all(&nested);
-            symlink(&outside_link, &nested).unwrap();
-        })));
+        let _hook = set_atomic_write_test_hook(
+            target.clone(),
+            Box::new(move || {
+                let _ = std::fs::remove_dir_all(&nested);
+                let _ = symlink(&outside_link, &nested);
+            }),
+        );
 
         let err = atomic_write(dir.path(), &target, b"nope").await.unwrap_err();
-        set_atomic_write_test_hook(None);
         assert!(!err.to_string().is_empty());
         assert!(!outside.path().join("escaped").exists());
     }

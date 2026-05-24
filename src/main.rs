@@ -330,7 +330,7 @@ enum Commands {
         #[arg(long)]
         provider: Option<String>,
         /// Model ID override (used in quick mode)
-        #[arg(long)]
+        #[arg(short = 'm', long)]
         model: Option<String>,
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
@@ -423,7 +423,7 @@ Examples:
         provider: Option<String>,
 
         /// Model to use
-        #[arg(long)]
+        #[arg(short = 'm', long)]
         model: Option<String>,
 
         /// Temperature (0.0 - 2.0)
@@ -1268,9 +1268,13 @@ async fn async_main() -> Result<()> {
                 }
             );
             println!(
-                "🧠 Memory:         {} (auto-save: {})",
+                "🧠 Memory:         {} (semantic auto-promote: {})",
                 effective_memory_backend,
-                if config.memory.auto_save { "on" } else { "off" }
+                if config.memory.auto_save && config.memory.semantic.auto_promote_user_messages {
+                    "on"
+                } else {
+                    "off"
+                }
             );
 
             println!();

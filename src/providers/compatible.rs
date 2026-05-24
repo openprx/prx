@@ -837,6 +837,8 @@ pub(crate) fn sse_bytes_to_chunks(
     tokio::spawn(async move {
         // Buffer for incomplete lines
         let mut buffer = String::new();
+        let mut saw_sse_event = false;
+        let mut saw_non_sse_line = false;
         // Per-index tool-call accumulator. Carried across all SSE frames so
         // argument fragments split across multiple `data:` lines aggregate
         // correctly before flush.
@@ -876,9 +878,14 @@ pub(crate) fn sse_bytes_to_chunks(
                     // → `drain` yields `""` and the empty buffer has no `[1..]`).
                     while let Some(pos) = buffer.find('\n') {
                         let line = buffer.drain(..=pos).collect::<String>();
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() && !trimmed.starts_with(':') && !trimmed.starts_with("data:") {
+                            saw_non_sse_line = true;
+                        }
 
                         match parse_sse_line(&line) {
                             Ok(Some(event)) => {
+                                saw_sse_event = true;
                                 // `[DONE]` carries no payload; nothing else to emit.
                                 if event.done_sentinel {
                                     continue;
@@ -937,6 +944,26 @@ pub(crate) fn sse_bytes_to_chunks(
                     break;
                 }
             }
+        }
+
+        let trailing = buffer.trim();
+        if !trailing.is_empty() {
+            let preview = trailing.chars().take(200).collect::<String>();
+            let _ = tx
+                .send(Err(StreamError::InvalidSse(format!(
+                    "OpenAI-compatible SSE stream ended with incomplete trailing data: {preview}"
+                ))))
+                .await;
+            return;
+        }
+
+        if !saw_sse_event && saw_non_sse_line {
+            let _ = tx
+                .send(Err(StreamError::InvalidSse(
+                    "OpenAI-compatible streaming response did not contain any SSE data events".to_string(),
+                )))
+                .await;
+            return;
         }
 
         // Defensive flush: if the stream ended without an explicit
@@ -3283,6 +3310,33 @@ mod tests {
         let lines = split_lines(&mut b4);
         assert_eq!(lines, vec!["中\n".to_string(), "中\n".to_string()]);
         assert!(b4.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compatible_streaming_rejects_malformed_non_sse_success_body() {
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn malformed() -> &'static str {
+            "{not valid json"
+        }
+
+        let app = Router::new().route("/chat/completions", post(malformed));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test: bind");
+        let addr = listener.local_addr().expect("test: addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = make_provider("custom", &format!("http://{addr}"), Some("test-key"));
+        let messages = vec![ChatMessage::user("hi".to_string())];
+        let mut stream = provider.stream_chat_with_history(&messages, "test-model", 0.0, StreamOptions::new(false));
+        let first = stream.next().await.expect("chunk");
+        let err = first.expect_err("malformed 200 response must not become empty success");
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid SSE format"), "got: {msg}");
+        assert!(msg.contains("incomplete trailing data"), "got: {msg}");
     }
 
     /// Defensive: a tool-call delta arriving with only `id` (no `name`) must

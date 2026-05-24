@@ -6,8 +6,8 @@ use crate::config::schema::{
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig, HeartbeatConfig,
-    IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig, RuntimeConfig, SecretsConfig,
-    SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, MemoryEventsConfig, MemorySemanticConfig,
+    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
 };
 use crate::memory::{default_memory_backend_key, memory_backend_profile, selectable_memory_backends};
 use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
@@ -346,6 +346,8 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
     MemoryConfig {
         backend: backend.to_string(),
         auto_save: profile.auto_save_default,
+        events: MemoryEventsConfig::default(),
+        semantic: MemorySemanticConfig::default(),
         acl_enabled: false,
         hygiene_enabled: profile.uses_sqlite_hygiene,
         archive_after_days: if profile.uses_sqlite_hygiene { 7 } else { 0 },
@@ -634,7 +636,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
         "gemini" => "gemini-2.5-pro".into(),
-        "kimi-code" => "kimi-for-coding".into(),
+        "kimi-code" => "kimi2.6".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         "astrai" => "anthropic/claude-sonnet-4.6".into(),
@@ -831,6 +833,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
         ],
         "kimi-code" => vec![
+            (
+                "kimi2.6".to_string(),
+                "Kimi 2.6 (Kimi Code subscription model)".to_string(),
+            ),
             (
                 "kimi-for-coding".to_string(),
                 "Kimi for Coding (official coding-agent model)".to_string(),
@@ -4940,7 +4946,7 @@ mod tests {
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
-        assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
+        assert_eq!(default_model_for_provider("kimi-code"), "kimi2.6");
         assert_eq!(
             default_model_for_provider("bedrock"),
             "anthropic.claude-sonnet-4-5-20250929-v1:0"
@@ -5070,6 +5076,7 @@ mod tests {
             .collect();
 
         assert!(ids.contains(&"kimi-for-coding".to_string()));
+        assert!(ids.contains(&"kimi2.6".to_string()));
         assert!(ids.contains(&"kimi-k2.5".to_string()));
     }
 

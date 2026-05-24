@@ -992,6 +992,14 @@ pub struct SessionsSpawnConfig {
     /// Default execution mode for sessions_spawn (`task` or `process`).
     #[serde(default = "default_sessions_spawn_mode")]
     pub default_mode: String,
+    /// Memory strategy for process-mode workers.
+    ///
+    /// Supported values:
+    /// - `shared_fabric`: worker uses the parent workspace memory DB.
+    /// - `isolated_private`: worker uses its private DB.
+    /// - `hybrid`: worker uses its private DB while the parent records spawn/result events.
+    #[serde(default = "default_sessions_spawn_process_memory_strategy")]
+    pub process_memory_strategy: String,
     /// Optional root directory for process-mode worker workspaces.
     ///
     /// When unset, falls back to `<workspace>/workers`.
@@ -1015,6 +1023,7 @@ impl Default for SessionsSpawnConfig {
     fn default() -> Self {
         Self {
             default_mode: default_sessions_spawn_mode(),
+            process_memory_strategy: default_sessions_spawn_process_memory_strategy(),
             worker_workspace_root: None,
             cleanup_on_complete: default_sessions_spawn_cleanup_on_complete(),
             max_concurrent: default_sessions_spawn_max_concurrent(),
@@ -1026,6 +1035,10 @@ impl Default for SessionsSpawnConfig {
 
 fn default_sessions_spawn_mode() -> String {
     "task".to_string()
+}
+
+fn default_sessions_spawn_process_memory_strategy() -> String {
+    "shared_fabric".to_string()
 }
 
 const fn default_sessions_spawn_cleanup_on_complete() -> bool {
@@ -2529,8 +2542,17 @@ pub struct MemoryConfig {
     ///
     /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
     pub backend: String,
-    /// Auto-save user-stated conversation input to memory (assistant output is excluded)
+    /// Backward-compatible semantic auto-promotion gate.
+    ///
+    /// Message events are controlled by `[memory.events]`; this controls whether
+    /// eligible user messages are promoted into long-term semantic memories.
     pub auto_save: bool,
+    /// Raw/quasi-raw message event recording controls (`[memory.events]`).
+    #[serde(default)]
+    pub events: MemoryEventsConfig,
+    /// Semantic memory promotion controls (`[memory.semantic]`).
+    #[serde(default)]
+    pub semantic: MemorySemanticConfig,
     /// Feature gate for memory ACL enforcement. Phase 0 keeps this disabled.
     #[serde(default)]
     pub acl_enabled: bool,
@@ -2617,6 +2639,40 @@ pub struct MemoryConfig {
     pub lucid_failure_cooldown_ms: u64,
 }
 
+/// Raw message event recording configuration (`[memory.events]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryEventsConfig {
+    /// Record normalized message events into the shared fabric.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Record inbound/user messages.
+    #[serde(default = "default_true")]
+    pub record_user_messages: bool,
+    /// Record assistant replies.
+    #[serde(default = "default_true")]
+    pub record_assistant_messages: bool,
+    /// Record tool/event payloads by default.
+    #[serde(default)]
+    pub record_tool_events: bool,
+    /// Retention hint for event cleanup. Enforcement is handled by hygiene.
+    #[serde(default = "default_memory_event_retention_days")]
+    pub retention_days: u32,
+}
+
+/// Semantic memory promotion configuration (`[memory.semantic]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemorySemanticConfig {
+    /// Auto-promote eligible user messages into long-term semantic memories.
+    #[serde(default = "default_true")]
+    pub auto_promote_user_messages: bool,
+    /// Auto-promote eligible assistant messages. Disabled by default to reduce noise.
+    #[serde(default)]
+    pub auto_promote_assistant_messages: bool,
+    /// Minimum content length for semantic auto-promotion.
+    #[serde(default = "default_semantic_auto_promote_min_chars")]
+    pub min_chars: usize,
+}
+
 fn default_embedding_provider() -> String {
     "none".into()
 }
@@ -2653,6 +2709,12 @@ const fn default_min_relevance_score() -> f64 {
 const fn default_cache_size() -> usize {
     10_000
 }
+const fn default_memory_event_retention_days() -> u32 {
+    14
+}
+const fn default_semantic_auto_promote_min_chars() -> usize {
+    30
+}
 const fn default_lucid_recall_timeout_ms() -> u64 {
     5000
 }
@@ -2671,6 +2733,8 @@ impl Default for MemoryConfig {
         Self {
             backend: "sqlite".into(),
             auto_save: true,
+            events: MemoryEventsConfig::default(),
+            semantic: MemorySemanticConfig::default(),
             acl_enabled: false,
             hygiene_enabled: default_hygiene_enabled(),
             archive_after_days: default_archive_after_days(),
@@ -2694,6 +2758,64 @@ impl Default for MemoryConfig {
             lucid_store_timeout_ms: default_lucid_store_timeout_ms(),
             lucid_local_hit_threshold: default_lucid_local_hit_threshold(),
             lucid_failure_cooldown_ms: default_lucid_failure_cooldown_ms(),
+        }
+    }
+}
+
+impl Default for MemoryEventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            record_user_messages: true,
+            record_assistant_messages: true,
+            record_tool_events: false,
+            retention_days: default_memory_event_retention_days(),
+        }
+    }
+}
+
+impl Default for MemorySemanticConfig {
+    fn default() -> Self {
+        Self {
+            auto_promote_user_messages: true,
+            auto_promote_assistant_messages: false,
+            min_chars: default_semantic_auto_promote_min_chars(),
+        }
+    }
+}
+
+impl MemoryConfig {
+    /// Whether user content should be promoted from the event stream into
+    /// durable semantic memory. This deliberately does not control event logs.
+    pub fn should_auto_promote_user_message(&self, content: &str) -> bool {
+        self.auto_save
+            && self.semantic.auto_promote_user_messages
+            && crate::memory::should_autosave_content_with_min(content, self.semantic.min_chars)
+    }
+
+    /// Whether assistant content should be promoted into durable semantic memory.
+    pub fn should_auto_promote_assistant_message(&self, content: &str) -> bool {
+        self.auto_save
+            && self.semantic.auto_promote_assistant_messages
+            && crate::memory::should_autosave_content_with_min(content, self.semantic.min_chars)
+    }
+
+    /// Whether normalized user message events should be recorded.
+    pub const fn should_record_user_message_event(&self) -> bool {
+        self.events.enabled && self.events.record_user_messages
+    }
+
+    /// Whether normalized assistant message events should be recorded.
+    pub const fn should_record_assistant_message_event(&self) -> bool {
+        self.events.enabled && self.events.record_assistant_messages
+    }
+
+    pub const fn event_recording_config(&self) -> crate::memory::MemoryEventRecording {
+        crate::memory::MemoryEventRecording {
+            enabled: self.events.enabled,
+            record_user_messages: self.events.record_user_messages,
+            record_assistant_messages: self.events.record_assistant_messages,
+            record_tool_events: self.events.record_tool_events,
         }
     }
 }
@@ -5317,6 +5439,15 @@ default_temperature = 0.7
         let m = MemoryConfig::default();
         assert_eq!(m.backend, "sqlite");
         assert!(m.auto_save);
+        assert!(m.events.enabled);
+        assert!(m.events.record_user_messages);
+        assert!(m.events.record_assistant_messages);
+        assert!(!m.events.record_tool_events);
+        assert_eq!(m.events.retention_days, 14);
+        assert!(m.semantic.auto_promote_user_messages);
+        assert!(!m.semantic.auto_promote_assistant_messages);
+        assert_eq!(m.semantic.min_chars, 30);
+        assert!(m.should_auto_promote_user_message("this is a long enough user preference that should be stored"));
         assert!(!m.acl_enabled);
         assert!(m.hygiene_enabled);
         assert_eq!(m.archive_after_days, 7);
@@ -5324,6 +5455,40 @@ default_temperature = 0.7
         assert_eq!(m.conversation_retention_days, 3);
         assert_eq!(m.daily_retention_days, 7);
         assert!(m.sqlite_open_timeout_secs.is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_events_and_semantic_config_parse_independently() {
+        let parsed: MemoryConfig = toml::from_str(
+            r#"
+backend = "sqlite"
+auto_save = true
+
+[events]
+enabled = true
+record_user_messages = true
+record_assistant_messages = false
+record_tool_events = true
+retention_days = 3
+
+[semantic]
+auto_promote_user_messages = false
+auto_promote_assistant_messages = true
+min_chars = 12
+"#,
+        )
+        .unwrap();
+
+        assert!(parsed.should_record_user_message_event());
+        assert!(!parsed.should_record_assistant_message_event());
+        assert!(parsed.events.record_tool_events);
+        assert_eq!(parsed.events.retention_days, 3);
+        assert!(
+            !parsed.should_auto_promote_user_message(
+                "this user message is long enough but semantic promotion is disabled"
+            )
+        );
+        assert!(parsed.should_auto_promote_assistant_message("assistant text long enough for semantic promotion"));
     }
 
     #[test]

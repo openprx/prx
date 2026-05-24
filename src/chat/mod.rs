@@ -37,8 +37,9 @@ pub mod renderer;
 pub mod tui;
 
 use crate::agent::loop_::{
-    ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig, build_context, build_runtime_system_prompt,
-    increment_recalled_useful_counts, is_tool_loop_cancelled, run_tool_call_loop, select_prompt_skills,
+    ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig, build_context_with_shared_events,
+    build_runtime_system_prompt, increment_recalled_useful_counts, is_tool_loop_cancelled, run_tool_call_loop,
+    select_prompt_skills,
 };
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
@@ -49,7 +50,7 @@ use crate::channels::{
 use crate::chat::terminal_proto::DraftVersionCounter;
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
-use crate::memory::{self, Memory, MemoryCategory};
+use crate::memory::{self, Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryVisibility, MessageEventScope};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
@@ -58,16 +59,15 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
-use std::io::Write as _;
+#[cfg(feature = "terminal-tui")]
+use std::collections::VecDeque;
+use std::io::{IsTerminal as _, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
-
-/// Minimum user-message length for auto-save to memory.
-const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 10;
 
 /// Window (ms) for double Ctrl+C to trigger exit.
 const DOUBLE_CTRLC_WINDOW_MS: u64 = 500;
@@ -95,6 +95,12 @@ const TOOL_EVENT_CHANNEL_CAPACITY: usize = 32;
 
 /// Minimum base timeout (seconds) for per-turn timeout budget.
 const TIMEOUT_MIN_BASE_SECS: u64 = 30;
+
+/// Bounded grace period for reducer-owned persistence to finish before exit.
+const EXIT_PERSISTENCE_DRAIN_GRACE_MS: u64 = 250;
+
+/// Extra idle settle window after the persistence guard is inactive.
+const EXIT_PERSISTENCE_IDLE_SETTLE_MS: u64 = 50;
 
 /// Maximum multiplier applied to the base timeout (caps iterations-based scaling).
 const TIMEOUT_MAX_SCALE_FACTOR: u64 = 4;
@@ -148,6 +154,19 @@ fn now_ms() -> u64 {
 }
 
 fn print_fallback_chat_output(text: &str) {
+    let out = format_fallback_chat_output_for(text, std::io::stdout().is_terminal());
+    print!("{out}");
+    let _ = std::io::stdout().flush();
+}
+
+fn format_fallback_chat_output_for(text: &str, stdout_is_terminal: bool) -> String {
+    if !stdout_is_terminal {
+        let mut out = String::with_capacity(text.len() + 1);
+        out.push_str(text);
+        out.push('\n');
+        return out;
+    }
+
     let mut out = String::with_capacity(text.len() + 2);
     let mut prev_was_cr = false;
     for ch in text.chars() {
@@ -158,188 +177,76 @@ fn print_fallback_chat_output(text: &str) {
         prev_was_cr = ch == '\r';
     }
     out.push_str("\r\n");
-    print!("{out}");
-    let _ = std::io::stdout().flush();
+    out
 }
 
-/// Chat 输入路径的 Redux 灰度模式. 由环境变量 `PRX_CHAT_REDUX` 控制.
+#[cfg(test)]
+mod fallback_chat_output_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_chat_output_preserves_lf_for_piped_stdout() {
+        assert_eq!(format_fallback_chat_output_for("a\nb", false), "a\nb\n");
+    }
+
+    #[test]
+    fn fallback_chat_output_uses_crlf_for_terminal_stdout() {
+        assert_eq!(format_fallback_chat_output_for("a\nb", true), "a\r\nb\r\n");
+    }
+}
+
+/// Chat 输入路径的运行模式.
 ///
-/// - `Off`:  旧路径单写（默认）。reducer 不构造、不执行。
-/// - `Both`: 双写。Event 同时分发到旧路径和 reducer，两者并行 mutate；
-///   用于开发/测试期对账 reducer 与旧实现的行为一致。
-/// - `Redux`: Both 的超集。reducer 并行构造 + 执行 Effect，同时允许
-///   `PRX_CHAT_REDUX_DRIVER=1` opt-in 切换到 ReduxDriver 路径。
-///   `"1"` 映射到 `Both`（向后兼容），显式 `"redux"` 才到此态。
-/// - `Pure`: S3 T3-3 收官模式，reducer 单路由。driver 路径**默认开启**（无需
-///   `PRX_CHAT_REDUX_DRIVER=1`），legacy 守卫全关，`chat_session.add_*_turn`
-///   不再执行（由 reducer 的 `RecordUserTurn`/`RecordAssistantTurn` +
-///   `Effect::SaveSession` 接管）。
-// S2.5 T2.5-4 (T3-3-fixB 后): PRX_CHAT_REDUX 三态环境变量保留至 S5 验收完成。
-//
-// 当前四态实际语义（与字面"三态"区分）:
-// - Off:   reducer 完全静默，旧路径单写（legacy chat_session 是唯一持久化源）
-// - Both:  reducer 并行，dual_write_guard 守卫旧路径（双写防护期间）
-// - Redux: Both 超集，额外允许 driver opt-in 路由（PRX_CHAT_REDUX_DRIVER=1 + Redux → ReduxDriver）
-// - Pure:  reducer 单路由，旧路径全关闭（T3-3 收官目标态）
-//
-// 移除节奏：S4-B 仅删 chat_mirror/active_cancel 等数据结构，env 守卫保留；
-// S5 验收全 PASS 后再删 enum + 全部守卫调用点。
+/// v0.4.1 清理后，terminal TUI 只支持 reducer/driver 单路由。旧的 Off/Both/Redux
+/// 灰度模式已在 v0.4.0 验收后退役；`PRX_CHAT_REDUX` 仍会被读取一次用于告警，
+/// 但不会再改变运行路径。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReduxMode {
-    Off,
-    Both,
-    Redux,
     Pure,
 }
 
 impl ReduxMode {
-    /// 解析环境变量 `PRX_CHAT_REDUX`. 默认 `Off`.
-    ///
-    /// 值大小写不敏感，识别规则：
-    /// - `""` / `"0"` / `"off"` / `"legacy"` / 未设置 → [`Self::Off`]
-    /// - `"1"` / `"both"` → [`Self::Both`]（向后兼容：原 `Redux` 别名也归此）
-    /// - `"redux"` → [`Self::Redux`]（显式字符串，不等价 `Both`；可 opt-in driver 路由）
-    /// - `"pure"` / `"2"` → [`Self::Pure`]（T3-3 收官模式，reducer 单路由）
-    /// - 其他未识别值 → [`Self::Off`]（fail-safe，避免误升级）
+    /// Read the retired `PRX_CHAT_REDUX` env only to warn operators when a
+    /// stale deployment still tries to select a legacy mode.
     fn from_env() -> Self {
-        std::env::var("PRX_CHAT_REDUX")
-            .ok()
-            .map_or(Self::Off, |raw| Self::parse(&raw))
-    }
-
-    /// 解析单个字符串值（大小写不敏感）；fail-safe 到 `Off`.
-    ///
-    /// 拆成独立 fn 让 env 解析逻辑可单测，不依赖进程级 env 状态.
-    fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "0" | "off" | "legacy" => Self::Off,
-            "1" | "both" => Self::Both,
-            "redux" => Self::Redux,
-            "pure" | "2" => Self::Pure,
-            _ => Self::Off,
+        if let Ok(raw) = std::env::var("PRX_CHAT_REDUX") {
+            let value = raw.trim();
+            if !value.is_empty() && !value.eq_ignore_ascii_case("pure") && value != "2" {
+                tracing::warn!(
+                    requested = value,
+                    "PRX_CHAT_REDUX legacy modes are retired; using Pure reducer path"
+                );
+            }
         }
+        Self::Pure
     }
 
-    /// 是否启用 reducer 路径（构造 + 执行 Effect）.
-    ///
-    /// `Off` → false（reducer 完全静默，旧路径单写）.
-    /// `Both` / `Redux` / `Pure` → true.
-    #[must_use]
-    pub(crate) const fn reducer_active(self) -> bool {
-        !matches!(self, Self::Off)
-    }
-
-    /// 是否在 Pure 模式（reducer 单路由，legacy 守卫全关）.
-    ///
-    /// T3-3-c 关键判断：`Pure` 时跳过 `chat_session.add_*_turn` 并让 reducer 的
-    /// `Effect::SaveSession` 单写持久化；`Off` / `Both` / `Redux` 保留 legacy.
     #[must_use]
     pub(crate) const fn is_pure(self) -> bool {
-        matches!(self, Self::Pure)
+        true
     }
 }
 
-/// Step 5a-4: chat::run 主循环 LLM turn 路由结果.
-///
-/// "切闸"决策由两个独立环境变量正交控制：
-/// - `PRX_CHAT_REDUX=1` → [`ReduxMode::Both`]（向后兼容；要切 driver 须用 `"redux"` 显式值）
-/// - `PRX_CHAT_REDUX=redux` → [`ReduxMode::Redux`]，再加 `PRX_CHAT_REDUX_DRIVER=1` 切 ReduxDriver
-/// - `PRX_CHAT_REDUX_DRIVER=1` → 仅在 `Redux` 模式下生效
-///
-/// **5a-6 更新**：driver 现已支持 tool turn ( `drive_start_turn_stream` 收到
-/// `ToolCallChunk` 后通过 `EffectDeps::tools_registry` 执行 + 多轮回合).
-/// 命中 [`TurnRoute::ReduxDriver`] 需 `PRX_CHAT_REDUX=redux` + `PRX_CHAT_REDUX_DRIVER=1`，
-/// `tools_registry` 是否为空不再是路由条件。但 driver 未覆盖 approval / multimodal /
-/// parallel / compaction / tiering 等高级场景，这些需要时仍走 legacy `run_tool_call_loop`
-/// (后续 step 渐进迁移).
+/// chat::run 主循环 LLM turn 路由结果.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Off / TUI 关闭场景下未必引用所有 variant
 pub(crate) enum TurnRoute {
-    /// 走旧 `run_tool_call_loop`（生产默认）.
+    /// Non-TUI fallback still uses the shared agent loop.
     LegacyToolLoop,
-    /// 走 Redux dispatcher driver（Redux + driver opt-in，5a-6 后不再限制 tools 为空）.
+    /// Terminal TUI uses reducer/driver single route.
     ReduxDriver,
 }
 
-/// 解析 `PRX_CHAT_REDUX_DRIVER` env 是否启用 driver 切闸.
-#[cfg(feature = "terminal-tui")]
-#[allow(dead_code)]
-fn driver_opt_in_from_env() -> bool {
-    matches!(std::env::var("PRX_CHAT_REDUX_DRIVER").as_deref(), Ok("1"))
-}
-
-/// 测试钩子：`PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS=1` 强制把 tools_registry 视为空，
-/// 让 5a-4 driver 切闸路径在 PTY E2E 中能被命中验证（生产环境核心工具硬编码非空）.
-///
-/// 仅影响路由判定 — tools_registry 内容本身**不**被清空，所以 legacy 路径分支
-/// 不受影响。命名带 `FORCE_EMPTY_TOOLS` 让生产部署 grep 容易识别为测试旁路。
-///
-/// **5a-5 Codex P0 修复**：用 `cfg(any(test, feature = "test-mock"))` 编译期门控
-/// — release build 不含 `test-mock` feature 时该函数永远返回 `false`，env 完全无效，
-/// 杜绝生产环境误开旁路丢失工具能力的风险。运行时 warn 只是兜底，不是终极防线。
-#[cfg(feature = "terminal-tui")]
-#[allow(dead_code)]
-#[allow(clippy::missing_const_for_fn)]
-fn force_empty_tools_from_env() -> bool {
-    // 编译期门控：只有 test build 或显式 test-mock feature 才允许读取这个 env.
-    // 标准 release build (cargo build --release --features terminal-tui) 直接走
-    // 下方 `false` 兜底分支，与 env 值无关 — 即便 attacker 设了该 env 也无效.
-    #[cfg(any(test, feature = "test-mock"))]
-    {
-        matches!(
-            std::env::var("PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS").as_deref(),
-            Ok("1")
-        )
-    }
-    #[cfg(not(any(test, feature = "test-mock")))]
-    {
-        false
-    }
-}
-
-/// Step 5a-4 路由契约函数：根据 ReduxMode + driver opt-in 决定本轮 turn 走哪条路径.
-///
-/// **5a-6 更新**：`tools_empty` 限制已移除. driver 现支持 tool turn (`drive_start_turn_stream`
-/// 收到 `ToolCallChunk` 时通过 `tools_registry` 执行 + 多轮回合). 保留 `driver_opt_in`
-/// env 闸 (`PRX_CHAT_REDUX_DRIVER`) 作为生产灰度开关; 默认仍走 legacy.
-///
-/// 路由真值表 (TUI feature):
-/// | mode  | driver_opt_in | 路由           |
-/// |-------|---------------|----------------|
-/// | Off   | *             | LegacyToolLoop |
-/// | Both  | *             | LegacyToolLoop |
-/// | Redux | false         | LegacyToolLoop |
-/// | Redux | true          | ReduxDriver    |
-/// | Pure  | *             | ReduxDriver    |
-///
-/// `Pure` 模式下 `driver_opt_in` 不再需要——T3-3 收官把 reducer 路由设为默认。
-///
-/// 非 TUI feature 下永远返回 [`TurnRoute::LegacyToolLoop`].
-///
-/// 注意 driver **未覆盖**的 legacy 能力（5a-6 故意保守）:
-/// - approval_manager (危险 tool 审批)
-/// - multimodal 图片校验
-/// - parallel tools / scope_ctx / 并发治理
-/// - context overflow 自动 compaction
-/// - tool tiering / priority scheduling
-///
-/// 这些场景上游 (run_tool_call_loop) 仍主导, 由后续 step 渐进迁移.
 #[cfg(feature = "terminal-tui")]
 #[must_use]
-pub(crate) const fn route_turn(mode: ReduxMode, driver_opt_in: bool, _tools_empty: bool) -> TurnRoute {
-    match mode {
-        // T3-3 收官：Pure 必走 driver，不再依赖 driver_opt_in env.
-        ReduxMode::Pure => TurnRoute::ReduxDriver,
-        // 向后兼容：Redux 需 driver opt-in 才切换；保持 5a-4 的"显式 opt-in"语义.
-        ReduxMode::Redux if driver_opt_in => TurnRoute::ReduxDriver,
-        _ => TurnRoute::LegacyToolLoop,
-    }
+pub(crate) const fn route_turn(_mode: ReduxMode) -> TurnRoute {
+    TurnRoute::ReduxDriver
 }
 
 #[cfg(not(feature = "terminal-tui"))]
 #[must_use]
 #[allow(dead_code)]
-pub(crate) const fn route_turn(_mode: (), _driver_opt_in: bool, _tools_empty: bool) -> TurnRoute {
+pub(crate) const fn route_turn(_mode: ()) -> TurnRoute {
     TurnRoute::LegacyToolLoop
 }
 
@@ -382,6 +289,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::InterruptTurn => "InterruptTurn",
         tui::KeyDispatch::Cancelled => "Cancelled",
         tui::KeyDispatch::Consumed => "Consumed",
+        tui::KeyDispatch::Ignored => "Ignored",
     };
     let new_kinds: Vec<&'static str> = new_effects
         .iter()
@@ -416,7 +324,10 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::Submitted(_) => !new_has_log_trace,
         // Ctrl+C → InterruptTurn in old path; new path either returns [] or Quit.
         // 只在新路径意外产生 Quit（但旧路径没有 Exit 语义）时记为差异.
-        tui::KeyDispatch::InterruptTurn | tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed => new_has_quit,
+        tui::KeyDispatch::InterruptTurn
+        | tui::KeyDispatch::Cancelled
+        | tui::KeyDispatch::Consumed
+        | tui::KeyDispatch::Ignored => new_has_quit,
     };
 
     if is_diff {
@@ -442,6 +353,58 @@ fn autosave_memory_key(prefix: &str) -> String {
         .unwrap_or_default()
         .as_millis();
     format!("{prefix}:{ts}")
+}
+
+fn chat_message_event_scope(
+    chat_session_key: &str,
+    chat_run_id: &str,
+    provider_name: &str,
+    model_name: &str,
+) -> MessageEventScope {
+    MessageEventScope::new("chat", MemoryVisibility::Workspace)
+        .with_channel("terminal")
+        .with_session_key(chat_session_key.to_string())
+        .with_run_id(chat_run_id.to_string())
+        .with_sender("local-user")
+        .with_recipient(format!("{provider_name}/{model_name}"))
+}
+
+async fn record_chat_user_message_event(
+    memory_fabric: &MemoryFabric,
+    chat_session: &session::ChatSession,
+    chat_session_key: &str,
+    chat_run_id: &str,
+    provider_name: &str,
+    model_name: &str,
+    turn_seq: u64,
+    user_input: &str,
+) -> anyhow::Result<crate::memory::MessageEvent> {
+    memory_fabric
+        .record_inbound_user_message(
+            chat_message_event_scope(chat_session_key, chat_run_id, provider_name, model_name),
+            user_input.to_string(),
+            Some(format!("chat:{}:{chat_run_id}:{turn_seq}:user", chat_session.id)),
+            None,
+        )
+        .await
+}
+
+async fn record_chat_assistant_message_event(
+    memory_fabric: &MemoryFabric,
+    chat_session_key: &str,
+    chat_run_id: &str,
+    provider_name: &str,
+    model_name: &str,
+    response: &str,
+) -> anyhow::Result<crate::memory::MessageEvent> {
+    memory_fabric
+        .record_assistant_message(
+            chat_message_event_scope(chat_session_key, chat_run_id, provider_name, model_name)
+                .with_sender(format!("{provider_name}/{model_name}"))
+                .with_recipient("local-user"),
+            response.to_string(),
+        )
+        .await
 }
 
 /// Aggregate the model's reasoning/thinking content from the turn's history
@@ -803,6 +766,8 @@ pub async fn run(
         &config.user_policies,
     )?);
     info!(backend = mem.name(), "Memory initialized");
+    let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
+        .with_event_recording(config.memory.event_recording_config());
 
     // ── List sessions (early return) ─────────────────────────────
     if list_sessions {
@@ -847,6 +812,7 @@ pub async fn run(
         .as_deref()
         .or(config.default_model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4");
+    providers::validate_provider_model(provider_name, model_name)?;
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -931,6 +897,10 @@ pub async fn run(
         },
         None => session::ChatSession::new(provider_name, model_name),
     };
+    bind_session_to_runtime_provider_model(&mut chat_session, provider_name, model_name);
+    let chat_run_id = uuid::Uuid::new_v4().to_string();
+    let chat_session_key = format!("chat:{}", chat_session.id);
+    let mut fabric_turn_seq: u64 = 0;
 
     // ── Build banner text ────────────────────────────────────────
     // On the TUI path the banner is *not* printed to stdout here — printing
@@ -1022,47 +992,31 @@ pub async fn run(
     // 入口统一读 PRX_CHAT_REDUX，函数体内复用此值避免多点解析环境变量
     // S4-B: Pure 是唯一支持的运行路径；非 Pure 值 warning 后强制升级
     #[cfg(feature = "terminal-tui")]
-    let top_redux_mode = {
-        let parsed = ReduxMode::from_env();
-        if !parsed.is_pure() {
-            tracing::warn!(
-                requested = ?parsed,
-                "S4-B: PRX_CHAT_REDUX 仅 Pure 是受支持模式; 非 Pure 值已强制升级为 Pure"
-            );
-        }
-        ReduxMode::Pure
-    };
+    let top_redux_mode = { ReduxMode::from_env() };
 
     // 根据 redux mode 选择 EffectExecutor 模式（TUI feature only）
     #[cfg(feature = "terminal-tui")]
     let effect_executor = {
         let mode = top_redux_mode;
-        if matches!(mode, ReduxMode::Off) {
-            dispatcher::EffectExecutor::new_shadow()
-        } else {
-            let deps = dispatcher::EffectDeps {
-                provider: Arc::clone(&provider),
-                memory: Arc::clone(&mem),
-                channel: Arc::clone(&terminal) as Arc<dyn crate::channels::Channel>,
-                hooks: Arc::clone(&hooks),
-                observer: Arc::clone(&observer),
-                action_tx: chat_dispatcher.sender(),
-                dual_write_guard: dual_write_guard.clone(),
-                redraw_tx: None,
-                shutdown: shutdown.clone(),
-                model: Arc::from(model_name),
-                temperature,
-                // 5a-6: 共享 tools_registry，让 driver 在 tool turn 中按名查表执行。
-                tools_registry: Some(Arc::clone(&tools_registry)),
-                max_tool_iterations: config.agent.max_tool_iterations,
-                // S3 T3-1: approval 桥接 — 共享 router + manager 句柄给 driver。
-                // ApprovalManager 由 chat::run 上方已构造（line 814），这里 wrap Arc。
-                approval_router: Arc::new(dispatcher::ApprovalRouter::new()),
-                approval_manager: Some(Arc::new(ApprovalManager::from_config(&config.autonomy))),
-            };
-            tracing::info!(mode = ?mode, "PRX_CHAT_REDUX: EffectExecutor in real-deps mode");
-            dispatcher::EffectExecutor::new_with_deps(deps)
-        }
+        let deps = dispatcher::EffectDeps {
+            provider: Arc::clone(&provider),
+            memory: Arc::clone(&mem),
+            channel: Arc::clone(&terminal) as Arc<dyn crate::channels::Channel>,
+            hooks: Arc::clone(&hooks),
+            observer: Arc::clone(&observer),
+            action_tx: chat_dispatcher.sender(),
+            dual_write_guard: dual_write_guard.clone(),
+            redraw_tx: None,
+            shutdown: shutdown.clone(),
+            model: Arc::from(model_name),
+            temperature,
+            tools_registry: Some(Arc::clone(&tools_registry)),
+            max_tool_iterations: config.agent.max_tool_iterations,
+            approval_router: Arc::new(dispatcher::ApprovalRouter::new()),
+            approval_manager: Some(Arc::new(ApprovalManager::from_config(&config.autonomy))),
+        };
+        tracing::info!(mode = ?mode, "chat EffectExecutor in Pure real-deps mode");
+        dispatcher::EffectExecutor::new_with_deps(deps)
     };
     #[cfg(not(feature = "terminal-tui"))]
     let effect_executor = dispatcher::EffectExecutor::new_shadow();
@@ -1087,18 +1041,13 @@ pub async fn run(
     // rx 保留为 `Option` 留给 spawn_tui_unified_loop 使用。
     #[cfg(feature = "terminal-tui")]
     let (snapshot_tx_for_dispatcher, snapshot_rx_for_tui) = {
-        let mode = top_redux_mode;
-        if mode.is_pure() {
-            let initial = std::sync::Arc::new(crate::chat::state::UiSnapshot::initial(
-                std::sync::Arc::from(provider_name),
-                std::sync::Arc::from(model_name),
-            ));
-            let (tx, rx) = tokio::sync::watch::channel(initial);
-            tracing::info!(mode = ?mode, "S4-A Commit 3: snapshot_tx constructed for Pure mode");
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        }
+        let initial = std::sync::Arc::new(crate::chat::state::UiSnapshot::initial(
+            std::sync::Arc::from(provider_name),
+            std::sync::Arc::from(model_name),
+        ));
+        let (tx, rx) = tokio::sync::watch::channel(initial);
+        tracing::info!(mode = ?top_redux_mode, "snapshot_tx constructed for Pure chat mode");
+        (Some(tx), Some(rx))
     };
     // Commit 4: snapshot_rx_for_tui 传给 run_tui_unified_loop（见 TUI 分支 spawn_tui_unified_loop 调用）.
 
@@ -1125,7 +1074,8 @@ pub async fn run(
     // Lifted above the input loop so the TUI dispatcher can fold its own
     // Ctrl+C presses into the same double-press → exit semantics.
     let last_ctrlc_ms = Arc::new(AtomicU64::new(0));
-    // The active cancellation token for the current generation turn (if any).
+    // Non-TUI fallback still needs a shared cancellation slot for SIGINT.
+    #[cfg(not(feature = "terminal-tui"))]
     let active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>> = Arc::new(parking_lot::Mutex::new(None));
 
     // Spawn the appropriate input loop:
@@ -1135,16 +1085,16 @@ pub async fn run(
     //     `ratatui::Terminal` and redraws on demand.
     //   - otherwise → legacy reedline + BufRead fallback via TerminalChannel.
     //
-    // `_terminal_guard` is bound to this function's stack so its Drop runs at
+    // `terminal_guard` is bound to this function's stack so its Drop runs at
     // chat::run exit (panic-safe via `install_chat_panic_hook` above). The
-    // legacy path leaves `_terminal_guard = None`, so no entry side-effects
+    // legacy path leaves `terminal_guard = None`, so no entry side-effects
     // are applied.
     // `redraw_tx_for_main` is `Some(sender)` only on the TUI path; the main
     // loop uses it to nudge the renderer after mutating `chat_mirror` (e.g.
     // echoing the user's submitted input so the conversation pane reflects
     // it immediately rather than waiting for the next async event).
     #[cfg(feature = "terminal-tui")]
-    let (_terminal_guard, redraw_tx_for_main): (Option<TerminalGuard>, Option<mpsc::Sender<()>>) = {
+    let (terminal_guard, redraw_tx_for_main): (Option<TerminalGuard>, Option<mpsc::Sender<()>>) = {
         use std::io::IsTerminal as _;
         // TUI is on by default in TTY. Opt out with PRX_TUI=0 (e.g. for
         // downstream scripts that scrape stdout, or to escape rendering
@@ -1208,7 +1158,6 @@ pub async fn run(
                         redraw_tx_loop,
                         shutdown.clone(),
                         Arc::clone(&last_ctrlc_ms),
-                        Arc::clone(&active_cancel),
                         chat_dispatcher.clone(),
                         snapshot_rx_for_tui.clone(),
                     );
@@ -1255,6 +1204,8 @@ pub async fn run(
         });
     }
 
+    let mut plain_mode_turn_failed = false;
+
     // Persistent Ctrl+C handler: runs for the entire chat session.
     // - If a generation is active: cancel it (first press) or exit (double press).
     // - If idle (no generation): exit on double press.
@@ -1268,6 +1219,7 @@ pub async fn run(
     // drop，channel 才能真正关闭，dispatcher_handle.await 才能返回）。
     {
         let last_ctrlc = Arc::clone(&last_ctrlc_ms);
+        #[cfg(not(feature = "terminal-tui"))]
         let cancel_ref = Arc::clone(&active_cancel);
         let shutdown_signal = shutdown.clone();
         let dispatcher_for_signal = chat_dispatcher.clone();
@@ -1301,6 +1253,7 @@ pub async fn run(
                 // Step 5b shadow: 同步投递 CancelRequested 给 reducer 观察。
                 let _ = dispatcher_for_signal
                     .dispatch_or_log(crate::chat::action::Action::CancelRequested, "chat.cancel_single_ctrlc");
+                #[cfg(not(feature = "terminal-tui"))]
                 if let Some(token) = cancel_ref.lock().as_ref() {
                     token.cancel();
                 }
@@ -1421,8 +1374,6 @@ pub async fn run(
             // 实际生产路径 legacy 后续会 push 新构造的 system（覆盖旧 system 的
             // skill 列表），reducer 这边的 system 仍是上一轮的。本 S2-C 阶段
             // 不做修正——legacy 仍是 LLM 真上下文源，reducer 是观察账本。
-            let _ =
-                chat_dispatcher.dispatch_or_log(crate::chat::action::Action::HistoryCleared, "chat.history_cleared");
             if !config.skill_rag.enabled {
                 let cleared_system = build_runtime_system_prompt(
                     &config,
@@ -1448,7 +1399,22 @@ pub async fn run(
             }
             let cleared = commands::handle_clear(mem.as_ref(), Some(&chat_session.id)).await;
             let msg = commands::format_clear_feedback(cleared);
-            emit_chat_output(&msg);
+            #[cfg(feature = "terminal-tui")]
+            {
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::HistoryClearedWithNotice { notice: msg.clone() },
+                    "chat.history_cleared_with_notice",
+                );
+                if let Some(tx) = redraw_tx_for_main.as_ref() {
+                    let _ = tx.try_send(());
+                } else {
+                    print_fallback_chat_output(&msg);
+                }
+            }
+            #[cfg(not(feature = "terminal-tui"))]
+            {
+                print_fallback_chat_output(&msg);
+            }
             continue;
         }
 
@@ -1493,19 +1459,57 @@ pub async fn run(
             }
         }
 
-        // Auto-save user message to memory
-        if config.memory.auto_save
-            && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-            && memory::should_autosave_content(&user_input)
+        fabric_turn_seq += 1;
+        let chat_user_event = match record_chat_user_message_event(
+            &memory_fabric,
+            &chat_session,
+            &chat_session_key,
+            &chat_run_id,
+            provider_name,
+            model_name,
+            fabric_turn_seq,
+            &user_input,
+        )
+        .await
         {
+            Ok(event) => Some(event),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to append chat user message event");
+                None
+            }
+        };
+
+        // Auto-save user message to memory
+        if config.memory.should_auto_promote_user_message(&user_input) {
             let user_key = autosave_memory_key("user_msg");
-            let _ = mem
-                .store(&user_key, &user_input, MemoryCategory::Conversation, None)
+            let _ = memory_fabric
+                .record_semantic_memory_from_event(
+                    &user_key,
+                    &user_input,
+                    MemoryCategory::Conversation,
+                    None,
+                    chat_user_event.as_ref().map(|event| event.event_id.as_str()),
+                    None,
+                    None,
+                )
                 .await;
         }
 
         // Inject memory context
-        let mem_context = build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+        let mem_context = build_context_with_shared_events(
+            mem.as_ref(),
+            MemoryPrincipal {
+                workspace_id: memory_fabric.workspace_id().to_string(),
+                agent_id: None,
+                persona_id: None,
+                session_key: Some(chat_session_key.clone()),
+                channel: Some("terminal".to_string()),
+                sender: Some("local-user".to_string()),
+            },
+            &user_input,
+            config.memory.min_relevance_score,
+        )
+        .await;
         let context = mem_context.preamble.clone();
         let enriched = if context.is_empty() {
             user_input.clone()
@@ -1537,13 +1541,11 @@ pub async fn run(
         );
         history.push(ChatMessage::user(&enriched));
 
-        // S2-B Step 4: 在与 legacy `history.push(ChatMessage::user(&enriched))` 同一点
-        // dispatch `RecordUserTurn(enriched)` — reducer 内 session.history 与 legacy
-        // history 字节级对齐，session.turns 也用 enriched（与 legacy
-        // `chat_session.add_user_turn(&sanitized_input)` 略有 sanitization 差异；
-        // S2-C 阶段统一持久化路径时再合并）。
+        // Persist the user-visible turn, not the memory-enriched prompt that
+        // is sent to the provider. Otherwise session titles/resume history
+        // leak the synthetic "[Memory context]" preamble.
         let _ = chat_dispatcher.dispatch_or_log(
-            crate::chat::action::Action::RecordUserTurn(enriched.clone()),
+            crate::chat::action::Action::RecordUserTurn(user_input.clone()),
             "chat.record_user_turn",
         );
 
@@ -1565,10 +1567,6 @@ pub async fn run(
         // only, so the user never sees the model's internal monologue.
         let cancellation = CancellationToken::new();
         let (delta_tx, delta_rx) = mpsc::channel::<String>(DELTA_CHANNEL_CAPACITY);
-
-        // 复用 chat::run 入口读取的 top_redux_mode（环境不会在进程内变化）
-        #[cfg(feature = "terminal-tui")]
-        let redux_mode = top_redux_mode;
 
         // Start a streaming draft on the terminal
         let draft_id = match terminal.send_draft(&SendMessage::new("", "user")).await {
@@ -1616,14 +1614,15 @@ pub async fn run(
         //      check as the single source of truth. Once Step 5 makes the
         //      reducer the renderer source, this task disappears entirely.
         //
-        // This is the P3-5 "one-shot switch" called out in the Step 3 plan:
-        // no double-write period for the version protocol. Off / Both / Redux
-        // modes all share this single counter-driven path and rely on the
-        // reducer (via shadow ChatState or its Step 5 successor) for any
-        // re-ordering protection beyond what mpsc already provides.
+        // Terminal TUI now relies on the reducer for the visible stream; the
+        // non-TUI fallback still forwards full accumulated drafts to the
+        // channel implementation.
         let draft_updater = if let Some(ref d_id) = draft_id {
+            #[cfg(not(feature = "terminal-tui"))]
             let channel: Arc<TerminalChannel> = Arc::clone(&terminal);
+            #[cfg(not(feature = "terminal-tui"))]
             let reply_target = "user".to_string();
+            #[cfg(not(feature = "terminal-tui"))]
             let draft_id_owned = d_id.clone();
             let mut rx = delta_rx;
             let version_counter = Arc::new(DraftVersionCounter::new());
@@ -1631,33 +1630,21 @@ pub async fn run(
             // bounded(2048) action_tx 满时由 coalescer 合并 delta，避免无界增长。
             let coalescer_sender = chat_dispatcher.sender();
             let coalescer_draft_id = d_id.clone();
-            // S2-A: capture per-turn mode snapshot. In `Off` and `Both` the
-            // legacy `update_draft` still runs (renderer source of truth);
-            // in `Redux` / `Pure` it is skipped so the reducer-driven path is
-            // the sole UI writer. The coalescer dispatch always runs — the
-            // reducer needs every delta for its `StreamState::draft` mirror.
-            //
-            // T3-3 收官（Pure）：与 Redux 同样关闸；guard 用 matches!(Off|Both)
-            // 反向命题保证未来新增 ReduxMode 变体时编译期可见漏写.
-            #[cfg(feature = "terminal-tui")]
-            let legacy_update_draft_enabled = matches!(redux_mode, ReduxMode::Off | ReduxMode::Both);
-            #[cfg(not(feature = "terminal-tui"))]
-            let legacy_update_draft_enabled = true;
             Some(tokio::spawn(async move {
+                #[cfg(not(feature = "terminal-tui"))]
                 let mut accumulated = String::new();
                 let mut coalescer = dispatcher::StreamChunkCoalescer::new(coalescer_sender);
                 while let Some(delta) = rx.recv().await {
-                    accumulated.push_str(&delta);
                     // Counter still ticks for downstream consumers (UiActor's
                     // inline-redraw protocol uses it). No tracker.accept() —
                     // see comment block above.
                     let version = version_counter.next();
-                    // S2-A gating: legacy UI write only in Off/Both; pure
-                    // Redux mode lets the reducer + EffectExecutor render.
-                    if legacy_update_draft_enabled
-                        && let Err(e) = channel.update_draft(&reply_target, &draft_id_owned, &accumulated).await
+                    #[cfg(not(feature = "terminal-tui"))]
                     {
-                        tracing::debug!("Draft update failed: {e}");
+                        accumulated.push_str(&delta);
+                        if let Err(e) = channel.update_draft(&reply_target, &draft_id_owned, &accumulated).await {
+                            tracing::debug!("Draft update failed: {e}");
+                        }
                     }
                     // Step 5b shadow: forward the **incremental** delta into
                     // the reducer via the coalescer. The reducer accumulates
@@ -1678,21 +1665,8 @@ pub async fn run(
             Some(tokio::spawn(async move { while rx.recv().await.is_some() {} }))
         };
 
-        // Register this turn's cancellation token so the Ctrl+C handler can cancel it.
-        //
-        // S2-B Step 3: 在 Redux 主路径下 `Action::TurnStarted` 已经把 token 写进
-        // `state.control.active_cancel`；reducer + `Effect::CancelToken` 接管单击
-        // Ctrl+C 的真取消。legacy `active_cancel` Arc 仍由顶层 Ctrl+C handler
-        // (mod.rs 持久 ctrl_c() 任务) 和 TUI 内部 `InterruptTurn` 读取 — 这两条
-        // 路径无法直接访问 ChatState，所以 legacy 字段在 Off/Both 模式下必须保留写
-        // 以确保兜底。Redux / Pure 模式下 legacy 字段不必再写（reducer 是单一真源）。
-        #[cfg(feature = "terminal-tui")]
-        // S4-B: Pure 模式取消 token 完全由 reducer + Effect::CancelToken 接管
-        #[cfg(feature = "terminal-tui")]
-        let legacy_active_cancel_enabled = false;
         #[cfg(not(feature = "terminal-tui"))]
-        let legacy_active_cancel_enabled = true;
-        if legacy_active_cancel_enabled {
+        {
             *active_cancel.lock() = Some(cancellation.clone());
         }
 
@@ -1804,36 +1778,17 @@ pub async fn run(
         #[cfg(feature = "terminal-tui")]
         let turn_route = {
             let mode = top_redux_mode;
-            let driver_opt_in = driver_opt_in_from_env();
-            // 路由判定中允许测试 env 强制把 tools_registry 视为空（5a-4 PTY 验证用）。
-            // Codex P2: 生产环境若误开此 env 会丢失工具能力，因此首次命中时 WARN
-            // 提示运维（每条 turn 都 warn 太吵——这里靠 tracing::warn_once 语义自然由
-            // 用户 LOG 聚合工具去重，或者运维通过 grep RUNTIME 启动日志识别）。
-            let force_empty = force_empty_tools_from_env();
-            if force_empty && !tools_registry.is_empty() {
-                tracing::warn!(
-                    "PRX_CHAT_REDUX_DRIVER_FORCE_EMPTY_TOOLS=1 is a TEST-ONLY backdoor; \
-                     production tools will be ignored for routing decisions"
-                );
-            }
-            let tools_empty = tools_registry.is_empty() || force_empty;
-            let route = route_turn(mode, driver_opt_in, tools_empty);
-            // 可观测性：每轮 turn 记录路由结果（生产排障线索 + Codex 审计要求）。
+            let route = route_turn(mode);
             tracing::info!(
                 redux_mode = ?mode,
-                driver_opt_in,
-                tools_empty,
                 tools_count = tools_registry.len(),
                 route = ?route,
-                fallback_reason = if matches!(route, TurnRoute::LegacyToolLoop) && driver_opt_in && matches!(mode, ReduxMode::Redux) {
-                    if tools_empty { "n/a" } else { "non_empty_tools_registry" }
-                } else {
-                    "n/a"
-                },
                 "chat::run turn route decision"
             );
             route
         };
+        #[cfg(feature = "terminal-tui")]
+        let reducer_driver_turn_active = matches!(turn_route, TurnRoute::ReduxDriver) && draft_id.is_some();
         // 非 TUI feature 下 turn_route 不参与控制流（driver 分支被 cfg 屏蔽），
         // 仅作变量保留以让两条 feature 配置下 chat::run 共享同一路由契约。
         #[cfg(not(feature = "terminal-tui"))]
@@ -1853,9 +1808,7 @@ pub async fn run(
         //   * round 2 hang 防御：tokio::select! 上 shutdown.cancelled() 兜底
         //
         #[cfg(feature = "terminal-tui")]
-        if matches!(turn_route, TurnRoute::ReduxDriver)
-            && let Some(d_id) = draft_id.clone()
-        {
+        if reducer_driver_turn_active && let Some(d_id) = draft_id.clone() {
             // 协议：先获取 notified() future，再 dispatch，再 await。
             // 在 dispatch 前消费旧 outcome 残留以确保读到的是本轮的。
             let notify_fut = turn_signal.notified();
@@ -1887,7 +1840,8 @@ pub async fn run(
                         "chat.stream_cancelled_dispatch_failed",
                     );
                 }
-                if legacy_active_cancel_enabled {
+                #[cfg(not(feature = "terminal-tui"))]
+                {
                     *active_cancel.lock() = None;
                 }
                 drop(delta_tx);
@@ -1917,7 +1871,8 @@ pub async fn run(
             //
             // S2-B Step 3: driver 路径下 reducer 在收到 StreamCompleted/Failed/Cancelled
             // 时已经清掉 `state.control.active_cancel`；legacy Arc 仅在 Off/Both 兜底.
-            if legacy_active_cancel_enabled {
+            #[cfg(not(feature = "terminal-tui"))]
+            {
                 *active_cancel.lock() = None;
             }
             drop(delta_tx);
@@ -1937,15 +1892,38 @@ pub async fn run(
                     if let Err(e) = terminal.finalize_draft("user", &d_id, &final_text).await {
                         tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
                     }
+                    let recorded_response = sanitize_channel_response(&final_text, &tools_registry);
+                    if let Err(e) = record_chat_assistant_message_event(
+                        &memory_fabric,
+                        &chat_session_key,
+                        &chat_run_id,
+                        provider_name,
+                        model_name,
+                        &recorded_response,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "Failed to append Redux driver chat assistant message event");
+                    }
                     // driver 路径 RecordAssistantTurn 已由 dispatcher.rs send（fixB B5）
                     let _ = final_text;
                 }
                 Some(dispatcher::TurnOutcomeKind::Failed { err, retryable: _ }) => {
                     // reducer NotifyHook(Error) 已发；这里不再 hooks.emit 避免双发.
-                    if let Some(ref id) = draft_id {
+                    #[cfg(feature = "terminal-tui")]
+                    let interactive_tui_active = redraw_tx_for_main.is_some();
+                    #[cfg(not(feature = "terminal-tui"))]
+                    let interactive_tui_active = false;
+
+                    if !interactive_tui_active && let Some(ref id) = draft_id {
                         let _ = terminal.cancel_draft("user", id).await;
                     }
-                    eprintln!("\nError: {err}\n");
+                    if !interactive_tui_active {
+                        eprintln!("\nError: {err}\n");
+                    }
+                    if plain_mode {
+                        plain_mode_turn_failed = true;
+                    }
                 }
                 Some(dispatcher::TurnOutcomeKind::Cancelled) | None => {
                     if let Some(ref id) = draft_id {
@@ -2017,6 +1995,9 @@ pub async fn run(
                         let _ = terminal.cancel_draft("user", d_id).await;
                     }
                     eprintln!("\nError: operation timed out\n");
+                    if plain_mode {
+                        plain_mode_turn_failed = true;
+                    }
                     // Phase E (5a-4): dual_write_guard 守卫防止与 reducer 的 NotifyHook(Error)
                     // 在 Both / Redux 双写期产生双发（reducer 通过 Effect::NotifyHook 已发）。
                     // Off 模式 guard 永远 false → 行为不变（旧路径单发）。
@@ -2079,6 +2060,9 @@ pub async fn run(
                         "\nError: context window exceeded after {} compaction retries\n",
                         MAX_CONTEXT_OVERFLOW_RETRIES
                     );
+                    if plain_mode {
+                        plain_mode_turn_failed = true;
+                    }
                     // Phase E (5a-4): dual_write_guard 守卫见 timeout 分支同理.
                     if !dual_write_guard.is_active() {
                         hooks
@@ -2101,6 +2085,9 @@ pub async fn run(
                     }
                     let err_text = e.to_string();
                     eprintln!("\nError: {err_text}\n");
+                    if plain_mode {
+                        plain_mode_turn_failed = true;
+                    }
                     // Phase E (5a-4): dual_write_guard 守卫见 timeout 分支同理.
                     if !dual_write_guard.is_active() {
                         hooks
@@ -2124,7 +2111,8 @@ pub async fn run(
         // S2-B Step 3: legacy 路径下 reducer 在 Stream{Completed,Cancelled,Failed}
         // dispatch (下方 1886-1911) 时也清 `state.control.active_cancel`；legacy
         // Arc 仅在 Off/Both 模式兜底（外部 Ctrl+C handler 读这个）。
-        if legacy_active_cancel_enabled {
+        #[cfg(not(feature = "terminal-tui"))]
+        {
             *active_cancel.lock() = None;
         }
 
@@ -2206,6 +2194,19 @@ pub async fn run(
 
         // ── Sanitize response: strip tool-call XML/JSON artifacts ──
         let response = sanitize_channel_response(&response, &tools_registry);
+
+        if let Err(e) = record_chat_assistant_message_event(
+            &memory_fabric,
+            &chat_session_key,
+            &chat_run_id,
+            provider_name,
+            model_name,
+            &response,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "Failed to append chat assistant message event");
+        }
 
         // ── Extract tool context summary for LLM awareness on next turn ──
         let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
@@ -2311,7 +2312,7 @@ pub async fn run(
         let sanitized_input = sanitize::sanitize_for_persistence(&user_input);
         let sanitized_response = sanitize::sanitize_for_persistence(&response);
         #[cfg(feature = "terminal-tui")]
-        let legacy_session_writes_enabled = false; // S4-B: Pure 单源
+        let legacy_session_writes_enabled = !reducer_driver_turn_active;
         #[cfg(not(feature = "terminal-tui"))]
         let legacy_session_writes_enabled = true;
         if legacy_session_writes_enabled {
@@ -2354,24 +2355,15 @@ pub async fn run(
         }
     }
 
-    // ── Graceful teardown: restore terminal state ────────────────
-    //
-    // On the TUI path (`terminal-tui` feature + TTY + PRX_TUI != "0"), terminal
-    // state is owned by `TerminalGuard` (entered above, dropped at end
-    // of scope) — the calls below are then redundant but idempotent
-    // and harmless. On the legacy reedline / non-TUI path no guard was
-    // ever created, so this is the only place that restores terminal
-    // state in case reedline or any helper left it dirty. Kept here as
-    // belt-and-braces defence; do not remove without also auditing
-    // every non-TUI exit path.
-    //
-    // P3-inline: no `LeaveAlternateScreen` — we never entered it. The
-    // inline viewport's content (status / streaming / input / footer)
-    // simply stops being redrawn; the host shell takes over on the row
-    // immediately below the last permanent message that was pushed via
-    // `terminal.insert_before`.
-    let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stderr(), crossterm::cursor::Show);
+    // Give the reducer-owned turn persistence path a bounded chance to finish
+    // before shutdown cancellation drains the dispatcher. This closes the
+    // piped-stdin race where a successful response followed immediately by
+    // `/exit` could print to the user but miss `chat_session:*` persistence.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(EXIT_PERSISTENCE_DRAIN_GRACE_MS);
+    while dual_write_guard.is_active() && tokio::time::Instant::now() < drain_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(EXIT_PERSISTENCE_IDLE_SETTLE_MS)).await;
 
     // Step 5b: dispatcher task graceful shutdown.
     //
@@ -2393,6 +2385,18 @@ pub async fn run(
         Err(e) => tracing::warn!(error = %e, "redux dispatcher join failed"),
     }
 
+    // Restore terminal state after the TUI loop has observed shutdown, so no
+    // late redraw can print the footer after the shell prompt.
+    #[cfg(feature = "terminal-tui")]
+    if terminal_guard.is_some() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stderr(), crossterm::cursor::Show);
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(b"\r\n");
+        let _ = stdout.flush();
+    }
+
     // T3-3-fixA P0-2: 退出 save_session Pure 守卫.
     //
     // Pure 模式下 chat_session.add_*_turn 被 line 2185 守卫跳过，chat_session.turns
@@ -2412,6 +2416,9 @@ pub async fn run(
     }
 
     info!("Chat session ended");
+    if plain_mode_turn_failed {
+        anyhow::bail!("one or more chat turns failed");
+    }
     Ok(())
 }
 
@@ -2473,6 +2480,56 @@ pub(crate) enum RenderSource {
 }
 
 #[cfg(feature = "terminal-tui")]
+fn should_log_tui_key_event(key: &crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    !matches!(key.code, KeyCode::Char(_)) || key.modifiers != KeyModifiers::NONE
+}
+
+#[cfg(feature = "terminal-tui")]
+fn is_plain_character_key(key: &crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    matches!(key.code, KeyCode::Char(_)) && key.modifiers == KeyModifiers::NONE
+}
+
+#[cfg(feature = "terminal-tui")]
+fn plain_character_from_key(key: &crossterm::event::KeyEvent) -> Option<char> {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) && key.modifiers == KeyModifiers::NONE {
+        if let KeyCode::Char(ch) = key.code {
+            return Some(ch);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "terminal-tui")]
+fn drain_plain_character_burst(
+    text: &mut String,
+    pending_events: &mut VecDeque<crossterm::event::Event>,
+) -> Result<()> {
+    use crossterm::event::Event;
+
+    const MAX_BURST_BYTES: usize = 256 * 1024;
+
+    while text.len() < MAX_BURST_BYTES && crossterm::event::poll(Duration::ZERO)? {
+        let next = crossterm::event::read()?;
+        if let Event::Key(key) = &next {
+            if let Some(ch) = plain_character_from_key(key) {
+                text.push(ch);
+                continue;
+            }
+        }
+        pending_events.push_back(next);
+        break;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "terminal-tui")]
 impl RenderSource {
     pub(crate) fn with_view<R>(&self, f: impl FnOnce(&dyn tui::BottomChromeView) -> R) -> R {
         match self {
@@ -2515,6 +2572,13 @@ impl RenderSource {
         match self {
             Self::Mirror(arc) => arc.lock().conversation_lines.len(),
             Self::Snapshot(rx) => rx.borrow().conversation_lines.len(),
+        }
+    }
+
+    pub(crate) fn conversation_generation(&self) -> u64 {
+        match self {
+            Self::Mirror(_) => 0,
+            Self::Snapshot(rx) => rx.borrow().conversation_generation,
         }
     }
 }
@@ -2569,7 +2633,6 @@ fn spawn_tui_unified_loop(
     redraw_tx: mpsc::Sender<()>,
     shutdown: CancellationToken,
     last_ctrlc_ms: Arc<AtomicU64>,
-    active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
     chat_dispatcher: dispatcher::ChatDispatcher,
     snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
 ) {
@@ -2581,7 +2644,6 @@ fn spawn_tui_unified_loop(
             redraw_tx,
             &shutdown,
             last_ctrlc_ms,
-            active_cancel,
             &chat_dispatcher,
             snapshot_rx,
         );
@@ -2610,7 +2672,6 @@ fn run_tui_unified_loop(
     redraw_tx: mpsc::Sender<()>,
     shutdown: &CancellationToken,
     last_ctrlc_ms: Arc<AtomicU64>,
-    active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
     chat_dispatcher: &dispatcher::ChatDispatcher,
     snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
 ) -> Result<()> {
@@ -2626,11 +2687,6 @@ fn run_tui_unified_loop(
             RenderSource::Snapshot(rx)
         },
     );
-
-    let redux_mode = ReduxMode::from_env();
-    if !matches!(redux_mode, ReduxMode::Off) {
-        tracing::info!(mode = ?redux_mode, "PRX_CHAT_REDUX active — TUI input dispatched to main reducer");
-    }
 
     let stdout = std::io::stdout();
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
@@ -2665,6 +2721,9 @@ fn run_tui_unified_loop(
     // scrollback via `insert_before`. New entries appear at indices
     // `>= last_pushed_idx` and are pushed on the next loop iteration.
     let mut last_pushed_idx: usize = 0;
+    let mut last_conversation_generation = render_source.conversation_generation();
+    let mut skip_next_draw = false;
+    let mut pending_events = VecDeque::new();
 
     // 50 ms event poll → ~20 fps idle redraw cap. Streaming wakes via
     // `redraw_rx` so this is just a floor, not an upper bound.
@@ -2672,6 +2731,10 @@ fn run_tui_unified_loop(
 
     loop {
         if shutdown.is_cancelled() {
+            let _ = terminal.draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(ratatui::widgets::Clear, area);
+            });
             return Ok(());
         }
 
@@ -2685,6 +2748,11 @@ fn run_tui_unified_loop(
         // S4-A Commit 4: Snapshot 路径 borrow_and_update Arc<UiSnapshot>，
         // Mirror 路径走原有 lock。两种路径都按 `last_pushed_idx` 切片以增量
         // 推送，同语义.
+        let conversation_generation = render_source.conversation_generation();
+        if conversation_generation != last_conversation_generation {
+            last_pushed_idx = 0;
+            last_conversation_generation = conversation_generation;
+        }
         let visible_len = render_source.conversation_len();
         if visible_len < last_pushed_idx {
             last_pushed_idx = 0;
@@ -2714,20 +2782,29 @@ fn run_tui_unified_loop(
         // `render_bottom_chrome` aligns the actual chrome to the bottom
         // of the reserved frame area, so unused rows above stay blank
         // without disturbing scrollback.
-        while redraw_rx.try_recv().is_ok() {}
-        if let Err(e) = terminal.draw(|f| render_source.with_view(|view| tui::render_bottom_chrome(f, view))) {
+        let mut redraw_requested = false;
+        while redraw_rx.try_recv().is_ok() {
+            redraw_requested = true;
+        }
+        if skip_next_draw && !redraw_requested {
+            skip_next_draw = false;
+        } else if let Err(e) = terminal.draw(|f| render_source.with_view(|view| tui::render_bottom_chrome(f, view))) {
             tracing::warn!(error = %e, "TUI draw failed");
         }
 
         // ── 3. Wait for the next input event, with a 50 ms floor ──────
-        if !crossterm::event::poll(poll)? {
-            continue;
-        }
-        let ev = crossterm::event::read()?;
-        // [DIAG] log every raw crossterm event so we can observe what the
-        // terminal actually delivers (Chinese IME, paste, resize, etc.).
+        let ev = if let Some(ev) = pending_events.pop_front() {
+            ev
+        } else {
+            if !crossterm::event::poll(poll)? {
+                continue;
+            }
+            crossterm::event::read()?
+        };
+        // [DIAG] log structural events so we can observe paste/resize/control
+        // behavior without turning large plain-text input into a log flood.
         match &ev {
-            crossterm::event::Event::Key(k) => {
+            crossterm::event::Event::Key(k) if should_log_tui_key_event(k) => {
                 tracing::info!(
                     event_type = "Key",
                     code = ?k.code,
@@ -2736,6 +2813,7 @@ fn run_tui_unified_loop(
                     "tui_input_event"
                 );
             }
+            crossterm::event::Event::Key(_) => {}
             crossterm::event::Event::Paste(s) => {
                 tracing::info!(
                     event_type = "Paste",
@@ -2761,6 +2839,26 @@ fn run_tui_unified_loop(
                 if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     continue;
                 }
+                if let Some(ch) = plain_character_from_key(&key) {
+                    let mut text = String::new();
+                    text.push(ch);
+                    drain_plain_character_burst(&mut text, &mut pending_events)?;
+                    if text.len() > 1 {
+                        let _ =
+                            chat_dispatcher.dispatch_or_log(Action::PasteReceived(text.clone()), "chat.tui_key_burst");
+                        mirror.lock().input.paste(&text);
+                        skip_next_draw = true;
+                        continue;
+                    }
+                }
+                if is_plain_character_key(&key) {
+                    let mut mirror_guard = mirror.lock();
+                    if mirror_guard.input.byte_len() >= tui::INPUT_MAX_BYTES {
+                        mirror_guard.input.truncated = true;
+                        skip_next_draw = true;
+                        continue;
+                    }
+                }
                 let _ = chat_dispatcher.dispatch_or_log(Action::KeyPressed(key), "chat.tui_key_pressed");
 
                 let dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
@@ -2771,7 +2869,13 @@ fn run_tui_unified_loop(
                 // on the next iteration rather than waiting for the next
                 // crossterm event (worst case 50 ms idle poll). cap=1 +
                 // try_send coalesces, so this is cheap on key floods.
-                let _ = redraw_tx.try_send(());
+                if matches!(dispatch, tui::KeyDispatch::Ignored)
+                    || (is_plain_character_key(&key) && matches!(dispatch, tui::KeyDispatch::Consumed))
+                {
+                    skip_next_draw = true;
+                } else {
+                    let _ = redraw_tx.try_send(());
+                }
                 match dispatch {
                     tui::KeyDispatch::Submitted(text) => {
                         let trimmed = text.trim().to_string();
@@ -2800,6 +2904,10 @@ fn run_tui_unified_loop(
                     tui::KeyDispatch::Exit => {
                         // Ctrl+D on empty buffer → graceful shutdown.
                         shutdown.cancel();
+                        let _ = terminal.draw(|frame| {
+                            let area = frame.area();
+                            frame.render_widget(ratatui::widgets::Clear, area);
+                        });
                         return Ok(());
                     }
                     tui::KeyDispatch::InterruptTurn => {
@@ -2819,23 +2927,20 @@ fn run_tui_unified_loop(
                                 "chat.shutdown_tui_double_ctrlc",
                             );
                             shutdown.cancel();
+                            let _ = terminal.draw(|frame| {
+                                let area = frame.area();
+                                frame.render_widget(ratatui::widgets::Clear, area);
+                            });
                             return Ok(());
                         }
-                        // S2-B Step 3: 单击 Ctrl+C — 优先走 reducer 路径
-                        // (Action::CancelRequested → Effect::CancelToken → 真 cancel)；
-                        // legacy token.cancel() 在 Off/Both 模式兜底，避免漏取消。
-                        // Pure / Redux 模式由 reducer 单源负责取消（已 dispatch 到上）。
+                        // Single Ctrl+C is handled by the reducer path
+                        // (Action::CancelRequested -> Effect::CancelToken).
                         let _ = chat_dispatcher.dispatch_or_log(
                             crate::chat::action::Action::CancelRequested,
                             "chat.cancel_tui_single_ctrlc",
                         );
-                        if matches!(redux_mode, ReduxMode::Off | ReduxMode::Both)
-                            && let Some(token) = active_cancel.lock().as_ref()
-                        {
-                            token.cancel();
-                        }
                     }
-                    tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed => {}
+                    tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed | tui::KeyDispatch::Ignored => {}
                 }
             }
             Event::Paste(text) => {
@@ -2891,13 +2996,26 @@ async fn load_session_by_id(mem: &dyn Memory, id: &str) -> Option<session::ChatS
 async fn load_latest_session(mem: &dyn Memory) -> Option<session::ChatSession> {
     let entries = mem.list(Some(&MemoryCategory::Conversation), None).await.ok()?;
     // Find entries with the session prefix, parse and sort by updated_at
-    let mut sessions: Vec<session::ChatSession> = entries
-        .iter()
-        .filter(|e| e.key.starts_with(session::SESSION_MEMORY_PREFIX))
-        .filter_map(|e| session::ChatSession::from_json(&e.content).ok())
-        .collect();
+    let mut sessions: Vec<session::ChatSession> = entries.iter().filter_map(valid_session_entry).collect();
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     sessions.into_iter().next()
+}
+
+fn bind_session_to_runtime_provider_model(session: &mut session::ChatSession, provider_name: &str, model_name: &str) {
+    session.provider = provider_name.to_string();
+    session.model = model_name.to_string();
+}
+
+fn valid_session_entry(entry: &crate::memory::MemoryEntry) -> Option<session::ChatSession> {
+    let id_from_key = entry
+        .key
+        .strip_prefix(session::SESSION_MEMORY_PREFIX)?
+        .strip_prefix(':')?;
+    if id_from_key.trim().is_empty() {
+        return None;
+    }
+    let session = session::ChatSession::from_json(&entry.content).ok()?;
+    if session.id == id_from_key { Some(session) } else { None }
 }
 
 fn session_turns_to_history(session: &session::ChatSession) -> Vec<ChatMessage> {
@@ -2912,17 +3030,106 @@ fn session_turns_to_history(session: &session::ChatSession) -> Vec<ChatMessage> 
         .collect()
 }
 
+#[cfg(test)]
+mod session_runtime_binding_tests {
+    use super::*;
+    use crate::memory::SqliteMemory;
+    use tempfile::TempDir;
+
+    #[test]
+    fn resumed_session_uses_runtime_provider_model_for_current_chat() {
+        let mut session = session::ChatSession::new("old-provider", "old-model");
+        session.title = "resumed".to_string();
+        session.add_user_turn("hello");
+
+        bind_session_to_runtime_provider_model(&mut session, "moonshot", "kimi-k2.5");
+
+        assert_eq!(session.provider, "moonshot");
+        assert_eq!(session.model, "kimi-k2.5");
+        assert_eq!(session.title, "resumed");
+        assert_eq!(session.turn_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_entrypoint_records_user_and_assistant_message_events() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), tmp.path().to_string_lossy());
+        let session = session::ChatSession::new("mock", "mock-model");
+        let session_key = format!("chat:{}", session.id);
+        let run_id = "chat-run-test";
+
+        let user_event = record_chat_user_message_event(
+            &fabric,
+            &session,
+            &session_key,
+            run_id,
+            "mock",
+            "mock-model",
+            1,
+            "hello from chat",
+        )
+        .await
+        .unwrap();
+        record_chat_assistant_message_event(
+            &fabric,
+            &session_key,
+            run_id,
+            "mock",
+            "mock-model",
+            "hello from assistant",
+        )
+        .await
+        .unwrap();
+
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: tmp.path().to_string_lossy().to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some(session_key.clone()),
+                    channel: Some("terminal".to_string()),
+                    sender: Some("local-user".to_string()),
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        let user_recorded = events.first();
+        let assistant_recorded = events.get(1);
+        assert_eq!(user_recorded.map(|event| event.source.as_str()), Some("chat"));
+        assert_eq!(user_recorded.map(|event| event.role.as_str()), Some("user"));
+        assert_eq!(
+            user_recorded.map(|event| event.content.as_str()),
+            Some("hello from chat")
+        );
+        assert_eq!(
+            user_recorded.map(|event| event.event_id.as_str()),
+            Some(user_event.event_id.as_str())
+        );
+        assert_eq!(assistant_recorded.map(|event| event.role.as_str()), Some("assistant"));
+        assert_eq!(
+            assistant_recorded.and_then(|event| event.sender.as_deref()),
+            Some("mock/mock-model")
+        );
+        assert_eq!(
+            assistant_recorded.and_then(|event| event.recipient.as_deref()),
+            Some("local-user")
+        );
+    }
+}
+
 /// List all saved sessions.
 async fn list_saved_sessions(mem: &dyn Memory) -> Result<()> {
     let entries = mem
         .list(Some(&MemoryCategory::Conversation), None)
         .await
         .unwrap_or_default();
-    let mut sessions: Vec<session::ChatSession> = entries
-        .iter()
-        .filter(|e| e.key.starts_with(session::SESSION_MEMORY_PREFIX))
-        .filter_map(|e| session::ChatSession::from_json(&e.content).ok())
-        .collect();
+    let mut sessions: Vec<session::ChatSession> = entries.iter().filter_map(valid_session_entry).collect();
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
     if sessions.is_empty() {
@@ -3445,170 +3652,22 @@ mod tracing_redirect_tests {
     }
 }
 
-// ─── T3-3: ReduxMode 解析 + route_turn 真值表 ─────────────────────────────────
+// ─── v0.4.1: Pure-only chat route contract ──────────────────────────────────
 
 #[cfg(test)]
 #[cfg(feature = "terminal-tui")]
 mod redux_mode_tests {
-    //! T3-3-a: `ReduxMode::parse` 覆盖 4 个枚举值 + fail-safe；
-    //! T3-3-b: `route_turn` Pure → ReduxDriver 无需 driver_opt_in.
-    //!
-    //! 解析逻辑用 `ReduxMode::parse(&str)` 单测，避免依赖进程级 env state（不同测试
-    //! 并行跑时 env 互相污染）。`from_env` 只是 env→parse 的薄包装，已由集成测试覆盖。
     use super::*;
 
-    /// T3-3-a-1: Off 类输入（含空串 / 0 / off / legacy / 未识别）一律 Off
     #[test]
-    fn parse_off_values() {
-        assert_eq!(ReduxMode::parse(""), ReduxMode::Off);
-        assert_eq!(ReduxMode::parse("0"), ReduxMode::Off);
-        assert_eq!(ReduxMode::parse("off"), ReduxMode::Off);
-        assert_eq!(ReduxMode::parse("OFF"), ReduxMode::Off);
-        assert_eq!(ReduxMode::parse("Legacy"), ReduxMode::Off);
-        // fail-safe：未识别值不升级到 Pure，防止误开 reducer 单路由
-        assert_eq!(ReduxMode::parse("garbage"), ReduxMode::Off);
-        assert_eq!(ReduxMode::parse("3"), ReduxMode::Off);
+    fn mode_is_pure_only() {
+        let mode = ReduxMode::Pure;
+        assert!(mode.is_pure());
     }
 
-    /// T3-3-a-2: "1" 与 "both"（大小写不敏感）都映射到 Both
-    #[test]
-    fn parse_both_values() {
-        assert_eq!(ReduxMode::parse("1"), ReduxMode::Both);
-        assert_eq!(ReduxMode::parse("both"), ReduxMode::Both);
-        assert_eq!(ReduxMode::parse("BOTH"), ReduxMode::Both);
-        assert_eq!(ReduxMode::parse(" both "), ReduxMode::Both, "trim 应生效");
-    }
-
-    /// "redux" 显式值/显式模式
-    #[test]
-    fn parse_redux_value() {
-        assert_eq!(ReduxMode::parse("redux"), ReduxMode::Redux);
-        assert_eq!(ReduxMode::parse("REDUX"), ReduxMode::Redux);
-    }
-
-    /// T3-3-a-4: "pure" / "2" → Pure（T3-3 收官模式）
-    #[test]
-    fn parse_pure_values() {
-        assert_eq!(ReduxMode::parse("pure"), ReduxMode::Pure);
-        assert_eq!(ReduxMode::parse("PURE"), ReduxMode::Pure);
-        assert_eq!(ReduxMode::parse("2"), ReduxMode::Pure);
-        assert_eq!(ReduxMode::parse(" pure "), ReduxMode::Pure, "trim 应生效");
-    }
-
-    /// T3-3-a-5: reducer_active / is_pure 辅助方法
-    #[test]
-    fn mode_helper_predicates() {
-        assert!(!ReduxMode::Off.reducer_active());
-        assert!(ReduxMode::Both.reducer_active());
-        assert!(ReduxMode::Redux.reducer_active());
-        assert!(ReduxMode::Pure.reducer_active());
-
-        assert!(!ReduxMode::Off.is_pure());
-        assert!(!ReduxMode::Both.is_pure());
-        assert!(!ReduxMode::Redux.is_pure());
-        assert!(ReduxMode::Pure.is_pure());
-    }
-
-    /// T3-3-b-1: Off / Both 任何 driver_opt_in 都走 legacy
-    #[test]
-    fn route_off_and_both_always_legacy() {
-        for tools_empty in [false, true] {
-            assert!(matches!(
-                route_turn(ReduxMode::Off, false, tools_empty),
-                TurnRoute::LegacyToolLoop
-            ));
-            assert!(matches!(
-                route_turn(ReduxMode::Off, true, tools_empty),
-                TurnRoute::LegacyToolLoop
-            ));
-            assert!(matches!(
-                route_turn(ReduxMode::Both, false, tools_empty),
-                TurnRoute::LegacyToolLoop
-            ));
-            assert!(matches!(
-                route_turn(ReduxMode::Both, true, tools_empty),
-                TurnRoute::LegacyToolLoop
-            ));
-        }
-    }
-
-    /// T3-3-b-2: Redux 需 driver_opt_in 才切到 driver（向后兼容 5a-4 语义）
-    #[test]
-    fn route_redux_requires_opt_in() {
-        assert!(matches!(
-            route_turn(ReduxMode::Redux, false, true),
-            TurnRoute::LegacyToolLoop
-        ));
-        assert!(matches!(
-            route_turn(ReduxMode::Redux, true, true),
-            TurnRoute::ReduxDriver
-        ));
-    }
-
-    /// T3-3-b-3: Pure 必走 driver，无论 driver_opt_in（T3-3 收官关键契约）
     #[test]
     fn route_pure_always_driver() {
-        for opt_in in [false, true] {
-            for tools_empty in [false, true] {
-                assert!(
-                    matches!(route_turn(ReduxMode::Pure, opt_in, tools_empty), TurnRoute::ReduxDriver),
-                    "Pure mode must always route to ReduxDriver (opt_in={opt_in} tools_empty={tools_empty})"
-                );
-            }
-        }
-    }
-
-    /// T3-3-fixA P0-2: Pure 模式跳过 legacy exit save_session 的真值表.
-    ///
-    /// 退出守卫表达式 `!ReduxMode::from_env().is_pure()`：
-    /// - Off / Both / Redux → 守卫为 true，legacy save 兜底
-    /// - Pure → 守卫为 false，跳过 legacy save，reducer 是唯一持久化源
-    ///
-    /// 这是 fixA P0-2 修复的逻辑契约——直接断言 is_pure() 真值表，避免依赖 env state.
-    #[test]
-    fn pure_mode_skips_legacy_exit_save_via_redux_mode_guard() {
-        // Pure 是唯一应跳过 legacy exit save 的模式
-        assert!(ReduxMode::Pure.is_pure(), "Pure.is_pure() 必须 true");
-        assert!(!ReduxMode::Off.is_pure(), "Off.is_pure() 必须 false");
-        assert!(!ReduxMode::Both.is_pure(), "Both.is_pure() 必须 false");
-        assert!(!ReduxMode::Redux.is_pure(), "Redux.is_pure() 必须 false");
-
-        // 守卫表达式 `legacy_exit_save_enabled = !mode.is_pure()` 真值
-        for (mode, expected_legacy_enabled) in [
-            (ReduxMode::Off, true),
-            (ReduxMode::Both, true),
-            (ReduxMode::Redux, true),
-            (ReduxMode::Pure, false),
-        ] {
-            let legacy_exit_save_enabled = !mode.is_pure();
-            assert_eq!(
-                legacy_exit_save_enabled, expected_legacy_enabled,
-                "mode {mode:?}: legacy_exit_save_enabled 应为 {expected_legacy_enabled}"
-            );
-        }
-    }
-
-    /// T3-3-fixB B4: Pure 模式跳过 legacy `chat_session.set_mode` 的真值表.
-    ///
-    /// SetMode 命令分支的守卫表达式 `legacy_session_mode_writes_enabled = !ReduxMode::from_env().is_pure()`:
-    /// - Off / Both / Redux → 守卫为 true，legacy set_mode 跑
-    /// - Pure → 守卫为 false，跳过 legacy set_mode（chat_session 不参与持久化，写 mode 是死写）
-    ///
-    /// 与 mod.rs:2197 `legacy_session_writes_enabled` 同形结构.
-    #[test]
-    fn pure_mode_skips_legacy_set_mode_via_redux_mode_guard() {
-        for (mode, expected_legacy_enabled) in [
-            (ReduxMode::Off, true),
-            (ReduxMode::Both, true),
-            (ReduxMode::Redux, true),
-            (ReduxMode::Pure, false),
-        ] {
-            let legacy_session_mode_writes_enabled = !mode.is_pure();
-            assert_eq!(
-                legacy_session_mode_writes_enabled, expected_legacy_enabled,
-                "mode {mode:?}: legacy_session_mode_writes_enabled 应为 {expected_legacy_enabled}"
-            );
-        }
+        assert!(matches!(route_turn(ReduxMode::Pure), TurnRoute::ReduxDriver));
     }
 }
 
@@ -3698,9 +3757,102 @@ mod s4_a_4 {
 
         assert_eq!(pending.len(), 1);
         assert!(
-            matches!(&pending[0], ConversationLine::System { content } if content.contains("Conversation cleared")),
+            matches!(pending.first(), Some(ConversationLine::System { content }) if content.contains("Conversation cleared")),
             "clear feedback must be flushed after conversation_lines shrink"
         );
+    }
+
+    #[test]
+    fn s4_a_4_pending_index_resets_after_equal_len_history_replacement() {
+        let mut state = crate::chat::state::ChatState::new(
+            Arc::from("ps"),
+            Arc::from("ms"),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let _ = state.reduce_tracked(crate::chat::action::Action::UserMessageEchoed("/clear".to_string()));
+        let snap0 = Arc::new(state.build_ui_snapshot(1));
+        let (tx, rx) = watch::channel(snap0);
+        let src = RenderSource::Snapshot(rx);
+
+        let mut last_pushed_idx = 1;
+        let mut last_generation = src.conversation_generation();
+        let _ = state.reduce_tracked(crate::chat::action::Action::HistoryClearedWithNotice {
+            notice: "Conversation cleared (kept system prompt).".to_string(),
+        });
+        let snap1 = Arc::new(state.build_ui_snapshot(2));
+        tx.send(snap1).expect("send replaced snap");
+
+        let generation = src.conversation_generation();
+        if generation != last_generation {
+            last_pushed_idx = 0;
+            last_generation = generation;
+        }
+        assert_eq!(last_generation, generation);
+        let (pending, _) = src.read_pending(last_pushed_idx);
+
+        assert_eq!(pending.len(), 1);
+        assert!(
+            matches!(pending.first(), Some(ConversationLine::System { content }) if content.contains("Conversation cleared")),
+            "clear feedback must be flushed even when replacement keeps the same len"
+        );
+    }
+
+    #[test]
+    fn plain_character_keys_are_not_logged_as_tui_input_events() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        assert!(!super::should_log_tui_key_event(&KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        )));
+        assert!(super::should_log_tui_key_event(&KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(super::should_log_tui_key_event(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
+    fn plain_character_key_detection_is_limited_to_unmodified_chars() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        assert!(super::is_plain_character_key(&KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!super::is_plain_character_key(&KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!super::is_plain_character_key(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
+    fn plain_character_key_char_excludes_control_and_release_events() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+        assert_eq!(
+            super::plain_character_from_key(&KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            Some('p')
+        );
+        assert_eq!(
+            super::plain_character_from_key(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            None
+        );
+
+        let release = KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        assert_eq!(super::plain_character_from_key(&release), None);
     }
 
     /// 验证 snapshot 路径在 watch 推送新值后 with_view 看到新内容.

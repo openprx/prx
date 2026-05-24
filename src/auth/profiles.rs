@@ -633,6 +633,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_profile_roundtrip_with_encryption_decrypts_token() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), true);
+        let profile = AuthProfile::new_token("moonshot", "default", "moonshot-token-123".into());
+
+        store.upsert_profile(profile.clone(), true).unwrap();
+
+        let raw = tokio::fs::read_to_string(store.path()).await.unwrap();
+        assert!(raw.contains("enc2:"));
+        assert!(!raw.contains("moonshot-token-123"));
+
+        let data = store.load().unwrap();
+        let loaded = data.profiles.get(&profile.id).unwrap();
+        assert_eq!(loaded.token.as_deref(), Some("moonshot-token-123"));
+        assert!(
+            !loaded.token.as_deref().unwrap().starts_with("enc2:"),
+            "loaded auth profile token must be decrypted before provider use"
+        );
+    }
+
+    #[tokio::test]
     async fn atomic_write_replaces_file() {
         let tmp = TempDir::new().unwrap();
         let store = AuthProfilesStore::new(tmp.path(), false);

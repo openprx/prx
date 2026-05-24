@@ -35,6 +35,7 @@ pub use traits::{
     ProviderCapabilityError, ToolCall, ToolResultMessage,
 };
 
+use crate::auth::{profiles::AuthProfilesStore, select_profile_id};
 use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
@@ -1158,7 +1159,16 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 ///
 /// Environment variables are NOT read here. All credentials must come from
 /// the config file or auth-profiles.json.
+#[cfg(test)]
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
+    resolve_provider_credential_with_options(name, credential_override, &ProviderRuntimeOptions::default())
+}
+
+fn resolve_provider_credential_with_options(
+    name: &str,
+    credential_override: Option<&str>,
+    options: &ProviderRuntimeOptions,
+) -> Option<String> {
     if let Some(raw_override) = credential_override {
         let trimmed_override = raw_override.trim();
         if !trimmed_override.is_empty() {
@@ -1178,7 +1188,39 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         return None;
     }
 
+    if let Some(credential) = resolve_auth_profile_credential(name, options) {
+        return Some(credential);
+    }
+
     None
+}
+
+fn resolve_auth_profile_credential(name: &str, options: &ProviderRuntimeOptions) -> Option<String> {
+    let openprx_dir = options.openprx_dir.as_ref()?;
+    let provider = canonical_auth_profile_provider(name);
+    let store = AuthProfilesStore::new(openprx_dir, options.secrets_encrypt);
+    let data = store.load().ok()?;
+    let profile_id = select_profile_id(&data, provider.as_str(), options.auth_profile_override.as_deref())?;
+    let profile = data.profiles.get(&profile_id)?;
+    profile
+        .token
+        .as_deref()
+        .or_else(|| profile.token_set.as_ref().map(|tokens| tokens.access_token.as_str()))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn canonical_auth_profile_provider(name: &str) -> String {
+    let lowered = name.trim().to_ascii_lowercase();
+    for info in list_providers() {
+        if info.name == lowered || info.aliases.iter().any(|alias| *alias == lowered) {
+            return info.name.to_string();
+        }
+    }
+    canonical_china_provider_name(&lowered)
+        .unwrap_or(lowered.as_str())
+        .to_string()
 }
 
 fn parse_custom_provider_url(raw_url: &str, provider_label: &str, format_hint: &str) -> anyhow::Result<String> {
@@ -1253,7 +1295,7 @@ fn create_provider_with_url_and_options(
         .map_or_else(
             || {
                 claude_code_context.as_ref().map_or_else(
-                    || resolve_provider_credential(name, api_key),
+                    || resolve_provider_credential_with_options(name, api_key, options),
                     |context| {
                         let fallback_override = if claude_code_placeholder_requested {
                             None
@@ -1262,9 +1304,9 @@ fn create_provider_with_url_and_options(
                         };
                         context.credential.clone().or_else(|| {
                             if is_claude_code_alias(name) {
-                                resolve_provider_credential("anthropic", fallback_override)
+                                resolve_provider_credential_with_options("anthropic", fallback_override, options)
                             } else {
-                                resolve_provider_credential(name, fallback_override)
+                                resolve_provider_credential_with_options(name, fallback_override, options)
                             }
                         })
                     },
@@ -1641,7 +1683,7 @@ pub fn create_resilient_provider_with_options(
     reliability: &crate::config::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    let availability = summarize_provider_availability(primary_name, api_key, reliability);
+    let availability = summarize_provider_availability(primary_name, api_key, reliability, options);
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
     let mut unavailable = availability.unavailable.clone();
 
@@ -1672,7 +1714,15 @@ pub fn create_resilient_provider_with_options(
     }
 
     if providers.is_empty() {
-        anyhow::bail!("No available providers after credential/initialization checks");
+        let reasons = unavailable
+            .iter()
+            .map(|(name, reason)| format!("{name}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if reasons.is_empty() {
+            anyhow::bail!("No available providers after credential/initialization checks");
+        }
+        anyhow::bail!("No available providers after credential/initialization checks: {reasons}");
     }
 
     let reliable = ReliableProvider::new(providers, reliability.provider_retries, reliability.provider_backoff_ms)
@@ -1893,10 +1943,52 @@ pub fn provider_matches_model_prefix(provider_name: &str, model: &str) -> bool {
     false
 }
 
+fn canonical_provider_info(provider_name: &str) -> Option<ProviderInfo> {
+    let provider_name = provider_name.trim();
+    list_providers().into_iter().find(|info| {
+        info.name.eq_ignore_ascii_case(provider_name)
+            || info
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(provider_name))
+    })
+}
+
+const KIMI_CODE_SUPPORTED_MODELS: &[&str] = &["kimi2.6", "kimi-for-coding", "kimi-k2.5"];
+
+/// Validate model IDs that PRX can safely validate locally.
+///
+/// Most OpenAI-compatible providers own model catalog changes, so PRX does not
+/// generally reject bare model IDs. Kimi Code is an exception in practice: the
+/// coding endpoint can return success even for an invalid model string, which
+/// makes CLI validation evidence misleading.
+pub fn validate_provider_model(provider_name: &str, model: &str) -> anyhow::Result<()> {
+    let model = model.trim();
+    if model.is_empty() || model.starts_with("hint:") {
+        return Ok(());
+    }
+
+    if !provider_matches_model_prefix(provider_name, model) {
+        anyhow::bail!("model '{model}' is not compatible with provider '{provider_name}'");
+    }
+
+    if canonical_provider_info(provider_name).is_some_and(|info| info.name == "kimi-code")
+        && !KIMI_CODE_SUPPORTED_MODELS.iter().any(|known| *known == model)
+    {
+        anyhow::bail!(
+            "invalid model '{model}' for provider 'kimi-code'. Supported models: {}",
+            KIMI_CODE_SUPPORTED_MODELS.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 pub fn summarize_provider_availability(
     primary_name: &str,
     api_key: Option<&str>,
     reliability: &crate::config::ReliabilityConfig,
+    options: &ProviderRuntimeOptions,
 ) -> ProviderAvailabilitySummary {
     let mut configured = vec![primary_name.to_string()];
     for fallback in &reliability.fallback_providers {
@@ -1925,7 +2017,7 @@ pub fn summarize_provider_availability(
 
         let explicit_for_provider = if provider == primary_name { api_key } else { None };
         if provider_requires_explicit_credential(provider)
-            && resolve_provider_credential(provider, explicit_for_provider).is_none()
+            && resolve_provider_credential_with_options(provider, explicit_for_provider, options).is_none()
         {
             // For anthropic (and its claude-code / claude-cli aliases), also check Claude Code
             // OAuth credentials from ~/.claude/.credentials.json.
@@ -2271,6 +2363,7 @@ mod tests {
     )]
     use super::*;
     use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
 
     struct EnvGuard {
         key: &'static str,
@@ -2341,6 +2434,55 @@ mod tests {
         assert!(resolve_provider_credential("litellm", None).is_none());
         assert!(resolve_provider_credential("vllm", None).is_none());
         assert!(resolve_provider_credential("hf", None).is_none());
+    }
+
+    #[test]
+    fn resolve_provider_credential_reads_active_auth_profiles_for_kimi_providers() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        store
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile::new_token(
+                    "moonshot",
+                    "default",
+                    "moonshot-profile-key".to_string(),
+                ),
+                true,
+            )
+            .unwrap();
+        store
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile::new_token(
+                    "kimi-code",
+                    "default",
+                    "kimi-code-profile-key".to_string(),
+                ),
+                true,
+            )
+            .unwrap();
+
+        let options = ProviderRuntimeOptions {
+            openprx_dir: Some(tmp.path().to_path_buf()),
+            secrets_encrypt: false,
+            ..ProviderRuntimeOptions::default()
+        };
+
+        assert_eq!(
+            resolve_provider_credential_with_options("moonshot", None, &options).as_deref(),
+            Some("moonshot-profile-key")
+        );
+        assert_eq!(
+            resolve_provider_credential_with_options("kimi", None, &options).as_deref(),
+            Some("moonshot-profile-key")
+        );
+        assert_eq!(
+            resolve_provider_credential_with_options("moonshot-intl", None, &options).as_deref(),
+            Some("moonshot-profile-key")
+        );
+        assert_eq!(
+            resolve_provider_credential_with_options("kimi-code", None, &options).as_deref(),
+            Some("kimi-code-profile-key")
+        );
     }
 
     #[test]
@@ -3007,7 +3149,12 @@ mod tests {
             scheduler_retries: 2,
         };
 
-        let summary = summarize_provider_availability("openai", Some("sk-test"), &reliability);
+        let summary = summarize_provider_availability(
+            "openai",
+            Some("sk-test"),
+            &reliability,
+            &ProviderRuntimeOptions::default(),
+        );
         let _ = std::fs::remove_dir_all(&iso_home);
         assert!(summary.degraded);
         assert_eq!(summary.available, vec!["openai"]);
@@ -3070,6 +3217,7 @@ mod tests {
                 scheduler_poll_secs: 15,
                 scheduler_retries: 2,
             },
+            &ProviderRuntimeOptions::default(),
         );
 
         assert!(summary.available.iter().any(|p| p == "openai-codex"));
@@ -3106,6 +3254,7 @@ mod tests {
                 scheduler_poll_secs: 15,
                 scheduler_retries: 2,
             },
+            &ProviderRuntimeOptions::default(),
         );
 
         assert!(
@@ -3122,6 +3271,19 @@ mod tests {
     fn provider_model_prefix_matching_rejects_cross_provider_mismatch() {
         assert!(provider_matches_model_prefix("openai", "openai/gpt-4o"));
         assert!(!provider_matches_model_prefix("anthropic", "openai/gpt-4o"));
+    }
+
+    #[test]
+    fn validate_provider_model_rejects_unknown_kimi_code_model() {
+        assert!(validate_provider_model("kimi-code", "kimi2.6").is_ok());
+        assert!(validate_provider_model("kimi_coding", "kimi-for-coding").is_ok());
+
+        let err = validate_provider_model("kimi-code", "definitely-not-a-real-model")
+            .expect_err("unknown Kimi Code model should fail local validation")
+            .to_string();
+
+        assert!(err.contains("invalid model 'definitely-not-a-real-model'"));
+        assert!(err.contains("kimi2.6"));
     }
 
     /// OpenRouter is a model aggregator: it must accept any `org/model` style

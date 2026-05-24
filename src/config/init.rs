@@ -560,6 +560,18 @@ fn memory_template(spec: Spec) -> String {
 [memory]
 backend = "sqlite"
 auto_save = true
+
+[memory.events]
+enabled = true
+record_user_messages = true
+record_assistant_messages = true
+record_tool_events = false
+retention_days = 14
+
+[memory.semantic]
+auto_promote_user_messages = true
+auto_promote_assistant_messages = false
+min_chars = 30
 "#
         .into(),
 
@@ -570,6 +582,18 @@ auto_save = true
 backend = "sqlite"
 auto_save = true
 
+[memory.events]
+enabled = true
+record_user_messages = true
+record_assistant_messages = true
+record_tool_events = false
+retention_days = 14
+
+[memory.semantic]
+auto_promote_user_messages = true
+auto_promote_assistant_messages = false
+min_chars = 30
+
 [storage]
 [storage.provider]
 [storage.provider.config]
@@ -579,11 +603,25 @@ auto_save = true
 
         Spec::Full => r#"# Memory configuration (full)
 # Backend options: sqlite (recommended), markdown, none
-# Auto-save persists conversation context across sessions
+# auto_save is a compatibility gate for semantic memory promotion.
 
 [memory]
 backend = "sqlite"
 auto_save = true
+
+# Message events are the shared live fabric and are independent from semantic auto-save.
+[memory.events]
+enabled = true
+record_user_messages = true
+record_assistant_messages = true
+record_tool_events = false
+retention_days = 14
+
+# Semantic memory promotion controls long-term durable memory extraction.
+[memory.semantic]
+auto_promote_user_messages = true
+auto_promote_assistant_messages = false
+min_chars = 30
 
 # Embedding configuration for semantic search
 # [memory.embedding]
@@ -834,6 +872,7 @@ max_context_tokens = 100000
 
 [sessions_spawn]
 enabled = false
+# process_memory_strategy = "shared_fabric" # shared_fabric | isolated_private | hybrid
 # max_concurrent = 4
 
 [self_system]
@@ -857,6 +896,7 @@ max_context_tokens = 100000
 [sessions_spawn]
 enabled = false
 max_concurrent = 4
+process_memory_strategy = "shared_fabric"
 # timeout_secs = 300
 
 # Self-system for autonomous behavior

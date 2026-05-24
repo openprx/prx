@@ -66,11 +66,17 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{ScopeContext, ToolConcurrencyGovernanceConfig, build_tool_instructions, run_tool_call_loop};
+use crate::agent::loop_::{
+    ScopeContext, ToolConcurrencyGovernanceConfig, build_context_with_shared_events, build_tool_instructions,
+    run_tool_call_loop,
+};
 use crate::config::Config;
 use crate::hooks::HookManager;
 use crate::identity;
-use crate::memory::{self, Memory, MemoryWriteContext};
+use crate::memory::{
+    self, Memory, MemoryEventRecording, MemoryFabric, MemoryPrincipal, MemoryVisibility, MemoryWriteContext,
+    MessageEventScope,
+};
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider};
 use crate::runtime;
@@ -95,11 +101,6 @@ type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
 const MAX_CHANNEL_HISTORY: usize = 50;
 /// Maximum number of persisted sessions to hydrate at startup.
 const MAX_HYDRATED_SESSIONS: usize = 100;
-/// Minimum user-message length (in chars) for auto-save to memory.
-/// Messages shorter than this (e.g. "ok", "thanks") are not stored,
-/// reducing noise in memory recall.
-const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
-
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
@@ -117,8 +118,11 @@ const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
+#[allow(dead_code)]
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
+#[allow(dead_code)]
 const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
+#[allow(dead_code)]
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 8;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 320;
@@ -209,6 +213,7 @@ struct ChannelRuntimeContext {
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
+    memory_event_recording: MemoryEventRecording,
     max_tool_iterations: usize,
     read_only_tool_concurrency_window: usize,
     read_only_tool_timeout_secs: u64,
@@ -627,6 +632,14 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}", msg.channel, msg.sender)
 }
 
+fn channel_message_visibility(msg: &traits::ChannelMessage) -> MemoryVisibility {
+    if infer_chat_type_from_message(msg) == "group" {
+        MemoryVisibility::Session
+    } else {
+        MemoryVisibility::Workspace
+    }
+}
+
 fn to_rfc3339_timestamp(raw_timestamp: u64) -> Option<String> {
     if raw_timestamp == 0 {
         return None;
@@ -962,10 +975,12 @@ async fn append_sender_turn(
     sender_key: &str,
     channel: &str,
     sender: &str,
+    recipient: Option<&str>,
     turn: ChatMessage,
+    visibility: MemoryVisibility,
     timestamp: Option<&str>,
     message_id: Option<&str>,
-) {
+) -> Option<crate::memory::MessageEvent> {
     let role = turn.role.clone();
     let content = turn.content.clone();
     {
@@ -988,6 +1003,46 @@ async fn append_sender_turn(
             sender,
             "Failed to persist channel conversation turn: {error}"
         );
+    }
+
+    let fabric = MemoryFabric::new(
+        ctx.memory.clone(),
+        ctx.workspace_dir.as_path().to_string_lossy().to_string(),
+    )
+    .with_event_recording(ctx.memory_event_recording);
+    let scope = MessageEventScope::new("channel", visibility)
+        .with_channel(channel.to_string())
+        .with_session_key(sender_key.to_string())
+        .with_sender(if role == "assistant" {
+            "prx".to_string()
+        } else {
+            sender.to_string()
+        })
+        .with_recipient(recipient.unwrap_or(sender).to_string());
+    let result = if role == "assistant" {
+        fabric.record_assistant_message(scope, content).await
+    } else {
+        fabric
+            .record_inbound_user_message(
+                scope,
+                content,
+                message_id.map(|id| format!("channel:{channel}:{id}")),
+                None,
+            )
+            .await
+    };
+    match result {
+        Ok(event) => Some(event),
+        Err(error) => {
+            tracing::warn!(
+                session_key = sender_key,
+                channel,
+                sender,
+                role,
+                "Failed to persist channel message event: {error}"
+            );
+            None
+        }
     }
 }
 
@@ -1019,6 +1074,7 @@ async fn load_persisted_histories(memory: &dyn Memory) -> HashMap<String, Vec<Ch
     }
 }
 
+#[allow(dead_code)]
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     if memory::is_assistant_autosave_key(key) {
         return true;
@@ -1224,6 +1280,7 @@ async fn handle_runtime_command_if_needed(
     true
 }
 
+#[allow(dead_code)]
 async fn build_memory_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
     let mut context = String::new();
 
@@ -2034,6 +2091,7 @@ async fn process_channel_message(
     }
 
     let history_key = conversation_history_key(&msg);
+    let message_visibility = channel_message_visibility(&msg);
     let route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
@@ -2060,32 +2118,6 @@ async fn process_channel_message(
     } else {
         "dm"
     };
-    // Only auto-save DM messages; group messages are noise unless explicitly stored by the agent.
-    if ctx.auto_save_memory
-        && inferred_chat_type == "dm"
-        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && memory::should_autosave_content(&msg.content)
-    {
-        let autosave_key = conversation_memory_key(&msg);
-        let write_ctx = MemoryWriteContext {
-            channel: Some(msg.channel.clone()),
-            chat_type: Some(inferred_chat_type.to_string()),
-            chat_id: Some(msg.reply_target.clone()),
-            sender_id: None,
-            raw_sender: Some(msg.sender.clone()),
-        };
-        let _ = ctx
-            .memory
-            .store_with_context(
-                &autosave_key,
-                &msg.content,
-                crate::memory::MemoryCategory::Conversation,
-                None,
-                Some(&write_ctx),
-            )
-            .await;
-    }
-
     println!("  ⏳ Processing message...");
 
     // Set active recipient on tools that support proactive messaging (message_send, sessions_spawn).
@@ -2100,24 +2132,49 @@ async fn process_channel_message(
 
     let started_at = Instant::now();
 
-    let had_prior_history = ctx
-        .conversation_histories
-        .lock()
-        .get(&history_key)
-        .is_some_and(|turns| !turns.is_empty());
-
     // Preserve user turn before the LLM call so interrupted requests keep context.
     let inbound_timestamp = to_rfc3339_timestamp(msg.timestamp);
-    append_sender_turn(
+    let inbound_event = append_sender_turn(
         ctx.as_ref(),
         &history_key,
         &msg.channel,
         &msg.sender,
+        Some(&msg.reply_target),
         ChatMessage::user(&msg.content),
+        message_visibility.clone(),
         inbound_timestamp.as_deref(),
         Some(msg.id.as_str()),
     )
     .await;
+
+    // Only auto-save DM messages; group messages are noise unless explicitly stored by the agent.
+    if ctx.auto_save_memory && inferred_chat_type == "dm" && memory::should_autosave_content(&msg.content) {
+        let autosave_key = conversation_memory_key(&msg);
+        let write_ctx = MemoryWriteContext {
+            channel: Some(msg.channel.clone()),
+            chat_type: Some(inferred_chat_type.to_string()),
+            chat_id: Some(msg.reply_target.clone()),
+            sender_id: None,
+            raw_sender: Some(msg.sender.clone()),
+        };
+        let _ = ctx
+            .memory
+            .store_with_context_and_metadata(
+                &autosave_key,
+                &msg.content,
+                crate::memory::MemoryCategory::Conversation,
+                None,
+                Some(&write_ctx),
+                crate::memory::MemoryStoreMetadata {
+                    workspace_id: Some(ctx.workspace_dir.as_path().to_string_lossy().to_string()),
+                    agent_id: None,
+                    persona_id: None,
+                    source_event_id: inbound_event.as_ref().map(|event| event.event_id.clone()),
+                    source: Some("semantic_promotion".to_string()),
+                },
+            )
+            .await;
+    }
 
     // Skip LLM call for group messages when mention_only is enabled and bot is not mentioned.
     let is_group = msg.reply_target.starts_with("group:")
@@ -2149,12 +2206,14 @@ async fn process_channel_message(
         SignalVisionPreflightOutcome::Ready { context } => Some(context),
         SignalVisionPreflightOutcome::Fallback => {
             let fallback = SIGNAL_IMAGE_UNCERTAINTY_FALLBACK.to_string();
-            append_sender_turn(
+            let _ = append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
                 &msg.channel,
                 &msg.sender,
+                Some(&msg.reply_target),
                 ChatMessage::assistant(&fallback),
+                message_visibility.clone(),
                 None,
                 None,
             )
@@ -2176,13 +2235,23 @@ async fn process_channel_message(
         }
     };
 
-    // Only enrich with memory context when there is no prior conversation
-    // history. Follow-up turns already include context from previous messages.
-    let memory_context = if had_prior_history {
-        String::new()
-    } else {
-        build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await
-    };
+    // Shared events are refreshed each turn so other entrypoints (chat/gateway)
+    // can be observed by channel turns without waiting for a session boundary.
+    let memory_context = build_context_with_shared_events(
+        ctx.memory.as_ref(),
+        MemoryPrincipal {
+            workspace_id: ctx.workspace_dir.as_path().to_string_lossy().to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some(history_key.clone()),
+            channel: Some(msg.channel.clone()),
+            sender: Some(msg.sender.clone()),
+        },
+        &msg.content,
+        ctx.min_relevance_score,
+    )
+    .await
+    .preamble;
 
     // When Skill RAG is enabled, select relevant skills per-message and rebuild
     // the system prompt (same as chat/mod.rs per-turn skill selection).
@@ -2227,7 +2296,7 @@ async fn process_channel_message(
 
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" {
-                if !had_prior_history && !memory_context.is_empty() {
+                if !memory_context.is_empty() {
                     last_turn.content = format!("{memory_context}{}", last_turn.content);
                 }
                 if let Some(preflight_context) = signal_vision_context.as_deref() {
@@ -2525,12 +2594,14 @@ async fn process_channel_message(
                 format!("{tool_summary}\n{delivered_response}")
             };
 
-            append_sender_turn(
+            let _ = append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
                 &msg.channel,
                 &msg.sender,
+                Some(&msg.reply_target),
                 ChatMessage::assistant(&history_response),
+                message_visibility,
                 None,
                 None,
             )
@@ -3974,7 +4045,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
             config.api_key.clone(),
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
-        );
+        )
+        .with_shared_memory(Arc::clone(&mem));
+        let spawn_tool = spawn_tool.with_event_recording(config.memory.event_recording_config());
         let handle = spawn_tool.tools_handle();
         let active_runs = spawn_tool.active_runs_arc();
 
@@ -4074,9 +4147,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let effective_backend =
         memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
     println!(
-        "  🧠 Memory:   {} (auto-save: {})",
+        "  🧠 Memory:   {} (semantic auto-promote: {})",
         effective_backend,
-        if config.memory.auto_save { "on" } else { "off" }
+        if config.memory.auto_save && config.memory.semantic.auto_promote_user_messages {
+            "on"
+        } else {
+            "off"
+        }
     );
     println!(
         "  📡 Channels: {}",
@@ -4179,7 +4256,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         system_prompt: Arc::new(system_prompt),
         model: Arc::new(model.clone()),
         temperature,
-        auto_save_memory: config.memory.auto_save,
+        auto_save_memory: config.memory.auto_save && config.memory.semantic.auto_promote_user_messages,
+        memory_event_recording: config.memory.event_recording_config(),
         max_tool_iterations: config.agent.max_tool_iterations,
         read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
         read_only_tool_timeout_secs: config.agent.read_only_tool_timeout_secs,
@@ -4232,7 +4310,7 @@ mod tests {
         clippy::unreadable_literal
     )]
     use super::*;
-    use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use crate::memory::{Memory, MemoryCategory, MemoryPrincipal, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
@@ -4372,6 +4450,7 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -4421,6 +4500,91 @@ mod tests {
             total_chars,
             CHANNEL_HISTORY_COMPACT_TOTAL_CHARS
         );
+    }
+
+    #[tokio::test]
+    async fn append_sender_turn_records_channel_message_event() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::clone(&memory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(tmp.path().to_path_buf())),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
+            max_tool_iterations: 5,
+            read_only_tool_concurrency_window: 2,
+            read_only_tool_timeout_secs: 30,
+            priority_scheduling_enabled: false,
+            low_priority_tools: Vec::new(),
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(tmp.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["prx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            skill_rag_ctx: None,
+        };
+
+        let _ = append_sender_turn(
+            &ctx,
+            "telegram_sender-1",
+            "telegram",
+            "sender-1",
+            Some("sender-1"),
+            ChatMessage::user("hello from telegram"),
+            MemoryVisibility::Workspace,
+            Some("2026-05-21T00:00:00Z"),
+            Some("msg-1"),
+        )
+        .await;
+
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: tmp.path().to_string_lossy().to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("telegram_sender-1".to_string()),
+                    channel: Some("telegram".to_string()),
+                    sender: Some("sender-1".to_string()),
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, "channel");
+        assert_eq!(events[0].channel.as_deref(), Some("telegram"));
+        assert_eq!(events[0].session_key.as_deref(), Some("telegram_sender-1"));
+        assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].content, "hello from telegram");
     }
 
     #[test]
@@ -5017,6 +5181,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -5092,6 +5257,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -5167,6 +5333,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -5244,6 +5411,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -5320,6 +5488,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -5402,6 +5571,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -5506,6 +5676,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -5589,6 +5760,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -5686,6 +5858,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("startup-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -5812,6 +5985,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 12,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -5888,6 +6062,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 3,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -6083,6 +6258,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -6180,6 +6356,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -6290,6 +6467,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -6361,8 +6539,10 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_cancels_scoped_typing_task() {
+        let tmp = tempfile::TempDir::new().unwrap();
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
 
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
@@ -6373,14 +6553,15 @@ BTC is currently around $65,000 based on latest tool output."#
                 delay: Duration::from_millis(20),
             }),
             default_provider: Arc::new("test-provider".to_string()),
-            memory: Arc::new(NoopMemory),
+            memory: Arc::clone(&memory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
+            hooks: Arc::new(crate::hooks::HookManager::new(tmp.path().to_path_buf())),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 10,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -6394,7 +6575,7 @@ BTC is currently around $65,000 based on latest tool output."#
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
+            workspace_dir: Arc::new(tmp.path().to_path_buf()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             agent_compaction: crate::config::AgentCompactionConfig::default(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
@@ -6432,6 +6613,35 @@ BTC is currently around $65,000 based on latest tool output."#
         let stops = channel_impl.stop_typing_calls.load(Ordering::SeqCst);
         assert_eq!(starts, 1, "start_typing should be called once");
         assert_eq!(stops, 1, "stop_typing should be called once");
+
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: tmp.path().to_string_lossy().to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("test-channel_alice".to_string()),
+                    channel: Some("test-channel".to_string()),
+                    sender: Some("alice".to_string()),
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        let user_event = events.first().unwrap();
+        let assistant_event = events.get(1).unwrap();
+        assert_eq!(user_event.source, "channel");
+        assert_eq!(user_event.role, "user");
+        assert_eq!(user_event.content, "hello");
+        assert_eq!(
+            user_event.idempotency_key.as_deref(),
+            Some("channel:test-channel:typing-msg")
+        );
+        assert_eq!(assistant_event.source, "channel");
+        assert_eq!(assistant_event.role, "assistant");
+        assert!(assistant_event.content.contains("echo:"));
     }
 
     #[test]
@@ -6842,6 +7052,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -6941,6 +7152,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,
@@ -7036,6 +7248,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
             read_only_tool_timeout_secs: 30,

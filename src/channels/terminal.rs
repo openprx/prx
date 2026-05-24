@@ -90,7 +90,11 @@ fn sanitize_terminal_output(text: &str) -> String {
     result
 }
 
-fn normalize_terminal_newlines(text: &str) -> String {
+fn normalize_terminal_newlines_for(text: &str, stdout_is_terminal: bool) -> String {
+    if !stdout_is_terminal {
+        return text.to_string();
+    }
+
     let mut out = String::with_capacity(text.len());
     let mut prev_was_cr = false;
     for ch in text.chars() {
@@ -104,7 +108,7 @@ fn normalize_terminal_newlines(text: &str) -> String {
 }
 
 fn print_terminal_text(text: &str) {
-    print!("{}", normalize_terminal_newlines(text));
+    print!("{}", normalize_terminal_newlines_for(text, io::stdout().is_terminal()));
 }
 
 fn println_terminal_text(text: &str) {
@@ -482,9 +486,13 @@ impl UiActor {
                 }
 
                 if self.active_draft_id.as_deref() == Some(&draft_id) {
-                    // Clear current line
-                    print!("\r");
-                    let _ = execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine));
+                    // Clear current line only for interactive rendering. Plain
+                    // mode is often piped to files and must not emit control
+                    // bytes such as CR or CSI clear-line sequences.
+                    if !self.plain_mode {
+                        print!("\r");
+                        let _ = execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine));
+                    }
                     if !self.draft_buffer.is_empty() {
                         print_terminal_text("\n");
                         if !self.plain_mode {
@@ -1060,9 +1068,15 @@ mod tests {
 
     #[test]
     fn terminal_output_newlines_use_carriage_return() {
-        assert_eq!(normalize_terminal_newlines("a\nb"), "a\r\nb");
-        assert_eq!(normalize_terminal_newlines("a\r\nb"), "a\r\nb");
-        assert_eq!(normalize_terminal_newlines("a\nb\n"), "a\r\nb\r\n");
+        assert_eq!(normalize_terminal_newlines_for("a\nb", true), "a\r\nb");
+        assert_eq!(normalize_terminal_newlines_for("a\r\nb", true), "a\r\nb");
+        assert_eq!(normalize_terminal_newlines_for("a\nb\n", true), "a\r\nb\r\n");
+    }
+
+    #[test]
+    fn non_terminal_output_preserves_lf_only_newlines() {
+        assert_eq!(normalize_terminal_newlines_for("a\nb", false), "a\nb");
+        assert_eq!(normalize_terminal_newlines_for("a\r\nb", false), "a\r\nb");
     }
 
     #[tokio::test]
