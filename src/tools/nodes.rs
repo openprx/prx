@@ -1,8 +1,11 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{RemoteNodeConfig, SharedConfig};
+use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::nodes::client::RemoteNodeClient;
 use crate::nodes::transport::H2Transport;
 use crate::security::SecurityPolicy;
+use crate::security::SideEffectGate;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -12,11 +15,43 @@ use std::time::Duration;
 pub struct NodesTool {
     config: SharedConfig,
     security: Arc<SecurityPolicy>,
+    memory: Option<Arc<dyn Memory>>,
+    event_recording: MemoryEventRecording,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NodeLineage {
+    owner_id: Option<String>,
+    topic_id: Option<String>,
+    parent_task_id: Option<String>,
+    source_message_event_id: Option<String>,
 }
 
 impl NodesTool {
-    pub const fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
-        Self { config, security }
+    pub fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
+        Self {
+            config,
+            security,
+            memory: None,
+            event_recording: MemoryEventRecording::default(),
+        }
+    }
+
+    pub fn with_shared_memory(mut self, memory: Arc<dyn Memory>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    pub const fn with_event_recording(mut self, event_recording: MemoryEventRecording) -> Self {
+        self.event_recording = event_recording;
+        self
+    }
+
+    fn memory_fabric(&self) -> Option<MemoryFabric> {
+        self.memory.as_ref().map(|memory| {
+            MemoryFabric::new(memory.clone(), self.security.workspace_dir.to_string_lossy())
+                .with_event_recording(self.event_recording)
+        })
     }
 
     fn require_write_access(&self) -> Option<ToolResult> {
@@ -37,6 +72,22 @@ impl NodesTool {
         }
 
         None
+    }
+
+    fn authorize_resource_operation(
+        &self,
+        operation_name: &str,
+        risk: ResourceRiskLevel,
+        approval_grant: Option<&ApprovalGrant>,
+    ) -> Option<ToolResult> {
+        SideEffectGate::new(self.security.as_ref())
+            .authorize_resource_operation(self.name(), operation_name, risk, approval_grant)
+            .err()
+            .map(|error| ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            })
     }
 
     fn load_nodes(&self) -> Vec<RemoteNodeConfig> {
@@ -86,6 +137,87 @@ impl NodesTool {
         args.get(key)
             .map(|value| value.as_bool().ok_or_else(|| anyhow!("'{key}' must be a boolean")))
             .transpose()
+    }
+
+    fn lineage_from_trusted_scope(args: &Value) -> NodeLineage {
+        let trusted = args.get("_zc_scope_trusted").and_then(Value::as_bool).unwrap_or(false);
+        if !trusted {
+            return NodeLineage::default();
+        }
+        let Some(scope) = args.get("_zc_scope").and_then(Value::as_object) else {
+            return NodeLineage::default();
+        };
+        NodeLineage {
+            owner_id: scope
+                .get("owner_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            topic_id: scope
+                .get("topic_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            parent_task_id: scope
+                .get("task_id")
+                .or_else(|| scope.get("parent_task_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            source_message_event_id: scope
+                .get("message_event_id")
+                .or_else(|| scope.get("source_message_event_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        }
+    }
+
+    async fn record_remote_task_event(
+        &self,
+        node_id: &str,
+        task_id: &str,
+        event_type: &str,
+        lineage: &NodeLineage,
+        detail: Value,
+    ) {
+        let Some(fabric) = self.memory_fabric() else {
+            return;
+        };
+        let mut scope = MessageEventScope::new("nodes", crate::memory::MemoryVisibility::Workspace)
+            .with_session_key(format!("nodes:{node_id}"))
+            .with_run_id(task_id.to_string());
+        if let Some(owner_id) = lineage.owner_id.as_deref() {
+            scope = scope.with_owner_id(owner_id);
+        }
+        if let Some(parent_task_id) = lineage.parent_task_id.as_deref() {
+            scope = scope.with_parent_run_id(parent_task_id);
+        }
+        let subject_id = format!("{node_id}:{task_id}");
+        let payload = json!({
+            "node_id": node_id,
+            "task_id": task_id,
+            "owner_id": lineage.owner_id,
+            "topic_id": lineage.topic_id,
+            "parent_task_id": lineage.parent_task_id,
+            "source_message_event_id": lineage.source_message_event_id,
+            "detail": detail
+        });
+        if let Err(error) = fabric
+            .record_task_event(scope, subject_id, event_type.to_string(), Some(payload.to_string()))
+            .await
+        {
+            tracing::warn!(
+                node_id,
+                task_id,
+                event_type,
+                "failed to record remote node task event: {error}"
+            );
+        }
     }
 }
 
@@ -159,10 +291,16 @@ impl Tool for NodesTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = Self::require_string_arg(&args, "action")?;
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
         let nodes = self.load_nodes();
 
         match action {
             "list" => {
+                if let Some(blocked) =
+                    self.authorize_resource_operation("nodes:list", ResourceRiskLevel::Low, approval_grant.as_ref())
+                {
+                    return Ok(blocked);
+                }
                 let items: Vec<Value> = nodes
                     .iter()
                     .map(|node| {
@@ -215,16 +353,47 @@ impl Tool for NodesTool {
 
                 let node_id = Self::require_string_arg(&args, "node")?;
                 let command = Self::require_string_arg(&args, "command")?;
+                let operation_name = format!("nodes:exec:{node_id}");
+                if let Some(blocked) =
+                    self.authorize_resource_operation(&operation_name, ResourceRiskLevel::High, approval_grant.as_ref())
+                {
+                    return Ok(blocked);
+                }
                 let timeout_ms = Self::optional_u64_arg(&args, "timeout_ms")?;
                 let cwd = args.get("cwd").and_then(Value::as_str);
+                let lineage = Self::lineage_from_trusted_scope(&args);
 
                 let node = Self::resolve_node(&nodes, node_id)
                     .ok_or_else(|| anyhow!("node '{node_id}' not found or disabled"))?;
                 let client = self.make_client(node)?;
                 let result = client.exec_shell(command, timeout_ms, cwd).await?;
+                let success = !result.timed_out && !result.cancelled;
+                let event_type = if success {
+                    "remote_node.task.completed"
+                } else {
+                    "remote_node.task.failed"
+                };
+                self.record_remote_task_event(
+                    node_id,
+                    &result.task_id,
+                    event_type,
+                    &lineage,
+                    json!({
+                        "operation": "nodes.exec",
+                        "command": command,
+                        "timeout_ms": timeout_ms,
+                        "cwd": cwd,
+                        "exit_code": result.exit_code,
+                        "timed_out": result.timed_out,
+                        "cancelled": result.cancelled,
+                        "stdout_preview": result.stdout.chars().take(500).collect::<String>(),
+                        "stderr_preview": result.stderr.chars().take(500).collect::<String>()
+                    }),
+                )
+                .await;
 
                 Ok(ToolResult {
-                    success: !result.timed_out && !result.cancelled,
+                    success,
                     output: serde_json::to_string_pretty(&result)?,
                     error: None,
                 })
@@ -254,6 +423,12 @@ impl Tool for NodesTool {
                 let node_id = Self::require_string_arg(&args, "node")?;
                 let path = Self::require_string_arg(&args, "path")?;
                 let content = Self::require_string_arg(&args, "content")?;
+                let operation_name = format!("nodes:write:{node_id}");
+                if let Some(blocked) =
+                    self.authorize_resource_operation(&operation_name, ResourceRiskLevel::High, approval_grant.as_ref())
+                {
+                    return Ok(blocked);
+                }
                 let create_dirs = Self::optional_bool_arg(&args, "create_dirs")?.unwrap_or(false);
 
                 let node = Self::resolve_node(&nodes, node_id)
@@ -274,11 +449,28 @@ impl Tool for NodesTool {
 
                 let node_id = Self::require_string_arg(&args, "node")?;
                 let task_id = Self::require_string_arg(&args, "task_id")?;
+                let operation_name = format!("nodes:cancel:{node_id}:{task_id}");
+                if let Some(blocked) = self.authorize_resource_operation(
+                    &operation_name,
+                    ResourceRiskLevel::Medium,
+                    approval_grant.as_ref(),
+                ) {
+                    return Ok(blocked);
+                }
+                let lineage = Self::lineage_from_trusted_scope(&args);
 
                 let node = Self::resolve_node(&nodes, node_id)
                     .ok_or_else(|| anyhow!("node '{node_id}' not found or disabled"))?;
                 let client = self.make_client(node)?;
                 client.cancel(task_id).await?;
+                self.record_remote_task_event(
+                    node_id,
+                    task_id,
+                    "remote_node.task.cancel_requested",
+                    &lineage,
+                    json!({ "operation": "nodes.cancel" }),
+                )
+                .await;
 
                 Ok(ToolResult {
                     success: true,
@@ -309,7 +501,9 @@ impl Tool for NodesTool {
 mod tests {
     use super::*;
     use crate::config::{Config, RemoteNodeConfig, new_shared};
+    use crate::memory::{MemoryPrincipal, SqliteMemory};
     use crate::security::AutonomyLevel;
+    use tempfile::TempDir;
 
     fn make_tool() -> NodesTool {
         let config = new_shared(Config::default());
@@ -324,6 +518,7 @@ mod tests {
             autonomy: level,
             max_actions_per_hour: 1000,
             workspace_dir: std::env::temp_dir(),
+            block_high_risk_commands: false,
             ..SecurityPolicy::default()
         });
         NodesTool::new(new_shared(config), security)
@@ -508,6 +703,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervised_exec_requires_matching_runtime_grant() {
+        let tool = make_tool_with_nodes(vec![test_node("n1")], AutonomyLevel::Supervised);
+        let result = tool
+            .execute(json!({"action": "exec", "node": "n1", "command": "ls"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("runtime approval grant"));
+    }
+
+    #[tokio::test]
+    async fn nodes_list_passes_low_risk_gate_without_grant() {
+        let tool = make_tool_with_nodes(vec![test_node("n1")], AutonomyLevel::Supervised);
+        let result = tool.execute(json!({"action": "list"})).await.unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("\"n1\""));
+    }
+
+    #[tokio::test]
     async fn readonly_blocks_write() {
         let tool = make_tool_with_nodes(vec![test_node("n1")], AutonomyLevel::ReadOnly);
         let result = tool
@@ -525,6 +741,59 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn record_remote_task_event_persists_owner_lineage() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            max_actions_per_hour: 1000,
+            ..SecurityPolicy::default()
+        });
+        let tool = NodesTool::new(new_shared(config), security).with_shared_memory(memory.clone());
+        let lineage = NodeLineage {
+            owner_id: Some("owner-a".to_string()),
+            topic_id: Some("topic-a".to_string()),
+            parent_task_id: Some("parent-a".to_string()),
+            source_message_event_id: Some("msg-a".to_string()),
+        };
+
+        tool.record_remote_task_event(
+            "node-a",
+            "task-a",
+            "remote_node.task.completed",
+            &lineage,
+            json!({ "operation": "nodes.exec" }),
+        )
+        .await;
+
+        let events = memory
+            .list_memory_events_since(
+                &MemoryPrincipal {
+                    workspace_id: tmp.path().to_string_lossy().to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("nodes:node-a".to_string()),
+                    channel: None,
+                    sender: None,
+                    owner_id: None,
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "remote_node.task.completed");
+        assert_eq!(events[0].subject_table, "tasks");
+        assert_eq!(events[0].subject_id, "node-a:task-a");
+        let payload = events[0].payload_json.as_deref().unwrap_or_default();
+        assert!(payload.contains("\"source_message_event_id\":\"msg-a\""));
+        assert!(payload.contains("\"operation\":\"nodes.exec\""));
     }
 
     // ── Unknown action ──────────────────────────────────────────

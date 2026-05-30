@@ -497,6 +497,10 @@ mod tests {
     fn heartbeat_job_detection_supports_name_command_and_prompt() {
         let mk = |name: Option<&str>, command: &str, prompt: Option<&str>| cron::CronJob {
             id: "id".into(),
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             expression: "* * * * *".into(),
             schedule: cron::Schedule::Every { every_ms: 1000 },
             command: command.into(),
@@ -513,6 +517,7 @@ mod tests {
             last_run: None,
             last_status: None,
             last_output: None,
+            approval_grant_json: None,
         };
 
         assert!(is_heartbeat_job(&mk(Some("daily-heartbeat"), "echo ok", None)));

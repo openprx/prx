@@ -8,6 +8,7 @@
 
 use crate::config::Config;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ApprovalGrant;
 use crate::xin::builtin::BuiltinRegistry;
 use crate::xin::store;
 use crate::xin::types::{ExecutionMode, XinTask, XinTickSummary};
@@ -268,11 +269,13 @@ async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -
         return (false, "blocked by security policy: rate limit exceeded".into());
     }
 
-    if !security.is_command_allowed(&task.payload) {
-        return (
-            false,
-            format!("blocked by security policy: command not allowed: {}", task.payload),
-        );
+    let approval_grant = persisted_task_approval_grant(task);
+    if let Err(reason) = crate::security::SideEffectGate::new(security).authorize_command_execution(
+        "xin_runner",
+        &task.payload,
+        approval_grant.as_ref(),
+    ) {
+        return (false, format!("blocked by security policy: {reason}"));
     }
 
     if !security.record_action() {
@@ -308,6 +311,12 @@ async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -
         Ok(Err(e)) => (false, format!("spawn error: {e}")),
         Err(_) => (false, format!("task timed out after {SHELL_TIMEOUT_SECS}s")),
     }
+}
+
+fn persisted_task_approval_grant(task: &XinTask) -> Option<ApprovalGrant> {
+    task.approval_grant_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<ApprovalGrant>(raw).ok())
 }
 
 #[cfg(test)]
@@ -360,6 +369,10 @@ mod tests {
         let config = test_config(&tmp);
 
         let new = NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             name: "shell_test".into(),
             description: None,
             kind: TaskKind::User,
@@ -369,6 +382,7 @@ mod tests {
             recurring: false,
             interval_secs: 0,
             max_failures: 3,
+            approval_grant_json: None,
         };
         let task = store::add_task(&config, &new).unwrap();
 
@@ -385,6 +399,10 @@ mod tests {
         let config = test_config(&tmp);
 
         let new = NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             name: "shell_fail".into(),
             description: None,
             kind: TaskKind::User,
@@ -394,6 +412,7 @@ mod tests {
             recurring: false,
             interval_secs: 0,
             max_failures: 3,
+            approval_grant_json: None,
         };
         let task = store::add_task(&config, &new).unwrap();
 
@@ -404,12 +423,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_shell_task_blocks_medium_risk_without_runtime_grant() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["touch".into()];
+
+        let new = NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
+            name: "shell_medium".into(),
+            description: None,
+            kind: TaskKind::User,
+            priority: TaskPriority::Normal,
+            execution_mode: ExecutionMode::Shell,
+            payload: "touch xin-medium-risk".into(),
+            recurring: false,
+            interval_secs: 0,
+            max_failures: 3,
+            approval_grant_json: None,
+        };
+        let task = store::add_task(&config, &new).unwrap();
+
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let (success, output) = run_shell(&config, &security, &task).await;
+
+        assert!(!success);
+        assert!(output.contains("runtime approval grant"), "{output}");
+        assert!(!config.workspace_dir.join("xin-medium-risk").exists());
+    }
+
+    #[tokio::test]
+    async fn execute_shell_task_allows_medium_risk_with_persisted_runner_grant() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["touch".into()];
+        let command = "touch xin-persisted-approval";
+
+        let new = NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
+            name: "shell_medium_persisted".into(),
+            description: None,
+            kind: TaskKind::User,
+            priority: TaskPriority::Normal,
+            execution_mode: ExecutionMode::Shell,
+            payload: command.into(),
+            recurring: false,
+            interval_secs: 0,
+            max_failures: 3,
+            approval_grant_json: Some(
+                serde_json::to_string(&ApprovalGrant::persisted_for_command(
+                    "xin_runner",
+                    command,
+                    "test",
+                    None,
+                    crate::security::policy::PERSISTED_APPROVAL_GRANT_TTL_SECS,
+                ))
+                .unwrap(),
+            ),
+        };
+        let task = store::add_task(&config, &new).unwrap();
+
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let (success, output) = run_shell(&config, &security, &task).await;
+
+        assert!(success, "{output}");
+        assert!(config.workspace_dir.join("xin-persisted-approval").exists());
+    }
+
+    #[tokio::test]
     async fn execute_internal_health_check() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let registry = BuiltinRegistry::new();
 
         let new = NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             name: "xin:health_check".into(),
             description: None,
             kind: TaskKind::System,
@@ -419,6 +515,7 @@ mod tests {
             recurring: true,
             interval_secs: 300,
             max_failures: 10,
+            approval_grant_json: None,
         };
         let task = store::add_task(&config, &new).unwrap();
 
@@ -434,6 +531,10 @@ mod tests {
         let registry = BuiltinRegistry::new();
 
         let new = NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             name: "xin:stale_cleanup".into(),
             description: None,
             kind: TaskKind::System,
@@ -443,6 +544,7 @@ mod tests {
             recurring: true,
             interval_secs: 1800,
             max_failures: 10,
+            approval_grant_json: None,
         };
         let task = store::add_task(&config, &new).unwrap();
 

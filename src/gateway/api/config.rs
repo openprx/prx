@@ -14,7 +14,12 @@ use tracing::warn;
 /// POST /api/config/reload — hot-reload configuration from config.toml (authenticated).
 pub async fn post_config_reload(State(state): State<AppState>) -> Response {
     use crate::tools::Tool as _;
-    let tool = crate::tools::ConfigReloadTool::new(Arc::clone(&state.shared_config));
+    let config_snapshot = state.config.lock().clone();
+    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+        &config_snapshot.autonomy,
+        &config_snapshot.workspace_dir,
+    ));
+    let tool = crate::tools::ConfigReloadTool::with_security(Arc::clone(&state.shared_config), security);
     match tool.execute(serde_json::json!({})).await {
         Ok(result) if result.success => (
             StatusCode::OK,
@@ -116,6 +121,14 @@ pub async fn post_config(State(state): State<AppState>, Json(incoming): Json<Val
             .into_response();
     }
 
+    if let Err(error) = super::authorize_resource_mutation(
+        &state,
+        "gateway_api:config:update",
+        crate::security::policy::ResourceRiskLevel::Low,
+    ) {
+        return error.into_response();
+    }
+
     // 5. Save to disk (Config::save handles backup + atomic write)
     if let Err(e) = merged_config.save().await {
         warn!("Failed to save config: {e}");
@@ -198,6 +211,14 @@ pub async fn put_config_file(
     Json(payload): Json<UpdateConfigFileRequest>,
 ) -> Response {
     let current = state.config.lock().clone();
+    if let Err(error) = super::authorize_resource_mutation(
+        &state,
+        "gateway_api:config:file_update",
+        crate::security::policy::ResourceRiskLevel::Low,
+    ) {
+        return error.into_response();
+    }
+
     let target_path = match resolve_config_file_path(&current.config_path, &filename) {
         Ok(path) => path,
         Err(error) => {
@@ -406,4 +427,49 @@ fn is_sensitive_key(key: &str) -> bool {
         || key.contains("password")
         || key.contains("secret")
         || key.contains("private_key")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::security::policy::AutonomyLevel;
+
+    #[test]
+    fn config_api_resource_gate_blocks_readonly_mutations() {
+        let config = crate::config::Config {
+            autonomy: crate::config::AutonomyConfig {
+                level: AutonomyLevel::ReadOnly,
+                ..crate::config::AutonomyConfig::default()
+            },
+            ..crate::config::Config::default()
+        };
+
+        let error = super::super::authorize_resource_mutation_for_config(
+            &config,
+            "gateway_api:config:update",
+            crate::security::policy::ResourceRiskLevel::Low,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .1
+                .0
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains("read-only mode")
+        );
+    }
+
+    #[test]
+    fn config_api_resource_gate_allows_supervised_mutations() {
+        let config = crate::config::Config::default();
+        assert!(
+            super::super::authorize_resource_mutation_for_config(
+                &config,
+                "gateway_api:config:update",
+                crate::security::policy::ResourceRiskLevel::Low,
+            )
+            .is_ok()
+        );
+    }
 }

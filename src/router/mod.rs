@@ -27,6 +27,8 @@ use self::intent::infer_router_intent;
 use self::knn::KnnStore;
 pub use self::scorer::RouterResult;
 use self::scorer::rank_models;
+// RouterResult remains the scorer output; RouteDecision is the durable
+// timeline projection used by ingress/provider execution paths.
 
 pub struct RouterEngine {
     config: RouterConfig,

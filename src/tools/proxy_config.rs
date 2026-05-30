@@ -1,6 +1,8 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, ProxyConfig, ProxyScope, SharedConfig, runtime_proxy_config, set_runtime_proxy_config};
 use crate::security::SecurityPolicy;
+use crate::security::SideEffectGate;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::util::MaybeSet;
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -49,6 +51,22 @@ impl ProxyConfigTool {
         }
 
         None
+    }
+
+    fn authorize_resource_operation(
+        &self,
+        operation_name: &str,
+        risk: ResourceRiskLevel,
+        approval_grant: Option<&ApprovalGrant>,
+    ) -> Option<ToolResult> {
+        SideEffectGate::new(self.security.as_ref())
+            .authorize_resource_operation(self.name(), operation_name, risk, approval_grant)
+            .err()
+            .map(|error| ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            })
     }
 
     fn parse_scope(raw: &str) -> Option<ProxyScope> {
@@ -394,12 +412,35 @@ impl Tool for ProxyConfigTool {
             .and_then(Value::as_str)
             .unwrap_or("get")
             .to_ascii_lowercase();
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
 
         let result = match action.as_str() {
-            "get" => self.handle_get(),
+            "get" => {
+                if let Some(blocked) = self.authorize_resource_operation(
+                    "proxy_config:show",
+                    ResourceRiskLevel::Low,
+                    approval_grant.as_ref(),
+                ) {
+                    return Ok(blocked);
+                }
+                self.handle_get()
+            }
             "list_services" => self.handle_list_services(),
             "set" | "disable" | "apply_env" | "clear_env" => {
                 if let Some(blocked) = self.require_write_access() {
+                    return Ok(blocked);
+                }
+
+                let operation_name = match action.as_str() {
+                    "set" | "apply_env" => "proxy_config:set",
+                    "disable" | "clear_env" => "proxy_config:unset",
+                    other => anyhow::bail!("Unknown proxy sub-action '{other}'"),
+                };
+                if let Some(blocked) = self.authorize_resource_operation(
+                    operation_name,
+                    ResourceRiskLevel::Medium,
+                    approval_grant.as_ref(),
+                ) {
                     return Ok(blocked);
                 }
 
@@ -442,6 +483,14 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn supervised_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
@@ -488,6 +537,41 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("proxy.scope='services'"));
+    }
+
+    #[tokio::test]
+    async fn set_requires_runtime_grant_in_supervised_mode() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, supervised_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set",
+                "http_proxy": "http://127.0.0.1:7890"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("runtime approval grant"));
+    }
+
+    #[tokio::test]
+    async fn set_accepts_matching_resource_grant_in_supervised_mode() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, supervised_security());
+        let grant = ApprovalGrant::for_resource_operation("proxy_config", "proxy_config:set", "test", None);
+
+        let result = tool
+            .execute(json!({
+                "action": "set",
+                "http_proxy": "http://127.0.0.1:7890",
+                (crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG): serde_json::to_value(grant).unwrap()
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
     }
 
     #[tokio::test]

@@ -1,7 +1,8 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::SharedConfig;
 use crate::cron::{self, JobType};
-use crate::security::SecurityPolicy;
+use crate::security::policy::ApprovalGrant;
+use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
@@ -33,11 +34,6 @@ impl Tool for CronRunTool {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string" },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
-                }
             },
             "required": ["job_id"]
         })
@@ -63,10 +59,7 @@ impl Tool for CronRunTool {
                 });
             }
         };
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let mut approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
 
         if !self.security.can_act() {
             return Ok(ToolResult {
@@ -94,9 +87,21 @@ impl Tool for CronRunTool {
                 });
             }
         };
+        if approval_grant.is_none()
+            && args
+                .get(crate::security::policy::RUNTIME_APPROVAL_GRANTED_ARG)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            approval_grant = Some(ApprovalGrant::for_command(self.name(), &job.command, "runtime", None));
+        }
 
         if matches!(job.job_type, JobType::Shell) {
-            if let Err(reason) = self.security.validate_command_execution(&job.command, approved) {
+            if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
+                self.name(),
+                &job.command,
+                approval_grant.as_ref(),
+            ) {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -114,7 +119,9 @@ impl Tool for CronRunTool {
         }
 
         let started_at = Utc::now();
-        let (success, output) = cron::scheduler::execute_job_now(&cfg, &job).await;
+        let (success, output) =
+            cron::scheduler::execute_job_now_with_runtime_approval_for_tool(&cfg, &job, self.name(), approval_grant)
+                .await;
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
         let status = if success { "ok" } else { "error" };
@@ -240,10 +247,16 @@ mod tests {
 
         let denied = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(!denied.success);
-        assert!(denied.error.unwrap_or_default().contains("explicit approval"));
+        assert!(denied.error.unwrap_or_default().contains("runtime approval grant"));
+
+        let forged_public_approval = tool
+            .execute(json!({ "job_id": job.id, "approved": true }))
+            .await
+            .unwrap();
+        assert!(!forged_public_approval.success);
 
         let approved = tool
-            .execute(json!({ "job_id": job.id, "approved": true }))
+            .execute(json!({ "job_id": job.id, (crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG): serde_json::to_value(crate::security::policy::ApprovalGrant::for_command("cron_run", "touch cron-run-approval", "test", None)).unwrap() }))
             .await
             .unwrap();
         assert!(approved.success, "{:?}", approved.error);

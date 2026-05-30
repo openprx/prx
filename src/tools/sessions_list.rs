@@ -3,22 +3,45 @@
 //! Wraps the shared active_runs registry from SessionsSpawnTool,
 //! exposing a dedicated tool that aligns with OpenClaw's `sessions_list`.
 
+use super::sessions_read_model::{self, RecoveredTaskRun, RecoveredTaskStatus};
 use super::sessions_spawn::{SubAgentRun, SubAgentStatus};
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
+use crate::memory::Memory;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Tool to list active and recently completed sub-agent sessions.
 pub struct SessionsListTool {
     active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
+    memory: Option<Arc<dyn Memory>>,
+    workspace_id: String,
 }
 
 impl SessionsListTool {
-    pub const fn new(active_runs: Arc<RwLock<Vec<SubAgentRun>>>) -> Self {
-        Self { active_runs }
+    pub fn new(active_runs: Arc<RwLock<Vec<SubAgentRun>>>) -> Self {
+        Self {
+            active_runs,
+            memory: None,
+            workspace_id: String::new(),
+        }
+    }
+
+    pub fn with_shared_memory(mut self, memory: Arc<dyn Memory>, workspace_id: impl Into<String>) -> Self {
+        self.memory = Some(memory);
+        self.workspace_id = workspace_id.into();
+        self
+    }
+
+    fn workspace_id(&self) -> &str {
+        if self.workspace_id.is_empty() {
+            "/tmp"
+        } else {
+            &self.workspace_id
+        }
     }
 }
 
@@ -72,7 +95,21 @@ impl Tool for SessionsListTool {
             .take(limit)
             .collect();
 
-        if filtered.is_empty() {
+        let active_ids = filtered.iter().map(|run| run.id.as_str()).collect::<HashSet<_>>();
+        let remaining = limit.saturating_sub(filtered.len());
+        let recovered = if remaining > 0 {
+            sessions_read_model::recover_task_runs(self.memory.as_ref(), self.workspace_id(), &args, limit)
+                .await?
+                .into_iter()
+                .filter(|run| !active_ids.contains(run.run_id.as_str()))
+                .filter(|run| recovered_matches_filter(run, status_filter))
+                .take(remaining)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        if filtered.is_empty() && recovered.is_empty() {
             return Ok(ToolResult {
                 success: true,
                 output: format!("No sessions found (filter: {status_filter})."),
@@ -80,7 +117,7 @@ impl Tool for SessionsListTool {
             });
         }
 
-        let lines: Vec<String> = filtered
+        let mut lines: Vec<String> = filtered
             .iter()
             .map(|r| {
                 let status = match &r.status {
@@ -97,11 +134,14 @@ impl Tool for SessionsListTool {
             })
             .collect();
 
+        let mut recovered_lines = recovered.iter().map(format_recovered_run).collect::<Vec<_>>();
+        lines.append(&mut recovered_lines);
+
         Ok(ToolResult {
             success: true,
             output: format!(
                 "Sessions ({} shown, filter: {}):\n\n{}",
-                filtered.len(),
+                lines.len(),
                 status_filter,
                 lines.join("\n\n")
             ),
@@ -117,9 +157,45 @@ impl Tool for SessionsListTool {
     }
 }
 
+fn recovered_matches_filter(run: &RecoveredTaskRun, status_filter: &str) -> bool {
+    match status_filter {
+        "running" => matches!(run.status, RecoveredTaskStatus::Running),
+        "completed" => matches!(run.status, RecoveredTaskStatus::Completed),
+        "failed" => matches!(run.status, RecoveredTaskStatus::Failed),
+        _ => true,
+    }
+}
+
+fn format_recovered_run(run: &RecoveredTaskRun) -> String {
+    let status = match run.status {
+        RecoveredTaskStatus::Running => format!("🔄 running (memory: {})", run.last_event_type),
+        RecoveredTaskStatus::Completed => {
+            let detail = run.status_detail.as_deref().unwrap_or("completed");
+            let preview = detail.chars().take(60).collect::<String>();
+            let ellipsis = if detail.len() > 60 { "…" } else { "" };
+            format!("✅ completed (memory): {preview}{ellipsis}")
+        }
+        RecoveredTaskStatus::Failed => {
+            let detail = run.status_detail.as_deref().unwrap_or(run.last_event_type.as_str());
+            format!("❌ failed (memory): {detail}")
+        }
+    };
+    let task = run.task.as_deref().unwrap_or("(task unavailable)");
+    let owner = run
+        .owner_id
+        .as_deref()
+        .map(|owner| format!("\n  owner: {owner}"))
+        .unwrap_or_default();
+    format!(
+        "• `{}` [memory at {}] {status}\n  task: {task}{owner}",
+        run.run_id, run.last_event_at
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{MemoryEventInput, MemoryPrincipal, MemoryVisibility, SqliteMemory};
     use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
     use chrono::Utc;
 
@@ -127,6 +203,9 @@ mod tests {
         SubAgentRun {
             id: id.to_string(),
             task: task.to_string(),
+            owner_id: None,
+            topic_id: None,
+            source_message_event_id: None,
             started_at: Utc::now(),
             status,
             recipient: None,
@@ -181,5 +260,73 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("run1"));
         assert!(!result.output.contains("run2"));
+    }
+
+    #[tokio::test]
+    async fn lists_memory_backed_runs_when_runtime_registry_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        memory
+            .append_memory_event(MemoryEventInput {
+                event_id: None,
+                workspace_id: "/tmp".to_string(),
+                event_type: "task.spawned".to_string(),
+                subject_table: "tasks".to_string(),
+                subject_id: "mem-run-1".to_string(),
+                session_key: Some("test-session".to_string()),
+                agent_id: None,
+                persona_id: None,
+                visibility: MemoryVisibility::Workspace,
+                payload_json: Some(
+                    json!({
+                        "task": "recover me",
+                        "owner_id": "owner-a",
+                        "topic_id": "topic-a"
+                    })
+                    .to_string(),
+                ),
+            })
+            .await
+            .unwrap();
+        memory
+            .append_memory_event(MemoryEventInput {
+                event_id: None,
+                workspace_id: "/tmp".to_string(),
+                event_type: "task.completed".to_string(),
+                subject_table: "tasks".to_string(),
+                subject_id: "mem-run-1".to_string(),
+                session_key: Some("test-session".to_string()),
+                agent_id: None,
+                persona_id: None,
+                visibility: MemoryVisibility::Workspace,
+                payload_json: Some(json!({"result_preview": "done"}).to_string()),
+            })
+            .await
+            .unwrap();
+
+        let tool = SessionsListTool::new(Arc::new(RwLock::new(Vec::new()))).with_shared_memory(memory.clone(), "/tmp");
+        let result = tool.execute(json!({"status": "completed"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("mem-run-1"));
+        assert!(result.output.contains("recover me"));
+        assert!(result.output.contains("owner-a"));
+
+        let visible = memory
+            .list_memory_events_since(
+                &MemoryPrincipal {
+                    workspace_id: "/tmp".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: None,
+                    channel: None,
+                    sender: None,
+                    owner_id: None,
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 2);
     }
 }

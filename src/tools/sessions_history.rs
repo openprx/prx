@@ -5,8 +5,10 @@
 //!
 //! Usage: sessions_history(run_id="...", limit=50)
 
+use super::sessions_read_model::{self, RecoveredRunHistory, RecoveredTaskStatus};
 use super::sessions_spawn::{SubAgentRun, SubAgentStatus};
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
+use crate::memory::Memory;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -17,11 +19,31 @@ const DEFAULT_LIMIT: usize = 50;
 /// Tool that retrieves the conversation history of a spawned sub-agent run.
 pub struct SessionsHistoryTool {
     active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
+    memory: Option<Arc<dyn Memory>>,
+    workspace_id: String,
 }
 
 impl SessionsHistoryTool {
-    pub const fn new(active_runs: Arc<RwLock<Vec<SubAgentRun>>>) -> Self {
-        Self { active_runs }
+    pub fn new(active_runs: Arc<RwLock<Vec<SubAgentRun>>>) -> Self {
+        Self {
+            active_runs,
+            memory: None,
+            workspace_id: String::new(),
+        }
+    }
+
+    pub fn with_shared_memory(mut self, memory: Arc<dyn Memory>, workspace_id: impl Into<String>) -> Self {
+        self.memory = Some(memory);
+        self.workspace_id = workspace_id.into();
+        self
+    }
+
+    fn workspace_id(&self) -> &str {
+        if self.workspace_id.is_empty() {
+            "/tmp"
+        } else {
+            &self.workspace_id
+        }
     }
 }
 
@@ -76,6 +98,22 @@ impl Tool for SessionsHistoryTool {
 
         let runs = self.active_runs.read().await;
         let Some(run) = runs.iter().find(|r| r.id == run_id) else {
+            drop(runs);
+            if let Some(history) = sessions_read_model::recover_run_history(
+                self.memory.as_ref(),
+                self.workspace_id(),
+                &args,
+                run_id,
+                limit,
+            )
+            .await?
+            {
+                return Ok(ToolResult {
+                    success: true,
+                    output: format_recovered_history(run_id, &history, limit),
+                    error: None,
+                });
+            }
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -135,9 +173,53 @@ impl Tool for SessionsHistoryTool {
     }
 }
 
+fn format_recovered_history(run_id: &str, history: &RecoveredRunHistory, limit: usize) -> String {
+    if !history.messages.is_empty() {
+        let total = history.messages.len();
+        let lines = history
+            .messages
+            .iter()
+            .take(limit)
+            .map(|event| {
+                let preview: String = event.content.chars().take(200).collect();
+                let ellipsis = if event.content.len() > 200 { "…" } else { "" };
+                format!(
+                    "[{}] **{}** {}: {}{}",
+                    event.created_at, event.role, event.source, preview, ellipsis
+                )
+            })
+            .collect::<Vec<_>>();
+        return format!(
+            "Recovered conversation history for sub-agent `{run_id}` from memory ({total} entries):\n\n{}",
+            lines.join("\n\n")
+        );
+    }
+
+    let status = match history.run.status {
+        RecoveredTaskStatus::Running => "running",
+        RecoveredTaskStatus::Completed => "completed",
+        RecoveredTaskStatus::Failed => "failed",
+    };
+    let task = history.run.task.as_deref().unwrap_or("(task unavailable)");
+    let detail = history
+        .run
+        .status_detail
+        .as_deref()
+        .unwrap_or(history.run.last_event_type.as_str());
+    format!(
+        "Recovered task ledger for `{run_id}` from memory:\n\n\
+         status: {status}\n\
+         task: {task}\n\
+         last_event: {} at {}\n\
+         detail: {detail}",
+        history.run.last_event_type, history.run.last_event_at
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{MemoryEventInput, MemoryFabric, MemoryVisibility, MessageEventScope, SqliteMemory};
     use crate::tools::sessions_spawn::{HistoryEntry, SubAgentRun, SubAgentStatus};
     use chrono::Utc;
 
@@ -145,6 +227,9 @@ mod tests {
         SubAgentRun {
             id: id.to_string(),
             task: "test task".to_string(),
+            owner_id: None,
+            topic_id: None,
+            source_message_event_id: None,
             started_at: Utc::now(),
             status,
             recipient: None,
@@ -229,5 +314,60 @@ mod tests {
         let result = tool.execute(json!({"run_id": "run-3", "limit": 5})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("showing 5/20"));
+    }
+
+    #[tokio::test]
+    async fn recovers_history_from_memory_when_runtime_registry_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), "/tmp");
+        let scope = MessageEventScope::new("sessions_spawn", MemoryVisibility::Workspace)
+            .with_session_key("test-session")
+            .with_run_id("mem-run-1");
+        fabric
+            .record_inbound_user_message(scope.clone(), "do durable work", None, None)
+            .await
+            .unwrap();
+        fabric
+            .record_worker_result(scope.clone(), "durable result", None)
+            .await
+            .unwrap();
+        memory
+            .append_memory_event(MemoryEventInput {
+                event_id: None,
+                workspace_id: "/tmp".to_string(),
+                event_type: "task.spawned".to_string(),
+                subject_table: "tasks".to_string(),
+                subject_id: "mem-run-1".to_string(),
+                session_key: Some("test-session".to_string()),
+                agent_id: None,
+                persona_id: None,
+                visibility: MemoryVisibility::Workspace,
+                payload_json: Some(json!({"task": "do durable work"}).to_string()),
+            })
+            .await
+            .unwrap();
+        memory
+            .append_memory_event(MemoryEventInput {
+                event_id: None,
+                workspace_id: "/tmp".to_string(),
+                event_type: "task.completed".to_string(),
+                subject_table: "tasks".to_string(),
+                subject_id: "mem-run-1".to_string(),
+                session_key: Some("test-session".to_string()),
+                agent_id: None,
+                persona_id: None,
+                visibility: MemoryVisibility::Workspace,
+                payload_json: Some(json!({"result_preview": "durable result"}).to_string()),
+            })
+            .await
+            .unwrap();
+
+        let tool = SessionsHistoryTool::new(Arc::new(RwLock::new(Vec::new()))).with_shared_memory(memory, "/tmp");
+        let result = tool.execute(json!({"run_id": "mem-run-1"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Recovered conversation history"));
+        assert!(result.output.contains("do durable work"));
+        assert!(result.output.contains("durable result"));
     }
 }

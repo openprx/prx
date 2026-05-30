@@ -5,6 +5,18 @@ use crate::memory::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+pub fn fail_fast(backend: &str, method: &str) -> anyhow::Error {
+    anyhow::anyhow!("memory backend {backend} does not implement fabric::{method} (fail_fast)")
+}
+
+pub fn fail_fast_result<T>(backend: &str, method: &str) -> anyhow::Result<T> {
+    return Err(fail_fast(backend, method));
+}
+
+pub fn fail_fast_optional<T>(backend: &str, method: &str) -> anyhow::Result<Option<T>> {
+    return Err(fail_fast(backend, method));
+}
+
 /// Shared memory fabric facade used by ingress points to record normalized
 /// runtime events without depending on backend-specific details.
 #[derive(Clone)]
@@ -46,6 +58,7 @@ pub struct MemoryEventWatcher {
 #[derive(Debug, Clone)]
 pub struct MessageEventScope {
     pub source: String,
+    pub owner_id: Option<String>,
     pub channel: Option<String>,
     pub session_key: Option<String>,
     pub parent_session_key: Option<String>,
@@ -63,6 +76,7 @@ impl MessageEventScope {
     pub fn new(source: impl Into<String>, visibility: MemoryVisibility) -> Self {
         Self {
             source: source.into(),
+            owner_id: None,
             channel: None,
             session_key: None,
             parent_session_key: None,
@@ -79,6 +93,12 @@ impl MessageEventScope {
     #[must_use]
     pub fn with_channel(mut self, channel: impl Into<String>) -> Self {
         self.channel = Some(channel.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_owner_id(mut self, owner_id: impl Into<String>) -> Self {
+        self.owner_id = Some(owner_id.into());
         self
     }
 
@@ -190,6 +210,66 @@ impl MemoryFabric {
             .await
     }
 
+    /// Append structured runtime timeline events such as RouteDecision and
+    /// ProviderExecutionOutcome records into the shared message fabric.
+    pub async fn record_runtime_event(
+        &self,
+        scope: MessageEventScope,
+        event_type: &str,
+        content: impl Into<String>,
+        raw_payload_json: Option<String>,
+    ) -> anyhow::Result<MessageEvent> {
+        let payload = raw_payload_json.map_or_else(
+            || Some(serde_json::json!({ "event_type": event_type }).to_string()),
+            Some,
+        );
+        let content = format!("{} {}", event_type, content.into());
+        self.record_message_event(scope, "event", content, None, payload).await
+    }
+
+    pub async fn record_task_event(
+        &self,
+        scope: MessageEventScope,
+        task_id: impl Into<String>,
+        event_type: impl Into<String>,
+        payload_json: Option<String>,
+    ) -> anyhow::Result<MemoryEvent> {
+        self.memory
+            .append_memory_event(MemoryEventInput {
+                event_id: None,
+                workspace_id: self.workspace_id.clone(),
+                event_type: event_type.into(),
+                subject_table: "tasks".to_string(),
+                subject_id: task_id.into(),
+                session_key: scope.session_key,
+                agent_id: scope.agent_id,
+                persona_id: scope.persona_id,
+                visibility: scope.visibility,
+                payload_json,
+            })
+            .await
+    }
+
+    pub async fn record_xin_task_event(
+        &self,
+        scope: MessageEventScope,
+        task_id: impl Into<String>,
+        event_type: impl Into<String>,
+        payload_json: Option<String>,
+    ) -> anyhow::Result<MemoryEvent> {
+        self.record_task_event(scope, task_id, event_type, payload_json).await
+    }
+
+    pub async fn record_cron_job_event(
+        &self,
+        scope: MessageEventScope,
+        job_id: impl Into<String>,
+        event_type: impl Into<String>,
+        payload_json: Option<String>,
+    ) -> anyhow::Result<MemoryEvent> {
+        self.record_task_event(scope, job_id, event_type, payload_json).await
+    }
+
     pub async fn record_semantic_memory(
         &self,
         key: &str,
@@ -220,6 +300,7 @@ impl MemoryFabric {
                 session_id,
                 MemoryStoreMetadata {
                     workspace_id: Some(self.workspace_id.clone()),
+                    owner_id: None,
                     agent_id: agent_id.map(str::to_string),
                     persona_id: persona_id.map(str::to_string),
                     source_event_id: source_event_id.map(str::to_string),
@@ -266,6 +347,7 @@ impl MemoryFabric {
             .create_memory_draft(MemoryDraftInput {
                 draft_id: None,
                 workspace_id: self.workspace_id.clone(),
+                owner_id: scope.owner_id.clone(),
                 worker_run_id: worker_run_id.to_string(),
                 parent_run_id: scope.parent_run_id.clone(),
                 session_key: scope.session_key.clone(),
@@ -300,6 +382,7 @@ impl MemoryFabric {
                 payload_json: Some(
                     serde_json::json!({
                         "draft_id": draft.draft_id,
+                        "owner_id": draft.owner_id,
                         "worker_run_id": draft.worker_run_id,
                         "parent_run_id": draft.parent_run_id,
                         "key": draft.key,
@@ -330,6 +413,14 @@ impl MemoryFabric {
         limit: usize,
     ) -> anyhow::Result<Vec<MemoryEvent>> {
         self.memory.list_memory_events_since(principal, after_id, limit).await
+    }
+
+    pub async fn poll_recent_memory_events(
+        &self,
+        principal: &MemoryPrincipal,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEvent>> {
+        self.memory.list_memory_events_recent(principal, limit).await
     }
 
     #[must_use]
@@ -364,6 +455,7 @@ impl MemoryFabric {
                 event_id: None,
                 idempotency_key,
                 workspace_id: self.workspace_id.clone(),
+                owner_id: scope.owner_id,
                 source: scope.source,
                 channel: scope.channel,
                 session_key: scope.session_key,
@@ -409,6 +501,7 @@ impl MemoryFabric {
             event_id: uuid::Uuid::new_v4().to_string(),
             idempotency_key,
             workspace_id: self.workspace_id.clone(),
+            owner_id: scope.owner_id,
             source: scope.source,
             channel: scope.channel,
             session_key: scope.session_key,
@@ -463,6 +556,7 @@ mod tests {
         let event = fabric
             .record_inbound_user_message(
                 MessageEventScope::new("chat", MemoryVisibility::Workspace)
+                    .with_owner_id("owner:workspace-a:terminal:local-user")
                     .with_channel("terminal")
                     .with_session_key("chat:1")
                     .with_sender("local-user"),
@@ -474,6 +568,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(event.workspace_id, "workspace-a");
+        assert_eq!(event.owner_id.as_deref(), Some("owner:workspace-a:terminal:local-user"));
         assert_eq!(event.source, "chat");
         assert_eq!(event.role, "user");
         assert_eq!(event.content, "hello fabric");
@@ -487,6 +582,7 @@ mod tests {
                     session_key: Some("chat:1".to_string()),
                     channel: Some("terminal".to_string()),
                     sender: Some("local-user".to_string()),
+                    owner_id: None,
                 },
                 0,
                 10,
@@ -497,6 +593,10 @@ mod tests {
         assert_eq!(
             visible.first().map(|event| event.content.as_str()),
             Some("hello fabric")
+        );
+        assert_eq!(
+            visible.first().and_then(|event| event.owner_id.as_deref()),
+            Some("owner:workspace-a:terminal:local-user")
         );
     }
 
@@ -523,6 +623,7 @@ mod tests {
                     session_key: None,
                     channel: None,
                     sender: None,
+                    owner_id: None,
                 },
                 0,
                 10,
@@ -565,6 +666,7 @@ mod tests {
                     session_key: Some("chat:1".to_string()),
                     channel: None,
                     sender: None,
+                    owner_id: None,
                 },
                 0,
                 10,
@@ -623,6 +725,7 @@ mod tests {
                     session_key: Some("session-a".to_string()),
                     channel: None,
                     sender: None,
+                    owner_id: None,
                 },
                 0,
                 10,
@@ -656,6 +759,7 @@ mod tests {
             session_key: Some("chat:1".to_string()),
             channel: Some("terminal".to_string()),
             sender: Some("local-user".to_string()),
+            owner_id: None,
         };
         let mut watcher = fabric.watch_memory_events(principal, 0, 10);
 
@@ -719,6 +823,7 @@ mod tests {
                     session_key: Some("chat:1".to_string()),
                     channel: Some("terminal".to_string()),
                     sender: None,
+                    owner_id: None,
                 },
                 0,
                 10,

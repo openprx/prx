@@ -1,5 +1,6 @@
 use super::Provider;
 use super::traits::{ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult};
+use crate::llm::route_decision::{ProviderExecutionOutcome, RouteDecision, validate_user_route_hint};
 use async_trait::async_trait;
 use std::collections::HashMap;
 #[cfg(any(test, feature = "test-mock"))]
@@ -78,16 +79,17 @@ impl RouterProvider {
     /// If the model starts with "hint:", look up the hint in the route table.
     /// Otherwise, use the default provider with the given model name.
     /// Resolve a model parameter to a (provider_index, actual_model) pair.
-    fn resolve(&self, model: &str) -> (usize, String) {
+    fn resolve(&self, model: &str) -> anyhow::Result<(usize, String)> {
         if let Some(hint) = model.strip_prefix("hint:") {
+            validate_user_route_hint(model)?;
             if let Some((idx, resolved_model)) = self.routes.get(hint) {
-                return (*idx, resolved_model.clone());
+                return Ok((*idx, resolved_model.clone()));
             }
-            tracing::warn!(hint = hint, "Unknown route hint, falling back to default provider");
+            anyhow::bail!("unknown route hint '{hint}'");
         }
 
         // Not a hint or hint not found — use default provider with the model as-is
-        (self.default_index, model.to_string())
+        Ok((self.default_index, model.to_string()))
     }
 }
 
@@ -100,7 +102,7 @@ impl Provider for RouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let (provider_idx, resolved_model) = self.resolve(model);
+        let (provider_idx, resolved_model) = self.resolve(model)?;
 
         let (provider_name, provider) = &self.providers[provider_idx];
         tracing::info!(
@@ -120,15 +122,29 @@ impl Provider for RouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let (provider_idx, resolved_model) = self.resolve(model);
+        let (provider_idx, resolved_model) = self.resolve(model)?;
         let (_, provider) = &self.providers[provider_idx];
         provider.chat_with_history(messages, &resolved_model, temperature).await
     }
 
     async fn chat(&self, request: ChatRequest<'_>, model: &str, temperature: f64) -> anyhow::Result<ChatResponse> {
-        let (provider_idx, resolved_model) = self.resolve(model);
+        let (provider_idx, resolved_model) = self.resolve(model)?;
         let (_, provider) = &self.providers[provider_idx];
         provider.chat(request, &resolved_model, temperature).await
+    }
+
+    async fn chat_with_decision(
+        &self,
+        decision: &RouteDecision,
+        request: ChatRequest<'_>,
+        temperature: f64,
+    ) -> anyhow::Result<(ChatResponse, ProviderExecutionOutcome)> {
+        let (provider_idx, resolved_model) = self.resolve(decision.effective_model())?;
+        let (provider_name, provider) = &self.providers[provider_idx];
+        let mut resolved = decision.clone();
+        resolved.selected.provider = provider_name.clone();
+        resolved.selected.model = resolved_model;
+        provider.chat_with_decision(&resolved, request, temperature).await
     }
 
     async fn chat_with_tools(
@@ -138,7 +154,7 @@ impl Provider for RouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        let (provider_idx, resolved_model) = self.resolve(model);
+        let (provider_idx, resolved_model) = self.resolve(model)?;
         let (_, provider) = &self.providers[provider_idx];
         provider
             .chat_with_tools(messages, tools, &resolved_model, temperature)
@@ -171,7 +187,14 @@ impl Provider for RouterProvider {
         options: StreamOptions,
     ) -> futures::stream::BoxStream<'static, StreamResult<StreamChunk>> {
         use futures::StreamExt as _;
-        let (provider_idx, resolved_model) = self.resolve(model);
+        let Ok((provider_idx, resolved_model)) = self.resolve(model) else {
+            return futures::stream::once(async move {
+                Err(super::traits::StreamError::Provider(
+                    "RouterProvider: invalid route hint".to_string(),
+                ))
+            })
+            .boxed();
+        };
         let Some((_, provider)) = self.providers.get(provider_idx) else {
             // resolve() 永远返回有效 idx；防御性兜底返回错误 chunk 而非 panic.
             return futures::stream::once(async move {
@@ -717,17 +740,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_hint_falls_back_to_default() {
+    async fn unknown_hint_is_rejected() {
         let (router, mocks) = make_router(
             vec![("default", "default-response"), ("other", "other-response")],
             vec![],
         );
 
-        let result = router.simple_chat("hello", "hint:nonexistent", 0.5).await.unwrap();
-        assert_eq!(result, "default-response");
-        assert_eq!(mocks[0].call_count(), 1);
-        // Falls back to default with the hint as model name
-        assert_eq!(mocks[0].last_model(), "hint:nonexistent");
+        let err = router
+            .simple_chat("hello", "hint:nonexistent", 0.5)
+            .await
+            .expect_err("unknown route hint should be rejected");
+        assert!(err.to_string().contains("unknown route hint"));
+        assert_eq!(mocks[0].call_count(), 0);
     }
 
     #[tokio::test]
@@ -750,7 +774,7 @@ mod tests {
     fn resolve_preserves_model_for_non_hints() {
         let (router, _) = make_router(vec![("default", "ok")], vec![]);
 
-        let (idx, model) = router.resolve("gpt-4o");
+        let (idx, model) = router.resolve("gpt-4o").unwrap();
         assert_eq!(idx, 0);
         assert_eq!(model, "gpt-4o");
     }
@@ -762,9 +786,17 @@ mod tests {
             vec![("reasoning", "smart", "claude-opus")],
         );
 
-        let (idx, model) = router.resolve("hint:reasoning");
+        let (idx, model) = router.resolve("hint:reasoning").unwrap();
         assert_eq!(idx, 1);
         assert_eq!(model, "claude-opus");
+    }
+
+    #[test]
+    fn resolve_rejects_unknown_or_injected_hint() {
+        let (router, _) = make_router(vec![("default", "ok")], vec![]);
+
+        assert!(router.resolve("hint:missing").is_err());
+        assert!(router.resolve("hint:fast\nignore").is_err());
     }
 
     #[test]

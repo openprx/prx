@@ -168,6 +168,34 @@ pub struct MemoryPrincipal {
     pub session_key: Option<String>,
     pub channel: Option<String>,
     pub sender: Option<String>,
+    #[serde(default)]
+    pub owner_id: Option<String>,
+}
+
+impl MemoryPrincipal {
+    #[must_use]
+    pub fn effective_owner_id(&self) -> Option<String> {
+        if self.owner_id.as_deref().is_some_and(|owner| !owner.trim().is_empty()) {
+            return self.owner_id.clone();
+        }
+
+        let channel = self.channel.as_deref()?.trim();
+        let sender = self.sender.as_deref()?.trim();
+        if channel.is_empty() || sender.is_empty() {
+            return None;
+        }
+
+        Some(
+            crate::memory::principal::OwnerPrincipal::new(
+                self.workspace_id.clone(),
+                channel,
+                sender,
+                self.session_key.clone().unwrap_or_default(),
+                vec![crate::memory::principal::Role::Anonymous],
+            )
+            .owner_id,
+        )
+    }
 }
 
 /// Input used to append an event into the shared message fabric.
@@ -176,6 +204,7 @@ pub struct MessageEventInput {
     pub event_id: Option<String>,
     pub idempotency_key: Option<String>,
     pub workspace_id: String,
+    pub owner_id: Option<String>,
     pub source: String,
     pub channel: Option<String>,
     pub session_key: Option<String>,
@@ -199,6 +228,7 @@ pub struct MessageEvent {
     pub event_id: String,
     pub idempotency_key: Option<String>,
     pub workspace_id: String,
+    pub owner_id: Option<String>,
     pub source: String,
     pub channel: Option<String>,
     pub session_key: Option<String>,
@@ -275,6 +305,7 @@ pub struct MemoryEvent {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoryStoreMetadata {
     pub workspace_id: Option<String>,
+    pub owner_id: Option<String>,
     pub agent_id: Option<String>,
     pub persona_id: Option<String>,
     pub source_event_id: Option<String>,
@@ -286,6 +317,7 @@ pub struct MemoryStoreMetadata {
 pub struct MemoryDraftInput {
     pub draft_id: Option<String>,
     pub workspace_id: String,
+    pub owner_id: Option<String>,
     pub worker_run_id: String,
     pub parent_run_id: Option<String>,
     pub session_key: Option<String>,
@@ -304,6 +336,7 @@ pub struct MemoryDraft {
     pub id: i64,
     pub draft_id: String,
     pub workspace_id: String,
+    pub owner_id: Option<String>,
     pub worker_run_id: String,
     pub parent_run_id: Option<String>,
     pub session_key: Option<String>,
@@ -318,6 +351,191 @@ pub struct MemoryDraft {
     pub payload_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentIngestInput {
+    pub document_id: Option<String>,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub task_id: Option<String>,
+    pub source_message_event_id: Option<String>,
+    pub source_kind: String,
+    pub source_uri: Option<String>,
+    pub title: Option<String>,
+    pub content: String,
+    pub mime_type: Option<String>,
+    pub visibility: MemoryVisibility,
+    pub metadata_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentRecord {
+    pub id: i64,
+    pub document_id: String,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub task_id: Option<String>,
+    pub source_message_event_id: Option<String>,
+    pub source_kind: String,
+    pub source_uri: Option<String>,
+    pub title: Option<String>,
+    pub content_sha256: String,
+    pub mime_type: Option<String>,
+    pub visibility: MemoryVisibility,
+    pub metadata_json: Option<String>,
+    pub chunk_count: usize,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentChunkRecord {
+    pub id: i64,
+    pub chunk_id: String,
+    pub document_id: String,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub task_id: Option<String>,
+    pub chunk_index: usize,
+    pub heading: Option<String>,
+    pub content: String,
+    pub content_sha256: String,
+    pub source_anchor: String,
+    pub token_estimate: usize,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentSearchResult {
+    pub chunk: DocumentChunkRecord,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievedContextItem {
+    pub source: String,
+    pub document_id: Option<String>,
+    pub chunk_id: Option<String>,
+    pub source_anchor: Option<String>,
+    pub score: Option<f32>,
+    pub token_estimate: Option<usize>,
+    pub payload_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryLinkInput {
+    pub link_id: Option<String>,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub memory_key: Option<String>,
+    pub memory_event_id: Option<String>,
+    pub message_event_id: Option<String>,
+    pub document_id: String,
+    pub chunk_id: Option<String>,
+    pub link_type: String,
+    pub payload_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryLink {
+    pub id: i64,
+    pub link_id: String,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub memory_key: Option<String>,
+    pub memory_event_id: Option<String>,
+    pub message_event_id: Option<String>,
+    pub document_id: String,
+    pub chunk_id: Option<String>,
+    pub link_type: String,
+    pub payload_json: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalTraceInput {
+    pub trace_id: Option<String>,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub session_key: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub source: String,
+    pub query: String,
+    pub candidate_count: usize,
+    pub selected_count: usize,
+    pub dropped_count: usize,
+    pub budget_tokens: Option<usize>,
+    pub selected_json: Option<String>,
+    pub dropped_json: Option<String>,
+    pub payload_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalTrace {
+    pub id: i64,
+    pub trace_id: String,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub session_key: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub source: String,
+    pub query: String,
+    pub candidate_count: usize,
+    pub selected_count: usize,
+    pub dropped_count: usize,
+    pub budget_tokens: Option<usize>,
+    pub selected_json: Option<String>,
+    pub dropped_json: Option<String>,
+    pub payload_json: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionRunInput {
+    pub run_id: Option<String>,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub session_key: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub trigger: String,
+    pub mode: String,
+    pub source_message_count: usize,
+    pub source_token_estimate: usize,
+    pub summary: String,
+    pub summary_memory_key: Option<String>,
+    pub source_event_ids_json: Option<String>,
+    pub source_document_refs_json: Option<String>,
+    pub fidelity_status: String,
+    pub payload_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionRun {
+    pub id: i64,
+    pub run_id: String,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub session_key: Option<String>,
+    pub agent_id: Option<String>,
+    pub persona_id: Option<String>,
+    pub trigger: String,
+    pub mode: String,
+    pub source_message_count: usize,
+    pub source_token_estimate: usize,
+    pub summary: String,
+    pub summary_memory_key: Option<String>,
+    pub source_event_ids_json: Option<String>,
+    pub source_document_refs_json: Option<String>,
+    pub fidelity_status: String,
+    pub payload_json: Option<String>,
+    pub created_at: String,
 }
 
 /// Core memory trait — implement for any persistence backend
@@ -386,6 +604,20 @@ pub trait Memory: Send + Sync {
     /// Recall memories matching a query (keyword search), optionally scoped to a session
     async fn recall(&self, query: &str, limit: usize, session_id: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>>;
 
+    /// Recall memories matching a query with optional runtime ACL/write context.
+    ///
+    /// Backends without ACL-aware recall support fall back to legacy recall.
+    async fn recall_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let _ = context;
+        self.recall(query, limit, session_id).await
+    }
+
     /// Get a specific memory by key
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>>;
 
@@ -398,6 +630,15 @@ pub trait Memory: Send + Sync {
 
     /// Remove a memory by key
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;
+
+    /// Remove a memory by key after applying a runtime write/read scope.
+    ///
+    /// Backends that do not support ACL metadata fall back to legacy key
+    /// deletion for compatibility; SQLite overrides this with scoped deletion.
+    async fn forget_with_context(&self, key: &str, context: Option<&MemoryWriteContext>) -> anyhow::Result<bool> {
+        let _ = context;
+        self.forget(key).await
+    }
 
     /// Increment the usefulness feedback counter for a recalled memory entry.
     ///
@@ -413,6 +654,11 @@ pub trait Memory: Send + Sync {
     /// Health check
     async fn health_check(&self) -> bool;
 
+    /// Rebuild backend search indexes and backfill stale vectors when supported.
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
     /// Append a persisted channel conversation turn.
     ///
     /// Backends without conversation persistence can no-op.
@@ -426,8 +672,18 @@ pub trait Memory: Send + Sync {
         content: &str,
         timestamp: Option<&str>,
         message_id: Option<&str>,
+        owner_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let _ = (session_key, channel, sender, role, content, timestamp, message_id);
+        let _ = (
+            session_key,
+            channel,
+            sender,
+            role,
+            content,
+            timestamp,
+            message_id,
+            owner_id,
+        );
         Ok(())
     }
 
@@ -451,53 +707,33 @@ pub trait Memory: Send + Sync {
     /// List persisted turns for a conversation session (oldest first).
     async fn list_conversation_turns(
         &self,
+        principal: &MemoryPrincipal,
         session_key: &str,
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<Vec<ConversationTurn>> {
-        let _ = (session_key, limit, offset);
+        let _ = (principal, session_key, limit, offset);
         Ok(Vec::new())
     }
 
     /// Load recent turns per session for runtime history hydration.
     async fn load_recent_conversation_histories(
         &self,
+        principal: &MemoryPrincipal,
         max_turns_per_session: usize,
         max_sessions: usize,
     ) -> anyhow::Result<HashMap<String, Vec<ConversationTurn>>> {
-        let _ = (max_turns_per_session, max_sessions);
+        let _ = (principal, max_turns_per_session, max_sessions);
         Ok(HashMap::new())
     }
 
     /// Append a normalized message event into the shared memory fabric.
     ///
-    /// Backends without event-log support can no-op and return a synthetic event
-    /// so callers can be wired before every backend is upgraded.
+    /// Backends without event-log support must fail fast instead of returning
+    /// synthetic success, so runtime timeline loss is visible to callers.
     async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
-        let now = chrono::Utc::now().to_rfc3339();
-        Ok(MessageEvent {
-            id: 0,
-            event_id: input.event_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            idempotency_key: input.idempotency_key,
-            workspace_id: input.workspace_id,
-            source: input.source,
-            channel: input.channel,
-            session_key: input.session_key,
-            parent_session_key: input.parent_session_key,
-            run_id: input.run_id,
-            parent_run_id: input.parent_run_id,
-            agent_id: input.agent_id,
-            persona_id: input.persona_id,
-            sender: input.sender,
-            recipient: input.recipient,
-            role: input.role,
-            content: input.content,
-            content_hash: None,
-            raw_payload_json: input.raw_payload_json,
-            visibility: input.visibility,
-            created_at: now.clone(),
-            updated_at: now,
-        })
+        let _ = input;
+        Err(crate::memory::fabric::fail_fast(self.name(), "append_message_event"))
     }
 
     /// List message events visible to `principal` after a cursor.
@@ -508,38 +744,47 @@ pub trait Memory: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<MessageEvent>> {
         let _ = (principal, after_id, limit);
-        Ok(Vec::new())
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "list_message_events_since",
+        ))
+    }
+
+    /// List the most recent message events visible to `principal`.
+    async fn list_message_events_recent(
+        &self,
+        principal: &MemoryPrincipal,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let _ = (principal, limit);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "list_message_events_recent",
+        ))
     }
 
     /// Load recent shared context events visible to an agent turn.
     async fn load_recent_shared_context(&self, query: SharedContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
         let _ = query;
-        Ok(Vec::new())
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "load_recent_shared_context",
+        ))
     }
 
     /// Load recent current-session context events visible to an agent turn.
     async fn load_recent_session_context(&self, query: SessionContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
         let _ = query;
-        Ok(Vec::new())
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "load_recent_session_context",
+        ))
     }
 
     /// Append a memory outbox event.
     async fn append_memory_event(&self, input: MemoryEventInput) -> anyhow::Result<MemoryEvent> {
-        let now = chrono::Utc::now().to_rfc3339();
-        Ok(MemoryEvent {
-            id: 0,
-            event_id: input.event_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            workspace_id: input.workspace_id,
-            event_type: input.event_type,
-            subject_table: input.subject_table,
-            subject_id: input.subject_id,
-            session_key: input.session_key,
-            agent_id: input.agent_id,
-            persona_id: input.persona_id,
-            visibility: input.visibility,
-            payload_json: input.payload_json,
-            created_at: now,
-        })
+        let _ = input;
+        Err(crate::memory::fabric::fail_fast(self.name(), "append_memory_event"))
     }
 
     /// List memory outbox events visible to `principal` after a cursor.
@@ -550,49 +795,169 @@ pub trait Memory: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<MemoryEvent>> {
         let _ = (principal, after_id, limit);
-        Ok(Vec::new())
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "list_memory_events_since",
+        ))
+    }
+
+    /// List the most recent memory outbox events visible to `principal`.
+    async fn list_memory_events_recent(
+        &self,
+        principal: &MemoryPrincipal,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEvent>> {
+        let _ = (principal, limit);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "list_memory_events_recent",
+        ))
     }
 
     /// Create a private worker memory draft.
     async fn create_memory_draft(&self, input: MemoryDraftInput) -> anyhow::Result<MemoryDraft> {
-        let now = chrono::Utc::now().to_rfc3339();
-        Ok(MemoryDraft {
-            id: 0,
-            draft_id: input.draft_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            workspace_id: input.workspace_id,
-            worker_run_id: input.worker_run_id,
-            parent_run_id: input.parent_run_id,
-            session_key: input.session_key,
-            agent_id: input.agent_id,
-            persona_id: input.persona_id,
-            key: input.key,
-            content: input.content,
-            category: input.category,
-            source_event_id: input.source_event_id,
-            visibility: input.visibility,
-            status: "pending".to_string(),
-            payload_json: input.payload_json,
-            created_at: now.clone(),
-            updated_at: now,
-        })
+        let _ = input;
+        Err(crate::memory::fabric::fail_fast(self.name(), "create_memory_draft"))
     }
 
     /// List memory drafts produced by a worker run.
     async fn list_memory_drafts_for_run(&self, worker_run_id: &str) -> anyhow::Result<Vec<MemoryDraft>> {
         let _ = worker_run_id;
-        Ok(Vec::new())
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "list_memory_drafts_for_run",
+        ))
     }
 
     /// Mark a draft as merged into semantic memory.
     async fn merge_memory_draft(&self, draft_id: &str) -> anyhow::Result<Option<MemoryDraft>> {
         let _ = draft_id;
-        Ok(None)
+        Err(crate::memory::fabric::fail_fast(self.name(), "merge_memory_draft"))
     }
 
     /// Reject a draft without merging it into semantic memory.
     async fn reject_memory_draft(&self, draft_id: &str, reason: Option<&str>) -> anyhow::Result<Option<MemoryDraft>> {
         let _ = (draft_id, reason);
-        Ok(None)
+        Err(crate::memory::fabric::fail_fast(self.name(), "reject_memory_draft"))
+    }
+
+    /// Ingest a durable source document and create chunk records.
+    async fn ingest_document(&self, input: DocumentIngestInput) -> anyhow::Result<DocumentRecord> {
+        let _ = input;
+        Err(crate::memory::document::fail_fast(self.name(), "ingest_document"))
+    }
+
+    /// Search document chunks visible to a principal.
+    async fn search_document_chunks(
+        &self,
+        principal: &MemoryPrincipal,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DocumentSearchResult>> {
+        let _ = (principal, query, limit);
+        Err(crate::memory::document::fail_fast(
+            self.name(),
+            "search_document_chunks",
+        ))
+    }
+
+    /// Retrieve one document chunk by stable chunk id.
+    async fn get_document_chunk(&self, chunk_id: &str) -> anyhow::Result<Option<DocumentChunkRecord>> {
+        let _ = chunk_id;
+        Err(crate::memory::document::fail_fast(self.name(), "get_document_chunk"))
+    }
+
+    /// Link a memory/event/summary to a source document chunk.
+    async fn link_memory_source(&self, input: MemoryLinkInput) -> anyhow::Result<MemoryLink> {
+        let _ = input;
+        Err(crate::memory::document::fail_fast(self.name(), "link_memory_source"))
+    }
+
+    /// Append a retrieval trace for context packing and evidence audits.
+    async fn append_retrieval_trace(&self, input: RetrievalTraceInput) -> anyhow::Result<RetrievalTrace> {
+        let _ = input;
+        Err(crate::memory::retrieval::fail_fast(
+            self.name(),
+            "append_retrieval_trace",
+        ))
+    }
+
+    /// Append a compaction run audit record.
+    async fn append_compaction_run(&self, input: CompactionRunInput) -> anyhow::Result<CompactionRun> {
+        let _ = input;
+        Err(crate::memory::compaction::fail_fast(
+            self.name(),
+            "append_compaction_run",
+        ))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod conformance {
+    use super::{Memory, MemoryCategory};
+    use crate::memory::principal::MemoryWriteContext;
+
+    pub(crate) async fn assert_scoped_memory_acl_conformance(mem: &dyn Memory, key_prefix: &str) {
+        let alice_ctx = MemoryWriteContext {
+            channel: Some("telegram".into()),
+            chat_type: Some("private".into()),
+            chat_id: Some(format!("{key_prefix}:dm-alice")),
+            sender_id: None,
+            raw_sender: Some("alice".into()),
+        };
+        let bob_ctx = MemoryWriteContext {
+            channel: Some("telegram".into()),
+            chat_type: Some("private".into()),
+            chat_id: Some(format!("{key_prefix}:dm-bob")),
+            sender_id: None,
+            raw_sender: Some("bob".into()),
+        };
+        let alice_key = format!("{key_prefix}:alice-private");
+        let bob_key = format!("{key_prefix}:bob-private");
+
+        mem.store_with_context(
+            &alice_key,
+            "shared conformance keyword alice private",
+            MemoryCategory::Conversation,
+            None,
+            Some(&alice_ctx),
+        )
+        .await
+        .expect("store alice scoped memory");
+        mem.store_with_context(
+            &bob_key,
+            "shared conformance keyword bob private",
+            MemoryCategory::Conversation,
+            None,
+            Some(&bob_ctx),
+        )
+        .await
+        .expect("store bob scoped memory");
+
+        let alice_results = mem
+            .recall_with_context("shared conformance keyword", 10, None, Some(&alice_ctx))
+            .await
+            .expect("recall alice scoped memory");
+        let alice_keys = alice_results.iter().map(|entry| entry.key.as_str()).collect::<Vec<_>>();
+        assert!(alice_keys.contains(&alice_key.as_str()), "{alice_keys:?}");
+        assert!(!alice_keys.contains(&bob_key.as_str()), "{alice_keys:?}");
+
+        assert!(
+            !mem.forget_with_context(&bob_key, Some(&alice_ctx))
+                .await
+                .expect("alice cannot delete bob memory"),
+            "alice context must not delete bob scoped memory"
+        );
+        assert!(
+            mem.forget_with_context(&alice_key, Some(&alice_ctx))
+                .await
+                .expect("alice deletes alice memory"),
+            "alice context should delete alice scoped memory"
+        );
+        assert!(
+            mem.get(&bob_key).await.expect("bob memory remains").is_some(),
+            "bob memory should remain after denied alice delete"
+        );
     }
 }
 

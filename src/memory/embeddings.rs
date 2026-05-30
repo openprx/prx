@@ -9,6 +9,11 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Embedding dimensions
     fn dimensions(&self) -> usize;
 
+    /// Embedding model identifier, when the provider exposes one.
+    fn model(&self) -> &str {
+        ""
+    }
+
     /// Embed a batch of texts into vectors
     async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
 
@@ -31,6 +36,10 @@ impl EmbeddingProvider for NoopEmbedding {
 
     fn dimensions(&self) -> usize {
         0
+    }
+
+    fn model(&self) -> &str {
+        "none"
     }
 
     async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -104,6 +113,10 @@ impl EmbeddingProvider for OpenAiEmbedding {
 
     fn dimensions(&self) -> usize {
         self.dims
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 
     async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {

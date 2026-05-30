@@ -9,7 +9,9 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::channels::SignalChannel;
 use crate::channels::traits::{Channel, SendMessage};
-use crate::security::SecurityPolicy;
+use crate::security::op_id;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
+use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -255,6 +257,21 @@ impl Tool for MessageSendTool {
                         });
                     }
                 };
+                let recipient_ref = op_id::ref_for_channel_recipient(channel.name(), &recipient);
+                let operation_name = op_id::op_id(self.name(), "send", &[channel.name(), &recipient_ref]);
+                let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+                if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+                    self.name(),
+                    &operation_name,
+                    ResourceRiskLevel::Medium,
+                    approval_grant.as_ref(),
+                ) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
 
                 let raw_content = args.get("message").and_then(|v| v.as_str()).unwrap_or("").to_owned();
                 let as_voice = args.get("as_voice").and_then(|v| v.as_bool()).unwrap_or(false);

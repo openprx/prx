@@ -1,4 +1,6 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
+use crate::security::SideEffectGate;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::json;
@@ -51,7 +53,33 @@ impl GitOperationsTool {
 
     /// Check if an operation requires write access
     fn requires_write_access(&self, operation: &str) -> bool {
-        matches!(operation, "commit" | "add" | "checkout" | "stash" | "reset" | "revert")
+        matches!(
+            operation,
+            "commit" | "add" | "checkout" | "stash" | "push" | "reset_hard" | "reset" | "revert"
+        )
+    }
+
+    fn resource_operation_name(&self, operation: &str, args: &serde_json::Value) -> Option<String> {
+        match operation {
+            "commit" => Some("git_operations:commit".to_string()),
+            "add" => Some("git_operations:add".to_string()),
+            "checkout" => {
+                let branch = args.get("branch").and_then(|value| value.as_str()).unwrap_or("*");
+                Some(format!("git_operations:checkout:{branch}"))
+            }
+            "stash" => {
+                let action = args.get("action").and_then(|value| value.as_str()).unwrap_or("push");
+                Some(format!("git_operations:stash:{action}"))
+            }
+            "push" => {
+                let remote = args.get("remote").and_then(|value| value.as_str()).unwrap_or("origin");
+                Some(format!("git_operations:push:{remote}"))
+            }
+            "reset_hard" => Some("git_operations:reset_hard".to_string()),
+            "reset" => Some("git_operations:reset".to_string()),
+            "revert" => Some("git_operations:revert".to_string()),
+            _ => None,
+        }
     }
 
     /// Check if an operation is read-only
@@ -411,6 +439,70 @@ impl GitOperationsTool {
             }),
         }
     }
+
+    async fn git_push(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let remote = args.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+        let remote_args = self.sanitize_git_args(remote)?;
+        if remote_args.len() != 1 {
+            anyhow::bail!("Invalid remote specification");
+        }
+        let remote_arg = remote_args
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Invalid remote specification"))?;
+
+        let mut git_args = vec!["push", remote_arg.as_str()];
+        let branch_holder;
+        if let Some(branch) = args.get("branch").and_then(|v| v.as_str()) {
+            let branch_args = self.sanitize_git_args(branch)?;
+            if branch_args.len() != 1 {
+                anyhow::bail!("Invalid branch specification");
+            }
+            branch_holder = branch_args;
+            let branch_arg = branch_holder
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("Invalid branch specification"))?;
+            git_args.push(branch_arg.as_str());
+        }
+
+        let output = self.run_git_command(&git_args).await;
+        match output {
+            Ok(out) => Ok(ToolResult {
+                success: true,
+                output: out,
+                error: None,
+            }),
+            Err(error) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Push failed: {error}")),
+            }),
+        }
+    }
+
+    async fn git_reset_hard(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("HEAD");
+        let target_args = self.sanitize_git_args(target)?;
+        if target_args.len() != 1 {
+            anyhow::bail!("Invalid reset target specification");
+        }
+        let target_arg = target_args
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Invalid reset target specification"))?;
+
+        let output = self.run_git_command(&["reset", "--hard", target_arg.as_str()]).await;
+        match output {
+            Ok(out) => Ok(ToolResult {
+                success: true,
+                output: out,
+                error: None,
+            }),
+            Err(error) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Reset hard failed: {error}")),
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -420,7 +512,7 @@ impl Tool for GitOperationsTool {
     }
 
     fn description(&self) -> &str {
-        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls."
+        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, push, reset_hard). Provides parsed JSON output and integrates with security policy for autonomy controls."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -429,7 +521,7 @@ impl Tool for GitOperationsTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash"],
+                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash", "push", "reset_hard"],
                     "description": "Git operation to perform"
                 },
                 "message": {
@@ -442,7 +534,15 @@ impl Tool for GitOperationsTool {
                 },
                 "branch": {
                     "type": "string",
-                    "description": "Branch name (for 'checkout' operation)"
+                    "description": "Branch name (for 'checkout' or 'push' operation)"
+                },
+                "remote": {
+                    "type": "string",
+                    "description": "Remote name (for 'push' operation, default: origin)"
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Revision target (for 'reset_hard' operation, default: HEAD)"
                 },
                 "files": {
                     "type": "string",
@@ -481,6 +581,7 @@ impl Tool for GitOperationsTool {
                 });
             }
         };
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
 
         // Check if we're in a git repository
         if !self.workspace_dir.join(".git").exists() {
@@ -524,6 +625,25 @@ impl Tool for GitOperationsTool {
                 }
                 AutonomyLevel::Supervised | AutonomyLevel::Full => {}
             }
+
+            if let Some(operation_name) = self.resource_operation_name(operation, &args) {
+                let risk = match operation {
+                    "push" | "reset_hard" => ResourceRiskLevel::High,
+                    _ => ResourceRiskLevel::Medium,
+                };
+                if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
+                    self.name(),
+                    &operation_name,
+                    risk,
+                    approval_grant.as_ref(),
+                ) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
+            }
         }
 
         // Record action for rate limiting
@@ -545,6 +665,8 @@ impl Tool for GitOperationsTool {
             "add" => self.git_add(args).await,
             "checkout" => self.git_checkout(args).await,
             "stash" => self.git_stash(args).await,
+            "push" => self.git_push(args).await,
+            "reset_hard" => self.git_reset_hard(args).await,
             _ => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -571,6 +693,7 @@ mod tests {
     fn test_tool(dir: &std::path::Path) -> GitOperationsTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
+            block_high_risk_commands: false,
             ..SecurityPolicy::default()
         });
         GitOperationsTool::new(security, dir.to_path_buf())
@@ -656,10 +779,42 @@ mod tests {
         assert!(tool.requires_write_access("commit"));
         assert!(tool.requires_write_access("add"));
         assert!(tool.requires_write_access("checkout"));
+        assert!(tool.requires_write_access("push"));
+        assert!(tool.requires_write_access("reset_hard"));
 
         assert!(!tool.requires_write_access("status"));
         assert!(!tool.requires_write_access("diff"));
         assert!(!tool.requires_write_access("log"));
+    }
+
+    #[test]
+    fn resource_operation_names_are_canonical() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        assert_eq!(
+            tool.resource_operation_name("commit", &json!({})).as_deref(),
+            Some("git_operations:commit")
+        );
+        assert_eq!(
+            tool.resource_operation_name("checkout", &json!({"branch": "main"}))
+                .as_deref(),
+            Some("git_operations:checkout:main")
+        );
+        assert_eq!(
+            tool.resource_operation_name("stash", &json!({"action": "drop"}))
+                .as_deref(),
+            Some("git_operations:stash:drop")
+        );
+        assert_eq!(
+            tool.resource_operation_name("push", &json!({"remote": "origin"}))
+                .as_deref(),
+            Some("git_operations:push:origin")
+        );
+        assert_eq!(
+            tool.resource_operation_name("reset_hard", &json!({})).as_deref(),
+            Some("git_operations:reset_hard")
+        );
     }
 
     #[test]
@@ -709,6 +864,98 @@ mod tests {
         assert!(!result.success);
         // can_act() returns false for ReadOnly, so we get the "higher autonomy level" message
         assert!(result.error.as_deref().unwrap_or("").contains("higher autonomy"));
+    }
+
+    #[tokio::test]
+    async fn supervised_write_ops_require_runtime_grant() {
+        let tmp = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let tool = test_tool(tmp.path());
+        let result = tool
+            .execute(json!({"operation": "commit", "message": "test"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("runtime approval grant"));
+    }
+
+    #[tokio::test]
+    async fn supervised_push_and_reset_hard_require_runtime_grant() {
+        let tmp = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let tool = test_tool(tmp.path());
+        let push = tool
+            .execute(json!({"operation": "push", "remote": "origin"}))
+            .await
+            .unwrap();
+        assert!(!push.success);
+        assert!(push.error.as_deref().unwrap_or("").contains("runtime approval grant"));
+
+        let reset = tool
+            .execute(json!({"operation": "reset_hard", "target": "HEAD"}))
+            .await
+            .unwrap();
+        assert!(!reset.success);
+        assert!(reset.error.as_deref().unwrap_or("").contains("runtime approval grant"));
+    }
+
+    #[tokio::test]
+    async fn supervised_push_accepts_matching_runtime_grant() {
+        let tmp = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let tool = test_tool(tmp.path());
+        let grant = ApprovalGrant::for_resource_operation("git_operations", "git_operations:push:origin", "test", None);
+        let result = tool
+            .execute(json!({
+                "operation": "push",
+                "remote": "origin",
+                (crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG): serde_json::to_value(grant).unwrap()
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(!result.error.as_deref().unwrap_or("").contains("runtime approval grant"));
+    }
+
+    #[tokio::test]
+    async fn supervised_write_ops_accept_matching_runtime_grant() {
+        let tmp = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let tool = test_tool(tmp.path());
+        let grant = ApprovalGrant::for_resource_operation("git_operations", "git_operations:commit", "test", None);
+        let result = tool
+            .execute(json!({
+                "operation": "commit",
+                "message": "test",
+                (crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG): serde_json::to_value(grant).unwrap()
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(!result.error.as_deref().unwrap_or("").contains("runtime approval grant"));
     }
 
     #[tokio::test]
@@ -779,7 +1026,7 @@ mod tests {
 
         let tool = test_tool(tmp.path());
 
-        let result = tool.execute(json!({"operation": "push"})).await.unwrap();
+        let result = tool.execute(json!({"operation": "fetch_all"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("Unknown operation"));
     }

@@ -1,7 +1,8 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::SharedConfig;
 use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
-use crate::security::SecurityPolicy;
+use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
+use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -112,11 +113,6 @@ impl Tool for CronAddTool {
                     "type": "boolean",
                     "description": "Auto-delete one-shot jobs after success (default true for 'at' schedule)"
                 },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
-                }
             },
             "required": ["schedule"]
         })
@@ -200,10 +196,8 @@ impl Tool for CronAddTool {
             .get("delete_after_run")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(default_delete_after_run);
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        let lineage = cron::lineage_from_trusted_scope(&cfg, &args);
 
         let result = match job_type {
             JobType::Shell => {
@@ -218,7 +212,11 @@ impl Tool for CronAddTool {
                     }
                 };
 
-                if let Err(reason) = self.security.validate_command_execution(command, approved) {
+                if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
+                    self.name(),
+                    command,
+                    approval_grant.as_ref(),
+                ) {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
@@ -230,7 +228,22 @@ impl Tool for CronAddTool {
                     return Ok(blocked);
                 }
 
-                cron::add_shell_job(&cfg, name, schedule, command)
+                let persisted_grant = ApprovalGrant::persisted_runner_grant(
+                    "cron_scheduler",
+                    command,
+                    approval_grant.as_ref(),
+                    PERSISTED_APPROVAL_GRANT_TTL_SECS,
+                )
+                .map(|grant| serde_json::to_string(&grant))
+                .transpose()?;
+                cron::add_shell_job_with_lineage_and_approval_grant(
+                    &cfg,
+                    name,
+                    schedule,
+                    command,
+                    persisted_grant,
+                    lineage,
+                )
             }
             JobType::Agent => {
                 // Resolve prompt: payload.message > payload.text > prompt field
@@ -300,7 +313,7 @@ impl Tool for CronAddTool {
                     return Ok(blocked);
                 }
 
-                cron::add_agent_job(
+                cron::add_agent_job_with_lineage(
                     &cfg,
                     name,
                     schedule,
@@ -309,6 +322,7 @@ impl Tool for CronAddTool {
                     model,
                     delivery,
                     delete_after_run,
+                    lineage,
                 )
             }
         };
@@ -462,14 +476,25 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied.error.unwrap_or_default().contains("explicit approval"));
+        assert!(denied.error.unwrap_or_default().contains("runtime approval grant"));
+
+        let forged_public_approval = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "touch cron-approval-test",
+                "approved": true
+            }))
+            .await
+            .unwrap();
+        assert!(!forged_public_approval.success);
 
         let approved = tool
             .execute(json!({
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
                 "job_type": "shell",
                 "command": "touch cron-approval-test",
-                "approved": true
+                (crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG): serde_json::to_value(crate::security::policy::ApprovalGrant::for_command("cron_add", "touch cron-approval-test", "test", None)).unwrap()
             }))
             .await
             .unwrap();

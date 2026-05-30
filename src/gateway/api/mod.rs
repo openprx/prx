@@ -1,5 +1,6 @@
 use super::AppState;
 use crate::config::Config;
+use crate::security::policy::ResourceRiskLevel;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Request, State},
@@ -18,6 +19,29 @@ mod plugins;
 mod sessions;
 mod skills;
 mod status;
+
+pub(super) fn authorize_resource_mutation(
+    state: &AppState,
+    operation_name: &str,
+    risk: ResourceRiskLevel,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let config = state.config.lock().clone();
+    authorize_resource_mutation_for_config(&config, operation_name, risk)
+}
+
+pub(super) fn authorize_resource_mutation_for_config(
+    config: &Config,
+    operation_name: &str,
+    risk: ResourceRiskLevel,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    crate::security::SideEffectGate::new(&crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ))
+    .authorize_resource_operation("gateway_api", operation_name, risk, None)
+    .map(|_| ())
+    .map_err(|error| (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": error}))))
+}
 
 pub fn router(state: AppState) -> Router<AppState> {
     let protected_routes = Router::new()

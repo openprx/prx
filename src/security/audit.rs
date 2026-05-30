@@ -8,7 +8,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use uuid::Uuid;
 
@@ -23,6 +23,7 @@ pub enum AuditEventType {
     AuthFailure,
     PolicyViolation,
     SecurityEvent,
+    ToolGate,
 }
 
 /// Actor information (who performed the action)
@@ -153,6 +154,28 @@ pub struct CommandExecutionLog<'a> {
     pub duration_ms: u64,
 }
 
+/// Structured side-effect gate decision details for audit logging.
+///
+/// Carries the EU AI Act Art.12 traceability fields for every authorization
+/// decision: subject (`principal_id`), operation (`tool_name` + `operation_name`),
+/// decision (`allowed`), deny `error` reason, and the `grant_id` correlation
+/// handle. The event `timestamp` is stamped by [`AuditEvent::new`].
+#[derive(Debug, Clone)]
+pub struct SideEffectDecisionLog<'a> {
+    pub tool_name: &'a str,
+    pub operation_name: &'a str,
+    pub risk_level: &'a str,
+    pub approved: bool,
+    pub allowed: bool,
+    pub error: Option<&'a str>,
+    /// Trusted caller principal id (audit subject / actor). `None` when no
+    /// principal context is available (e.g. background runners).
+    pub principal_id: Option<&'a str>,
+    /// Stable approval-grant identifier for audit correlation, when a grant was
+    /// presented. `None` when the decision was made without any grant.
+    pub grant_id: Option<&'a str>,
+}
+
 impl AuditLogger {
     /// Create a new audit logger
     pub fn new(config: AuditConfig, openprx_dir: PathBuf) -> Result<Self> {
@@ -223,6 +246,33 @@ impl AuditLogger {
         self.log(&event)
     }
 
+    /// Log a SideEffectGate decision for command or resource operations.
+    ///
+    /// Records the full EU AI Act Art.12 field set: timestamp (stamped by
+    /// [`AuditEvent::new`]), subject (`principal_id` as the actor `user_id`),
+    /// operation (`tool_name:operation_name`), decision (`allowed`), deny reason
+    /// (`error`), and the `grant_id` correlation handle (folded into the action
+    /// string so it survives in the structured `command` field).
+    pub fn log_side_effect_decision(&self, entry: SideEffectDecisionLog<'_>) -> Result<()> {
+        let mut action = format!("{}:{}", entry.tool_name, entry.operation_name);
+        if let Some(grant_id) = entry.grant_id {
+            // Append the grant correlation handle so a single structured field
+            // ties the decision back to the authorizing grant.
+            action.push_str(" grant_id=");
+            action.push_str(grant_id);
+        }
+        let event = AuditEvent::new(AuditEventType::ToolGate)
+            .with_actor(
+                "side_effect_gate".to_string(),
+                entry.principal_id.map(ToString::to_string),
+                None,
+            )
+            .with_action(action, entry.risk_level.to_string(), entry.approved, entry.allowed)
+            .with_result(entry.allowed, None, 0, entry.error.map(ToString::to_string));
+
+        self.log(&event)
+    }
+
     /// Backward-compatible helper to log a command execution event.
     #[allow(clippy::too_many_arguments)]
     pub fn log_command(
@@ -268,6 +318,23 @@ impl AuditLogger {
         let rotated = format!("{}.1.log", self.log_path.display());
         std::fs::rename(&self.log_path, &rotated)?;
         Ok(())
+    }
+}
+
+/// Best-effort production audit hook for SideEffectGate decisions.
+///
+/// Default/unit policies often use `.` as workspace; skip those to avoid writing
+/// audit.log into the repo during tests. Runtime policies built from config have
+/// an explicit workspace and are logged with the default audit configuration.
+pub fn record_side_effect_decision_best_effort(workspace_dir: &Path, entry: SideEffectDecisionLog<'_>) {
+    if workspace_dir.as_os_str().is_empty() || workspace_dir == Path::new(".") {
+        return;
+    }
+    let Ok(logger) = AuditLogger::new(AuditConfig::default(), workspace_dir.to_path_buf()) else {
+        return;
+    };
+    if let Err(error) = logger.log_side_effect_decision(entry) {
+        tracing::debug!(error = %error, "failed to write side-effect audit event");
     }
 }
 
@@ -352,6 +419,59 @@ mod tests {
         assert!(parsed.actor.is_some());
         assert!(parsed.action.is_some());
         assert!(parsed.result.is_some());
+    }
+
+    #[test]
+    fn audit_side_effect_decision_uses_tool_gate_event_type() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let logger = AuditLogger::new(AuditConfig::default(), tmp.path().to_path_buf())?;
+
+        logger.log_side_effect_decision(SideEffectDecisionLog {
+            tool_name: "file_write",
+            operation_name: "file_write:write:abc",
+            risk_level: "medium",
+            approved: false,
+            allowed: false,
+            error: Some("requires approval"),
+            principal_id: None,
+            grant_id: None,
+        })?;
+
+        let log = std::fs::read_to_string(tmp.path().join("audit.log"))?;
+        assert!(log.contains(r#""event_type":"tool_gate""#));
+        assert!(log.contains("file_write:file_write:write:abc"));
+        Ok(())
+    }
+
+    #[test]
+    fn audit_side_effect_decision_records_compliance_fields() -> Result<()> {
+        // EU AI Act Art.12: every gate decision audit entry must carry the
+        // subject (principal_id), operation, decision, deny reason, and grant_id.
+        let tmp = TempDir::new()?;
+        let logger = AuditLogger::new(AuditConfig::default(), tmp.path().to_path_buf())?;
+
+        logger.log_side_effect_decision(SideEffectDecisionLog {
+            tool_name: "file_write",
+            operation_name: "file_write:write:abc",
+            risk_level: "medium",
+            approved: true,
+            allowed: true,
+            error: None,
+            principal_id: Some("telegram:alice"),
+            grant_id: Some("grant-123"),
+        })?;
+
+        let raw = std::fs::read_to_string(tmp.path().join("audit.log"))?;
+        let event: AuditEvent = serde_json::from_str(raw.trim()).expect("parse audit event");
+        assert!(event.timestamp <= Utc::now());
+        let actor = event.actor.expect("actor present");
+        assert_eq!(actor.user_id.as_deref(), Some("telegram:alice"));
+        let action = event.action.expect("action present");
+        let command = action.command.expect("command present");
+        assert!(command.contains("file_write:file_write:write:abc"));
+        assert!(command.contains("grant_id=grant-123"));
+        assert!(action.allowed);
+        Ok(())
     }
 
     #[test]

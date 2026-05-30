@@ -97,6 +97,10 @@ const fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronJob {
     pub id: String,
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub source_message_event_id: Option<String>,
     pub expression: String,
     pub schedule: Schedule,
     pub command: String,
@@ -113,6 +117,15 @@ pub struct CronJob {
     pub last_run: Option<DateTime<Utc>>,
     pub last_status: Option<String>,
     pub last_output: Option<String>,
+    pub approval_grant_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CronJobLineage {
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub source_message_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +139,22 @@ pub struct CronRun {
     pub duration_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronJobEvent {
+    pub id: i64,
+    pub event_id: String,
+    pub job_id: String,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub source_message_event_id: Option<String>,
+    pub event_type: String,
+    pub status: Option<String>,
+    pub payload_json: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CronJobPatch {
     pub schedule: Option<Schedule>,
@@ -137,4 +166,6 @@ pub struct CronJobPatch {
     pub model: Option<String>,
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,
+    #[serde(skip)]
+    pub approval_grant_json: Option<String>,
 }

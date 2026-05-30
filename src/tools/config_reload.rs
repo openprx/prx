@@ -19,6 +19,8 @@
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
+use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -29,12 +31,17 @@ use std::sync::Arc;
 /// config after validation — no Mutex required.
 pub struct ConfigReloadTool {
     config: SharedConfig,
+    security: Arc<SecurityPolicy>,
 }
 
 impl ConfigReloadTool {
     /// Create a new `ConfigReloadTool` backed by the shared config state.
-    pub const fn new(config: SharedConfig) -> Self {
-        Self { config }
+    pub fn new(config: SharedConfig) -> Self {
+        Self::with_security(config, Arc::new(SecurityPolicy::default()))
+    }
+
+    pub const fn with_security(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
+        Self { config, security }
     }
 }
 
@@ -60,7 +67,21 @@ impl Tool for ConfigReloadTool {
         })
     }
 
-    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
+            self.name(),
+            "config_reload:reload",
+            ResourceRiskLevel::Low,
+            approval_grant.as_ref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
         // 1. Read runtime config locations from current config (lock-free)
         let current = self.config.load_full();
         let config_path = current.config_path.clone();
@@ -322,6 +343,16 @@ mod tests {
         ConfigReloadTool::new(new_shared(cfg))
     }
 
+    fn make_readonly_tool_with_config(cfg: Config) -> ConfigReloadTool {
+        ConfigReloadTool::with_security(
+            new_shared(cfg),
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::policy::AutonomyLevel::ReadOnly,
+                ..SecurityPolicy::default()
+            }),
+        )
+    }
+
     #[test]
     fn name_and_description() {
         let tool = make_tool_with_config(Config::default());
@@ -357,6 +388,22 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Failed to load merged config"));
+    }
+
+    #[tokio::test]
+    async fn reload_obeys_readonly_resource_gate() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(tmp.path(), "default_temperature = 0.3\n")
+            .await
+            .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.config_path = tmp.path().to_path_buf();
+        let tool = make_readonly_tool_with_config(cfg);
+
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("read-only mode"));
     }
 
     #[tokio::test]

@@ -135,10 +135,7 @@ impl EvolutionPipeline {
                 gate_rejections,
                 judge_result: None,
                 evolution_log: None,
-                shadow_mode: matches!(
-                    self.shared_config.load_full().runtime.mode,
-                    crate::self_system::evolution::config::EvolutionMode::Shadow
-                ),
+                shadow_mode: self.shared_config.load_full().runtime.mode.is_proposal_only(),
                 rolled_back: false,
                 errors,
             });
@@ -156,10 +153,7 @@ impl EvolutionPipeline {
                 gate_rejections,
                 judge_result: None,
                 evolution_log: None,
-                shadow_mode: matches!(
-                    self.shared_config.load_full().runtime.mode,
-                    crate::self_system::evolution::config::EvolutionMode::Shadow
-                ),
+                shadow_mode: self.shared_config.load_full().runtime.mode.is_proposal_only(),
                 rolled_back: false,
                 errors,
             });
@@ -392,11 +386,10 @@ const fn metrics_for_candidate(candidate: &EvolutionCandidate) -> GateMetrics {
 }
 
 fn should_rollback(judge: &JudgeResult, cycle_result: &crate::self_system::evolution::engine::CycleResult) -> bool {
-    judge.scores.overall() < JUDGE_PASS_THRESHOLD
-        || matches!(
-            cycle_result.cycle.outcome,
-            crate::self_system::evolution::CycleOutcome::Failed
-        )
+    matches!(
+        cycle_result.cycle.outcome,
+        crate::self_system::evolution::CycleOutcome::Applied
+    ) && judge.scores.overall() < JUDGE_PASS_THRESHOLD
 }
 
 fn infer_rollback_dir(workspace_root: &Path, layer: &EvolutionLayer) -> Result<PathBuf> {

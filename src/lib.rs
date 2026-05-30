@@ -85,6 +85,7 @@
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
+pub mod acl;
 pub mod agent;
 pub mod approval;
 pub mod auth;
@@ -99,6 +100,7 @@ pub(crate) mod health;
 pub mod heartbeat;
 pub(crate) mod hooks;
 pub mod identity;
+pub mod llm;
 pub mod media;
 pub mod memory;
 pub(crate) mod multimodal;
@@ -112,6 +114,7 @@ pub mod rag;
 #[cfg(feature = "llm-router")]
 pub mod router;
 pub mod runtime;
+pub mod schema_migration;
 pub mod security;
 pub mod self_system;
 // In the library crate, only the protocol types are needed (used by tools/sessions_spawn).
@@ -229,6 +232,14 @@ pub enum SkillCommands {
 /// Migration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MigrateCommands {
+    /// Show schema migration status for the memory database
+    Status,
+    /// Verify applied schema migration checksums
+    Verify,
+    /// Preview pending schema migrations without writing
+    DryRun,
+    /// Record the current schema as the migration baseline
+    Baseline,
     /// Import memory from an `OpenClaw` workspace into this `OpenPRX` workspace
     Openclaw {
         /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)

@@ -1,10 +1,11 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::agent::loop_::{ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
+use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
 use crate::config::DelegateAgentConfig;
 use crate::hooks::HookManager;
-use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MemoryVisibility, MessageEventScope};
+use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
+use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
@@ -48,6 +49,10 @@ struct DelegateScope {
     channel: String,
     chat_type: String,
     chat_id: String,
+    owner_id: Option<String>,
+    topic_id: Option<String>,
+    task_id: Option<String>,
+    source_message_event_id: Option<String>,
 }
 
 fn parse_delegate_scope(args: &serde_json::Value) -> Option<DelegateScope> {
@@ -90,6 +95,32 @@ fn parse_delegate_scope(args: &serde_json::Value) -> Option<DelegateScope> {
         channel,
         chat_type,
         chat_id,
+        owner_id: scope
+            .get("owner_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        topic_id: scope
+            .get("topic_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        task_id: scope
+            .get("task_id")
+            .or_else(|| scope.get("parent_task_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        source_message_event_id: scope
+            .get("message_event_id")
+            .or_else(|| scope.get("source_message_event_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -200,6 +231,35 @@ fn delegate_session_key(scope: Option<&DelegateScope>) -> String {
     scope
         .map(|scope| format!("delegate:{}:{}:{}", scope.channel, scope.chat_id, scope.sender))
         .unwrap_or_else(|| "delegate:global".to_string())
+}
+
+fn delegate_event_scope(
+    workspace_id: &str,
+    delegate_run_id: &str,
+    agent_name: &str,
+    scope: Option<&DelegateScope>,
+) -> MessageEventScope {
+    let mut envelope = RuntimeEnvelope::delegate(workspace_id, delegate_session_key(scope), delegate_run_id)
+        .with_channel(scope.map_or("delegate", |scope| scope.channel.as_str()))
+        .with_agent_id(agent_name);
+    if let Some(scope) = scope {
+        envelope = envelope
+            .with_sender(scope.sender.as_str())
+            .with_recipient(scope.chat_id.as_str());
+        if let Some(owner_id) = &scope.owner_id {
+            envelope = envelope.with_owner_id(owner_id.clone());
+        }
+        if let Some(topic_id) = &scope.topic_id {
+            envelope = envelope.with_topic_id(topic_id.clone());
+        }
+        if let Some(task_id) = &scope.task_id {
+            envelope = envelope.with_task_id(task_id.clone());
+        }
+        if let Some(source_message_event_id) = &scope.source_message_event_id {
+            envelope = envelope.with_source_message_event_id(source_message_event_id.clone());
+        }
+    }
+    envelope.message_scope()
 }
 
 #[async_trait]
@@ -363,17 +423,12 @@ impl Tool for DelegateTool {
             MemoryFabric::new(memory.clone(), self.security.workspace_dir.to_string_lossy())
                 .with_event_recording(self.event_recording)
         });
-        let session_key = delegate_session_key(scope.as_ref());
-        let mut event_scope = MessageEventScope::new("delegate", MemoryVisibility::Workspace)
-            .with_channel(scope.as_ref().map_or("delegate", |scope| scope.channel.as_str()))
-            .with_session_key(session_key.clone())
-            .with_run_id(delegate_run_id.clone())
-            .with_agent_id(agent_name);
-        if let Some(scope) = scope.as_ref() {
-            event_scope = event_scope
-                .with_sender(scope.sender.as_str())
-                .with_recipient(scope.chat_id.as_str());
-        }
+        let event_scope = delegate_event_scope(
+            &self.security.workspace_dir.to_string_lossy(),
+            &delegate_run_id,
+            agent_name,
+            scope.as_ref(),
+        );
         if let Some(fabric) = memory_fabric.as_ref() {
             if let Err(error) = fabric
                 .record_inbound_user_message(
@@ -395,6 +450,23 @@ impl Tool for DelegateTool {
             {
                 tracing::warn!(agent = agent_name, "failed to record delegate request event: {error}");
             }
+            record_delegate_task_event(
+                fabric,
+                event_scope.clone(),
+                "delegate.task.started",
+                json!({
+                    "agent": agent_name,
+                    "provider": agent_config.provider,
+                    "model": agent_config.model,
+                    "agentic": agent_config.agentic,
+                    "has_context": !context.is_empty(),
+                    "owner_id": scope.as_ref().and_then(|scope| scope.owner_id.clone()),
+                    "topic_id": scope.as_ref().and_then(|scope| scope.topic_id.clone()),
+                    "parent_task_id": scope.as_ref().and_then(|scope| scope.task_id.clone()),
+                    "source_message_event_id": scope.as_ref().and_then(|scope| scope.source_message_event_id.clone())
+                }),
+            )
+            .await;
         }
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
@@ -410,7 +482,17 @@ impl Tool for DelegateTool {
                 )
                 .await;
             if let Some(fabric) = memory_fabric.as_ref() {
-                record_delegate_result_event(fabric, event_scope, &result).await;
+                record_delegate_result_event(fabric, event_scope.clone(), &result).await;
+                record_delegate_terminal_task_event(
+                    fabric,
+                    event_scope,
+                    agent_name,
+                    agent_config,
+                    scope.as_ref(),
+                    &result,
+                    false,
+                )
+                .await;
             }
             return result;
         }
@@ -430,11 +512,25 @@ impl Tool for DelegateTool {
         let result = match result {
             Ok(inner) => inner,
             Err(_elapsed) => {
-                return Ok(ToolResult {
+                let tool_result = ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s")),
-                });
+                };
+                if let Some(fabric) = memory_fabric.as_ref() {
+                    record_delegate_result_event(fabric, event_scope.clone(), &Ok(tool_result.clone())).await;
+                    record_delegate_terminal_task_event(
+                        fabric,
+                        event_scope,
+                        agent_name,
+                        agent_config,
+                        scope.as_ref(),
+                        &Ok(tool_result.clone()),
+                        true,
+                    )
+                    .await;
+                }
+                return Ok(tool_result);
             }
         };
 
@@ -455,7 +551,17 @@ impl Tool for DelegateTool {
                     error: None,
                 };
                 if let Some(fabric) = memory_fabric.as_ref() {
-                    record_delegate_result_event(fabric, event_scope, &Ok(tool_result.clone())).await;
+                    record_delegate_result_event(fabric, event_scope.clone(), &Ok(tool_result.clone())).await;
+                    record_delegate_terminal_task_event(
+                        fabric,
+                        event_scope,
+                        agent_name,
+                        agent_config,
+                        scope.as_ref(),
+                        &Ok(tool_result.clone()),
+                        false,
+                    )
+                    .await;
                 }
                 Ok(tool_result)
             }
@@ -466,7 +572,17 @@ impl Tool for DelegateTool {
                     error: Some(format!("Agent '{agent_name}' failed: {e}",)),
                 };
                 if let Some(fabric) = memory_fabric.as_ref() {
-                    record_delegate_result_event(fabric, event_scope, &Ok(tool_result.clone())).await;
+                    record_delegate_result_event(fabric, event_scope.clone(), &Ok(tool_result.clone())).await;
+                    record_delegate_terminal_task_event(
+                        fabric,
+                        event_scope,
+                        agent_name,
+                        agent_config,
+                        scope.as_ref(),
+                        &Ok(tool_result.clone()),
+                        false,
+                    )
+                    .await;
                 }
                 Ok(tool_result)
             }
@@ -512,6 +628,66 @@ async fn record_delegate_result_event(
     {
         tracing::warn!("failed to record delegate result event: {error}");
     }
+}
+
+async fn record_delegate_task_event(
+    fabric: &MemoryFabric,
+    scope: MessageEventScope,
+    event_type: &str,
+    payload: serde_json::Value,
+) {
+    let task_id = scope.run_id.clone().unwrap_or_else(|| "delegate:unknown".to_string());
+    if let Err(error) = fabric
+        .record_task_event(scope, task_id, event_type.to_string(), Some(payload.to_string()))
+        .await
+    {
+        tracing::warn!(event_type, "failed to record delegate task event: {error}");
+    }
+}
+
+async fn record_delegate_terminal_task_event(
+    fabric: &MemoryFabric,
+    scope: MessageEventScope,
+    agent_name: &str,
+    agent_config: &DelegateAgentConfig,
+    delegate_scope: Option<&DelegateScope>,
+    result: &anyhow::Result<ToolResult>,
+    timeout: bool,
+) {
+    let (success, error, output_preview) = match result {
+        Ok(result) => (
+            result.success,
+            result.error.clone(),
+            result.output.chars().take(500).collect::<String>(),
+        ),
+        Err(error) => (false, Some(error.to_string()), String::new()),
+    };
+    let event_type = if timeout {
+        "delegate.task.timeout"
+    } else if success {
+        "delegate.task.completed"
+    } else {
+        "delegate.task.failed"
+    };
+    record_delegate_task_event(
+        fabric,
+        scope,
+        event_type,
+        json!({
+            "success": success,
+            "error": error,
+            "output_preview": output_preview,
+            "agent": agent_name,
+            "provider": agent_config.provider,
+            "model": agent_config.model,
+            "agentic": agent_config.agentic,
+            "owner_id": delegate_scope.and_then(|scope| scope.owner_id.clone()),
+            "topic_id": delegate_scope.and_then(|scope| scope.topic_id.clone()),
+            "parent_task_id": delegate_scope.and_then(|scope| scope.task_id.clone()),
+            "source_message_event_id": delegate_scope.and_then(|scope| scope.source_message_event_id.clone())
+        }),
+    )
+    .await;
 }
 
 impl DelegateTool {
@@ -574,6 +750,10 @@ impl DelegateTool {
             channel: scope.channel.as_str(),
             chat_type: scope.chat_type.as_str(),
             chat_id: scope.chat_id.as_str(),
+            owner_id: scope.owner_id.as_deref(),
+            topic_id: scope.topic_id.as_deref(),
+            task_id: scope.task_id.as_deref(),
+            source_message_event_id: scope.source_message_event_id.as_deref(),
             policy_pipeline: None,
         });
 
@@ -612,6 +792,11 @@ impl DelegateTool {
                 scope_ctx.as_ref(),
                 None,
                 None, // delegate sub-agents do not use tool tiering
+                scope_ctx.as_ref().and_then(|ctx| {
+                    self.memory
+                        .as_ref()
+                        .map(|memory| DocumentIngestRuntime::from_scope(memory.clone(), ctx))
+                }),
                 crate::agent::loop_::ChatMode::default(),
             ),
         )
@@ -1150,7 +1335,10 @@ mod tests {
                     "sender": "alice",
                     "channel": "telegram",
                     "chat_type": "direct",
-                    "chat_id": "chat-1"
+                    "chat_id": "chat-1",
+                    "topic_id": "topic-1",
+                    "task_id": "parent-task",
+                    "message_event_id": "msg-1"
                 }
             }))
             .await
@@ -1166,6 +1354,7 @@ mod tests {
                     session_key: Some("delegate:telegram:chat-1:alice".to_string()),
                     channel: Some("telegram".to_string()),
                     sender: Some("alice".to_string()),
+                    owner_id: None,
                 },
                 0,
                 10,
@@ -1180,6 +1369,89 @@ mod tests {
         assert_eq!(events[1].source, "delegate");
         assert_eq!(events[1].role, "event");
         assert!(events[1].content.contains("tester"));
+
+        let task_events = memory
+            .list_memory_events_since(
+                &MemoryPrincipal {
+                    workspace_id: tmp.path().to_string_lossy().to_string(),
+                    agent_id: Some("tester".to_string()),
+                    persona_id: None,
+                    session_key: Some("delegate:telegram:chat-1:alice".to_string()),
+                    channel: Some("telegram".to_string()),
+                    sender: Some("alice".to_string()),
+                    owner_id: None,
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.subject_table == "tasks")
+            .collect::<Vec<_>>();
+        let event_types = task_events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"delegate.task.started"));
+        assert!(event_types.contains(&"delegate.task.completed"));
+        assert!(task_events.iter().all(|event| !event.subject_id.is_empty()));
+        assert!(task_events.iter().any(|event| {
+            event
+                .payload_json
+                .as_deref()
+                .is_some_and(|payload| payload.contains("\"source_message_event_id\":\"msg-1\""))
+        }));
+    }
+
+    #[test]
+    fn delegate_event_scope_is_derived_from_runtime_envelope() {
+        let scope = DelegateScope {
+            sender: "alice".to_string(),
+            channel: "telegram".to_string(),
+            chat_type: "direct".to_string(),
+            chat_id: "chat-1".to_string(),
+            owner_id: Some("owner:/tmp/ws:telegram:alice".to_string()),
+            topic_id: Some("topic-a".to_string()),
+            task_id: Some("task-a".to_string()),
+            source_message_event_id: Some("msg-a".to_string()),
+        };
+        let event_scope = delegate_event_scope("/tmp/ws", "run-delegate", "tester", Some(&scope));
+
+        assert_eq!(event_scope.source, "delegate");
+        assert_eq!(event_scope.channel.as_deref(), Some("telegram"));
+        assert_eq!(
+            event_scope.session_key.as_deref(),
+            Some("delegate:telegram:chat-1:alice")
+        );
+        assert_eq!(event_scope.run_id.as_deref(), Some("run-delegate"));
+        assert_eq!(event_scope.agent_id.as_deref(), Some("tester"));
+        assert_eq!(event_scope.sender.as_deref(), Some("alice"));
+        assert_eq!(event_scope.recipient.as_deref(), Some("chat-1"));
+        assert_eq!(event_scope.owner_id.as_deref(), Some("owner:/tmp/ws:telegram:alice"));
+    }
+
+    #[test]
+    fn parse_delegate_scope_preserves_owner_topic_task_lineage() {
+        let scope = parse_delegate_scope(&json!({
+            "_zc_scope_trusted": true,
+            "_zc_scope": {
+                "sender": "alice",
+                "channel": "telegram",
+                "chat_type": "direct",
+                "chat_id": "chat-1",
+                "owner_id": "owner:/tmp/ws:telegram:alice",
+                "topic_id": "topic-a",
+                "task_id": "task-a",
+                "source_message_event_id": "msg-a"
+            }
+        }))
+        .expect("trusted scope should parse");
+
+        assert_eq!(scope.owner_id.as_deref(), Some("owner:/tmp/ws:telegram:alice"));
+        assert_eq!(scope.topic_id.as_deref(), Some("topic-a"));
+        assert_eq!(scope.task_id.as_deref(), Some("task-a"));
+        assert_eq!(scope.source_message_event_id.as_deref(), Some("msg-a"));
     }
 
     #[tokio::test]

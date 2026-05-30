@@ -147,7 +147,7 @@ impl EvolutionScheduler {
                                     gate_rejections: Vec::new(),
                                     judge_result: None,
                                     evolution_log: None,
-                                    shadow_mode: matches!(mode, EvolutionMode::Shadow),
+                                    shadow_mode: mode.is_draft_like(),
                                     rolled_back: false,
                                     errors: vec![err.to_string()],
                                 });

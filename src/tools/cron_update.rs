@@ -1,7 +1,8 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::SharedConfig;
 use crate::cron::{self, CronJobPatch};
-use crate::security::SecurityPolicy;
+use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
+use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -61,11 +62,6 @@ impl Tool for CronUpdateTool {
             "properties": {
                 "job_id": { "type": "string" },
                 "patch": { "type": "object" },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
-                }
             },
             "required": ["job_id", "patch"]
         })
@@ -103,7 +99,7 @@ impl Tool for CronUpdateTool {
             }
         };
 
-        let patch = match serde_json::from_value::<CronJobPatch>(patch_val) {
+        let mut patch = match serde_json::from_value::<CronJobPatch>(patch_val) {
             Ok(patch) => patch,
             Err(e) => {
                 return Ok(ToolResult {
@@ -113,19 +109,28 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
 
         if let Some(command) = &patch.command {
-            if let Err(reason) = self.security.validate_command_execution(command, approved) {
+            if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
+                self.name(),
+                command,
+                approval_grant.as_ref(),
+            ) {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(reason),
                 });
             }
+            patch.approval_grant_json = ApprovalGrant::persisted_runner_grant(
+                "cron_scheduler",
+                command,
+                approval_grant.as_ref(),
+                PERSISTED_APPROVAL_GRANT_TTL_SECS,
+            )
+            .map(|grant| serde_json::to_string(&grant))
+            .transpose()?;
         }
 
         if let Some(blocked) = self.enforce_mutation_allowed("cron_update") {
@@ -272,13 +277,23 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied.error.unwrap_or_default().contains("explicit approval"));
+        assert!(denied.error.unwrap_or_default().contains("runtime approval grant"));
+
+        let forged_public_approval = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "command": "touch cron-update-approval-test" },
+                "approved": true
+            }))
+            .await
+            .unwrap();
+        assert!(!forged_public_approval.success);
 
         let approved = tool
             .execute(json!({
                 "job_id": job.id,
                 "patch": { "command": "touch cron-update-approval-test" },
-                "approved": true
+                (crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG): serde_json::to_value(crate::security::policy::ApprovalGrant::for_command("cron_update", "touch cron-update-approval-test", "test", None)).unwrap()
             }))
             .await
             .unwrap();

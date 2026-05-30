@@ -1,9 +1,11 @@
-use super::principal::MemoryWriteContext;
+use super::principal::{ChatType, MemoryWriteContext, Principal, Role, Visibility, classify_memory};
 use super::traits::{
-    Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryPrincipal,
-    MemoryStoreMetadata, MemoryVisibility, MessageEvent, MessageEventInput, SessionContextQuery, SharedContextQuery,
-    validate_memory_write_target,
+    CompactionRun, CompactionRunInput, DocumentChunkRecord, DocumentIngestInput, DocumentRecord, DocumentSearchResult,
+    Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink,
+    MemoryLinkInput, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent, MessageEventInput,
+    RetrievalTrace, RetrievalTraceInput, SessionContextQuery, SharedContextQuery, validate_memory_write_target,
 };
+use super::{embeddings, vector};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -16,6 +18,18 @@ use uuid::Uuid;
 
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
+const POSTGRES_EMBEDDING_CACHE_MAX_ROWS: i64 = 10_000;
+
+fn message_event_type_for(role: &str, content: &str) -> Option<String> {
+    if role != "event" {
+        return None;
+    }
+    content
+        .split_whitespace()
+        .next()
+        .filter(|event_type| event_type.contains('.'))
+        .map(str::to_string)
+}
 
 /// PostgreSQL-backed persistent memory.
 ///
@@ -27,6 +41,17 @@ pub struct PostgresMemory {
     qualified_message_events_table: String,
     qualified_memory_events_table: String,
     qualified_drafts_table: String,
+    qualified_documents_table: String,
+    qualified_document_chunks_table: String,
+    qualified_memory_links_table: String,
+    qualified_retrieval_traces_table: String,
+    qualified_compaction_runs_table: String,
+    qualified_embedding_cache_table: String,
+    embedding_cache_max_rows: i64,
+    pgvector_available: bool,
+    embedder: Arc<dyn embeddings::EmbeddingProvider>,
+    vector_weight: f32,
+    keyword_weight: f32,
 }
 
 struct PostgresClientSlot {
@@ -65,6 +90,48 @@ impl Drop for PostgresClientSlot {
 
 impl PostgresMemory {
     pub fn new(db_url: &str, schema: &str, table: &str, connect_timeout_secs: Option<u64>) -> Result<Self> {
+        Self::with_embedder(
+            db_url,
+            schema,
+            table,
+            connect_timeout_secs,
+            Arc::new(embeddings::NoopEmbedding),
+            0.35,
+            0.65,
+        )
+    }
+
+    pub fn with_embedder(
+        db_url: &str,
+        schema: &str,
+        table: &str,
+        connect_timeout_secs: Option<u64>,
+        embedder: Arc<dyn embeddings::EmbeddingProvider>,
+        vector_weight: f32,
+        keyword_weight: f32,
+    ) -> Result<Self> {
+        Self::with_embedder_and_cache(
+            db_url,
+            schema,
+            table,
+            connect_timeout_secs,
+            embedder,
+            vector_weight,
+            keyword_weight,
+            usize::try_from(POSTGRES_EMBEDDING_CACHE_MAX_ROWS).unwrap_or(10_000),
+        )
+    }
+
+    pub fn with_embedder_and_cache(
+        db_url: &str,
+        schema: &str,
+        table: &str,
+        connect_timeout_secs: Option<u64>,
+        embedder: Arc<dyn embeddings::EmbeddingProvider>,
+        vector_weight: f32,
+        keyword_weight: f32,
+        cache_max: usize,
+    ) -> Result<Self> {
         validate_identifier(schema, "storage schema")?;
         validate_identifier(table, "storage table")?;
 
@@ -73,15 +140,33 @@ impl PostgresMemory {
         let message_events_table = related_table_name(table, "_message_events")?;
         let memory_events_table = related_table_name(table, "_memory_events")?;
         let drafts_table = related_table_name(table, "_drafts")?;
+        let documents_table = related_table_name(table, "_documents")?;
+        let document_chunks_table = related_table_name(table, "_document_chunks")?;
+        let memory_links_table = related_table_name(table, "_memory_links")?;
+        let retrieval_traces_table = related_table_name(table, "_retrieval_traces")?;
+        let compaction_runs_table = related_table_name(table, "_compaction_runs")?;
+        let embedding_cache_table = related_table_name(table, "_embedding_cache")?;
         let message_events_table_ident = quote_identifier(&message_events_table);
         let memory_events_table_ident = quote_identifier(&memory_events_table);
         let drafts_table_ident = quote_identifier(&drafts_table);
+        let documents_table_ident = quote_identifier(&documents_table);
+        let document_chunks_table_ident = quote_identifier(&document_chunks_table);
+        let memory_links_table_ident = quote_identifier(&memory_links_table);
+        let retrieval_traces_table_ident = quote_identifier(&retrieval_traces_table);
+        let compaction_runs_table_ident = quote_identifier(&compaction_runs_table);
+        let embedding_cache_table_ident = quote_identifier(&embedding_cache_table);
         let qualified_table = format!("{schema_ident}.{table_ident}");
         let qualified_message_events_table = format!("{schema_ident}.{message_events_table_ident}");
         let qualified_memory_events_table = format!("{schema_ident}.{memory_events_table_ident}");
         let qualified_drafts_table = format!("{schema_ident}.{drafts_table_ident}");
+        let qualified_documents_table = format!("{schema_ident}.{documents_table_ident}");
+        let qualified_document_chunks_table = format!("{schema_ident}.{document_chunks_table_ident}");
+        let qualified_memory_links_table = format!("{schema_ident}.{memory_links_table_ident}");
+        let qualified_retrieval_traces_table = format!("{schema_ident}.{retrieval_traces_table_ident}");
+        let qualified_compaction_runs_table = format!("{schema_ident}.{compaction_runs_table_ident}");
+        let qualified_embedding_cache_table = format!("{schema_ident}.{embedding_cache_table_ident}");
 
-        let client = Self::initialize_client(
+        let (client, pgvector_available) = Self::initialize_client(
             db_url.to_string(),
             connect_timeout_secs,
             schema_ident,
@@ -89,6 +174,13 @@ impl PostgresMemory {
             qualified_message_events_table.clone(),
             qualified_memory_events_table.clone(),
             qualified_drafts_table.clone(),
+            qualified_documents_table.clone(),
+            qualified_document_chunks_table.clone(),
+            qualified_memory_links_table.clone(),
+            qualified_retrieval_traces_table.clone(),
+            qualified_compaction_runs_table.clone(),
+            qualified_embedding_cache_table.clone(),
+            embedder.dimensions(),
         )?;
 
         Ok(Self {
@@ -97,6 +189,17 @@ impl PostgresMemory {
             qualified_message_events_table,
             qualified_memory_events_table,
             qualified_drafts_table,
+            qualified_documents_table,
+            qualified_document_chunks_table,
+            qualified_memory_links_table,
+            qualified_retrieval_traces_table,
+            qualified_compaction_runs_table,
+            qualified_embedding_cache_table,
+            embedding_cache_max_rows: i64::try_from(cache_max.max(1)).unwrap_or(POSTGRES_EMBEDDING_CACHE_MAX_ROWS),
+            pgvector_available,
+            embedder,
+            vector_weight,
+            keyword_weight,
         })
     }
 
@@ -108,10 +211,17 @@ impl PostgresMemory {
         qualified_message_events_table: String,
         qualified_memory_events_table: String,
         qualified_drafts_table: String,
-    ) -> Result<Client> {
+        qualified_documents_table: String,
+        qualified_document_chunks_table: String,
+        qualified_memory_links_table: String,
+        qualified_retrieval_traces_table: String,
+        qualified_compaction_runs_table: String,
+        qualified_embedding_cache_table: String,
+        embedding_dimensions: usize,
+    ) -> Result<(Client, bool)> {
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())
-            .spawn(move || -> Result<Client> {
+            .spawn(move || -> Result<(Client, bool)> {
                 let mut config: postgres::Config = db_url.parse().context("invalid PostgreSQL connection URL")?;
 
                 if let Some(timeout_secs) = connect_timeout_secs {
@@ -123,15 +233,22 @@ impl PostgresMemory {
                     .connect(NoTls)
                     .context("failed to connect to PostgreSQL memory backend")?;
 
-                Self::init_schema(
+                let pgvector_available = Self::init_schema(
                     &mut client,
                     &schema_ident,
                     &qualified_table,
                     &qualified_message_events_table,
                     &qualified_memory_events_table,
                     &qualified_drafts_table,
+                    &qualified_documents_table,
+                    &qualified_document_chunks_table,
+                    &qualified_memory_links_table,
+                    &qualified_retrieval_traces_table,
+                    &qualified_compaction_runs_table,
+                    &qualified_embedding_cache_table,
+                    embedding_dimensions,
                 )?;
-                Ok(client)
+                Ok((client, pgvector_available))
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
 
@@ -151,7 +268,14 @@ impl PostgresMemory {
         qualified_message_events_table: &str,
         qualified_memory_events_table: &str,
         qualified_drafts_table: &str,
-    ) -> Result<()> {
+        qualified_documents_table: &str,
+        qualified_document_chunks_table: &str,
+        qualified_memory_links_table: &str,
+        qualified_retrieval_traces_table: &str,
+        qualified_compaction_runs_table: &str,
+        qualified_embedding_cache_table: &str,
+        embedding_dimensions: usize,
+    ) -> Result<bool> {
         client.batch_execute(&format!(
             "
             CREATE SCHEMA IF NOT EXISTS {schema_ident};
@@ -166,20 +290,122 @@ impl PostgresMemory {
                 session_id TEXT,
                 useful_count INTEGER NOT NULL DEFAULT 0,
                 workspace_id TEXT,
+                owner_id TEXT,
                 agent_id TEXT,
                 persona_id TEXT,
                 source_event_id TEXT,
-                source TEXT
+                source TEXT,
+                embedding BYTEA,
+                embedding_provider TEXT,
+                embedding_model TEXT,
+                embedding_dimensions BIGINT,
+                channel TEXT,
+                chat_type TEXT,
+                chat_id TEXT,
+                sender_id TEXT,
+                raw_sender TEXT,
+                topic_id TEXT,
+                visibility TEXT NOT NULL DEFAULT 'workspace',
+                sensitivity TEXT NOT NULL DEFAULT 'normal',
+                risk_signals TEXT,
+                policy_version BIGINT
             );
 
             CREATE INDEX IF NOT EXISTS idx_memories_category ON {qualified_table}(category);
             CREATE INDEX IF NOT EXISTS idx_memories_session_id ON {qualified_table}(session_id);
             CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memories_context_scope
+                ON {qualified_table}(channel, chat_id, raw_sender);
+            CREATE INDEX IF NOT EXISTS idx_memories_owner_scope
+                ON {qualified_table}(owner_id);
+            CREATE INDEX IF NOT EXISTS idx_memories_sender_scope
+                ON {qualified_table}(sender_id);
+            CREATE INDEX IF NOT EXISTS idx_memories_visibility
+                ON {qualified_table}(visibility, sensitivity);
+            CREATE INDEX IF NOT EXISTS idx_memories_embedding_current
+                ON {qualified_table}(embedding_provider, embedding_model, embedding_dimensions, session_id, id)
+                WHERE embedding IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS {schema_ident}.agent_identity_bindings (
+                binding_id TEXT PRIMARY KEY,
+                external_subject TEXT NOT NULL,
+                external_issuer TEXT NOT NULL,
+                auth_method TEXT NOT NULL,
+                prx_owner_id TEXT NOT NULL,
+                prx_principal_id TEXT NOT NULL,
+                capabilities TEXT NOT NULL,
+                expires_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMPTZ,
+                UNIQUE (external_issuer, external_subject, auth_method)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_bindings_lookup
+                ON {schema_ident}.agent_identity_bindings(external_issuer, external_subject);
+            CREATE INDEX IF NOT EXISTS idx_agent_bindings_owner
+                ON {schema_ident}.agent_identity_bindings(prx_owner_id);
+
+            CREATE TABLE IF NOT EXISTS {schema_ident}.approval_grants (
+                grant_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                owner_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                session_key TEXT,
+                issuer_authority TEXT NOT NULL,
+                issuer_authority_id TEXT NOT NULL,
+                issuer_public_key_id TEXT NOT NULL,
+                capability_op_id TEXT NOT NULL,
+                capability_op_id_match TEXT NOT NULL,
+                capability_risk_level TEXT NOT NULL CHECK (capability_risk_level IN ('low','medium','high','critical')),
+                resource_constraints_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                grant_json JSONB NOT NULL,
+                signature_alg TEXT NOT NULL,
+                signed_payload_sha256 TEXT NOT NULL,
+                issued_at TIMESTAMPTZ NOT NULL,
+                not_before TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                max_uses BIGINT NOT NULL,
+                uses_consumed BIGINT NOT NULL DEFAULT 0,
+                related_task_id TEXT,
+                related_message_event_id BIGINT,
+                revoked_at TIMESTAMPTZ,
+                revocation_reason TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_approval_grants_owner
+                ON {schema_ident}.approval_grants(workspace_id, owner_id, issued_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_approval_grants_principal
+                ON {schema_ident}.approval_grants(workspace_id, principal_id, issued_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_approval_grants_capability
+                ON {schema_ident}.approval_grants(workspace_id, capability_op_id, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_approval_grants_active
+                ON {schema_ident}.approval_grants(workspace_id, expires_at, revoked_at);
+
+            CREATE TABLE IF NOT EXISTS {schema_ident}.approval_grant_events (
+                id BIGSERIAL PRIMARY KEY,
+                event_id TEXT UNIQUE NOT NULL,
+                grant_id TEXT NOT NULL REFERENCES {schema_ident}.approval_grants(grant_id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL CHECK (event_type IN (
+                    'grant.issued','grant.verified','grant.consumed','grant.revoked',
+                    'grant.rejected','grant.expired'
+                )),
+                actor TEXT NOT NULL,
+                occurred_at TIMESTAMPTZ NOT NULL,
+                payload_json JSONB
+            );
+            CREATE INDEX IF NOT EXISTS idx_approval_grant_events_grant
+                ON {schema_ident}.approval_grant_events(grant_id, occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_approval_grant_events_type
+                ON {schema_ident}.approval_grant_events(event_type, occurred_at);
 
             ALTER TABLE {qualified_table}
                 ADD COLUMN IF NOT EXISTS useful_count INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE {qualified_table}
                 ADD COLUMN IF NOT EXISTS workspace_id TEXT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS owner_id TEXT;
             ALTER TABLE {qualified_table}
                 ADD COLUMN IF NOT EXISTS agent_id TEXT;
             ALTER TABLE {qualified_table}
@@ -188,12 +414,56 @@ impl PostgresMemory {
                 ADD COLUMN IF NOT EXISTS source_event_id TEXT;
             ALTER TABLE {qualified_table}
                 ADD COLUMN IF NOT EXISTS source TEXT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS embedding BYTEA;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS embedding_provider TEXT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS embedding_model TEXT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS embedding_dimensions BIGINT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS channel TEXT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS chat_type TEXT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS chat_id TEXT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS sender_id TEXT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS raw_sender TEXT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS topic_id TEXT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'workspace';
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS sensitivity TEXT NOT NULL DEFAULT 'normal';
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS risk_signals TEXT;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS policy_version BIGINT;
+
+            CREATE TABLE IF NOT EXISTS {qualified_embedding_cache_table} (
+                content_hash TEXT NOT NULL,
+                embedding BYTEA NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                dimensions BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                accessed_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (content_hash, provider, model, dimensions)
+            );
+            CREATE INDEX IF NOT EXISTS idx_embedding_cache_accessed
+                ON {qualified_embedding_cache_table}(accessed_at);
+            CREATE INDEX IF NOT EXISTS idx_embedding_cache_provider_model
+                ON {qualified_embedding_cache_table}(provider, model, dimensions, accessed_at);
 
             CREATE TABLE IF NOT EXISTS {qualified_message_events_table} (
                 id BIGSERIAL PRIMARY KEY,
                 event_id TEXT UNIQUE NOT NULL,
                 idempotency_key TEXT UNIQUE,
                 workspace_id TEXT NOT NULL,
+                owner_id TEXT,
                 source TEXT NOT NULL,
                 channel TEXT,
                 session_key TEXT,
@@ -205,6 +475,7 @@ impl PostgresMemory {
                 sender TEXT,
                 recipient TEXT,
                 role TEXT NOT NULL,
+                event_type TEXT,
                 content TEXT NOT NULL,
                 content_hash TEXT,
                 raw_payload_json TEXT,
@@ -212,9 +483,13 @@ impl PostgresMemory {
                 created_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL
             );
+            ALTER TABLE {qualified_message_events_table}
+                ADD COLUMN IF NOT EXISTS event_type TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_message_events_workspace_id
                 ON {qualified_message_events_table}(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_message_events_owner_id
+                ON {qualified_message_events_table}(workspace_id, owner_id, id);
             CREATE INDEX IF NOT EXISTS idx_message_events_session
                 ON {qualified_message_events_table}(workspace_id, session_key, id);
             CREATE INDEX IF NOT EXISTS idx_message_events_agent
@@ -223,6 +498,8 @@ impl PostgresMemory {
                 ON {qualified_message_events_table}(workspace_id, channel, sender, id);
             CREATE INDEX IF NOT EXISTS idx_message_events_visibility
                 ON {qualified_message_events_table}(workspace_id, visibility, id);
+            CREATE INDEX IF NOT EXISTS idx_message_events_event_type
+                ON {qualified_message_events_table}(workspace_id, event_type, id);
             CREATE INDEX IF NOT EXISTS idx_message_events_created_at
                 ON {qualified_message_events_table}(created_at);
 
@@ -252,6 +529,7 @@ impl PostgresMemory {
                 id BIGSERIAL PRIMARY KEY,
                 draft_id TEXT UNIQUE NOT NULL,
                 workspace_id TEXT NOT NULL,
+                owner_id TEXT,
                 worker_run_id TEXT NOT NULL,
                 parent_run_id TEXT,
                 session_key TEXT,
@@ -270,11 +548,15 @@ impl PostgresMemory {
 
             CREATE INDEX IF NOT EXISTS idx_memory_drafts_worker_run
                 ON {qualified_drafts_table}(worker_run_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_drafts_owner
+                ON {qualified_drafts_table}(workspace_id, owner_id, id);
             CREATE INDEX IF NOT EXISTS idx_memory_drafts_status
                 ON {qualified_drafts_table}(status, id);
             CREATE INDEX IF NOT EXISTS idx_memory_drafts_source_event
                 ON {qualified_drafts_table}(source_event_id);
 
+            ALTER TABLE {qualified_drafts_table}
+                ADD COLUMN IF NOT EXISTS owner_id TEXT;
             ALTER TABLE {qualified_drafts_table}
                 ADD COLUMN IF NOT EXISTS parent_run_id TEXT;
             ALTER TABLE {qualified_drafts_table}
@@ -287,10 +569,206 @@ impl PostgresMemory {
                 ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'workspace';
             ALTER TABLE {qualified_drafts_table}
                 ADD COLUMN IF NOT EXISTS payload_json TEXT;
+
+            CREATE TABLE IF NOT EXISTS {qualified_documents_table} (
+                id BIGSERIAL PRIMARY KEY,
+                document_id TEXT UNIQUE NOT NULL,
+                workspace_id TEXT NOT NULL,
+                owner_id TEXT,
+                topic_id TEXT,
+                task_id TEXT,
+                source_message_event_id TEXT,
+                source_kind TEXT NOT NULL,
+                source_uri TEXT,
+                title TEXT,
+                content_sha256 TEXT NOT NULL,
+                mime_type TEXT,
+                visibility TEXT NOT NULL DEFAULT 'workspace',
+                metadata_json TEXT,
+                chunk_count BIGINT NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS {qualified_document_chunks_table} (
+                id BIGSERIAL PRIMARY KEY,
+                chunk_id TEXT UNIQUE NOT NULL,
+                document_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                owner_id TEXT,
+                topic_id TEXT,
+                task_id TEXT,
+                chunk_index BIGINT NOT NULL,
+                heading TEXT,
+                content TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                embedding BYTEA,
+                embedding_provider TEXT,
+                embedding_model TEXT,
+                embedding_dimensions BIGINT,
+                source_anchor TEXT NOT NULL,
+                token_estimate BIGINT NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+
+            ALTER TABLE {qualified_document_chunks_table}
+                ADD COLUMN IF NOT EXISTS embedding BYTEA;
+            ALTER TABLE {qualified_document_chunks_table}
+                ADD COLUMN IF NOT EXISTS embedding_provider TEXT;
+            ALTER TABLE {qualified_document_chunks_table}
+                ADD COLUMN IF NOT EXISTS embedding_model TEXT;
+            ALTER TABLE {qualified_document_chunks_table}
+                ADD COLUMN IF NOT EXISTS embedding_dimensions BIGINT;
+
+            CREATE TABLE IF NOT EXISTS {qualified_memory_links_table} (
+                id BIGSERIAL PRIMARY KEY,
+                link_id TEXT UNIQUE NOT NULL,
+                workspace_id TEXT NOT NULL,
+                owner_id TEXT,
+                memory_key TEXT,
+                memory_event_id TEXT,
+                message_event_id TEXT,
+                document_id TEXT NOT NULL,
+                chunk_id TEXT,
+                link_type TEXT NOT NULL,
+                payload_json TEXT,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS {qualified_retrieval_traces_table} (
+                id BIGSERIAL PRIMARY KEY,
+                trace_id TEXT UNIQUE NOT NULL,
+                workspace_id TEXT NOT NULL,
+                owner_id TEXT,
+                session_key TEXT,
+                agent_id TEXT,
+                persona_id TEXT,
+                source TEXT NOT NULL,
+                query TEXT NOT NULL,
+                candidate_count BIGINT NOT NULL,
+                selected_count BIGINT NOT NULL,
+                dropped_count BIGINT NOT NULL,
+                budget_tokens BIGINT,
+                selected_json TEXT,
+                dropped_json TEXT,
+                payload_json TEXT,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS {qualified_compaction_runs_table} (
+                id BIGSERIAL PRIMARY KEY,
+                run_id TEXT UNIQUE NOT NULL,
+                workspace_id TEXT NOT NULL,
+                owner_id TEXT,
+                session_key TEXT,
+                agent_id TEXT,
+                persona_id TEXT,
+                trigger TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                source_message_count BIGINT NOT NULL,
+                source_token_estimate BIGINT NOT NULL,
+                summary TEXT NOT NULL,
+                summary_memory_key TEXT,
+                source_event_ids_json TEXT,
+                source_document_refs_json TEXT,
+                fidelity_status TEXT NOT NULL,
+                payload_json TEXT,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_documents_workspace
+                ON {qualified_documents_table}(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_documents_owner
+                ON {qualified_documents_table}(workspace_id, owner_id, id);
+            CREATE INDEX IF NOT EXISTS idx_documents_topic
+                ON {qualified_documents_table}(workspace_id, topic_id, id);
+            CREATE INDEX IF NOT EXISTS idx_documents_task
+                ON {qualified_documents_table}(workspace_id, task_id, id);
+            CREATE INDEX IF NOT EXISTS idx_documents_hash
+                ON {qualified_documents_table}(workspace_id, content_sha256);
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_document
+                ON {qualified_document_chunks_table}(document_id, chunk_index);
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_workspace
+                ON {qualified_document_chunks_table}(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_owner
+                ON {qualified_document_chunks_table}(workspace_id, owner_id, id);
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_topic
+                ON {qualified_document_chunks_table}(workspace_id, topic_id, id);
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_content_tsv
+                ON {qualified_document_chunks_table}
+                USING GIN (to_tsvector('simple', content));
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding_current
+                ON {qualified_document_chunks_table}(embedding_provider, embedding_model, embedding_dimensions, workspace_id, owner_id, id)
+                WHERE embedding IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_memory_links_workspace
+                ON {qualified_memory_links_table}(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_links_document
+                ON {qualified_memory_links_table}(document_id, chunk_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_links_memory_key
+                ON {qualified_memory_links_table}(workspace_id, memory_key);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_traces_workspace
+                ON {qualified_retrieval_traces_table}(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_traces_owner
+                ON {qualified_retrieval_traces_table}(workspace_id, owner_id, id);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_traces_session
+                ON {qualified_retrieval_traces_table}(workspace_id, session_key, id);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_traces_source
+                ON {qualified_retrieval_traces_table}(workspace_id, source, id);
+            CREATE INDEX IF NOT EXISTS idx_compaction_runs_workspace
+                ON {qualified_compaction_runs_table}(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_compaction_runs_owner
+                ON {qualified_compaction_runs_table}(workspace_id, owner_id, id);
+            CREATE INDEX IF NOT EXISTS idx_compaction_runs_session
+                ON {qualified_compaction_runs_table}(workspace_id, session_key, id);
+            CREATE INDEX IF NOT EXISTS idx_compaction_runs_trigger
+                ON {qualified_compaction_runs_table}(workspace_id, trigger, id);
             "
         ))?;
 
-        Ok(())
+        Ok(Self::try_init_pgvector(
+            client,
+            qualified_table,
+            qualified_document_chunks_table,
+            embedding_dimensions,
+        ))
+    }
+
+    fn try_init_pgvector(
+        client: &mut Client,
+        qualified_table: &str,
+        qualified_document_chunks_table: &str,
+        embedding_dimensions: usize,
+    ) -> bool {
+        if embedding_dimensions == 0 {
+            return false;
+        }
+        let Ok(dimensions) = i64::try_from(embedding_dimensions) else {
+            return false;
+        };
+        let init = format!(
+            "
+            CREATE EXTENSION IF NOT EXISTS vector;
+            ALTER TABLE {qualified_table}
+                ADD COLUMN IF NOT EXISTS embedding_vector vector({dimensions});
+            ALTER TABLE {qualified_document_chunks_table}
+                ADD COLUMN IF NOT EXISTS embedding_vector vector({dimensions});
+            CREATE INDEX IF NOT EXISTS idx_memories_embedding_vector_hnsw
+                ON {qualified_table}
+                USING hnsw (embedding_vector vector_cosine_ops)
+                WHERE embedding_vector IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding_vector_hnsw
+                ON {qualified_document_chunks_table}
+                USING hnsw (embedding_vector vector_cosine_ops)
+                WHERE embedding_vector IS NOT NULL;
+            "
+        );
+        match client.batch_execute(&init) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::debug!(error = %error, "Postgres pgvector/ANN initialization skipped");
+                false
+            }
+        }
     }
 
     fn category_to_str(category: &MemoryCategory) -> String {
@@ -308,8 +786,238 @@ impl PostgresMemory {
         format!("{:x}", hasher.finalize())
     }
 
+    fn content_sha256_hex(content: &str) -> String {
+        Self::content_hash(content)
+    }
+
+    fn pgvector_literal(embedding: &[f32]) -> Option<String> {
+        if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        Some(format!(
+            "[{}]",
+            embedding
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+    }
+
+    const fn memory_category_needs_embedding(category: &MemoryCategory) -> bool {
+        matches!(category, MemoryCategory::Core | MemoryCategory::Custom(_))
+    }
+
+    fn embedding_provider_name(&self) -> String {
+        self.embedder.name().to_string()
+    }
+
+    fn embedding_model_name(&self) -> String {
+        self.embedder.model().to_string()
+    }
+
+    fn embedding_dimensions_i64(&self) -> i64 {
+        i64::try_from(self.embedder.dimensions()).unwrap_or(i64::MAX)
+    }
+
+    async fn get_or_compute_embedding(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        if self.embedder.dimensions() == 0 {
+            return Ok(None);
+        }
+        let content_hash = Self::content_hash(text);
+        let provider_name = self.embedding_provider_name();
+        let model_name = self.embedding_model_name();
+        let dimensions = self.embedding_dimensions_i64();
+        let cache_table = self.qualified_embedding_cache_table.clone();
+        let client = self.client.clone();
+        let cache_hash = content_hash.clone();
+        let cache_provider = provider_name.clone();
+        let cache_model = model_name.clone();
+        let cached = tokio::task::spawn_blocking(move || -> Result<Option<Vec<f32>>> {
+            let select_stmt = format!(
+                "
+                SELECT embedding
+                FROM {cache_table}
+                WHERE content_hash = $1
+                  AND provider = $2
+                  AND model = $3
+                  AND dimensions = $4
+                LIMIT 1
+                "
+            );
+            let update_stmt = format!(
+                "
+                UPDATE {cache_table}
+                SET accessed_at = $5
+                WHERE content_hash = $1
+                  AND provider = $2
+                  AND model = $3
+                  AND dimensions = $4
+                "
+            );
+            client.with_client(|client| {
+                let row = client.query_opt(&select_stmt, &[&cache_hash, &cache_provider, &cache_model, &dimensions])?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let bytes: Vec<u8> = row.get(0);
+                let embedding = vector::bytes_to_vec(&bytes);
+                if embedding.len() != usize::try_from(dimensions).unwrap_or(usize::MAX) {
+                    return Ok(None);
+                }
+                let now = Utc::now();
+                client.execute(
+                    &update_stmt,
+                    &[&cache_hash, &cache_provider, &cache_model, &dimensions, &now],
+                )?;
+                Ok(Some(embedding))
+            })
+        })
+        .await??;
+        if cached.is_some() {
+            return Ok(cached);
+        }
+
+        let embedding = self.embedder.embed_one(text).await?;
+        if embedding.len() != self.embedder.dimensions() {
+            anyhow::bail!(
+                "embedding dimension mismatch: provider={} model={} expected={} got={}",
+                self.embedder.name(),
+                self.embedder.model(),
+                self.embedder.dimensions(),
+                embedding.len()
+            );
+        }
+        let cache_table = self.qualified_embedding_cache_table.clone();
+        let client = self.client.clone();
+        let provider_name = self.embedding_provider_name();
+        let model_name = self.embedding_model_name();
+        let dimensions = self.embedding_dimensions_i64();
+        let cache_max = self.embedding_cache_max_rows;
+        let bytes = vector::vec_to_bytes(&embedding);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let insert_stmt = format!(
+                "
+                INSERT INTO {cache_table} (
+                    content_hash, embedding, provider, model, dimensions, created_at, accessed_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $6)
+                ON CONFLICT (content_hash, provider, model, dimensions)
+                DO UPDATE SET embedding = EXCLUDED.embedding, accessed_at = EXCLUDED.accessed_at
+                "
+            );
+            let evict_stmt = format!(
+                "
+                DELETE FROM {cache_table}
+                WHERE (content_hash, provider, model, dimensions) IN (
+                    SELECT content_hash, provider, model, dimensions
+                    FROM {cache_table}
+                    ORDER BY accessed_at ASC
+                    LIMIT GREATEST(
+                        (SELECT COUNT(*) FROM {cache_table}) - $1,
+                        0
+                    )
+                )
+                "
+            );
+            client.with_client(|client| {
+                let mut tx = client.transaction()?;
+                let now = Utc::now();
+                tx.execute(
+                    &insert_stmt,
+                    &[&content_hash, &bytes, &provider_name, &model_name, &dimensions, &now],
+                )?;
+                tx.execute(&evict_stmt, &[&cache_max])?;
+                tx.commit()?;
+                Ok(())
+            })
+        })
+        .await??;
+        Ok(Some(embedding))
+    }
+
+    async fn embedding_metadata_for_category(
+        &self,
+        category: &MemoryCategory,
+        content: &str,
+    ) -> Result<(
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    )> {
+        if !Self::memory_category_needs_embedding(category) {
+            return Ok((None, None, None, None, None));
+        }
+        let Some(embedding) = self.get_or_compute_embedding(content).await? else {
+            return Ok((None, None, None, None, None));
+        };
+        let pgvector_literal = self
+            .pgvector_available
+            .then(|| Self::pgvector_literal(&embedding))
+            .flatten();
+        Ok((
+            Some(vector::vec_to_bytes(&embedding)),
+            Some(self.embedding_provider_name()),
+            Some(self.embedding_model_name()),
+            Some(self.embedding_dimensions_i64()),
+            pgvector_literal,
+        ))
+    }
+
+    fn document_owner_for_principal(principal: &MemoryPrincipal) -> Option<String> {
+        let channel = principal.channel.as_deref()?.trim();
+        let sender = principal.sender.as_deref()?.trim();
+        if channel.is_empty() || sender.is_empty() {
+            return None;
+        }
+        Some(
+            super::principal::OwnerPrincipal::new(
+                principal.workspace_id.clone(),
+                channel,
+                sender,
+                principal.session_key.clone().unwrap_or_default(),
+                vec![Role::Anonymous],
+            )
+            .owner_id,
+        )
+    }
+
     fn is_system_principal(principal: &MemoryPrincipal) -> bool {
         principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system")
+    }
+
+    fn principal_from_context(context: &MemoryWriteContext) -> Principal {
+        let current_channel = context.channel.clone().unwrap_or_default();
+        let current_chat_id = context.chat_id.clone().unwrap_or_default();
+        let current_chat_type = context
+            .chat_type
+            .as_deref()
+            .map(ChatType::from_str)
+            .unwrap_or(ChatType::Dm);
+        let user_id = context.sender_id.clone().unwrap_or_else(|| {
+            let channel = context.channel.as_deref().unwrap_or("unknown");
+            let raw_sender = context.raw_sender.as_deref().unwrap_or("unknown");
+            format!("anonymous:{channel}:{raw_sender}")
+        });
+        let role = if context.sender_id.is_some() {
+            Role::Member
+        } else {
+            Role::Anonymous
+        };
+
+        Principal {
+            user_id,
+            role,
+            projects: Vec::new(),
+            visibility_ceiling: Visibility::Private,
+            blocked_patterns: Vec::new(),
+            current_channel,
+            current_chat_id,
+            current_chat_type,
+            acl_enforced: true,
+        }
     }
 
     fn parse_category(value: &str) -> MemoryCategory {
@@ -344,10 +1052,10 @@ impl PostgresMemory {
     }
 
     fn row_to_message_event(row: &Row) -> Result<MessageEvent> {
-        let created_at: DateTime<Utc> = row.get(19);
-        let updated_at: DateTime<Utc> = row.get(20);
+        let created_at: DateTime<Utc> = row.get(20);
+        let updated_at: DateTime<Utc> = row.get(21);
         let visibility = row
-            .get::<_, String>(18)
+            .get::<_, String>(19)
             .parse::<MemoryVisibility>()
             .unwrap_or(MemoryVisibility::Workspace);
 
@@ -356,20 +1064,21 @@ impl PostgresMemory {
             event_id: row.get(1),
             idempotency_key: row.get(2),
             workspace_id: row.get(3),
-            source: row.get(4),
-            channel: row.get(5),
-            session_key: row.get(6),
-            parent_session_key: row.get(7),
-            run_id: row.get(8),
-            parent_run_id: row.get(9),
-            agent_id: row.get(10),
-            persona_id: row.get(11),
-            sender: row.get(12),
-            recipient: row.get(13),
-            role: row.get(14),
-            content: row.get(15),
-            content_hash: row.get(16),
-            raw_payload_json: row.get(17),
+            owner_id: row.get(4),
+            source: row.get(5),
+            channel: row.get(6),
+            session_key: row.get(7),
+            parent_session_key: row.get(8),
+            run_id: row.get(9),
+            parent_run_id: row.get(10),
+            agent_id: row.get(11),
+            persona_id: row.get(12),
+            sender: row.get(13),
+            recipient: row.get(14),
+            role: row.get(15),
+            content: row.get(16),
+            content_hash: row.get(17),
+            raw_payload_json: row.get(18),
             visibility,
             created_at: created_at.to_rfc3339(),
             updated_at: updated_at.to_rfc3339(),
@@ -400,10 +1109,10 @@ impl PostgresMemory {
     }
 
     fn row_to_draft(row: &Row) -> Result<MemoryDraft> {
-        let created_at: DateTime<Utc> = row.get(15);
-        let updated_at: DateTime<Utc> = row.get(16);
+        let created_at: DateTime<Utc> = row.get(16);
+        let updated_at: DateTime<Utc> = row.get(17);
         let visibility = row
-            .get::<_, String>(12)
+            .get::<_, String>(13)
             .parse::<MemoryVisibility>()
             .unwrap_or(MemoryVisibility::Workspace);
 
@@ -411,20 +1120,144 @@ impl PostgresMemory {
             id: row.get(0),
             draft_id: row.get(1),
             workspace_id: row.get(2),
-            worker_run_id: row.get(3),
-            parent_run_id: row.get(4),
-            session_key: row.get(5),
-            agent_id: row.get(6),
-            persona_id: row.get(7),
-            key: row.get(8),
-            content: row.get(9),
-            category: Self::parse_category(&row.get::<_, String>(10)),
-            source_event_id: row.get(11),
+            owner_id: row.get(3),
+            worker_run_id: row.get(4),
+            parent_run_id: row.get(5),
+            session_key: row.get(6),
+            agent_id: row.get(7),
+            persona_id: row.get(8),
+            key: row.get(9),
+            content: row.get(10),
+            category: Self::parse_category(&row.get::<_, String>(11)),
+            source_event_id: row.get(12),
             visibility,
-            status: row.get(13),
-            payload_json: row.get(14),
+            status: row.get(14),
+            payload_json: row.get(15),
             created_at: created_at.to_rfc3339(),
             updated_at: updated_at.to_rfc3339(),
+        })
+    }
+
+    fn row_to_document(row: &Row) -> Result<DocumentRecord> {
+        let created_at: DateTime<Utc> = row.get(15);
+        let updated_at: DateTime<Utc> = row.get(16);
+        let visibility = row
+            .get::<_, String>(12)
+            .parse::<MemoryVisibility>()
+            .unwrap_or(MemoryVisibility::Workspace);
+        let chunk_count: i64 = row.get(14);
+
+        Ok(DocumentRecord {
+            id: row.get(0),
+            document_id: row.get(1),
+            workspace_id: row.get(2),
+            owner_id: row.get(3),
+            topic_id: row.get(4),
+            task_id: row.get(5),
+            source_message_event_id: row.get(6),
+            source_kind: row.get(7),
+            source_uri: row.get(8),
+            title: row.get(9),
+            content_sha256: row.get(10),
+            mime_type: row.get(11),
+            visibility,
+            metadata_json: row.get(13),
+            chunk_count: usize::try_from(chunk_count.max(0)).unwrap_or(usize::MAX),
+            created_at: created_at.to_rfc3339(),
+            updated_at: updated_at.to_rfc3339(),
+        })
+    }
+
+    fn row_to_document_chunk(row: &Row) -> Result<DocumentChunkRecord> {
+        let created_at: DateTime<Utc> = row.get(13);
+        let chunk_index: i64 = row.get(7);
+        let token_estimate: i64 = row.get(12);
+        Ok(DocumentChunkRecord {
+            id: row.get(0),
+            chunk_id: row.get(1),
+            document_id: row.get(2),
+            workspace_id: row.get(3),
+            owner_id: row.get(4),
+            topic_id: row.get(5),
+            task_id: row.get(6),
+            chunk_index: usize::try_from(chunk_index.max(0)).unwrap_or(usize::MAX),
+            heading: row.get(8),
+            content: row.get(9),
+            content_sha256: row.get(10),
+            source_anchor: row.get(11),
+            token_estimate: usize::try_from(token_estimate.max(0)).unwrap_or(usize::MAX),
+            created_at: created_at.to_rfc3339(),
+        })
+    }
+
+    fn row_to_memory_link(row: &Row) -> Result<MemoryLink> {
+        let created_at: DateTime<Utc> = row.get(11);
+        Ok(MemoryLink {
+            id: row.get(0),
+            link_id: row.get(1),
+            workspace_id: row.get(2),
+            owner_id: row.get(3),
+            memory_key: row.get(4),
+            memory_event_id: row.get(5),
+            message_event_id: row.get(6),
+            document_id: row.get(7),
+            chunk_id: row.get(8),
+            link_type: row.get(9),
+            payload_json: row.get(10),
+            created_at: created_at.to_rfc3339(),
+        })
+    }
+
+    fn row_to_retrieval_trace(row: &Row) -> Result<RetrievalTrace> {
+        let created_at: DateTime<Utc> = row.get(16);
+        let candidate_count: i64 = row.get(9);
+        let selected_count: i64 = row.get(10);
+        let dropped_count: i64 = row.get(11);
+        let budget_tokens: Option<i64> = row.get(12);
+        Ok(RetrievalTrace {
+            id: row.get(0),
+            trace_id: row.get(1),
+            workspace_id: row.get(2),
+            owner_id: row.get(3),
+            session_key: row.get(4),
+            agent_id: row.get(5),
+            persona_id: row.get(6),
+            source: row.get(7),
+            query: row.get(8),
+            candidate_count: usize::try_from(candidate_count.max(0)).unwrap_or(usize::MAX),
+            selected_count: usize::try_from(selected_count.max(0)).unwrap_or(usize::MAX),
+            dropped_count: usize::try_from(dropped_count.max(0)).unwrap_or(usize::MAX),
+            budget_tokens: budget_tokens.and_then(|value| usize::try_from(value.max(0)).ok()),
+            selected_json: row.get(13),
+            dropped_json: row.get(14),
+            payload_json: row.get(15),
+            created_at: created_at.to_rfc3339(),
+        })
+    }
+
+    fn row_to_compaction_run(row: &Row) -> Result<CompactionRun> {
+        let created_at: DateTime<Utc> = row.get(17);
+        let source_message_count: i64 = row.get(9);
+        let source_token_estimate: i64 = row.get(10);
+        Ok(CompactionRun {
+            id: row.get(0),
+            run_id: row.get(1),
+            workspace_id: row.get(2),
+            owner_id: row.get(3),
+            session_key: row.get(4),
+            agent_id: row.get(5),
+            persona_id: row.get(6),
+            trigger: row.get(7),
+            mode: row.get(8),
+            source_message_count: usize::try_from(source_message_count.max(0)).unwrap_or(usize::MAX),
+            source_token_estimate: usize::try_from(source_token_estimate.max(0)).unwrap_or(usize::MAX),
+            summary: row.get(11),
+            summary_memory_key: row.get(12),
+            source_event_ids_json: row.get(13),
+            source_document_refs_json: row.get(14),
+            fidelity_status: row.get(15),
+            payload_json: row.get(16),
+            created_at: created_at.to_rfc3339(),
         })
     }
 }
@@ -490,6 +1323,25 @@ impl Memory for PostgresMemory {
             .await
     }
 
+    async fn store_with_context(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+    ) -> Result<()> {
+        self.store_with_context_and_metadata(
+            key,
+            content,
+            category,
+            session_id,
+            context,
+            MemoryStoreMetadata::default(),
+        )
+        .await
+    }
+
     async fn store_with_metadata(
         &self,
         key: &str,
@@ -499,8 +1351,11 @@ impl Memory for PostgresMemory {
         metadata: MemoryStoreMetadata,
     ) -> Result<()> {
         validate_memory_write_target(key, session_id)?;
+        let (embedding, embedding_provider, embedding_model, embedding_dimensions, embedding_vector) =
+            self.embedding_metadata_for_category(&category, content).await?;
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
+        let pgvector_available = self.pgvector_available;
         let key = key.to_string();
         let content = content.to_string();
         let category = Self::category_to_str(&category);
@@ -513,20 +1368,26 @@ impl Memory for PostgresMemory {
                 INSERT INTO {qualified_table}
                     (
                         id, key, content, category, created_at, updated_at, session_id,
-                        workspace_id, agent_id, persona_id, source_event_id, source
+                        workspace_id, owner_id, agent_id, persona_id, source_event_id, source,
+                        embedding, embedding_provider, embedding_model, embedding_dimensions
                     )
                 VALUES
-                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
                 ON CONFLICT (key) DO UPDATE SET
                     content = EXCLUDED.content,
                     category = EXCLUDED.category,
                     updated_at = EXCLUDED.updated_at,
                     session_id = EXCLUDED.session_id,
                     workspace_id = EXCLUDED.workspace_id,
+                    owner_id = EXCLUDED.owner_id,
                     agent_id = EXCLUDED.agent_id,
                     persona_id = EXCLUDED.persona_id,
                     source_event_id = EXCLUDED.source_event_id,
-                    source = EXCLUDED.source
+                    source = EXCLUDED.source,
+                    embedding = EXCLUDED.embedding,
+                    embedding_provider = EXCLUDED.embedding_provider,
+                    embedding_model = EXCLUDED.embedding_model,
+                    embedding_dimensions = EXCLUDED.embedding_dimensions
                 "
             );
 
@@ -543,12 +1404,28 @@ impl Memory for PostgresMemory {
                         &now,
                         &sid,
                         &metadata.workspace_id,
+                        &metadata.owner_id,
                         &metadata.agent_id,
                         &metadata.persona_id,
                         &metadata.source_event_id,
                         &metadata.source,
+                        &embedding,
+                        &embedding_provider,
+                        &embedding_model,
+                        &embedding_dimensions,
                     ],
                 )?;
+                if pgvector_available {
+                    let update_vector_stmt =
+                        format!("UPDATE {qualified_table} SET embedding_vector = $1::vector WHERE key = $2");
+                    let clear_vector_stmt =
+                        format!("UPDATE {qualified_table} SET embedding_vector = NULL WHERE key = $1");
+                    if let Some(embedding_vector) = embedding_vector.as_ref() {
+                        client.execute(&update_vector_stmt, &[embedding_vector, &key])?;
+                    } else {
+                        client.execute(&clear_vector_stmt, &[&key])?;
+                    }
+                }
                 Ok(())
             })?;
             Ok(())
@@ -565,9 +1442,132 @@ impl Memory for PostgresMemory {
         context: Option<&MemoryWriteContext>,
         metadata: MemoryStoreMetadata,
     ) -> Result<()> {
-        let _ = context;
-        self.store_with_metadata(key, content, category, session_id, metadata)
-            .await
+        let Some(context) = context.cloned() else {
+            return self
+                .store_with_metadata(key, content, category, session_id, metadata)
+                .await;
+        };
+
+        validate_memory_write_target(key, session_id)?;
+        let (embedding, embedding_provider, embedding_model, embedding_dimensions, embedding_vector) =
+            self.embedding_metadata_for_category(&category, content).await?;
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let pgvector_available = self.pgvector_available;
+        let key = key.to_string();
+        let content = content.to_string();
+        let category = Self::category_to_str(&category);
+        let sid = session_id.map(str::to_string);
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let now = Utc::now();
+            let principal = Self::principal_from_context(&context);
+            let classified = classify_memory(&context, &content, &principal);
+            let risk_json = serde_json::to_string(&classified.risk_signals)?;
+            let chat_type = context
+                .chat_type
+                .as_deref()
+                .map(ChatType::from_str)
+                .map(|chat_type| chat_type.as_str().to_string());
+            let sender_id = context.sender_id.clone().or_else(|| {
+                if context.channel.is_some() && context.raw_sender.is_some() {
+                    Some(principal.user_id.clone())
+                } else {
+                    None
+                }
+            });
+            let owner_id = metadata.owner_id.clone().or_else(|| sender_id.clone());
+            let stmt = format!(
+                "
+                INSERT INTO {qualified_table}
+                    (
+                        id, key, content, category, created_at, updated_at, session_id,
+                        workspace_id, owner_id, agent_id, persona_id, source_event_id, source,
+                        embedding, embedding_provider, embedding_model, embedding_dimensions,
+                        channel, chat_type, chat_id, sender_id, raw_sender, topic_id,
+                        visibility, sensitivity, risk_signals, policy_version
+                    )
+                VALUES
+                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                     $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+                ON CONFLICT (key) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    category = EXCLUDED.category,
+                    updated_at = EXCLUDED.updated_at,
+                    session_id = EXCLUDED.session_id,
+                    workspace_id = EXCLUDED.workspace_id,
+                    owner_id = EXCLUDED.owner_id,
+                    agent_id = EXCLUDED.agent_id,
+                    persona_id = EXCLUDED.persona_id,
+                    source_event_id = EXCLUDED.source_event_id,
+                    source = EXCLUDED.source,
+                    embedding = EXCLUDED.embedding,
+                    embedding_provider = EXCLUDED.embedding_provider,
+                    embedding_model = EXCLUDED.embedding_model,
+                    embedding_dimensions = EXCLUDED.embedding_dimensions,
+                    channel = EXCLUDED.channel,
+                    chat_type = EXCLUDED.chat_type,
+                    chat_id = EXCLUDED.chat_id,
+                    sender_id = EXCLUDED.sender_id,
+                    raw_sender = EXCLUDED.raw_sender,
+                    topic_id = EXCLUDED.topic_id,
+                    visibility = EXCLUDED.visibility,
+                    sensitivity = EXCLUDED.sensitivity,
+                    risk_signals = EXCLUDED.risk_signals,
+                    policy_version = EXCLUDED.policy_version
+                "
+            );
+
+            let id = Uuid::new_v4().to_string();
+            client.with_client(|client| {
+                client.execute(
+                    &stmt,
+                    &[
+                        &id,
+                        &key,
+                        &content,
+                        &category,
+                        &now,
+                        &now,
+                        &sid,
+                        &metadata.workspace_id,
+                        &owner_id,
+                        &metadata.agent_id,
+                        &metadata.persona_id,
+                        &metadata.source_event_id,
+                        &metadata.source,
+                        &embedding,
+                        &embedding_provider,
+                        &embedding_model,
+                        &embedding_dimensions,
+                        &context.channel,
+                        &chat_type,
+                        &context.chat_id,
+                        &sender_id,
+                        &context.raw_sender,
+                        &None::<String>,
+                        &classified.visibility.as_str(),
+                        &classified.sensitivity.as_str(),
+                        &risk_json,
+                        &classified.policy_version,
+                    ],
+                )?;
+                if pgvector_available {
+                    let update_vector_stmt =
+                        format!("UPDATE {qualified_table} SET embedding_vector = $1::vector WHERE key = $2");
+                    let clear_vector_stmt =
+                        format!("UPDATE {qualified_table} SET embedding_vector = NULL WHERE key = $1");
+                    if let Some(embedding_vector) = embedding_vector.as_ref() {
+                        client.execute(&update_vector_stmt, &[embedding_vector, &key])?;
+                    } else {
+                        client.execute(&clear_vector_stmt, &[&key])?;
+                    }
+                }
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .await?
     }
 
     async fn recall(&self, query: &str, limit: usize, session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
@@ -575,6 +1575,21 @@ impl Memory for PostgresMemory {
         let qualified_table = self.qualified_table.clone();
         let query = query.trim().to_string();
         let sid = session_id.map(str::to_string);
+        let query_embedding = if query.is_empty() {
+            None
+        } else {
+            self.get_or_compute_embedding(&query).await?
+        };
+        let embedding_provider = self.embedding_provider_name();
+        let embedding_model = self.embedding_model_name();
+        let embedding_dimensions = self.embedder.dimensions();
+        let embedding_dimensions_i64 = self.embedding_dimensions_i64();
+        let vector_weight = f64::from(self.vector_weight);
+        let keyword_weight = f64::from(self.keyword_weight);
+        let pgvector_available = self.pgvector_available;
+        let query_vector = query_embedding
+            .as_ref()
+            .and_then(|embedding| Self::pgvector_literal(embedding));
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
             let stmt = format!(
@@ -597,6 +1612,193 @@ impl Memory for PostgresMemory {
             let limit_i64 = limit as i64;
 
             let rows = client.with_client(|client| Ok(client.query(&stmt, &[&query, &sid, &limit_i64])?))?;
+            let mut by_id = std::collections::HashMap::<String, MemoryEntry>::new();
+            for row in &rows {
+                let mut entry = Self::row_to_entry(row)?;
+                entry.score = entry.score.map(|score| score * keyword_weight);
+                by_id.insert(entry.id.clone(), entry);
+            }
+
+            if let Some(query_embedding) = query_embedding {
+                if pgvector_available {
+                    if let Some(query_vector) = query_vector.as_ref() {
+                        let vector_stmt = format!(
+                            "
+                            SELECT id, key, content, category, created_at, session_id,
+                                   (1.0 - (embedding_vector <=> $1::vector))::DOUBLE PRECISION AS score,
+                                   useful_count
+                            FROM {qualified_table}
+                            WHERE embedding_vector IS NOT NULL
+                              AND embedding_provider = $2
+                              AND embedding_model = $3
+                              AND embedding_dimensions = $4
+                              AND ($5::TEXT IS NULL OR session_id = $5)
+                            ORDER BY embedding_vector <=> $1::vector
+                            LIMIT $6
+                            "
+                        );
+                        let candidate_limit = limit_i64.saturating_mul(4).max(limit_i64);
+                        let vector_rows = client.with_client(|client| {
+                            Ok(client.query(
+                                &vector_stmt,
+                                &[
+                                    query_vector,
+                                    &embedding_provider,
+                                    &embedding_model,
+                                    &embedding_dimensions_i64,
+                                    &sid,
+                                    &candidate_limit,
+                                ],
+                            )?)
+                        })?;
+                        for row in &vector_rows {
+                            let score: f64 = row.try_get(6).unwrap_or(0.0);
+                            let score = score * vector_weight;
+                            if score <= 0.0 {
+                                continue;
+                            }
+                            let mut entry = Self::row_to_entry(row)?;
+                            entry.score = Some(score);
+                            by_id
+                                .entry(entry.id.clone())
+                                .and_modify(|existing| {
+                                    let combined = existing.score.unwrap_or(0.0) + score;
+                                    existing.score = Some(combined);
+                                })
+                                .or_insert(entry);
+                        }
+                    }
+                } else {
+                    let vector_stmt = format!(
+                        "
+                        SELECT id, key, content, category, created_at, session_id,
+                               NULL::DOUBLE PRECISION AS score,
+                               useful_count,
+                               embedding
+                        FROM {qualified_table}
+                        WHERE embedding IS NOT NULL
+                          AND embedding_provider = $1
+                          AND embedding_model = $2
+                          AND embedding_dimensions = $3
+                          AND ($4::TEXT IS NULL OR session_id = $4)
+                        "
+                    );
+                    let vector_rows = client.with_client(|client| {
+                        Ok(client.query(
+                            &vector_stmt,
+                            &[&embedding_provider, &embedding_model, &embedding_dimensions_i64, &sid],
+                        )?)
+                    })?;
+                    for row in &vector_rows {
+                        let embedding_blob: Vec<u8> = row.get(8);
+                        let embedding = vector::bytes_to_vec(&embedding_blob);
+                        if embedding.len() != embedding_dimensions {
+                            tracing::debug!(
+                                memory_id = %row.get::<_, String>(0),
+                                expected_dimensions = embedding_dimensions,
+                                actual_dimensions = embedding.len(),
+                                "Skipping stale Postgres memory embedding with mismatched dimensions"
+                            );
+                            continue;
+                        }
+                        let score = f64::from(vector::cosine_similarity(&query_embedding, &embedding)) * vector_weight;
+                        if score <= 0.0 {
+                            continue;
+                        }
+                        let mut entry = Self::row_to_entry(row)?;
+                        entry.score = Some(score);
+                        by_id
+                            .entry(entry.id.clone())
+                            .and_modify(|existing| {
+                                let combined = existing.score.unwrap_or(0.0) + score;
+                                existing.score = Some(combined);
+                            })
+                            .or_insert(entry);
+                    }
+                }
+            }
+
+            let mut entries: Vec<MemoryEntry> = by_id.into_values().collect();
+            entries.sort_by(|a, b| {
+                let left = a.score.unwrap_or(0.0);
+                let right = b.score.unwrap_or(0.0);
+                right.partial_cmp(&left).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            entries.truncate(limit.max(1));
+            Ok(entries)
+        })
+        .await?
+    }
+
+    async fn recall_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+    ) -> Result<Vec<MemoryEntry>> {
+        let Some(context) = context.cloned() else {
+            return self.recall(query, limit, session_id).await;
+        };
+
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let query = query.trim().to_string();
+        let sid = session_id.map(str::to_string);
+        let channel = context.channel.clone();
+        let chat_id = context.chat_id.clone();
+        let raw_sender = context.raw_sender.clone();
+        let sender_id = context.sender_id.clone().or_else(|| {
+            if context.channel.is_some() && context.raw_sender.is_some() {
+                Some(format!(
+                    "anonymous:{}:{}",
+                    context.channel.as_deref().unwrap_or("unknown"),
+                    context.raw_sender.as_deref().unwrap_or("unknown")
+                ))
+            } else {
+                None
+            }
+        });
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
+            let stmt = format!(
+                "
+                SELECT id, key, content, category, created_at, session_id,
+                       (
+                         CASE WHEN key ILIKE '%' || $1 || '%' THEN 2.0 ELSE 0.0 END +
+                         CASE WHEN content ILIKE '%' || $1 || '%' THEN 1.0 ELSE 0.0 END
+                       ) AS score,
+                       useful_count
+                FROM {qualified_table}
+                WHERE ($2::TEXT IS NULL OR session_id = $2)
+                  AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
+                  AND COALESCE(sensitivity, 'normal') != 'secret'
+                  AND (
+                      visibility IS NULL
+                      OR visibility IN ('workspace', 'public')
+                      OR (
+                          $4::TEXT IS NOT NULL
+                          AND $5::TEXT IS NOT NULL
+                          AND $6::TEXT IS NOT NULL
+                          AND channel = $4
+                          AND chat_id = $5
+                          AND raw_sender = $6
+                      )
+                      OR ($7::TEXT IS NOT NULL AND sender_id = $7)
+                  )
+                ORDER BY score DESC, updated_at DESC
+                LIMIT $3
+                "
+            );
+
+            #[allow(clippy::cast_possible_wrap)]
+            let limit_i64 = limit.max(1) as i64;
+            let rows = client.with_client(|client| {
+                Ok(client.query(
+                    &stmt,
+                    &[&query, &sid, &limit_i64, &channel, &chat_id, &raw_sender, &sender_id],
+                )?)
+            })?;
             rows.iter()
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
@@ -669,6 +1871,58 @@ impl Memory for PostgresMemory {
         .await?
     }
 
+    async fn forget_with_context(&self, key: &str, context: Option<&MemoryWriteContext>) -> Result<bool> {
+        let Some(context) = context.cloned() else {
+            return self.forget(key).await;
+        };
+
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let key = key.to_string();
+        let channel = context.channel.clone();
+        let chat_id = context.chat_id.clone();
+        let raw_sender = context.raw_sender.clone();
+        let sender_id = context.sender_id.clone().or_else(|| {
+            if context.channel.is_some() && context.raw_sender.is_some() {
+                Some(format!(
+                    "anonymous:{}:{}",
+                    context.channel.as_deref().unwrap_or("unknown"),
+                    context.raw_sender.as_deref().unwrap_or("unknown")
+                ))
+            } else {
+                None
+            }
+        });
+
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let stmt = format!(
+                "
+                DELETE FROM {qualified_table}
+                WHERE key = $1
+                  AND COALESCE(sensitivity, 'normal') != 'secret'
+                  AND (
+                      visibility IS NULL
+                      OR visibility IN ('workspace', 'public')
+                      OR (
+                          $2::TEXT IS NOT NULL
+                          AND $3::TEXT IS NOT NULL
+                          AND $4::TEXT IS NOT NULL
+                          AND channel = $2
+                          AND chat_id = $3
+                          AND raw_sender = $4
+                      )
+                      OR ($5::TEXT IS NOT NULL AND sender_id = $5)
+                  )
+                "
+            );
+            let deleted = client.with_client(|client| {
+                Ok(client.execute(&stmt, &[&key, &channel, &chat_id, &raw_sender, &sender_id])?)
+            })?;
+            Ok(deleted > 0)
+        })
+        .await?
+    }
+
     async fn count(&self) -> Result<usize> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
@@ -692,25 +1946,26 @@ impl Memory for PostgresMemory {
             let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let content_hash = Self::content_hash(&input.content);
             let visibility = input.visibility.as_str().to_string();
+            let event_type = message_event_type_for(&input.role, &input.content);
 
             let insert_stmt = format!(
                 "
                 INSERT INTO {qualified_message_events_table} (
-                    event_id, idempotency_key, workspace_id, source, channel, session_key,
+                    event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                     parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                    sender, recipient, role, content, content_hash, raw_payload_json,
+                    sender, recipient, role, event_type, content, content_hash, raw_payload_json,
                     visibility, created_at, updated_at
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
                 )
                 ON CONFLICT DO NOTHING
                 "
             );
             let select_stmt = format!(
                 "
-                SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                        sender, recipient, role, content, content_hash, raw_payload_json,
                        visibility, created_at, updated_at
@@ -739,6 +1994,7 @@ impl Memory for PostgresMemory {
                         &event_id,
                         &input.idempotency_key,
                         &input.workspace_id,
+                        &input.owner_id,
                         &input.source,
                         &input.channel,
                         &input.session_key,
@@ -750,6 +2006,7 @@ impl Memory for PostgresMemory {
                         &input.sender,
                         &input.recipient,
                         &input.role,
+                        &event_type,
                         &input.content,
                         &content_hash,
                         &input.raw_payload_json,
@@ -762,9 +2019,10 @@ impl Memory for PostgresMemory {
                 let event = Self::row_to_message_event(&row)?;
                 if inserted > 0 {
                     let outbox_event_type = if event.role == "event" {
-                        "worker.result.created"
+                        message_event_type_for(&event.role, &event.content)
+                            .unwrap_or_else(|| "worker.result.created".to_string())
                     } else {
-                        "message.created"
+                        "message.created".to_string()
                     };
                     tx.execute(
                         &outbox_stmt,
@@ -803,7 +2061,7 @@ impl Memory for PostgresMemory {
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
                 "
-                SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                        sender, recipient, role, content, content_hash, raw_payload_json,
                        visibility, created_at, updated_at
@@ -855,6 +2113,66 @@ impl Memory for PostgresMemory {
         .await?
     }
 
+    async fn list_message_events_recent(&self, principal: &MemoryPrincipal, limit: usize) -> Result<Vec<MessageEvent>> {
+        let client = self.client.clone();
+        let qualified_message_events_table = self.qualified_message_events_table.clone();
+        let principal = principal.clone();
+        let limit_i64 = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let system_allowed = Self::is_system_principal(&principal);
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
+            let stmt = format!(
+                "
+                SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                       parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                       sender, recipient, role, content, content_hash, raw_payload_json,
+                       visibility, created_at, updated_at
+                FROM {qualified_message_events_table}
+                WHERE (
+                      visibility = 'global'
+                      OR (
+                          workspace_id = $1
+                          AND (
+                              visibility = 'workspace'
+                              OR (visibility = 'agent' AND (
+                                  ($2::TEXT IS NOT NULL AND agent_id = $2)
+                                  OR ($3::TEXT IS NOT NULL AND persona_id = $3)
+                              ))
+                              OR (visibility = 'session' AND $4::TEXT IS NOT NULL AND session_key = $4)
+                              OR (visibility = 'private' AND (
+                                  ($2::TEXT IS NOT NULL AND agent_id = $2)
+                                  OR ($3::TEXT IS NOT NULL AND persona_id = $3)
+                                  OR ($5::TEXT IS NOT NULL AND sender = $5)
+                              ))
+                              OR (visibility = 'system' AND $6::BOOLEAN)
+                          )
+                      )
+                  )
+                ORDER BY id DESC
+                LIMIT $7
+                "
+            );
+            let rows = client.with_client(|client| {
+                Ok(client.query(
+                    &stmt,
+                    &[
+                        &principal.workspace_id,
+                        &principal.agent_id,
+                        &principal.persona_id,
+                        &principal.session_key,
+                        &principal.sender,
+                        &system_allowed,
+                        &limit_i64,
+                    ],
+                )?)
+            })?;
+            rows.iter()
+                .map(Self::row_to_message_event)
+                .collect::<Result<Vec<MessageEvent>>>()
+        })
+        .await?
+    }
+
     async fn load_recent_shared_context(&self, query: SharedContextQuery) -> Result<Vec<MessageEvent>> {
         let client = self.client.clone();
         let qualified_message_events_table = self.qualified_message_events_table.clone();
@@ -872,7 +2190,7 @@ impl Memory for PostgresMemory {
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
                 "
-                SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                        sender, recipient, role, content, content_hash, raw_payload_json,
                        visibility, created_at, updated_at
@@ -953,7 +2271,7 @@ impl Memory for PostgresMemory {
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
                 "
-                SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                        sender, recipient, role, content, content_hash, raw_payload_json,
                        visibility, created_at, updated_at
@@ -1123,9 +2441,66 @@ impl Memory for PostgresMemory {
         .await?
     }
 
+    async fn list_memory_events_recent(&self, principal: &MemoryPrincipal, limit: usize) -> Result<Vec<MemoryEvent>> {
+        let client = self.client.clone();
+        let qualified_memory_events_table = self.qualified_memory_events_table.clone();
+        let principal = principal.clone();
+        let limit_i64 = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let system_allowed = Self::is_system_principal(&principal);
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEvent>> {
+            let stmt = format!(
+                "
+                SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
+                       session_key, agent_id, persona_id, visibility, payload_json, created_at
+                FROM {qualified_memory_events_table}
+                WHERE (
+                      visibility = 'global'
+                      OR (
+                          workspace_id = $1
+                          AND (
+                              visibility = 'workspace'
+                              OR (visibility = 'agent' AND (
+                                  ($2::TEXT IS NOT NULL AND agent_id = $2)
+                                  OR ($3::TEXT IS NOT NULL AND persona_id = $3)
+                              ))
+                              OR (visibility = 'session' AND $4::TEXT IS NOT NULL AND session_key = $4)
+                              OR (visibility = 'private' AND (
+                                  ($2::TEXT IS NOT NULL AND agent_id = $2)
+                                  OR ($3::TEXT IS NOT NULL AND persona_id = $3)
+                              ))
+                              OR (visibility = 'system' AND $5::BOOLEAN)
+                          )
+                      )
+                  )
+                ORDER BY id DESC
+                LIMIT $6
+                "
+            );
+            let rows = client.with_client(|client| {
+                Ok(client.query(
+                    &stmt,
+                    &[
+                        &principal.workspace_id,
+                        &principal.agent_id,
+                        &principal.persona_id,
+                        &principal.session_key,
+                        &system_allowed,
+                        &limit_i64,
+                    ],
+                )?)
+            })?;
+            rows.iter()
+                .map(Self::row_to_memory_event)
+                .collect::<Result<Vec<MemoryEvent>>>()
+        })
+        .await?
+    }
+
     async fn create_memory_draft(&self, input: MemoryDraftInput) -> Result<MemoryDraft> {
         let client = self.client.clone();
         let qualified_drafts_table = self.qualified_drafts_table.clone();
+        let qualified_memory_events_table = self.qualified_memory_events_table.clone();
         let draft_id = input.draft_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let category = Self::category_to_str(&input.category);
         let visibility = input.visibility.as_str().to_string();
@@ -1136,14 +2511,15 @@ impl Memory for PostgresMemory {
                 "
                 INSERT INTO {qualified_drafts_table}
                     (
-                        draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                        draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                         agent_id, persona_id, key, content, category, source_event_id,
                         visibility, status, payload_json, created_at, updated_at
                     )
                 VALUES
-                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', $13, $14, $15)
+                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'pending', $14, $15, $16)
                 ON CONFLICT (draft_id) DO UPDATE SET
                     workspace_id = EXCLUDED.workspace_id,
+                    owner_id = EXCLUDED.owner_id,
                     worker_run_id = EXCLUDED.worker_run_id,
                     parent_run_id = EXCLUDED.parent_run_id,
                     session_key = EXCLUDED.session_key,
@@ -1157,17 +2533,28 @@ impl Memory for PostgresMemory {
                     payload_json = EXCLUDED.payload_json,
                     updated_at = EXCLUDED.updated_at
                 RETURNING
-                    id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                    id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                     agent_id, persona_id, key, content, category, source_event_id,
                     visibility, status, payload_json, created_at, updated_at
                 "
             );
+            let outbox_stmt = format!(
+                "
+                INSERT INTO {qualified_memory_events_table} (
+                    event_id, workspace_id, event_type, subject_table, subject_id, session_key,
+                    agent_id, persona_id, visibility, payload_json, created_at
+                )
+                VALUES ($1, $2, 'memory.draft.created', 'memory_drafts', $3, $4, $5, $6, $7, $8, $9)
+                "
+            );
             let row = client.with_client(|client| {
-                Ok(client.query_one(
+                let mut tx = client.transaction()?;
+                let row = tx.query_one(
                     &stmt,
                     &[
                         &draft_id,
                         &input.workspace_id,
+                        &input.owner_id,
                         &input.worker_run_id,
                         &input.parent_run_id,
                         &input.session_key,
@@ -1182,7 +2569,31 @@ impl Memory for PostgresMemory {
                         &now,
                         &now,
                     ],
-                )?)
+                )?;
+                let draft = Self::row_to_draft(&row)?;
+                let payload_json = serde_json::json!({
+                    "worker_run_id": draft.worker_run_id,
+                    "owner_id": draft.owner_id,
+                    "parent_run_id": draft.parent_run_id,
+                    "key": draft.key,
+                })
+                .to_string();
+                tx.execute(
+                    &outbox_stmt,
+                    &[
+                        &Uuid::new_v4().to_string(),
+                        &draft.workspace_id,
+                        &draft.draft_id,
+                        &draft.session_key,
+                        &draft.agent_id,
+                        &draft.persona_id,
+                        &draft.visibility.as_str(),
+                        &payload_json,
+                        &Utc::now(),
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(row)
             })?;
             Self::row_to_draft(&row)
         })
@@ -1198,7 +2609,7 @@ impl Memory for PostgresMemory {
             let stmt = format!(
                 "
                 SELECT
-                    id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                    id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                     agent_id, persona_id, key, content, category, source_event_id,
                     visibility, status, payload_json, created_at, updated_at
                 FROM {qualified_drafts_table}
@@ -1218,13 +2629,14 @@ impl Memory for PostgresMemory {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_drafts_table = self.qualified_drafts_table.clone();
+        let qualified_memory_events_table = self.qualified_memory_events_table.clone();
         let draft_id = draft_id.to_string();
 
         tokio::task::spawn_blocking(move || -> Result<Option<MemoryDraft>> {
             let select_stmt = format!(
                 "
                 SELECT
-                    id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                    id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                     agent_id, persona_id, key, content, category, source_event_id,
                     visibility, status, payload_json, created_at, updated_at
                 FROM {qualified_drafts_table}
@@ -1248,16 +2660,17 @@ impl Memory for PostgresMemory {
                 INSERT INTO {qualified_table}
                     (
                         id, key, content, category, created_at, updated_at, session_id,
-                        workspace_id, agent_id, persona_id, source_event_id, source
+                        workspace_id, owner_id, agent_id, persona_id, source_event_id, source
                     )
                 VALUES
-                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'memory_draft')
+                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'memory_draft')
                 ON CONFLICT (key) DO UPDATE SET
                     content = EXCLUDED.content,
                     category = EXCLUDED.category,
                     updated_at = EXCLUDED.updated_at,
                     session_id = EXCLUDED.session_id,
                     workspace_id = EXCLUDED.workspace_id,
+                    owner_id = EXCLUDED.owner_id,
                     agent_id = EXCLUDED.agent_id,
                     persona_id = EXCLUDED.persona_id,
                     source_event_id = EXCLUDED.source_event_id,
@@ -1270,13 +2683,23 @@ impl Memory for PostgresMemory {
                 SET status = 'merged', updated_at = $2
                 WHERE draft_id = $1
                 RETURNING
-                    id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                    id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                     agent_id, persona_id, key, content, category, source_event_id,
                     visibility, status, payload_json, created_at, updated_at
                 "
             );
+            let outbox_stmt = format!(
+                "
+                INSERT INTO {qualified_memory_events_table} (
+                    event_id, workspace_id, event_type, subject_table, subject_id, session_key,
+                    agent_id, persona_id, visibility, payload_json, created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                "
+            );
             let row = client.with_client(|client| {
-                client.execute(
+                let mut tx = client.transaction()?;
+                tx.execute(
                     &upsert_stmt,
                     &[
                         &memory_id,
@@ -1287,12 +2710,45 @@ impl Memory for PostgresMemory {
                         &now,
                         &draft.session_key,
                         &draft.workspace_id,
+                        &draft.owner_id,
                         &draft.agent_id,
                         &draft.persona_id,
                         &draft.source_event_id,
                     ],
                 )?;
-                Ok(client.query_one(&update_stmt, &[&draft_id, &now])?)
+                let row = tx.query_one(&update_stmt, &[&draft_id, &now])?;
+                let merged = Self::row_to_draft(&row)?;
+                let payload_json = serde_json::json!({
+                    "draft_id": merged.draft_id,
+                    "owner_id": merged.owner_id,
+                    "worker_run_id": merged.worker_run_id,
+                    "parent_run_id": merged.parent_run_id,
+                    "key": merged.key,
+                })
+                .to_string();
+                for (event_type, subject_table, subject_id) in [
+                    ("memory.draft.merged", "memory_drafts", merged.draft_id.as_str()),
+                    ("memory.stored", "memories", merged.key.as_str()),
+                ] {
+                    tx.execute(
+                        &outbox_stmt,
+                        &[
+                            &Uuid::new_v4().to_string(),
+                            &merged.workspace_id,
+                            &event_type,
+                            &subject_table,
+                            &subject_id,
+                            &merged.session_key,
+                            &merged.agent_id,
+                            &merged.persona_id,
+                            &merged.visibility.as_str(),
+                            &payload_json,
+                            &Utc::now(),
+                        ],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(row)
             })?;
             Ok(Some(Self::row_to_draft(&row)?))
         })
@@ -1302,12 +2758,15 @@ impl Memory for PostgresMemory {
     async fn reject_memory_draft(&self, draft_id: &str, reason: Option<&str>) -> Result<Option<MemoryDraft>> {
         let client = self.client.clone();
         let qualified_drafts_table = self.qualified_drafts_table.clone();
+        let qualified_memory_events_table = self.qualified_memory_events_table.clone();
         let draft_id = draft_id.to_string();
         let reason = reason.map(str::to_string);
 
         tokio::task::spawn_blocking(move || -> Result<Option<MemoryDraft>> {
             let now = Utc::now();
-            let payload = reason.map(|reason| serde_json::json!({ "reason": reason }).to_string());
+            let payload = reason
+                .as_ref()
+                .map(|reason| serde_json::json!({ "reason": reason }).to_string());
             let stmt = format!(
                 "
                 UPDATE {qualified_drafts_table}
@@ -1317,12 +2776,52 @@ impl Memory for PostgresMemory {
                     updated_at = $2
                 WHERE draft_id = $1
                 RETURNING
-                    id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                    id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                     agent_id, persona_id, key, content, category, source_event_id,
                     visibility, status, payload_json, created_at, updated_at
                 "
             );
-            let row = client.with_client(|client| Ok(client.query_opt(&stmt, &[&draft_id, &now, &payload])?))?;
+            let outbox_stmt = format!(
+                "
+                INSERT INTO {qualified_memory_events_table} (
+                    event_id, workspace_id, event_type, subject_table, subject_id, session_key,
+                    agent_id, persona_id, visibility, payload_json, created_at
+                )
+                VALUES ($1, $2, 'memory.draft.rejected', 'memory_drafts', $3, $4, $5, $6, $7, $8, $9)
+                "
+            );
+            let row = client.with_client(|client| {
+                let mut tx = client.transaction()?;
+                let row = tx.query_opt(&stmt, &[&draft_id, &now, &payload])?;
+                if let Some(row) = &row {
+                    let draft = Self::row_to_draft(row)?;
+                    let payload_json = serde_json::json!({
+                        "draft_id": draft.draft_id,
+                        "owner_id": draft.owner_id,
+                        "worker_run_id": draft.worker_run_id,
+                        "parent_run_id": draft.parent_run_id,
+                        "key": draft.key,
+                        "reason": reason.as_deref(),
+                    })
+                    .to_string();
+                    tx.execute(
+                        &outbox_stmt,
+                        &[
+                            &Uuid::new_v4().to_string(),
+                            &draft.workspace_id,
+                            &draft.draft_id,
+                            &draft.session_key,
+                            &draft.agent_id,
+                            &draft.persona_id,
+                            &draft.visibility.as_str(),
+                            &payload_json,
+                            &Utc::now(),
+                        ],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(row)
+            })?;
             row.as_ref().map(Self::row_to_draft).transpose()
         })
         .await?
@@ -1330,6 +2829,768 @@ impl Memory for PostgresMemory {
 
     async fn increment_useful_count(&self, _id: &str) -> Result<()> {
         Ok(())
+    }
+
+    async fn ingest_document(&self, input: DocumentIngestInput) -> Result<DocumentRecord> {
+        let client = self.client.clone();
+        let qualified_documents_table = self.qualified_documents_table.clone();
+        let qualified_document_chunks_table = self.qualified_document_chunks_table.clone();
+        let qualified_memory_events_table = self.qualified_memory_events_table.clone();
+        let embedding_provider = self.embedding_provider_name();
+        let embedding_model = self.embedding_model_name();
+        let embedding_dimensions = self.embedding_dimensions_i64();
+        let raw_chunks: Vec<(usize, Option<String>, String)> = super::chunker::chunk_markdown(&input.content, 1_000)
+            .into_iter()
+            .map(|chunk| {
+                (
+                    chunk.index,
+                    chunk.heading.as_ref().map(|heading| heading.to_string()),
+                    chunk.content,
+                )
+            })
+            .collect();
+        let mut prepared_chunks = Vec::with_capacity(raw_chunks.len());
+        for (chunk_index, heading, content) in raw_chunks {
+            let embedding = self.get_or_compute_embedding(&content).await?;
+            let embedding_vector = embedding.as_ref().and_then(|embedding| {
+                self.pgvector_available
+                    .then(|| Self::pgvector_literal(embedding))
+                    .flatten()
+            });
+            let embedding_bytes = embedding.map(|embedding| vector::vec_to_bytes(&embedding));
+            prepared_chunks.push((chunk_index, heading, content, embedding_bytes, embedding_vector));
+        }
+        let pgvector_available = self.pgvector_available;
+
+        tokio::task::spawn_blocking(move || -> Result<DocumentRecord> {
+            let now = Utc::now();
+            let document_id = input.document_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let content_sha256 = Self::content_sha256_hex(&input.content);
+            let visibility = input.visibility.as_str().to_string();
+            let chunk_count = i64::try_from(prepared_chunks.len()).unwrap_or(i64::MAX);
+            let insert_document_stmt = format!(
+                "
+                INSERT INTO {qualified_documents_table} (
+                    document_id, workspace_id, owner_id, topic_id, task_id, source_message_event_id,
+                    source_kind, source_uri, title, content_sha256, mime_type, visibility,
+                    metadata_json, chunk_count, created_at, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                ON CONFLICT (document_id) DO UPDATE SET
+                    workspace_id = EXCLUDED.workspace_id,
+                    owner_id = EXCLUDED.owner_id,
+                    topic_id = EXCLUDED.topic_id,
+                    task_id = EXCLUDED.task_id,
+                    source_message_event_id = EXCLUDED.source_message_event_id,
+                    source_kind = EXCLUDED.source_kind,
+                    source_uri = EXCLUDED.source_uri,
+                    title = EXCLUDED.title,
+                    content_sha256 = EXCLUDED.content_sha256,
+                    mime_type = EXCLUDED.mime_type,
+                    visibility = EXCLUDED.visibility,
+                    metadata_json = EXCLUDED.metadata_json,
+                    chunk_count = EXCLUDED.chunk_count,
+                    updated_at = EXCLUDED.updated_at
+                "
+            );
+            let delete_chunks_stmt = format!("DELETE FROM {qualified_document_chunks_table} WHERE document_id = $1");
+            let insert_chunk_stmt = format!(
+                "
+                INSERT INTO {qualified_document_chunks_table} (
+                    chunk_id, document_id, workspace_id, owner_id, topic_id, task_id,
+                    chunk_index, heading, content, content_sha256, embedding,
+                    embedding_provider, embedding_model, embedding_dimensions,
+                    source_anchor, token_estimate, created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                "
+            );
+            let insert_event_stmt = format!(
+                "
+                INSERT INTO {qualified_memory_events_table} (
+                    event_id, workspace_id, event_type, subject_table, subject_id,
+                    session_key, agent_id, persona_id, visibility, payload_json, created_at
+                )
+                VALUES ($1, $2, 'document.ingested', 'documents', $3, NULL, NULL, NULL, $4, $5, $6)
+                "
+            );
+            let select_document_stmt = format!(
+                "
+                SELECT id, document_id, workspace_id, owner_id, topic_id, task_id,
+                       source_message_event_id, source_kind, source_uri, title,
+                       content_sha256, mime_type, visibility, metadata_json,
+                       chunk_count, created_at, updated_at
+                FROM {qualified_documents_table}
+                WHERE document_id = $1
+                LIMIT 1
+                "
+            );
+            client.with_client(|client| {
+                let mut tx = client.transaction()?;
+                tx.execute(
+                    &insert_document_stmt,
+                    &[
+                        &document_id,
+                        &input.workspace_id,
+                        &input.owner_id,
+                        &input.topic_id,
+                        &input.task_id,
+                        &input.source_message_event_id,
+                        &input.source_kind,
+                        &input.source_uri,
+                        &input.title,
+                        &content_sha256,
+                        &input.mime_type,
+                        &visibility,
+                        &input.metadata_json,
+                        &chunk_count,
+                        &now,
+                        &now,
+                    ],
+                )?;
+                tx.execute(&delete_chunks_stmt, &[&document_id])?;
+                let update_chunk_vector_stmt = if pgvector_available {
+                    Some(format!(
+                        "UPDATE {qualified_document_chunks_table} SET embedding_vector = $1::vector WHERE chunk_id = $2"
+                    ))
+                } else {
+                    None
+                };
+                for (chunk_index, heading, content, embedding_bytes, embedding_vector) in prepared_chunks {
+                    let chunk_id = format!("{document_id}:chunk:{chunk_index}");
+                    let source_anchor = format!("{document_id}#chunk-{chunk_index}");
+                    let token_estimate = i64::try_from(content.chars().count().div_ceil(4)).unwrap_or(i64::MAX);
+                    let chunk_index = i64::try_from(chunk_index).unwrap_or(i64::MAX);
+                    let chunk_hash = Self::content_sha256_hex(&content);
+                    let chunk_embedding_provider = embedding_bytes.as_ref().map(|_| embedding_provider.clone());
+                    let chunk_embedding_model = embedding_bytes.as_ref().map(|_| embedding_model.clone());
+                    let chunk_embedding_dimensions = embedding_bytes.as_ref().map(|_| embedding_dimensions);
+                    tx.execute(
+                        &insert_chunk_stmt,
+                        &[
+                            &chunk_id,
+                            &document_id,
+                            &input.workspace_id,
+                            &input.owner_id,
+                            &input.topic_id,
+                            &input.task_id,
+                            &chunk_index,
+                            &heading,
+                            &content,
+                            &chunk_hash,
+                            &embedding_bytes,
+                            &chunk_embedding_provider,
+                            &chunk_embedding_model,
+                            &chunk_embedding_dimensions,
+                            &source_anchor,
+                            &token_estimate,
+                            &now,
+                        ],
+                    )?;
+                    if let (Some(stmt), Some(embedding_vector)) =
+                        (update_chunk_vector_stmt.as_ref(), embedding_vector.as_ref())
+                    {
+                        tx.execute(stmt, &[embedding_vector, &chunk_id])?;
+                    }
+                }
+                let payload_json = serde_json::json!({
+                    "owner_id": input.owner_id,
+                    "topic_id": input.topic_id,
+                    "task_id": input.task_id,
+                    "source_message_event_id": input.source_message_event_id,
+                    "chunk_count": chunk_count,
+                    "content_sha256": content_sha256
+                })
+                .to_string();
+                tx.execute(
+                    &insert_event_stmt,
+                    &[
+                        &Uuid::new_v4().to_string(),
+                        &input.workspace_id,
+                        &document_id,
+                        &visibility,
+                        &payload_json,
+                        &Utc::now(),
+                    ],
+                )?;
+                let row = tx.query_one(&select_document_stmt, &[&document_id])?;
+                let document = Self::row_to_document(&row)?;
+                tx.commit()?;
+                Ok(document)
+            })
+        })
+        .await?
+    }
+
+    async fn search_document_chunks(
+        &self,
+        principal: &MemoryPrincipal,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<DocumentSearchResult>> {
+        let client = self.client.clone();
+        let qualified_documents_table = self.qualified_documents_table.clone();
+        let qualified_document_chunks_table = self.qualified_document_chunks_table.clone();
+        let principal = principal.clone();
+        let query = query.trim().to_string();
+        let owner_id = Self::document_owner_for_principal(&principal);
+        let limit_i64 = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query_embedding = self.get_or_compute_embedding(&query).await?;
+        let embedding_provider = self.embedding_provider_name();
+        let embedding_model = self.embedding_model_name();
+        let embedding_dimensions = self.embedder.dimensions();
+        let embedding_dimensions_i64 = self.embedding_dimensions_i64();
+        let vector_weight = self.vector_weight;
+        let keyword_weight = self.keyword_weight;
+        let pgvector_available = self.pgvector_available;
+        let query_vector = query_embedding
+            .as_ref()
+            .and_then(|embedding| Self::pgvector_literal(embedding));
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<DocumentSearchResult>> {
+            let stmt = format!(
+                "
+                SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
+                       c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
+                       c.token_estimate, c.created_at,
+                       ts_rank_cd(to_tsvector('simple', c.content), plainto_tsquery('simple', $1)) AS score
+                FROM {qualified_document_chunks_table} c
+                JOIN {qualified_documents_table} d ON d.document_id = c.document_id
+                WHERE c.workspace_id = $2
+                  AND (
+                      d.visibility IN ('global', 'workspace')
+                      OR ($3::TEXT IS NOT NULL AND c.owner_id = $3)
+                  )
+                  AND (
+                      to_tsvector('simple', c.content) @@ plainto_tsquery('simple', $1)
+                      OR c.content ILIKE '%' || $1 || '%'
+                      OR c.heading ILIKE '%' || $1 || '%'
+                  )
+                ORDER BY score DESC, c.id ASC
+                LIMIT $4
+                "
+            );
+            let rows = client.with_client(|client| {
+                Ok(client.query(&stmt, &[&query, &principal.workspace_id, &owner_id, &limit_i64])?)
+            })?;
+            let mut by_chunk = std::collections::HashMap::<String, DocumentSearchResult>::new();
+            for row in &rows {
+                let mut result = {
+                    let chunk = Self::row_to_document_chunk(row)?;
+                    let score: f32 = row.try_get::<_, f32>(14).unwrap_or(0.0);
+                    DocumentSearchResult { chunk, score }
+                };
+                result.score *= keyword_weight;
+                by_chunk.insert(result.chunk.chunk_id.clone(), result);
+            }
+
+            if let Some(query_embedding) = query_embedding {
+                if pgvector_available {
+                    if let Some(query_vector) = query_vector.as_ref() {
+                        let vector_stmt = format!(
+                            "
+                            SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
+                                   c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
+                                   c.token_estimate, c.created_at,
+                                   (1.0 - (c.embedding_vector <=> $1::vector))::REAL AS score
+                            FROM {qualified_document_chunks_table} c
+                            JOIN {qualified_documents_table} d ON d.document_id = c.document_id
+                            WHERE c.embedding_vector IS NOT NULL
+                              AND c.embedding_provider = $2
+                              AND c.embedding_model = $3
+                              AND c.embedding_dimensions = $4
+                              AND c.workspace_id = $5
+                              AND (
+                                  d.visibility IN ('global', 'workspace')
+                                  OR ($6::TEXT IS NOT NULL AND c.owner_id = $6)
+                              )
+                            ORDER BY c.embedding_vector <=> $1::vector
+                            LIMIT $7
+                            "
+                        );
+                        let candidate_limit = limit_i64.saturating_mul(4).max(limit_i64);
+                        let rows = client.with_client(|client| {
+                            Ok(client.query(
+                                &vector_stmt,
+                                &[
+                                    query_vector,
+                                    &embedding_provider,
+                                    &embedding_model,
+                                    &embedding_dimensions_i64,
+                                    &principal.workspace_id,
+                                    &owner_id,
+                                    &candidate_limit,
+                                ],
+                            )?)
+                        })?;
+                        for row in &rows {
+                            let score = row.try_get::<_, f32>(14).unwrap_or(0.0) * vector_weight;
+                            if score <= 0.0 {
+                                continue;
+                            }
+                            let chunk = Self::row_to_document_chunk(row)?;
+                            by_chunk
+                                .entry(chunk.chunk_id.clone())
+                                .and_modify(|existing| {
+                                    existing.score += score;
+                                })
+                                .or_insert(DocumentSearchResult { chunk, score });
+                        }
+                    }
+                } else {
+                    let vector_stmt = format!(
+                        "
+                        SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
+                               c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
+                               c.token_estimate, c.created_at, c.embedding
+                        FROM {qualified_document_chunks_table} c
+                        JOIN {qualified_documents_table} d ON d.document_id = c.document_id
+                        WHERE c.embedding IS NOT NULL
+                          AND c.embedding_provider = $1
+                          AND c.embedding_model = $2
+                          AND c.embedding_dimensions = $3
+                          AND c.workspace_id = $4
+                          AND (
+                              d.visibility IN ('global', 'workspace')
+                              OR ($5::TEXT IS NOT NULL AND c.owner_id = $5)
+                          )
+                        "
+                    );
+                    let rows = client.with_client(|client| {
+                        Ok(client.query(
+                            &vector_stmt,
+                            &[
+                                &embedding_provider,
+                                &embedding_model,
+                                &embedding_dimensions_i64,
+                                &principal.workspace_id,
+                                &owner_id,
+                            ],
+                        )?)
+                    })?;
+                    for row in &rows {
+                        let embedding_blob: Vec<u8> = row.get(14);
+                        let embedding = vector::bytes_to_vec(&embedding_blob);
+                        if embedding.len() != embedding_dimensions {
+                            tracing::debug!(
+                                chunk_id = %row.get::<_, String>(1),
+                                expected_dimensions = embedding_dimensions,
+                                actual_dimensions = embedding.len(),
+                                "Skipping stale Postgres document chunk embedding with mismatched dimensions"
+                            );
+                            continue;
+                        }
+                        let score = vector::cosine_similarity(&query_embedding, &embedding) * vector_weight;
+                        if score <= 0.0 {
+                            continue;
+                        }
+                        let chunk = Self::row_to_document_chunk(row)?;
+                        by_chunk
+                            .entry(chunk.chunk_id.clone())
+                            .and_modify(|existing| {
+                                existing.score += score;
+                            })
+                            .or_insert(DocumentSearchResult { chunk, score });
+                    }
+                }
+            }
+
+            let mut results: Vec<DocumentSearchResult> = by_chunk.into_values().collect();
+            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            results.truncate(limit.max(1));
+            Ok(results)
+        })
+        .await?
+    }
+
+    async fn get_document_chunk(&self, chunk_id: &str) -> Result<Option<DocumentChunkRecord>> {
+        let client = self.client.clone();
+        let qualified_document_chunks_table = self.qualified_document_chunks_table.clone();
+        let chunk_id = chunk_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> Result<Option<DocumentChunkRecord>> {
+            let stmt = format!(
+                "
+                SELECT id, chunk_id, document_id, workspace_id, owner_id, topic_id, task_id,
+                       chunk_index, heading, content, content_sha256, source_anchor,
+                       token_estimate, created_at
+                FROM {qualified_document_chunks_table}
+                WHERE chunk_id = $1
+                LIMIT 1
+                "
+            );
+            let row = client.with_client(|client| Ok(client.query_opt(&stmt, &[&chunk_id])?))?;
+            row.as_ref().map(Self::row_to_document_chunk).transpose()
+        })
+        .await?
+    }
+
+    async fn link_memory_source(&self, input: MemoryLinkInput) -> Result<MemoryLink> {
+        let client = self.client.clone();
+        let qualified_memory_links_table = self.qualified_memory_links_table.clone();
+        let link_id = input.link_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        tokio::task::spawn_blocking(move || -> Result<MemoryLink> {
+            let now = Utc::now();
+            let insert_stmt = format!(
+                "
+                INSERT INTO {qualified_memory_links_table} (
+                    link_id, workspace_id, owner_id, memory_key, memory_event_id,
+                    message_event_id, document_id, chunk_id, link_type, payload_json, created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (link_id) DO NOTHING
+                "
+            );
+            let select_stmt = format!(
+                "
+                SELECT id, link_id, workspace_id, owner_id, memory_key, memory_event_id,
+                       message_event_id, document_id, chunk_id, link_type, payload_json, created_at
+                FROM {qualified_memory_links_table}
+                WHERE link_id = $1
+                LIMIT 1
+                "
+            );
+            client.with_client(|client| {
+                client.execute(
+                    &insert_stmt,
+                    &[
+                        &link_id,
+                        &input.workspace_id,
+                        &input.owner_id,
+                        &input.memory_key,
+                        &input.memory_event_id,
+                        &input.message_event_id,
+                        &input.document_id,
+                        &input.chunk_id,
+                        &input.link_type,
+                        &input.payload_json,
+                        &now,
+                    ],
+                )?;
+                let row = client.query_one(&select_stmt, &[&link_id])?;
+                Self::row_to_memory_link(&row)
+            })
+        })
+        .await?
+    }
+
+    async fn append_retrieval_trace(&self, input: RetrievalTraceInput) -> Result<RetrievalTrace> {
+        let client = self.client.clone();
+        let qualified_retrieval_traces_table = self.qualified_retrieval_traces_table.clone();
+        let trace_id = input.trace_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        tokio::task::spawn_blocking(move || -> Result<RetrievalTrace> {
+            let now = Utc::now();
+            let candidate_count = i64::try_from(input.candidate_count).unwrap_or(i64::MAX);
+            let selected_count = i64::try_from(input.selected_count).unwrap_or(i64::MAX);
+            let dropped_count = i64::try_from(input.dropped_count).unwrap_or(i64::MAX);
+            let budget_tokens = input
+                .budget_tokens
+                .map(|value| i64::try_from(value).unwrap_or(i64::MAX));
+            let insert_stmt = format!(
+                "
+                INSERT INTO {qualified_retrieval_traces_table} (
+                    trace_id, workspace_id, owner_id, session_key, agent_id, persona_id,
+                    source, query, candidate_count, selected_count, dropped_count,
+                    budget_tokens, selected_json, dropped_json, payload_json, created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                ON CONFLICT (trace_id) DO UPDATE SET
+                    workspace_id = EXCLUDED.workspace_id,
+                    owner_id = EXCLUDED.owner_id,
+                    session_key = EXCLUDED.session_key,
+                    agent_id = EXCLUDED.agent_id,
+                    persona_id = EXCLUDED.persona_id,
+                    source = EXCLUDED.source,
+                    query = EXCLUDED.query,
+                    candidate_count = EXCLUDED.candidate_count,
+                    selected_count = EXCLUDED.selected_count,
+                    dropped_count = EXCLUDED.dropped_count,
+                    budget_tokens = EXCLUDED.budget_tokens,
+                    selected_json = EXCLUDED.selected_json,
+                    dropped_json = EXCLUDED.dropped_json,
+                    payload_json = EXCLUDED.payload_json
+                "
+            );
+            let select_stmt = format!(
+                "
+                SELECT id, trace_id, workspace_id, owner_id, session_key, agent_id,
+                       persona_id, source, query, candidate_count, selected_count,
+                       dropped_count, budget_tokens, selected_json, dropped_json,
+                       payload_json, created_at
+                FROM {qualified_retrieval_traces_table}
+                WHERE trace_id = $1
+                LIMIT 1
+                "
+            );
+            client.with_client(|client| {
+                client.execute(
+                    &insert_stmt,
+                    &[
+                        &trace_id,
+                        &input.workspace_id,
+                        &input.owner_id,
+                        &input.session_key,
+                        &input.agent_id,
+                        &input.persona_id,
+                        &input.source,
+                        &input.query,
+                        &candidate_count,
+                        &selected_count,
+                        &dropped_count,
+                        &budget_tokens,
+                        &input.selected_json,
+                        &input.dropped_json,
+                        &input.payload_json,
+                        &now,
+                    ],
+                )?;
+                let row = client.query_one(&select_stmt, &[&trace_id])?;
+                Self::row_to_retrieval_trace(&row)
+            })
+        })
+        .await?
+    }
+
+    async fn append_compaction_run(&self, input: CompactionRunInput) -> Result<CompactionRun> {
+        let client = self.client.clone();
+        let qualified_compaction_runs_table = self.qualified_compaction_runs_table.clone();
+        let run_id = input.run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        tokio::task::spawn_blocking(move || -> Result<CompactionRun> {
+            let now = Utc::now();
+            let source_message_count = i64::try_from(input.source_message_count).unwrap_or(i64::MAX);
+            let source_token_estimate = i64::try_from(input.source_token_estimate).unwrap_or(i64::MAX);
+            let insert_stmt = format!(
+                "
+                INSERT INTO {qualified_compaction_runs_table} (
+                    run_id, workspace_id, owner_id, session_key, agent_id, persona_id,
+                    trigger, mode, source_message_count, source_token_estimate,
+                    summary, summary_memory_key, source_event_ids_json,
+                    source_document_refs_json, fidelity_status, payload_json, created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    workspace_id = EXCLUDED.workspace_id,
+                    owner_id = EXCLUDED.owner_id,
+                    session_key = EXCLUDED.session_key,
+                    agent_id = EXCLUDED.agent_id,
+                    persona_id = EXCLUDED.persona_id,
+                    trigger = EXCLUDED.trigger,
+                    mode = EXCLUDED.mode,
+                    source_message_count = EXCLUDED.source_message_count,
+                    source_token_estimate = EXCLUDED.source_token_estimate,
+                    summary = EXCLUDED.summary,
+                    summary_memory_key = EXCLUDED.summary_memory_key,
+                    source_event_ids_json = EXCLUDED.source_event_ids_json,
+                    source_document_refs_json = EXCLUDED.source_document_refs_json,
+                    fidelity_status = EXCLUDED.fidelity_status,
+                    payload_json = EXCLUDED.payload_json
+                "
+            );
+            let select_stmt = format!(
+                "
+                SELECT id, run_id, workspace_id, owner_id, session_key, agent_id,
+                       persona_id, trigger, mode, source_message_count,
+                       source_token_estimate, summary, summary_memory_key,
+                       source_event_ids_json, source_document_refs_json,
+                       fidelity_status, payload_json, created_at
+                FROM {qualified_compaction_runs_table}
+                WHERE run_id = $1
+                LIMIT 1
+                "
+            );
+            client.with_client(|client| {
+                client.execute(
+                    &insert_stmt,
+                    &[
+                        &run_id,
+                        &input.workspace_id,
+                        &input.owner_id,
+                        &input.session_key,
+                        &input.agent_id,
+                        &input.persona_id,
+                        &input.trigger,
+                        &input.mode,
+                        &source_message_count,
+                        &source_token_estimate,
+                        &input.summary,
+                        &input.summary_memory_key,
+                        &input.source_event_ids_json,
+                        &input.source_document_refs_json,
+                        &input.fidelity_status,
+                        &input.payload_json,
+                        &now,
+                    ],
+                )?;
+                let row = client.query_one(&select_stmt, &[&run_id])?;
+                Self::row_to_compaction_run(&row)
+            })
+        })
+        .await?
+    }
+
+    async fn reindex(&self) -> Result<usize> {
+        if self.embedder.dimensions() == 0 {
+            return Ok(0);
+        }
+
+        let provider_name = self.embedding_provider_name();
+        let model_name = self.embedding_model_name();
+        let dimensions = self.embedding_dimensions_i64();
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let entries: Vec<(String, String)> = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>> {
+            let stmt = format!(
+                "
+                SELECT id, content
+                FROM {qualified_table}
+                WHERE category NOT IN ('daily', 'conversation')
+                  AND (
+                      embedding IS NULL
+                      OR embedding_provider IS NULL
+                      OR embedding_model IS NULL
+                      OR embedding_dimensions IS NULL
+                      OR embedding_provider != $1
+                      OR embedding_model != $2
+                      OR embedding_dimensions != $3
+                  )
+                "
+            );
+            client.with_client(|client| {
+                let rows = client.query(&stmt, &[&provider_name, &model_name, &dimensions])?;
+                Ok(rows
+                    .iter()
+                    .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+                    .collect())
+            })
+        })
+        .await??;
+
+        let mut count = 0usize;
+        for (id, content) in entries {
+            if let Some(embedding) = self.get_or_compute_embedding(&content).await? {
+                let embedding_bytes = vector::vec_to_bytes(&embedding);
+                let embedding_vector = self
+                    .pgvector_available
+                    .then(|| Self::pgvector_literal(&embedding))
+                    .flatten();
+                let provider_name = self.embedding_provider_name();
+                let model_name = self.embedding_model_name();
+                let dimensions = self.embedding_dimensions_i64();
+                let client = self.client.clone();
+                let qualified_table = self.qualified_table.clone();
+                let pgvector_available = self.pgvector_available;
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let stmt = format!(
+                        "
+                        UPDATE {qualified_table}
+                        SET embedding = $1,
+                            embedding_provider = $2,
+                            embedding_model = $3,
+                            embedding_dimensions = $4
+                        WHERE id = $5
+                        "
+                    );
+                    client.with_client(|client| {
+                        client.execute(
+                            &stmt,
+                            &[&embedding_bytes, &provider_name, &model_name, &dimensions, &id],
+                        )?;
+                        if pgvector_available {
+                            let vector_stmt =
+                                format!("UPDATE {qualified_table} SET embedding_vector = $1::vector WHERE id = $2");
+                            if let Some(embedding_vector) = embedding_vector.as_ref() {
+                                client.execute(&vector_stmt, &[embedding_vector, &id])?;
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .await??;
+                count += 1;
+            }
+        }
+
+        let provider_name = self.embedding_provider_name();
+        let model_name = self.embedding_model_name();
+        let dimensions = self.embedding_dimensions_i64();
+        let client = self.client.clone();
+        let qualified_document_chunks_table = self.qualified_document_chunks_table.clone();
+        let chunks: Vec<(String, String)> = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>> {
+            let stmt = format!(
+                "
+                SELECT chunk_id, content
+                FROM {qualified_document_chunks_table}
+                WHERE embedding IS NULL
+                   OR embedding_provider IS NULL
+                   OR embedding_model IS NULL
+                   OR embedding_dimensions IS NULL
+                   OR embedding_provider != $1
+                   OR embedding_model != $2
+                   OR embedding_dimensions != $3
+                "
+            );
+            client.with_client(|client| {
+                let rows = client.query(&stmt, &[&provider_name, &model_name, &dimensions])?;
+                Ok(rows
+                    .iter()
+                    .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+                    .collect())
+            })
+        })
+        .await??;
+
+        for (chunk_id, content) in chunks {
+            if let Some(embedding) = self.get_or_compute_embedding(&content).await? {
+                let embedding_bytes = vector::vec_to_bytes(&embedding);
+                let embedding_vector = self
+                    .pgvector_available
+                    .then(|| Self::pgvector_literal(&embedding))
+                    .flatten();
+                let provider_name = self.embedding_provider_name();
+                let model_name = self.embedding_model_name();
+                let dimensions = self.embedding_dimensions_i64();
+                let client = self.client.clone();
+                let qualified_document_chunks_table = self.qualified_document_chunks_table.clone();
+                let pgvector_available = self.pgvector_available;
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let stmt = format!(
+                        "
+                        UPDATE {qualified_document_chunks_table}
+                        SET embedding = $1,
+                            embedding_provider = $2,
+                            embedding_model = $3,
+                            embedding_dimensions = $4
+                        WHERE chunk_id = $5
+                        "
+                    );
+                    client.with_client(|client| {
+                        client.execute(
+                            &stmt,
+                            &[&embedding_bytes, &provider_name, &model_name, &dimensions, &chunk_id],
+                        )?;
+                        if pgvector_available {
+                            let vector_stmt = format!(
+                                "UPDATE {qualified_document_chunks_table} SET embedding_vector = $1::vector WHERE chunk_id = $2"
+                            );
+                            if let Some(embedding_vector) = embedding_vector.as_ref() {
+                                client.execute(&vector_stmt, &[embedding_vector, &chunk_id])?;
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .await??;
+                count += 1;
+            }
+        }
+
+        Ok(count)
     }
 
     async fn health_check(&self) -> bool {
@@ -1344,6 +3605,35 @@ impl Memory for PostgresMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct CountingEmbedding {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl embeddings::EmbeddingProvider for CountingEmbedding {
+        fn name(&self) -> &str {
+            "counting"
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn model(&self) -> &str {
+            "counting-v1"
+        }
+
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(texts.len(), Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+    }
 
     #[test]
     fn valid_identifiers_pass_validation() {
@@ -1398,6 +3688,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pgvector_literal_rejects_empty_or_non_finite_vectors() {
+        assert_eq!(
+            PostgresMemory::pgvector_literal(&[0.1, 0.2, 0.3]).as_deref(),
+            Some("[0.1,0.2,0.3]")
+        );
+        assert!(PostgresMemory::pgvector_literal(&[]).is_none());
+        assert!(PostgresMemory::pgvector_literal(&[f32::NAN]).is_none());
+        assert!(PostgresMemory::pgvector_literal(&[f32::INFINITY]).is_none());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn new_does_not_panic_inside_tokio_runtime() {
         let outcome = std::panic::catch_unwind(|| {
@@ -1430,6 +3731,7 @@ mod tests {
                 event_id: Some("event-user-1".to_string()),
                 idempotency_key: Some("idem-user-1".to_string()),
                 workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
                 source: "postgres-test".to_string(),
                 channel: Some("telegram".to_string()),
                 session_key: Some("telegram_sender-1".to_string()),
@@ -1452,6 +3754,7 @@ mod tests {
                 event_id: Some("event-user-duplicate".to_string()),
                 idempotency_key: Some("idem-user-1".to_string()),
                 workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
                 source: "postgres-test".to_string(),
                 channel: Some("telegram".to_string()),
                 session_key: Some("telegram_sender-1".to_string()),
@@ -1477,6 +3780,7 @@ mod tests {
                 event_id: Some("event-assistant-1".to_string()),
                 idempotency_key: None,
                 workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
                 source: "postgres-test".to_string(),
                 channel: Some("telegram".to_string()),
                 session_key: Some("telegram_sender-1".to_string()),
@@ -1502,6 +3806,7 @@ mod tests {
             session_key: Some("telegram_sender-1".to_string()),
             channel: Some("telegram".to_string()),
             sender: Some("sender-1".to_string()),
+            owner_id: None,
         };
         let events = mem.list_message_events_since(&principal, 0, 10).await.unwrap();
         assert_eq!(events.len(), 2);
@@ -1511,6 +3816,12 @@ mod tests {
         );
         assert_eq!(
             events.get(1).map(|event| event.event_id.as_str()),
+            Some("event-assistant-1")
+        );
+        let recent_events = mem.list_message_events_recent(&principal, 10).await.unwrap();
+        assert_eq!(recent_events.len(), 2);
+        assert_eq!(
+            recent_events.first().map(|event| event.event_id.as_str()),
             Some("event-assistant-1")
         );
 
@@ -1569,11 +3880,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(custom_event.event_type, "memory.custom");
+        let recent_outbox = mem.list_memory_events_recent(&principal, 10).await.unwrap();
+        assert_eq!(
+            recent_outbox.first().map(|event| event.event_id.as_str()),
+            Some("memory-event-1")
+        );
 
         let draft = mem
             .create_memory_draft(MemoryDraftInput {
                 draft_id: Some("draft-1".to_string()),
                 workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
                 worker_run_id: "worker-run-1".to_string(),
                 parent_run_id: Some("parent-run-1".to_string()),
                 session_key: Some("telegram_sender-1".to_string()),
@@ -1593,6 +3910,395 @@ mod tests {
         assert_eq!(merged.status, "merged");
         let stored = mem.get("draft-key").await.unwrap().unwrap();
         assert_eq!(stored.content, "draft content");
+
+        let rejected = mem
+            .create_memory_draft(MemoryDraftInput {
+                draft_id: Some("draft-2".to_string()),
+                workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
+                worker_run_id: "worker-run-1".to_string(),
+                parent_run_id: Some("parent-run-1".to_string()),
+                session_key: Some("telegram_sender-1".to_string()),
+                agent_id: Some("agent-a".to_string()),
+                persona_id: Some("persona-a".to_string()),
+                key: "rejected-draft-key".to_string(),
+                content: "rejected draft content".to_string(),
+                category: MemoryCategory::Conversation,
+                source_event_id: Some(user.event_id.clone()),
+                visibility: MemoryVisibility::Private,
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rejected.status, "pending");
+        let rejected = mem
+            .reject_memory_draft("draft-2", Some("not useful"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.status, "rejected");
+
+        let event_types: Vec<String> = mem
+            .list_memory_events_since(&principal, 0, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect();
+        assert!(event_types.contains(&"memory.draft.created".to_string()));
+        assert!(event_types.contains(&"memory.draft.merged".to_string()));
+        assert!(event_types.contains(&"memory.draft.rejected".to_string()));
+        assert!(event_types.contains(&"memory.stored".to_string()));
+
+        let document = mem
+            .ingest_document(DocumentIngestInput {
+                document_id: Some("doc-postgres-1".to_string()),
+                workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
+                topic_id: Some("topic-a".to_string()),
+                task_id: Some("task-a".to_string()),
+                source_message_event_id: Some(user.event_id.clone()),
+                source_kind: "tool_output".to_string(),
+                source_uri: Some("tool:file_read".to_string()),
+                title: Some("Postgres Document".to_string()),
+                content: "Durable postgres document fact about vector retrieval and source anchors.".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                visibility: MemoryVisibility::Workspace,
+                metadata_json: Some("{\"tool\":\"file_read\"}".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(document.document_id, "doc-postgres-1");
+        assert_eq!(document.chunk_count, 1);
+        assert_eq!(document.content_sha256.len(), 64);
+
+        let document_results = mem
+            .search_document_chunks(&principal, "vector retrieval", 10)
+            .await
+            .unwrap();
+        assert_eq!(document_results.len(), 1);
+        let document_result = document_results.first().expect("document result should exist");
+        assert_eq!(document_result.chunk.document_id, "doc-postgres-1");
+        assert_eq!(document_result.chunk.source_anchor, "doc-postgres-1#chunk-0");
+
+        let chunk = mem
+            .get_document_chunk(&document_result.chunk.chunk_id)
+            .await
+            .unwrap()
+            .expect("document chunk should be retrievable");
+        assert!(chunk.content.contains("source anchors"));
+
+        let link = mem
+            .link_memory_source(MemoryLinkInput {
+                link_id: Some("link-postgres-1".to_string()),
+                workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
+                memory_key: Some("draft-key".to_string()),
+                memory_event_id: None,
+                message_event_id: Some(user.event_id.clone()),
+                document_id: document.document_id.clone(),
+                chunk_id: Some(chunk.chunk_id.clone()),
+                link_type: "evidence".to_string(),
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(link.link_id, "link-postgres-1");
+        assert_eq!(link.chunk_id.as_deref(), Some(chunk.chunk_id.as_str()));
+
+        let trace = mem
+            .append_retrieval_trace(RetrievalTraceInput {
+                trace_id: Some("trace-postgres-1".to_string()),
+                workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
+                session_key: Some("telegram_sender-1".to_string()),
+                agent_id: Some("agent-a".to_string()),
+                persona_id: Some("persona-a".to_string()),
+                source: "agent_context.document_evidence".to_string(),
+                query: "vector retrieval".to_string(),
+                candidate_count: document_results.len(),
+                selected_count: 1,
+                dropped_count: 0,
+                budget_tokens: Some(512),
+                selected_json: Some(format!(r#"[{{"chunk_id":"{}"}}]"#, chunk.chunk_id)),
+                dropped_json: Some("[]".to_string()),
+                payload_json: Some(r#"{"phase":"postgres_conformance"}"#.to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(trace.trace_id, "trace-postgres-1");
+        assert_eq!(trace.source, "agent_context.document_evidence");
+        assert!(trace.selected_json.unwrap().contains("doc-postgres-1:chunk:0"));
+
+        let compaction = mem
+            .append_compaction_run(CompactionRunInput {
+                run_id: Some("compact-postgres-1".to_string()),
+                workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
+                session_key: Some("telegram_sender-1".to_string()),
+                agent_id: Some("agent-a".to_string()),
+                persona_id: Some("persona-a".to_string()),
+                trigger: "overflow_retry".to_string(),
+                mode: "safeguard".to_string(),
+                source_message_count: 3,
+                source_token_estimate: 512,
+                summary: "## Decisions\n- preserve source anchors".to_string(),
+                summary_memory_key: Some("compaction_summary_pg".to_string()),
+                source_event_ids_json: Some(format!(r#"["{}"]"#, user.event_id)),
+                source_document_refs_json: Some(format!(r#"[{{"chunk_id":"{}"}}]"#, chunk.chunk_id)),
+                fidelity_status: "accepted".to_string(),
+                payload_json: Some(r#"{"phase":"postgres_conformance"}"#.to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(compaction.run_id, "compact-postgres-1");
+        assert_eq!(compaction.summary_memory_key.as_deref(), Some("compaction_summary_pg"));
+        assert_eq!(compaction.fidelity_status, "accepted");
+
+        crate::memory::traits::conformance::assert_scoped_memory_acl_conformance(&mem, "postgres-scoped-conformance")
+            .await;
+
+        drop(mem);
+        tokio::task::spawn_blocking(move || {
+            let mut client = db_url.parse::<postgres::Config>().unwrap().connect(NoTls).unwrap();
+            client
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_identifier(&schema)))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_embedding_vector_reindex_from_env() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let schema = format!("prx_vector_test_{}", Uuid::new_v4().simple());
+        let table = "memories";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mem = PostgresMemory::with_embedder(
+            &db_url,
+            &schema,
+            table,
+            Some(5),
+            Arc::new(CountingEmbedding {
+                calls: Arc::clone(&calls),
+            }),
+            1.0,
+            0.0,
+        )
+        .unwrap();
+
+        mem.store("core-vector", "alpha beta gamma", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("core-vector-copy", "alpha beta gamma", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("daily-vector", "daily alpha beta", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Postgres should cache repeated durable core/custom memory embeddings"
+        );
+
+        let vector_results = mem.recall("semantic-neighbor", 5, None).await.unwrap();
+        assert!(
+            vector_results.iter().any(|entry| entry.key == "core-vector"),
+            "Postgres memory recall should use app-level vector scan when lexical search has no match"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "Postgres should compute the first query embedding"
+        );
+        let _ = mem.recall("semantic-neighbor", 5, None).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "Postgres should reuse cached query embeddings"
+        );
+
+        mem.ingest_document(DocumentIngestInput {
+            document_id: Some("doc-vector-postgres-1".to_string()),
+            workspace_id: "workspace-a".to_string(),
+            owner_id: None,
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+            source_kind: "test".to_string(),
+            source_uri: None,
+            title: Some("Vector Postgres Doc".to_string()),
+            content: "delta epsilon zeta".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            visibility: MemoryVisibility::Workspace,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+        mem.ingest_document(DocumentIngestInput {
+            document_id: Some("doc-vector-postgres-2".to_string()),
+            workspace_id: "workspace-a".to_string(),
+            owner_id: None,
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+            source_kind: "test".to_string(),
+            source_uri: None,
+            title: Some("Vector Postgres Doc Copy".to_string()),
+            content: "delta epsilon zeta".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            visibility: MemoryVisibility::Workspace,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "Postgres should cache repeated document chunk embeddings"
+        );
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-a".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("chat:postgres-vector".to_string()),
+            channel: Some("terminal".to_string()),
+            sender: Some("local-user".to_string()),
+            owner_id: None,
+        };
+        let document_results = mem
+            .search_document_chunks(&principal, "semantic-neighbor", 5)
+            .await
+            .unwrap();
+        assert!(
+            document_results
+                .iter()
+                .any(|result| result.chunk.document_id == "doc-vector-postgres-1"),
+            "Postgres document search should use app-level vector scan when lexical search has no match"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "Postgres document search should reuse the cached query embedding"
+        );
+        {
+            let client_slot = mem.client.clone();
+            let qualified_embedding_cache_table = mem.qualified_embedding_cache_table.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                client_slot.with_client(|client| {
+                    let count: i64 = client
+                        .query_one(&format!("SELECT COUNT(*) FROM {qualified_embedding_cache_table}"), &[])
+                        .map(|row| row.get(0))?;
+                    assert!(
+                        count >= 3,
+                        "Postgres embedding cache should retain stored/query embeddings"
+                    );
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
+
+        {
+            let client_slot = mem.client.clone();
+            let qualified_table = mem.qualified_table.clone();
+            let qualified_document_chunks_table = mem.qualified_document_chunks_table.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                client_slot.with_client(|client| {
+                    client.execute(
+                        &format!(
+                            "UPDATE {} SET embedding_provider = 'stale-provider',
+                         embedding_model = 'stale-model',
+                         embedding_dimensions = 999
+                         WHERE key = 'core-vector'",
+                            qualified_table
+                        ),
+                        &[],
+                    )?;
+                    client.execute(
+                        &format!(
+                            "UPDATE {} SET embedding_provider = 'stale-provider',
+                         embedding_model = 'stale-model',
+                         embedding_dimensions = 999
+                         WHERE document_id = 'doc-vector-postgres-1'",
+                            qualified_document_chunks_table
+                        ),
+                        &[],
+                    )?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
+
+        let stale_memory = mem.recall("semantic-neighbor", 5, None).await.unwrap();
+        assert!(
+            stale_memory.iter().all(|entry| entry.key != "core-vector"),
+            "stale Postgres memory vector metadata must be ignored before reindex"
+        );
+        let stale_document = mem
+            .search_document_chunks(&principal, "semantic-neighbor", 5)
+            .await
+            .unwrap();
+        assert!(
+            stale_document
+                .iter()
+                .all(|result| result.chunk.document_id != "doc-vector-postgres-1"),
+            "stale Postgres document chunk vector metadata must be ignored before reindex"
+        );
+
+        let repaired = mem.reindex().await.unwrap();
+        assert_eq!(repaired, 2);
+
+        let restored_memory = mem.recall("semantic-neighbor", 5, None).await.unwrap();
+        assert!(
+            restored_memory.iter().any(|entry| entry.key == "core-vector"),
+            "Postgres memory vector recall should work after reindex"
+        );
+        let restored_document = mem
+            .search_document_chunks(&principal, "semantic-neighbor", 5)
+            .await
+            .unwrap();
+        assert!(
+            restored_document
+                .iter()
+                .any(|result| result.chunk.document_id == "doc-vector-postgres-1"),
+            "Postgres document vector recall should work after reindex"
+        );
+
+        {
+            let client_slot = mem.client.clone();
+            let qualified_table = mem.qualified_table.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                client_slot.with_client(|client| {
+                    let (provider, model, dimensions): (String, String, i64) = client
+                        .query_one(
+                            &format!(
+                                "SELECT embedding_provider, embedding_model, embedding_dimensions
+                             FROM {} WHERE key = 'core-vector'",
+                                qualified_table
+                            ),
+                            &[],
+                        )
+                        .map(|row| (row.get(0), row.get(1), row.get(2)))?;
+                    assert_eq!(provider, "counting");
+                    assert_eq!(model, "counting-v1");
+                    assert_eq!(dimensions, 3);
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
 
         drop(mem);
         tokio::task::spawn_blocking(move || {

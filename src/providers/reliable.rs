@@ -1,5 +1,6 @@
 use super::Provider;
 use super::traits::{ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult};
+use crate::llm::route_decision::{ProviderExecutionOutcome, RouteDecision};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use std::collections::HashMap;
@@ -719,6 +720,20 @@ impl Provider for ReliableProvider {
         }
 
         anyhow::bail!(self.all_failed_message(&failures, &runtime_unavailable))
+    }
+
+    async fn chat_with_decision(
+        &self,
+        decision: &RouteDecision,
+        request: ChatRequest<'_>,
+        temperature: f64,
+    ) -> anyhow::Result<(ChatResponse, ProviderExecutionOutcome)> {
+        let started_at = chrono::Utc::now();
+        let response = self.chat(request, decision.effective_model(), temperature).await?;
+        Ok((
+            response,
+            ProviderExecutionOutcome::success_for_decision(decision, started_at),
+        ))
     }
 
     fn supports_native_tools(&self) -> bool {

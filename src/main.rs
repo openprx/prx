@@ -86,10 +86,12 @@
 )]
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::{fs, io::Write, path::PathBuf};
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -208,6 +210,7 @@ fn is_config_show_sensitive_key(key: &str) -> bool {
         || key.contains("private_key")
 }
 
+mod acl;
 mod agent;
 mod approval;
 mod auth;
@@ -226,6 +229,7 @@ mod heartbeat;
 mod hooks;
 mod identity;
 mod integrations;
+mod llm;
 mod media;
 mod memory;
 mod migration;
@@ -239,6 +243,7 @@ mod providers;
 #[cfg(feature = "llm-router")]
 mod router;
 mod runtime;
+mod schema_migration;
 mod security;
 mod self_system;
 mod service;
@@ -281,6 +286,90 @@ enum ServiceCommands {
     Status,
     /// Uninstall daemon service unit
     Uninstall,
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryCommands {
+    /// Rebuild memory/document indexes and backfill stale embeddings where supported
+    Reindex {
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ApprovalCommands {
+    /// List runtime approval grants
+    List {
+        /// Filter by approval grant schema version
+        #[arg(long)]
+        version: Option<u8>,
+    },
+    /// Verify runtime approval grants
+    Verify {
+        /// Verify all known grants
+        #[arg(long)]
+        all: bool,
+        /// Grant id to verify
+        grant_id: Option<String>,
+    },
+    /// Revoke a runtime approval grant
+    Revoke {
+        /// Grant id to revoke
+        grant_id: String,
+        /// Human-readable revocation reason
+        #[arg(long, default_value = "operator revoked")]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditCommands {
+    /// Generate a local EU AI Act implementation attestation
+    #[command(name = "attest-eu-ai-act")]
+    AttestEuAiAct {
+        /// Emit JSON to stdout
+        #[arg(long)]
+        json: bool,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = AuditOutputFormat::Markdown)]
+        format: AuditOutputFormat,
+        /// Write the attestation to a file
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Include implementation notes in markdown output
+        #[arg(long)]
+        verbose: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum AuditOutputFormat {
+    Markdown,
+    Json,
+}
+
+#[derive(Debug, Serialize)]
+struct EuAiActAttestation {
+    generated_at: String,
+    classification: String,
+    default_provider: Option<String>,
+    total_checks: usize,
+    passed_count: usize,
+    warning_count: usize,
+    failed_count: usize,
+    checks: Vec<EuAiActCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct EuAiActCheck {
+    id: &'static str,
+    article: &'static str,
+    control: &'static str,
+    status: &'static str,
+    evidence: &'static str,
+    gap: &'static str,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -511,6 +600,12 @@ Examples:
     /// Show system status (full details)
     Status,
 
+    /// Manage memory indexes and maintenance operations
+    Memory {
+        #[command(subcommand)]
+        memory_command: MemoryCommands,
+    },
+
     /// Evolution dashboard and operations
     Evolution {
         /// Output machine-readable JSON
@@ -595,6 +690,18 @@ Examples:
     Auth {
         #[command(subcommand)]
         auth_command: AuthCommands,
+    },
+
+    /// Manage runtime approval grants
+    Approval {
+        #[command(subcommand)]
+        approval_command: ApprovalCommands,
+    },
+
+    /// Generate runtime audit attestations
+    Audit {
+        #[command(subcommand)]
+        audit_command: AuditCommands,
     },
 
     /// Manage configuration
@@ -798,6 +905,14 @@ enum AuthCommands {
 
 #[derive(Subcommand, Debug)]
 enum MigrateCommands {
+    /// Show schema migration status for the memory database
+    Status,
+    /// Verify applied schema migration checksums
+    Verify,
+    /// Preview pending schema migrations without writing
+    DryRun,
+    /// Record the current schema as the migration baseline
+    Baseline,
     /// Import memory from an `OpenClaw` workspace into this `OpenPRX` workspace
     Openclaw {
         /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
@@ -911,6 +1026,10 @@ enum DoctorCommands {
         #[arg(long)]
         use_cache: bool,
     },
+    /// Diagnose memory backend and embedding/vector configuration
+    Memory,
+    /// Report live runtime validation matrix readiness
+    Runtime,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1057,7 +1176,11 @@ async fn async_main() -> Result<()> {
     // diagnostics (config errors, etc.) remain visible to the user.
     let use_stderr = matches!(
         cli.command,
-        Commands::Chat { .. } | Commands::Config { .. } | Commands::Models { .. } | Commands::Integrations { .. }
+        Commands::Chat { .. }
+            | Commands::Config { .. }
+            | Commands::Models { .. }
+            | Commands::Integrations { .. }
+            | Commands::Audit { .. }
     );
     if use_stderr {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -1318,6 +1441,8 @@ async fn async_main() -> Result<()> {
             Ok(())
         }
 
+        Commands::Memory { memory_command } => handle_memory_command(memory_command, &config).await,
+
         Commands::Evolution {
             json,
             evolution_command,
@@ -1382,6 +1507,8 @@ async fn async_main() -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("doctor models task failed: {e}"))?
             }
+            Some(DoctorCommands::Memory) => doctor::run_memory(&config),
+            Some(DoctorCommands::Runtime) => doctor::run_runtime(&config).await,
             None => doctor::run(&config),
         },
 
@@ -1400,6 +1527,10 @@ async fn async_main() -> Result<()> {
         Commands::Migrate { migrate_command } => migration::handle_command(migrate_command, &config).await,
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
+
+        Commands::Approval { approval_command } => handle_approval_command(approval_command, &config),
+
+        Commands::Audit { audit_command } => handle_audit_command(audit_command, &config),
 
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Show { format } => {
@@ -1443,6 +1574,39 @@ async fn async_main() -> Result<()> {
                 Ok(())
             }
         },
+    }
+}
+
+async fn handle_memory_command(command: MemoryCommands, config: &Config) -> anyhow::Result<()> {
+    match command {
+        MemoryCommands::Reindex { json } => {
+            if !config.modules.memory {
+                bail!("memory module is disabled; enable [modules].memory before running memory maintenance");
+            }
+            let memory = memory::create_memory_with_storage_and_routes_with_acl(
+                &config.memory,
+                &config.embedding_routes,
+                Some(&config.storage.provider.config),
+                &config.workspace_dir,
+                config.api_key.as_deref(),
+                &config.identity_bindings,
+                &config.user_policies,
+            )?;
+            let backend = memory.name().to_string();
+            let repaired = memory.reindex().await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "backend": backend,
+                        "reindexed": repaired,
+                    })
+                );
+            } else {
+                println!("Memory reindex complete for {backend}: {repaired} stale vectors rebuilt");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1609,6 +1773,400 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
                 }
             },
         )
+}
+
+fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
+    let checks = vec![
+        EuAiActCheck {
+            id: "L01",
+            article: "Art.12",
+            control: "Side-effect gate decisions are audit-loggable",
+            status: "pass",
+            evidence: "SideEffectGate emits ToolGate audit events through AuditLogger.",
+            gap: "Retention policy still needs a configurable floor.",
+        },
+        EuAiActCheck {
+            id: "L02",
+            article: "Art.12",
+            control: "Audit log retention floor",
+            status: "warning",
+            evidence: "security.audit has enablement and size settings.",
+            gap: "No six-month minimum retention configuration is enforced yet.",
+        },
+        EuAiActCheck {
+            id: "L03",
+            article: "Art.12",
+            control: "Control ladder trace rotation",
+            status: "warning",
+            evidence: "control_ladder_traces records runtime decisions.",
+            gap: "Rotation and archival policy are still pending.",
+        },
+        EuAiActCheck {
+            id: "L04",
+            article: "Art.12",
+            control: "Message timeline records router/provider events",
+            status: "pass",
+            evidence: "router.route_decision and provider.final_outcome message_events are persisted.",
+            gap: "Provider policy URL metadata is not attached to every event.",
+        },
+        EuAiActCheck {
+            id: "T01",
+            article: "Art.13",
+            control: "Provider routing transparency",
+            status: "pass",
+            evidence: "RouteDecision and ProviderExecutionOutcome capture selected provider and model.",
+            gap: "User-facing provider transparency pages are still pending.",
+        },
+        EuAiActCheck {
+            id: "T02",
+            article: "Art.13",
+            control: "Third-party LLM data policy disclosure",
+            status: "warning",
+            evidence: "Provider names are available in runtime configuration.",
+            gap: "Policy URLs and data-use terms are not emitted by doctor/chat yet.",
+        },
+        EuAiActCheck {
+            id: "T04",
+            article: "Art.50",
+            control: "AI interaction notice",
+            status: "fail",
+            evidence: "No universal first-message disclosure was found in runtime routing.",
+            gap: "Channel adapters need a first-contact AI identity notice.",
+        },
+        EuAiActCheck {
+            id: "H01",
+            article: "Art.14",
+            control: "ApprovalGrant v2 cryptographic witness",
+            status: "pass",
+            evidence: "ApprovalGrantV2 signs and verifies grants with Ed25519 witness signatures.",
+            gap: "Persistence, revocation, and rotation policy remain future work.",
+        },
+        EuAiActCheck {
+            id: "H02",
+            article: "Art.14",
+            control: "Side-effect tool gate coverage",
+            status: "pass",
+            evidence: "Fourteen side-effect tools call authorize_resource_operation.",
+            gap: "Inbound channel listeners still need end-to-end supervised-mode coverage.",
+        },
+        EuAiActCheck {
+            id: "H03",
+            article: "Art.14",
+            control: "High-risk operation blocking",
+            status: "pass",
+            evidence: "ResourceRiskLevel::High is blocked when policy disables high-risk operations.",
+            gap: "Policy presets need operator-facing documentation.",
+        },
+        EuAiActCheck {
+            id: "H04",
+            article: "Art.14",
+            control: "Inbound listener human oversight",
+            status: "warning",
+            evidence: "Tool execution paths are gated.",
+            gap: "Native channel inbound paths still require explicit gate integration.",
+        },
+        EuAiActCheck {
+            id: "A01",
+            article: "Art.15",
+            control: "Retrieval traceability",
+            status: "pass",
+            evidence: "retrieval_traces and fail-fast retrieval memory traits are present.",
+            gap: "All context injection paths need trace coverage.",
+        },
+        EuAiActCheck {
+            id: "A02",
+            article: "Art.15",
+            control: "Context compaction provenance",
+            status: "pass",
+            evidence: "compaction_runs records source events and compaction status.",
+            gap: "Summary fidelity scoring is not yet enforced as a runtime gate.",
+        },
+        EuAiActCheck {
+            id: "A03",
+            article: "Art.15",
+            control: "Prompt-injection content boundaries",
+            status: "warning",
+            evidence: "Document and retrieval layers are separated in memory traits.",
+            gap: "Retrieved document chunks still need structured trust-boundary wrappers.",
+        },
+        EuAiActCheck {
+            id: "A04",
+            article: "Art.15",
+            control: "Vector-store row-level isolation",
+            status: "fail",
+            evidence: "Owner-centric fields exist in memory models.",
+            gap: "pgvector SQL row-level security policy is not implemented.",
+        },
+        EuAiActCheck {
+            id: "Q01",
+            article: "Art.16",
+            control: "Dependency vulnerability gate",
+            status: "pass",
+            evidence: "cargo audit is part of the current milestone validation surface.",
+            gap: "CI evidence should be attached to release attestations.",
+        },
+        EuAiActCheck {
+            id: "Q02",
+            article: "Art.16",
+            control: "Rust quality gate",
+            status: "pass",
+            evidence: "fmt, clippy -D warnings, cargo check, and cargo test are local release gates.",
+            gap: "Business E2E evidence remains deploy-gated.",
+        },
+        EuAiActCheck {
+            id: "Q03",
+            article: "Art.16",
+            control: "Quality management documentation",
+            status: "warning",
+            evidence: "Reaudit and milestone reports define current acceptance gates.",
+            gap: "A formal QMS document set is still pending.",
+        },
+        EuAiActCheck {
+            id: "C01",
+            article: "Art.17",
+            control: "Conformity assessment attestation",
+            status: "warning",
+            evidence: "This command generates an implementation attestation.",
+            gap: "A signed release-level conformity assessment document is still pending.",
+        },
+        EuAiActCheck {
+            id: "C02",
+            article: "Art.18",
+            control: "Declaration of conformity template",
+            status: "fail",
+            evidence: "No declaration template is currently emitted.",
+            gap: "DoC template requires product identity, version, operator, and scope fields.",
+        },
+        EuAiActCheck {
+            id: "M01",
+            article: "Art.19",
+            control: "Runtime monitoring surfaces",
+            status: "pass",
+            evidence: "doctor runtime and control ladder traces expose runtime health and decision data.",
+            gap: "Long-running trace rotation remains pending.",
+        },
+        EuAiActCheck {
+            id: "M02",
+            article: "Art.19",
+            control: "Incident response runbook",
+            status: "warning",
+            evidence: "Audit events can capture denied side-effect attempts.",
+            gap: "Operator incident triage and escalation runbooks are not documented.",
+        },
+        EuAiActCheck {
+            id: "M03",
+            article: "Art.19",
+            control: "Post-market monitoring report cadence",
+            status: "warning",
+            evidence: "Runtime traces provide raw monitoring inputs.",
+            gap: "Weekly/monthly monitoring report templates are still pending.",
+        },
+        EuAiActCheck {
+            id: "M04",
+            article: "Art.19",
+            control: "Serious incident reporting workflow",
+            status: "fail",
+            evidence: "No dedicated serious-incident workflow is currently wired.",
+            gap: "A 72-hour reporting workflow is needed for high-risk deployments.",
+        },
+    ];
+
+    let passed_count = checks.iter().filter(|check| check.status == "pass").count();
+    let warning_count = checks.iter().filter(|check| check.status == "warning").count();
+    let failed_count = checks.iter().filter(|check| check.status == "fail").count();
+
+    EuAiActAttestation {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        classification: "Art.50 Transparency Obligations System with high-risk-compatible controls".to_string(),
+        default_provider: config.default_provider.clone(),
+        total_checks: checks.len(),
+        passed_count,
+        warning_count,
+        failed_count,
+        checks,
+    }
+}
+
+fn render_eu_ai_act_attestation_markdown(attestation: &EuAiActAttestation, verbose: bool) -> String {
+    let mut output = String::new();
+    output.push_str("# PRX EU AI Act Implementation Attestation\n\n");
+    output.push_str(&format!("- Generated at: {}\n", attestation.generated_at));
+    output.push_str(&format!("- Classification: {}\n", attestation.classification));
+    output.push_str(&format!(
+        "- Checks: {} total, {} pass, {} warning, {} fail\n\n",
+        attestation.total_checks, attestation.passed_count, attestation.warning_count, attestation.failed_count
+    ));
+    output.push_str("| ID | Article | Status | Control |\n");
+    output.push_str("|----|---------|--------|---------|\n");
+    for check in &attestation.checks {
+        output.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            check.id, check.article, check.status, check.control
+        ));
+        if verbose {
+            output.push_str(&format!(
+                "\n{} evidence: {}\n\n{} gap: {}\n\n",
+                check.id, check.evidence, check.id, check.gap
+            ));
+        }
+    }
+    output
+}
+
+fn render_eu_ai_act_attestation_json(attestation: &EuAiActAttestation) -> Result<String> {
+    serde_json::to_string_pretty(attestation).context("Failed to serialize EU AI Act attestation")
+}
+
+fn handle_audit_command(audit_command: AuditCommands, config: &Config) -> Result<()> {
+    match audit_command {
+        AuditCommands::AttestEuAiAct {
+            json,
+            format,
+            output,
+            verbose,
+        } => {
+            let attestation = build_eu_ai_act_attestation(config);
+            let stdout_json = json || format == AuditOutputFormat::Json;
+            let stdout_rendered = if stdout_json {
+                render_eu_ai_act_attestation_json(&attestation)?
+            } else {
+                render_eu_ai_act_attestation_markdown(&attestation, verbose)
+            };
+
+            if let Some(path) = output {
+                let write_json = path.extension().and_then(|ext| ext.to_str()) == Some("json") || stdout_json;
+                let file_rendered = if write_json {
+                    render_eu_ai_act_attestation_json(&attestation)?
+                } else {
+                    render_eu_ai_act_attestation_markdown(&attestation, verbose)
+                };
+                fs::write(&path, file_rendered)
+                    .with_context(|| format!("Failed to write EU AI Act attestation to {}", path.display()))?;
+            }
+
+            println!("{stdout_rendered}");
+            Ok(())
+        }
+    }
+}
+
+fn handle_approval_command(approval_command: ApprovalCommands, config: &Config) -> Result<()> {
+    let conn = open_approval_ledger(config)?;
+    match approval_command {
+        ApprovalCommands::List { version } => {
+            let version = version.unwrap_or(2);
+            if version == acl::approval_grant::ApprovalGrantV2::VERSION {
+                let mut stmt = conn.prepare(
+                    "SELECT grant_id, owner_id, principal_id, capability_op_id, expires_at, revoked_at
+                     FROM approval_grants
+                     WHERE version = ?1
+                     ORDER BY issued_at DESC
+                     LIMIT 50",
+                )?;
+                let rows = stmt.query_map([i64::from(version)], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                })?;
+                let grants = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                if grants.is_empty() {
+                    println!("no approval grants found (version: 2)");
+                } else {
+                    for (grant_id, owner_id, principal_id, op_id, expires_at, revoked_at) in grants {
+                        let status = if revoked_at.is_some() { "revoked" } else { "active" };
+                        println!(
+                            "{grant_id}\t{status}\towner={owner_id}\tprincipal={principal_id}\top={op_id}\texpires={expires_at}"
+                        );
+                    }
+                }
+                Ok(())
+            } else {
+                bail!("unsupported approval grant version: {version}")
+            }
+        }
+        ApprovalCommands::Verify { all, grant_id } => {
+            if all {
+                let total: i64 = conn.query_row("SELECT COUNT(*) FROM approval_grants", [], |row| row.get(0))?;
+                let malformed: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM approval_grants
+                     WHERE grant_json = '' OR signature_alg = '' OR signed_payload_sha256 = ''",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if total == 0 {
+                    println!("no approval grants found to verify");
+                } else if malformed == 0 {
+                    println!("approval grant ledger metadata verified: {total} grants");
+                } else {
+                    bail!("approval grant ledger metadata verification failed: {malformed}/{total} malformed grants");
+                }
+                return Ok(());
+            }
+            let Some(grant_id) = grant_id else {
+                bail!("provide a grant id or --all");
+            };
+            let found: Option<(String, String, String)> = conn
+                .query_row(
+                    "SELECT grant_id, signature_alg, signed_payload_sha256
+                     FROM approval_grants
+                     WHERE grant_id = ?1",
+                    [grant_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((grant_id, signature_alg, payload_sha)) = found else {
+                bail!("approval grant not found: {grant_id}");
+            };
+            if signature_alg.trim().is_empty() || payload_sha.trim().is_empty() {
+                bail!("approval grant metadata verification failed: {grant_id}");
+            }
+            println!("approval grant metadata verified: {grant_id} ({signature_alg})");
+            Ok(())
+        }
+        ApprovalCommands::Revoke { grant_id, reason } => {
+            let now = Utc::now().to_rfc3339();
+            let updated = conn.execute(
+                "UPDATE approval_grants
+                 SET revoked_at = COALESCE(revoked_at, ?2),
+                     revocation_reason = COALESCE(revocation_reason, ?3),
+                     updated_at = ?2
+                 WHERE grant_id = ?1",
+                params![grant_id, now, reason],
+            )?;
+            if updated == 0 {
+                bail!("approval grant not found: {grant_id}");
+            }
+            conn.execute(
+                "INSERT INTO approval_grant_events (event_id, grant_id, event_type, actor, occurred_at, payload_json)
+                 VALUES (?1, ?2, 'grant.revoked', 'cli', ?3, ?4)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    grant_id,
+                    now,
+                    serde_json::json!({ "reason": reason }).to_string()
+                ],
+            )?;
+            println!("approval grant revoked: {grant_id}");
+            Ok(())
+        }
+    }
+}
+
+fn open_approval_ledger(config: &Config) -> Result<Connection> {
+    let db_path = config.workspace_dir.join("memory").join("brain.db");
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create approval ledger directory: {}", parent.display()))?;
+    }
+    let conn =
+        Connection::open(&db_path).with_context(|| format!("Failed to open approval ledger: {}", db_path.display()))?;
+    memory::sqlite::init_approval_grant_schema(&conn)?;
+    Ok(conn)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1960,6 +2518,140 @@ mod tests {
                 config_command: ConfigCommands::Show { format },
             } => assert_eq!(format, ConfigShowFormat::Json),
             other => panic!("expected config show json command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_reindex_cli_parses() {
+        let cli = Cli::try_parse_from(["prx", "memory", "reindex"]).expect("memory reindex should parse");
+        match cli.command {
+            Commands::Memory {
+                memory_command: MemoryCommands::Reindex { json },
+            } => assert!(!json),
+            other => panic!("expected memory reindex command, got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["prx", "memory", "reindex", "--json"]).expect("memory reindex --json should parse");
+        match cli.command {
+            Commands::Memory {
+                memory_command: MemoryCommands::Reindex { json },
+            } => assert!(json),
+            other => panic!("expected memory reindex command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_revoke_cli_parses() {
+        let cli = Cli::try_parse_from([
+            "prx",
+            "approval",
+            "revoke",
+            "grant-test",
+            "--reason",
+            "operator requested",
+        ])
+        .expect("approval revoke should parse");
+        match cli.command {
+            Commands::Approval {
+                approval_command: ApprovalCommands::Revoke { grant_id, reason },
+            } => {
+                assert_eq!(grant_id, "grant-test");
+                assert_eq!(reason, "operator requested");
+            }
+            other => panic!("expected approval revoke command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eu_ai_act_audit_cli_parses_json_and_output() {
+        let cli = Cli::try_parse_from([
+            "prx",
+            "audit",
+            "attest-eu-ai-act",
+            "--json",
+            "--output",
+            "/tmp/eu-ai-act-test.json",
+        ])
+        .expect("eu ai act attestation should parse");
+
+        match cli.command {
+            Commands::Audit {
+                audit_command:
+                    AuditCommands::AttestEuAiAct {
+                        json,
+                        format,
+                        output,
+                        verbose,
+                    },
+            } => {
+                assert!(json);
+                assert_eq!(format, AuditOutputFormat::Markdown);
+                assert_eq!(
+                    output.as_deref(),
+                    Some(std::path::Path::new("/tmp/eu-ai-act-test.json"))
+                );
+                assert!(!verbose);
+            }
+            other => panic!("expected audit attest-eu-ai-act command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eu_ai_act_attestation_has_required_check_counts() {
+        let attestation = build_eu_ai_act_attestation(&Config::default());
+
+        assert_eq!(attestation.total_checks, 24);
+        assert_eq!(attestation.checks.len(), 24);
+        assert!(attestation.passed_count >= 8);
+        assert_eq!(
+            attestation.total_checks,
+            attestation.passed_count + attestation.warning_count + attestation.failed_count
+        );
+
+        let json = render_eu_ai_act_attestation_json(&attestation).expect("attestation should serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("attestation json should parse");
+        assert_eq!(value.get("total_checks").and_then(serde_json::Value::as_u64), Some(24));
+        assert!(
+            value
+                .get("passed_count")
+                .and_then(serde_json::Value::as_u64)
+                .expect("passed_count should be numeric")
+                >= 8
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_reindex_respects_memory_module_gate() {
+        let mut config = Config::default();
+        config.modules.memory = false;
+
+        let error = handle_memory_command(MemoryCommands::Reindex { json: false }, &config)
+            .await
+            .expect_err("disabled memory module should block reindex");
+
+        assert!(error.to_string().contains("memory module is disabled"));
+    }
+
+    #[test]
+    fn doctor_memory_cli_parses() {
+        let cli = Cli::try_parse_from(["prx", "doctor", "memory"]).expect("doctor memory should parse");
+        match cli.command {
+            Commands::Doctor {
+                doctor_command: Some(DoctorCommands::Memory),
+            } => {}
+            other => panic!("expected doctor memory command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doctor_runtime_cli_parses() {
+        let cli = Cli::try_parse_from(["prx", "doctor", "runtime"]).expect("doctor runtime should parse");
+        match cli.command {
+            Commands::Doctor {
+                doctor_command: Some(DoctorCommands::Runtime),
+            } => {}
+            other => panic!("expected doctor runtime command, got {other:?}"),
         }
     }
 

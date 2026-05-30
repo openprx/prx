@@ -13,11 +13,35 @@ use tokio::time::{Duration, Instant};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EvolutionMode {
-    /// Analyze and log recommendations but do not auto-apply.
+    /// Emit proposal drafts only; never mutate memory, prompts, config, or strategy files.
     #[default]
+    DraftOnly,
+    /// Analyze and log recommendations but do not auto-apply.
     Shadow,
     /// Auto-apply allowed evolution changes.
     Auto,
+}
+
+impl EvolutionMode {
+    pub const fn allows_target_mutation(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub const fn is_proposal_only(&self) -> bool {
+        matches!(self, Self::DraftOnly | Self::Shadow)
+    }
+
+    pub const fn requires_judge(&self) -> bool {
+        matches!(self, Self::Shadow | Self::Auto)
+    }
+
+    pub const fn requires_grant(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub const fn is_draft_like(&self) -> bool {
+        self.is_proposal_only()
+    }
 }
 
 /// Data thresholds used to gate evolution actions.
@@ -404,7 +428,7 @@ mod tests {
         tokio::fs::write(&path, "").await.unwrap();
 
         let cfg = EvolutionConfig::load_from_path(&path).await.unwrap();
-        assert_eq!(cfg.runtime.mode, EvolutionMode::Shadow);
+        assert_eq!(cfg.runtime.mode, EvolutionMode::DraftOnly);
         assert_eq!(cfg.runtime.data_thresholds.decision_log, 200);
         assert_eq!(cfg.runtime.data_thresholds.memory_access, 800);
         assert_eq!(cfg.runtime.data_thresholds.same_failure, 25);
@@ -528,6 +552,23 @@ max_tokens = 4096
     }
 
     #[test]
+    fn config_toml_parses_draft_only_mode() {
+        let parsed = toml::from_str::<EvolutionConfig>(
+            r#"
+[runtime]
+mode = "draft_only"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.runtime.mode, EvolutionMode::DraftOnly);
+        assert!(parsed.runtime.mode.is_proposal_only());
+        assert!(!parsed.runtime.mode.requires_judge());
+        assert!(!parsed.runtime.mode.requires_grant());
+        assert!(!parsed.runtime.mode.allows_target_mutation());
+    }
+
+    #[test]
     fn config_json_parses_with_partial_nested_objects() {
         let parsed = serde_json::from_str::<EvolutionConfig>(
             r#"{
@@ -541,7 +582,7 @@ max_tokens = 4096
         )
         .unwrap();
 
-        assert_eq!(parsed.runtime.mode, EvolutionMode::Shadow);
+        assert_eq!(parsed.runtime.mode, EvolutionMode::DraftOnly);
         assert_eq!(parsed.runtime.retention.hot_days, 30);
         assert_eq!(parsed.runtime.retention.cold_days, 365);
         assert_eq!(parsed.runtime.data_thresholds.memory_access, 800);

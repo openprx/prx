@@ -1,5 +1,7 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::security::SecurityPolicy;
+use crate::security::op_id;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
+use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -126,6 +128,20 @@ impl Tool for FileWriteTool {
         };
 
         let resolved_target = resolved_parent.join(file_name);
+        let operation_name = op_id::op_id(self.name(), "write", &[&op_id::ref_for_file(&resolved_target)]);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+            self.name(),
+            &operation_name,
+            ResourceRiskLevel::Medium,
+            approval_grant.as_ref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
 
         if !self.security.record_action() {
             return Ok(ToolResult {
@@ -214,6 +230,24 @@ mod tests {
         })
     }
 
+    fn approved_args(workspace: &std::path::Path, path: &str, content: &str) -> serde_json::Value {
+        let target = workspace.join(path);
+        let parent = target.parent().unwrap_or(workspace);
+        let file_name = target.file_name().unwrap_or_default();
+        let resolved_target = parent.join(file_name);
+        let operation = op_id::op_id("file_write", "write", &[&op_id::ref_for_file(&resolved_target)]);
+        json!({
+            "path": path,
+            "content": content,
+            crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG: ApprovalGrant::for_resource_operation(
+                "file_write",
+                &operation,
+                "test",
+                None,
+            )
+        })
+    }
+
     #[test]
     fn file_write_name() {
         let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
@@ -238,10 +272,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let tool = FileWriteTool::new(test_security(dir.clone()));
-        let result = tool
-            .execute(json!({"path": "out.txt", "content": "written!"}))
-            .await
-            .unwrap();
+        let result = tool.execute(approved_args(&dir, "out.txt", "written!")).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("8 bytes"));
 
@@ -259,7 +290,7 @@ mod tests {
 
         let tool = FileWriteTool::new(test_security(dir.clone()));
         let result = tool
-            .execute(json!({"path": "a/b/c/deep.txt", "content": "deep"}))
+            .execute(approved_args(&dir, "a/b/c/deep.txt", "deep"))
             .await
             .unwrap();
         assert!(result.success);
@@ -278,10 +309,7 @@ mod tests {
         tokio::fs::write(dir.join("exist.txt"), "old").await.unwrap();
 
         let tool = FileWriteTool::new(test_security(dir.clone()));
-        let result = tool
-            .execute(json!({"path": "exist.txt", "content": "new"}))
-            .await
-            .unwrap();
+        let result = tool.execute(approved_args(&dir, "exist.txt", "new")).await.unwrap();
         assert!(result.success);
 
         let content = tokio::fs::read_to_string(dir.join("exist.txt")).await.unwrap();
@@ -339,7 +367,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let tool = FileWriteTool::new(test_security(dir.clone()));
-        let result = tool.execute(json!({"path": "empty.txt", "content": ""})).await.unwrap();
+        let result = tool.execute(approved_args(&dir, "empty.txt", "")).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("0 bytes"));
 
@@ -433,7 +461,7 @@ mod tests {
 
         let tool = FileWriteTool::new(test_security(workspace.clone()));
         let result = tool
-            .execute(json!({"path": "linked.txt", "content": "overwritten"}))
+            .execute(approved_args(&workspace, "linked.txt", "overwritten"))
             .await
             .unwrap();
 

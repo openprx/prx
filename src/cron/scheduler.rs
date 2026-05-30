@@ -6,7 +6,8 @@ use crate::cron::{
     CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget, claim_job, due_jobs,
     next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run, update_job,
 };
-use crate::security::SecurityPolicy;
+use crate::security::policy::ApprovalGrant;
+use crate::security::{SecurityPolicy, SideEffectGate};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -46,18 +47,49 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
-    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    execute_job_with_retry(config, &security, job).await
+    execute_job_now_with_runtime_approval(config, job, false).await
 }
 
-async fn execute_job_with_retry(config: &Config, security: &SecurityPolicy, job: &CronJob) -> (bool, String) {
+pub async fn execute_job_now_with_runtime_approval(
+    config: &Config,
+    job: &CronJob,
+    runtime_approval_granted: bool,
+) -> (bool, String) {
+    execute_job_now_with_runtime_approval_for_tool(
+        config,
+        job,
+        "cron_run",
+        runtime_approval_granted.then(|| ApprovalGrant::for_command("cron_run", &job.command, "runtime", None)),
+    )
+    .await
+}
+
+pub async fn execute_job_now_with_runtime_approval_for_tool(
+    config: &Config,
+    job: &CronJob,
+    tool_name: &str,
+    approval_grant: Option<ApprovalGrant>,
+) -> (bool, String) {
+    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    execute_job_with_retry(config, &security, job, tool_name, approval_grant.as_ref()).await
+}
+
+async fn execute_job_with_retry(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    tool_name: &str,
+    approval_grant: Option<&ApprovalGrant>,
+) -> (bool, String) {
+    let persisted_approval_grant = approval_grant.cloned().or_else(|| persisted_job_approval_grant(job));
+    let approval_grant = persisted_approval_grant.as_ref();
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
-            JobType::Shell => run_job_command(config, security, job).await,
+            JobType::Shell => run_job_command(config, security, job, tool_name, approval_grant).await,
             JobType::Agent => run_agent_job(config, security, job).await,
         };
         last_output = output;
@@ -79,6 +111,12 @@ async fn execute_job_with_retry(config: &Config, security: &SecurityPolicy, job:
     }
 
     (false, last_output)
+}
+
+fn persisted_job_approval_grant(job: &CronJob) -> Option<ApprovalGrant> {
+    job.approval_grant_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<ApprovalGrant>(raw).ok())
 }
 
 async fn process_due_jobs(config: &Config, security: &Arc<SecurityPolicy>, jobs: Vec<CronJob>, component: &str) {
@@ -124,7 +162,7 @@ async fn execute_and_persist_job(
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
-    let (success, output) = execute_job_with_retry(config, security, job).await;
+    let (success, output) = execute_job_with_retry(config, security, job, "cron_scheduler", None).await;
     let finished_at = Utc::now();
     let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
 
@@ -489,8 +527,22 @@ fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<S
     None
 }
 
-async fn run_job_command(config: &Config, security: &SecurityPolicy, job: &CronJob) -> (bool, String) {
-    run_job_command_with_timeout(config, security, job, Duration::from_secs(SHELL_JOB_TIMEOUT_SECS)).await
+async fn run_job_command(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    tool_name: &str,
+    approval_grant: Option<&ApprovalGrant>,
+) -> (bool, String) {
+    run_job_command_with_timeout(
+        config,
+        security,
+        job,
+        Duration::from_secs(SHELL_JOB_TIMEOUT_SECS),
+        tool_name,
+        approval_grant,
+    )
+    .await
 }
 
 async fn run_job_command_with_timeout(
@@ -498,7 +550,15 @@ async fn run_job_command_with_timeout(
     security: &SecurityPolicy,
     job: &CronJob,
     timeout: Duration,
+    tool_name: &str,
+    approval_grant: Option<&ApprovalGrant>,
 ) -> (bool, String) {
+    let persisted_approval_grant = if approval_grant.is_none() {
+        persisted_job_approval_grant(job)
+    } else {
+        None
+    };
+    let approval_grant = approval_grant.or(persisted_approval_grant.as_ref());
     if !security.can_act() {
         return (false, "blocked by security policy: autonomy is read-only".to_string());
     }
@@ -507,11 +567,10 @@ async fn run_job_command_with_timeout(
         return (false, "blocked by security policy: rate limit exceeded".to_string());
     }
 
-    if !security.is_command_allowed(&job.command) {
-        return (
-            false,
-            format!("blocked by security policy: command not allowed: {}", job.command),
-        );
+    if let Err(reason) =
+        SideEffectGate::new(security).authorize_command_execution(tool_name, &job.command, approval_grant)
+    {
+        return (false, format!("blocked by security policy: {reason}"));
     }
 
     if let Some(path) = forbidden_path_argument(security, &job.command) {
@@ -579,6 +638,10 @@ mod tests {
     fn test_job(command: &str) -> CronJob {
         CronJob {
             id: "test-job".into(),
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             expression: "* * * * *".into(),
             schedule: crate::cron::Schedule::Cron {
                 expr: "* * * * *".into(),
@@ -598,6 +661,7 @@ mod tests {
             last_run: None,
             last_status: None,
             last_output: None,
+            approval_grant_json: None,
         }
     }
 
@@ -612,7 +676,7 @@ mod tests {
         let job = test_job("echo scheduler-ok");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &security, &job).await;
+        let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
         assert!(success);
         assert!(output.contains("scheduler-ok"));
         assert!(output.contains("status=exit status: 0"));
@@ -625,7 +689,7 @@ mod tests {
         let job = test_job("ls definitely_missing_file_for_scheduler_test");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &security, &job).await;
+        let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
         assert!(!success);
         assert!(output.contains("definitely_missing_file_for_scheduler_test"));
         assert!(output.contains("status=exit status:"));
@@ -639,7 +703,15 @@ mod tests {
         let job = test_job("sleep 1");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
+        let (success, output) = run_job_command_with_timeout(
+            &config,
+            &security,
+            &job,
+            Duration::from_millis(50),
+            "cron_scheduler",
+            None,
+        )
+        .await;
         assert!(!success);
         assert!(output.contains("job timed out after"));
     }
@@ -652,10 +724,48 @@ mod tests {
         let job = test_job("curl https://evil.example");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &security, &job).await;
+        let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("command not allowed"));
+        assert!(output.contains("Command not allowed"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_medium_risk_without_runtime_grant() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["touch".into()];
+        let job = test_job("touch cron-medium-risk");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
+        assert!(!success);
+        assert!(output.contains("runtime approval grant"), "{output}");
+        assert!(!config.workspace_dir.join("cron-medium-risk").exists());
+    }
+
+    #[tokio::test]
+    async fn run_job_command_allows_medium_risk_with_persisted_scheduler_grant() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["touch".into()];
+        let command = "touch cron-persisted-approval";
+        let mut job = test_job(command);
+        job.approval_grant_json = Some(
+            serde_json::to_string(&ApprovalGrant::persisted_for_command(
+                "cron_scheduler",
+                command,
+                "test",
+                None,
+                crate::security::policy::PERSISTED_APPROVAL_GRANT_TTL_SECS,
+            ))
+            .unwrap(),
+        );
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
+        assert!(success, "{output}");
+        assert!(config.workspace_dir.join("cron-persisted-approval").exists());
     }
 
     #[tokio::test]
@@ -666,7 +776,7 @@ mod tests {
         let job = test_job("cat /etc/passwd");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &security, &job).await;
+        let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
@@ -681,7 +791,7 @@ mod tests {
         let job = test_job("echo should-not-run");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &security, &job).await;
+        let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -695,7 +805,7 @@ mod tests {
         let job = test_job("echo should-not-run");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_job_command(&config, &security, &job).await;
+        let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -718,7 +828,7 @@ mod tests {
         .unwrap();
         let job = test_job("sh ./retry-once.sh");
 
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
+        let (success, output) = execute_job_with_retry(&config, &security, &job, "cron_scheduler", None).await;
         assert!(success);
         assert!(output.contains("recovered"));
     }
@@ -733,7 +843,7 @@ mod tests {
 
         let job = test_job("ls always_missing_for_retry_test");
 
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
+        let (success, output) = execute_job_with_retry(&config, &security, &job, "cron_scheduler", None).await;
         assert!(!success);
         assert!(output.contains("always_missing_for_retry_test"));
     }

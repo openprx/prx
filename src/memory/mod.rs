@@ -1,5 +1,7 @@
 pub mod backend;
 pub mod chunker;
+pub mod compaction;
+pub mod document;
 pub mod embeddings;
 pub mod fabric;
 pub mod filter;
@@ -9,6 +11,7 @@ pub mod markdown;
 pub mod none;
 pub mod postgres;
 pub mod principal;
+pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
 pub mod topic;
@@ -32,9 +35,11 @@ pub use traits::LifecycleState;
 pub use traits::Memory;
 #[allow(unused_imports)]
 pub use traits::{
-    ConversationSessionSummary, ConversationTurn, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry,
-    MemoryEvent, MemoryEventInput, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent,
-    MessageEventInput, SessionContextQuery, SharedContextQuery,
+    CompactionRun, CompactionRunInput, ConversationSessionSummary, ConversationTurn, DocumentChunkRecord,
+    DocumentIngestInput, DocumentRecord, DocumentSearchResult, MemoryCategory, MemoryDraft, MemoryDraftInput,
+    MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryStoreMetadata,
+    MemoryVisibility, MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, RetrievedContextItem,
+    SessionContextQuery, SharedContextQuery,
 };
 
 use crate::config::{
@@ -296,7 +301,13 @@ pub fn create_memory_with_storage_and_routes_with_acl(
         Ok(mem)
     }
 
-    fn build_postgres_memory(storage_provider: Option<&StorageProviderConfig>) -> anyhow::Result<PostgresMemory> {
+    fn build_postgres_memory(
+        storage_provider: Option<&StorageProviderConfig>,
+        resolved_embedding: &ResolvedEmbeddingConfig,
+        vector_weight: f64,
+        keyword_weight: f64,
+        embedding_cache_size: usize,
+    ) -> anyhow::Result<PostgresMemory> {
         let storage_provider =
             storage_provider.context("memory backend 'postgres' requires [storage.provider.config] settings")?;
         let db_url = storage_provider
@@ -306,11 +317,23 @@ pub fn create_memory_with_storage_and_routes_with_acl(
             .filter(|value| !value.is_empty())
             .context("memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)")?;
 
-        PostgresMemory::new(
+        let embedder: Arc<dyn embeddings::EmbeddingProvider> = Arc::from(embeddings::create_embedding_provider(
+            &resolved_embedding.provider,
+            resolved_embedding.api_key.as_deref(),
+            &resolved_embedding.model,
+            resolved_embedding.dimensions,
+        ));
+
+        #[allow(clippy::cast_possible_truncation)]
+        PostgresMemory::with_embedder_and_cache(
             db_url,
             &storage_provider.schema,
             &storage_provider.table,
             storage_provider.connect_timeout_secs,
+            embedder,
+            vector_weight as f32,
+            keyword_weight as f32,
+            embedding_cache_size,
         )
     }
 
@@ -319,7 +342,15 @@ pub fn create_memory_with_storage_and_routes_with_acl(
         workspace_dir,
         config,
         || build_sqlite_memory(config, workspace_dir, &resolved_embedding),
-        || build_postgres_memory(storage_provider),
+        || {
+            build_postgres_memory(
+                storage_provider,
+                &resolved_embedding,
+                config.vector_weight,
+                config.keyword_weight,
+                config.embedding_cache_size,
+            )
+        },
         "",
     )?;
 

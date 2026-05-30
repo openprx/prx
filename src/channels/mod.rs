@@ -67,19 +67,19 @@ pub use whatsapp::WhatsAppChannel;
 pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
-    ScopeContext, ToolConcurrencyGovernanceConfig, build_context_with_shared_events, build_tool_instructions,
-    run_tool_call_loop,
+    DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, build_context_with_shared_events_and_scope,
+    build_tool_instructions, run_tool_call_loop,
 };
 use crate::config::Config;
 use crate::hooks::HookManager;
 use crate::identity;
 use crate::memory::{
     self, Memory, MemoryEventRecording, MemoryFabric, MemoryPrincipal, MemoryVisibility, MemoryWriteContext,
-    MessageEventScope,
 };
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider};
 use crate::runtime;
+use crate::runtime::envelope::{RuntimeEnvelope, RuntimeSource};
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
@@ -992,9 +992,29 @@ async fn append_sender_turn(
         }
     }
 
+    let envelope = RuntimeEnvelope::new(
+        RuntimeSource::Channel,
+        ctx.workspace_dir.as_path().to_string_lossy().to_string(),
+        sender_key.to_string(),
+        visibility,
+    )
+    .with_channel(channel.to_string())
+    .with_sender(sender.to_string())
+    .with_recipient(recipient.unwrap_or(sender).to_string());
+    let owner_id = envelope.resolved_owner_id();
+
     if let Err(error) = ctx
         .memory
-        .append_conversation_turn(sender_key, channel, sender, &role, &content, timestamp, message_id)
+        .append_conversation_turn(
+            sender_key,
+            channel,
+            sender,
+            &role,
+            &content,
+            timestamp,
+            message_id,
+            Some(owner_id.as_str()),
+        )
         .await
     {
         tracing::warn!(
@@ -1010,15 +1030,11 @@ async fn append_sender_turn(
         ctx.workspace_dir.as_path().to_string_lossy().to_string(),
     )
     .with_event_recording(ctx.memory_event_recording);
-    let scope = MessageEventScope::new("channel", visibility)
-        .with_channel(channel.to_string())
-        .with_session_key(sender_key.to_string())
-        .with_sender(if role == "assistant" {
-            "prx".to_string()
-        } else {
-            sender.to_string()
-        })
-        .with_recipient(recipient.unwrap_or(sender).to_string());
+    let scope = if role == "assistant" {
+        envelope.message_scope().with_sender("prx")
+    } else {
+        envelope.message_scope()
+    };
     let result = if role == "assistant" {
         fabric.record_assistant_message(scope, content).await
     } else {
@@ -1046,9 +1062,21 @@ async fn append_sender_turn(
     }
 }
 
-async fn load_persisted_histories(memory: &dyn Memory) -> HashMap<String, Vec<ChatMessage>> {
+async fn load_persisted_histories(
+    workspace_dir: &std::path::Path,
+    memory: &dyn Memory,
+) -> HashMap<String, Vec<ChatMessage>> {
+    let principal = MemoryPrincipal {
+        workspace_id: workspace_dir.to_string_lossy().to_string(),
+        agent_id: None,
+        persona_id: None,
+        session_key: None,
+        channel: None,
+        sender: None,
+        owner_id: Some("system:*".to_string()),
+    };
     match memory
-        .load_recent_conversation_histories(MAX_CHANNEL_HISTORY, MAX_HYDRATED_SESSIONS)
+        .load_recent_conversation_histories(&principal, MAX_CHANNEL_HISTORY, MAX_HYDRATED_SESSIONS)
         .await
     {
         Ok(histories) => {
@@ -2167,6 +2195,7 @@ async fn process_channel_message(
                 Some(&write_ctx),
                 crate::memory::MemoryStoreMetadata {
                     workspace_id: Some(ctx.workspace_dir.as_path().to_string_lossy().to_string()),
+                    owner_id: inbound_event.as_ref().and_then(|event| event.owner_id.clone()),
                     agent_id: None,
                     persona_id: None,
                     source_event_id: inbound_event.as_ref().map(|event| event.event_id.clone()),
@@ -2237,18 +2266,22 @@ async fn process_channel_message(
 
     // Shared events are refreshed each turn so other entrypoints (chat/gateway)
     // can be observed by channel turns without waiting for a session boundary.
-    let memory_context = build_context_with_shared_events(
+    let mut runtime_envelope = RuntimeEnvelope::channel(
+        ctx.workspace_dir.as_path().to_string_lossy().to_string(),
+        msg.channel.clone(),
+        msg.sender.clone(),
+        Some(msg.reply_target.clone()),
+    );
+    if let Some(event) = &inbound_event {
+        runtime_envelope = runtime_envelope.with_source_message_event_id(event.event_id.clone());
+    }
+    let semantic_scope = runtime_envelope.memory_write_context(inferred_chat_type.to_string());
+    let memory_context = build_context_with_shared_events_and_scope(
         ctx.memory.as_ref(),
-        MemoryPrincipal {
-            workspace_id: ctx.workspace_dir.as_path().to_string_lossy().to_string(),
-            agent_id: None,
-            persona_id: None,
-            session_key: Some(history_key.clone()),
-            channel: Some(msg.channel.clone()),
-            sender: Some(msg.sender.clone()),
-        },
+        runtime_envelope.memory_principal(),
         &msg.content,
         ctx.min_relevance_score,
+        Some(&semantic_scope),
     )
     .await
     .preamble;
@@ -2440,12 +2473,17 @@ async fn process_channel_message(
 
     // Derive chat_type from reply_target: "group" if the reply target is a group, else "direct".
     let chat_type = infer_chat_type_from_message(&msg);
+    let scope_owner_id = runtime_envelope.resolved_owner_id();
     let scope_ctx = ScopeContext {
         policy: &ctx.security,
         sender: &msg.sender,
         channel: &msg.channel,
         chat_type,
         chat_id: &msg.reply_target,
+        owner_id: Some(&scope_owner_id),
+        topic_id: runtime_envelope.topic_id.as_deref(),
+        task_id: runtime_envelope.resolved_task_id(),
+        source_message_event_id: runtime_envelope.source_message_event_id.as_deref(),
         policy_pipeline: Some(&ctx.tool_policy_pipeline),
     };
 
@@ -2484,6 +2522,7 @@ async fn process_channel_message(
                     Some(&scope_ctx),
                     Some(tool_event_tx.clone()),
                     Some(&ctx.tool_tiering),
+                    Some(DocumentIngestRuntime::from_scope(ctx.memory.clone(), &scope_ctx)),
                     crate::agent::loop_::ChatMode::default(),
                 ),
             ) => LlmExecutionResult::Completed(result),
@@ -3605,7 +3644,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-    let conversation_histories = Arc::new(Mutex::new(load_persisted_histories(mem.as_ref()).await));
+    let conversation_histories = Arc::new(Mutex::new(
+        load_persisted_histories(&config.workspace_dir, mem.as_ref()).await,
+    ));
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -4052,28 +4093,44 @@ pub async fn start_channels(config: Config) -> Result<()> {
         let active_runs = spawn_tool.active_runs_arc();
 
         // sessions_list: dedicated listing tool (OpenClaw alignment)
-        tools_list.push(Box::new(tools::SessionsListTool::new(active_runs.clone())));
+        let workspace_id = config.workspace_dir.to_string_lossy().to_string();
+        tools_list.push(Box::new(
+            tools::SessionsListTool::new(active_runs.clone())
+                .with_shared_memory(Arc::clone(&mem), workspace_id.clone()),
+        ));
         // sessions_send: cross-session message injection (OpenClaw alignment)
-        tools_list.push(Box::new(tools::SessionsSendTool::new(active_runs.clone())));
+        tools_list.push(Box::new(
+            tools::SessionsSendTool::with_security(active_runs.clone(), security.clone())
+                .with_shared_memory(Arc::clone(&mem))
+                .with_event_recording(config.memory.event_recording_config()),
+        ));
         // subagents: OpenClaw-compatible subagent management interface
-        tools_list.push(Box::new(tools::SubagentsTool::new(active_runs.clone())));
+        tools_list.push(Box::new(
+            tools::SubagentsTool::with_security(active_runs.clone(), security.clone())
+                .with_shared_memory(Arc::clone(&mem))
+                .with_event_recording(config.memory.event_recording_config()),
+        ));
         // sessions_history: conversation log viewer (OpenClaw alignment)
-        tools_list.push(Box::new(tools::SessionsHistoryTool::new(active_runs.clone())));
+        tools_list.push(Box::new(
+            tools::SessionsHistoryTool::new(active_runs.clone())
+                .with_shared_memory(Arc::clone(&mem), workspace_id.clone()),
+        ));
         // session_status: runtime status card (OpenClaw alignment)
         let channel_names: Vec<String> = channels.iter().map(|c| c.name().to_string()).collect();
-        tools_list.push(Box::new(tools::SessionStatusTool::new(
-            active_runs,
-            &provider_name,
-            &model,
-            channel_names.clone(),
-        )));
+        tools_list.push(Box::new(
+            tools::SessionStatusTool::new(active_runs, &provider_name, &model, channel_names.clone())
+                .with_shared_memory(Arc::clone(&mem), workspace_id),
+        ));
         // gateway: daemon management (OpenClaw alignment)
-        tools_list.push(Box::new(tools::GatewayTool::new(
-            Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())),
-            &provider_name,
-            &model,
-            channel_names,
-        )));
+        tools_list.push(Box::new(
+            tools::GatewayTool::new(
+                Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())),
+                &provider_name,
+                &model,
+                channel_names,
+            )
+            .with_security(security.clone()),
+        ));
 
         // image: vision tool backed by the active provider (OpenClaw alignment)
         tools_list.push(Box::new(tools::ImageTool::new(
@@ -4093,7 +4150,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Register config_reload tool (allows AI to manually trigger hot-reload).
     {
         let shared_config_for_reload = Arc::new(arc_swap::ArcSwap::from_pointee(config.clone()));
-        tools_list.push(Box::new(tools::ConfigReloadTool::new(shared_config_for_reload)));
+        tools_list.push(Box::new(tools::ConfigReloadTool::with_security(
+            shared_config_for_reload,
+            security.clone(),
+        )));
     }
 
     // ── Register WASM plugin tools (channel path) ──
@@ -4572,6 +4632,7 @@ mod tests {
                     session_key: Some("telegram_sender-1".to_string()),
                     channel: Some("telegram".to_string()),
                     sender: Some("sender-1".to_string()),
+                    owner_id: None,
                 },
                 0,
                 10,
@@ -4581,6 +4642,8 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source, "channel");
+        let expected_owner = format!("owner:{}:telegram:sender-1", tmp.path().to_string_lossy());
+        assert_eq!(events[0].owner_id.as_deref(), Some(expected_owner.as_str()));
         assert_eq!(events[0].channel.as_deref(), Some("telegram"));
         assert_eq!(events[0].session_key.as_deref(), Some("telegram_sender-1"));
         assert_eq!(events[0].role, "user");
@@ -6623,6 +6686,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     session_key: Some("test-channel_alice".to_string()),
                     channel: Some("test-channel".to_string()),
                     sender: Some("alice".to_string()),
+                    owner_id: None,
                 },
                 0,
                 10,

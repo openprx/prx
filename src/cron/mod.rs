@@ -11,11 +11,17 @@ mod types;
 pub mod scheduler;
 
 pub use schedule::{next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule};
+#[cfg(test)]
+pub use store::add_job;
+#[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_job, add_shell_job, claim_job, due_jobs, get_job, list_jobs, list_runs, record_last_run,
-    record_run, remove_job, reschedule_after_run, update_job,
+    add_agent_job, add_agent_job_with_lineage, add_shell_job, add_shell_job_with_approval_grant,
+    add_shell_job_with_lineage_and_approval_grant, claim_job, due_jobs, get_job, list_job_events, list_jobs, list_runs,
+    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
 };
-pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
+pub use types::{
+    CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+};
 
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
@@ -159,9 +165,53 @@ pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> 
     add_once_at(config, at, command)
 }
 
+pub fn add_once_with_approval_grant(
+    config: &Config,
+    delay: &str,
+    command: &str,
+    approval_grant_json: Option<String>,
+) -> Result<CronJob> {
+    let duration = parse_delay(delay)?;
+    let at = chrono::Utc::now() + duration;
+    add_once_at_with_approval_grant(config, at, command, approval_grant_json)
+}
+
+pub fn add_once_with_lineage_and_approval_grant(
+    config: &Config,
+    delay: &str,
+    command: &str,
+    approval_grant_json: Option<String>,
+    lineage: CronJobLineage,
+) -> Result<CronJob> {
+    let duration = parse_delay(delay)?;
+    let at = chrono::Utc::now() + duration;
+    add_once_at_with_lineage_and_approval_grant(config, at, command, approval_grant_json, lineage)
+}
+
 pub fn add_once_at(config: &Config, at: chrono::DateTime<chrono::Utc>, command: &str) -> Result<CronJob> {
     let schedule = Schedule::At { at };
     add_shell_job(config, None, schedule, command)
+}
+
+pub fn add_once_at_with_approval_grant(
+    config: &Config,
+    at: chrono::DateTime<chrono::Utc>,
+    command: &str,
+    approval_grant_json: Option<String>,
+) -> Result<CronJob> {
+    let schedule = Schedule::At { at };
+    add_shell_job_with_approval_grant(config, None, schedule, command, approval_grant_json)
+}
+
+pub fn add_once_at_with_lineage_and_approval_grant(
+    config: &Config,
+    at: chrono::DateTime<chrono::Utc>,
+    command: &str,
+    approval_grant_json: Option<String>,
+    lineage: CronJobLineage,
+) -> Result<CronJob> {
+    let schedule = Schedule::At { at };
+    add_shell_job_with_lineage_and_approval_grant(config, None, schedule, command, approval_grant_json, lineage)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {
@@ -184,6 +234,78 @@ pub fn resume_job(config: &Config, id: &str) -> Result<CronJob> {
             ..CronJobPatch::default()
         },
     )
+}
+
+pub fn lineage_from_trusted_scope(config: &Config, args: &serde_json::Value) -> CronJobLineage {
+    let trusted = args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !trusted {
+        return CronJobLineage::default();
+    }
+    let Some(scope) = args.get("_zc_scope").and_then(serde_json::Value::as_object) else {
+        return CronJobLineage::default();
+    };
+    let channel = scope
+        .get("channel")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let sender = scope
+        .get("sender")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let chat_id = scope
+        .get("chat_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("cron");
+    let explicit_owner_id = scope
+        .get("owner_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let owner_id = explicit_owner_id.or_else(|| match (channel, sender) {
+        (Some(channel), Some(sender)) => Some(
+            crate::memory::principal::OwnerPrincipal::new(
+                config.workspace_dir.to_string_lossy().to_string(),
+                channel,
+                sender,
+                chat_id,
+                vec![crate::memory::principal::Role::Anonymous],
+            )
+            .owner_id,
+        ),
+        _ => None,
+    });
+
+    CronJobLineage {
+        owner_id,
+        topic_id: scope
+            .get("topic_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        parent_task_id: scope
+            .get("task_id")
+            .or_else(|| scope.get("parent_task_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        source_message_event_id: scope
+            .get("message_event_id")
+            .or_else(|| scope.get("source_message_event_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    }
 }
 
 fn parse_delay(input: &str) -> Result<chrono::Duration> {
@@ -251,6 +373,30 @@ mod tests {
             },
             config,
         )
+    }
+
+    #[test]
+    fn trusted_scope_derives_cron_lineage() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let args = serde_json::json!({
+            "_zc_scope_trusted": true,
+            "_zc_scope": {
+                "sender": "alice",
+                "channel": "telegram",
+                "chat_id": "chat-1",
+                "topic_id": "topic-1",
+                "task_id": "task-parent",
+                "message_event_id": "msg-1"
+            }
+        });
+
+        let lineage = lineage_from_trusted_scope(&config, &args);
+        let expected_owner = format!("owner:{}:telegram:alice", config.workspace_dir.to_string_lossy());
+        assert_eq!(lineage.owner_id.as_deref(), Some(expected_owner.as_str()));
+        assert_eq!(lineage.topic_id.as_deref(), Some("topic-1"));
+        assert_eq!(lineage.parent_task_id.as_deref(), Some("task-parent"));
+        assert_eq!(lineage.source_message_event_id.as_deref(), Some("msg-1"));
     }
 
     #[test]

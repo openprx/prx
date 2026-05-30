@@ -48,6 +48,10 @@ impl BuiltinRegistry {
 pub fn builtin_task_definitions() -> Vec<NewXinTask> {
     vec![
         NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             name: "xin:health_check".into(),
             description: Some("Check all component health statuses".into()),
             kind: TaskKind::System,
@@ -57,8 +61,13 @@ pub fn builtin_task_definitions() -> Vec<NewXinTask> {
             recurring: true,
             interval_secs: 300, // 5 minutes
             max_failures: 10,
+            approval_grant_json: None,
         },
         NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             name: "xin:stale_cleanup".into(),
             description: Some("Clean up stale and completed non-recurring tasks".into()),
             kind: TaskKind::System,
@@ -68,8 +77,13 @@ pub fn builtin_task_definitions() -> Vec<NewXinTask> {
             recurring: true,
             interval_secs: 1800, // 30 minutes
             max_failures: 10,
+            approval_grant_json: None,
         },
         NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             name: "xin:memory_evolution".into(),
             description: Some("Trigger L1/L2/L3 memory evolution cycles".into()),
             kind: TaskKind::System,
@@ -79,8 +93,13 @@ pub fn builtin_task_definitions() -> Vec<NewXinTask> {
             recurring: true,
             interval_secs: 10800, // 3 hours
             max_failures: 5,
+            approval_grant_json: None,
         },
         NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             name: "xin:fitness_report".into(),
             description: Some("Generate daily fitness/adaptation report".into()),
             kind: TaskKind::System,
@@ -90,8 +109,13 @@ pub fn builtin_task_definitions() -> Vec<NewXinTask> {
             recurring: true,
             interval_secs: 86400, // 24 hours
             max_failures: 5,
+            approval_grant_json: None,
         },
         NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             name: "xin:memory_hygiene".into(),
             description: Some("Memory compaction, deduplication, pruning".into()),
             kind: TaskKind::System,
@@ -101,6 +125,7 @@ pub fn builtin_task_definitions() -> Vec<NewXinTask> {
             recurring: true,
             interval_secs: 43200, // 12 hours
             max_failures: 5,
+            approval_grant_json: None,
         },
     ]
 }
@@ -124,37 +149,18 @@ async fn handle_stale_cleanup(config: Config) -> Result<String> {
     ))
 }
 
+#[allow(clippy::unused_async)]
 async fn handle_memory_evolution(config: Config) -> Result<String> {
     if !config.self_system.evolution_enabled {
         return Ok("memory evolution skipped: evolution not enabled".into());
     }
 
-    // Delegate to agent::run with an evolution prompt.
-    // The agent session invokes the evolution pipeline internally,
-    // avoiding the need to replicate complex scheduler construction here.
-    let prompt = "[xin:memory_evolution] Run a scheduled evolution cycle: \
-                  review recent interactions, generate a daily digest if due, \
-                  and trigger L1/L2/L3 evolution layers as appropriate."
-        .to_string();
-
-    const XIN_MAX_TOOL_ITERATIONS: usize = 15;
-    let mut evo_config = config.clone();
-    if evo_config.agent.max_tool_iterations == 0 || evo_config.agent.max_tool_iterations > XIN_MAX_TOOL_ITERATIONS {
-        evo_config.agent.max_tool_iterations = XIN_MAX_TOOL_ITERATIONS;
-    }
-
-    match crate::agent::run(
-        evo_config,
-        Some(prompt),
-        None,
-        config.default_model.clone(),
-        config.default_temperature,
-    )
-    .await
-    {
-        Ok(response) => Ok(format!("evolution cycle completed: {response}")),
-        Err(e) => anyhow::bail!("evolution cycle failed: {e}"),
-    }
+    let scheduler = crate::xin::evolution::DraftEvolutionScheduler::load(config)?;
+    let report = scheduler.tick()?;
+    Ok(format!(
+        "evolution draft tick completed: mode={:?}, drafted={}, judged={}, applied={}",
+        report.mode, report.drafted, report.judged, report.applied
+    ))
 }
 
 async fn handle_fitness_report() -> Result<String> {
@@ -165,37 +171,14 @@ async fn handle_fitness_report() -> Result<String> {
     ))
 }
 
+#[allow(clippy::unused_async)]
 async fn handle_memory_hygiene(config: Config) -> Result<String> {
     if !config.self_system.enabled {
         return Ok("memory hygiene skipped: self_system not enabled".into());
     }
 
-    // Delegate to agent::run with a hygiene prompt.
-    let prompt = "[xin:memory_hygiene] Perform memory maintenance: \
-                  review memory store for duplicates, compress verbose entries, \
-                  prune low-relevance items, and report a summary of actions taken."
-        .to_string();
-
-    const XIN_MAX_TOOL_ITERATIONS: usize = 10;
-    let mut hygiene_config = config.clone();
-    if hygiene_config.agent.max_tool_iterations == 0
-        || hygiene_config.agent.max_tool_iterations > XIN_MAX_TOOL_ITERATIONS
-    {
-        hygiene_config.agent.max_tool_iterations = XIN_MAX_TOOL_ITERATIONS;
-    }
-
-    match crate::agent::run(
-        hygiene_config,
-        Some(prompt),
-        None,
-        config.default_model.clone(),
-        config.default_temperature,
-    )
-    .await
-    {
-        Ok(response) => Ok(format!("memory hygiene completed: {response}")),
-        Err(e) => anyhow::bail!("memory hygiene failed: {e}"),
-    }
+    crate::memory::hygiene::run_if_due(&config.memory, &config.workspace_dir)?;
+    Ok("memory hygiene completed: deterministic hygiene tick".into())
 }
 
 #[cfg(test)]

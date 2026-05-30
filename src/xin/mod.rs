@@ -7,6 +7,7 @@
 
 pub(crate) mod builtin;
 pub mod config;
+pub mod evolution;
 pub(crate) mod runner;
 pub(crate) mod store;
 pub(crate) mod types;

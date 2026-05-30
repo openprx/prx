@@ -6,13 +6,15 @@
 //!  - add — create a new user task
 //!  - remove — delete a task
 //!  - pause / resume — disable/enable a task
+//!  - events — list lifecycle events for a task
 //!  - status — show xin subsystem status
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
 use crate::security::SecurityPolicy;
+use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
 use crate::xin::store;
-use crate::xin::types::{ExecutionMode, NewXinTask, TaskKind, TaskPriority, XinTask, XinTaskPatch};
+use crate::xin::types::{ExecutionMode, NewXinTask, TaskKind, TaskPriority, XinTask, XinTaskEvent, XinTaskPatch};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -85,6 +87,18 @@ fn format_task_line(task: &XinTask) -> String {
 fn format_task_detail(task: &XinTask) -> String {
     let mut lines = Vec::new();
     lines.push(format!("ID:          {}", task.id));
+    if let Some(owner_id) = &task.owner_id {
+        lines.push(format!("Owner:       {owner_id}"));
+    }
+    if let Some(topic_id) = &task.topic_id {
+        lines.push(format!("Topic:       {topic_id}"));
+    }
+    if let Some(parent_task_id) = &task.parent_task_id {
+        lines.push(format!("Parent Task: {parent_task_id}"));
+    }
+    if let Some(source_event_id) = &task.source_message_event_id {
+        lines.push(format!("Source Msg:  {source_event_id}"));
+    }
     lines.push(format!("Name:        {}", task.name));
     if let Some(ref desc) = task.description {
         lines.push(format!("Description: {desc}"));
@@ -127,6 +141,103 @@ fn format_task_detail(task: &XinTask) -> String {
     lines.join("\n")
 }
 
+fn format_task_event(event: &XinTaskEvent) -> String {
+    let mut parts = vec![
+        event.created_at.to_rfc3339(),
+        event.event_type.clone(),
+        format!("status={}", event.status.as_deref().unwrap_or("-")),
+    ];
+    if let Some(owner_id) = &event.owner_id {
+        parts.push(format!("owner={owner_id}"));
+    }
+    if let Some(topic_id) = &event.topic_id {
+        parts.push(format!("topic={topic_id}"));
+    }
+    if let Some(parent_task_id) = &event.parent_task_id {
+        parts.push(format!("parent={parent_task_id}"));
+    }
+    parts.join(" | ")
+}
+
+#[derive(Debug, Clone, Default)]
+struct XinLineageScope {
+    owner_id: Option<String>,
+    topic_id: Option<String>,
+    parent_task_id: Option<String>,
+    source_message_event_id: Option<String>,
+}
+
+fn parse_xin_lineage_scope(cfg: &Config, args: &serde_json::Value) -> XinLineageScope {
+    let trusted = args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !trusted {
+        return XinLineageScope::default();
+    }
+    let Some(scope) = args.get("_zc_scope").and_then(serde_json::Value::as_object) else {
+        return XinLineageScope::default();
+    };
+    let channel = scope
+        .get("channel")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let sender = scope
+        .get("sender")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let chat_id = scope
+        .get("chat_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("xin");
+    let explicit_owner_id = scope
+        .get("owner_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let owner_id = explicit_owner_id.or_else(|| match (channel, sender) {
+        (Some(channel), Some(sender)) => Some(
+            crate::memory::principal::OwnerPrincipal::new(
+                cfg.workspace_dir.to_string_lossy().to_string(),
+                channel,
+                sender,
+                chat_id,
+                vec![crate::memory::principal::Role::Anonymous],
+            )
+            .owner_id,
+        ),
+        _ => None,
+    });
+    XinLineageScope {
+        owner_id,
+        topic_id: scope
+            .get("topic_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        parent_task_id: scope
+            .get("task_id")
+            .or_else(|| scope.get("parent_task_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        source_message_event_id: scope
+            .get("message_event_id")
+            .or_else(|| scope.get("source_message_event_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    }
+}
+
 #[async_trait]
 impl Tool for XinTool {
     fn name(&self) -> &str {
@@ -135,7 +246,7 @@ impl Tool for XinTool {
 
     fn description(&self) -> &str {
         "Xin (心) autonomous task heartbeat engine. \
-         Actions: list, get, add, remove, pause, resume, status."
+         Actions: list, get, events, add, remove, pause, resume, status."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -144,12 +255,12 @@ impl Tool for XinTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "get", "add", "remove", "pause", "resume", "status"],
+                    "enum": ["list", "get", "events", "add", "remove", "pause", "resume", "status"],
                     "description": "Action to perform."
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Task ID for get/remove/pause/resume actions."
+                    "description": "Task ID for get/events/remove/pause/resume actions."
                 },
                 "name": {
                     "type": "string",
@@ -257,6 +368,42 @@ impl Tool for XinTool {
                 }
             }
 
+            "events" => {
+                if let Some(r) = self.check_enabled(&cfg) {
+                    return Ok(r);
+                }
+                let task_id = match args.get("task_id").and_then(|v| v.as_str()) {
+                    Some(v) if !v.trim().is_empty() => v,
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("Missing 'task_id' parameter".to_string()),
+                        });
+                    }
+                };
+                match store::list_task_events(&cfg, task_id) {
+                    Ok(events) if events.is_empty() => Ok(ToolResult {
+                        success: true,
+                        output: format!("No xin task events for {task_id}."),
+                        error: None,
+                    }),
+                    Ok(events) => {
+                        let lines = events.iter().map(format_task_event).collect::<Vec<_>>();
+                        Ok(ToolResult {
+                            success: true,
+                            output: format!("Xin task events ({task_id}):\n{}", lines.join("\n")),
+                            error: None,
+                        })
+                    }
+                    Err(e) => Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }),
+                }
+            }
+
             "status" => {
                 if let Some(r) = self.check_enabled(&cfg) {
                     return Ok(r);
@@ -335,10 +482,33 @@ impl Tool for XinTool {
                     "shell" => ExecutionMode::Shell,
                     _ => ExecutionMode::AgentSession,
                 };
+                let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+                let approval_grant_json = if matches!(execution_mode, ExecutionMode::Shell) {
+                    if let Err(reason) = crate::security::SideEffectGate::new(self.security.as_ref())
+                        .authorize_command_execution(self.name(), &payload, approval_grant.as_ref())
+                    {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(reason),
+                        });
+                    }
+                    ApprovalGrant::persisted_runner_grant(
+                        "xin_runner",
+                        &payload,
+                        approval_grant.as_ref(),
+                        PERSISTED_APPROVAL_GRANT_TTL_SECS,
+                    )
+                    .map(|grant| serde_json::to_string(&grant))
+                    .transpose()?
+                } else {
+                    None
+                };
                 let priority =
                     TaskPriority::from_str_lossy(args.get("priority").and_then(|v| v.as_str()).unwrap_or("normal"));
                 let recurring = args.get("recurring").and_then(|v| v.as_bool()).unwrap_or(false);
                 let interval_secs = args.get("interval_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                let lineage_scope = parse_xin_lineage_scope(&cfg, &args);
 
                 // Prevent busy-loop: recurring tasks must have ≥60s interval.
                 if recurring && interval_secs < 60 {
@@ -350,6 +520,10 @@ impl Tool for XinTool {
                 }
 
                 let new = NewXinTask {
+                    owner_id: lineage_scope.owner_id,
+                    topic_id: lineage_scope.topic_id,
+                    parent_task_id: lineage_scope.parent_task_id,
+                    source_message_event_id: lineage_scope.source_message_event_id,
                     name,
                     description,
                     kind: TaskKind::User,
@@ -359,6 +533,7 @@ impl Tool for XinTool {
                     recurring,
                     interval_secs,
                     max_failures: 3,
+                    approval_grant_json,
                 };
 
                 match store::add_task(&cfg, &new) {
@@ -471,7 +646,7 @@ impl Tool for XinTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action '{other}'. Use: list, get, add, remove, pause, resume, status."
+                    "Unknown action '{other}'. Use: list, get, events, add, remove, pause, resume, status."
                 )),
             }),
         }
@@ -482,5 +657,62 @@ impl Tool for XinTool {
 
     fn categories(&self) -> &'static [ToolCategory] {
         &[ToolCategory::Automation]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_config(tmp: &TempDir) -> Config {
+        Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn parse_xin_lineage_scope_derives_owner_and_parent_task() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let args = serde_json::json!({
+            "_zc_scope_trusted": true,
+            "_zc_scope": {
+                "sender": "alice",
+                "channel": "telegram",
+                "chat_id": "chat-1",
+                "topic_id": "topic-1",
+                "task_id": "run-parent",
+                "message_event_id": "msg-1"
+            }
+        });
+
+        let scope = parse_xin_lineage_scope(&config, &args);
+        let expected_owner = format!("owner:{}:telegram:alice", config.workspace_dir.to_string_lossy());
+
+        assert_eq!(scope.owner_id.as_deref(), Some(expected_owner.as_str()));
+        assert_eq!(scope.topic_id.as_deref(), Some("topic-1"));
+        assert_eq!(scope.parent_task_id.as_deref(), Some("run-parent"));
+        assert_eq!(scope.source_message_event_id.as_deref(), Some("msg-1"));
+    }
+
+    #[test]
+    fn parse_xin_lineage_scope_ignores_untrusted_scope() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let args = serde_json::json!({
+            "_zc_scope_trusted": false,
+            "_zc_scope": {
+                "owner_id": "owner-forged",
+                "topic_id": "topic-forged"
+            }
+        });
+
+        let scope = parse_xin_lineage_scope(&config, &args);
+
+        assert!(scope.owner_id.is_none());
+        assert!(scope.topic_id.is_none());
     }
 }

@@ -16,6 +16,8 @@
 //!   / `PersistToMemory` 在 deps 模式下统一 `tokio::spawn`，避免 await 阻塞主循环
 //! - **coalescer version 取最新**：与 reducer `state.rs:540` strict-monotonic
 //!   一致，合并时 `version = max(pending, new)`，否则高版本先到合并后会被丢
+//! - **RouteDecision / ProviderExecutionOutcome timeline**：streaming 路径保留
+//!   ingress 层统一记录，dispatcher 只负责 stream-state 事件顺序
 //! - **OS 信号统一入 Action**：Ctrl+C / SIGTERM handler `try_send` shutdown action
 //!
 //! 灰度模式（与 `chat::ReduxMode` 对齐）:

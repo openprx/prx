@@ -1,7 +1,8 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::SharedConfig;
 use crate::cron;
-use crate::security::SecurityPolicy;
+use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
+use crate::security::{SecurityPolicy, SideEffectGate};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -55,11 +56,6 @@ impl Tool for ScheduleTool {
                     "type": "string",
                     "description": "Shell command to execute. Required for create/add/once."
                 },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
-                },
                 "id": {
                     "type": "string",
                     "description": "Task ID. Required for get/cancel/remove/pause/resume."
@@ -88,11 +84,8 @@ impl Tool for ScheduleTool {
                 if let Some(blocked) = self.enforce_mutation_allowed(action) {
                     return Ok(blocked);
                 }
-                let approved = args
-                    .get("approved")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                self.handle_create_like(action, &args, approved)
+                let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+                self.handle_create_like(action, &args, approval_grant.as_ref())
             }
             "cancel" | "remove" => {
                 if let Some(blocked) = self.enforce_mutation_allowed(action) {
@@ -243,24 +236,43 @@ impl ScheduleTool {
         }
     }
 
-    fn handle_create_like(&self, action: &str, args: &serde_json::Value, approved: bool) -> Result<ToolResult> {
+    fn handle_create_like(
+        &self,
+        action: &str,
+        args: &serde_json::Value,
+        approval_grant: Option<&ApprovalGrant>,
+    ) -> Result<ToolResult> {
         let command = args
             .get("command")
             .and_then(|value| value.as_str())
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing or empty 'command' parameter"))?;
 
-        if let Err(reason) = self.security.validate_command_execution(command, approved) {
+        if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
+            self.name(),
+            command,
+            approval_grant,
+        ) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(reason),
             });
         }
+        let persisted_grant = ApprovalGrant::persisted_runner_grant(
+            "cron_scheduler",
+            command,
+            approval_grant,
+            PERSISTED_APPROVAL_GRANT_TTL_SECS,
+        )
+        .map(|grant| serde_json::to_string(&grant))
+        .transpose()?;
 
         let expression = args.get("expression").and_then(|value| value.as_str());
         let delay = args.get("delay").and_then(|value| value.as_str());
         let run_at = args.get("run_at").and_then(|value| value.as_str());
+        let cfg = self.config.load_full();
+        let lineage = cron::lineage_from_trusted_scope(&cfg, args);
 
         match action {
             "add" => {
@@ -304,7 +316,17 @@ impl ScheduleTool {
         }
 
         if let Some(value) = expression {
-            let job = cron::add_job(&self.config.load_full(), value, command)?;
+            let job = cron::add_shell_job_with_lineage_and_approval_grant(
+                &cfg,
+                None,
+                cron::Schedule::Cron {
+                    expr: value.to_string(),
+                    tz: None,
+                },
+                command,
+                persisted_grant,
+                lineage,
+            )?;
             return Ok(ToolResult {
                 success: true,
                 output: format!(
@@ -319,7 +341,7 @@ impl ScheduleTool {
         }
 
         if let Some(value) = delay {
-            let job = cron::add_once(&self.config.load_full(), value, command)?;
+            let job = cron::add_once_with_lineage_and_approval_grant(&cfg, value, command, persisted_grant, lineage)?;
             return Ok(ToolResult {
                 success: true,
                 output: format!(
@@ -337,7 +359,8 @@ impl ScheduleTool {
             .map_err(|error| anyhow::anyhow!("Invalid run_at timestamp: {error}"))?
             .with_timezone(&Utc);
 
-        let job = cron::add_once_at(&self.config.load_full(), run_at_parsed, command)?;
+        let job =
+            cron::add_once_at_with_lineage_and_approval_grant(&cfg, run_at_parsed, command, persisted_grant, lineage)?;
         Ok(ToolResult {
             success: true,
             output: format!(
@@ -616,15 +639,26 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("explicit approval")
+                .contains("runtime approval grant")
         );
+
+        let forged_public_approval = tool
+            .execute(json!({
+                "action": "create",
+                "expression": "*/5 * * * *",
+                "command": "touch schedule-policy-test",
+                "approved": true
+            }))
+            .await
+            .unwrap();
+        assert!(!forged_public_approval.success);
 
         let approved = tool
             .execute(json!({
                 "action": "create",
                 "expression": "*/5 * * * *",
                 "command": "touch schedule-policy-test",
-                "approved": true
+                (crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG): serde_json::to_value(crate::security::policy::ApprovalGrant::for_command("schedule", "touch schedule-policy-test", "test", None)).unwrap()
             }))
             .await
             .unwrap();

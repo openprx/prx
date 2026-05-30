@@ -41,6 +41,8 @@ impl Spec {
                 routing: false,
                 tools: false,
                 integrations: false,
+                mcp_server: false,
+                a2a: false,
                 nodes: false,
                 cost: false,
                 observability: false,
@@ -56,6 +58,8 @@ impl Spec {
                 routing: false,
                 tools: true,
                 integrations: true,
+                mcp_server: false,
+                a2a: false,
                 nodes: false,
                 cost: false,
                 observability: false,
@@ -77,6 +81,8 @@ impl Spec {
             + m.routing as usize
             + m.tools as usize
             + m.integrations as usize
+            + m.mcp_server as usize
+            + m.a2a as usize
             + m.nodes as usize
             + m.cost as usize
             + m.observability as usize
@@ -1270,7 +1276,7 @@ mod tests {
     fn enabled_count_is_correct() {
         assert_eq!(Spec::Minimal.enabled_count(), 2);
         assert_eq!(Spec::Server.enabled_count(), 6);
-        assert_eq!(Spec::Full.enabled_count(), 13);
+        assert_eq!(Spec::Full.enabled_count(), 15);
     }
 
     #[test]

@@ -89,6 +89,12 @@ pub struct ModulesConfig {
     /// MCP, Composio, and webhook integrations (config.d/integrations.toml)
     #[serde(default)]
     pub integrations: bool,
+    /// MCP server compatibility endpoint.
+    #[serde(default)]
+    pub mcp_server: bool,
+    /// Agent-to-Agent compatibility endpoint.
+    #[serde(default)]
+    pub a2a: bool,
     /// Remote node proxy (config.d/nodes.toml)
     #[serde(default)]
     pub nodes: bool,
@@ -113,6 +119,8 @@ impl Default for ModulesConfig {
             routing: false,
             tools: false,
             integrations: false,
+            mcp_server: false,
+            a2a: false,
             nodes: false,
             cost: false,
             observability: false,
@@ -134,6 +142,8 @@ impl ModulesConfig {
             routing: true,
             tools: true,
             integrations: true,
+            mcp_server: true,
+            a2a: true,
             nodes: true,
             cost: true,
             observability: true,
@@ -156,6 +166,8 @@ impl ModulesConfig {
             "routing" => Some(self.routing),
             "tools" => Some(self.tools),
             "integrations" => Some(self.integrations),
+            "mcp_server" => Some(self.mcp_server),
+            "a2a" => Some(self.a2a),
             "nodes" => Some(self.nodes),
             "cost" => Some(self.cost),
             "observability" => Some(self.observability),
@@ -176,6 +188,8 @@ impl ModulesConfig {
             routing: false,
             tools: false,
             integrations: false,
+            mcp_server: false,
+            a2a: false,
             nodes: false,
             cost: false,
             observability: false,
@@ -319,6 +333,14 @@ pub struct Config {
     #[serde(default)]
     pub mcp: McpConfig,
 
+    /// MCP server compatibility configuration (`[mcp_server]`).
+    #[serde(default)]
+    pub mcp_server: McpServerRuntimeConfig,
+
+    /// Agent-to-Agent compatibility configuration (`[a2a]`).
+    #[serde(default)]
+    pub a2a: A2aConfig,
+
     /// Auth profile and external credential import settings (`[auth]`).
     #[serde(default)]
     pub auth: AuthConfig,
@@ -423,6 +445,8 @@ impl std::fmt::Debug for Config {
             .field("webhook", &self.webhook)
             .field("composio", &self.composio)
             .field("mcp", &self.mcp)
+            .field("mcp_server", &self.mcp_server)
+            .field("a2a", &self.a2a)
             .field("auth", &self.auth)
             .field("secrets", &self.secrets)
             .field("browser", &self.browser)
@@ -1721,6 +1745,126 @@ impl Default for McpConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpServerRuntimeConfig {
+    /// Enable MCP server compatibility endpoints.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Advertised bind address. The gateway may still be started with a CLI port override.
+    #[serde(default = "default_mcp_server_bind")]
+    pub bind: String,
+    /// Require an authenticated external identity for mutating calls.
+    #[serde(default = "default_true")]
+    pub require_auth: bool,
+    /// Read-only tools exposed to MCP discovery.
+    #[serde(default = "default_mcp_server_exposed_tools")]
+    pub exposed_tools: Vec<String>,
+    /// Allowed browser origins for future streamable HTTP clients.
+    #[serde(default = "default_mcp_allowed_origins")]
+    pub allowed_origins: Vec<String>,
+    /// Per-caller request budget.
+    #[serde(default = "default_mcp_server_rate_limit_rps")]
+    pub rate_limit_rps: u32,
+}
+
+fn default_mcp_server_bind() -> String {
+    "127.0.0.1:16831".into()
+}
+
+fn default_mcp_server_exposed_tools() -> Vec<String> {
+    [
+        "memory_search",
+        "memory_recall",
+        "memory_get",
+        "document_search",
+        "document_get_chunk",
+        "sessions_list",
+        "sessions_history",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn default_mcp_allowed_origins() -> Vec<String> {
+    ["claude.ai", "openai.com", "localhost"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+const fn default_mcp_server_rate_limit_rps() -> u32 {
+    10
+}
+
+impl Default for McpServerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_mcp_server_bind(),
+            require_auth: true,
+            exposed_tools: default_mcp_server_exposed_tools(),
+            allowed_origins: default_mcp_allowed_origins(),
+            rate_limit_rps: default_mcp_server_rate_limit_rps(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct A2aConfig {
+    /// Enable Agent-to-Agent compatibility endpoints.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Advertised bind address.
+    #[serde(default = "default_a2a_bind")]
+    pub bind: String,
+    /// Stable PRX agent identifier advertised to peers.
+    #[serde(default = "default_a2a_agent_id")]
+    pub agent_id: String,
+    /// Local SPIFFE-style identifier placeholder.
+    #[serde(default = "default_a2a_spiffe_id")]
+    pub spiffe_id: String,
+    /// Whether to advertise into an external A2A registry.
+    #[serde(default)]
+    pub discovery_advertised: bool,
+    /// Accepted external peer issuers.
+    #[serde(default)]
+    pub allowed_peer_issuers: Vec<String>,
+    /// Replay window for future handoff delegation tokens.
+    #[serde(default = "default_a2a_handoff_nonce_ttl_seconds")]
+    pub handoff_nonce_ttl_seconds: u64,
+}
+
+fn default_a2a_bind() -> String {
+    "127.0.0.1:16832".into()
+}
+
+fn default_a2a_agent_id() -> String {
+    "prx-default".into()
+}
+
+fn default_a2a_spiffe_id() -> String {
+    "spiffe://prx-local/agent/prx-default".into()
+}
+
+const fn default_a2a_handoff_nonce_ttl_seconds() -> u64 {
+    3_600
+}
+
+impl Default for A2aConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_a2a_bind(),
+            agent_id: default_a2a_agent_id(),
+            spiffe_id: default_a2a_spiffe_id(),
+            discovery_advertised: false,
+            allowed_peer_issuers: Vec::new(),
+            handoff_nonce_ttl_seconds: default_a2a_handoff_nonce_ttl_seconds(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpTransport {
@@ -2556,6 +2700,10 @@ pub struct MemoryConfig {
     /// Feature gate for memory ACL enforcement. Phase 0 keeps this disabled.
     #[serde(default)]
     pub acl_enabled: bool,
+    /// Phase 1/2 compatibility gate for legacy conversation turns while owner_id
+    /// backfill rolls out. Phase 3 can disable and remove this after NULL=0.
+    #[serde(default = "default_true")]
+    pub legacy_conversation_turns_visible: bool,
     /// Run memory/session hygiene (archiving + retention cleanup)
     #[serde(default = "default_hygiene_enabled")]
     pub hygiene_enabled: bool,
@@ -2736,6 +2884,7 @@ impl Default for MemoryConfig {
             events: MemoryEventsConfig::default(),
             semantic: MemorySemanticConfig::default(),
             acl_enabled: false,
+            legacy_conversation_turns_visible: true,
             hygiene_enabled: default_hygiene_enabled(),
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
@@ -4529,6 +4678,8 @@ impl Default for Config {
             webhook: MemoryWebhookConfig::default(),
             composio: ComposioConfig::default(),
             mcp: McpConfig::default(),
+            mcp_server: McpServerRuntimeConfig::default(),
+            a2a: A2aConfig::default(),
             auth: AuthConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
@@ -5608,6 +5759,8 @@ min_chars = 12
             webhook: MemoryWebhookConfig::default(),
             composio: ComposioConfig::default(),
             mcp: McpConfig::default(),
+            mcp_server: McpServerRuntimeConfig::default(),
+            a2a: A2aConfig::default(),
             auth: AuthConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
@@ -5863,6 +6016,8 @@ concurrency_rollback_error_rate_threshold = 0.23
             webhook: MemoryWebhookConfig::default(),
             composio: ComposioConfig::default(),
             mcp: McpConfig::default(),
+            mcp_server: McpServerRuntimeConfig::default(),
+            a2a: A2aConfig::default(),
             auth: AuthConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),

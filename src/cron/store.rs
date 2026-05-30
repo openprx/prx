@@ -2,8 +2,8 @@
 
 use crate::config::Config;
 use crate::cron::{
-    CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget, next_run_for_schedule,
-    schedule_cron_expression, validate_schedule,
+    CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+    next_run_for_schedule, schedule_cron_expression, validate_schedule,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -13,6 +13,7 @@ use uuid::Uuid;
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
 
+#[cfg(test)]
 pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
     let schedule = Schedule::Cron {
         expr: expression.to_string(),
@@ -22,31 +23,93 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
 }
 
 pub fn add_shell_job(config: &Config, name: Option<String>, schedule: Schedule, command: &str) -> Result<CronJob> {
+    add_shell_job_with_approval_grant(config, name, schedule, command, None)
+}
+
+pub fn add_shell_job_with_approval_grant(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    approval_grant_json: Option<String>,
+) -> Result<CronJob> {
+    add_shell_job_with_lineage_and_approval_grant(
+        config,
+        name,
+        schedule,
+        command,
+        approval_grant_json,
+        CronJobLineage::default(),
+    )
+}
+
+pub fn add_shell_job_with_lineage_and_approval_grant(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    approval_grant_json: Option<String>,
+    lineage: CronJobLineage,
+) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
     let id = Uuid::new_v4().to_string();
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
+    let owner_id = lineage.owner_id.clone();
+    let topic_id = lineage.topic_id.clone();
+    let parent_task_id = lineage.parent_task_id.clone();
+    let source_message_event_id = lineage.source_message_event_id;
 
     with_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
-                id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, 0, ?7, ?8)",
+                id, owner_id, topic_id, parent_task_id, source_message_event_id,
+                expression, command, schedule, job_type, prompt, name, session_target, model,
+                enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'shell', NULL, ?9, 'isolated', NULL, 1, ?10, 0, ?11, ?12, ?13)",
             params![
                 id,
+                owner_id.as_deref(),
+                topic_id.as_deref(),
+                parent_task_id.as_deref(),
+                source_message_event_id.as_deref(),
                 expression,
                 command,
-                schedule_json,
-                name,
+                schedule_json.as_str(),
+                name.as_deref(),
                 serde_json::to_string(&DeliveryConfig::default())?,
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
+                approval_grant_json,
             ],
         )
         .context("Failed to insert cron shell job")?;
+        insert_job_event(
+            conn,
+            &workspace_id(config),
+            &id,
+            JobLineage {
+                owner_id: owner_id.clone(),
+                topic_id: topic_id.clone(),
+                parent_task_id: parent_task_id.clone(),
+                source_message_event_id: source_message_event_id.clone(),
+                status: Some("pending".to_string()),
+            },
+            "cron.job.created",
+            Some("pending"),
+            Some(
+                serde_json::json!({
+                    "kind": "shell",
+                    "name": name,
+                    "schedule": schedule_json,
+                    "source_message_event_id": source_message_event_id,
+                })
+                .to_string(),
+            )
+            .as_deref(),
+        )?;
         Ok(())
     })?;
 
@@ -64,6 +127,31 @@ pub fn add_agent_job(
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
 ) -> Result<CronJob> {
+    add_agent_job_with_lineage(
+        config,
+        name,
+        schedule,
+        prompt,
+        session_target,
+        model,
+        delivery,
+        delete_after_run,
+        CronJobLineage::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn add_agent_job_with_lineage(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    prompt: &str,
+    session_target: SessionTarget,
+    model: Option<String>,
+    delivery: Option<DeliveryConfig>,
+    delete_after_run: bool,
+    lineage: CronJobLineage,
+) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
@@ -71,19 +159,28 @@ pub fn add_agent_job(
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
     let delivery = delivery.unwrap_or_default();
+    let owner_id = lineage.owner_id.clone();
+    let topic_id = lineage.topic_id.clone();
+    let parent_task_id = lineage.parent_task_id.clone();
+    let source_message_event_id = lineage.source_message_event_id;
 
     with_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
-                id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11)",
+                id, owner_id, topic_id, parent_task_id, source_message_event_id,
+                expression, command, schedule, job_type, prompt, name, session_target, model,
+                enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, 'agent', ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, NULL)",
             params![
                 id,
+                owner_id.as_deref(),
+                topic_id.as_deref(),
+                parent_task_id.as_deref(),
+                source_message_event_id.as_deref(),
                 expression,
-                schedule_json,
+                schedule_json.as_str(),
                 prompt,
-                name,
+                name.as_deref(),
                 session_target.as_str(),
                 model,
                 serde_json::to_string(&delivery)?,
@@ -93,6 +190,31 @@ pub fn add_agent_job(
             ],
         )
         .context("Failed to insert cron agent job")?;
+        insert_job_event(
+            conn,
+            &workspace_id(config),
+            &id,
+            JobLineage {
+                owner_id: owner_id.clone(),
+                topic_id: topic_id.clone(),
+                parent_task_id: parent_task_id.clone(),
+                source_message_event_id: source_message_event_id.clone(),
+                status: Some("pending".to_string()),
+            },
+            "cron.job.created",
+            Some("pending"),
+            Some(
+                serde_json::json!({
+                    "kind": "agent",
+                    "name": name,
+                    "schedule": schedule_json,
+                    "session_target": session_target.as_str(),
+                    "source_message_event_id": source_message_event_id,
+                })
+                .to_string(),
+            )
+            .as_deref(),
+        )?;
         Ok(())
     })?;
 
@@ -102,8 +224,10 @@ pub fn add_agent_job(
 pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+            "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
+                    expression, command, schedule, job_type, prompt, name, session_target, model,
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                    approval_grant_json
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -120,8 +244,10 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
 pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+            "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
+                    expression, command, schedule, job_type, prompt, name, session_target, model,
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                    approval_grant_json
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -136,6 +262,17 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
 
 pub fn remove_job(config: &Config, id: &str) -> Result<()> {
     let changed = with_connection(config, |conn| {
+        if let Some(lineage) = load_job_lineage(conn, id)? {
+            insert_job_event(
+                conn,
+                &workspace_id(config),
+                id,
+                lineage.clone(),
+                "cron.job.removed",
+                lineage.status.as_deref(),
+                None,
+            )?;
+        }
         conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
             .context("Failed to delete cron job")
     })?;
@@ -160,6 +297,19 @@ pub fn claim_job(config: &Config, job_id: &str) -> Result<bool> {
              WHERE id = ?1 AND enabled = 1 AND (last_status IS NULL OR last_status != 'running')",
             params![job_id],
         )?;
+        if changed > 0 {
+            if let Some(lineage) = load_job_lineage(conn, job_id)? {
+                insert_job_event(
+                    conn,
+                    &workspace_id(config),
+                    job_id,
+                    lineage,
+                    "cron.job.claimed",
+                    Some("running"),
+                    None,
+                )?;
+            }
+        }
         Ok(changed > 0)
     })
 }
@@ -168,8 +318,10 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let lim = i64::try_from(config.scheduler.max_tasks.max(1)).context("Scheduler max_tasks overflows i64")?;
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+            "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
+                    expression, command, schedule, job_type, prompt, name, session_target, model,
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                    approval_grant_json
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC
@@ -188,6 +340,8 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
 
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
     let mut job = get_job(config, job_id)?;
+    let was_enabled = job.enabled;
+    let approval_grant_json = patch.approval_grant_json.clone();
     let schedule_changed = if let Some(schedule) = patch.schedule {
         validate_schedule(&schedule, Utc::now())?;
         job.schedule = schedule;
@@ -198,6 +352,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     };
     if let Some(command) = patch.command {
         job.command = command;
+        job.approval_grant_json = approval_grant_json;
     }
     if let Some(prompt) = patch.prompt {
         job.prompt = Some(prompt);
@@ -231,8 +386,8 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                 "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                  session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 next_run = ?12
-             WHERE id = ?13",
+                 next_run = ?12, approval_grant_json = ?13
+             WHERE id = ?14",
                 params![
                     job.expression,
                     job.command,
@@ -246,12 +401,37 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                     serde_json::to_string(&job.delivery)?,
                     if job.delete_after_run { 1 } else { 0 },
                     job.next_run.to_rfc3339(),
+                    job.approval_grant_json,
                     job.id,
                 ],
             )
             .context("Failed to update cron job")?;
         if changed == 0 {
             anyhow::bail!("cron job '{}' was deleted or modified concurrently", job.id);
+        }
+        let event_type = match (was_enabled, job.enabled) {
+            (true, false) => "cron.job.disabled",
+            (false, true) => "cron.job.enabled",
+            _ => "cron.job.updated",
+        };
+        if let Some(lineage) = load_job_lineage(conn, &job.id)? {
+            insert_job_event(
+                conn,
+                &workspace_id(config),
+                &job.id,
+                lineage,
+                event_type,
+                job.last_status.as_deref(),
+                Some(
+                    serde_json::json!({
+                        "enabled": job.enabled,
+                        "expression": job.expression,
+                        "kind": job.job_type.as_str(),
+                    })
+                    .to_string(),
+                )
+                .as_deref(),
+            )?;
         }
         Ok(())
     })?;
@@ -276,6 +456,24 @@ pub fn record_last_run(
             params![finished_at.to_rfc3339(), status, bounded_output, job_id],
         )
         .context("Failed to update cron last run fields")?;
+        if let Some(lineage) = load_job_lineage(conn, job_id)? {
+            insert_job_event(
+                conn,
+                &workspace_id(config),
+                job_id,
+                lineage,
+                "cron.job.last_run_recorded",
+                Some(status),
+                Some(
+                    serde_json::json!({
+                        "finished_at": finished_at.to_rfc3339(),
+                        "success": success,
+                    })
+                    .to_string(),
+                )
+                .as_deref(),
+            )?;
+        }
         Ok(())
     })
 }
@@ -294,6 +492,24 @@ pub fn reschedule_after_run(config: &Config, job: &CronJob, success: bool, outpu
             params![next_run.to_rfc3339(), now.to_rfc3339(), status, bounded_output, job.id],
         )
         .context("Failed to update cron job run state")?;
+        if let Some(lineage) = load_job_lineage(conn, &job.id)? {
+            insert_job_event(
+                conn,
+                &workspace_id(config),
+                &job.id,
+                lineage,
+                "cron.job.rescheduled",
+                Some(status),
+                Some(
+                    serde_json::json!({
+                        "next_run": next_run.to_rfc3339(),
+                        "success": success,
+                    })
+                    .to_string(),
+                )
+                .as_deref(),
+            )?;
+        }
         Ok(())
     })
 }
@@ -327,6 +543,25 @@ pub fn record_run(
             ],
         )
         .context("Failed to insert cron run")?;
+        if let Some(lineage) = load_job_lineage(&tx, job_id)? {
+            insert_job_event(
+                &tx,
+                &workspace_id(config),
+                job_id,
+                lineage,
+                "cron.job.run_recorded",
+                Some(status),
+                Some(
+                    serde_json::json!({
+                        "started_at": started_at.to_rfc3339(),
+                        "finished_at": finished_at.to_rfc3339(),
+                        "duration_ms": duration_ms,
+                    })
+                    .to_string(),
+                )
+                .as_deref(),
+            )?;
+        }
 
         let keep = i64::from(config.cron.max_run_history.max(1));
         tx.execute(
@@ -397,6 +632,20 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
     })
 }
 
+pub fn list_job_events(config: &Config, job_id: &str) -> Result<Vec<CronJobEvent>> {
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, event_id, job_id, workspace_id, owner_id, topic_id, parent_task_id,
+                    source_message_event_id, event_type, status, payload_json, created_at
+             FROM cron_job_events
+             WHERE job_id = ?1
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![job_id], map_job_event_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    })
+}
+
 fn parse_rfc3339(raw: &str) -> Result<DateTime<Utc>> {
     let parsed =
         DateTime::parse_from_rfc3339(raw).with_context(|| format!("Invalid RFC3339 timestamp in cron DB: {raw}"))?;
@@ -408,38 +657,172 @@ fn sql_conversion_error(err: anyhow::Error) -> rusqlite::Error {
 }
 
 fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
-    let expression: String = row.get(1)?;
-    let schedule_raw: Option<String> = row.get(3)?;
+    let expression: String = row.get(5)?;
+    let schedule_raw: Option<String> = row.get(7)?;
     let schedule = decode_schedule(schedule_raw.as_deref(), &expression).map_err(sql_conversion_error)?;
 
-    let delivery_raw: Option<String> = row.get(10)?;
+    let delivery_raw: Option<String> = row.get(14)?;
     let delivery = decode_delivery(delivery_raw.as_deref()).map_err(sql_conversion_error)?;
 
-    let next_run_raw: String = row.get(13)?;
-    let last_run_raw: Option<String> = row.get(14)?;
-    let created_at_raw: String = row.get(12)?;
+    let next_run_raw: String = row.get(17)?;
+    let last_run_raw: Option<String> = row.get(18)?;
+    let created_at_raw: String = row.get(16)?;
 
     Ok(CronJob {
         id: row.get(0)?,
+        owner_id: row.get(1)?,
+        topic_id: row.get(2)?,
+        parent_task_id: row.get(3)?,
+        source_message_event_id: row.get(4)?,
         expression,
         schedule,
-        command: row.get(2)?,
-        job_type: JobType::parse(&row.get::<_, String>(4)?),
-        prompt: row.get(5)?,
-        name: row.get(6)?,
-        session_target: SessionTarget::parse(&row.get::<_, String>(7)?),
-        model: row.get(8)?,
-        enabled: row.get::<_, i64>(9)? != 0,
+        command: row.get(6)?,
+        job_type: JobType::parse(&row.get::<_, String>(8)?),
+        prompt: row.get(9)?,
+        name: row.get(10)?,
+        session_target: SessionTarget::parse(&row.get::<_, String>(11)?),
+        model: row.get(12)?,
+        enabled: row.get::<_, i64>(13)? != 0,
         delivery,
-        delete_after_run: row.get::<_, i64>(11)? != 0,
+        delete_after_run: row.get::<_, i64>(15)? != 0,
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_conversion_error)?,
         next_run: parse_rfc3339(&next_run_raw).map_err(sql_conversion_error)?,
         last_run: match last_run_raw {
             Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_conversion_error)?),
             None => None,
         },
-        last_status: row.get(15)?,
-        last_output: row.get(16)?,
+        last_status: row.get(19)?,
+        last_output: row.get(20)?,
+        approval_grant_json: row.get(21)?,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct JobLineage {
+    owner_id: Option<String>,
+    topic_id: Option<String>,
+    parent_task_id: Option<String>,
+    source_message_event_id: Option<String>,
+    status: Option<String>,
+}
+
+fn workspace_id(config: &Config) -> String {
+    config.workspace_dir.to_string_lossy().to_string()
+}
+
+fn load_job_lineage(conn: &Connection, job_id: &str) -> Result<Option<JobLineage>> {
+    let mut stmt = conn.prepare(
+        "SELECT owner_id, topic_id, parent_task_id, source_message_event_id, last_status
+         FROM cron_jobs
+         WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query(params![job_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(JobLineage {
+        owner_id: row.get(0)?,
+        topic_id: row.get(1)?,
+        parent_task_id: row.get(2)?,
+        source_message_event_id: row.get(3)?,
+        status: row.get(4)?,
+    }))
+}
+
+fn insert_job_event(
+    conn: &Connection,
+    workspace_id: &str,
+    job_id: &str,
+    lineage: JobLineage,
+    event_type: &str,
+    status: Option<&str>,
+    payload_json: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO cron_job_events (
+            event_id, job_id, workspace_id, owner_id, topic_id, parent_task_id, source_message_event_id,
+            event_type, status, payload_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            Uuid::new_v4().to_string(),
+            job_id,
+            workspace_id,
+            lineage.owner_id.as_deref(),
+            lineage.topic_id.as_deref(),
+            lineage.parent_task_id.as_deref(),
+            lineage.source_message_event_id.as_deref(),
+            event_type,
+            status,
+            payload_json,
+            Utc::now().to_rfc3339(),
+        ],
+    )
+    .context("Failed to insert cron job event")?;
+    if let Err(error) = mirror_cron_job_event(workspace_id, job_id, &lineage, event_type, status, payload_json) {
+        tracing::warn!(job_id = %job_id, event_type, "failed to mirror cron job event into memory_events: {error}");
+    }
+    Ok(())
+}
+
+fn mirror_cron_job_event(
+    workspace_id: &str,
+    job_id: &str,
+    lineage: &JobLineage,
+    event_type: &str,
+    status: Option<&str>,
+    payload_json: Option<&str>,
+) -> Result<i64> {
+    let mut payload = payload_json
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    payload.insert("owner_id".to_string(), lineage.owner_id.clone().into());
+    payload.insert("topic_id".to_string(), lineage.topic_id.clone().into());
+    payload.insert("parent_task_id".to_string(), lineage.parent_task_id.clone().into());
+    payload.insert(
+        "source_message_event_id".to_string(),
+        lineage.source_message_event_id.clone().into(),
+    );
+    payload.insert(
+        "status".to_string(),
+        status.map(str::to_string).or_else(|| lineage.status.clone()).into(),
+    );
+    payload.insert("task_id".to_string(), job_id.to_string().into());
+    if !payload.contains_key("task") {
+        if let Some(name) = payload.get("name").and_then(serde_json::Value::as_str) {
+            payload.insert("task".to_string(), name.to_string().into());
+        }
+    }
+    let payload_json = serde_json::Value::Object(payload).to_string();
+    crate::memory::sqlite::append_task_event_mirror(
+        std::path::Path::new(workspace_id),
+        crate::memory::sqlite::SqliteTaskEventMirror {
+            workspace_id,
+            task_id: job_id,
+            event_type,
+            session_key: None,
+            agent_id: None,
+            persona_id: None,
+            payload_json: Some(&payload_json),
+        },
+    )
+}
+
+fn map_job_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJobEvent> {
+    let created_at_raw: String = row.get(11)?;
+    Ok(CronJobEvent {
+        id: row.get(0)?,
+        event_id: row.get(1)?,
+        job_id: row.get(2)?,
+        workspace_id: row.get(3)?,
+        owner_id: row.get(4)?,
+        topic_id: row.get(5)?,
+        parent_task_id: row.get(6)?,
+        source_message_event_id: row.get(7)?,
+        event_type: row.get(8)?,
+        status: row.get(9)?,
+        payload_json: row.get(10)?,
+        created_at: parse_rfc3339(&created_at_raw).map_err(sql_conversion_error)?,
     })
 }
 
@@ -473,8 +856,8 @@ fn decode_delivery(delivery_raw: Option<&str>) -> Result<DeliveryConfig> {
     Ok(DeliveryConfig::default())
 }
 
-fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(cron_jobs)")?;
+fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let col_name: String = row.get(1)?;
@@ -488,13 +871,13 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
 
     // Tolerate "duplicate column name" errors to handle the race where
     // another process adds the column between our PRAGMA check and ALTER.
-    match conn.execute(&format!("ALTER TABLE cron_jobs ADD COLUMN {name} {sql_type}"), []) {
+    match conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {sql_type}"), []) {
         Ok(_) => Ok(()),
         Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
-            tracing::debug!("Column cron_jobs.{name} already exists (concurrent migration): {err}");
+            tracing::debug!("Column {table}.{name} already exists (concurrent migration): {err}");
             Ok(())
         }
-        Err(e) => Err(e).with_context(|| format!("Failed to add cron_jobs.{name}")),
+        Err(e) => Err(e).with_context(|| format!("Failed to add {table}.{name}")),
     }
 }
 
@@ -514,6 +897,10 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
         "PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS cron_jobs (
             id               TEXT PRIMARY KEY,
+            owner_id         TEXT,
+            topic_id         TEXT,
+            parent_task_id   TEXT,
+            source_message_event_id TEXT,
             expression       TEXT NOT NULL,
             command          TEXT NOT NULL,
             schedule         TEXT,
@@ -529,7 +916,8 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             next_run         TEXT NOT NULL,
             last_run         TEXT,
             last_status      TEXT,
-            last_output      TEXT
+            last_output      TEXT,
+            approval_grant_json TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
 
@@ -545,19 +933,53 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
         );
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at ON cron_runs(started_at);
-        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);",
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);
+
+        CREATE TABLE IF NOT EXISTS cron_job_events (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id       TEXT NOT NULL UNIQUE,
+            job_id         TEXT NOT NULL,
+            workspace_id   TEXT NOT NULL,
+            owner_id       TEXT,
+            topic_id       TEXT,
+            parent_task_id TEXT,
+            source_message_event_id TEXT,
+            event_type     TEXT NOT NULL,
+            status         TEXT,
+            payload_json   TEXT,
+            created_at     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cron_job_events_job_id ON cron_job_events(job_id, id);
+        CREATE INDEX IF NOT EXISTS idx_cron_job_events_owner ON cron_job_events(workspace_id, owner_id, id);
+        CREATE INDEX IF NOT EXISTS idx_cron_job_events_topic ON cron_job_events(workspace_id, topic_id, id);
+        CREATE INDEX IF NOT EXISTS idx_cron_job_events_type ON cron_job_events(event_type, id);",
     )
     .context("Failed to initialize cron schema")?;
 
-    add_column_if_missing(&conn, "schedule", "TEXT")?;
-    add_column_if_missing(&conn, "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
-    add_column_if_missing(&conn, "prompt", "TEXT")?;
-    add_column_if_missing(&conn, "name", "TEXT")?;
-    add_column_if_missing(&conn, "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
-    add_column_if_missing(&conn, "model", "TEXT")?;
-    add_column_if_missing(&conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(&conn, "delivery", "TEXT")?;
-    add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(&conn, "cron_jobs", "owner_id", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "topic_id", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "parent_task_id", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "source_message_event_id", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "schedule", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
+    add_column_if_missing(&conn, "cron_jobs", "prompt", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "name", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
+    add_column_if_missing(&conn, "cron_jobs", "model", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(&conn, "cron_jobs", "delivery", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(&conn, "cron_jobs", "last_run", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "last_status", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "last_output", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "approval_grant_json", "TEXT")?;
+    add_column_if_missing(&conn, "cron_job_events", "source_message_event_id", "TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_cron_jobs_owner ON cron_jobs(owner_id, enabled, next_run);
+         CREATE INDEX IF NOT EXISTS idx_cron_jobs_topic ON cron_jobs(topic_id, enabled, next_run);
+         CREATE INDEX IF NOT EXISTS idx_cron_jobs_parent ON cron_jobs(parent_task_id, id);",
+    )
+    .context("Failed to initialize cron lineage indexes")?;
 
     f(&conn)
 }
@@ -603,6 +1025,183 @@ mod tests {
 
         remove_job(&config, &job.id).unwrap();
         assert!(list_jobs(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_job_persists_owner_topic_lineage_and_event() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let lineage = CronJobLineage {
+            owner_id: Some("owner:workspace:telegram:alice".to_string()),
+            topic_id: Some("topic-1".to_string()),
+            parent_task_id: Some("task-parent".to_string()),
+            source_message_event_id: Some("msg-1".to_string()),
+        };
+
+        let job = add_shell_job_with_lineage_and_approval_grant(
+            &config,
+            Some("lineage-test".to_string()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo lineage",
+            None,
+            lineage,
+        )
+        .unwrap();
+
+        assert_eq!(job.owner_id.as_deref(), Some("owner:workspace:telegram:alice"));
+        assert_eq!(job.topic_id.as_deref(), Some("topic-1"));
+        assert_eq!(job.parent_task_id.as_deref(), Some("task-parent"));
+        assert_eq!(job.source_message_event_id.as_deref(), Some("msg-1"));
+
+        let events = list_job_events(&config, &job.id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "cron.job.created");
+        assert_eq!(events[0].owner_id.as_deref(), Some("owner:workspace:telegram:alice"));
+        assert_eq!(events[0].topic_id.as_deref(), Some("topic-1"));
+        assert_eq!(events[0].parent_task_id.as_deref(), Some("task-parent"));
+        assert_eq!(events[0].source_message_event_id.as_deref(), Some("msg-1"));
+
+        let memory_conn = Connection::open(config.workspace_dir.join("memory").join("brain.db")).unwrap();
+        let (event_type, subject_id, payload): (String, String, String) = memory_conn
+            .query_row(
+                "SELECT event_type, subject_id, payload_json
+                 FROM memory_events
+                 WHERE subject_table = 'tasks' AND subject_id = ?1
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![job.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(event_type, "cron.job.created");
+        assert_eq!(subject_id, job.id);
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["owner_id"].as_str(), Some("owner:workspace:telegram:alice"));
+        assert_eq!(payload["topic_id"].as_str(), Some("topic-1"));
+        assert_eq!(payload["parent_task_id"].as_str(), Some("task-parent"));
+        assert_eq!(payload["source_message_event_id"].as_str(), Some("msg-1"));
+        assert_eq!(payload["task"].as_str(), Some("lineage-test"));
+    }
+
+    #[test]
+    fn cron_task_lifecycle_records_owner_scoped_events() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let lineage = CronJobLineage {
+            owner_id: Some("owner-a".to_string()),
+            topic_id: Some("topic-a".to_string()),
+            parent_task_id: Some("task-a".to_string()),
+            source_message_event_id: Some("msg-a".to_string()),
+        };
+        let job = add_shell_job_with_lineage_and_approval_grant(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo lifecycle",
+            None,
+            lineage,
+        )
+        .unwrap();
+
+        assert!(claim_job(&config, &job.id).unwrap());
+        let started = Utc::now();
+        record_run(
+            &config,
+            &job.id,
+            started,
+            started + ChronoDuration::milliseconds(5),
+            "ok",
+            Some("done"),
+            5,
+        )
+        .unwrap();
+        reschedule_after_run(&config, &job, true, "done").unwrap();
+        let _ = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        let events = list_job_events(&config, &job.id).unwrap();
+        let event_types = events.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>();
+        assert!(event_types.contains(&"cron.job.created"));
+        assert!(event_types.contains(&"cron.job.claimed"));
+        assert!(event_types.contains(&"cron.job.run_recorded"));
+        assert!(event_types.contains(&"cron.job.rescheduled"));
+        assert!(event_types.contains(&"cron.job.disabled"));
+        assert!(events.iter().all(|event| event.owner_id.as_deref() == Some("owner-a")));
+        assert!(events.iter().all(|event| event.topic_id.as_deref() == Some("topic-a")));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.source_message_event_id.as_deref() == Some("msg-a"))
+        );
+    }
+
+    #[test]
+    fn legacy_cron_schema_migrates_lineage_columns_and_events_table() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let db_dir = config.workspace_dir.join("cron");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("jobs.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let jobs = list_jobs(&config).unwrap();
+        assert!(jobs.is_empty());
+
+        with_connection(&config, |conn| {
+            let mut stmt = conn.prepare("PRAGMA table_info(cron_jobs)")?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for name in [
+                "owner_id",
+                "topic_id",
+                "parent_task_id",
+                "source_message_event_id",
+                "approval_grant_json",
+            ] {
+                assert!(names.iter().any(|existing| existing == name), "missing {name}");
+            }
+            let event_tables: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'cron_job_events'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(event_tables, 1);
+            let mut event_stmt = conn.prepare("PRAGMA table_info(cron_job_events)")?;
+            let event_names = event_stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert!(
+                event_names.iter().any(|existing| existing == "source_message_event_id"),
+                "missing cron_job_events.source_message_event_id"
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

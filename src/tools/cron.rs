@@ -12,13 +12,15 @@
 //!  - run — force-run a job immediately
 //!  - runs / history — list run history for a job
 //!  - get — fetch details of a single job
+//!  - events — list append-only lifecycle events for a job
 //!  - pause / resume — enable/disable a job without removing it
 //!  - status — show cron subsystem status
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
 use crate::cron::{self, CronJobPatch, JobType, Schedule};
-use crate::security::SecurityPolicy;
+use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
+use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -107,7 +109,7 @@ impl Tool for CronTool {
     fn description(&self) -> &str {
         "Unified cron/scheduler management. \
          Actions: add/schedule/once (create job), list, get, remove/cancel, update/patch, \
-         run (force-run now), runs/history (run log), pause, resume, status."
+         run (force-run now), runs/history (run log), events, pause, resume, status."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -124,6 +126,7 @@ impl Tool for CronTool {
                         "update", "patch",
                         "run",
                         "runs", "history",
+                        "events",
                         "pause", "resume",
                         "status"
                     ],
@@ -157,11 +160,6 @@ impl Tool for CronTool {
                     "type": "integer",
                     "description": "Max entries for 'runs' action (default 10)."
                 },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Explicitly approve medium/high-risk shell commands in supervised mode.",
-                    "default": false
-                }
             },
             "required": ["action"]
         })
@@ -341,6 +339,34 @@ impl Tool for CronTool {
                 }
             }
 
+            "events" => {
+                if let Some(r) = self.check_enabled(&cfg) {
+                    return Ok(r);
+                }
+                let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
+                    Some(v) if !v.trim().is_empty() => v,
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("Missing 'job_id' parameter".to_string()),
+                        });
+                    }
+                };
+                match cron::list_job_events(&cfg, job_id) {
+                    Ok(events) => Ok(ToolResult {
+                        success: true,
+                        output: serde_json::to_string_pretty(&events)?,
+                        error: None,
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }),
+                }
+            }
+
             // ── Mutating ───────────────────────────────────────────────────────────
             "add" | "schedule" => {
                 if let Some(r) = self.enforce_mutation(action, &cfg) {
@@ -366,15 +392,39 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
-                if let Err(reason) = self.security.validate_command_execution(command, approved) {
+                let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+                if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
+                    self.name(),
+                    command,
+                    approval_grant.as_ref(),
+                ) {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(reason),
                     });
                 }
-                match cron::add_job(&cfg, expression, command) {
+                let persisted_grant = ApprovalGrant::persisted_runner_grant(
+                    "cron_scheduler",
+                    command,
+                    approval_grant.as_ref(),
+                    PERSISTED_APPROVAL_GRANT_TTL_SECS,
+                )
+                .map(|grant| serde_json::to_string(&grant))
+                .transpose()?;
+                let schedule = Schedule::Cron {
+                    expr: expression.to_string(),
+                    tz: None,
+                };
+                let lineage = cron::lineage_from_trusted_scope(&cfg, &args);
+                match cron::add_shell_job_with_lineage_and_approval_grant(
+                    &cfg,
+                    None,
+                    schedule,
+                    command,
+                    persisted_grant,
+                    lineage,
+                ) {
                     Ok(job) => Ok(ToolResult {
                         success: true,
                         output: format!(
@@ -408,36 +458,52 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
-                if let Err(reason) = self.security.validate_command_execution(command, approved) {
+                let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+                if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
+                    self.name(),
+                    command,
+                    approval_grant.as_ref(),
+                ) {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(reason),
                     });
                 }
+                let persisted_grant = ApprovalGrant::persisted_runner_grant(
+                    "cron_scheduler",
+                    command,
+                    approval_grant.as_ref(),
+                    PERSISTED_APPROVAL_GRANT_TTL_SECS,
+                )
+                .map(|grant| serde_json::to_string(&grant))
+                .transpose()?;
 
                 let delay = args.get("delay").and_then(|v| v.as_str());
                 let run_at = args.get("run_at").and_then(|v| v.as_str());
+                let lineage = cron::lineage_from_trusted_scope(&cfg, &args);
 
                 match (delay, run_at) {
-                    (Some(d), None) => match cron::add_once(&cfg, d, command) {
-                        Ok(job) => Ok(ToolResult {
-                            success: true,
-                            output: format!(
-                                "Created one-shot job {} (runs at: {}, cmd: {})",
-                                job.id,
-                                job.next_run.to_rfc3339(),
-                                job.command
-                            ),
-                            error: None,
-                        }),
-                        Err(e) => Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(e.to_string()),
-                        }),
-                    },
+                    (Some(d), None) => {
+                        match cron::add_once_with_lineage_and_approval_grant(&cfg, d, command, persisted_grant, lineage)
+                        {
+                            Ok(job) => Ok(ToolResult {
+                                success: true,
+                                output: format!(
+                                    "Created one-shot job {} (runs at: {}, cmd: {})",
+                                    job.id,
+                                    job.next_run.to_rfc3339(),
+                                    job.command
+                                ),
+                                error: None,
+                            }),
+                            Err(e) => Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(e.to_string()),
+                            }),
+                        }
+                    }
                     (None, Some(at)) => {
                         let run_at_parsed: DateTime<Utc> = match DateTime::parse_from_rfc3339(at) {
                             Ok(v) => v.with_timezone(&Utc),
@@ -449,7 +515,13 @@ impl Tool for CronTool {
                                 });
                             }
                         };
-                        match cron::add_once_at(&cfg, run_at_parsed, command) {
+                        match cron::add_once_at_with_lineage_and_approval_grant(
+                            &cfg,
+                            run_at_parsed,
+                            command,
+                            persisted_grant,
+                            lineage,
+                        ) {
                             Ok(job) => Ok(ToolResult {
                                 success: true,
                                 output: format!(
@@ -527,7 +599,7 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                let patch = match serde_json::from_value::<CronJobPatch>(patch_val) {
+                let mut patch = match serde_json::from_value::<CronJobPatch>(patch_val) {
                     Ok(p) => p,
                     Err(e) => {
                         return Ok(ToolResult {
@@ -537,15 +609,27 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
+                let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 if let Some(command) = &patch.command {
-                    if let Err(reason) = self.security.validate_command_execution(command, approved) {
+                    if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
+                        self.name(),
+                        command,
+                        approval_grant.as_ref(),
+                    ) {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
                             error: Some(reason),
                         });
                     }
+                    patch.approval_grant_json = ApprovalGrant::persisted_runner_grant(
+                        "cron_scheduler",
+                        command,
+                        approval_grant.as_ref(),
+                        PERSISTED_APPROVAL_GRANT_TTL_SECS,
+                    )
+                    .map(|grant| serde_json::to_string(&grant))
+                    .transpose()?;
                 }
                 match cron::update_job(&cfg, job_id, patch) {
                     Ok(job) => Ok(ToolResult {
@@ -576,7 +660,7 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
+                let mut approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 if !self.security.can_act() {
                     return Ok(ToolResult {
                         success: false,
@@ -601,8 +685,20 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                if approval_grant.is_none()
+                    && args
+                        .get(crate::security::policy::RUNTIME_APPROVAL_GRANTED_ARG)
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    approval_grant = Some(ApprovalGrant::for_command(self.name(), &job.command, "runtime", None));
+                }
                 if matches!(job.job_type, JobType::Shell) {
-                    if let Err(reason) = self.security.validate_command_execution(&job.command, approved) {
+                    if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
+                        self.name(),
+                        &job.command,
+                        approval_grant.as_ref(),
+                    ) {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
@@ -618,7 +714,13 @@ impl Tool for CronTool {
                     });
                 }
                 let started_at = Utc::now();
-                let (success, output) = cron::scheduler::execute_job_now(&cfg, &job).await;
+                let (success, output) = cron::scheduler::execute_job_now_with_runtime_approval_for_tool(
+                    &cfg,
+                    &job,
+                    self.name(),
+                    approval_grant,
+                )
+                .await;
                 let finished_at = Utc::now();
                 let duration_ms = (finished_at - started_at).num_milliseconds();
                 let status = if success { "ok" } else { "error" };
@@ -708,7 +810,7 @@ impl Tool for CronTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action '{other}'. Use: add, schedule, once, list, get, remove, cancel, update, patch, run, runs, history, pause, resume, status."
+                    "Unknown action '{other}'. Use: add, schedule, once, list, get, remove, cancel, update, patch, run, runs, history, events, pause, resume, status."
                 )),
             }),
         }
@@ -794,6 +896,23 @@ mod tests {
         let result = tool.execute(json!({"action": "get", "job_id": job.id})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("echo get-test"));
+    }
+
+    #[tokio::test]
+    async fn events_lists_job_lifecycle_events() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo events-test").unwrap();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+
+        let result = tool
+            .execute(json!({"action": "events", "job_id": job.id}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("cron.job.created"));
     }
 
     #[tokio::test]

@@ -29,6 +29,8 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod document_get_chunk;
+pub mod document_search;
 pub mod error_hints;
 pub mod file_read;
 pub mod file_write;
@@ -42,6 +44,7 @@ pub mod mcp;
 pub mod memory_forget;
 pub mod memory_get;
 pub mod memory_recall;
+pub mod memory_reindex;
 pub mod memory_search;
 pub mod memory_store;
 pub mod message_send;
@@ -54,6 +57,7 @@ pub mod screenshot;
 pub mod session_status;
 pub mod sessions_history;
 pub mod sessions_list;
+pub(crate) mod sessions_read_model;
 pub mod sessions_send;
 pub mod sessions_spawn;
 pub mod shell;
@@ -78,6 +82,8 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use document_get_chunk::DocumentGetChunkTool;
+pub use document_search::DocumentSearchTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use gateway::GatewayTool;
@@ -89,6 +95,7 @@ pub use mcp::McpTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_get::MemoryGetTool;
 pub use memory_recall::MemoryRecallTool;
+pub use memory_reindex::MemoryReindexTool;
 pub use memory_search::MemorySearchTool;
 pub use memory_store::MemoryStoreTool;
 pub use message_send::MessageSendTool;
@@ -329,6 +336,15 @@ pub fn all_tools_with_runtime_ext(
             memory.clone(),
             config.memory.acl_enabled,
         )));
+        tool_arcs.push(Arc::new(DocumentSearchTool::new(
+            workspace_dir.to_path_buf(),
+            memory.clone(),
+        )));
+        tool_arcs.push(Arc::new(DocumentGetChunkTool::new(
+            workspace_dir.to_path_buf(),
+            memory.clone(),
+        )));
+        tool_arcs.push(Arc::new(MemoryReindexTool::new(memory.clone(), security.clone())));
 
         if config.memory.acl_enabled {
             tracing::warn!("memory_recall disabled because memory ACL is enabled; skipping tool registration");
@@ -341,7 +357,11 @@ pub fn all_tools_with_runtime_ext(
 
     // ── Nodes module gates nodes tool ──
     if modules.nodes {
-        tool_arcs.push(Arc::new(NodesTool::new(shared_config, security.clone())));
+        tool_arcs.push(Arc::new(
+            NodesTool::new(shared_config, security.clone())
+                .with_shared_memory(memory.clone())
+                .with_event_recording(root_config.memory.event_recording_config()),
+        ));
     } else {
         tracing::debug!("Nodes module disabled, skipping nodes tool registration");
     }
@@ -658,6 +678,9 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"memory_recall"));
+        assert!(names.contains(&"document_search"));
+        assert!(names.contains(&"document_get_chunk"));
+        assert!(names.contains(&"memory_reindex"));
     }
 
     #[test]

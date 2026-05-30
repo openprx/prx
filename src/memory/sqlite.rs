@@ -1,11 +1,16 @@
 use super::embeddings::EmbeddingProvider;
 use super::filter::{MemorySafetyFilter, SourceMetadata, safety_rejection_message};
-use super::principal::{ChatType, MemoryWriteContext, Principal, Role, Visibility, classify_memory, resolve_principal};
+use super::principal::{
+    ChatType, MemoryWriteContext, OwnerPrincipal, Principal, Role, Visibility, classify_memory, log_access,
+    post_filter, resolve_principal,
+};
 use super::topic::resolve_topic;
 use super::traits::{
-    ConversationSessionSummary, ConversationTurn, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry,
-    MemoryEvent, MemoryEventInput, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent,
-    MessageEventInput, SessionContextQuery, SharedContextQuery, validate_memory_write_target,
+    CompactionRun, CompactionRunInput, ConversationSessionSummary, ConversationTurn, DocumentChunkRecord,
+    DocumentIngestInput, DocumentRecord, DocumentSearchResult, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput,
+    MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryStoreMetadata,
+    MemoryVisibility, MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, SessionContextQuery,
+    SharedContextQuery, validate_memory_write_target,
 };
 use super::vector;
 use crate::self_system::evolution::record::Actor;
@@ -13,7 +18,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Local, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter, types::Value};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -28,6 +33,143 @@ use uuid::Uuid;
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 const DEFAULT_CONVERSATION_LIMIT: usize = 50;
 const MAX_CONVERSATION_QUERY_LIMIT: usize = 500;
+
+fn message_event_type_for(role: &str, content: &str) -> Option<String> {
+    if role != "event" {
+        return None;
+    }
+    content
+        .split_whitespace()
+        .next()
+        .filter(|event_type| event_type.contains('.'))
+        .map(str::to_string)
+}
+
+pub struct SqliteTaskEventMirror<'a> {
+    pub workspace_id: &'a str,
+    pub task_id: &'a str,
+    pub event_type: &'a str,
+    pub session_key: Option<&'a str>,
+    pub agent_id: Option<&'a str>,
+    pub persona_id: Option<&'a str>,
+    pub payload_json: Option<&'a str>,
+}
+
+pub fn append_task_event_mirror(workspace_dir: &Path, input: SqliteTaskEventMirror<'_>) -> anyhow::Result<i64> {
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create memory directory: {}", parent.display()))?;
+    }
+    let conn =
+        Connection::open(&db_path).with_context(|| format!("Failed to open memory DB: {}", db_path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_events (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id      TEXT NOT NULL UNIQUE,
+            workspace_id  TEXT NOT NULL,
+            event_type    TEXT NOT NULL,
+            subject_table TEXT NOT NULL,
+            subject_id    TEXT NOT NULL,
+            session_key   TEXT,
+            agent_id      TEXT,
+            persona_id    TEXT,
+            visibility    TEXT NOT NULL DEFAULT 'workspace',
+            payload_json  TEXT,
+            created_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_events_workspace_id
+            ON memory_events(workspace_id, id);
+        CREATE INDEX IF NOT EXISTS idx_memory_events_type
+            ON memory_events(workspace_id, event_type, id);
+        CREATE INDEX IF NOT EXISTS idx_memory_events_session
+            ON memory_events(workspace_id, session_key, id);",
+    )?;
+
+    let event_id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO memory_events (
+            event_id, workspace_id, event_type, subject_table, subject_id,
+            session_key, agent_id, persona_id, visibility, payload_json, created_at
+         )
+         VALUES (?1, ?2, ?3, 'tasks', ?4, ?5, ?6, ?7, 'workspace', ?8, ?9)",
+        params![
+            event_id,
+            input.workspace_id,
+            input.event_type,
+            input.task_id,
+            input.session_key,
+            input.agent_id,
+            input.persona_id,
+            input.payload_json,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub(crate) fn init_approval_grant_schema(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS approval_grants (
+            grant_id                 TEXT PRIMARY KEY,
+            version                  INTEGER NOT NULL,
+            owner_id                 TEXT NOT NULL,
+            principal_id             TEXT NOT NULL,
+            workspace_id             TEXT NOT NULL,
+            agent_id                 TEXT NOT NULL,
+            session_key              TEXT,
+            issuer_authority         TEXT NOT NULL,
+            issuer_authority_id      TEXT NOT NULL,
+            issuer_public_key_id     TEXT NOT NULL,
+            capability_op_id         TEXT NOT NULL,
+            capability_op_id_match   TEXT NOT NULL,
+            capability_risk_level    TEXT NOT NULL CHECK (capability_risk_level IN ('low','medium','high','critical')),
+            resource_constraints_json TEXT NOT NULL DEFAULT '{}',
+            grant_json               TEXT NOT NULL,
+            signature_alg            TEXT NOT NULL,
+            signed_payload_sha256    TEXT NOT NULL,
+            issued_at                TEXT NOT NULL,
+            not_before               TEXT NOT NULL,
+            expires_at               TEXT NOT NULL,
+            max_uses                 INTEGER NOT NULL,
+            uses_consumed            INTEGER NOT NULL DEFAULT 0,
+            related_task_id          TEXT,
+            related_message_event_id INTEGER,
+            revoked_at               TEXT,
+            revocation_reason        TEXT,
+            created_at               TEXT NOT NULL,
+            updated_at               TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_grants_owner
+            ON approval_grants(workspace_id, owner_id, issued_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_approval_grants_principal
+            ON approval_grants(workspace_id, principal_id, issued_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_approval_grants_capability
+            ON approval_grants(workspace_id, capability_op_id, expires_at);
+        CREATE INDEX IF NOT EXISTS idx_approval_grants_active
+            ON approval_grants(workspace_id, expires_at, revoked_at);
+
+        CREATE TABLE IF NOT EXISTS approval_grant_events (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id      TEXT NOT NULL UNIQUE,
+            grant_id      TEXT NOT NULL,
+            event_type    TEXT NOT NULL CHECK (event_type IN (
+                'grant.issued','grant.verified','grant.consumed','grant.revoked',
+                'grant.rejected','grant.expired'
+            )),
+            actor         TEXT NOT NULL,
+            occurred_at   TEXT NOT NULL,
+            payload_json  TEXT,
+            FOREIGN KEY (grant_id) REFERENCES approval_grants(grant_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_grant_events_grant
+            ON approval_grant_events(grant_id, occurred_at);
+        CREATE INDEX IF NOT EXISTS idx_approval_grant_events_type
+            ON approval_grant_events(event_type, occurred_at);",
+    )?;
+    Ok(())
+}
 const MAX_HYDRATED_SESSIONS: usize = 100;
 const SESSION_PREVIEW_CHARS: usize = 120;
 
@@ -273,9 +415,13 @@ impl SqliteMemory {
                 content     TEXT NOT NULL,
                 category    TEXT NOT NULL DEFAULT 'core',
                 embedding   BLOB,
+                embedding_provider TEXT,
+                embedding_model TEXT,
+                embedding_dimensions INTEGER,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL,
                 workspace_id TEXT,
+                owner_id    TEXT,
                 agent_id     TEXT,
                 persona_id   TEXT,
                 source_event_id TEXT,
@@ -320,6 +466,9 @@ impl SqliteMemory {
             CREATE TABLE IF NOT EXISTS embedding_cache (
                 content_hash TEXT PRIMARY KEY,
                 embedding    BLOB NOT NULL,
+                provider     TEXT,
+                model        TEXT,
+                dimensions   INTEGER,
                 created_at   TEXT NOT NULL,
                 accessed_at  TEXT NOT NULL
             );
@@ -339,6 +488,24 @@ impl SqliteMemory {
             );
             CREATE INDEX IF NOT EXISTS idx_ib_user ON identity_bindings(user_id);
             CREATE INDEX IF NOT EXISTS idx_ib_channel_account ON identity_bindings(channel, channel_account);
+
+            CREATE TABLE IF NOT EXISTS agent_identity_bindings (
+                binding_id        TEXT PRIMARY KEY,
+                external_subject  TEXT NOT NULL,
+                external_issuer   TEXT NOT NULL,
+                auth_method       TEXT NOT NULL,
+                prx_owner_id      TEXT NOT NULL,
+                prx_principal_id  TEXT NOT NULL,
+                capabilities      TEXT NOT NULL,
+                expires_at        TEXT,
+                created_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at      TEXT,
+                UNIQUE (external_issuer, external_subject, auth_method)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_bindings_lookup
+                ON agent_identity_bindings(external_issuer, external_subject);
+            CREATE INDEX IF NOT EXISTS idx_agent_bindings_owner
+                ON agent_identity_bindings(prx_owner_id);
 
             CREATE TABLE IF NOT EXISTS user_policies (
                 user_id             TEXT PRIMARY KEY,
@@ -427,6 +594,7 @@ impl SqliteMemory {
                 session_key          TEXT PRIMARY KEY,
                 channel              TEXT NOT NULL,
                 sender               TEXT NOT NULL,
+                owner_id             TEXT,
                 created_at           TEXT NOT NULL,
                 updated_at           TEXT NOT NULL,
                 message_count        INTEGER NOT NULL DEFAULT 0,
@@ -438,6 +606,7 @@ impl SqliteMemory {
             CREATE TABLE IF NOT EXISTS conversation_turns (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_key      TEXT NOT NULL,
+                owner_id         TEXT,
                 role             TEXT NOT NULL,
                 content          TEXT NOT NULL,
                 timestamp        TEXT NOT NULL,
@@ -456,6 +625,7 @@ impl SqliteMemory {
                 event_id           TEXT NOT NULL UNIQUE,
                 idempotency_key    TEXT UNIQUE,
                 workspace_id       TEXT NOT NULL,
+                owner_id           TEXT,
                 source             TEXT NOT NULL,
                 channel            TEXT,
                 session_key        TEXT,
@@ -467,6 +637,7 @@ impl SqliteMemory {
                 sender             TEXT,
                 recipient          TEXT,
                 role               TEXT NOT NULL,
+                event_type         TEXT,
                 content            TEXT NOT NULL,
                 content_hash       TEXT,
                 raw_payload_json   TEXT,
@@ -512,6 +683,7 @@ impl SqliteMemory {
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 draft_id        TEXT NOT NULL UNIQUE,
                 workspace_id    TEXT NOT NULL,
+                owner_id        TEXT,
                 worker_run_id   TEXT NOT NULL,
                 parent_run_id   TEXT,
                 session_key     TEXT,
@@ -532,8 +704,213 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_memory_drafts_status
                 ON memory_drafts(status, id);
             CREATE INDEX IF NOT EXISTS idx_memory_drafts_source_event
-                ON memory_drafts(source_event_id);",
+                ON memory_drafts(source_event_id);
+
+            CREATE TABLE IF NOT EXISTS documents (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id             TEXT NOT NULL UNIQUE,
+                workspace_id            TEXT NOT NULL,
+                owner_id                TEXT,
+                topic_id                TEXT,
+                task_id                 TEXT,
+                source_message_event_id TEXT,
+                source_kind             TEXT NOT NULL,
+                source_uri              TEXT,
+                title                   TEXT,
+                content_sha256          TEXT NOT NULL,
+                mime_type               TEXT,
+                visibility              TEXT NOT NULL DEFAULT 'workspace',
+                metadata_json           TEXT,
+                chunk_count             INTEGER NOT NULL DEFAULT 0,
+                created_at              TEXT NOT NULL,
+                updated_at              TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_documents_workspace
+                ON documents(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_documents_owner
+                ON documents(workspace_id, owner_id, id);
+            CREATE INDEX IF NOT EXISTS idx_documents_topic
+                ON documents(workspace_id, topic_id, id);
+            CREATE INDEX IF NOT EXISTS idx_documents_task
+                ON documents(workspace_id, task_id, id);
+            CREATE INDEX IF NOT EXISTS idx_documents_hash
+                ON documents(content_sha256);
+
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                chunk_id        TEXT NOT NULL UNIQUE,
+                document_id     TEXT NOT NULL,
+                workspace_id    TEXT NOT NULL,
+                owner_id        TEXT,
+                topic_id        TEXT,
+                task_id         TEXT,
+                chunk_index     INTEGER NOT NULL,
+                heading         TEXT,
+                content         TEXT NOT NULL,
+                content_sha256  TEXT NOT NULL,
+                embedding       BLOB,
+                embedding_provider TEXT,
+                embedding_model TEXT,
+                embedding_dimensions INTEGER,
+                source_anchor   TEXT NOT NULL,
+                token_estimate  INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT NOT NULL,
+                FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_document
+                ON document_chunks(document_id, chunk_index);
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_workspace
+                ON document_chunks(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_owner
+                ON document_chunks(workspace_id, owner_id, id);
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_topic
+                ON document_chunks(workspace_id, topic_id, id);
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_task
+                ON document_chunks(workspace_id, task_id, id);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(
+                content, heading, content='document_chunks', content_rowid='rowid'
+            );
+            CREATE TRIGGER IF NOT EXISTS document_chunks_ai AFTER INSERT ON document_chunks BEGIN
+                INSERT INTO document_chunks_fts(rowid, content, heading)
+                VALUES (new.rowid, new.content, new.heading);
+            END;
+            CREATE TRIGGER IF NOT EXISTS document_chunks_ad AFTER DELETE ON document_chunks BEGIN
+                INSERT INTO document_chunks_fts(document_chunks_fts, rowid, content, heading)
+                VALUES ('delete', old.rowid, old.content, old.heading);
+            END;
+            CREATE TRIGGER IF NOT EXISTS document_chunks_au AFTER UPDATE ON document_chunks BEGIN
+                INSERT INTO document_chunks_fts(document_chunks_fts, rowid, content, heading)
+                VALUES ('delete', old.rowid, old.content, old.heading);
+                INSERT INTO document_chunks_fts(rowid, content, heading)
+                VALUES (new.rowid, new.content, new.heading);
+            END;
+
+            CREATE TABLE IF NOT EXISTS memory_links (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                link_id          TEXT NOT NULL UNIQUE,
+                workspace_id     TEXT NOT NULL,
+                owner_id         TEXT,
+                memory_key       TEXT,
+                memory_event_id  TEXT,
+                message_event_id TEXT,
+                document_id      TEXT NOT NULL,
+                chunk_id         TEXT,
+                link_type        TEXT NOT NULL,
+                payload_json     TEXT,
+                created_at       TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_links_workspace
+                ON memory_links(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_links_owner
+                ON memory_links(workspace_id, owner_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_links_memory_key
+                ON memory_links(workspace_id, memory_key, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_links_document
+                ON memory_links(document_id, chunk_id, id);
+
+            CREATE TABLE IF NOT EXISTS retrieval_traces (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id            TEXT NOT NULL UNIQUE,
+                workspace_id        TEXT NOT NULL,
+                owner_id            TEXT,
+                session_key         TEXT,
+                agent_id            TEXT,
+                persona_id          TEXT,
+                source              TEXT NOT NULL,
+                query               TEXT NOT NULL,
+                candidate_count     INTEGER NOT NULL,
+                selected_count      INTEGER NOT NULL,
+                dropped_count       INTEGER NOT NULL,
+                budget_tokens       INTEGER,
+                selected_json       TEXT,
+                dropped_json        TEXT,
+                payload_json        TEXT,
+                created_at          TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_retrieval_traces_workspace
+                ON retrieval_traces(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_traces_owner
+                ON retrieval_traces(workspace_id, owner_id, id);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_traces_session
+                ON retrieval_traces(workspace_id, session_key, id);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_traces_source
+                ON retrieval_traces(workspace_id, source, id);
+
+            CREATE TABLE IF NOT EXISTS compaction_runs (
+                id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id                    TEXT NOT NULL UNIQUE,
+                workspace_id              TEXT NOT NULL,
+                owner_id                  TEXT,
+                session_key               TEXT,
+                agent_id                  TEXT,
+                persona_id                TEXT,
+                trigger                   TEXT NOT NULL,
+                mode                      TEXT NOT NULL,
+                source_message_count      INTEGER NOT NULL,
+                source_token_estimate     INTEGER NOT NULL,
+                summary                   TEXT NOT NULL,
+                summary_memory_key        TEXT,
+                source_event_ids_json     TEXT,
+                source_document_refs_json TEXT,
+                fidelity_status           TEXT NOT NULL,
+                payload_json              TEXT,
+                created_at                TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_compaction_runs_workspace
+                ON compaction_runs(workspace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_compaction_runs_owner
+                ON compaction_runs(workspace_id, owner_id, id);
+            CREATE INDEX IF NOT EXISTS idx_compaction_runs_session
+                ON compaction_runs(workspace_id, session_key, id);
+            CREATE INDEX IF NOT EXISTS idx_compaction_runs_trigger
+                ON compaction_runs(workspace_id, \"trigger\", id);
+
+            CREATE TABLE IF NOT EXISTS evolution_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_id TEXT NOT NULL UNIQUE,
+                owner_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                topic_id TEXT,
+                task_id TEXT,
+                source_message_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                source_memory_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                evidence_hashes_json TEXT NOT NULL DEFAULT '[]',
+                target_resource_json TEXT NOT NULL,
+                proposed_change_json TEXT NOT NULL,
+                risk_level TEXT NOT NULL CHECK (risk_level IN ('low','medium','high','critical')),
+                mode TEXT NOT NULL CHECK (mode IN ('draft_only','shadow','auto')),
+                created_at TEXT NOT NULL,
+                created_by_runtime TEXT NOT NULL,
+                judge_verdict_json TEXT,
+                applied_at TEXT,
+                applied_by TEXT,
+                rollback_anchor_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_evolution_proposals_owner_workspace
+                ON evolution_proposals(owner_id, workspace_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_evolution_proposals_pending
+                ON evolution_proposals(workspace_id, applied_at) WHERE applied_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_evolution_proposals_task
+                ON evolution_proposals(task_id) WHERE task_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS evolution_proposal_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_id TEXT NOT NULL,
+                event_type TEXT NOT NULL CHECK (event_type IN (
+                    'proposal.drafted','proposal.judged','proposal.approved',
+                    'proposal.rejected','proposal.applied','proposal.rollback','proposal.evidence_mismatch'
+                )),
+                occurred_at TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                payload_json TEXT,
+                FOREIGN KEY (draft_id) REFERENCES evolution_proposals(draft_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_evolution_proposal_events_draft
+                ON evolution_proposal_events(draft_id, occurred_at);",
         )?;
+        init_approval_grant_schema(conn)?;
 
         let mut column_stmt = conn.prepare("PRAGMA table_info(memories)")?;
         let existing_columns = column_stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -546,6 +923,7 @@ impl SqliteMemory {
         let missing_columns = [
             ("session_id", "ALTER TABLE memories ADD COLUMN session_id TEXT"),
             ("workspace_id", "ALTER TABLE memories ADD COLUMN workspace_id TEXT"),
+            ("owner_id", "ALTER TABLE memories ADD COLUMN owner_id TEXT"),
             ("agent_id", "ALTER TABLE memories ADD COLUMN agent_id TEXT"),
             ("persona_id", "ALTER TABLE memories ADD COLUMN persona_id TEXT"),
             (
@@ -579,6 +957,18 @@ impl SqliteMemory {
                 "useful_count",
                 "ALTER TABLE memories ADD COLUMN useful_count INTEGER NOT NULL DEFAULT 0",
             ),
+            (
+                "embedding_provider",
+                "ALTER TABLE memories ADD COLUMN embedding_provider TEXT",
+            ),
+            (
+                "embedding_model",
+                "ALTER TABLE memories ADD COLUMN embedding_model TEXT",
+            ),
+            (
+                "embedding_dimensions",
+                "ALTER TABLE memories ADD COLUMN embedding_dimensions INTEGER",
+            ),
         ];
         for (name, alter_sql) in missing_columns {
             if !names.contains(name) {
@@ -596,6 +986,116 @@ impl SqliteMemory {
             }
         }
 
+        let mut chunk_column_stmt = conn.prepare("PRAGMA table_info(document_chunks)")?;
+        let existing_chunk_columns = chunk_column_stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut chunk_names = std::collections::HashSet::new();
+        for column in existing_chunk_columns {
+            chunk_names.insert(column?);
+        }
+        for (name, alter_sql) in [
+            ("embedding", "ALTER TABLE document_chunks ADD COLUMN embedding BLOB"),
+            (
+                "embedding_provider",
+                "ALTER TABLE document_chunks ADD COLUMN embedding_provider TEXT",
+            ),
+            (
+                "embedding_model",
+                "ALTER TABLE document_chunks ADD COLUMN embedding_model TEXT",
+            ),
+            (
+                "embedding_dimensions",
+                "ALTER TABLE document_chunks ADD COLUMN embedding_dimensions INTEGER",
+            ),
+        ] {
+            if !chunk_names.contains(name) {
+                match conn.execute_batch(alter_sql) {
+                    Ok(()) => {}
+                    Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
+                        if msg.contains("duplicate column name") =>
+                    {
+                        tracing::debug!("Column document_chunks.{name} already exists (concurrent migration): {err}");
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to add document_chunks.{name}: {e}"));
+                    }
+                }
+            }
+        }
+
+        let mut cache_column_stmt = conn.prepare("PRAGMA table_info(embedding_cache)")?;
+        let existing_cache_columns = cache_column_stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut cache_names = std::collections::HashSet::new();
+        for column in existing_cache_columns {
+            cache_names.insert(column?);
+        }
+        for (name, alter_sql) in [
+            ("provider", "ALTER TABLE embedding_cache ADD COLUMN provider TEXT"),
+            ("model", "ALTER TABLE embedding_cache ADD COLUMN model TEXT"),
+            (
+                "dimensions",
+                "ALTER TABLE embedding_cache ADD COLUMN dimensions INTEGER",
+            ),
+        ] {
+            if !cache_names.contains(name) {
+                match conn.execute_batch(alter_sql) {
+                    Ok(()) => {}
+                    Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
+                        if msg.contains("duplicate column name") =>
+                    {
+                        tracing::debug!("Column embedding_cache.{name} already exists (concurrent migration): {err}");
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to add embedding_cache.{name}: {e}"));
+                    }
+                }
+            }
+        }
+
+        let mut msg_column_stmt = conn.prepare("PRAGMA table_info(message_events)")?;
+        let existing_msg_columns = msg_column_stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut msg_names = std::collections::HashSet::new();
+        for column in existing_msg_columns {
+            msg_names.insert(column?);
+        }
+        if !msg_names.contains("owner_id") {
+            match conn.execute_batch("ALTER TABLE message_events ADD COLUMN owner_id TEXT") {
+                Ok(()) => {}
+                Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
+                    tracing::debug!("Column message_events.owner_id already exists (concurrent migration): {err}");
+                }
+                Err(e) => return Err(anyhow::anyhow!("Failed to add message_events.owner_id: {e}")),
+            }
+        }
+        if !msg_names.contains("event_type") {
+            match conn.execute_batch("ALTER TABLE message_events ADD COLUMN event_type TEXT") {
+                Ok(()) => {}
+                Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
+                    tracing::debug!("Column message_events.event_type already exists (concurrent migration): {err}");
+                }
+                Err(e) => return Err(anyhow::anyhow!("Failed to add message_events.event_type: {e}")),
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_message_events_event_type
+                ON message_events(workspace_id, event_type, id);",
+        )?;
+
+        let mut session_column_stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        let existing_session_columns = session_column_stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut session_names = std::collections::HashSet::new();
+        for column in existing_session_columns {
+            session_names.insert(column?);
+        }
+        if !session_names.contains("owner_id") {
+            match conn.execute_batch("ALTER TABLE sessions ADD COLUMN owner_id TEXT") {
+                Ok(()) => {}
+                Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
+                    tracing::debug!("Column sessions.owner_id already exists (concurrent migration): {err}");
+                }
+                Err(e) => return Err(anyhow::anyhow!("Failed to add sessions.owner_id: {e}")),
+            }
+        }
+
         let mut turn_column_stmt = conn.prepare("PRAGMA table_info(conversation_turns)")?;
         let existing_turn_columns = turn_column_stmt.query_map([], |row| row.get::<_, String>(1))?;
         let mut turn_names = std::collections::HashSet::new();
@@ -603,6 +1103,7 @@ impl SqliteMemory {
             turn_names.insert(column?);
         }
         let missing_turn_columns = [
+            ("owner_id", "ALTER TABLE conversation_turns ADD COLUMN owner_id TEXT"),
             (
                 "message_event_id",
                 "ALTER TABLE conversation_turns ADD COLUMN message_event_id TEXT",
@@ -642,6 +1143,7 @@ impl SqliteMemory {
             draft_names.insert(column?);
         }
         let missing_draft_columns = [
+            ("owner_id", "ALTER TABLE memory_drafts ADD COLUMN owner_id TEXT"),
             (
                 "parent_run_id",
                 "ALTER TABLE memory_drafts ADD COLUMN parent_run_id TEXT",
@@ -676,6 +1178,7 @@ impl SqliteMemory {
 
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
+             CREATE INDEX IF NOT EXISTS idx_mem_owner ON memories(owner_id);
              CREATE INDEX IF NOT EXISTS idx_mem_vis_chan_type_chat
                  ON memories(visibility, channel, chat_type, chat_id, sensitivity, created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_mem_sender ON memories(sender_id);
@@ -683,14 +1186,48 @@ impl SqliteMemory {
              CREATE INDEX IF NOT EXISTS idx_mem_channel ON memories(channel);
              CREATE INDEX IF NOT EXISTS idx_mem_workspace_agent ON memories(workspace_id, agent_id, persona_id);
              CREATE INDEX IF NOT EXISTS idx_mem_source_event ON memories(source_event_id);
+             CREATE INDEX IF NOT EXISTS idx_message_events_owner
+                 ON message_events(workspace_id, owner_id, id);
+             CREATE INDEX IF NOT EXISTS idx_sessions_owner
+                 ON sessions(owner_id);
+             CREATE INDEX IF NOT EXISTS idx_conversation_turns_owner_session
+                 ON conversation_turns(owner_id, session_key);
              CREATE INDEX IF NOT EXISTS idx_conversation_turns_message_event
                  ON conversation_turns(message_event_id);
              CREATE INDEX IF NOT EXISTS idx_memory_drafts_worker_run
                  ON memory_drafts(worker_run_id, id);
+             CREATE INDEX IF NOT EXISTS idx_memory_drafts_owner
+                 ON memory_drafts(workspace_id, owner_id, id);
              CREATE INDEX IF NOT EXISTS idx_memory_drafts_status
                  ON memory_drafts(status, id);
              CREATE INDEX IF NOT EXISTS idx_memory_drafts_source_event
                  ON memory_drafts(source_event_id);",
+        )?;
+
+        conn.execute_batch(
+            "UPDATE sessions
+             SET owner_id = (
+                 SELECT me.owner_id
+                 FROM message_events me
+                 WHERE me.session_key = sessions.session_key
+                   AND me.owner_id IS NOT NULL
+                 ORDER BY me.id ASC
+                 LIMIT 1
+             )
+             WHERE owner_id IS NULL;
+             UPDATE sessions
+             SET owner_id = 'legacy:' || session_key
+             WHERE owner_id IS NULL;
+             UPDATE conversation_turns
+             SET owner_id = (
+                 SELECT s.owner_id
+                 FROM sessions s
+                 WHERE s.session_key = conversation_turns.session_key
+             )
+             WHERE owner_id IS NULL;
+             UPDATE conversation_turns
+             SET owner_id = 'legacy:' || session_key
+             WHERE owner_id IS NULL;",
         )?;
 
         Ok(())
@@ -715,29 +1252,30 @@ impl SqliteMemory {
     }
 
     fn message_event_from_row(row: &Row<'_>) -> rusqlite::Result<MessageEvent> {
-        let visibility_raw: String = row.get(18)?;
+        let visibility_raw: String = row.get(19)?;
         Ok(MessageEvent {
             id: row.get(0)?,
             event_id: row.get(1)?,
             idempotency_key: row.get(2)?,
             workspace_id: row.get(3)?,
-            source: row.get(4)?,
-            channel: row.get(5)?,
-            session_key: row.get(6)?,
-            parent_session_key: row.get(7)?,
-            run_id: row.get(8)?,
-            parent_run_id: row.get(9)?,
-            agent_id: row.get(10)?,
-            persona_id: row.get(11)?,
-            sender: row.get(12)?,
-            recipient: row.get(13)?,
-            role: row.get(14)?,
-            content: row.get(15)?,
-            content_hash: row.get(16)?,
-            raw_payload_json: row.get(17)?,
+            owner_id: row.get(4)?,
+            source: row.get(5)?,
+            channel: row.get(6)?,
+            session_key: row.get(7)?,
+            parent_session_key: row.get(8)?,
+            run_id: row.get(9)?,
+            parent_run_id: row.get(10)?,
+            agent_id: row.get(11)?,
+            persona_id: row.get(12)?,
+            sender: row.get(13)?,
+            recipient: row.get(14)?,
+            role: row.get(15)?,
+            content: row.get(16)?,
+            content_hash: row.get(17)?,
+            raw_payload_json: row.get(18)?,
             visibility: visibility_raw.parse().unwrap_or(MemoryVisibility::Workspace),
-            created_at: row.get(19)?,
-            updated_at: row.get(20)?,
+            created_at: row.get(20)?,
+            updated_at: row.get(21)?,
         })
     }
 
@@ -760,26 +1298,140 @@ impl SqliteMemory {
     }
 
     fn memory_draft_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryDraft> {
-        let category_raw: String = row.get(10)?;
-        let visibility_raw: String = row.get(12)?;
+        let category_raw: String = row.get(11)?;
+        let visibility_raw: String = row.get(13)?;
         Ok(MemoryDraft {
             id: row.get(0)?,
             draft_id: row.get(1)?,
             workspace_id: row.get(2)?,
-            worker_run_id: row.get(3)?,
-            parent_run_id: row.get(4)?,
-            session_key: row.get(5)?,
-            agent_id: row.get(6)?,
-            persona_id: row.get(7)?,
-            key: row.get(8)?,
-            content: row.get(9)?,
+            owner_id: row.get(3)?,
+            worker_run_id: row.get(4)?,
+            parent_run_id: row.get(5)?,
+            session_key: row.get(6)?,
+            agent_id: row.get(7)?,
+            persona_id: row.get(8)?,
+            key: row.get(9)?,
+            content: row.get(10)?,
             category: Self::str_to_category(&category_raw),
-            source_event_id: row.get(11)?,
+            source_event_id: row.get(12)?,
             visibility: visibility_raw.parse().unwrap_or(MemoryVisibility::Workspace),
-            status: row.get(13)?,
-            payload_json: row.get(14)?,
+            status: row.get(14)?,
+            payload_json: row.get(15)?,
+            created_at: row.get(16)?,
+            updated_at: row.get(17)?,
+        })
+    }
+
+    fn document_from_row(row: &Row<'_>) -> rusqlite::Result<DocumentRecord> {
+        let visibility_raw: String = row.get(12)?;
+        let chunk_count_raw: i64 = row.get(14)?;
+        Ok(DocumentRecord {
+            id: row.get(0)?,
+            document_id: row.get(1)?,
+            workspace_id: row.get(2)?,
+            owner_id: row.get(3)?,
+            topic_id: row.get(4)?,
+            task_id: row.get(5)?,
+            source_message_event_id: row.get(6)?,
+            source_kind: row.get(7)?,
+            source_uri: row.get(8)?,
+            title: row.get(9)?,
+            content_sha256: row.get(10)?,
+            mime_type: row.get(11)?,
+            visibility: visibility_raw.parse().unwrap_or(MemoryVisibility::Workspace),
+            metadata_json: row.get(13)?,
+            chunk_count: usize::try_from(chunk_count_raw).unwrap_or(0),
             created_at: row.get(15)?,
             updated_at: row.get(16)?,
+        })
+    }
+
+    fn document_chunk_from_row(row: &Row<'_>) -> rusqlite::Result<DocumentChunkRecord> {
+        let chunk_index_raw: i64 = row.get(7)?;
+        let token_estimate_raw: i64 = row.get(12)?;
+        Ok(DocumentChunkRecord {
+            id: row.get(0)?,
+            chunk_id: row.get(1)?,
+            document_id: row.get(2)?,
+            workspace_id: row.get(3)?,
+            owner_id: row.get(4)?,
+            topic_id: row.get(5)?,
+            task_id: row.get(6)?,
+            chunk_index: usize::try_from(chunk_index_raw).unwrap_or(0),
+            heading: row.get(8)?,
+            content: row.get(9)?,
+            content_sha256: row.get(10)?,
+            source_anchor: row.get(11)?,
+            token_estimate: usize::try_from(token_estimate_raw).unwrap_or(0),
+            created_at: row.get(13)?,
+        })
+    }
+
+    fn memory_link_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryLink> {
+        Ok(MemoryLink {
+            id: row.get(0)?,
+            link_id: row.get(1)?,
+            workspace_id: row.get(2)?,
+            owner_id: row.get(3)?,
+            memory_key: row.get(4)?,
+            memory_event_id: row.get(5)?,
+            message_event_id: row.get(6)?,
+            document_id: row.get(7)?,
+            chunk_id: row.get(8)?,
+            link_type: row.get(9)?,
+            payload_json: row.get(10)?,
+            created_at: row.get(11)?,
+        })
+    }
+
+    fn retrieval_trace_from_row(row: &Row<'_>) -> rusqlite::Result<RetrievalTrace> {
+        let candidate_count_raw: i64 = row.get(9)?;
+        let selected_count_raw: i64 = row.get(10)?;
+        let dropped_count_raw: i64 = row.get(11)?;
+        let budget_tokens_raw: Option<i64> = row.get(12)?;
+        Ok(RetrievalTrace {
+            id: row.get(0)?,
+            trace_id: row.get(1)?,
+            workspace_id: row.get(2)?,
+            owner_id: row.get(3)?,
+            session_key: row.get(4)?,
+            agent_id: row.get(5)?,
+            persona_id: row.get(6)?,
+            source: row.get(7)?,
+            query: row.get(8)?,
+            candidate_count: usize::try_from(candidate_count_raw).unwrap_or(0),
+            selected_count: usize::try_from(selected_count_raw).unwrap_or(0),
+            dropped_count: usize::try_from(dropped_count_raw).unwrap_or(0),
+            budget_tokens: budget_tokens_raw.and_then(|value| usize::try_from(value).ok()),
+            selected_json: row.get(13)?,
+            dropped_json: row.get(14)?,
+            payload_json: row.get(15)?,
+            created_at: row.get(16)?,
+        })
+    }
+
+    fn compaction_run_from_row(row: &Row<'_>) -> rusqlite::Result<CompactionRun> {
+        let source_message_count_raw: i64 = row.get(9)?;
+        let source_token_estimate_raw: i64 = row.get(10)?;
+        Ok(CompactionRun {
+            id: row.get(0)?,
+            run_id: row.get(1)?,
+            workspace_id: row.get(2)?,
+            owner_id: row.get(3)?,
+            session_key: row.get(4)?,
+            agent_id: row.get(5)?,
+            persona_id: row.get(6)?,
+            trigger: row.get(7)?,
+            mode: row.get(8)?,
+            source_message_count: usize::try_from(source_message_count_raw).unwrap_or(0),
+            source_token_estimate: usize::try_from(source_token_estimate_raw).unwrap_or(0),
+            summary: row.get(11)?,
+            summary_memory_key: row.get(12)?,
+            source_event_ids_json: row.get(13)?,
+            source_document_refs_json: row.get(14)?,
+            fidelity_status: row.get(15)?,
+            payload_json: row.get(16)?,
+            created_at: row.get(17)?,
         })
     }
 
@@ -869,6 +1521,9 @@ impl SqliteMemory {
         } else {
             None
         };
+        let embedding_provider = embedding_bytes.as_ref().map(|_| self.embedding_provider_name());
+        let embedding_model = embedding_bytes.as_ref().map(|_| self.embedding_model_name());
+        let embedding_dimensions = embedding_bytes.as_ref().map(|_| self.embedding_dimensions_i64());
 
         let conn = self.conn.clone();
         let db_path = self.db_path.clone();
@@ -921,19 +1576,31 @@ impl SqliteMemory {
                     None
                 };
                 let explicit_sender_id = ctx.sender_id.or(sender_id);
+                let owner_id = metadata.owner_id.clone().or_else(|| explicit_sender_id.clone());
                 let chat_type = ctx
                     .chat_type
                     .map(|raw| ChatType::from_str(&raw).as_str().to_string());
 
                 conn.execute(
-                    "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, channel, chat_type, chat_id, sender_id, raw_sender, topic_id, visibility, sensitivity, risk_signals, policy_version)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                    "INSERT INTO memories (
+                        id, key, content, category, embedding, embedding_provider,
+                        embedding_model, embedding_dimensions, created_at, updated_at,
+                        session_id, workspace_id, owner_id, channel, chat_type, chat_id,
+                        sender_id, raw_sender, topic_id, visibility, sensitivity,
+                        risk_signals, policy_version
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
                      ON CONFLICT(key) DO UPDATE SET
                         content = excluded.content,
                         category = excluded.category,
                         embedding = excluded.embedding,
+                        embedding_provider = excluded.embedding_provider,
+                        embedding_model = excluded.embedding_model,
+                        embedding_dimensions = excluded.embedding_dimensions,
                         updated_at = excluded.updated_at,
                         session_id = excluded.session_id,
+                        workspace_id = excluded.workspace_id,
+                        owner_id = excluded.owner_id,
                         channel = excluded.channel,
                         chat_type = excluded.chat_type,
                         chat_id = excluded.chat_id,
@@ -950,9 +1617,14 @@ impl SqliteMemory {
                         &content,
                         cat,
                         embedding_bytes,
+                        embedding_provider,
+                        embedding_model,
+                        embedding_dimensions,
                         now,
                         now,
                         sid,
+                        metadata.workspace_id.clone(),
+                        owner_id,
                         ctx.channel,
                         chat_type,
                         ctx.chat_id,
@@ -967,19 +1639,52 @@ impl SqliteMemory {
                 )?;
             } else {
                 conn.execute(
-                    "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    "INSERT INTO memories (
+                        id, key, content, category, embedding, embedding_provider,
+                        embedding_model, embedding_dimensions, created_at, updated_at,
+                        session_id, workspace_id, owner_id, agent_id, persona_id,
+                        source_event_id, source
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                      ON CONFLICT(key) DO UPDATE SET
                         content = excluded.content,
                         category = excluded.category,
                         embedding = excluded.embedding,
+                        embedding_provider = excluded.embedding_provider,
+                        embedding_model = excluded.embedding_model,
+                        embedding_dimensions = excluded.embedding_dimensions,
                         updated_at = excluded.updated_at,
-                        session_id = excluded.session_id",
-                    params![id, &key, &content, cat, embedding_bytes, now, now, sid],
+                        session_id = excluded.session_id,
+                        workspace_id = excluded.workspace_id,
+                        owner_id = excluded.owner_id,
+                        agent_id = excluded.agent_id,
+                        persona_id = excluded.persona_id,
+                        source_event_id = excluded.source_event_id,
+                        source = excluded.source",
+                    params![
+                        id,
+                        &key,
+                        &content,
+                        cat,
+                        embedding_bytes,
+                        embedding_provider,
+                        embedding_model,
+                        embedding_dimensions,
+                        now,
+                        now,
+                        sid,
+                        metadata.workspace_id.clone(),
+                        metadata.owner_id.clone(),
+                        metadata.agent_id.clone(),
+                        metadata.persona_id.clone(),
+                        metadata.source_event_id.clone(),
+                        metadata.source.clone()
+                    ],
                 )?;
             }
 
             if metadata.workspace_id.is_some()
+                || metadata.owner_id.is_some()
                 || metadata.agent_id.is_some()
                 || metadata.persona_id.is_some()
                 || metadata.source_event_id.is_some()
@@ -988,14 +1693,16 @@ impl SqliteMemory {
                 conn.execute(
                     "UPDATE memories
                      SET workspace_id = ?1,
-                         agent_id = ?2,
-                         persona_id = ?3,
-                         source_event_id = ?4,
-                         source = ?5,
-                         updated_at = ?6
-                     WHERE key = ?7",
+                         owner_id = COALESCE(?2, owner_id),
+                         agent_id = ?3,
+                         persona_id = ?4,
+                         source_event_id = ?5,
+                         source = ?6,
+                         updated_at = ?7
+                     WHERE key = ?8",
                     params![
                         metadata.workspace_id,
+                        metadata.owner_id,
                         metadata.agent_id,
                         metadata.persona_id,
                         metadata.source_event_id,
@@ -1053,6 +1760,46 @@ impl SqliteMemory {
         hex
     }
 
+    fn content_sha256_hex(text: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(text.as_bytes());
+        let mut hex = String::with_capacity(64);
+        for byte in hash {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
+    }
+
+    fn document_owner_for_principal(principal: &MemoryPrincipal) -> Option<String> {
+        let channel = principal.channel.as_deref()?.trim();
+        let sender = principal.sender.as_deref()?.trim();
+        if channel.is_empty() || sender.is_empty() {
+            return None;
+        }
+        Some(
+            OwnerPrincipal::new(
+                principal.workspace_id.clone(),
+                channel,
+                sender,
+                principal.session_key.clone().unwrap_or_default(),
+                vec![Role::Anonymous],
+            )
+            .owner_id,
+        )
+    }
+
+    fn embedding_provider_name(&self) -> String {
+        self.embedder.name().to_string()
+    }
+
+    fn embedding_model_name(&self) -> String {
+        self.embedder.model().to_string()
+    }
+
+    fn embedding_dimensions_i64(&self) -> i64 {
+        i64::try_from(self.embedder.dimensions()).unwrap_or(i64::MAX)
+    }
+
     /// Get embedding from cache, or compute + cache it
     async fn get_or_compute_embedding(&self, text: &str) -> anyhow::Result<Option<Vec<f32>>> {
         if self.embedder.dimensions() == 0 {
@@ -1061,21 +1808,37 @@ impl SqliteMemory {
 
         let hash = Self::content_hash(text);
         let now = Local::now().to_rfc3339();
+        let provider_name = self.embedding_provider_name();
+        let model_name = self.embedding_model_name();
+        let dimensions = self.embedding_dimensions_i64();
 
         // Check cache (offloaded to blocking thread)
         let conn = self.conn.clone();
         let hash_c = hash.clone();
         let now_c = now.clone();
+        let provider_c = provider_name.clone();
+        let model_c = model_name.clone();
         let cached = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<f32>>> {
             let conn = conn.lock();
-            let mut stmt = conn.prepare("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")?;
-            let blob: Option<Vec<u8>> = stmt.query_row(params![hash_c], |row| row.get(0)).ok();
+            let mut stmt = conn.prepare(
+                "SELECT embedding FROM embedding_cache
+                 WHERE content_hash = ?1
+                   AND provider = ?2
+                   AND model = ?3
+                   AND dimensions = ?4",
+            )?;
+            let blob: Option<Vec<u8>> = stmt
+                .query_row(params![hash_c, provider_c, model_c, dimensions], |row| row.get(0))
+                .ok();
             if let Some(bytes) = blob {
                 conn.execute(
                     "UPDATE embedding_cache SET accessed_at = ?1 WHERE content_hash = ?2",
                     params![now_c, hash_c],
                 )?;
-                return Ok(Some(vector::bytes_to_vec(&bytes)));
+                let embedding = vector::bytes_to_vec(&bytes);
+                if embedding.len() == usize::try_from(dimensions).unwrap_or(usize::MAX) {
+                    return Ok(Some(embedding));
+                }
             }
             Ok(None)
         })
@@ -1087,6 +1850,15 @@ impl SqliteMemory {
 
         // Compute embedding (async I/O)
         let embedding = self.embedder.embed_one(text).await?;
+        if embedding.len() != self.embedder.dimensions() {
+            anyhow::bail!(
+                "embedding dimension mismatch: provider={} model={} expected={} got={}",
+                provider_name,
+                model_name,
+                self.embedder.dimensions(),
+                embedding.len()
+            );
+        }
         let bytes = vector::vec_to_bytes(&embedding);
 
         // Store in cache + LRU eviction (offloaded to blocking thread)
@@ -1096,9 +1868,11 @@ impl SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
             conn.execute(
-                "INSERT OR REPLACE INTO embedding_cache (content_hash, embedding, created_at, accessed_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![hash, bytes, now, now],
+                "INSERT OR REPLACE INTO embedding_cache (
+                    content_hash, embedding, provider, model, dimensions, created_at, accessed_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![hash, bytes, provider_name, model_name, dimensions, now, now],
             )?;
             // Two-step LRU eviction: count first, then delete oldest if over limit.
             // Avoids relying on MAX() as a scalar function in a LIMIT clause.
@@ -1162,13 +1936,24 @@ impl SqliteMemory {
     fn vector_search(
         conn: &Connection,
         query_embedding: &[f32],
+        provider: &str,
+        model: &str,
+        dimensions: usize,
         limit: usize,
         category: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        let mut sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
+        let mut sql = "SELECT id, embedding FROM memories
+                       WHERE embedding IS NOT NULL
+                         AND embedding_provider = ?1
+                         AND embedding_model = ?2
+                         AND embedding_dimensions = ?3"
+            .to_string();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut idx = 1;
+        param_values.push(Box::new(provider.to_string()));
+        param_values.push(Box::new(model.to_string()));
+        param_values.push(Box::new(i64::try_from(dimensions).unwrap_or(i64::MAX)));
+        let mut idx = 4;
 
         if let Some(cat) = category {
             let _ = write!(sql, " AND category = ?{idx}");
@@ -1192,6 +1977,15 @@ impl SqliteMemory {
         for row in rows {
             let (id, blob) = row?;
             let emb = vector::bytes_to_vec(&blob);
+            if emb.len() != dimensions {
+                tracing::debug!(
+                    memory_id = %id,
+                    expected_dimensions = dimensions,
+                    actual_dimensions = emb.len(),
+                    "Skipping stale memory embedding with mismatched dimensions"
+                );
+                continue;
+            }
             let sim = vector::cosine_similarity(query_embedding, &emb);
             if sim > 0.0 {
                 scored.push((id, sim));
@@ -1204,7 +1998,6 @@ impl SqliteMemory {
     }
 
     /// Safe reindex: rebuild FTS5 + embeddings with rollback on failure
-    #[cfg(test)]
     pub async fn reindex(&self) -> anyhow::Result<usize> {
         // Step 1: Rebuild FTS5
         {
@@ -1222,16 +2015,29 @@ impl SqliteMemory {
             return Ok(0);
         }
 
+        let provider_name = self.embedding_provider_name();
+        let model_name = self.embedding_model_name();
+        let dimensions = self.embedding_dimensions_i64();
         let conn = self.conn.clone();
         let entries: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT id, content
                  FROM memories
-                 WHERE embedding IS NULL
-                 AND category NOT IN ('daily', 'conversation')",
+                 WHERE category NOT IN ('daily', 'conversation')
+                   AND (
+                       embedding IS NULL
+                       OR embedding_provider IS NULL
+                       OR embedding_model IS NULL
+                       OR embedding_dimensions IS NULL
+                       OR embedding_provider != ?1
+                       OR embedding_model != ?2
+                       OR embedding_dimensions != ?3
+                   )",
             )?;
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            let rows = stmt.query_map(params![provider_name, model_name, dimensions], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
             Ok::<_, anyhow::Error>(rows.filter_map(std::result::Result::ok).collect())
         })
         .await??;
@@ -1242,9 +2048,70 @@ impl SqliteMemory {
                 let bytes = vector::vec_to_bytes(&emb);
                 let conn = self.conn.clone();
                 let id = id.clone();
+                let provider_name = self.embedding_provider_name();
+                let model_name = self.embedding_model_name();
+                let dimensions = self.embedding_dimensions_i64();
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                     let conn = conn.lock();
-                    conn.execute("UPDATE memories SET embedding = ?1 WHERE id = ?2", params![bytes, id])?;
+                    conn.execute(
+                        "UPDATE memories
+                         SET embedding = ?1,
+                             embedding_provider = ?2,
+                             embedding_model = ?3,
+                             embedding_dimensions = ?4
+                         WHERE id = ?5",
+                        params![bytes, provider_name, model_name, dimensions, id],
+                    )?;
+                    Ok(())
+                })
+                .await??;
+                count += 1;
+            }
+        }
+
+        let provider_name = self.embedding_provider_name();
+        let model_name = self.embedding_model_name();
+        let dimensions = self.embedding_dimensions_i64();
+        let conn = self.conn.clone();
+        let chunks: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT chunk_id, content
+                 FROM document_chunks
+                 WHERE embedding IS NULL
+                    OR embedding_provider IS NULL
+                    OR embedding_model IS NULL
+                    OR embedding_dimensions IS NULL
+                    OR embedding_provider != ?1
+                    OR embedding_model != ?2
+                    OR embedding_dimensions != ?3",
+            )?;
+            let rows = stmt.query_map(params![provider_name, model_name, dimensions], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            Ok::<_, anyhow::Error>(rows.filter_map(std::result::Result::ok).collect())
+        })
+        .await??;
+
+        for (chunk_id, content) in &chunks {
+            if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
+                let bytes = vector::vec_to_bytes(&emb);
+                let conn = self.conn.clone();
+                let chunk_id = chunk_id.clone();
+                let provider_name = self.embedding_provider_name();
+                let model_name = self.embedding_model_name();
+                let dimensions = self.embedding_dimensions_i64();
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let conn = conn.lock();
+                    conn.execute(
+                        "UPDATE document_chunks
+                         SET embedding = ?1,
+                             embedding_provider = ?2,
+                             embedding_model = ?3,
+                             embedding_dimensions = ?4
+                         WHERE chunk_id = ?5",
+                        params![bytes, provider_name, model_name, dimensions, chunk_id],
+                    )?;
                     Ok(())
                 })
                 .await??;
@@ -1323,6 +2190,9 @@ impl Memory for SqliteMemory {
         let sid = session_id.map(String::from);
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
+        let embedding_provider = self.embedding_provider_name();
+        let embedding_model = self.embedding_model_name();
+        let embedding_dimensions = self.embedder.dimensions();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
@@ -1339,7 +2209,16 @@ impl Memory for SqliteMemory {
 
             // Vector similarity search (if embeddings available)
             let vector_results = query_embedding.as_ref().map_or_else(Vec::new, |qe| {
-                match Self::vector_search(&conn, qe, limit * 2, None, session_ref) {
+                match Self::vector_search(
+                    &conn,
+                    qe,
+                    &embedding_provider,
+                    &embedding_model,
+                    embedding_dimensions,
+                    limit * 2,
+                    None,
+                    session_ref,
+                ) {
                     Ok(results) => results,
                     Err(e) => {
                         tracing::warn!("Vector search failed (returning empty): {e}");
@@ -1498,6 +2377,90 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn recall_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let Some(context) = context.cloned() else {
+            return self.recall(query, limit, session_id).await;
+        };
+
+        let entries = self
+            .recall(query, limit.saturating_mul(3).max(limit), session_id)
+            .await?;
+        if entries.is_empty() {
+            return Ok(entries);
+        }
+
+        let conn = self.conn.clone();
+        let capped_limit = limit;
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let fallback_principal = Principal {
+                user_id: "anonymous:unknown:unknown".to_string(),
+                role: Role::Anonymous,
+                projects: Vec::new(),
+                visibility_ceiling: Visibility::Private,
+                blocked_patterns: Vec::new(),
+                current_channel: context.channel.clone().unwrap_or_default(),
+                current_chat_id: context.chat_id.clone().unwrap_or_default(),
+                current_chat_type: context
+                    .chat_type
+                    .as_deref()
+                    .map(ChatType::from_str)
+                    .unwrap_or(ChatType::Dm),
+                acl_enforced: true,
+            };
+            let principal = if context.channel.is_some() && context.raw_sender.is_some() {
+                resolve_principal(&conn, &context).unwrap_or(fallback_principal)
+            } else {
+                fallback_principal
+            };
+            let (scope_sql, scope_params) = if matches!(principal.role, Role::Anonymous) {
+                (
+                    "(visibility = 'public' OR (channel = ? AND chat_id = ? AND raw_sender = ?)) AND sensitivity != 'secret'"
+                        .to_string(),
+                    vec![
+                        Value::from(context.channel.clone().unwrap_or_default()),
+                        Value::from(context.chat_id.clone().unwrap_or_default()),
+                        Value::from(context.raw_sender.clone().unwrap_or_default()),
+                    ],
+                )
+            } else {
+                principal.build_sql_scope()
+            };
+
+            let mut allowed_ids = std::collections::HashSet::new();
+            if !entries.is_empty() {
+                let id_placeholders = (0..entries.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!("SELECT id FROM memories WHERE id IN ({id_placeholders}) AND ({scope_sql})");
+                let mut params = entries
+                    .iter()
+                    .map(|entry| Value::from(entry.id.clone()))
+                    .collect::<Vec<_>>();
+                params.extend(scope_params);
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params_from_iter(params), |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    allowed_ids.insert(row?);
+                }
+            }
+
+            let visible = entries
+                .into_iter()
+                .filter(|entry| allowed_ids.contains(&entry.id))
+                .collect::<Vec<_>>();
+            let mut visible = post_filter(visible, &principal, |entry| entry.content.as_str());
+            visible.truncate(capped_limit);
+            Ok(visible)
+        })
+        .await?
+    }
+
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
         let conn = self.conn.clone();
         let key = key.to_string();
@@ -1622,6 +2585,77 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn forget_with_context(&self, key: &str, context: Option<&MemoryWriteContext>) -> anyhow::Result<bool> {
+        let Some(context) = context.cloned() else {
+            return self.forget(key).await;
+        };
+
+        let conn = self.conn.clone();
+        let key = key.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            let fallback_principal = Principal {
+                user_id: "anonymous:unknown:unknown".to_string(),
+                role: Role::Anonymous,
+                projects: Vec::new(),
+                visibility_ceiling: Visibility::Private,
+                blocked_patterns: Vec::new(),
+                current_channel: context.channel.clone().unwrap_or_default(),
+                current_chat_id: context.chat_id.clone().unwrap_or_default(),
+                current_chat_type: context
+                    .chat_type
+                    .as_deref()
+                    .map(ChatType::from_str)
+                    .unwrap_or(ChatType::Dm),
+                acl_enforced: true,
+            };
+            let principal = if context.channel.is_some() && context.raw_sender.is_some() {
+                resolve_principal(&conn, &context).unwrap_or(fallback_principal)
+            } else {
+                fallback_principal
+            };
+            let (scope_sql, scope_params) = if matches!(principal.role, Role::Anonymous) {
+                (
+                    "(visibility = 'public' OR (channel = ? AND chat_id = ? AND raw_sender = ?)) AND sensitivity != 'secret'"
+                        .to_string(),
+                    vec![
+                        Value::from(context.channel.clone().unwrap_or_default()),
+                        Value::from(context.chat_id.clone().unwrap_or_default()),
+                        Value::from(context.raw_sender.clone().unwrap_or_default()),
+                    ],
+                )
+            } else {
+                principal.build_sql_scope()
+            };
+            let mut query_params = Vec::with_capacity(scope_params.len() + 1);
+            query_params.push(Value::from(key.clone()));
+            query_params.extend(scope_params);
+            let query = format!("SELECT id FROM memories WHERE key = ?1 AND ({scope_sql}) LIMIT 1");
+            let visible_id = conn
+                .query_row(&query, params_from_iter(query_params), |row| row.get::<_, String>(0))
+                .optional()?;
+
+            let Some(memory_id) = visible_id else {
+                log_access(&conn, &principal, "forget", Some(&key), None, None, "denied");
+                return Ok(false);
+            };
+
+            let affected = conn.execute("DELETE FROM memories WHERE id = ?1", params![memory_id])?;
+            log_access(
+                &conn,
+                &principal,
+                "forget",
+                Some(&key),
+                Some(&memory_id),
+                None,
+                "allowed",
+            );
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
     async fn increment_useful_count(&self, id: &str) -> anyhow::Result<()> {
         let conn = self.conn.clone();
         let id = id.to_string();
@@ -1662,6 +2696,7 @@ impl Memory for SqliteMemory {
         content: &str,
         timestamp: Option<&str>,
         message_id: Option<&str>,
+        owner_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let conn = self.conn.clone();
         let session_key = session_key.to_string();
@@ -1671,6 +2706,9 @@ impl Memory for SqliteMemory {
         let content = content.to_string();
         let timestamp = Self::normalize_conversation_timestamp(timestamp);
         let message_id = message_id.map(str::to_string);
+        let owner_id = owner_id
+            .map(str::to_string)
+            .or_else(|| Some(format!("legacy:{session_key}")));
         let preview = Self::conversation_preview(&content);
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -1681,23 +2719,39 @@ impl Memory for SqliteMemory {
                     session_key,
                     channel,
                     sender,
+                    owner_id,
                     created_at,
                     updated_at,
                     message_count,
                     last_message_preview
-                 ) VALUES (?1, ?2, ?3, ?4, ?4, 1, ?5)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, ?6)
                  ON CONFLICT(session_key) DO UPDATE SET
                     channel = excluded.channel,
                     sender = excluded.sender,
+                    owner_id = COALESCE(excluded.owner_id, sessions.owner_id),
                     updated_at = excluded.updated_at,
                     message_count = COALESCE(sessions.message_count, 0) + 1,
                     last_message_preview = excluded.last_message_preview",
-                params![&session_key, &channel, &sender, &timestamp, &preview],
+                params![
+                    &session_key,
+                    &channel,
+                    &sender,
+                    owner_id.as_deref(),
+                    &timestamp,
+                    &preview
+                ],
             )?;
             tx.execute(
-                "INSERT INTO conversation_turns (session_key, role, content, timestamp, message_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![&session_key, &role, &content, &timestamp, message_id.as_deref()],
+                "INSERT INTO conversation_turns (session_key, owner_id, role, content, timestamp, message_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    &session_key,
+                    owner_id.as_deref(),
+                    &role,
+                    &content,
+                    &timestamp,
+                    message_id.as_deref()
+                ],
             )?;
             tx.commit()?;
             Ok(())
@@ -1812,14 +2866,17 @@ impl Memory for SqliteMemory {
 
     async fn list_conversation_turns(
         &self,
+        principal: &MemoryPrincipal,
         session_key: &str,
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<Vec<ConversationTurn>> {
         let conn = self.conn.clone();
+        let owner_id = principal.effective_owner_id();
         let session_key = session_key.to_string();
         let limit = Self::sanitize_conversation_limit(limit);
         let offset = Self::sanitize_conversation_offset(offset);
+        let legacy_visible = 1_i64;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ConversationTurn>> {
             let conn = conn.lock();
@@ -1827,10 +2884,16 @@ impl Memory for SqliteMemory {
                 "SELECT id, session_key, role, content, timestamp, message_id
                  FROM conversation_turns
                  WHERE session_key = ?1
+                   AND (
+                       ?4 = 'system:*'
+                       OR
+                       owner_id = ?4
+                       OR (?5 = 1 AND (owner_id IS NULL OR owner_id = 'legacy:' || session_key))
+                   )
                  ORDER BY id DESC
                  LIMIT ?2 OFFSET ?3",
             )?;
-            let rows = stmt.query_map(params![session_key, limit, offset], |row| {
+            let rows = stmt.query_map(params![session_key, limit, offset, owner_id, legacy_visible], |row| {
                 Ok(ConversationTurn {
                     id: row.get(0)?,
                     session_key: row.get(1)?,
@@ -1853,12 +2916,15 @@ impl Memory for SqliteMemory {
 
     async fn load_recent_conversation_histories(
         &self,
+        principal: &MemoryPrincipal,
         max_turns_per_session: usize,
         max_sessions: usize,
     ) -> anyhow::Result<std::collections::HashMap<String, Vec<ConversationTurn>>> {
         let conn = self.conn.clone();
+        let owner_id = principal.effective_owner_id();
         let max_turns_per_session = Self::sanitize_conversation_limit(max_turns_per_session);
         let max_sessions = Self::sanitize_hydrated_sessions_limit(max_sessions);
+        let legacy_visible = 1_i64;
 
         tokio::task::spawn_blocking(
             move || -> anyhow::Result<std::collections::HashMap<String, Vec<ConversationTurn>>> {
@@ -1878,24 +2944,33 @@ impl Memory for SqliteMemory {
                          INNER JOIN (
                              SELECT session_key
                              FROM sessions
+                             WHERE ?3 = 'system:*'
+                                OR owner_id = ?3
+                                OR (?4 = 1 AND (owner_id IS NULL OR owner_id = 'legacy:' || session_key))
                              ORDER BY updated_at DESC
                              LIMIT ?2
                          ) recent_sessions
                          ON recent_sessions.session_key = ct.session_key
+                         WHERE ?3 = 'system:*'
+                            OR ct.owner_id = ?3
+                            OR (?4 = 1 AND (ct.owner_id IS NULL OR ct.owner_id = 'legacy:' || ct.session_key))
                      )
                      WHERE row_num <= ?1
                      ORDER BY session_key ASC, id ASC",
                 )?;
-                let rows = stmt.query_map(params![max_turns_per_session, max_sessions], |row| {
-                    Ok(ConversationTurn {
-                        id: row.get(0)?,
-                        session_key: row.get(1)?,
-                        role: row.get(2)?,
-                        content: row.get(3)?,
-                        timestamp: row.get(4)?,
-                        message_id: row.get(5)?,
-                    })
-                })?;
+                let rows = stmt.query_map(
+                    params![max_turns_per_session, max_sessions, owner_id, legacy_visible],
+                    |row| {
+                        Ok(ConversationTurn {
+                            id: row.get(0)?,
+                            session_key: row.get(1)?,
+                            role: row.get(2)?,
+                            content: row.get(3)?,
+                            timestamp: row.get(4)?,
+                            message_id: row.get(5)?,
+                        })
+                    },
+                )?;
 
                 let mut histories: std::collections::HashMap<String, Vec<ConversationTurn>> =
                     std::collections::HashMap::new();
@@ -1919,19 +2994,21 @@ impl Memory for SqliteMemory {
             let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let content_hash = Self::content_hash(&input.content);
             let visibility = input.visibility.as_str().to_string();
+            let event_type = message_event_type_for(&input.role, &input.content);
 
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO message_events (
-                    event_id, idempotency_key, workspace_id, source, channel, session_key,
+                    event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                     parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                    sender, recipient, role, content, content_hash, raw_payload_json,
+                    sender, recipient, role, event_type, content, content_hash, raw_payload_json,
                     visibility, created_at, updated_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
                 params![
                     event_id,
                     input.idempotency_key,
                     input.workspace_id,
+                    input.owner_id,
                     input.source,
                     input.channel,
                     input.session_key,
@@ -1943,6 +3020,7 @@ impl Memory for SqliteMemory {
                     input.sender,
                     input.recipient,
                     input.role,
+                    event_type,
                     input.content,
                     content_hash,
                     input.raw_payload_json,
@@ -1954,7 +3032,7 @@ impl Memory for SqliteMemory {
 
             let event = if let Some(ref idempotency_key) = input.idempotency_key {
                 tx.query_row(
-                    "SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                    "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                             parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                             sender, recipient, role, content, content_hash, raw_payload_json,
                             visibility, created_at, updated_at
@@ -1967,7 +3045,7 @@ impl Memory for SqliteMemory {
                 )?
             } else {
                 tx.query_row(
-                    "SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                    "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                             parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                             sender, recipient, role, content, content_hash, raw_payload_json,
                             visibility, created_at, updated_at
@@ -1981,9 +3059,10 @@ impl Memory for SqliteMemory {
 
             if inserted > 0 {
                 let outbox_event_type = if event.role == "event" {
-                    "worker.result.created"
+                    message_event_type_for(&event.role, &event.content)
+                        .unwrap_or_else(|| "worker.result.created".to_string())
                 } else {
-                    "message.created"
+                    "message.created".to_string()
                 };
                 tx.execute(
                     "INSERT INTO memory_events (
@@ -2025,7 +3104,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                         sender, recipient, role, content, content_hash, raw_payload_json,
                         visibility, created_at, updated_at
@@ -2073,6 +3152,65 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn list_message_events_recent(
+        &self,
+        principal: &MemoryPrincipal,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        let conn = self.conn.clone();
+        let principal = principal.clone();
+        let limit = Self::sanitize_conversation_limit(limit);
+        let system_allowed = Self::is_system_principal(&principal);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, content, content_hash, raw_payload_json,
+                        visibility, created_at, updated_at
+                 FROM message_events
+                 WHERE (
+                       visibility = 'global'
+                       OR (
+                           workspace_id = ?1
+                           AND (
+                               visibility = 'workspace'
+                               OR (visibility = 'agent' AND (
+                                   (?2 IS NOT NULL AND agent_id = ?2)
+                                   OR (?3 IS NOT NULL AND persona_id = ?3)
+                               ))
+                               OR (visibility = 'session' AND ?4 IS NOT NULL AND session_key = ?4)
+                               OR (visibility = 'private' AND (
+                                   (?2 IS NOT NULL AND agent_id = ?2)
+                                   OR (?3 IS NOT NULL AND persona_id = ?3)
+                                   OR (?5 IS NOT NULL AND sender = ?5)
+                               ))
+                               OR (visibility = 'system' AND ?6)
+                           )
+                       )
+                   )
+                 ORDER BY id DESC
+                 LIMIT ?7",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    principal.workspace_id,
+                    principal.agent_id,
+                    principal.persona_id,
+                    principal.session_key,
+                    principal.sender,
+                    system_allowed,
+                    limit
+                ],
+                Self::message_event_from_row,
+            )?;
+
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await?
+    }
+
     async fn load_recent_shared_context(&self, query: SharedContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
         let conn = self.conn.clone();
         let principal = query.principal;
@@ -2089,7 +3227,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                         sender, recipient, role, content, content_hash, raw_payload_json,
                         visibility, created_at, updated_at
@@ -2164,7 +3302,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT id, event_id, idempotency_key, workspace_id, source, channel, session_key,
+                "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                         sender, recipient, role, content, content_hash, raw_payload_json,
                         visibility, created_at, updated_at
@@ -2316,6 +3454,61 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn list_memory_events_recent(
+        &self,
+        principal: &MemoryPrincipal,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEvent>> {
+        let conn = self.conn.clone();
+        let principal = principal.clone();
+        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEvent>> {
+            let conn = conn.lock();
+            let system_allowed =
+                principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system");
+            let mut stmt = conn.prepare(
+                "SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
+                        session_key, agent_id, persona_id, visibility, payload_json, created_at
+                   FROM memory_events
+                  WHERE (
+                        visibility = 'global'
+                        OR (
+                            workspace_id = ?1
+                            AND (
+                                visibility = 'workspace'
+                                OR (visibility = 'agent' AND (
+                                    (?2 IS NOT NULL AND agent_id = ?2)
+                                    OR (?3 IS NOT NULL AND persona_id = ?3)
+                                ))
+                                OR (visibility = 'session' AND ?4 IS NOT NULL AND session_key = ?4)
+                                OR (visibility = 'private' AND (
+                                    (?2 IS NOT NULL AND agent_id = ?2)
+                                    OR (?3 IS NOT NULL AND persona_id = ?3)
+                                ))
+                                OR (visibility = 'system' AND ?5)
+                            )
+                        )
+                    )
+                  ORDER BY id DESC
+                  LIMIT ?6",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    principal.workspace_id,
+                    principal.agent_id,
+                    principal.persona_id,
+                    principal.session_key,
+                    system_allowed,
+                    limit
+                ],
+                Self::memory_event_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await?
+    }
+
     async fn create_memory_draft(&self, input: MemoryDraftInput) -> anyhow::Result<MemoryDraft> {
         let conn = self.conn.clone();
 
@@ -2329,14 +3522,15 @@ impl Memory for SqliteMemory {
 
             tx.execute(
                 "INSERT OR IGNORE INTO memory_drafts (
-                    draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                    draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                     agent_id, persona_id, key, content, category, source_event_id,
                     visibility, status, payload_json, created_at, updated_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'pending', ?13, ?14, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', ?14, ?15, ?15)",
                 params![
                     draft_id,
                     input.workspace_id,
+                    input.owner_id,
                     input.worker_run_id,
                     input.parent_run_id,
                     input.session_key,
@@ -2353,7 +3547,7 @@ impl Memory for SqliteMemory {
             )?;
 
             let draft = tx.query_row(
-                "SELECT id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                         agent_id, persona_id, key, content, category, source_event_id,
                         visibility, status, payload_json, created_at, updated_at
                    FROM memory_drafts
@@ -2379,6 +3573,7 @@ impl Memory for SqliteMemory {
                     draft.visibility.as_str(),
                     serde_json::json!({
                         "worker_run_id": draft.worker_run_id,
+                        "owner_id": draft.owner_id,
                         "parent_run_id": draft.parent_run_id,
                         "key": draft.key
                     })
@@ -2400,7 +3595,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryDraft>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                         agent_id, persona_id, key, content, category, source_event_id,
                         visibility, status, payload_json, created_at, updated_at
                    FROM memory_drafts
@@ -2421,7 +3616,7 @@ impl Memory for SqliteMemory {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
             let mut draft = match tx.query_row(
-                "SELECT id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                         agent_id, persona_id, key, content, category, source_event_id,
                         visibility, status, payload_json, created_at, updated_at
                    FROM memory_drafts
@@ -2445,15 +3640,16 @@ impl Memory for SqliteMemory {
             tx.execute(
                 "INSERT INTO memories (
                     id, key, content, category, created_at, updated_at, session_id,
-                    workspace_id, agent_id, persona_id, source_event_id, source, visibility
+                    workspace_id, owner_id, agent_id, persona_id, source_event_id, source, visibility
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, 'memory_draft', ?11)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'memory_draft', ?12)
                  ON CONFLICT(key) DO UPDATE SET
                     content = excluded.content,
                     category = excluded.category,
                     updated_at = excluded.updated_at,
                     session_id = excluded.session_id,
                     workspace_id = excluded.workspace_id,
+                    owner_id = excluded.owner_id,
                     agent_id = excluded.agent_id,
                     persona_id = excluded.persona_id,
                     source_event_id = excluded.source_event_id,
@@ -2467,6 +3663,7 @@ impl Memory for SqliteMemory {
                     now,
                     draft.session_key,
                     draft.workspace_id,
+                    draft.owner_id,
                     draft.agent_id,
                     draft.persona_id,
                     draft.source_event_id,
@@ -2503,6 +3700,7 @@ impl Memory for SqliteMemory {
                         draft.visibility.as_str(),
                         serde_json::json!({
                             "draft_id": draft.draft_id,
+                            "owner_id": draft.owner_id,
                             "worker_run_id": draft.worker_run_id,
                             "parent_run_id": draft.parent_run_id,
                             "key": draft.key
@@ -2528,7 +3726,7 @@ impl Memory for SqliteMemory {
             let mut conn = conn.lock();
             let tx = conn.transaction()?;
             let mut draft = match tx.query_row(
-                "SELECT id, draft_id, workspace_id, worker_run_id, parent_run_id, session_key,
+                "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                         agent_id, persona_id, key, content, category, source_event_id,
                         visibility, status, payload_json, created_at, updated_at
                    FROM memory_drafts
@@ -2570,6 +3768,7 @@ impl Memory for SqliteMemory {
                     draft.visibility.as_str(),
                     serde_json::json!({
                         "draft_id": draft.draft_id,
+                        "owner_id": draft.owner_id,
                         "worker_run_id": draft.worker_run_id,
                         "parent_run_id": draft.parent_run_id,
                         "key": draft.key,
@@ -2586,11 +3785,495 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn ingest_document(&self, input: DocumentIngestInput) -> anyhow::Result<DocumentRecord> {
+        let conn = self.conn.clone();
+        let embedding_provider = self.embedding_provider_name();
+        let embedding_model = self.embedding_model_name();
+        let embedding_dimensions = self.embedding_dimensions_i64();
+        let raw_chunks: Vec<(usize, Option<String>, String)> = super::chunker::chunk_markdown(&input.content, 1_000)
+            .into_iter()
+            .map(|chunk| {
+                (
+                    chunk.index,
+                    chunk.heading.as_ref().map(|heading| heading.to_string()),
+                    chunk.content,
+                )
+            })
+            .collect();
+        let mut prepared_chunks = Vec::with_capacity(raw_chunks.len());
+        for (chunk_index, heading, content) in raw_chunks {
+            let embedding_bytes = if self.embedder.dimensions() == 0 {
+                None
+            } else {
+                self.get_or_compute_embedding(&content)
+                    .await?
+                    .map(|embedding| vector::vec_to_bytes(&embedding))
+            };
+            prepared_chunks.push((chunk_index, heading, content, embedding_bytes));
+        }
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<DocumentRecord> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            let now = Utc::now().to_rfc3339();
+            let document_id = input.document_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let content_sha256 = Self::content_sha256_hex(&input.content);
+            let visibility = input.visibility.as_str().to_string();
+            let chunk_count = prepared_chunks.len();
+
+            tx.execute(
+                "INSERT INTO documents (
+                    document_id, workspace_id, owner_id, topic_id, task_id, source_message_event_id,
+                    source_kind, source_uri, title, content_sha256, mime_type, visibility,
+                    metadata_json, chunk_count, created_at, updated_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+                 ON CONFLICT(document_id) DO UPDATE SET
+                    workspace_id = excluded.workspace_id,
+                    owner_id = excluded.owner_id,
+                    topic_id = excluded.topic_id,
+                    task_id = excluded.task_id,
+                    source_message_event_id = excluded.source_message_event_id,
+                    source_kind = excluded.source_kind,
+                    source_uri = excluded.source_uri,
+                    title = excluded.title,
+                    content_sha256 = excluded.content_sha256,
+                    mime_type = excluded.mime_type,
+                    visibility = excluded.visibility,
+                    metadata_json = excluded.metadata_json,
+                    chunk_count = excluded.chunk_count,
+                    updated_at = excluded.updated_at",
+                params![
+                    document_id,
+                    input.workspace_id,
+                    input.owner_id,
+                    input.topic_id,
+                    input.task_id,
+                    input.source_message_event_id,
+                    input.source_kind,
+                    input.source_uri,
+                    input.title,
+                    content_sha256,
+                    input.mime_type,
+                    visibility,
+                    input.metadata_json,
+                    i64::try_from(chunk_count).unwrap_or(i64::MAX),
+                    now,
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM document_chunks WHERE document_id = ?1",
+                params![document_id],
+            )?;
+
+            for (chunk_index, heading, content, embedding_bytes) in prepared_chunks {
+                let chunk_id = format!("{document_id}:chunk:{chunk_index}");
+                let source_anchor = format!("{document_id}#chunk-{chunk_index}");
+                let token_estimate = content.chars().count().div_ceil(4);
+                let chunk_hash = Self::content_sha256_hex(&content);
+                let chunk_embedding_provider = embedding_bytes.as_ref().map(|_| embedding_provider.clone());
+                let chunk_embedding_model = embedding_bytes.as_ref().map(|_| embedding_model.clone());
+                let chunk_embedding_dimensions = embedding_bytes.as_ref().map(|_| embedding_dimensions);
+                tx.execute(
+                    "INSERT INTO document_chunks (
+                        chunk_id, document_id, workspace_id, owner_id, topic_id, task_id,
+                        chunk_index, heading, content, content_sha256, embedding,
+                        embedding_provider, embedding_model, embedding_dimensions,
+                        source_anchor, token_estimate, created_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    params![
+                        chunk_id,
+                        document_id,
+                        input.workspace_id,
+                        input.owner_id,
+                        input.topic_id,
+                        input.task_id,
+                        i64::try_from(chunk_index).unwrap_or(i64::MAX),
+                        heading,
+                        content,
+                        chunk_hash,
+                        embedding_bytes,
+                        chunk_embedding_provider,
+                        chunk_embedding_model,
+                        chunk_embedding_dimensions,
+                        source_anchor,
+                        i64::try_from(token_estimate).unwrap_or(i64::MAX),
+                        now,
+                    ],
+                )?;
+            }
+
+            tx.execute(
+                "INSERT INTO memory_events (
+                    event_id, workspace_id, event_type, subject_table, subject_id,
+                    session_key, agent_id, persona_id, visibility, payload_json, created_at
+                 )
+                 VALUES (?1, ?2, 'document.ingested', 'documents', ?3, NULL, NULL, NULL, ?4, ?5, ?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    input.workspace_id,
+                    document_id,
+                    input.visibility.as_str(),
+                    serde_json::json!({
+                        "owner_id": input.owner_id,
+                        "topic_id": input.topic_id,
+                        "task_id": input.task_id,
+                        "source_message_event_id": input.source_message_event_id,
+                        "chunk_count": chunk_count,
+                        "content_sha256": content_sha256
+                    })
+                    .to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+
+            let document = tx.query_row(
+                "SELECT id, document_id, workspace_id, owner_id, topic_id, task_id,
+                        source_message_event_id, source_kind, source_uri, title,
+                        content_sha256, mime_type, visibility, metadata_json,
+                        chunk_count, created_at, updated_at
+                 FROM documents
+                 WHERE document_id = ?1
+                 LIMIT 1",
+                params![document_id],
+                Self::document_from_row,
+            )?;
+            tx.commit()?;
+            Ok(document)
+        })
+        .await?
+    }
+
+    async fn search_document_chunks(
+        &self,
+        principal: &MemoryPrincipal,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DocumentSearchResult>> {
+        let conn = self.conn.clone();
+        let principal = principal.clone();
+        let query = query.to_string();
+        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let owner_id = Self::document_owner_for_principal(&principal);
+        let query_embedding = self.get_or_compute_embedding(&query).await?;
+        let embedding_provider = self.embedding_provider_name();
+        let embedding_model = self.embedding_model_name();
+        let embedding_dimensions = self.embedder.dimensions();
+        let embedding_dimensions_i64 = self.embedding_dimensions_i64();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<DocumentSearchResult>> {
+            let conn = conn.lock();
+            let fts_query = super::topic::build_safe_fts_query(&query);
+            let mut results = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            if !fts_query.is_empty() {
+                let mut stmt = conn.prepare(
+                    "SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
+                            c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
+                            c.token_estimate, c.created_at, bm25(document_chunks_fts) AS score
+                     FROM document_chunks_fts f
+                     JOIN document_chunks c ON c.rowid = f.rowid
+                     JOIN documents d ON d.document_id = c.document_id
+                     WHERE document_chunks_fts MATCH ?1
+                       AND c.workspace_id = ?2
+                       AND (
+                           d.visibility IN ('global', 'workspace')
+                           OR (?3 IS NOT NULL AND c.owner_id = ?3)
+                       )
+                     ORDER BY score ASC
+                     LIMIT ?4",
+                )?;
+                let rows = stmt.query_map(params![fts_query, principal.workspace_id, owner_id, limit], |row| {
+                    let chunk = Self::document_chunk_from_row(row)?;
+                    let score: f32 = row.get(14)?;
+                    Ok(DocumentSearchResult { chunk, score })
+                })?;
+                for row in rows {
+                    let result = row?;
+                    seen.insert(result.chunk.chunk_id.clone());
+                    results.push(result);
+                }
+            }
+
+            if let Some(query_embedding) = query_embedding {
+                let mut stmt = conn.prepare(
+                    "SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
+                            c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
+                            c.token_estimate, c.created_at, c.embedding
+                     FROM document_chunks c
+                     JOIN documents d ON d.document_id = c.document_id
+                     WHERE c.embedding IS NOT NULL
+                       AND c.embedding_provider = ?1
+                       AND c.embedding_model = ?2
+                       AND c.embedding_dimensions = ?3
+                       AND c.workspace_id = ?4
+                       AND (
+                           d.visibility IN ('global', 'workspace')
+                           OR (?5 IS NOT NULL AND c.owner_id = ?5)
+                       )",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        embedding_provider,
+                        embedding_model,
+                        embedding_dimensions_i64,
+                        principal.workspace_id,
+                        owner_id
+                    ],
+                    |row| {
+                        let chunk = Self::document_chunk_from_row(row)?;
+                        let embedding_blob: Vec<u8> = row.get(14)?;
+                        Ok((chunk, embedding_blob))
+                    },
+                )?;
+                let mut vector_results = Vec::new();
+                for row in rows {
+                    let (chunk, embedding_blob) = row?;
+                    if seen.contains(&chunk.chunk_id) {
+                        continue;
+                    }
+                    let embedding = vector::bytes_to_vec(&embedding_blob);
+                    if embedding.len() != embedding_dimensions {
+                        tracing::debug!(
+                            chunk_id = %chunk.chunk_id,
+                            expected_dimensions = embedding_dimensions,
+                            actual_dimensions = embedding.len(),
+                            "Skipping stale document chunk embedding with mismatched dimensions"
+                        );
+                        continue;
+                    }
+                    let score = vector::cosine_similarity(&query_embedding, &embedding);
+                    if score > 0.0 {
+                        vector_results.push(DocumentSearchResult { chunk, score });
+                    }
+                }
+                vector_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                for result in vector_results {
+                    if results.len() >= usize::try_from(limit).unwrap_or(usize::MAX) {
+                        break;
+                    }
+                    seen.insert(result.chunk.chunk_id.clone());
+                    results.push(result);
+                }
+            }
+
+            Ok(results)
+        })
+        .await?
+    }
+
+    async fn get_document_chunk(&self, chunk_id: &str) -> anyhow::Result<Option<DocumentChunkRecord>> {
+        let conn = self.conn.clone();
+        let chunk_id = chunk_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<DocumentChunkRecord>> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT id, chunk_id, document_id, workspace_id, owner_id, topic_id, task_id,
+                        chunk_index, heading, content, content_sha256, source_anchor,
+                        token_estimate, created_at
+                 FROM document_chunks
+                 WHERE chunk_id = ?1
+                 LIMIT 1",
+                params![chunk_id],
+                Self::document_chunk_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?
+    }
+
+    async fn link_memory_source(&self, input: MemoryLinkInput) -> anyhow::Result<MemoryLink> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryLink> {
+            let conn = conn.lock();
+            let now = Utc::now().to_rfc3339();
+            let link_id = input.link_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_links (
+                    link_id, workspace_id, owner_id, memory_key, memory_event_id,
+                    message_event_id, document_id, chunk_id, link_type, payload_json, created_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    link_id,
+                    input.workspace_id,
+                    input.owner_id,
+                    input.memory_key,
+                    input.memory_event_id,
+                    input.message_event_id,
+                    input.document_id,
+                    input.chunk_id,
+                    input.link_type,
+                    input.payload_json,
+                    now,
+                ],
+            )?;
+            conn.query_row(
+                "SELECT id, link_id, workspace_id, owner_id, memory_key, memory_event_id,
+                        message_event_id, document_id, chunk_id, link_type, payload_json, created_at
+                 FROM memory_links
+                 WHERE link_id = ?1
+                 LIMIT 1",
+                params![link_id],
+                Self::memory_link_from_row,
+            )
+            .map_err(Into::into)
+        })
+        .await?
+    }
+
+    async fn append_retrieval_trace(&self, input: RetrievalTraceInput) -> anyhow::Result<RetrievalTrace> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<RetrievalTrace> {
+            let conn = conn.lock();
+            let now = Utc::now().to_rfc3339();
+            let trace_id = input.trace_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let candidate_count = i64::try_from(input.candidate_count).unwrap_or(i64::MAX);
+            let selected_count = i64::try_from(input.selected_count).unwrap_or(i64::MAX);
+            let dropped_count = i64::try_from(input.dropped_count).unwrap_or(i64::MAX);
+            let budget_tokens = input
+                .budget_tokens
+                .map(|value| i64::try_from(value).unwrap_or(i64::MAX));
+            conn.execute(
+                "INSERT INTO retrieval_traces (
+                    trace_id, workspace_id, owner_id, session_key, agent_id, persona_id,
+                    source, query, candidate_count, selected_count, dropped_count,
+                    budget_tokens, selected_json, dropped_json, payload_json, created_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 ON CONFLICT(trace_id) DO UPDATE SET
+                    workspace_id = excluded.workspace_id,
+                    owner_id = excluded.owner_id,
+                    session_key = excluded.session_key,
+                    agent_id = excluded.agent_id,
+                    persona_id = excluded.persona_id,
+                    source = excluded.source,
+                    query = excluded.query,
+                    candidate_count = excluded.candidate_count,
+                    selected_count = excluded.selected_count,
+                    dropped_count = excluded.dropped_count,
+                    budget_tokens = excluded.budget_tokens,
+                    selected_json = excluded.selected_json,
+                    dropped_json = excluded.dropped_json,
+                    payload_json = excluded.payload_json",
+                params![
+                    trace_id,
+                    input.workspace_id,
+                    input.owner_id,
+                    input.session_key,
+                    input.agent_id,
+                    input.persona_id,
+                    input.source,
+                    input.query,
+                    candidate_count,
+                    selected_count,
+                    dropped_count,
+                    budget_tokens,
+                    input.selected_json,
+                    input.dropped_json,
+                    input.payload_json,
+                    now,
+                ],
+            )?;
+            conn.query_row(
+                "SELECT id, trace_id, workspace_id, owner_id, session_key, agent_id,
+                        persona_id, source, query, candidate_count, selected_count,
+                        dropped_count, budget_tokens, selected_json, dropped_json,
+                        payload_json, created_at
+                 FROM retrieval_traces
+                 WHERE trace_id = ?1
+                 LIMIT 1",
+                params![trace_id],
+                Self::retrieval_trace_from_row,
+            )
+            .map_err(Into::into)
+        })
+        .await?
+    }
+
+    async fn append_compaction_run(&self, input: CompactionRunInput) -> anyhow::Result<CompactionRun> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<CompactionRun> {
+            let conn = conn.lock();
+            let now = Utc::now().to_rfc3339();
+            let run_id = input.run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let source_message_count = i64::try_from(input.source_message_count).unwrap_or(i64::MAX);
+            let source_token_estimate = i64::try_from(input.source_token_estimate).unwrap_or(i64::MAX);
+            conn.execute(
+                "INSERT INTO compaction_runs (
+                    run_id, workspace_id, owner_id, session_key, agent_id, persona_id,
+                    \"trigger\", mode, source_message_count, source_token_estimate,
+                    summary, summary_memory_key, source_event_ids_json,
+                    source_document_refs_json, fidelity_status, payload_json, created_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    workspace_id = excluded.workspace_id,
+                    owner_id = excluded.owner_id,
+                    session_key = excluded.session_key,
+                    agent_id = excluded.agent_id,
+                    persona_id = excluded.persona_id,
+                    \"trigger\" = excluded.\"trigger\",
+                    mode = excluded.mode,
+                    source_message_count = excluded.source_message_count,
+                    source_token_estimate = excluded.source_token_estimate,
+                    summary = excluded.summary,
+                    summary_memory_key = excluded.summary_memory_key,
+                    source_event_ids_json = excluded.source_event_ids_json,
+                    source_document_refs_json = excluded.source_document_refs_json,
+                    fidelity_status = excluded.fidelity_status,
+                    payload_json = excluded.payload_json",
+                params![
+                    run_id,
+                    input.workspace_id,
+                    input.owner_id,
+                    input.session_key,
+                    input.agent_id,
+                    input.persona_id,
+                    input.trigger,
+                    input.mode,
+                    source_message_count,
+                    source_token_estimate,
+                    input.summary,
+                    input.summary_memory_key,
+                    input.source_event_ids_json,
+                    input.source_document_refs_json,
+                    input.fidelity_status,
+                    input.payload_json,
+                    now,
+                ],
+            )?;
+            conn.query_row(
+                "SELECT id, run_id, workspace_id, owner_id, session_key, agent_id,
+                        persona_id, \"trigger\", mode, source_message_count, source_token_estimate,
+                        summary, summary_memory_key, source_event_ids_json,
+                        source_document_refs_json, fidelity_status, payload_json, created_at
+                 FROM compaction_runs
+                 WHERE run_id = ?1
+                 LIMIT 1",
+                params![run_id],
+                Self::compaction_run_from_row,
+            )
+            .map_err(Into::into)
+        })
+        .await?
+    }
+
     async fn health_check(&self) -> bool {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
             .await
             .unwrap_or(false)
+    }
+
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        Self::reindex(self).await
     }
 }
 
@@ -2617,6 +4300,18 @@ mod tests {
         (tmp, mem)
     }
 
+    fn test_conversation_principal(session_key: &str, owner_id: Option<&str>) -> MemoryPrincipal {
+        MemoryPrincipal {
+            workspace_id: "/tmp/test-workspace".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some(session_key.to_string()),
+            channel: Some("test".to_string()),
+            sender: Some("tester".to_string()),
+            owner_id: owner_id.map(str::to_string),
+        }
+    }
+
     fn message_input(
         workspace_id: &str,
         content: &str,
@@ -2629,6 +4324,7 @@ mod tests {
             event_id: None,
             idempotency_key: None,
             workspace_id: workspace_id.to_string(),
+            owner_id: None,
             source: "test".to_string(),
             channel: Some("terminal".to_string()),
             session_key: session_key.map(str::to_string),
@@ -2679,6 +4375,10 @@ mod tests {
 
         fn dimensions(&self) -> usize {
             3
+        }
+
+        fn model(&self) -> &str {
+            "counting-v1"
         }
 
         async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -2749,25 +4449,120 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let documents: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'documents'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let document_chunks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'document_chunks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let memory_links: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_links'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retrieval_traces: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'retrieval_traces'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let compaction_runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'compaction_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let approval_grants: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'approval_grants'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let approval_grant_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'approval_grant_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         assert_eq!(message_events, 1);
         assert_eq!(memory_events, 1);
         assert_eq!(memory_drafts, 1);
+        assert_eq!(documents, 1);
+        assert_eq!(document_chunks, 1);
+        assert_eq!(memory_links, 1);
+        assert_eq!(retrieval_traces, 1);
+        assert_eq!(compaction_runs, 1);
+        assert_eq!(approval_grants, 1);
+        assert_eq!(approval_grant_events, 1);
 
         for (table, column) in [
             ("memories", "workspace_id"),
+            ("memories", "owner_id"),
             ("memories", "agent_id"),
             ("memories", "persona_id"),
             ("memories", "source_event_id"),
             ("memories", "source"),
+            ("memories", "embedding_provider"),
+            ("memories", "embedding_model"),
+            ("memories", "embedding_dimensions"),
             ("conversation_turns", "message_event_id"),
+            ("sessions", "owner_id"),
+            ("conversation_turns", "owner_id"),
             ("conversation_turns", "agent_id"),
             ("conversation_turns", "persona_id"),
             ("conversation_turns", "visibility"),
+            ("message_events", "owner_id"),
+            ("memory_drafts", "owner_id"),
             ("memory_drafts", "parent_run_id"),
             ("memory_drafts", "source_event_id"),
             ("memory_drafts", "visibility"),
             ("memory_drafts", "payload_json"),
+            ("documents", "owner_id"),
+            ("documents", "topic_id"),
+            ("documents", "task_id"),
+            ("documents", "source_message_event_id"),
+            ("document_chunks", "owner_id"),
+            ("document_chunks", "topic_id"),
+            ("document_chunks", "task_id"),
+            ("document_chunks", "embedding"),
+            ("document_chunks", "embedding_provider"),
+            ("document_chunks", "embedding_model"),
+            ("document_chunks", "embedding_dimensions"),
+            ("memory_links", "owner_id"),
+            ("memory_links", "document_id"),
+            ("memory_links", "chunk_id"),
+            ("retrieval_traces", "owner_id"),
+            ("retrieval_traces", "selected_json"),
+            ("retrieval_traces", "dropped_json"),
+            ("compaction_runs", "owner_id"),
+            ("compaction_runs", "summary_memory_key"),
+            ("compaction_runs", "fidelity_status"),
+            ("embedding_cache", "provider"),
+            ("embedding_cache", "model"),
+            ("embedding_cache", "dimensions"),
+            ("approval_grants", "owner_id"),
+            ("approval_grants", "principal_id"),
+            ("approval_grants", "capability_op_id"),
+            ("approval_grants", "grant_json"),
+            ("approval_grants", "revoked_at"),
+            ("approval_grant_events", "grant_id"),
+            ("approval_grant_events", "event_type"),
+            ("approval_grant_events", "payload_json"),
         ] {
             let count: i64 = conn
                 .query_row(
@@ -2781,6 +4576,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_conversation_turns_schema_upgrades_owner_id_and_backfills() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("brain.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    session_key          TEXT PRIMARY KEY,
+                    channel              TEXT NOT NULL,
+                    sender               TEXT NOT NULL,
+                    created_at           TEXT NOT NULL,
+                    updated_at           TEXT NOT NULL,
+                    message_count        INTEGER NOT NULL DEFAULT 0,
+                    last_message_preview TEXT NOT NULL DEFAULT ''
+                 );
+                 CREATE TABLE conversation_turns (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_key TEXT NOT NULL,
+                    role        TEXT NOT NULL,
+                    content     TEXT NOT NULL,
+                    timestamp   TEXT NOT NULL,
+                    message_id  TEXT,
+                    FOREIGN KEY (session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+            for idx in 0..85 {
+                let session_key = format!("legacy-session-{}", idx % 5);
+                conn.execute(
+                    "INSERT OR IGNORE INTO sessions (
+                        session_key, channel, sender, created_at, updated_at, message_count, last_message_preview
+                     ) VALUES (?1, 'signal', 'legacy-user', '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z', 0, '')",
+                    params![session_key],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO conversation_turns (session_key, role, content, timestamp, message_id)
+                     VALUES (?1, 'user', ?2, '2026-05-01T00:00:00Z', ?3)",
+                    params![session_key, format!("turn-{idx}"), format!("msg-{idx}")],
+                )
+                .unwrap();
+            }
+        }
+
+        let mem = SqliteMemory::new_with_path(db_path).unwrap();
+        let conn = mem.conn.lock();
+        for (table, column) in [("sessions", "owner_id"), ("conversation_turns", "owner_id")] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    [column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing upgraded {table}.{column}");
+        }
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversation_turns", [], |row| row.get(0))
+            .unwrap();
+        let non_null: i64 = conn
+            .query_row(
+                "SELECT COUNT(owner_id) FROM conversation_turns WHERE owner_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_turns WHERE owner_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(total, 85);
+        assert_eq!(non_null, 85);
+        assert_eq!(null_count, 0);
+    }
+
+    #[tokio::test]
+    async fn retrieval_trace_persists_context_pack_audit() {
+        let (_tmp, mem) = temp_sqlite();
+
+        let trace = mem
+            .append_retrieval_trace(RetrievalTraceInput {
+                trace_id: Some("trace-sqlite-1".to_string()),
+                workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
+                session_key: Some("chat:session".to_string()),
+                agent_id: Some("agent-a".to_string()),
+                persona_id: Some("persona-a".to_string()),
+                source: "agent_context.document_evidence".to_string(),
+                query: "stable source anchors".to_string(),
+                candidate_count: 2,
+                selected_count: 1,
+                dropped_count: 1,
+                budget_tokens: Some(512),
+                selected_json: Some(r#"[{"chunk_id":"doc-1:chunk:0"}]"#.to_string()),
+                dropped_json: Some(r#"[{"chunk_id":"doc-1:chunk:1"}]"#.to_string()),
+                payload_json: Some(r#"{"phase":"test"}"#.to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(trace.trace_id, "trace-sqlite-1");
+        assert_eq!(trace.selected_count, 1);
+        assert_eq!(trace.dropped_count, 1);
+        assert!(trace.selected_json.unwrap().contains("doc-1:chunk:0"));
+    }
+
+    #[tokio::test]
+    async fn compaction_run_persists_summary_audit() {
+        let (_tmp, mem) = temp_sqlite();
+
+        let run = mem
+            .append_compaction_run(CompactionRunInput {
+                run_id: Some("compact-sqlite-1".to_string()),
+                workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
+                session_key: Some("chat:session".to_string()),
+                agent_id: Some("agent-a".to_string()),
+                persona_id: Some("persona-a".to_string()),
+                trigger: "pre_turn".to_string(),
+                mode: "safeguard".to_string(),
+                source_message_count: 4,
+                source_token_estimate: 256,
+                summary: "## Decisions\n- keep source anchors".to_string(),
+                summary_memory_key: Some("compaction_summary_1".to_string()),
+                source_event_ids_json: Some(r#"["event-1"]"#.to_string()),
+                source_document_refs_json: Some(r#"[{"chunk_id":"doc-1:chunk:0"}]"#.to_string()),
+                fidelity_status: "accepted".to_string(),
+                payload_json: Some(r#"{"phase":"test"}"#.to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(run.run_id, "compact-sqlite-1");
+        assert_eq!(run.source_message_count, 4);
+        assert_eq!(run.summary_memory_key.as_deref(), Some("compaction_summary_1"));
+        assert_eq!(run.fidelity_status, "accepted");
+    }
+
+    #[tokio::test]
     async fn store_with_metadata_persists_fabric_source_fields() {
         let (_tmp, mem) = temp_sqlite();
 
@@ -2791,6 +4729,7 @@ mod tests {
             Some("chat:session"),
             MemoryStoreMetadata {
                 workspace_id: Some("workspace-a".to_string()),
+                owner_id: Some("owner-a".to_string()),
                 agent_id: Some("agent-a".to_string()),
                 persona_id: Some("persona-a".to_string()),
                 source_event_id: Some("event-123".to_string()),
@@ -2806,22 +4745,269 @@ mod tests {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         ) = mem
             .conn
             .lock()
             .query_row(
-                "SELECT workspace_id, agent_id, persona_id, source_event_id, source
+                "SELECT workspace_id, owner_id, agent_id, persona_id, source_event_id, source
                  FROM memories WHERE key = 'semantic-key'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .unwrap();
 
         assert_eq!(row.0.as_deref(), Some("workspace-a"));
-        assert_eq!(row.1.as_deref(), Some("agent-a"));
-        assert_eq!(row.2.as_deref(), Some("persona-a"));
-        assert_eq!(row.3.as_deref(), Some("event-123"));
-        assert_eq!(row.4.as_deref(), Some("semantic_promotion"));
+        assert_eq!(row.1.as_deref(), Some("owner-a"));
+        assert_eq!(row.2.as_deref(), Some("agent-a"));
+        assert_eq!(row.3.as_deref(), Some("persona-a"));
+        assert_eq!(row.4.as_deref(), Some("event-123"));
+        assert_eq!(row.5.as_deref(), Some("semantic_promotion"));
+    }
+
+    #[tokio::test]
+    async fn document_ingest_chunks_searches_and_links_sources() {
+        let (_tmp, mem) = temp_sqlite();
+        let document = mem
+            .ingest_document(DocumentIngestInput {
+                document_id: Some("doc-1".to_string()),
+                workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner:workspace-a:telegram:alice".to_string()),
+                topic_id: Some("topic-a".to_string()),
+                task_id: Some("task-a".to_string()),
+                source_message_event_id: Some("msg-a".to_string()),
+                source_kind: "tool_output".to_string(),
+                source_uri: Some("tool:file_read".to_string()),
+                title: Some("Research Notes".to_string()),
+                content: "# Notes\n\nDurable document fact about vector retrieval and source anchors.".to_string(),
+                mime_type: Some("text/markdown".to_string()),
+                visibility: MemoryVisibility::Workspace,
+                metadata_json: Some(serde_json::json!({"tool": "file_read"}).to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(document.document_id, "doc-1");
+        assert_eq!(document.owner_id.as_deref(), Some("owner:workspace-a:telegram:alice"));
+        assert_eq!(document.topic_id.as_deref(), Some("topic-a"));
+        assert_eq!(document.task_id.as_deref(), Some("task-a"));
+        assert_eq!(document.chunk_count, 1);
+        assert_eq!(document.content_sha256.len(), 64);
+
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-a".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("telegram:chat-1:alice".to_string()),
+            channel: Some("telegram".to_string()),
+            sender: Some("alice".to_string()),
+            owner_id: None,
+        };
+        let results = mem
+            .search_document_chunks(&principal, "vector retrieval", 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk.document_id, "doc-1");
+        assert_eq!(
+            results[0].chunk.owner_id.as_deref(),
+            Some("owner:workspace-a:telegram:alice")
+        );
+        assert_eq!(results[0].chunk.source_anchor, "doc-1#chunk-0");
+
+        let chunk = mem
+            .get_document_chunk(&results[0].chunk.chunk_id)
+            .await
+            .unwrap()
+            .expect("chunk should exist");
+        assert!(chunk.content.contains("source anchors"));
+
+        let link = mem
+            .link_memory_source(MemoryLinkInput {
+                link_id: Some("link-1".to_string()),
+                workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner:workspace-a:telegram:alice".to_string()),
+                memory_key: Some("summary-key".to_string()),
+                memory_event_id: None,
+                message_event_id: Some("msg-a".to_string()),
+                document_id: document.document_id.clone(),
+                chunk_id: Some(chunk.chunk_id.clone()),
+                link_type: "evidence".to_string(),
+                payload_json: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(link.link_id, "link-1");
+        assert_eq!(link.chunk_id.as_deref(), Some(chunk.chunk_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn document_chunk_vector_search_uses_current_embedding_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(CountingEmbedding {
+                calls: Arc::clone(&calls),
+            }),
+            1.0,
+            0.0,
+            10,
+            None,
+        )
+        .unwrap();
+        mem.ingest_document(DocumentIngestInput {
+            document_id: Some("doc-vector-1".to_string()),
+            workspace_id: "workspace-a".to_string(),
+            owner_id: None,
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+            source_kind: "test".to_string(),
+            source_uri: None,
+            title: Some("Vector Doc".to_string()),
+            content: "alpha beta gamma".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            visibility: MemoryVisibility::Workspace,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-a".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("chat:vector".to_string()),
+            channel: Some("terminal".to_string()),
+            sender: Some("local-user".to_string()),
+            owner_id: None,
+        };
+        let vector_results = mem
+            .search_document_chunks(&principal, "no keyword overlap", 10)
+            .await
+            .unwrap();
+        assert_eq!(vector_results.len(), 1);
+        assert_eq!(vector_results[0].chunk.document_id, "doc-vector-1");
+
+        {
+            let conn = mem.conn.lock();
+            let (provider, model, dimensions): (String, String, i64) = conn
+                .query_row(
+                    "SELECT embedding_provider, embedding_model, embedding_dimensions
+                     FROM document_chunks WHERE document_id = 'doc-vector-1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(provider, "counting");
+            assert_eq!(model, "counting-v1");
+            assert_eq!(dimensions, 3);
+            conn.execute(
+                "UPDATE document_chunks
+                 SET embedding_provider = 'stale-provider',
+                     embedding_model = 'stale-model',
+                     embedding_dimensions = 999
+                 WHERE document_id = 'doc-vector-1'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let stale_results = mem
+            .search_document_chunks(&principal, "no keyword overlap", 10)
+            .await
+            .unwrap();
+        assert!(stale_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reindex_backfills_stale_document_chunk_embeddings() {
+        let tmp = TempDir::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(CountingEmbedding {
+                calls: Arc::clone(&calls),
+            }),
+            1.0,
+            0.0,
+            10,
+            None,
+        )
+        .unwrap();
+        mem.ingest_document(DocumentIngestInput {
+            document_id: Some("doc-reindex-1".to_string()),
+            workspace_id: "workspace-a".to_string(),
+            owner_id: None,
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+            source_kind: "test".to_string(),
+            source_uri: None,
+            title: Some("Reindex Doc".to_string()),
+            content: "delta epsilon zeta".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            visibility: MemoryVisibility::Workspace,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+        calls.store(0, Ordering::SeqCst);
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "UPDATE document_chunks
+                 SET embedding = NULL,
+                     embedding_provider = 'stale-provider',
+                     embedding_model = 'stale-model',
+                     embedding_dimensions = 999
+                 WHERE document_id = 'doc-reindex-1'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let reindexed = mem.reindex().await.unwrap();
+        assert_eq!(reindexed, 1);
+
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-a".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("chat:reindex".to_string()),
+            channel: Some("terminal".to_string()),
+            sender: Some("local-user".to_string()),
+            owner_id: None,
+        };
+        let vector_results = mem
+            .search_document_chunks(&principal, "no keyword overlap", 10)
+            .await
+            .unwrap();
+        assert_eq!(vector_results.len(), 1);
+        assert_eq!(vector_results[0].chunk.document_id, "doc-reindex-1");
+
+        let conn = mem.conn.lock();
+        let (provider, model, dimensions): (String, String, i64) = conn
+            .query_row(
+                "SELECT embedding_provider, embedding_model, embedding_dimensions
+                 FROM document_chunks WHERE document_id = 'doc-reindex-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "counting");
+        assert_eq!(model, "counting-v1");
+        assert_eq!(dimensions, 3);
     }
 
     #[tokio::test]
@@ -2832,6 +5018,7 @@ mod tests {
             .create_memory_draft(MemoryDraftInput {
                 draft_id: Some("draft-1".to_string()),
                 workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
                 worker_run_id: "run-worker".to_string(),
                 parent_run_id: Some("run-parent".to_string()),
                 session_key: Some("session-a".to_string()),
@@ -2847,6 +5034,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(draft.status, "pending");
+        assert_eq!(draft.owner_id.as_deref(), Some("owner-a"));
 
         let drafts = mem.list_memory_drafts_for_run("run-worker").await.unwrap();
         assert_eq!(drafts.len(), 1);
@@ -2861,6 +5049,7 @@ mod tests {
             .create_memory_draft(MemoryDraftInput {
                 draft_id: Some("draft-2".to_string()),
                 workspace_id: "workspace-a".to_string(),
+                owner_id: Some("owner-a".to_string()),
                 worker_run_id: "run-worker".to_string(),
                 parent_run_id: Some("run-parent".to_string()),
                 session_key: Some("session-a".to_string()),
@@ -2933,6 +5122,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_message_event_sets_runtime_event_type_column() {
+        let (_tmp, mem) = temp_sqlite();
+        let mut input = message_input(
+            "workspace-a",
+            "router.route_decision decision_id=decision-1",
+            MemoryVisibility::Workspace,
+            Some("llm-router"),
+            Some("chat:1"),
+            Some("router"),
+        );
+        input.role = "event".to_string();
+
+        let event = mem.append_message_event(input).await.unwrap();
+        let conn = mem.conn.lock();
+        let event_type: String = conn
+            .query_row(
+                "SELECT event_type FROM message_events WHERE event_id = ?1",
+                [event.event_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_type, "router.route_decision");
+        let outbox_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE event_type = 'router.route_decision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_count, 1);
+    }
+
+    #[tokio::test]
     async fn append_message_event_is_idempotent_by_key() {
         let (_tmp, mem) = temp_sqlite();
         let mut first = message_input(
@@ -2996,6 +5218,7 @@ mod tests {
                     session_key: Some("session-a".to_string()),
                     channel: None,
                     sender: None,
+                    owner_id: None,
                 },
                 0,
                 10,
@@ -3072,6 +5295,7 @@ mod tests {
             session_key: Some("session-a".to_string()),
             channel: None,
             sender: Some("alice".to_string()),
+            owner_id: None,
         };
         let visible = mem.list_message_events_since(&principal, 0, 20).await.unwrap();
         let contents = visible.iter().map(|event| event.content.as_str()).collect::<Vec<_>>();
@@ -3120,6 +5344,7 @@ mod tests {
                     session_key: None,
                     channel: None,
                     sender: None,
+                    owner_id: None,
                 },
                 0,
                 20,
@@ -3166,6 +5391,7 @@ mod tests {
                     session_key: Some("chat:current".to_string()),
                     channel: Some("terminal".to_string()),
                     sender: None,
+                    owner_id: None,
                 },
                 since_event_id: None,
                 limit: 10,
@@ -3234,6 +5460,7 @@ mod tests {
             session_key: Some("session-a".to_string()),
             channel: None,
             sender: None,
+            owner_id: None,
         };
         let visible = mem.list_memory_events_since(&principal, hidden.id, 20).await.unwrap();
         let event_types = visible
@@ -3278,6 +5505,7 @@ mod tests {
                     session_key: None,
                     channel: None,
                     sender: None,
+                    owner_id: None,
                 },
                 0,
                 20,
@@ -3332,6 +5560,7 @@ mod tests {
                     session_key: None,
                     channel: None,
                     sender: None,
+                    owner_id: None,
                 },
                 since_event_id: None,
                 limit: 10,
@@ -3680,6 +5909,14 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
+        let (provider, model, dimensions): (String, String, i64) = conn
+            .query_row(
+                "SELECT embedding_provider, embedding_model, embedding_dimensions
+                 FROM memories WHERE key = ?1",
+                ["core_key"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
         let daily_emb: Option<Vec<u8>> = conn
             .query_row("SELECT embedding FROM memories WHERE key = ?1", ["daily_key"], |row| {
                 row.get(0)
@@ -3697,6 +5934,9 @@ mod tests {
             .unwrap();
 
         assert!(core_emb.is_some());
+        assert_eq!(provider, "counting");
+        assert_eq!(model, "counting-v1");
+        assert_eq!(dimensions, 3);
         assert!(custom_emb.is_some());
         assert!(daily_emb.is_none());
         assert!(conv_emb.is_none());
@@ -3772,6 +6012,62 @@ mod tests {
         assert!(custom_emb.is_some());
         assert!(daily_emb.is_none());
         assert!(conv_emb.is_none());
+    }
+
+    #[tokio::test]
+    async fn vector_recall_skips_stale_embedding_metadata_until_reindex() {
+        let tmp = TempDir::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(CountingEmbedding {
+                calls: Arc::clone(&calls),
+            }),
+            1.0,
+            0.0,
+            10,
+            None,
+        )
+        .unwrap();
+
+        mem.store("vector_key", "alpha beta gamma", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "UPDATE memories
+                 SET embedding_provider = 'stale-provider',
+                     embedding_model = 'stale-model',
+                     embedding_dimensions = 999
+                 WHERE key = 'vector_key'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let stale_results = mem.recall("no keyword overlap", 5, None).await.unwrap();
+        assert!(stale_results.is_empty());
+
+        let reindexed = mem.reindex().await.unwrap();
+        assert_eq!(reindexed, 1);
+
+        let fresh_results = mem.recall("no keyword overlap", 5, None).await.unwrap();
+        assert_eq!(fresh_results.len(), 1);
+        assert_eq!(fresh_results[0].key, "vector_key");
+
+        let conn = mem.conn.lock();
+        let (provider, model, dimensions): (String, String, i64) = conn
+            .query_row(
+                "SELECT embedding_provider, embedding_model, embedding_dimensions
+                 FROM memories WHERE key = 'vector_key'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "counting");
+        assert_eq!(model, "counting-v1");
+        assert_eq!(dimensions, 3);
     }
 
     // ── Schema tests ─────────────────────────────────────────────
@@ -4161,6 +6457,59 @@ mod tests {
         assert!(!results.is_empty());
     }
 
+    #[tokio::test]
+    async fn recall_with_context_filters_private_sender_scope() {
+        let (_tmp, mem) = temp_sqlite();
+        let alice_ctx = MemoryWriteContext {
+            channel: Some("telegram".into()),
+            chat_type: Some("private".into()),
+            chat_id: Some("dm-alice".into()),
+            sender_id: None,
+            raw_sender: Some("alice".into()),
+        };
+        let bob_ctx = MemoryWriteContext {
+            channel: Some("telegram".into()),
+            chat_type: Some("private".into()),
+            chat_id: Some("dm-bob".into()),
+            sender_id: None,
+            raw_sender: Some("bob".into()),
+        };
+
+        mem.store_with_context(
+            "alice-private",
+            "shared keyword alice private",
+            MemoryCategory::Conversation,
+            None,
+            Some(&alice_ctx),
+        )
+        .await
+        .unwrap();
+        mem.store_with_context(
+            "bob-private",
+            "shared keyword bob private",
+            MemoryCategory::Conversation,
+            None,
+            Some(&bob_ctx),
+        )
+        .await
+        .unwrap();
+
+        let results = mem
+            .recall_with_context("shared keyword", 10, None, Some(&alice_ctx))
+            .await
+            .unwrap();
+        let keys = results.iter().map(|entry| entry.key.as_str()).collect::<Vec<_>>();
+        assert!(keys.contains(&"alice-private"), "{keys:?}");
+        assert!(!keys.contains(&"bob-private"), "{keys:?}");
+    }
+
+    #[tokio::test]
+    async fn sqlite_scoped_memory_acl_conformance() {
+        let (_tmp, mem) = temp_sqlite();
+        crate::memory::traits::conformance::assert_scoped_memory_acl_conformance(&mem, "sqlite-scoped-conformance")
+            .await;
+    }
+
     // ── Edge cases: schema idempotency ───────────────────────────
 
     #[tokio::test]
@@ -4528,6 +6877,7 @@ mod tests {
             "first user message",
             Some("2026-03-05T00:00:00Z"),
             Some("msg-1"),
+            None,
         )
         .await
         .unwrap();
@@ -4538,6 +6888,7 @@ mod tests {
             "assistant",
             "first assistant message",
             Some("2026-03-05T00:00:01Z"),
+            None,
             None,
         )
         .await
@@ -4551,13 +6902,131 @@ mod tests {
         assert_eq!(sessions[0].updated_at, "2026-03-05T00:00:01Z");
         assert_eq!(sessions[0].last_message_preview, "first assistant message");
 
-        let turns = mem.list_conversation_turns("signal_alice", 50, 0).await.unwrap();
+        let principal = test_conversation_principal("signal_alice", Some("legacy:signal_alice"));
+        let turns = mem
+            .list_conversation_turns(&principal, "signal_alice", 50, 0)
+            .await
+            .unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].timestamp, "2026-03-05T00:00:00Z");
         assert_eq!(turns[0].message_id.as_deref(), Some("msg-1"));
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].timestamp, "2026-03-05T00:00:01Z");
+    }
+
+    #[tokio::test]
+    async fn conversation_turns_phase1_owner_columns_exist() {
+        let (_tmp, mem) = temp_sqlite();
+        let conn = mem.conn.lock();
+
+        let session_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let turn_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(conversation_turns)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+
+        assert!(session_cols.contains(&"owner_id".to_string()));
+        assert!(turn_cols.contains(&"owner_id".to_string()));
+    }
+
+    #[tokio::test]
+    async fn append_conversation_turn_stores_owner_id() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.append_conversation_turn(
+            "signal_owned",
+            "signal",
+            "alice",
+            "user",
+            "owned message",
+            Some("2026-03-05T00:00:00Z"),
+            Some("msg-owned"),
+            Some("owner:alice"),
+        )
+        .await
+        .unwrap();
+
+        let conn = mem.conn.lock();
+        let session_owner: Option<String> = conn
+            .query_row(
+                "SELECT owner_id FROM sessions WHERE session_key = 'signal_owned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let turn_owner: Option<String> = conn
+            .query_row(
+                "SELECT owner_id FROM conversation_turns WHERE session_key = 'signal_owned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(session_owner.as_deref(), Some("owner:alice"));
+        assert_eq!(turn_owner.as_deref(), Some("owner:alice"));
+    }
+
+    #[tokio::test]
+    async fn conversation_turns_owner_acl_filters_same_session_key() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.append_conversation_turn(
+            "shared-session",
+            "signal",
+            "alice",
+            "user",
+            "alice private turn",
+            Some("2026-03-05T00:00:00Z"),
+            Some("msg-a"),
+            Some("owner:alice"),
+        )
+        .await
+        .unwrap();
+        mem.append_conversation_turn(
+            "shared-session",
+            "signal",
+            "bob",
+            "user",
+            "bob private turn",
+            Some("2026-03-05T00:00:01Z"),
+            Some("msg-b"),
+            Some("owner:bob"),
+        )
+        .await
+        .unwrap();
+
+        let alice = test_conversation_principal("shared-session", Some("owner:alice"));
+        let bob = test_conversation_principal("shared-session", Some("owner:bob"));
+        let mallory = test_conversation_principal("shared-session", Some("owner:mallory"));
+
+        let alice_turns = mem
+            .list_conversation_turns(&alice, "shared-session", 50, 0)
+            .await
+            .unwrap();
+        let bob_turns = mem
+            .list_conversation_turns(&bob, "shared-session", 50, 0)
+            .await
+            .unwrap();
+        let mallory_turns = mem
+            .list_conversation_turns(&mallory, "shared-session", 50, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(alice_turns.len(), 1);
+        assert_eq!(alice_turns[0].content, "alice private turn");
+        assert_eq!(bob_turns.len(), 1);
+        assert_eq!(bob_turns[0].content, "bob private turn");
+        assert!(mallory_turns.is_empty());
     }
 
     #[tokio::test]
@@ -4572,13 +7041,15 @@ mod tests {
                 &format!("turn-{idx}"),
                 Some(&format!("2026-03-05T00:00:0{idx}Z")),
                 None,
+                None,
             )
             .await
             .unwrap();
         }
 
+        let principal = test_conversation_principal("telegram_bob", Some("legacy:telegram_bob"));
         let histories = mem
-            .load_recent_conversation_histories(2, MAX_HYDRATED_SESSIONS)
+            .load_recent_conversation_histories(&principal, 2, MAX_HYDRATED_SESSIONS)
             .await
             .unwrap();
         let bob_history = histories.get("telegram_bob").unwrap();
@@ -4599,12 +7070,17 @@ mod tests {
                 &format!("turn-{idx}"),
                 Some(&format!("2026-03-05T00:00:0{idx}Z")),
                 None,
+                None,
             )
             .await
             .unwrap();
         }
 
-        let turns = mem.list_conversation_turns("signal_latest_window", 2, 0).await.unwrap();
+        let principal = test_conversation_principal("signal_latest_window", Some("legacy:signal_latest_window"));
+        let turns = mem
+            .list_conversation_turns(&principal, "signal_latest_window", 2, 0)
+            .await
+            .unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].content, "turn-2");
         assert_eq!(turns[1].content, "turn-3");
@@ -4621,6 +7097,7 @@ mod tests {
             "turn-a",
             Some("2026-03-05T00:00:00Z"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4631,6 +7108,7 @@ mod tests {
             "user",
             "turn-b",
             Some("2026-03-05T00:00:01Z"),
+            None,
             None,
         )
         .await
@@ -4643,11 +7121,13 @@ mod tests {
             "turn-c",
             Some("2026-03-05T00:00:02Z"),
             None,
+            None,
         )
         .await
         .unwrap();
 
-        let histories = mem.load_recent_conversation_histories(2, 2).await.unwrap();
+        let principal = test_conversation_principal("*", Some("system:*"));
+        let histories = mem.load_recent_conversation_histories(&principal, 2, 2).await.unwrap();
         assert_eq!(histories.len(), 2);
         assert!(histories.contains_key("session_b"));
         assert!(histories.contains_key("session_c"));

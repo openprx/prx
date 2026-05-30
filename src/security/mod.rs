@@ -27,6 +27,7 @@ pub mod docker;
 pub mod firejail;
 #[cfg(feature = "sandbox-landlock")]
 pub mod landlock;
+pub mod op_id;
 pub mod pairing;
 pub mod policy;
 pub mod policy_pipeline;
@@ -34,7 +35,7 @@ pub mod secrets;
 pub mod traits;
 
 pub use detect::create_sandbox;
-pub use policy::{AutonomyLevel, SecurityPolicy};
+pub use policy::{AutonomyLevel, SecurityPolicy, SideEffectGate};
 pub use policy_pipeline::{EvalContext, PolicyPipeline};
 pub use secrets::SecretStore;
 

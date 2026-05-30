@@ -31,6 +31,13 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     };
 
     crate::health::mark_component_ok("daemon");
+    let startup_trace =
+        crate::runtime::control_ladder::ControlLadderSnapshot::from_config(&config).build_trace("daemon.start", None);
+    if let Err(error) =
+        crate::runtime::control_ladder::append_control_ladder_trace(&config.workspace_dir, &startup_trace)
+    {
+        tracing::warn!("failed to append daemon control ladder trace: {error}");
+    }
 
     if config.modules.scheduler && config.heartbeat.enabled {
         let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir).await;
@@ -883,7 +890,10 @@ mod tests {
         let config = test_config(&tmp);
 
         let (cfg, path) = load_evolution_config(&config).await.unwrap();
-        assert_eq!(cfg.runtime.mode, crate::self_system::evolution::EvolutionMode::Shadow);
+        assert_eq!(
+            cfg.runtime.mode,
+            crate::self_system::evolution::EvolutionMode::DraftOnly
+        );
         assert_eq!(path, config.workspace_dir.join("evolution_config.toml"));
     }
 

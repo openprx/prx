@@ -209,17 +209,8 @@ impl EvolutionEngine for MemoryEvolutionEngine {
         };
 
         let current = self.shared_config.load_full();
-        let deduplicated_conversation_memories = match self.prune_redundant_conversation_memories().await {
-            Ok(count) => count,
-            Err(error) => {
-                tracing::warn!(
-                    target: "self_system",
-                    "memory redundancy cleanup skipped: {error}"
-                );
-                0
-            }
-        };
         let mode = current.runtime.mode.clone();
+        let mut deduplicated_conversation_memories = 0u32;
         let candidate = self
             .select_candidate(&input.analyzer_candidates)
             .unwrap_or_else(default_candidate);
@@ -268,9 +259,19 @@ impl EvolutionEngine for MemoryEvolutionEngine {
         let mut notes = "shadow mode: recommendation only".to_string();
 
         match mode {
-            EvolutionMode::Shadow => {}
+            EvolutionMode::DraftOnly | EvolutionMode::Shadow => {}
             EvolutionMode::Auto => {
                 if matches!(gate_result, GateResult::Passed) {
+                    deduplicated_conversation_memories = match self.prune_redundant_conversation_memories().await {
+                        Ok(count) => count,
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "self_system",
+                                "memory redundancy cleanup skipped: {error}"
+                            );
+                            0
+                        }
+                    };
                     self.rollback.backup_current_version().await?;
                     if let Some(parent) = self.config_path.parent() {
                         if !parent.as_os_str().is_empty() {
@@ -382,7 +383,7 @@ impl EvolutionEngine for MemoryEvolutionEngine {
             cycle,
             evolution_log: Some(evolution_log),
             needs_human_approval: false,
-            shadow_mode: matches!(mode, EvolutionMode::Shadow),
+            shadow_mode: mode.is_draft_like(),
         })
     }
 }

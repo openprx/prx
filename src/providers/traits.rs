@@ -1,3 +1,4 @@
+use crate::llm::route_decision::{ProviderExecutionOutcome, RouteDecision};
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -526,6 +527,22 @@ pub trait Provider: Send + Sync {
             tool_calls: Vec::new(),
             reasoning_content: None,
         })
+    }
+
+    async fn chat_with_decision(
+        &self,
+        decision: &RouteDecision,
+        request: ChatRequest<'_>,
+        temperature: f64,
+    ) -> anyhow::Result<(ChatResponse, ProviderExecutionOutcome)> {
+        let started_at = chrono::Utc::now();
+        match self.chat(request, decision.effective_model(), temperature).await {
+            Ok(response) => Ok((
+                response,
+                ProviderExecutionOutcome::success_for_decision(decision, started_at),
+            )),
+            Err(error) => Err(error),
+        }
     }
 
     /// Whether provider supports native tool calls over API.

@@ -7,6 +7,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::security::policy::ResourceRiskLevel;
+
 const HOOKS_JSON_FILE: &str = "hooks.json";
 const DEFAULT_HOOK_TIMEOUT_MS: u64 = 5_000;
 const MIN_HOOK_TIMEOUT_MS: u64 = 1_000;
@@ -234,6 +236,7 @@ pub async fn create_hook(
         timeout_ms,
         stdin_json: true,
     };
+    super::authorize_resource_mutation(&state, "gateway_api:hooks:create", ResourceRiskLevel::Low)?;
     file.hooks.entry(event.clone()).or_default().push(action);
     write_hooks_file(&state, &file)?;
 
@@ -289,6 +292,7 @@ pub async fn update_hook(
         }
     }
 
+    super::authorize_resource_mutation(&state, "gateway_api:hooks:update", ResourceRiskLevel::Low)?;
     write_hooks_file(&state, &file)?;
     Ok(Json(serde_json::json!({"status": "updated", "id": id})))
 }
@@ -319,6 +323,7 @@ pub async fn delete_hook(
         file.hooks.remove(&event_key);
     }
 
+    super::authorize_resource_mutation(&state, "gateway_api:hooks:delete", ResourceRiskLevel::Low)?;
     write_hooks_file(&state, &file)?;
     Ok(Json(serde_json::json!({"status": "deleted", "id": id})))
 }
@@ -342,6 +347,7 @@ pub async fn toggle_hook(
 
     let current = file.enabled.unwrap_or(true);
     file.enabled = Some(!current);
+    super::authorize_resource_mutation(&state, "gateway_api:hooks:toggle", ResourceRiskLevel::Low)?;
     write_hooks_file(&state, &file)?;
 
     Ok(Json(

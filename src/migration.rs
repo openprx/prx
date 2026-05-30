@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
+use crate::schema_migration;
 use anyhow::{Context, Result, bail};
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -27,7 +28,106 @@ struct MigrationStats {
 
 pub async fn handle_command(command: crate::MigrateCommands, config: &Config) -> Result<()> {
     match command {
+        crate::MigrateCommands::Status => show_schema_migration_status(config),
+        crate::MigrateCommands::Verify => verify_schema_migrations(config),
+        crate::MigrateCommands::DryRun => dry_run_schema_migrations(config),
+        crate::MigrateCommands::Baseline => baseline_schema_migrations(config),
         crate::MigrateCommands::Openclaw { source, dry_run } => migrate_openclaw_memory(config, source, dry_run).await,
+    }
+}
+
+fn show_schema_migration_status(config: &Config) -> Result<()> {
+    let conn = schema_migration::open_sqlite_memory_db(config)?;
+    let status = schema_migration::status_sqlite(&conn)?;
+    println!("Memory DB: {}", schema_migration::memory_db_path(config).display());
+    print_schema_migration_status(&status);
+    Ok(())
+}
+
+fn verify_schema_migrations(config: &Config) -> Result<()> {
+    let conn = schema_migration::open_sqlite_memory_db(config)?;
+    let mismatches = schema_migration::verify_sqlite(&conn)?;
+    if mismatches.is_empty() {
+        println!("Schema migration checksums OK");
+        return Ok(());
+    }
+
+    println!("Schema migration checksum mismatch(es): {}", mismatches.len());
+    for mismatch in &mismatches {
+        println!(
+            "- {} expected={} actual={}",
+            mismatch.version, mismatch.expected, mismatch.actual
+        );
+    }
+    bail!("schema migration checksum verification failed")
+}
+
+fn dry_run_schema_migrations(config: &Config) -> Result<()> {
+    let db_path = schema_migration::memory_db_path(config);
+    let conn = if db_path.exists() {
+        Some(
+            Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("open memory db read-only {}", db_path.display()))?,
+        )
+    } else {
+        None
+    };
+    let status = schema_migration::dry_run_sqlite(conn.as_ref())?;
+    println!("Dry run: schema migrations for {}", db_path.display());
+    if status.pending.is_empty() {
+        println!("No pending migrations.");
+    } else {
+        println!("Would apply ({}):", status.pending.len());
+        for pending in &status.pending {
+            println!("  {}  {}", pending.version, pending.name);
+        }
+    }
+    Ok(())
+}
+
+fn baseline_schema_migrations(config: &Config) -> Result<()> {
+    let mut conn = schema_migration::open_sqlite_memory_db(config)?;
+    let inserted = schema_migration::baseline_sqlite(&mut conn, "prx-cli")?;
+    if inserted {
+        println!(
+            "Recorded schema migration baseline {} ({})",
+            schema_migration::BASELINE_VERSION,
+            schema_migration::BASELINE_NAME
+        );
+    } else {
+        println!(
+            "Schema migration baseline already present: {}",
+            schema_migration::BASELINE_VERSION
+        );
+    }
+    Ok(())
+}
+
+fn print_schema_migration_status(status: &schema_migration::MigrationStatus) {
+    println!("Applied ({}):", status.applied.len());
+    if status.applied.is_empty() {
+        println!("  <none>");
+    } else {
+        for record in &status.applied {
+            let duration = record
+                .duration_ms
+                .map(|duration_ms| format!("{duration_ms}ms"))
+                .unwrap_or_else(|| "n/a".to_string());
+            println!(
+                "  {}  {}  {}  {}  {}",
+                record.version, record.name, record.applied_at, record.applied_by, duration
+            );
+        }
+    }
+
+    println!("Pending ({}):", status.pending.len());
+    if status.pending.is_empty() {
+        println!("  <none>");
+    } else {
+        for pending in &status.pending {
+            println!("  {}  {}", pending.version, pending.name);
+        }
+        println!("Run `prx migrate baseline` to record the baseline.");
     }
 }
 

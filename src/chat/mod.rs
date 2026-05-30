@@ -37,9 +37,9 @@ pub mod renderer;
 pub mod tui;
 
 use crate::agent::loop_::{
-    ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig, build_context_with_shared_events,
-    build_runtime_system_prompt, increment_recalled_useful_counts, is_tool_loop_cancelled, run_tool_call_loop,
-    select_prompt_skills,
+    DocumentIngestRuntime, ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig,
+    build_context_with_shared_events_and_scope, build_runtime_system_prompt, increment_recalled_useful_counts,
+    is_tool_loop_cancelled, run_tool_call_loop, select_prompt_skills,
 };
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
@@ -50,15 +50,24 @@ use crate::channels::{
 use crate::chat::terminal_proto::DraftVersionCounter;
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
-use crate::memory::{self, Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryVisibility, MessageEventScope};
+use crate::llm::route_decision::{
+    ProviderExecutionOutcome, RouteDecision, record_provider_outcome_events, record_route_decision_event,
+    route_event_scope,
+};
+use crate::memory::{
+    self, CompactionRunInput, Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryStoreMetadata,
+    MemoryVisibility, MessageEventScope,
+};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
+use crate::runtime::envelope::{RuntimeEnvelope, RuntimeSource};
 use crate::security::PolicyPipeline;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use sha2::Digest;
 #[cfg(feature = "terminal-tui")]
 use std::collections::VecDeque;
 use std::io::{IsTerminal as _, Write as _};
@@ -143,6 +152,98 @@ fn compact_chat_history(history: &mut Vec<ChatMessage>) {
         && history.len() > start + 1
     {
         history.remove(start);
+    }
+}
+
+fn estimate_chat_history_tokens(history: &[ChatMessage]) -> usize {
+    history
+        .iter()
+        .map(|msg| msg.role.chars().count() + msg.content.chars().count() + 12)
+        .sum::<usize>()
+        / 4
+}
+
+async fn persist_legacy_chat_compaction_audit(
+    mem: &dyn Memory,
+    envelope: &RuntimeEnvelope,
+    source_history: &[ChatMessage],
+    trigger: &str,
+) {
+    if source_history.len() <= 1 {
+        return;
+    }
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let summary_memory_key = format!("compaction_summary_{}", run_id.replace('-', "_"));
+    let has_system = source_history.first().is_some_and(|msg| msg.role == "system");
+    let source_message_count = source_history.len().saturating_sub(usize::from(has_system));
+    let source_refs: Vec<serde_json::Value> = source_history
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(message.role.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(message.content.as_bytes());
+            serde_json::json!({
+                "index": index,
+                "role": message.role,
+                "content_hash": hex::encode(hasher.finalize())
+            })
+        })
+        .collect();
+    let summary = format!(
+        "Legacy chat context overflow compaction preserved the system prompt, kept the last {COMPACT_KEEP_MESSAGES} non-system messages, truncated turns to {COMPACT_CONTENT_CHARS} chars, and capped retained chat context at {COMPACT_TOTAL_CHARS} chars."
+    );
+    let owner = envelope.owner_principal();
+    let metadata = MemoryStoreMetadata {
+        workspace_id: Some(envelope.workspace_id.clone()),
+        owner_id: Some(owner.owner_id.clone()),
+        agent_id: envelope.agent_id.clone(),
+        persona_id: envelope.persona_id.clone(),
+        source_event_id: None,
+        source: Some("legacy_chat_compaction_summary".to_string()),
+    };
+    if let Err(error) = mem
+        .store_with_metadata(
+            &summary_memory_key,
+            &summary,
+            MemoryCategory::Conversation,
+            Some(&envelope.session_key),
+            metadata,
+        )
+        .await
+    {
+        tracing::debug!(error = %error, "failed to persist legacy chat compaction summary memory");
+    }
+    if let Err(error) = mem
+        .append_compaction_run(CompactionRunInput {
+            run_id: Some(run_id),
+            workspace_id: envelope.workspace_id.clone(),
+            owner_id: Some(owner.owner_id),
+            session_key: Some(envelope.session_key.clone()),
+            agent_id: envelope.agent_id.clone(),
+            persona_id: envelope.persona_id.clone(),
+            trigger: trigger.to_string(),
+            mode: "legacy_chat_overflow".to_string(),
+            source_message_count,
+            source_token_estimate: estimate_chat_history_tokens(source_history),
+            summary,
+            summary_memory_key: Some(summary_memory_key),
+            source_event_ids_json: None,
+            source_document_refs_json: Some(serde_json::to_string(&source_refs).unwrap_or_else(|_| "[]".to_string())),
+            fidelity_status: "accepted_legacy_deterministic".to_string(),
+            payload_json: Some(
+                serde_json::json!({
+                    "compact_keep_messages": COMPACT_KEEP_MESSAGES,
+                    "compact_content_chars": COMPACT_CONTENT_CHARS,
+                    "compact_total_chars": COMPACT_TOTAL_CHARS
+                })
+                .to_string(),
+            ),
+        })
+        .await
+    {
+        tracing::debug!(error = %error, "failed to append legacy chat compaction run");
     }
 }
 
@@ -361,12 +462,37 @@ fn chat_message_event_scope(
     provider_name: &str,
     model_name: &str,
 ) -> MessageEventScope {
-    MessageEventScope::new("chat", MemoryVisibility::Workspace)
-        .with_channel("terminal")
-        .with_session_key(chat_session_key.to_string())
-        .with_run_id(chat_run_id.to_string())
-        .with_sender("local-user")
-        .with_recipient(format!("{provider_name}/{model_name}"))
+    RuntimeEnvelope::new(
+        RuntimeSource::Chat,
+        "workspace",
+        chat_session_key.to_string(),
+        MemoryVisibility::Workspace,
+    )
+    .with_channel("terminal")
+    .with_sender("local-user")
+    .with_recipient(format!("{provider_name}/{model_name}"))
+    .with_run_id(chat_run_id.to_string())
+    .message_scope()
+}
+
+fn chat_runtime_envelope(workspace_id: &str, chat_session_key: &str) -> RuntimeEnvelope {
+    RuntimeEnvelope::new(
+        RuntimeSource::Chat,
+        workspace_id.to_string(),
+        chat_session_key.to_string(),
+        MemoryVisibility::Workspace,
+    )
+    .with_channel("terminal")
+    .with_sender("local-user")
+    .with_recipient("terminal:user")
+}
+
+fn chat_runtime_write_context(envelope: &RuntimeEnvelope) -> crate::memory::principal::MemoryWriteContext {
+    envelope.memory_write_context("private")
+}
+
+fn chat_runtime_principal(envelope: &RuntimeEnvelope) -> MemoryPrincipal {
+    envelope.memory_principal()
 }
 
 async fn record_chat_user_message_event(
@@ -1496,18 +1622,18 @@ pub async fn run(
         }
 
         // Inject memory context
-        let mem_context = build_context_with_shared_events(
+        let runtime_envelope = chat_runtime_envelope(memory_fabric.workspace_id(), &chat_session_key);
+        let document_ingest = Some(
+            DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
+                .with_source_message_event_id(chat_user_event.as_ref().map(|event| event.event_id.clone())),
+        );
+        let semantic_scope = chat_runtime_write_context(&runtime_envelope);
+        let mem_context = build_context_with_shared_events_and_scope(
             mem.as_ref(),
-            MemoryPrincipal {
-                workspace_id: memory_fabric.workspace_id().to_string(),
-                agent_id: None,
-                persona_id: None,
-                session_key: Some(chat_session_key.clone()),
-                channel: Some("terminal".to_string()),
-                sender: Some("local-user".to_string()),
-            },
+            chat_runtime_principal(&runtime_envelope),
             &user_input,
             config.memory.min_relevance_score,
+            Some(&semantic_scope),
         )
         .await;
         let context = mem_context.preamble.clone();
@@ -1730,12 +1856,17 @@ pub async fn run(
 
         // ── Policy Pipeline for tool access control ──────────────
         let policy_pipeline = PolicyPipeline::from_config(&config);
+        let scope_owner_id = runtime_envelope.resolved_owner_id();
         let scope_ctx = ScopeContext {
             policy: &security,
             sender: "user",
             channel: "terminal",
             chat_type: "private",
             chat_id: "terminal:user",
+            owner_id: Some(&scope_owner_id),
+            topic_id: runtime_envelope.topic_id.as_deref(),
+            task_id: runtime_envelope.resolved_task_id(),
+            source_message_event_id: runtime_envelope.source_message_event_id.as_deref(),
             policy_pipeline: Some(&policy_pipeline),
         };
 
@@ -1745,6 +1876,34 @@ pub async fn run(
             let scale = (config.agent.max_tool_iterations.max(1) as u64).min(TIMEOUT_MAX_SCALE_FACTOR);
             Duration::from_secs(base.saturating_mul(scale))
         };
+
+        let route_decision = RouteDecision::from_model_routes_for_context(
+            provider_name,
+            model_name,
+            &config.model_routes,
+            runtime_envelope.resolved_owner_id(),
+            chat_session_key.clone(),
+            chat_user_event.as_ref().map(|event| event.event_id.clone()),
+            "chat",
+            (user_input.chars().count() / 4 + 1).min(u32::MAX as usize) as u32,
+            true,
+            false,
+        );
+        let route_scope = route_event_scope(
+            "chat",
+            Some(runtime_envelope.resolved_owner_id()),
+            Some(chat_session_key.clone()),
+            Some(chat_run_id.clone()),
+            Some("local-user".to_string()),
+            Some(format!(
+                "{}/{}",
+                route_decision.selected.provider, route_decision.selected.model
+            )),
+        );
+        if let Err(e) = record_route_decision_event(&memory_fabric, route_scope.clone(), &route_decision).await {
+            tracing::warn!(error = %e, "Failed to append router.route_decision message event");
+        }
+        let provider_started_at = chrono::Utc::now();
 
         // ── Retry loop (context overflow recovery + timeout retry) ──
         //
@@ -1975,6 +2134,7 @@ pub async fn run(
                     Some(&scope_ctx),
                     Some(tool_event_tx.clone()),
                     Some(&config.tool_tiering),
+                    document_ingest.clone(),
                     chat_session.mode,
                 ),
             )
@@ -2034,6 +2194,7 @@ pub async fn run(
                     // 因为 `history` 是真实喂给 `run_tool_call_loop` 的 LLM 上下文 Vec —
                     // S2-C 删除 legacy 路径前不能跳过它，否则 Redux 模式下 overflow
                     // 重试会拿同一份未压缩的 history 二次失败。
+                    let source_history = history.clone();
                     let _ = chat_dispatcher.dispatch_or_log(
                         crate::chat::action::Action::HistoryCompacted {
                             reason: crate::chat::action::CompactReason::ContextOverflow,
@@ -2041,6 +2202,13 @@ pub async fn run(
                         "chat.history_compacted_overflow",
                     );
                     compact_chat_history(&mut history);
+                    persist_legacy_chat_compaction_audit(
+                        mem.as_ref(),
+                        &runtime_envelope,
+                        &source_history,
+                        "chat_context_overflow",
+                    )
+                    .await;
                     let compacted_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
                     tracing::warn!(
                         retries = context_overflow_retries,
@@ -2167,6 +2335,10 @@ pub async fn run(
             TurnOutcome::Success(resp) => resp,
             TurnOutcome::Cancelled | TurnOutcome::FailedWithError { .. } => continue,
         };
+        let provider_outcome = ProviderExecutionOutcome::success_for_decision(&route_decision, provider_started_at);
+        if let Err(e) = record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await {
+            tracing::warn!(error = %e, "Failed to append provider.final_outcome message event");
+        }
 
         // ── P2-12: Mirror reasoning content into the TUI as a folded card. ──
         //
@@ -3091,6 +3263,7 @@ mod session_runtime_binding_tests {
                     session_key: Some(session_key.clone()),
                     channel: Some("terminal".to_string()),
                     sender: Some("local-user".to_string()),
+                    owner_id: None,
                 },
                 0,
                 10,
@@ -3150,6 +3323,57 @@ async fn list_saved_sessions(mem: &dyn Memory) -> Result<()> {
     }
     println!("\nResume with: prx chat --session <ID>");
     Ok(())
+}
+
+#[cfg(test)]
+mod legacy_chat_compaction_audit_tests {
+    use super::*;
+    use crate::memory::SqliteMemory;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn legacy_chat_compaction_persists_run_and_summary_memory() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let envelope = RuntimeEnvelope::chat("workspace-a", "session-a");
+        let source_history = vec![
+            ChatMessage::system("system rules"),
+            ChatMessage::user("remember /tmp/source-a and owner lineage".repeat(20)),
+            ChatMessage::assistant("acknowledged source hash trace".repeat(20)),
+        ];
+
+        persist_legacy_chat_compaction_audit(&mem, &envelope, &source_history, "chat_context_overflow").await;
+
+        let conn = rusqlite::Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
+        let (summary_memory_key, mode, fidelity_status, source_refs): (String, String, String, String) = conn
+            .query_row(
+                "SELECT summary_memory_key, mode, fidelity_status, source_document_refs_json
+                 FROM compaction_runs
+                 WHERE workspace_id = 'workspace-a'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert!(summary_memory_key.starts_with("compaction_summary_"));
+        assert_eq!(mode, "legacy_chat_overflow");
+        assert_eq!(fidelity_status, "accepted_legacy_deterministic");
+        assert!(source_refs.contains("content_hash"));
+
+        let stored_summary_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM memories
+                 WHERE key = ?1
+                   AND source = 'legacy_chat_compaction_summary'
+                   AND session_id = ?2",
+                [&summary_memory_key, &envelope.session_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_summary_count, 1);
+    }
 }
 
 #[cfg(test)]

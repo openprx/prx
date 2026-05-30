@@ -134,6 +134,10 @@ impl ExecutionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XinTask {
     pub id: String,
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub source_message_event_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub kind: TaskKind,
@@ -157,11 +161,17 @@ pub struct XinTask {
     /// Max consecutive failures before auto-disabling (0 = no limit).
     pub max_failures: u32,
     pub enabled: bool,
+    /// Runtime-created approval grant for delayed shell execution.
+    pub approval_grant_json: Option<String>,
 }
 
 /// Input for creating a new task.
 #[derive(Debug, Clone)]
 pub struct NewXinTask {
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub source_message_event_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub kind: TaskKind,
@@ -171,6 +181,7 @@ pub struct NewXinTask {
     pub recurring: bool,
     pub interval_secs: u64,
     pub max_failures: u32,
+    pub approval_grant_json: Option<String>,
 }
 
 /// Patch struct for updating tasks.
@@ -183,6 +194,25 @@ pub struct XinTaskPatch {
     pub interval_secs: Option<u64>,
     pub enabled: Option<bool>,
     pub max_failures: Option<u32>,
+    #[serde(skip)]
+    pub approval_grant_json: Option<String>,
+}
+
+/// Append-only execution and lifecycle event for a Xin task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XinTaskEvent {
+    pub id: i64,
+    pub event_id: String,
+    pub task_id: String,
+    pub workspace_id: String,
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub source_message_event_id: Option<String>,
+    pub event_type: String,
+    pub status: Option<String>,
+    pub payload_json: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Summary of a single xin tick.

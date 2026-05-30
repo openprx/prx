@@ -1,7 +1,8 @@
 use super::sqlite::SqliteMemory;
 use super::traits::{
-    Memory, MemoryCategory, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryPrincipal, MessageEvent,
-    MessageEventInput, SessionContextQuery, SharedContextQuery,
+    CompactionRun, CompactionRunInput, DocumentChunkRecord, DocumentIngestInput, DocumentRecord, DocumentSearchResult,
+    Memory, MemoryCategory, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal,
+    MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, SessionContextQuery, SharedContextQuery,
 };
 use async_trait::async_trait;
 use chrono::Local;
@@ -344,6 +345,10 @@ impl Memory for LucidMemory {
         self.local.health_check().await
     }
 
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        self.local.reindex().await
+    }
+
     async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
         self.local.append_message_event(input).await
     }
@@ -355,6 +360,14 @@ impl Memory for LucidMemory {
         limit: usize,
     ) -> anyhow::Result<Vec<MessageEvent>> {
         self.local.list_message_events_since(principal, after_id, limit).await
+    }
+
+    async fn list_message_events_recent(
+        &self,
+        principal: &MemoryPrincipal,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.local.list_message_events_recent(principal, limit).await
     }
 
     async fn load_recent_shared_context(&self, query: SharedContextQuery) -> anyhow::Result<Vec<MessageEvent>> {
@@ -376,6 +389,43 @@ impl Memory for LucidMemory {
         limit: usize,
     ) -> anyhow::Result<Vec<MemoryEvent>> {
         self.local.list_memory_events_since(principal, after_id, limit).await
+    }
+
+    async fn list_memory_events_recent(
+        &self,
+        principal: &MemoryPrincipal,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEvent>> {
+        self.local.list_memory_events_recent(principal, limit).await
+    }
+
+    async fn ingest_document(&self, input: DocumentIngestInput) -> anyhow::Result<DocumentRecord> {
+        self.local.ingest_document(input).await
+    }
+
+    async fn search_document_chunks(
+        &self,
+        principal: &MemoryPrincipal,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DocumentSearchResult>> {
+        self.local.search_document_chunks(principal, query, limit).await
+    }
+
+    async fn get_document_chunk(&self, chunk_id: &str) -> anyhow::Result<Option<DocumentChunkRecord>> {
+        self.local.get_document_chunk(chunk_id).await
+    }
+
+    async fn link_memory_source(&self, input: MemoryLinkInput) -> anyhow::Result<MemoryLink> {
+        self.local.link_memory_source(input).await
+    }
+
+    async fn append_retrieval_trace(&self, input: RetrievalTraceInput) -> anyhow::Result<RetrievalTrace> {
+        self.local.append_retrieval_trace(input).await
+    }
+
+    async fn append_compaction_run(&self, input: CompactionRunInput) -> anyhow::Result<CompactionRun> {
+        self.local.append_compaction_run(input).await
     }
 }
 

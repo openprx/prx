@@ -9,16 +9,17 @@
 //! - `steer` action: inject a message into a running sub-agent's context
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::agent::loop_::{ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
+use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
 use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
 use crate::config::{AgentCompactionConfig, DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
 use crate::hooks::HookManager;
-use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MemoryVisibility, MessageEventScope};
+use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider};
-use crate::security::SecurityPolicy;
-use crate::security::policy::ToolOperation;
+use crate::runtime::envelope::RuntimeEnvelope;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
+use crate::security::{SecurityPolicy, SideEffectGate};
 use crate::session_worker::protocol::{WorkerManifest, WorkerResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -61,6 +62,9 @@ pub struct HistoryEntry {
 pub struct SubAgentRun {
     pub id: String,
     pub task: String,
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub source_message_event_id: Option<String>,
     pub started_at: DateTime<Utc>,
     pub status: SubAgentStatus,
     pub recipient: Option<String>,
@@ -80,6 +84,9 @@ pub(crate) struct SpawnExecutionContext {
     pub(crate) run_id: String,
     pub(crate) session_scope_key: String,
     pub(crate) spawn_depth: usize,
+    pub(crate) owner_id: Option<String>,
+    pub(crate) topic_id: Option<String>,
+    pub(crate) source_message_event_id: Option<String>,
 }
 
 tokio::task_local! {
@@ -92,6 +99,10 @@ struct SpawnScope {
     channel: String,
     chat_type: String,
     chat_id: String,
+    owner_id: Option<String>,
+    topic_id: Option<String>,
+    parent_task_id: Option<String>,
+    source_message_event_id: Option<String>,
 }
 
 fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
@@ -134,6 +145,32 @@ fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
         channel,
         chat_type,
         chat_id,
+        owner_id: scope
+            .get("owner_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        topic_id: scope
+            .get("topic_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        parent_task_id: scope
+            .get("task_id")
+            .or_else(|| scope.get("parent_task_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        source_message_event_id: scope
+            .get("message_event_id")
+            .or_else(|| scope.get("source_message_event_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -153,10 +190,48 @@ fn spawn_session_scope_key(parent_ctx: Option<&SpawnExecutionContext>, scope: Op
     "sessions_spawn:global".to_string()
 }
 
+#[derive(Debug, Clone, Default)]
+struct SpawnLineage {
+    owner_id: Option<String>,
+    topic_id: Option<String>,
+    parent_task_id: Option<String>,
+    source_message_event_id: Option<String>,
+}
+
+fn spawn_lineage(
+    event_scope: &MessageEventScope,
+    parent_ctx: Option<&SpawnExecutionContext>,
+    scope: Option<&SpawnScope>,
+) -> SpawnLineage {
+    SpawnLineage {
+        owner_id: scope
+            .and_then(|scope| scope.owner_id.clone())
+            .or_else(|| parent_ctx.and_then(|ctx| ctx.owner_id.clone()))
+            .or_else(|| event_scope.owner_id.clone()),
+        topic_id: scope
+            .and_then(|scope| scope.topic_id.clone())
+            .or_else(|| parent_ctx.and_then(|ctx| ctx.topic_id.clone())),
+        parent_task_id: parent_ctx
+            .map(|ctx| ctx.run_id.clone())
+            .or_else(|| scope.and_then(|scope| scope.parent_task_id.clone())),
+        source_message_event_id: scope
+            .and_then(|scope| scope.source_message_event_id.clone())
+            .or_else(|| parent_ctx.and_then(|ctx| ctx.source_message_event_id.clone())),
+    }
+}
+
 fn running_run_count(runs: &[SubAgentRun]) -> usize {
     runs.iter()
         .filter(|run| matches!(run.status, SubAgentStatus::Running))
         .count()
+}
+
+const fn status_label(status: &SubAgentStatus) -> &'static str {
+    match status {
+        SubAgentStatus::Running => "running",
+        SubAgentStatus::Completed(_) => "completed",
+        SubAgentStatus::Failed(_) => "failed",
+    }
 }
 
 /// Tool that spawns an asynchronous sub-agent to handle a task in isolation.
@@ -283,26 +358,29 @@ impl SessionsSpawnTool {
 }
 
 fn spawn_event_scope(
+    workspace_id: &str,
     run_id: &str,
     session_scope_key: &str,
     parent_run_id: Option<&str>,
     agent_name: Option<&str>,
     scope: Option<&SpawnScope>,
 ) -> MessageEventScope {
-    let mut event_scope = MessageEventScope::new("sessions_spawn", MemoryVisibility::Workspace)
-        .with_channel(scope.map_or("sessions_spawn", |scope| scope.channel.as_str()))
-        .with_session_key(session_scope_key)
-        .with_run_id(run_id);
+    let mut envelope = RuntimeEnvelope::sessions_spawn(workspace_id, session_scope_key, run_id)
+        .with_channel(scope.map_or("sessions_spawn", |scope| scope.channel.as_str()));
     if let Some(parent_run_id) = parent_run_id {
-        event_scope = event_scope.with_parent_run_id(parent_run_id);
+        envelope = envelope.with_parent_run_id(parent_run_id);
     }
     if let Some(agent_name) = agent_name {
-        event_scope = event_scope.with_agent_id(agent_name);
+        envelope = envelope.with_agent_id(agent_name);
     }
     if let Some(scope) = scope {
-        event_scope = event_scope
+        envelope = envelope
             .with_sender(scope.sender.as_str())
             .with_recipient(scope.chat_id.as_str());
+    }
+    let mut event_scope = envelope.message_scope();
+    if let Some(owner_id) = scope.and_then(|scope| scope.owner_id.as_deref()) {
+        event_scope.owner_id = Some(owner_id.to_string());
     }
     event_scope
 }
@@ -315,10 +393,16 @@ async fn record_spawn_request_event(
     provider_name: &str,
     model: &str,
     max_iterations: usize,
+    lineage: &SpawnLineage,
 ) {
     let Some(fabric) = fabric else {
         return;
     };
+    let task_event_scope = scope.clone();
+    let task_id = task_event_scope
+        .run_id
+        .clone()
+        .unwrap_or_else(|| "sessions_spawn:unknown".to_string());
     if let Err(error) = fabric
         .record_inbound_user_message(
             scope,
@@ -329,7 +413,11 @@ async fn record_spawn_request_event(
                     "mode": mode,
                     "provider": provider_name,
                     "model": model,
-                    "max_iterations": max_iterations
+                    "max_iterations": max_iterations,
+                    "owner_id": lineage.owner_id,
+                    "topic_id": lineage.topic_id,
+                    "parent_task_id": lineage.parent_task_id,
+                    "source_message_event_id": lineage.source_message_event_id
                 })
                 .to_string(),
             ),
@@ -338,6 +426,30 @@ async fn record_spawn_request_event(
     {
         tracing::warn!("failed to record sessions_spawn request event: {error}");
     }
+    if let Err(error) = fabric
+        .record_task_event(
+            task_event_scope,
+            task_id,
+            "task.spawned",
+            Some(
+                json!({
+                    "task": task,
+                    "mode": mode,
+                    "provider": provider_name,
+                    "model": model,
+                    "max_iterations": max_iterations,
+                    "owner_id": lineage.owner_id,
+                    "topic_id": lineage.topic_id,
+                    "parent_task_id": lineage.parent_task_id,
+                    "source_message_event_id": lineage.source_message_event_id
+                })
+                .to_string(),
+            ),
+        )
+        .await
+    {
+        tracing::warn!("failed to record sessions_spawn task.spawned event: {error}");
+    }
 }
 
 async fn record_spawn_result_event(
@@ -345,10 +457,16 @@ async fn record_spawn_result_event(
     scope: MessageEventScope,
     result_text: &str,
     status: &SubAgentStatus,
+    lineage: &SpawnLineage,
 ) {
     let Some(fabric) = fabric else {
         return;
     };
+    let task_event_scope = scope.clone();
+    let task_id = task_event_scope
+        .run_id
+        .clone()
+        .unwrap_or_else(|| "sessions_spawn:unknown".to_string());
     let (success, error) = match status {
         SubAgentStatus::Completed(_) => (true, None),
         SubAgentStatus::Running => (false, Some("still running".to_string())),
@@ -358,11 +476,44 @@ async fn record_spawn_result_event(
         .record_worker_result(
             scope,
             result_text,
-            Some(json!({ "success": success, "error": error }).to_string()),
+            Some(
+                json!({
+                    "success": success,
+                    "error": error,
+                    "owner_id": lineage.owner_id,
+                    "topic_id": lineage.topic_id,
+                    "parent_task_id": lineage.parent_task_id,
+                    "source_message_event_id": lineage.source_message_event_id
+                })
+                .to_string(),
+            ),
         )
         .await
     {
         tracing::warn!("failed to record sessions_spawn result event: {error}");
+    }
+    let task_event_type = if success { "task.completed" } else { "task.failed" };
+    if let Err(error) = fabric
+        .record_task_event(
+            task_event_scope,
+            task_id,
+            task_event_type,
+            Some(
+                json!({
+                    "success": success,
+                    "error": error,
+                    "result_preview": result_text.chars().take(500).collect::<String>(),
+                    "owner_id": lineage.owner_id,
+                    "topic_id": lineage.topic_id,
+                    "parent_task_id": lineage.parent_task_id,
+                    "source_message_event_id": lineage.source_message_event_id
+                })
+                .to_string(),
+            ),
+        )
+        .await
+    {
+        tracing::warn!("failed to record sessions_spawn {task_event_type} event: {error}");
     }
 }
 
@@ -458,6 +609,7 @@ impl Tool for SessionsSpawnTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("spawn");
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
 
         match action {
             "list" => return self.execute_list().await,
@@ -468,7 +620,7 @@ impl Tool for SessionsSpawnTool {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter for kill action"))?;
-                return self.execute_kill(run_id).await;
+                return self.execute_kill(run_id, approval_grant.as_ref()).await;
             }
             "history" => {
                 let run_id = args
@@ -492,7 +644,7 @@ impl Tool for SessionsSpawnTool {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'message' parameter for steer action"))?;
-                return self.execute_steer(run_id, message).await;
+                return self.execute_steer(run_id, message, approval_grant.as_ref()).await;
             }
             _ => {} // fall through to spawn
         }
@@ -615,11 +767,12 @@ impl Tool for SessionsSpawnTool {
             }
         }
 
-        // Security check
-        if let Err(error) = self
-            .security
-            .enforce_tool_operation(ToolOperation::Act, "sessions_spawn")
-        {
+        if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
+            self.name(),
+            "sessions_spawn:spawn",
+            ResourceRiskLevel::Low,
+            approval_grant.as_ref(),
+        ) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -714,12 +867,14 @@ impl Tool for SessionsSpawnTool {
                 .with_event_recording(self.event_recording)
         });
         let spawn_scope_for_event = spawn_event_scope(
+            &self.workspace_dir.to_string_lossy(),
             &run_id,
             &session_scope_key,
             parent_run_id.as_deref(),
             agent_name.as_deref(),
             spawn_scope.as_ref(),
         );
+        let run_lineage = spawn_lineage(&spawn_scope_for_event, parent_exec_ctx.as_ref(), spawn_scope.as_ref());
         record_spawn_request_event(
             memory_fabric.as_ref(),
             spawn_scope_for_event.clone(),
@@ -728,6 +883,7 @@ impl Tool for SessionsSpawnTool {
             &resolved_provider_name,
             &resolved_model,
             resolved_max_iterations,
+            &run_lineage,
         )
         .await;
 
@@ -740,6 +896,9 @@ impl Tool for SessionsSpawnTool {
                 runs.push(SubAgentRun {
                     id: run_id.clone(),
                     task: task.to_string(),
+                    owner_id: run_lineage.owner_id.clone(),
+                    topic_id: run_lineage.topic_id.clone(),
+                    source_message_event_id: run_lineage.source_message_event_id.clone(),
                     started_at: Utc::now(),
                     status: SubAgentStatus::Running,
                     recipient: recipient.clone(),
@@ -807,9 +966,13 @@ impl Tool for SessionsSpawnTool {
                 run_id: rid.clone(),
                 session_scope_key: session_scope_key.clone(),
                 spawn_depth,
+                owner_id: run_lineage.owner_id.clone(),
+                topic_id: run_lineage.topic_id.clone(),
+                source_message_event_id: run_lineage.source_message_event_id.clone(),
             };
             let process_memory_fabric = memory_fabric.clone();
             let process_result_scope = spawn_scope_for_event.clone();
+            let process_lineage = run_lineage.clone();
 
             let jh = tokio::spawn(SPAWN_EXECUTION_CONTEXT.scope(process_execution_ctx, async move {
                 tracing::info!(run_id = %rid, "Sub-agent process starting");
@@ -833,6 +996,7 @@ impl Tool for SessionsSpawnTool {
                     &process_session_scope_key,
                     process_parent_run_id.as_deref(),
                     process_agent_id.as_deref(),
+                    &process_lineage,
                     &process_memory_strategy,
                     process_event_recording,
                     &process_compaction_config,
@@ -858,6 +1022,7 @@ impl Tool for SessionsSpawnTool {
                     process_result_scope,
                     &result_text,
                     &status,
+                    &process_lineage,
                 )
                 .await;
 
@@ -908,6 +1073,9 @@ impl Tool for SessionsSpawnTool {
             runs.push(SubAgentRun {
                 id: run_id.clone(),
                 task: task.to_string(),
+                owner_id: run_lineage.owner_id.clone(),
+                topic_id: run_lineage.topic_id.clone(),
+                source_message_event_id: run_lineage.source_message_event_id.clone(),
                 started_at: Utc::now(),
                 status: SubAgentStatus::Running,
                 recipient: recipient.clone(),
@@ -954,14 +1122,19 @@ impl Tool for SessionsSpawnTool {
         let multimodal_config = self.multimodal_config.clone();
         let security = self.security.clone();
         let task_scope = spawn_scope.clone();
+        let task_memory = self.memory.clone();
         let compaction_config = self.compaction_config.clone();
         let task_execution_ctx = SpawnExecutionContext {
             run_id: rid.clone(),
             session_scope_key: session_scope_key.clone(),
             spawn_depth,
+            owner_id: run_lineage.owner_id.clone(),
+            topic_id: run_lineage.topic_id.clone(),
+            source_message_event_id: run_lineage.source_message_event_id.clone(),
         };
         let task_memory_fabric = memory_fabric.clone();
         let task_result_scope = spawn_scope_for_event.clone();
+        let task_lineage = run_lineage.clone();
         let (system_prompt, filtered_tools) = if let Some((agent, cfg)) = selected_agent {
             let identity_prompt = cfg
                 .identity_dir
@@ -1014,6 +1187,7 @@ impl Tool for SessionsSpawnTool {
                     steer_rx,
                     history_arc,
                     task_scope,
+                    task_memory,
                 ),
             )
             .await;
@@ -1032,7 +1206,14 @@ impl Tool for SessionsSpawnTool {
             };
 
             let announce = format_announce_message(&rid, &status, &result_text);
-            record_spawn_result_event(task_memory_fabric.as_ref(), task_result_scope, &result_text, &status).await;
+            record_spawn_result_event(
+                task_memory_fabric.as_ref(),
+                task_result_scope,
+                &result_text,
+                &status,
+                &task_lineage,
+            )
+            .await;
 
             // Update run status
             {
@@ -1081,6 +1262,43 @@ impl Tool for SessionsSpawnTool {
 }
 
 impl SessionsSpawnTool {
+    fn memory_fabric(&self) -> Option<MemoryFabric> {
+        self.memory.as_ref().map(|memory| {
+            MemoryFabric::new(memory.clone(), self.workspace_dir.to_string_lossy())
+                .with_event_recording(self.event_recording)
+        })
+    }
+
+    async fn record_active_run_task_event(&self, run: &SubAgentRun, event_type: &str, payload: serde_json::Value) {
+        let Some(fabric) = self.memory_fabric() else {
+            return;
+        };
+        let mut scope = MessageEventScope::new("sessions_spawn", crate::memory::MemoryVisibility::Workspace)
+            .with_session_key(run.session_scope_key.clone())
+            .with_run_id(run.id.clone());
+        if let Some(owner_id) = run.owner_id.as_deref() {
+            scope = scope.with_owner_id(owner_id);
+        }
+        if let Some(parent_run_id) = run.parent_run_id.as_deref() {
+            scope = scope.with_parent_run_id(parent_run_id);
+        }
+        let payload = json!({
+            "task": run.task,
+            "status": status_label(&run.status),
+            "owner_id": run.owner_id,
+            "topic_id": run.topic_id,
+            "parent_task_id": run.parent_run_id,
+            "source_message_event_id": run.source_message_event_id,
+            "detail": payload
+        });
+        if let Err(error) = fabric
+            .record_task_event(scope, run.id.clone(), event_type.to_string(), Some(payload.to_string()))
+            .await
+        {
+            tracing::warn!(run_id = %run.id, event_type, "failed to record sessions_spawn task event: {error}");
+        }
+    }
+
     /// List all tracked sub-agent runs.
     async fn execute_list(&self) -> anyhow::Result<ToolResult> {
         let runs = self.active_runs.read().await;
@@ -1121,12 +1339,25 @@ impl SessionsSpawnTool {
     }
 
     /// Kill a running sub-agent by its run ID.
-    async fn execute_kill(&self, run_id: &str) -> anyhow::Result<ToolResult> {
-        let (recipient_opt, rid) = {
+    async fn execute_kill(&self, run_id: &str, approval_grant: Option<&ApprovalGrant>) -> anyhow::Result<ToolResult> {
+        let (recipient_opt, rid, killed_run) = {
             let mut runs = self.active_runs.write().await;
             if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
                 match &run.status {
                     SubAgentStatus::Running => {
+                        let operation_name = format!("sessions_spawn:kill:{run_id}");
+                        if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
+                            self.name(),
+                            &operation_name,
+                            ResourceRiskLevel::Medium,
+                            approval_grant,
+                        ) {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(error),
+                            });
+                        }
                         if let Some(ah) = run.abort_handle.as_ref() {
                             ah.abort();
                         }
@@ -1134,7 +1365,7 @@ impl SessionsSpawnTool {
                         let rid = run.id.clone();
                         run.status = SubAgentStatus::Failed("killed by user".into());
                         run.steer_tx = None;
-                        (recipient, rid)
+                        (recipient, rid, run.clone())
                     }
                     SubAgentStatus::Completed(_) => {
                         return Ok(ToolResult {
@@ -1159,6 +1390,9 @@ impl SessionsSpawnTool {
                 });
             }
         };
+
+        self.record_active_run_task_event(&killed_run, "task.killed", json!({"reason": "killed by user"}))
+            .await;
 
         if let Some(target) = recipient_opt {
             let msg_text = format!("🤖 Sub-agent `{rid}` was killed by user.");
@@ -1227,50 +1461,81 @@ impl SessionsSpawnTool {
     }
 
     /// Inject a steering message into a running sub-agent.
-    async fn execute_steer(&self, run_id: &str, message: &str) -> anyhow::Result<ToolResult> {
-        let runs = self.active_runs.read().await;
-        let Some(run) = runs.iter().find(|r| r.id == run_id) else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("No run found with ID `{run_id}`.")),
-            });
-        };
+    async fn execute_steer(
+        &self,
+        run_id: &str,
+        message: &str,
+        approval_grant: Option<&ApprovalGrant>,
+    ) -> anyhow::Result<ToolResult> {
+        let run_snapshot = {
+            let runs = self.active_runs.read().await;
+            let Some(run) = runs.iter().find(|r| r.id == run_id) else {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("No run found with ID `{run_id}`.")),
+                });
+            };
 
-        match &run.status {
-            SubAgentStatus::Running => {
-                if let Some(ref tx) = run.steer_tx {
+            match &run.status {
+                SubAgentStatus::Running => {
+                    let Some(ref tx) = run.steer_tx else {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "Run `{run_id}` is running but has no steer channel (legacy run)."
+                            )),
+                        });
+                    };
+                    let operation_name = format!("sessions_spawn:steer:{run_id}");
+                    if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
+                        self.name(),
+                        &operation_name,
+                        ResourceRiskLevel::Low,
+                        approval_grant,
+                    ) {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(error),
+                        });
+                    }
                     tx.send(message.to_string())
                         .map_err(|_| anyhow::anyhow!("Sub-agent steer channel closed unexpectedly"))?;
-                    Ok(ToolResult {
-                        success: true,
-                        output: format!(
-                            "Steering message sent to sub-agent `{run_id}`. \
-                             The agent will incorporate it at the next opportunity."
-                        ),
-                        error: None,
-                    })
-                } else {
-                    Ok(ToolResult {
+                    run.clone()
+                }
+                SubAgentStatus::Completed(_) => {
+                    return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!(
-                            "Run `{run_id}` is running but has no steer channel (legacy run)."
-                        )),
-                    })
+                        error: Some(format!("Run `{run_id}` already completed; cannot steer.")),
+                    });
+                }
+                SubAgentStatus::Failed(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Run `{run_id}` already failed ({e}); cannot steer.")),
+                    });
                 }
             }
-            SubAgentStatus::Completed(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Run `{run_id}` already completed; cannot steer.")),
-            }),
-            SubAgentStatus::Failed(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Run `{run_id}` already failed ({e}); cannot steer.")),
-            }),
-        }
+        };
+
+        self.record_active_run_task_event(
+            &run_snapshot,
+            "task.steered",
+            json!({"message_preview": message.chars().take(500).collect::<String>()}),
+        )
+        .await;
+        Ok(ToolResult {
+            success: true,
+            output: format!(
+                "Steering message sent to sub-agent `{run_id}`. \
+                 The agent will incorporate it at the next opportunity."
+            ),
+            error: None,
+        })
     }
 }
 
@@ -1471,6 +1736,7 @@ async fn run_sub_agent_task(
     mut steer_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     history_out: Arc<RwLock<Vec<HistoryEntry>>>,
     scope: Option<SpawnScope>,
+    memory: Option<Arc<dyn Memory>>,
 ) -> anyhow::Result<String> {
     // --- No-tools fallback: single-turn completion ---
     let Some(tools_registry) = tools else {
@@ -1517,6 +1783,7 @@ async fn run_sub_agent_task(
         let cancel_token_owned = cancel_token.clone();
         let security = security.clone();
         let scope_owned = scope.clone();
+        let memory_owned = memory.clone();
 
         let mut loop_handle = tokio::spawn(async move {
             let observer = NoopObserver;
@@ -1527,6 +1794,10 @@ async fn run_sub_agent_task(
                 channel: scope.channel.as_str(),
                 chat_type: scope.chat_type.as_str(),
                 chat_id: scope.chat_id.as_str(),
+                owner_id: scope.owner_id.as_deref(),
+                topic_id: scope.topic_id.as_deref(),
+                task_id: scope.parent_task_id.as_deref(),
+                source_message_event_id: scope.source_message_event_id.as_deref(),
                 policy_pipeline: None,
             });
             let result = run_tool_call_loop(
@@ -1562,6 +1833,11 @@ async fn run_sub_agent_task(
                 scope_ctx.as_ref(),
                 None,
                 None, // spawned sessions do not use tool tiering
+                scope_ctx.as_ref().and_then(|ctx| {
+                    memory_owned
+                        .as_ref()
+                        .map(|memory| DocumentIngestRuntime::from_scope(memory.clone(), ctx))
+                }),
                 crate::agent::loop_::ChatMode::default(),
             )
             .await;
@@ -1710,6 +1986,7 @@ async fn run_sub_agent_process(
     session_scope_key: &str,
     parent_run_id: Option<&str>,
     agent_id: Option<&str>,
+    lineage: &SpawnLineage,
     memory_strategy: &str,
     event_recording: MemoryEventRecording,
     compaction_config: &AgentCompactionConfig,
@@ -1757,6 +2034,7 @@ async fn run_sub_agent_process(
     };
 
     let manifest = WorkerManifest {
+        parent_capability: Some(Uuid::new_v4().to_string()),
         run_id: run_id.to_string(),
         task: task.to_string(),
         provider_name: provider_name.to_string(),
@@ -1781,6 +2059,10 @@ async fn run_sub_agent_process(
         scope_channel: scope.map(|ctx| ctx.channel.clone()),
         scope_chat_type: scope.map(|ctx| ctx.chat_type.clone()),
         scope_chat_id: scope.map(|ctx| ctx.chat_id.clone()),
+        owner_id: lineage.owner_id.clone(),
+        topic_id: lineage.topic_id.clone(),
+        parent_task_id: lineage.parent_task_id.clone(),
+        source_message_event_id: lineage.source_message_event_id.clone(),
         spawn_depth,
         session_scope_key: session_scope_key.to_string(),
         parent_run_id: parent_run_id.map(str::to_string),
@@ -1790,6 +2072,9 @@ async fn run_sub_agent_process(
     let executable = std::env::current_exe()?;
     let cli_args = build_session_worker_cli_args(&manifest)?;
     let mut command = tokio::process::Command::new(executable);
+    if let Some(parent_capability) = manifest.parent_capability.as_deref() {
+        command.env("OPENPRX_SESSION_WORKER_CAPABILITY", parent_capability);
+    }
     command
         .args(cli_args)
         .stdin(std::process::Stdio::piped())
@@ -1918,7 +2203,7 @@ mod tests {
     )]
     use super::*;
     use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
-    use crate::memory::{MemoryPrincipal, SqliteMemory};
+    use crate::memory::{Memory, MemoryPrincipal, SqliteMemory};
     use crate::security::SecurityPolicy;
     use anyhow::anyhow;
     use std::collections::HashMap;
@@ -2182,7 +2467,9 @@ mod tests {
                     "sender": "alice",
                     "channel": "telegram",
                     "chat_type": "direct",
-                    "chat_id": "chat-1"
+                    "chat_id": "chat-1",
+                    "topic_id": "topic-1",
+                    "source_message_event_id": "msg-1"
                 }
             }))
             .await
@@ -2200,6 +2487,7 @@ mod tests {
                     session_key: Some("telegram:chat-1:alice".to_string()),
                     channel: Some("telegram".to_string()),
                     sender: Some("alice".to_string()),
+                    owner_id: None,
                 },
                 0,
                 10,
@@ -2210,10 +2498,53 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].source, "sessions_spawn");
         assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].owner_id.as_deref(), Some("owner:/tmp:telegram:alice"));
         assert_eq!(events[0].content, "write through fabric");
         assert_eq!(events[1].source, "sessions_spawn");
         assert_eq!(events[1].role, "event");
+        assert_eq!(events[1].owner_id.as_deref(), Some("owner:/tmp:telegram:alice"));
         assert!(events[1].content.contains("fabric result"));
+        let request_payload: serde_json::Value = serde_json::from_str(events[0].raw_payload_json.as_deref().unwrap())
+            .expect("request payload should be json");
+        assert_eq!(request_payload["topic_id"].as_str(), Some("topic-1"));
+        assert_eq!(request_payload["source_message_event_id"].as_str(), Some("msg-1"));
+
+        let memory_events = memory
+            .list_memory_events_since(
+                &MemoryPrincipal {
+                    workspace_id: "/tmp".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("telegram:chat-1:alice".to_string()),
+                    channel: Some("telegram".to_string()),
+                    sender: Some("alice".to_string()),
+                    owner_id: None,
+                },
+                0,
+                20,
+            )
+            .await
+            .unwrap();
+        let task_events = memory_events
+            .iter()
+            .filter(|event| event.subject_table == "tasks")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            task_events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task.spawned", "task.completed"]
+        );
+        assert!(
+            task_events
+                .iter()
+                .all(|event| event.subject_id == events[0].run_id.as_deref().unwrap())
+        );
+        let task_payload: serde_json::Value =
+            serde_json::from_str(task_events[0].payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(task_payload["topic_id"].as_str(), Some("topic-1"));
+        assert_eq!(task_payload["source_message_event_id"].as_str(), Some("msg-1"));
     }
 
     #[tokio::test]
@@ -2296,6 +2627,9 @@ mod tests {
                     run_id: "parent-run".to_string(),
                     session_scope_key: "signal:group:test".to_string(),
                     spawn_depth: 0,
+                    owner_id: Some("owner-a".to_string()),
+                    topic_id: Some("topic-a".to_string()),
+                    source_message_event_id: Some("msg-a".to_string()),
                 },
                 async { tool.execute(json!({"task": "nested"})).await },
             )
@@ -2372,6 +2706,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_action_obeys_readonly_resource_gate() {
+        let (ch, _) = RecordingChannel::new();
+        let readonly_security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::policy::AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = SessionsSpawnTool::new(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "done".into(),
+            }),
+            "test-provider",
+            "test-model",
+            0.7,
+            readonly_security,
+            std::path::PathBuf::from("/tmp"),
+            crate::config::MultimodalConfig::default(),
+            crate::config::AgentCompactionConfig::default(),
+            HashMap::new(),
+            None,
+            crate::providers::ProviderRuntimeOptions::default(),
+            crate::config::SessionsSpawnConfig::default(),
+        );
+
+        let result = tool.execute(json!({"task": "blocked"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("read-only mode"));
+    }
+
+    #[tokio::test]
+    async fn kill_action_requires_resource_grant() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "done".into(),
+            }),
+        )
+        .with_shared_memory(memory.clone());
+        {
+            let mut runs = tool.active_runs.write().await;
+            runs.push(SubAgentRun {
+                id: "run-1".to_string(),
+                task: "task".to_string(),
+                owner_id: Some("owner-a".to_string()),
+                topic_id: Some("topic-a".to_string()),
+                source_message_event_id: Some("msg-a".to_string()),
+                started_at: Utc::now(),
+                status: SubAgentStatus::Running,
+                recipient: None,
+                abort_handle: None,
+                history: Arc::new(RwLock::new(Vec::new())),
+                steer_tx: None,
+                parent_run_id: None,
+                session_scope_key: "test-session".to_string(),
+                spawn_depth: 0,
+            });
+        }
+
+        let denied = tool
+            .execute(json!({"action": "kill", "run_id": "run-1"}))
+            .await
+            .unwrap();
+        assert!(!denied.success);
+        assert!(denied.error.unwrap_or_default().contains("runtime approval grant"));
+
+        let allowed = tool
+            .execute(json!({
+                "action": "kill",
+                "run_id": "run-1",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    serde_json::to_value(ApprovalGrant::for_resource_operation(
+                        "sessions_spawn",
+                        "sessions_spawn:kill:run-1",
+                        "test",
+                        None
+                    )).unwrap()
+            }))
+            .await
+            .unwrap();
+        assert!(allowed.success);
+
+        let events = memory
+            .list_memory_events_since(
+                &MemoryPrincipal {
+                    workspace_id: "/tmp".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("test-session".to_string()),
+                    channel: None,
+                    sender: None,
+                    owner_id: None,
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        let killed = events
+            .iter()
+            .find(|event| event.event_type == "task.killed")
+            .expect("task.killed event should be persisted");
+        assert_eq!(killed.subject_table, "tasks");
+        assert_eq!(killed.subject_id, "run-1");
+        let payload: serde_json::Value = serde_json::from_str(killed.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["owner_id"].as_str(), Some("owner-a"));
+        assert_eq!(payload["topic_id"].as_str(), Some("topic-a"));
+        assert_eq!(payload["source_message_event_id"].as_str(), Some("msg-a"));
+    }
+
+    #[tokio::test]
+    async fn active_runs_store_owner_topic_lineage() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "done".into(),
+            }),
+        );
+
+        let result = tool
+            .execute(json!({
+                "task": "lineage task",
+                "_zc_scope_trusted": true,
+                "_zc_scope": {
+                    "sender": "alice",
+                    "channel": "telegram",
+                    "chat_type": "direct",
+                    "chat_id": "chat-1",
+                    "topic_id": "topic-a",
+                    "task_id": "parent-task",
+                    "message_event_id": "msg-a"
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let runs = tool.active_runs_snapshot().await;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].owner_id.as_deref(), Some("owner:/tmp:telegram:alice"));
+        assert_eq!(runs[0].topic_id.as_deref(), Some("topic-a"));
+        assert_eq!(runs[0].parent_run_id.as_deref(), None);
+        assert_eq!(runs[0].source_message_event_id.as_deref(), Some("msg-a"));
+    }
+
+    #[tokio::test]
     async fn default_recipient_handle_shared() {
         let (ch, _) = RecordingChannel::new();
         let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
@@ -2420,6 +2903,68 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("No run found"));
+    }
+
+    #[tokio::test]
+    async fn steer_action_persists_task_event() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }))
+            .with_shared_memory(memory.clone());
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut runs = tool.active_runs.write().await;
+            runs.push(SubAgentRun {
+                id: "run-steer".to_string(),
+                task: "task".to_string(),
+                owner_id: Some("owner-a".to_string()),
+                topic_id: Some("topic-a".to_string()),
+                source_message_event_id: Some("msg-a".to_string()),
+                started_at: Utc::now(),
+                status: SubAgentStatus::Running,
+                recipient: None,
+                abort_handle: None,
+                history: Arc::new(RwLock::new(Vec::new())),
+                steer_tx: Some(steer_tx),
+                parent_run_id: None,
+                session_scope_key: "test-session".to_string(),
+                spawn_depth: 0,
+            });
+        }
+
+        let result = tool
+            .execute(json!({"action": "steer", "run_id": "run-steer", "message": "pivot now"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(steer_rx.recv().await.as_deref(), Some("pivot now"));
+
+        let events = memory
+            .list_memory_events_since(
+                &MemoryPrincipal {
+                    workspace_id: "/tmp".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("test-session".to_string()),
+                    channel: None,
+                    sender: None,
+                    owner_id: None,
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        let steered = events
+            .iter()
+            .find(|event| event.event_type == "task.steered")
+            .expect("task.steered event should be persisted");
+        assert_eq!(steered.subject_table, "tasks");
+        assert_eq!(steered.subject_id, "run-steer");
+        let payload: serde_json::Value = serde_json::from_str(steered.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["owner_id"].as_str(), Some("owner-a"));
+        assert_eq!(payload["detail"]["message_preview"].as_str(), Some("pivot now"));
     }
 
     #[tokio::test]
@@ -2558,6 +3103,7 @@ mod tests {
     #[test]
     fn process_mode_task_arg_is_not_json_encoded() {
         let manifest = WorkerManifest {
+            parent_capability: Some("capability".to_string()),
             run_id: "run".to_string(),
             task: "say \"hello\"".to_string(),
             provider_name: "provider".to_string(),
@@ -2582,6 +3128,10 @@ mod tests {
             scope_channel: None,
             scope_chat_type: None,
             scope_chat_id: None,
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             spawn_depth: 0,
             session_scope_key: "sessions_spawn:global".to_string(),
             parent_run_id: None,
@@ -2619,6 +3169,43 @@ mod tests {
         );
         assert_eq!(normalize_process_memory_strategy("hybrid").unwrap(), "hybrid");
         assert!(normalize_process_memory_strategy("worker-only").is_err());
+    }
+
+    #[test]
+    fn spawn_event_scope_is_derived_from_runtime_envelope() {
+        let scope = SpawnScope {
+            sender: "alice".to_string(),
+            channel: "telegram".to_string(),
+            chat_type: "direct".to_string(),
+            chat_id: "chat-1".to_string(),
+            owner_id: None,
+            topic_id: Some("topic-a".to_string()),
+            parent_task_id: Some("parent-task".to_string()),
+            source_message_event_id: Some("msg-a".to_string()),
+        };
+        let event_scope = spawn_event_scope(
+            "/tmp/ws",
+            "run-child",
+            "telegram:chat-1:alice",
+            Some("run-parent"),
+            Some("agent-a"),
+            Some(&scope),
+        );
+
+        assert_eq!(event_scope.source, "sessions_spawn");
+        assert_eq!(event_scope.channel.as_deref(), Some("telegram"));
+        assert_eq!(event_scope.session_key.as_deref(), Some("telegram:chat-1:alice"));
+        assert_eq!(event_scope.run_id.as_deref(), Some("run-child"));
+        assert_eq!(event_scope.parent_run_id.as_deref(), Some("run-parent"));
+        assert_eq!(event_scope.agent_id.as_deref(), Some("agent-a"));
+        assert_eq!(event_scope.sender.as_deref(), Some("alice"));
+        assert_eq!(event_scope.recipient.as_deref(), Some("chat-1"));
+        assert_eq!(event_scope.owner_id.as_deref(), Some("owner:/tmp/ws:telegram:alice"));
+        let lineage = spawn_lineage(&event_scope, None, Some(&scope));
+        assert_eq!(lineage.owner_id.as_deref(), Some("owner:/tmp/ws:telegram:alice"));
+        assert_eq!(lineage.topic_id.as_deref(), Some("topic-a"));
+        assert_eq!(lineage.parent_task_id.as_deref(), Some("parent-task"));
+        assert_eq!(lineage.source_message_event_id.as_deref(), Some("msg-a"));
     }
 
     #[tokio::test]

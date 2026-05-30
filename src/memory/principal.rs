@@ -7,6 +7,80 @@ use uuid::Uuid;
 
 pub const CURRENT_POLICY_VERSION: i64 = 1;
 
+/// Canonical owner-centric identity carried by runtime ingress.
+///
+/// Phase 0 maps this onto existing `sender_id`/`raw_sender` columns so current
+/// SQLite/Postgres ACL code can start using a shared owner anchor without a
+/// disruptive schema rewrite. Later phases can persist `owner_id` explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerPrincipal {
+    pub owner_id: String,
+    pub principal_id: String,
+    pub workspace_id: String,
+    pub source_channel: String,
+    pub external_subject: String,
+    pub session_key: String,
+    pub roles: Vec<Role>,
+    pub policy_version: i64,
+}
+
+impl OwnerPrincipal {
+    #[must_use]
+    pub fn new(
+        workspace_id: impl Into<String>,
+        source_channel: impl Into<String>,
+        external_subject: impl Into<String>,
+        session_key: impl Into<String>,
+        roles: Vec<Role>,
+    ) -> Self {
+        let workspace_id = workspace_id.into();
+        let source_channel = normalize_identity_part(source_channel.into(), "local");
+        let external_subject = normalize_identity_part(external_subject.into(), "unknown");
+        let session_key = normalize_identity_part(session_key.into(), "session");
+        let principal_id = format!("{source_channel}:{external_subject}");
+        let owner_id = format!("owner:{workspace_id}:{principal_id}");
+
+        Self {
+            owner_id,
+            principal_id,
+            workspace_id,
+            source_channel,
+            external_subject,
+            session_key,
+            roles,
+            policy_version: CURRENT_POLICY_VERSION,
+        }
+    }
+
+    #[must_use]
+    pub fn from_write_context(
+        workspace_id: impl Into<String>,
+        session_key: impl Into<String>,
+        ctx: &MemoryWriteContext,
+    ) -> Self {
+        Self::new(
+            workspace_id,
+            ctx.channel.as_deref().unwrap_or("local"),
+            ctx.sender_id
+                .as_deref()
+                .or(ctx.raw_sender.as_deref())
+                .unwrap_or("unknown"),
+            session_key,
+            vec![Role::Anonymous],
+        )
+    }
+}
+
+fn normalize_identity_part(value: impl Into<String>, fallback: &str) -> String {
+    let value = value.into();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.replace(['\n', '\r', '\t'], " ")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
     Owner,
@@ -502,6 +576,25 @@ mod tests {
 
         assert_eq!(principal.role, Role::Anonymous);
         assert_eq!(principal.user_id, "anonymous:signal:sender-a");
+    }
+
+    #[test]
+    fn owner_principal_from_write_context_uses_sender_id_as_stable_anchor() {
+        let ctx = MemoryWriteContext {
+            channel: Some("signal".into()),
+            chat_type: Some("dm".into()),
+            chat_id: Some("chat-1".into()),
+            sender_id: Some("+15551234567".into()),
+            raw_sender: Some("display-name".into()),
+        };
+
+        let owner = OwnerPrincipal::from_write_context("workspace-a", "signal_display-name", &ctx);
+
+        assert_eq!(owner.workspace_id, "workspace-a");
+        assert_eq!(owner.source_channel, "signal");
+        assert_eq!(owner.external_subject, "+15551234567");
+        assert_eq!(owner.principal_id, "signal:+15551234567");
+        assert_eq!(owner.owner_id, "owner:workspace-a:signal:+15551234567");
     }
 
     #[test]

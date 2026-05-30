@@ -4,10 +4,13 @@
 //! channel(s), uptime, and counts of active/completed/failed sub-agents.
 //! Aligns with OpenClaw's `session_status` tool (📊 session_status).
 
+use super::sessions_read_model::{self, RecoveredTaskStatus};
 use super::sessions_spawn::{SubAgentRun, SubAgentStatus};
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
+use crate::memory::Memory;
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -24,6 +27,8 @@ pub struct SessionStatusTool {
     channels: Vec<String>,
     /// Server startup time for uptime calculation.
     started_at: Instant,
+    memory: Option<Arc<dyn Memory>>,
+    workspace_id: String,
 }
 
 impl SessionStatusTool {
@@ -39,6 +44,22 @@ impl SessionStatusTool {
             model: model.into(),
             channels,
             started_at: Instant::now(),
+            memory: None,
+            workspace_id: String::new(),
+        }
+    }
+
+    pub fn with_shared_memory(mut self, memory: Arc<dyn Memory>, workspace_id: impl Into<String>) -> Self {
+        self.memory = Some(memory);
+        self.workspace_id = workspace_id.into();
+        self
+    }
+
+    fn workspace_id(&self) -> &str {
+        if self.workspace_id.is_empty() {
+            "/tmp"
+        } else {
+            &self.workspace_id
         }
     }
 
@@ -73,11 +94,12 @@ impl Tool for SessionStatusTool {
         })
     }
 
-    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let uptime_secs = self.started_at.elapsed().as_secs();
         let uptime_str = Self::format_uptime(uptime_secs);
 
         let runs = self.active_runs.read().await;
+        let active_ids = runs.iter().map(|run| run.id.clone()).collect::<HashSet<_>>();
         let running_count = runs
             .iter()
             .filter(|r| matches!(r.status, SubAgentStatus::Running))
@@ -90,8 +112,27 @@ impl Tool for SessionStatusTool {
             .iter()
             .filter(|r| matches!(r.status, SubAgentStatus::Failed(_)))
             .count();
-        let total_count = runs.len();
+        let runtime_count = runs.len();
         drop(runs);
+
+        let recovered = sessions_read_model::recover_task_runs(self.memory.as_ref(), self.workspace_id(), &args, 100)
+            .await?
+            .into_iter()
+            .filter(|run| !active_ids.contains(&run.run_id))
+            .collect::<Vec<_>>();
+        let recovered_running = recovered
+            .iter()
+            .filter(|run| matches!(run.status, RecoveredTaskStatus::Running))
+            .count();
+        let recovered_completed = recovered
+            .iter()
+            .filter(|run| matches!(run.status, RecoveredTaskStatus::Completed))
+            .count();
+        let recovered_failed = recovered
+            .iter()
+            .filter(|run| matches!(run.status, RecoveredTaskStatus::Failed))
+            .count();
+        let total_count = runtime_count + recovered.len();
 
         let channels_str = if self.channels.is_empty() {
             "none".to_string()
@@ -107,15 +148,16 @@ impl Tool for SessionStatusTool {
              Channels:  {}\n\
              Uptime:    {}\n\
              \n\
-             Sub-agents: {} total ({} running, {} completed, {} failed)",
+             Sub-agents/tasks: {} total ({} running, {} completed, {} failed; {} memory-backed recovered)",
             self.model,
             self.provider_name,
             channels_str,
             uptime_str,
             total_count,
-            running_count,
-            completed_count,
-            failed_count,
+            running_count + recovered_running,
+            completed_count + recovered_completed,
+            failed_count + recovered_failed,
+            recovered.len(),
         );
 
         Ok(ToolResult {
@@ -136,6 +178,7 @@ impl Tool for SessionStatusTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{MemoryEventInput, MemoryVisibility, SqliteMemory};
     use crate::tools::sessions_spawn::SubAgentStatus;
     use chrono::Utc;
 
@@ -187,6 +230,9 @@ mod tests {
             SubAgentRun {
                 id: "r1".into(),
                 task: "t1".into(),
+                owner_id: None,
+                topic_id: None,
+                source_message_event_id: None,
                 started_at: Utc::now(),
                 status: SubAgentStatus::Running,
                 recipient: None,
@@ -200,6 +246,9 @@ mod tests {
             SubAgentRun {
                 id: "r2".into(),
                 task: "t2".into(),
+                owner_id: None,
+                topic_id: None,
+                source_message_event_id: None,
                 started_at: Utc::now(),
                 status: SubAgentStatus::Completed("done".into()),
                 recipient: None,
@@ -213,6 +262,9 @@ mod tests {
             SubAgentRun {
                 id: "r3".into(),
                 task: "t3".into(),
+                owner_id: None,
+                topic_id: None,
+                source_message_event_id: None,
                 started_at: Utc::now(),
                 status: SubAgentStatus::Failed("oops".into()),
                 recipient: None,
@@ -231,5 +283,76 @@ mod tests {
         assert!(result.output.contains("1 running"));
         assert!(result.output.contains("1 completed"));
         assert!(result.output.contains("1 failed"));
+    }
+
+    #[tokio::test]
+    async fn counts_memory_backed_runs_after_runtime_registry_loss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        memory
+            .append_memory_event(MemoryEventInput {
+                event_id: None,
+                workspace_id: "/tmp".to_string(),
+                event_type: "task.spawned".to_string(),
+                subject_table: "tasks".to_string(),
+                subject_id: "mem-run-1".to_string(),
+                session_key: Some("test-session".to_string()),
+                agent_id: None,
+                persona_id: None,
+                visibility: MemoryVisibility::Workspace,
+                payload_json: Some(json!({"task": "durable task"}).to_string()),
+            })
+            .await
+            .unwrap();
+        memory
+            .append_memory_event(MemoryEventInput {
+                event_id: None,
+                workspace_id: "/tmp".to_string(),
+                event_type: "task.failed".to_string(),
+                subject_table: "tasks".to_string(),
+                subject_id: "mem-run-1".to_string(),
+                session_key: Some("test-session".to_string()),
+                agent_id: None,
+                persona_id: None,
+                visibility: MemoryVisibility::Workspace,
+                payload_json: Some(json!({"error": "boom"}).to_string()),
+            })
+            .await
+            .unwrap();
+
+        let tool = make_tool_with_runs(vec![]).with_shared_memory(memory, "/tmp");
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("1 total"));
+        assert!(result.output.contains("1 failed"));
+        assert!(result.output.contains("1 memory-backed recovered"));
+    }
+
+    #[tokio::test]
+    async fn counts_cron_job_events_from_memory_read_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        memory
+            .append_memory_event(MemoryEventInput {
+                event_id: None,
+                workspace_id: "/tmp".to_string(),
+                event_type: "cron.job.created".to_string(),
+                subject_table: "tasks".to_string(),
+                subject_id: "cron-job-1".to_string(),
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
+                visibility: MemoryVisibility::Workspace,
+                payload_json: Some(json!({"task": "cron lineaged task"}).to_string()),
+            })
+            .await
+            .unwrap();
+
+        let tool = make_tool_with_runs(vec![]).with_shared_memory(memory, "/tmp");
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("1 total"));
+        assert!(result.output.contains("1 running"));
+        assert!(result.output.contains("1 memory-backed recovered"));
     }
 }

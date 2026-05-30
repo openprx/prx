@@ -126,8 +126,8 @@ async fn int_ts_02_risk_classification_medium_needs_approval() {
     assert!(!denied.success, "Medium-risk without approval must be denied");
     let err = denied.error.as_deref().unwrap_or("");
     assert!(
-        err.contains("explicit approval"),
-        "test: expected 'explicit approval' in error, got: {err}"
+        err.contains("runtime approval grant"),
+        "test: expected 'runtime approval grant' in error, got: {err}"
     );
 }
 

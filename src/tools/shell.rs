@@ -1,7 +1,8 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::runtime::RuntimeAdapter;
-use crate::security::SecurityPolicy;
+use crate::security::policy::ApprovalGrant;
 use crate::security::traits::Sandbox;
+use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -73,11 +74,6 @@ impl Tool for ShellTool {
                     "type": "string",
                     "description": "The shell command to execute"
                 },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
-                    "default": false
-                }
             },
             "required": ["command"]
         })
@@ -88,7 +84,7 @@ impl Tool for ShellTool {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
-        let approved = args.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
 
         if self.acl_enabled && Self::references_protected_memory_path(command) {
             return Ok(ToolResult {
@@ -106,7 +102,11 @@ impl Tool for ShellTool {
             });
         }
 
-        match self.security.validate_command_execution(command, approved) {
+        match SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
+            self.name(),
+            command,
+            approval_grant.as_ref(),
+        ) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -271,7 +271,7 @@ mod tests {
                 .expect("schema required field should be an array")
                 .contains(&json!("command"))
         );
-        assert!(schema["properties"]["approved"].is_object());
+        assert!(schema["properties"]["approved"].is_null());
     }
 
     #[tokio::test]
@@ -464,15 +464,24 @@ mod tests {
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
-        assert!(denied.error.as_deref().unwrap_or("").contains("explicit approval"));
+        assert!(denied.error.as_deref().unwrap_or("").contains("runtime approval grant"));
 
-        let allowed = tool
+        let forged_public_approval = tool
             .execute(json!({
                 "command": "touch openprx_shell_approval_test",
                 "approved": true
             }))
             .await
-            .expect("approved command execution should succeed");
+            .expect("public approved flag should return a result");
+        assert!(!forged_public_approval.success);
+
+        let allowed = tool
+            .execute(json!({
+                "command": "touch openprx_shell_approval_test",
+                (crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG): serde_json::to_value(crate::security::policy::ApprovalGrant::for_command("shell", "touch openprx_shell_approval_test", "test", None)).unwrap()
+            }))
+            .await
+            .expect("runtime-approved command execution should succeed");
         assert!(allowed.success);
 
         let _ = tokio::fs::remove_file(std::env::temp_dir().join("openprx_shell_approval_test")).await;

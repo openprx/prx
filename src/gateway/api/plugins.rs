@@ -11,6 +11,7 @@ use axum::{
 };
 
 use super::super::AppState;
+use crate::security::policy::ResourceRiskLevel;
 
 /// GET /api/plugins — list all loaded plugins with status.
 pub async fn list_plugins(State(state): State<AppState>) -> impl IntoResponse {
@@ -42,6 +43,11 @@ pub async fn list_plugins(State(state): State<AppState>) -> impl IntoResponse {
 
 /// POST /api/plugins/{name}/reload — reload a specific plugin.
 pub async fn reload_plugin(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+    if let Err(error) = super::authorize_resource_mutation(&state, "gateway_api:plugins:reload", ResourceRiskLevel::Low)
+    {
+        return error;
+    }
+
     #[cfg(feature = "wasm-plugins")]
     {
         if let Some(ref pm) = state.plugin_manager {

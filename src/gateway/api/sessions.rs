@@ -1,5 +1,14 @@
 use super::{AppState, extract_resource_auth_token};
+use crate::agent::loop_::{
+    DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, build_context_with_shared_events_and_scope,
+    build_runtime_system_prompt, run_tool_call_loop, select_prompt_skills,
+};
+use crate::memory::MemoryFabric;
+use crate::observability::NoopObserver;
 use crate::providers::ChatMessage;
+use crate::runtime::envelope::RuntimeEnvelope;
+use crate::security::policy::ResourceRiskLevel;
+use crate::security::{PolicyPipeline, SecurityPolicy};
 use axum::{
     Json,
     body::Body,
@@ -120,6 +129,196 @@ fn json_error(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+fn console_runtime_envelope(state: &AppState, session_id: &str, channel: &str, sender: &str) -> RuntimeEnvelope {
+    let workspace_id = state.config.lock().workspace_dir.to_string_lossy().to_string();
+    console_runtime_envelope_for_workspace(workspace_id, session_id, channel, sender)
+}
+
+fn console_runtime_envelope_for_workspace(
+    workspace_id: impl Into<String>,
+    session_id: &str,
+    channel: &str,
+    sender: &str,
+) -> RuntimeEnvelope {
+    RuntimeEnvelope::console(workspace_id, session_id.to_string())
+        .with_channel(channel.to_string())
+        .with_sender(sender.to_string())
+}
+
+async fn append_console_turn(
+    state: &AppState,
+    envelope: &RuntimeEnvelope,
+    role: &str,
+    content: &str,
+) -> anyhow::Result<String> {
+    let fabric = MemoryFabric::new(state.mem.clone(), envelope.workspace_id.clone());
+    let event = if role == "assistant" {
+        fabric
+            .record_assistant_message(envelope.message_scope(), content)
+            .await?
+    } else {
+        fabric
+            .record_inbound_user_message(envelope.message_scope(), content, None, None)
+            .await?
+    };
+    let owner_id = envelope.resolved_owner_id();
+
+    state
+        .mem
+        .append_conversation_turn(
+            &envelope.session_key,
+            envelope.channel.as_deref().unwrap_or("console"),
+            envelope.sender.as_deref().unwrap_or("console-user"),
+            role,
+            content,
+            None,
+            Some(&event.event_id),
+            Some(owner_id.as_str()),
+        )
+        .await?;
+
+    Ok(event.event_id)
+}
+
+fn console_tool_descriptions(config: &crate::config::Config) -> Vec<(&'static str, &'static str)> {
+    let mut tool_descs = vec![
+        ("shell", "Execute terminal commands"),
+        ("file_read", "Read file contents"),
+        ("file_write", "Write file contents"),
+        ("memory_store", "Save to memory"),
+        ("memory_recall", "Search memory"),
+        ("memory_forget", "Delete a memory entry"),
+        ("document_search", "Search stored document chunks with source anchors"),
+        ("document_get_chunk", "Read a stored document chunk by id"),
+    ];
+    if config.browser.enabled {
+        tool_descs.push(("browser_open", "Open approved HTTPS URLs in Brave Browser"));
+    }
+    if config.composio.enabled {
+        tool_descs.push(("composio", "Execute configured Composio app actions"));
+    }
+    if !config.agents.is_empty() {
+        tool_descs.push(("delegate", "Delegate a sub-task to a specialized agent"));
+    }
+    tool_descs
+}
+
+async fn run_console_runtime_turn(
+    state: &AppState,
+    envelope: &RuntimeEnvelope,
+    visible_message: &str,
+    previous_turns: Vec<crate::memory::ConversationTurn>,
+    source_message_event_id: Option<String>,
+) -> anyhow::Result<String> {
+    let config_snapshot = state.config.lock().clone();
+    let provider_label = config_snapshot
+        .default_provider
+        .as_deref()
+        .unwrap_or("openrouter")
+        .to_string();
+    let native_tools = state.provider.supports_native_tools();
+    let skill_embedder =
+        crate::memory::create_embedder_from_config(&config_snapshot, config_snapshot.api_key.as_deref());
+    let mut skills = crate::skills::load_skills_with_config(&config_snapshot.workspace_dir, &config_snapshot);
+    if config_snapshot.skill_rag.enabled {
+        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
+    }
+    let selected_skills =
+        select_prompt_skills(visible_message, &skills, &config_snapshot, skill_embedder.as_ref()).await;
+    let tool_descs = console_tool_descriptions(&config_snapshot);
+    let system_prompt = build_runtime_system_prompt(
+        &config_snapshot,
+        &state.model,
+        &tool_descs,
+        &selected_skills,
+        native_tools,
+        state.tools_registry.as_ref(),
+    );
+
+    let semantic_scope = envelope.memory_write_context("private");
+    let mem_context = build_context_with_shared_events_and_scope(
+        state.mem.as_ref(),
+        envelope.memory_principal(),
+        visible_message,
+        config_snapshot.memory.min_relevance_score,
+        Some(&semantic_scope),
+    )
+    .await;
+    let enriched_message = if mem_context.preamble.is_empty() {
+        visible_message.to_string()
+    } else {
+        format!("{}{}", mem_context.preamble, visible_message)
+    };
+
+    let mut history = Vec::with_capacity(previous_turns.len() + 2);
+    history.push(ChatMessage::system(system_prompt));
+    history.extend(previous_turns.into_iter().map(|turn| ChatMessage {
+        role: turn.role,
+        content: turn.content,
+    }));
+    history.push(ChatMessage::user(enriched_message));
+
+    let security = SecurityPolicy::from_config(&config_snapshot.autonomy, &config_snapshot.workspace_dir);
+    let policy_pipeline = PolicyPipeline::from_config(&config_snapshot);
+    let scope_owner_id = envelope.resolved_owner_id();
+    let scope_ctx = ScopeContext {
+        policy: &security,
+        sender: envelope.sender.as_deref().unwrap_or("console-user"),
+        channel: envelope.channel.as_deref().unwrap_or("console"),
+        chat_type: "private",
+        chat_id: &envelope.session_key,
+        owner_id: Some(&scope_owner_id),
+        topic_id: envelope.topic_id.as_deref(),
+        task_id: envelope.resolved_task_id(),
+        source_message_event_id: envelope.source_message_event_id.as_deref(),
+        policy_pipeline: Some(&policy_pipeline),
+    };
+    let noop_observer = NoopObserver;
+
+    run_tool_call_loop(
+        state.provider.as_ref(),
+        &mut history,
+        state.tools_registry.as_ref(),
+        &noop_observer,
+        state.hooks.as_ref(),
+        &provider_label,
+        &state.model,
+        state.temperature,
+        true,
+        None,
+        "console",
+        &config_snapshot.multimodal,
+        config_snapshot.agent.max_tool_iterations,
+        config_snapshot.agent.parallel_tools,
+        config_snapshot.agent.read_only_tool_concurrency_window,
+        config_snapshot.agent.read_only_tool_timeout_secs,
+        config_snapshot.agent.priority_scheduling_enabled,
+        config_snapshot.agent.low_priority_tools.clone(),
+        ToolConcurrencyGovernanceConfig {
+            kill_switch_force_serial: config_snapshot.agent.concurrency_kill_switch_force_serial,
+            rollout_stage: config_snapshot.agent.concurrency_rollout_stage.clone(),
+            rollout_sample_percent: config_snapshot.agent.concurrency_rollout_sample_percent,
+            rollout_channels: config_snapshot.agent.concurrency_rollout_channels.clone(),
+            auto_rollback_enabled: config_snapshot.agent.concurrency_auto_rollback_enabled,
+            rollback_timeout_rate_threshold: config_snapshot.agent.concurrency_rollback_timeout_rate_threshold,
+            rollback_cancel_rate_threshold: config_snapshot.agent.concurrency_rollback_cancel_rate_threshold,
+            rollback_error_rate_threshold: config_snapshot.agent.concurrency_rollback_error_rate_threshold,
+        },
+        Some(&config_snapshot.agent.compaction),
+        None,
+        None,
+        Some(&scope_ctx),
+        None,
+        Some(&config_snapshot.tool_tiering),
+        Some(
+            DocumentIngestRuntime::from_envelope(state.mem.clone(), envelope)
+                .with_source_message_event_id(source_message_event_id),
+        ),
+        crate::agent::loop_::ChatMode::default(),
+    )
+    .await
+}
+
 fn sanitize_upload_filename(raw_name: &str) -> String {
     let file_name = StdPath::new(raw_name)
         .file_name()
@@ -219,11 +418,7 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
         let config = state.config.lock();
         config.workspace_dir.join(UPLOADS_DIR_NAME)
     };
-
-    fs::create_dir_all(&uploads_root).await.map_err(|error| {
-        tracing::error!("Failed to create uploads directory: {error}");
-        json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to prepare uploads directory")
-    })?;
+    let mut uploads_root_prepared = false;
 
     let mut message = String::new();
     let mut attachments = Vec::new();
@@ -263,6 +458,17 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
                         StatusCode::PAYLOAD_TOO_LARGE,
                         "File too large (max 20MB per file)",
                     ));
+                }
+
+                super::authorize_resource_mutation(state, "gateway_api:sessions:upload", ResourceRiskLevel::Low)
+                    .map_err(|error| error.into_response())?;
+
+                if !uploads_root_prepared {
+                    fs::create_dir_all(&uploads_root).await.map_err(|error| {
+                        tracing::error!("Failed to create uploads directory: {error}");
+                        json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to prepare uploads directory")
+                    })?;
+                    uploads_root_prepared = true;
                 }
 
                 let stored_name = format!("{}_{}_{}", Utc::now().timestamp_millis(), file_count, safe_name);
@@ -403,8 +609,8 @@ pub async fn get_session_messages(
     Path(session_id): Path<String>,
     Query(query): Query<SessionMessagesQuery>,
 ) -> impl IntoResponse {
-    let exists = match state.mem.get_conversation_session(&session_id).await {
-        Ok(session) => session.is_some(),
+    let Some(session) = (match state.mem.get_conversation_session(&session_id).await {
+        Ok(session) => session,
         Err(error) => {
             tracing::error!("Failed to load session metadata from DB: {error}");
             return (
@@ -413,18 +619,22 @@ pub async fn get_session_messages(
             )
                 .into_response();
         }
-    };
-    if !exists {
+    }) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Session not found" })),
         )
             .into_response();
-    }
+    };
 
     let limit = normalize_limit(query.limit);
     let offset = normalize_offset(query.offset);
-    let turns = match state.mem.list_conversation_turns(&session_id, limit, offset).await {
+    let principal = console_runtime_envelope(&state, &session_id, &session.channel, &session.sender).memory_principal();
+    let turns = match state
+        .mem
+        .list_conversation_turns(&principal, &session_id, limit, offset)
+        .await
+    {
         Ok(turns) => turns,
         Err(error) => {
             tracing::error!("Failed to load conversation turns from DB: {error}");
@@ -476,8 +686,14 @@ pub async fn post_session_message(
         )
             .into_response();
     };
+    let runtime_envelope = console_runtime_envelope(&state, &session_id, &session.channel, &session.sender);
 
-    let turns = match state.mem.list_conversation_turns(&session_id, MAX_PAGE_LIMIT, 0).await {
+    let principal = runtime_envelope.memory_principal();
+    let turns = match state
+        .mem
+        .list_conversation_turns(&principal, &session_id, MAX_PAGE_LIMIT, 0)
+        .await
+    {
         Ok(turns) => turns,
         Err(error) => {
             tracing::error!("Failed to load conversation history from DB: {error}");
@@ -489,66 +705,45 @@ pub async fn post_session_message(
         }
     };
 
-    let mut history_for_provider: Vec<ChatMessage> = turns
-        .into_iter()
-        .map(|turn| ChatMessage {
-            role: turn.role,
-            content: turn.content,
-        })
-        .collect();
-    history_for_provider.push(ChatMessage::user(message.clone()));
-
-    if let Err(error) = state
-        .mem
-        .append_conversation_turn(
-            &session_id,
-            &session.channel,
-            &session.sender,
-            "user",
-            &message,
-            None,
-            None,
-        )
-        .await
+    if let Err(error) =
+        super::authorize_resource_mutation(&state, "gateway_api:sessions:message", ResourceRiskLevel::Low)
     {
-        tracing::error!("Failed to persist user session turn: {error}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "Failed to persist session message" })),
-        )
-            .into_response();
+        return error.into_response();
     }
 
-    let reply = match state
-        .provider
-        .chat_with_history(&history_for_provider, &state.model, state.temperature)
-        .await
-    {
-        Ok(reply) => reply,
+    let user_message_event_id = match append_console_turn(&state, &runtime_envelope, "user", &message).await {
+        Ok(event_id) => event_id,
         Err(error) => {
+            tracing::error!("Failed to persist user session turn: {error}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": crate::providers::sanitize_api_error(&error.to_string())
-                })),
+                Json(serde_json::json!({ "error": "Failed to persist session message" })),
             )
                 .into_response();
         }
     };
 
-    if let Err(error) = state
-        .mem
-        .append_conversation_turn(
-            &session_id,
-            &session.channel,
-            &session.sender,
-            "assistant",
-            &reply,
-            None,
-            None,
-        )
-        .await
+    let reply =
+        match run_console_runtime_turn(&state, &runtime_envelope, &message, turns, Some(user_message_event_id)).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": crate::providers::sanitize_api_error(&error.to_string())
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+    if let Err(error) =
+        super::authorize_resource_mutation(&state, "gateway_api:sessions:assistant_message", ResourceRiskLevel::Low)
     {
+        return error.into_response();
+    }
+
+    if let Err(error) = append_console_turn(&state, &runtime_envelope, "assistant", &reply).await {
         tracing::error!("Failed to persist assistant session turn: {error}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -627,4 +822,203 @@ pub async fn get_session_media(
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::gateway::{GatewayRateLimiter, IdempotencyStore};
+    use crate::hooks::HookManager;
+    use crate::memory::{ConversationTurn, Memory, MemoryCategory, MemoryEntry};
+    use crate::providers::{ChatRequest, ChatResponse, Provider};
+    use crate::security::pairing::PairingGuard;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::broadcast;
+
+    #[test]
+    fn console_runtime_envelope_preserves_session_channel_and_sender() {
+        let envelope = console_runtime_envelope_for_workspace("workspace", "signal_alice", "signal", "alice");
+        let scope = envelope.message_scope();
+
+        assert_eq!(scope.source, "console");
+        assert_eq!(scope.session_key.as_deref(), Some("signal_alice"));
+        assert_eq!(scope.channel.as_deref(), Some("signal"));
+        assert_eq!(scope.sender.as_deref(), Some("alice"));
+    }
+
+    #[derive(Default)]
+    struct TestMemory;
+
+    #[async_trait]
+    impl Memory for TestMemory {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingProvider {
+        requests: parking_lot::Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    #[async_trait]
+    impl Provider for CapturingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("console runtime should use structured Provider::chat");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.requests.lock().push(request.messages.to_vec());
+            Ok(ChatResponse {
+                text: Some("console-runtime-ok".to_string()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    fn test_app_state(config: Config, provider: Arc<dyn Provider>) -> AppState {
+        AppState {
+            config: Arc::new(parking_lot::Mutex::new(config.clone())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(config)),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(TestMemory),
+            auto_save: false,
+            tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            signal: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn console_runtime_turn_uses_shared_tool_loop_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        let provider_impl = Arc::new(CapturingProvider::default());
+        let state = test_app_state(config, provider_impl.clone());
+        let envelope = console_runtime_envelope_for_workspace(
+            tmp.path().to_string_lossy().to_string(),
+            "console-session",
+            "console",
+            "alice",
+        );
+        let previous_turns = vec![ConversationTurn {
+            id: 1,
+            session_key: "console-session".to_string(),
+            role: "assistant".to_string(),
+            content: "previous answer".to_string(),
+            timestamp: "2026-05-27T00:00:00Z".to_string(),
+            message_id: Some("previous-event".to_string()),
+        }];
+
+        let reply = run_console_runtime_turn(
+            &state,
+            &envelope,
+            "current question",
+            previous_turns,
+            Some("user-event".into()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply, "console-runtime-ok");
+        let requests = provider_impl.requests.lock();
+        assert_eq!(requests.len(), 1);
+        let history = requests.first().expect("request should be recorded");
+        assert_eq!(history.first().map(|m| m.role.as_str()), Some("system"));
+        assert!(
+            history
+                .iter()
+                .any(|m| m.role == "assistant" && m.content == "previous answer")
+        );
+        assert_eq!(history.last().map(|m| m.role.as_str()), Some("user"));
+        assert!(history.last().is_some_and(|m| m.content.contains("current question")));
+    }
 }

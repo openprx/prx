@@ -12,9 +12,12 @@
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
+use crate::security::{SecurityPolicy, SideEffectGate};
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub struct GatewayTool {
@@ -27,6 +30,8 @@ pub struct GatewayTool {
     channels: Vec<String>,
     /// Number of registered runtime tools, if known
     tools_count: usize,
+    /// Security policy for mutating gateway operations.
+    security: Arc<SecurityPolicy>,
     /// Process start time for uptime calculation
     started_at: Instant,
 }
@@ -44,12 +49,18 @@ impl GatewayTool {
             model: model.into(),
             channels,
             tools_count: 0,
+            security: Arc::new(SecurityPolicy::default()),
             started_at: Instant::now(),
         }
     }
 
     pub const fn with_tools_count(mut self, tools_count: usize) -> Self {
         self.tools_count = tools_count;
+        self
+    }
+
+    pub fn with_security(mut self, security: Arc<SecurityPolicy>) -> Self {
+        self.security = security;
         self
     }
 
@@ -205,6 +216,21 @@ impl Tool for GatewayTool {
                     error: Some(
                         "Destructive gateway action requires trusted scope (_prx_scope_trusted=true)".to_string(),
                     ),
+                });
+            }
+
+            let operation_name = format!("gateway:{action}");
+            let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+            if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
+                self.name(),
+                &operation_name,
+                ResourceRiskLevel::Medium,
+                approval_grant.as_ref(),
+            ) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
                 });
             }
         }
@@ -518,6 +544,13 @@ mod tests {
             .execute(json!({
                 "action": "config.patch",
                 "_prx_scope_trusted": true,
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    serde_json::to_value(ApprovalGrant::for_resource_operation(
+                        "gateway",
+                        "gateway:config.patch",
+                        "test",
+                        None
+                    )).unwrap(),
                 "patch": {
                     "gateway": {
                         "port": 3300
@@ -547,6 +580,35 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("trusted scope"));
+    }
+
+    #[tokio::test]
+    async fn config_patch_requires_resource_grant() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: config_path.clone(),
+            ..Config::default()
+        };
+        cfg.save().await.unwrap();
+        let shared = new_shared(cfg);
+        let tool = GatewayTool::new(shared, "anthropic", "claude-sonnet-4-6", vec![]);
+
+        let result = tool
+            .execute(json!({
+                "action": "config.patch",
+                "_prx_scope_trusted": true,
+                "patch": { "gateway": { "port": 3300 } }
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("runtime approval grant"));
+        let contents = tokio::fs::read_to_string(config_path).await.unwrap();
+        let parsed: Config = toml::from_str(&contents).unwrap();
+        assert_ne!(parsed.gateway.port, 3300);
     }
 
     #[tokio::test]

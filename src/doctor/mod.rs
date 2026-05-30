@@ -5,7 +5,9 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::io::Write;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
+use std::time::Duration;
 
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
@@ -94,6 +96,318 @@ pub fn run(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn run_memory(config: &Config) -> Result<()> {
+    let mut items: Vec<DiagItem> = Vec::new();
+    check_memory_diagnostics(config, &mut items);
+    print_report("OpenPRX Doctor - Memory", &items);
+    Ok(())
+}
+
+pub async fn run_runtime(config: &Config) -> Result<()> {
+    let mut items: Vec<DiagItem> = Vec::new();
+    check_deployed_binary(&mut items);
+    check_runtime_config(config, &mut items);
+    check_daemon_state(config, &mut items);
+    check_gateway_runtime(config, &mut items);
+    check_channel_runtime(config, &mut items);
+    check_console_runtime(config, &mut items).await;
+    check_runtime_memory_health(config, &mut items).await;
+    print_report("OpenPRX Doctor - Runtime Matrix", &items);
+    Ok(())
+}
+
+fn print_report(title: &str, items: &[DiagItem]) {
+    println!("🩺 {title}");
+    println!();
+
+    let mut current_cat = "";
+    for item in items {
+        if item.category != current_cat {
+            current_cat = item.category;
+            println!("  [{current_cat}]");
+        }
+        println!("    {} {}", item.icon(), item.message);
+    }
+
+    let errors = items.iter().filter(|i| i.severity == Severity::Error).count();
+    let warns = items.iter().filter(|i| i.severity == Severity::Warn).count();
+    let oks = items.iter().filter(|i| i.severity == Severity::Ok).count();
+
+    println!();
+    println!("  Summary: {oks} ok, {warns} warnings, {errors} errors");
+}
+
+fn check_deployed_binary(items: &mut Vec<DiagItem>) {
+    let cat = "deployed";
+    let deployed = Path::new("/home/ck/.cargo/bin/prx");
+    if deployed.exists() {
+        items.push(DiagItem::ok(
+            cat,
+            format!("deployed binary exists: {}", deployed.display()),
+        ));
+    } else {
+        items.push(DiagItem::error(
+            cat,
+            format!("deployed binary missing: {}", deployed.display()),
+        ));
+    }
+
+    match std::env::current_exe() {
+        Ok(current) if current == deployed => items.push(DiagItem::ok(cat, "doctor is running from deployed binary")),
+        Ok(current) => items.push(DiagItem::warn(
+            cat,
+            format!("doctor is running from {}, not deployed binary", current.display()),
+        )),
+        Err(error) => items.push(DiagItem::warn(
+            cat,
+            format!("cannot resolve current executable: {error}"),
+        )),
+    }
+}
+
+fn check_runtime_config(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "config";
+    if config.config_path.exists() {
+        items.push(DiagItem::ok(
+            cat,
+            format!("config path exists: {}", config.config_path.display()),
+        ));
+    } else {
+        items.push(DiagItem::error(
+            cat,
+            format!("config path missing: {}", config.config_path.display()),
+        ));
+    }
+    if config.workspace_dir.exists() {
+        items.push(DiagItem::ok(
+            cat,
+            format!("workspace exists: {}", config.workspace_dir.display()),
+        ));
+    } else {
+        items.push(DiagItem::error(
+            cat,
+            format!("workspace missing: {}", config.workspace_dir.display()),
+        ));
+    }
+}
+
+fn check_gateway_runtime(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "gateway";
+    if !config.modules.network {
+        items.push(DiagItem::warn(
+            cat,
+            "network module disabled in config; probing gateway port anyway because daemon may still expose it",
+        ));
+    }
+
+    items.push(DiagItem::ok(
+        cat,
+        format!(
+            "configured bind {}:{} (pairing required: {})",
+            config.gateway.host, config.gateway.port, config.gateway.require_pairing
+        ),
+    ));
+
+    let address = format!("{}:{}", config.gateway.host, config.gateway.port);
+    match address.to_socket_addrs().ok().and_then(|mut addrs| addrs.next()) {
+        Some(socket) => match TcpStream::connect_timeout(&socket, Duration::from_millis(300)) {
+            Ok(_) => items.push(DiagItem::ok(cat, format!("gateway port reachable at {socket}"))),
+            Err(error) => items.push(DiagItem::warn(
+                cat,
+                format!("gateway port not reachable at {socket}: {error}"),
+            )),
+        },
+        None => items.push(DiagItem::warn(
+            cat,
+            format!("cannot resolve gateway bind address {address}"),
+        )),
+    }
+}
+
+fn check_channel_runtime(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "channels";
+    if !config.modules.channels {
+        items.push(DiagItem::warn(
+            cat,
+            "channels module disabled; IM live path is not expected",
+        ));
+        return;
+    }
+
+    let configured = configured_channel_names(config);
+    if configured.is_empty() {
+        items.push(DiagItem::warn(
+            cat,
+            "channels module enabled but no IM channels are configured",
+        ));
+    } else {
+        items.push(DiagItem::ok(
+            cat,
+            format!("configured channels: {}", configured.join(", ")),
+        ));
+    }
+}
+
+fn configured_channel_names(config: &Config) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if config.channels_config.cli {
+        names.push("cli");
+    }
+    if config.channels_config.telegram.is_some() {
+        names.push("telegram");
+    }
+    if config.channels_config.discord.is_some() {
+        names.push("discord");
+    }
+    if config.channels_config.slack.is_some() {
+        names.push("slack");
+    }
+    if config.channels_config.webhook.is_some() {
+        names.push("webhook");
+    }
+    if config.channels_config.signal.is_some() {
+        names.push("signal");
+    }
+    if config.channels_config.whatsapp.is_some() {
+        names.push("whatsapp");
+    }
+    if config.channels_config.nextcloud_talk.is_some() {
+        names.push("nextcloud-talk");
+    }
+    if config.channels_config.email.is_some() {
+        names.push("email");
+    }
+    if config.channels_config.irc.is_some() {
+        names.push("irc");
+    }
+    if config.channels_config.lark.is_some() {
+        names.push("lark");
+    }
+    names
+}
+
+async fn check_console_runtime(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "console";
+    let Ok(memory) = crate::memory::create_memory_with_storage_and_routes_with_acl(
+        &config.memory,
+        &config.embedding_routes,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+        &config.identity_bindings,
+        &config.user_policies,
+    ) else {
+        items.push(DiagItem::warn(
+            cat,
+            "cannot open memory backend to inspect console sessions",
+        ));
+        return;
+    };
+
+    match memory.list_conversation_sessions(5, 0, None).await {
+        Ok(sessions) if sessions.is_empty() => {
+            items.push(DiagItem::warn(cat, "no persisted console/channel sessions found"))
+        }
+        Ok(sessions) => items.push(DiagItem::ok(
+            cat,
+            format!("persisted conversation sessions visible: {}", sessions.len()),
+        )),
+        Err(error) => items.push(DiagItem::warn(
+            cat,
+            format!("failed to list persisted conversation sessions: {error}"),
+        )),
+    }
+}
+
+async fn check_runtime_memory_health(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "memory";
+    match crate::memory::create_memory_with_storage_and_routes_with_acl(
+        &config.memory,
+        &config.embedding_routes,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+        &config.identity_bindings,
+        &config.user_policies,
+    ) {
+        Ok(memory) => {
+            if memory.health_check().await {
+                items.push(DiagItem::ok(cat, format!("memory backend healthy: {}", memory.name())));
+            } else {
+                items.push(DiagItem::error(
+                    cat,
+                    format!("memory backend health check failed: {}", memory.name()),
+                ));
+            }
+        }
+        Err(error) => items.push(DiagItem::error(cat, format!("failed to open memory backend: {error}"))),
+    }
+}
+
+fn check_memory_diagnostics(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "memory";
+    if config.modules.memory {
+        items.push(DiagItem::ok(cat, "memory module enabled"));
+    } else {
+        items.push(DiagItem::warn(
+            cat,
+            "memory module disabled; memory tools and maintenance commands are gated off",
+        ));
+    }
+
+    let backend =
+        crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
+    items.push(DiagItem::ok(cat, format!("backend configured as {backend}")));
+    items.push(DiagItem::ok(
+        cat,
+        format!("workspace path {}", config.workspace_dir.display()),
+    ));
+
+    let embedder = crate::memory::create_embedder_from_config(config, config.api_key.as_deref());
+    if embedder.name() == "none" || embedder.dimensions() == 0 {
+        items.push(DiagItem::warn(
+            "embedding",
+            "embedding provider disabled or unresolved; keyword/FTS search remains the fallback",
+        ));
+    } else {
+        items.push(DiagItem::ok(
+            "embedding",
+            format!(
+                "embedding provider={} model={} dimensions={}",
+                embedder.name(),
+                embedder.model(),
+                embedder.dimensions()
+            ),
+        ));
+    }
+
+    let provider = config.memory.embedding_provider.trim();
+    if provider.starts_with("custom:") {
+        let url = provider.strip_prefix("custom:").unwrap_or("").trim();
+        match reqwest::Url::parse(url) {
+            Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {
+                items.push(DiagItem::ok("embedding", format!("custom embedding endpoint {url}")));
+            }
+            _ => items.push(DiagItem::error(
+                "embedding",
+                format!("custom embedding endpoint is invalid: {url}"),
+            )),
+        }
+    }
+
+    if config.memory.embedding_dimensions == 0 {
+        items.push(DiagItem::error(
+            "embedding",
+            "memory.embedding_dimensions must be greater than zero when embeddings are enabled",
+        ));
+    }
+
+    items.push(DiagItem::ok(
+        "maintenance",
+        "run `prx memory reindex` to rebuild SQLite/Lucid memory and document chunk vectors",
+    ));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

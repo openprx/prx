@@ -3,19 +3,24 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
+use crate::memory::principal::{MemoryWriteContext, OwnerPrincipal, Role};
 use crate::memory::{
-    self, ConversationTurn, Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryVisibility, MessageEvent,
-    MessageEventScope, SessionContextQuery, SharedContextQuery,
+    self, CompactionRunInput, ConversationTurn, DocumentIngestInput, DocumentSearchResult, Memory, MemoryCategory,
+    MemoryFabric, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent, RetrievalTraceInput,
+    RetrievedContextItem, SessionContextQuery, SharedContextQuery,
 };
 use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall};
 use crate::runtime;
+use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
+use crate::security::policy::{ApprovalGrant, RUNTIME_APPROVAL_GRANT_ARG, RUNTIME_APPROVAL_GRANTED_ARG};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use sha2::Digest;
 use std::collections::{BTreeSet, HashMap, hash_map::DefaultHasher};
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
@@ -94,10 +99,77 @@ pub(crate) struct ScopeContext<'a> {
     pub channel: &'a str,
     pub chat_type: &'a str,
     pub chat_id: &'a str,
+    pub owner_id: Option<&'a str>,
+    pub topic_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub source_message_event_id: Option<&'a str>,
     /// Optional multi-layer tool policy pipeline (P3-1).
     /// When set, tool calls are additionally evaluated against the pipeline
     /// before execution. A denial from the pipeline blocks the tool call.
     pub policy_pipeline: Option<&'a crate::security::PolicyPipeline>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DocumentIngestRuntime {
+    memory: Arc<dyn Memory>,
+    workspace_id: String,
+    owner_id: Option<String>,
+    topic_id: Option<String>,
+    task_id: Option<String>,
+    source_message_event_id: Option<String>,
+    session_key: Option<String>,
+    agent_id: Option<String>,
+    persona_id: Option<String>,
+    visibility: MemoryVisibility,
+}
+
+impl DocumentIngestRuntime {
+    pub(crate) fn from_envelope(memory: Arc<dyn Memory>, envelope: &RuntimeEnvelope) -> Self {
+        Self {
+            memory,
+            workspace_id: envelope.workspace_id.clone(),
+            owner_id: Some(envelope.resolved_owner_id()),
+            topic_id: envelope.topic_id.clone(),
+            task_id: envelope.resolved_task_id().map(ToString::to_string),
+            source_message_event_id: envelope.source_message_event_id.clone(),
+            session_key: Some(envelope.session_key.clone()),
+            agent_id: envelope.agent_id.clone(),
+            persona_id: envelope.persona_id.clone(),
+            visibility: envelope.visibility.clone(),
+        }
+    }
+
+    pub(crate) fn from_scope(memory: Arc<dyn Memory>, scope: &ScopeContext<'_>) -> Self {
+        let workspace_id = scope.policy.workspace_dir.to_string_lossy().to_string();
+        let owner_id = Some(
+            crate::memory::principal::OwnerPrincipal::new(
+                workspace_id.clone(),
+                scope.channel,
+                scope.sender,
+                scope.chat_id,
+                vec![crate::memory::principal::Role::Anonymous],
+            )
+            .owner_id,
+        );
+        Self {
+            memory,
+            workspace_id,
+            owner_id,
+            topic_id: scope.topic_id.map(ToString::to_string),
+            task_id: scope.task_id.map(ToString::to_string),
+            source_message_event_id: scope.source_message_event_id.map(ToString::to_string),
+            session_key: Some(scope.chat_id.to_string()),
+            agent_id: None,
+            persona_id: None,
+            visibility: MemoryVisibility::Session,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_source_message_event_id(mut self, source_message_event_id: Option<String>) -> Self {
+        self.source_message_event_id = source_message_event_id;
+        self
+    }
 }
 
 /// P2 concurrency governance controls used by the tool scheduler.
@@ -134,8 +206,12 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 const TOOL_PARSE_LOG_PREVIEW_CHARS: usize = 200;
 
-/// Maximum characters allowed for a single tool result before truncation.
-const MAX_TOOL_RESULT_CHARS: usize = 30_000;
+/// Maximum inline characters allowed for a single tool result before it is
+/// represented as a document-ingest reference in model history.
+const MAX_TOOL_RESULT_INLINE_CHARS: usize = 8_000;
+
+/// Approximate chunk size for large tool-output document references.
+const TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS: usize = 2_048;
 
 /// Timeout (seconds) for apply_configurable_compaction before falling back to aggressive trim.
 const COMPACTION_TIMEOUT_SECS: u64 = 300;
@@ -284,6 +360,9 @@ const MAX_MEMORY_ENTRY_BYTES: usize = 512;
 #[allow(dead_code)]
 const MAX_SHARED_EVENTS_PREAMBLE_BYTES: usize = 2048;
 
+/// Maximum bytes for document evidence injected into prompts.
+const MAX_DOCUMENT_CONTEXT_PREAMBLE_BYTES: usize = 2048;
+
 pub(crate) struct RecalledMemoryContext {
     pub(crate) preamble: String,
     pub(crate) ids: Vec<String>,
@@ -293,14 +372,18 @@ pub(crate) struct AgentContextBundle {
     pub(crate) current_session_context: String,
     pub(crate) recent_shared_context: String,
     pub(crate) semantic_memory_context: String,
+    pub(crate) document_context: String,
     pub(crate) recalled_memory_ids: Vec<String>,
 }
 
 impl AgentContextBundle {
     pub(crate) fn preamble(&self) -> String {
         format!(
-            "{}{}{}",
-            self.current_session_context, self.recent_shared_context, self.semantic_memory_context
+            "{}{}{}{}",
+            self.current_session_context,
+            self.recent_shared_context,
+            self.semantic_memory_context,
+            self.document_context
         )
     }
 }
@@ -330,25 +413,119 @@ fn apply_aggressive_trim(history: &mut Vec<ChatMessage>, keep_recent: usize) {
     trim_history(history, keep_recent.max(1));
 }
 
-/// Truncate a tool result string if it exceeds max_chars.
-/// Appends a note describing how many characters were dropped.
-fn truncate_tool_result_if_needed(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars {
+fn tool_output_document_id(tool_name: &str, content: &str) -> (String, String) {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(tool_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(content.as_bytes());
+    let digest = hasher.finalize();
+    let sha256 = hex::encode(digest);
+    let short = sha256.get(..16).unwrap_or(&sha256);
+    (format!("tool-output:{tool_name}:{short}"), sha256)
+}
+
+async fn persist_tool_output_document(
+    runtime: Option<&DocumentIngestRuntime>,
+    tool_name: &str,
+    content: &str,
+    max_inline_chars: usize,
+) -> Option<&'static str> {
+    if content.len() <= max_inline_chars {
+        return None;
+    }
+    let Some(runtime) = runtime else {
+        return None;
+    };
+    let (document_id, sha256) = tool_output_document_id(tool_name, content);
+    let metadata_json = serde_json::json!({
+        "tool": tool_name,
+        "content_sha256": sha256,
+        "bytes": content.len(),
+    })
+    .to_string();
+    let input = DocumentIngestInput {
+        document_id: Some(document_id.clone()),
+        workspace_id: runtime.workspace_id.clone(),
+        owner_id: runtime.owner_id.clone(),
+        topic_id: runtime.topic_id.clone(),
+        task_id: runtime.task_id.clone(),
+        source_message_event_id: runtime.source_message_event_id.clone(),
+        source_kind: "tool_output".to_string(),
+        source_uri: Some(format!("tool:{tool_name}")),
+        title: Some(format!("Tool output: {tool_name}")),
+        content: content.to_string(),
+        mime_type: Some("text/plain".to_string()),
+        visibility: runtime.visibility.clone(),
+        metadata_json: Some(metadata_json),
+    };
+    match runtime.memory.ingest_document(input).await {
+        Ok(document) => {
+            tracing::info!(
+                document_id = %document.document_id,
+                tool = %tool_name,
+                chunks = document.chunk_count,
+                "Persisted oversized tool output into document store"
+            );
+            Some("persisted_document_backend")
+        }
+        Err(error) => {
+            tracing::warn!(
+                document_id = %document_id,
+                tool = %tool_name,
+                error = %error,
+                "Failed to persist oversized tool output into document store"
+            );
+            Some("document_ingest_failed")
+        }
+    }
+}
+
+/// Compact a large tool result before inserting it into LLM history.
+///
+/// This is the Phase-0 document-ingest spike: the full document backend is not
+/// required here, but model history receives a stable document/vector anchor
+/// instead of a large raw blob. Later phases can persist the same `document_id`
+/// and `vector_anchor` in the document/vector layer without changing the
+/// history contract.
+#[allow(dead_code)]
+fn compact_tool_result_for_history(tool_name: &str, content: &str, max_inline_chars: usize) -> String {
+    compact_tool_result_for_history_with_status(tool_name, content, max_inline_chars, "pending_document_backend")
+}
+
+fn compact_tool_result_for_history_with_status(
+    tool_name: &str,
+    content: &str,
+    max_inline_chars: usize,
+    status: &str,
+) -> String {
+    if content.len() <= max_inline_chars {
         return content.to_string();
     }
-    // Safe UTF-8 boundary
+
     let boundary = content
         .char_indices()
         .map(|(i, _)| i)
-        .take_while(|&i| i <= max_chars)
+        .take_while(|&i| i <= max_inline_chars)
         .last()
         .unwrap_or(0);
-    let kept = &content[..boundary];
+    let preview = &content[..boundary];
+    let (document_id, sha256) = tool_output_document_id(tool_name, content);
+    let chunk_count = crate::memory::chunker::chunk_markdown(content, TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS)
+        .len()
+        .max(1);
     format!(
-        "{}\n\n[truncated: output exceeded context limit ({} chars, kept {})]",
-        kept,
-        content.len(),
-        boundary
+        "{preview}\n\n[document_ingest_ref]\n\
+document_id: {document_id}\n\
+source: tool_output\n\
+tool: {tool_name}\n\
+content_sha256: {sha256}\n\
+bytes: {}\n\
+inline_preview_bytes: {boundary}\n\
+chunks: {chunk_count}\n\
+vector_anchor: vector://{document_id}\n\
+status: {status}\n\
+[/document_ingest_ref]",
+        content.len()
     )
 }
 
@@ -408,6 +585,180 @@ fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
         / 4
 }
 
+fn compaction_summary_fidelity_status(
+    summary: &str,
+    mode: crate::config::AgentCompactionMode,
+    source_messages: &[ChatMessage],
+) -> &'static str {
+    if summary.trim().is_empty() {
+        return "rejected_empty";
+    }
+    if matches!(mode, crate::config::AgentCompactionMode::Safeguard) {
+        let required_headers = [
+            "## Decisions",
+            "## Open TODOs",
+            "## Constraints",
+            "## Pending",
+            "## Exact",
+            "## Progress",
+            "## Critical Context",
+        ];
+        let found_count = required_headers
+            .iter()
+            .filter(|header| summary.contains(*header))
+            .count();
+        if found_count < 3 {
+            return "accepted_retry_missing_headers";
+        }
+    }
+    let identifiers = source_messages
+        .iter()
+        .flat_map(|message| message.content.split_whitespace())
+        .filter(|word| {
+            word.contains('/')
+                || word.contains("://")
+                || word.contains(':')
+                || word.chars().filter(|ch| *ch == '-').count() >= 2
+        })
+        .take(8);
+    let missing_identifiers = identifiers
+        .filter(|identifier| !summary.contains(identifier.trim_matches(|ch: char| ch.is_ascii_punctuation())))
+        .count();
+    if missing_identifiers > 0 {
+        "accepted_identifier_loss"
+    } else {
+        "accepted"
+    }
+}
+
+fn extract_document_ingest_refs(source_messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+    let mut refs = Vec::new();
+    for (index, message) in source_messages.iter().enumerate() {
+        let mut remaining = message.content.as_str();
+        while let Some(start) = remaining.find("[document_ingest_ref]") {
+            let after_start = &remaining[start + "[document_ingest_ref]".len()..];
+            let Some(end) = after_start.find("[/document_ingest_ref]") else {
+                break;
+            };
+            let block = &after_start[..end];
+            let mut item = serde_json::Map::new();
+            item.insert("index".to_string(), serde_json::json!(index));
+            item.insert("role".to_string(), serde_json::json!(message.role));
+            for line in block.lines() {
+                let Some((key, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let key = key.trim();
+                let value = value.trim();
+                if key.is_empty() || value.is_empty() {
+                    continue;
+                }
+                let parsed_value = match key {
+                    "bytes" | "inline_preview_bytes" | "chunks" => value
+                        .parse::<u64>()
+                        .map_or_else(|_| serde_json::json!(value), serde_json::Value::from),
+                    _ => serde_json::json!(value),
+                };
+                item.insert(key.to_string(), parsed_value);
+            }
+            if item.contains_key("document_id") {
+                refs.push(serde_json::Value::Object(item));
+            }
+            remaining = &after_start[end + "[/document_ingest_ref]".len()..];
+        }
+    }
+    refs
+}
+
+async fn persist_compaction_audit(
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
+    mode: &crate::config::AgentCompactionMode,
+    source_messages: &[ChatMessage],
+    summary: &str,
+    fidelity_status: &str,
+) {
+    let Some(audit) = audit else {
+        return;
+    };
+    let run_id = Uuid::new_v4().to_string();
+    let summary_memory_key = format!("compaction_summary_{}", run_id.replace('-', "_"));
+    let source_token_estimate = estimate_history_tokens(source_messages);
+    let source_message_refs: Vec<serde_json::Value> = source_messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(message.role.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(message.content.as_bytes());
+            let content_hash = hex::encode(hasher.finalize());
+            serde_json::json!({
+                "index": index,
+                "role": message.role,
+                "content_hash": content_hash
+            })
+        })
+        .collect();
+    let source_document_refs = extract_document_ingest_refs(source_messages);
+    let metadata = MemoryStoreMetadata {
+        workspace_id: Some(audit.workspace_id.clone()),
+        owner_id: audit.owner_id.clone(),
+        agent_id: audit.agent_id.clone(),
+        persona_id: audit.persona_id.clone(),
+        source_event_id: audit.source_message_event_id.clone(),
+        source: Some("compaction_summary".to_string()),
+    };
+    if let Err(error) = audit
+        .memory
+        .store_with_metadata(
+            &summary_memory_key,
+            summary,
+            MemoryCategory::Conversation,
+            audit.session_key.as_deref(),
+            metadata,
+        )
+        .await
+    {
+        tracing::debug!(error = %error, "failed to persist compaction summary memory");
+    }
+    if let Err(error) = audit
+        .memory
+        .append_compaction_run(CompactionRunInput {
+            run_id: Some(run_id),
+            workspace_id: audit.workspace_id.clone(),
+            owner_id: audit.owner_id.clone(),
+            session_key: audit.session_key.clone(),
+            agent_id: audit.agent_id.clone(),
+            persona_id: audit.persona_id.clone(),
+            trigger: trigger.to_string(),
+            mode: format!("{mode:?}"),
+            source_message_count: source_messages.len(),
+            source_token_estimate,
+            summary: summary.to_string(),
+            summary_memory_key: Some(summary_memory_key),
+            source_event_ids_json: Some(
+                serde_json::to_string(&source_message_refs).unwrap_or_else(|_| "[]".to_string()),
+            ),
+            source_document_refs_json: Some(
+                serde_json::to_string(&source_document_refs).unwrap_or_else(|_| "[]".to_string()),
+            ),
+            fidelity_status: fidelity_status.to_string(),
+            payload_json: Some(
+                serde_json::json!({
+                    "task_id": audit.task_id,
+                    "topic_id": audit.topic_id,
+                    "source_message_event_id": audit.source_message_event_id
+                })
+                .to_string(),
+            ),
+        })
+        .await
+    {
+        tracing::debug!(error = %error, "failed to append compaction run audit");
+    }
+}
+
 fn compaction_trigger_limit(config: &crate::config::AgentCompactionConfig) -> Option<usize> {
     if config.mode == crate::config::AgentCompactionMode::Off {
         return None;
@@ -425,6 +776,8 @@ async fn apply_configurable_compaction(
     provider: &dyn Provider,
     model: &str,
     config: &crate::config::AgentCompactionConfig,
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
 ) -> Result<bool> {
     let Some(limit) = compaction_trigger_limit(config) else {
         return Ok(false);
@@ -556,6 +909,8 @@ async fn apply_configurable_compaction(
         }
         crate::config::AgentCompactionMode::Off => return Ok(false),
     };
+    let fidelity_status = compaction_summary_fidelity_status(&summary, config.mode, &to_compact);
+    persist_compaction_audit(audit, trigger, &config.mode, &to_compact, &summary, fidelity_status).await;
 
     history.splice(
         start..compact_end,
@@ -691,12 +1046,22 @@ async fn auto_compact_history(
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
+#[allow(dead_code)]
 pub(crate) async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> RecalledMemoryContext {
+    build_context_with_scope(mem, user_msg, min_relevance_score, None).await
+}
+
+pub(crate) async fn build_context_with_scope(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+    scope_ctx: Option<&MemoryWriteContext>,
+) -> RecalledMemoryContext {
     let mut context = String::new();
     let mut ids = Vec::new();
 
     // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = mem.recall_with_context(user_msg, 5, None, scope_ctx).await {
         let relevant: Vec<_> = entries
             .iter()
             .filter(|e| e.score.map_or(true, |score| score >= min_relevance_score))
@@ -869,6 +1234,149 @@ fn build_current_session_preamble(turns: &[ConversationTurn], user_msg: &str) ->
     context
 }
 
+fn format_document_result_line(result: &DocumentSearchResult) -> String {
+    let chunk = &result.chunk;
+    let mut content = chunk.content.trim().replace('\n', " ");
+    if content.len() > MAX_MEMORY_ENTRY_BYTES {
+        let end = content.floor_char_boundary(MAX_MEMORY_ENTRY_BYTES);
+        content = format!("{}...", &content[..end]);
+    }
+    format!(
+        "- [document_id={} chunk_id={} source_anchor={}] {}\n",
+        chunk.document_id, chunk.chunk_id, chunk.source_anchor, content
+    )
+}
+
+fn document_result_to_context_item(result: &DocumentSearchResult) -> RetrievedContextItem {
+    let chunk = &result.chunk;
+    RetrievedContextItem {
+        source: "document_chunk".to_string(),
+        document_id: Some(chunk.document_id.clone()),
+        chunk_id: Some(chunk.chunk_id.clone()),
+        source_anchor: Some(chunk.source_anchor.clone()),
+        score: Some(result.score),
+        token_estimate: Some(chunk.token_estimate),
+        payload_json: Some(
+            serde_json::json!({
+                "workspace_id": chunk.workspace_id,
+                "owner_id": chunk.owner_id,
+                "topic_id": chunk.topic_id,
+                "task_id": chunk.task_id,
+                "chunk_index": chunk.chunk_index
+            })
+            .to_string(),
+        ),
+    }
+}
+
+fn build_document_context_trace_payload(
+    results: &[DocumentSearchResult],
+) -> (String, Vec<RetrievedContextItem>, Vec<RetrievedContextItem>) {
+    let mut context = String::new();
+    let mut selected = Vec::new();
+    let mut dropped = Vec::new();
+
+    for result in results {
+        let line = format_document_result_line(result);
+        let header_len = if context.is_empty() {
+            "[Document evidence]\n".len()
+        } else {
+            0
+        };
+        if context.len() + header_len + line.len() > MAX_DOCUMENT_CONTEXT_PREAMBLE_BYTES {
+            dropped.push(document_result_to_context_item(result));
+            continue;
+        }
+        if context.is_empty() {
+            context.push_str("[Document evidence]\n");
+        }
+        context.push_str(&line);
+        selected.push(document_result_to_context_item(result));
+    }
+
+    if !context.is_empty() {
+        context.push('\n');
+    }
+
+    (context, selected, dropped)
+}
+
+fn owner_id_for_memory_principal(principal: &MemoryPrincipal) -> Option<String> {
+    let channel = principal.channel.as_deref()?.trim();
+    let sender = principal.sender.as_deref()?.trim();
+    if channel.is_empty() || sender.is_empty() {
+        return None;
+    }
+    Some(
+        OwnerPrincipal::new(
+            principal.workspace_id.clone(),
+            channel,
+            sender,
+            principal.session_key.clone().unwrap_or_default(),
+            vec![Role::Anonymous],
+        )
+        .owner_id,
+    )
+}
+
+async fn append_document_retrieval_trace(
+    mem: &dyn Memory,
+    principal: &MemoryPrincipal,
+    user_msg: &str,
+    candidate_count: usize,
+    selected: &[RetrievedContextItem],
+    dropped: &[RetrievedContextItem],
+) {
+    if candidate_count == 0 {
+        return;
+    }
+
+    let selected_json = match serde_json::to_string(selected) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::debug!(error = %error, "failed to serialize selected document retrieval trace items");
+            None
+        }
+    };
+    let dropped_json = match serde_json::to_string(dropped) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::debug!(error = %error, "failed to serialize dropped document retrieval trace items");
+            None
+        }
+    };
+
+    if let Err(error) = mem
+        .append_retrieval_trace(RetrievalTraceInput {
+            trace_id: None,
+            workspace_id: principal.workspace_id.clone(),
+            owner_id: owner_id_for_memory_principal(principal),
+            session_key: principal.session_key.clone(),
+            agent_id: principal.agent_id.clone(),
+            persona_id: principal.persona_id.clone(),
+            source: "agent_context.document_evidence".to_string(),
+            query: user_msg.to_string(),
+            candidate_count,
+            selected_count: selected.len(),
+            dropped_count: dropped.len(),
+            budget_tokens: Some(MAX_DOCUMENT_CONTEXT_PREAMBLE_BYTES / 4),
+            selected_json,
+            dropped_json,
+            payload_json: Some(
+                serde_json::json!({
+                    "channel": principal.channel,
+                    "sender": principal.sender,
+                    "limit": 5
+                })
+                .to_string(),
+            ),
+        })
+        .await
+    {
+        tracing::debug!(error = %error, "failed to append document retrieval trace");
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) async fn build_agent_context(
     mem: &dyn Memory,
@@ -876,10 +1384,20 @@ pub(crate) async fn build_agent_context(
     user_msg: &str,
     min_relevance_score: f64,
 ) -> AgentContextBundle {
-    let semantic = build_context(mem, user_msg, min_relevance_score).await;
+    build_agent_context_with_semantic_scope(mem, principal, user_msg, min_relevance_score, None).await
+}
+
+pub(crate) async fn build_agent_context_with_semantic_scope(
+    mem: &dyn Memory,
+    principal: MemoryPrincipal,
+    user_msg: &str,
+    min_relevance_score: f64,
+    semantic_scope: Option<&MemoryWriteContext>,
+) -> AgentContextBundle {
+    let semantic = build_context_with_scope(mem, user_msg, min_relevance_score, semantic_scope).await;
     let current_session_turns = match principal.session_key.as_deref() {
         Some(session_key) => mem
-            .list_conversation_turns(session_key, 12, 0)
+            .list_conversation_turns(&principal, session_key, 12, 0)
             .await
             .unwrap_or_default(),
         None => Vec::new(),
@@ -902,6 +1420,21 @@ pub(crate) async fn build_agent_context(
         })
         .await
         .unwrap_or_default();
+    let document_results = mem
+        .search_document_chunks(&principal, user_msg, 5)
+        .await
+        .unwrap_or_default();
+    let (document_context, selected_document_items, dropped_document_items) =
+        build_document_context_trace_payload(&document_results);
+    append_document_retrieval_trace(
+        mem,
+        &principal,
+        user_msg,
+        document_results.len(),
+        &selected_document_items,
+        &dropped_document_items,
+    )
+    .await;
     let current_session_context = {
         let from_events = build_current_session_events_preamble(&principal, &current_session_events, user_msg);
         if from_events.is_empty() {
@@ -915,6 +1448,7 @@ pub(crate) async fn build_agent_context(
         current_session_context,
         recent_shared_context: build_shared_events_preamble(&principal, &shared_events),
         semantic_memory_context: semantic.preamble,
+        document_context,
         recalled_memory_ids: semantic.ids,
     }
 }
@@ -931,7 +1465,18 @@ pub(crate) async fn build_context_with_shared_events(
     user_msg: &str,
     min_relevance_score: f64,
 ) -> RecalledMemoryContext {
-    let bundle = build_agent_context(mem, principal, user_msg, min_relevance_score).await;
+    build_context_with_shared_events_and_scope(mem, principal, user_msg, min_relevance_score, None).await
+}
+
+pub(crate) async fn build_context_with_shared_events_and_scope(
+    mem: &dyn Memory,
+    principal: MemoryPrincipal,
+    user_msg: &str,
+    min_relevance_score: f64,
+    semantic_scope: Option<&MemoryWriteContext>,
+) -> RecalledMemoryContext {
+    let bundle =
+        build_agent_context_with_semantic_scope(mem, principal, user_msg, min_relevance_score, semantic_scope).await;
     RecalledMemoryContext {
         preamble: bundle.preamble(),
         ids: bundle.recalled_memory_ids,
@@ -1777,7 +2322,7 @@ fn tool_barrier_key(name: &str) -> Option<&'static str> {
         "config_reload" | "cron" | "cron_add" | "cron_update" | "cron_remove" | "cron_run" | "schedule"
         | "proxy_config" => Some("runtime_config"),
         // Shared long-term memory writes.
-        "memory_store" | "memory_forget" => Some("memory_write"),
+        "memory_store" | "memory_forget" | "memory_reindex" => Some("memory_write"),
         // Background session lifecycle operations.
         "sessions_spawn" | "sessions_send" | "delegate" | "subagents" => Some("session_lifecycle"),
         _ => None,
@@ -1837,6 +2382,7 @@ pub(crate) async fn agent_turn(
     priority_scheduling_enabled: bool,
     low_priority_tool_names: Vec<String>,
     concurrency_governance: ToolConcurrencyGovernanceConfig,
+    document_ingest: Option<DocumentIngestRuntime>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -1864,6 +2410,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
+        document_ingest,
         ChatMode::default(),
     )
     .await
@@ -1889,6 +2436,8 @@ fn is_write_tool(name: &str) -> bool {
             | "memory_recall"
             | "memory_search"
             | "memory_get"
+            | "document_search"
+            | "document_get_chunk"
             | "cron_list"
             | "cron_runs"
             | "sessions_list"
@@ -1910,6 +2459,249 @@ fn preview_tool_arguments(args: &serde_json::Value) -> String {
     truncate_with_ellipsis(&raw, 160)
 }
 
+/// Risk class a resource operation is issued at. Mirrors the risk the matching
+/// tool passes to `SideEffectGate::authorize_resource_operation`, so the
+/// no-escalation check in the v2 gate path never rejects a legitimately approved
+/// call.
+#[derive(Clone)]
+enum GrantOp {
+    /// Shell-style command, bound by command hash (v1 path; kept for cron/runner
+    /// persisted-grant compatibility).
+    Command(String),
+    /// Exact resource operation id + the risk it is authorized at. Used when the
+    /// agent loop can reconstruct the tool's gate op-id verbatim from the raw
+    /// args (no runtime resolution involved).
+    ResourceExact(String, crate::acl::approval_grant::RiskLevel),
+    /// Conservative glob op pattern (`{tool}:{verb}:*`) + risk. Used when the
+    /// tool derives its gate op-id from runtime-resolved state (canonicalized
+    /// path, resolved recipient, owner-principal ref) that the loop cannot
+    /// reproduce byte-for-byte. The glob is still tool+verb scoped (never a bare
+    /// wildcard), and the grant remains principal-bound, time-bound, single-use
+    /// and signed — far tighter than the removed v1 wildcard grant.
+    ResourceGlob(String, crate::acl::approval_grant::RiskLevel),
+}
+
+/// Derive the operation a freshly approved tool call is authorized for.
+///
+/// For `ResourceExact` the returned op id MUST equal the `operation_name` the
+/// target tool computes before calling the gate. For `ResourceGlob` the tool's
+/// resolved op id must start with the `{tool}:{verb}:` prefix. Returning `None`
+/// means we cannot bind even a tool+verb scope; with the d08-tightened gate such
+/// a call is denied rather than wildcard-approved.
+fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Option<GrantOp> {
+    use crate::acl::approval_grant::RiskLevel;
+    let string_arg = |name: &str| args.get(name).and_then(serde_json::Value::as_str);
+    match tool_name {
+        "shell" => string_arg("command").map(|command| GrantOp::Command(command.to_string())),
+        "schedule" | "cron_add" | "cron_update" => {
+            string_arg("command").map(|command| GrantOp::Command(command.to_string()))
+        }
+        "cron" => {
+            let action = string_arg("action").unwrap_or_default();
+            let command = if action == "update" {
+                args.get("patch")
+                    .and_then(|patch| patch.get("command"))
+                    .and_then(serde_json::Value::as_str)
+            } else {
+                string_arg("command")
+            };
+            command.map(|command| GrantOp::Command(command.to_string()))
+        }
+        // ── Exact: loop reconstructs the tool's op-id verbatim from raw args ──
+        "config_reload" => Some(GrantOp::ResourceExact("config_reload:reload".to_string(), RiskLevel::Low)),
+        "memory_reindex" => Some(GrantOp::ResourceExact("memory_reindex:rebuild".to_string(), RiskLevel::Medium)),
+        "proxy_config" => {
+            let action = string_arg("action").unwrap_or_default();
+            let (operation, risk) = match action {
+                "set" | "apply_env" => ("proxy_config:set", RiskLevel::Medium),
+                "disable" | "clear_env" => ("proxy_config:unset", RiskLevel::Medium),
+                _ => ("proxy_config:show", RiskLevel::Low),
+            };
+            Some(GrantOp::ResourceExact(operation.to_string(), risk))
+        }
+        "nodes" => {
+            let action = string_arg("action").unwrap_or_default();
+            let node = string_arg("node").unwrap_or_default();
+            let task_id = string_arg("task_id").unwrap_or_default();
+            // Risk MUST match NodesTool::execute's authorize_resource_operation
+            // risk for each action, or the v2 no-escalation check rejects an
+            // approved call: exec=High, write=High, cancel=Medium, list=Low.
+            let (operation, risk) = match action {
+                "exec" => (format!("nodes:exec:{node}"), RiskLevel::High),
+                "write" => (format!("nodes:write:{node}"), RiskLevel::High),
+                "cancel" => (format!("nodes:cancel:{node}:{task_id}"), RiskLevel::Medium),
+                _ => ("nodes:list".to_string(), RiskLevel::Low),
+            };
+            Some(GrantOp::ResourceExact(operation, risk))
+        }
+        "git_operations" => {
+            let operation = string_arg("operation").unwrap_or_default();
+            let (resource_operation, risk) = match operation {
+                "push" => (
+                    format!("git_operations:push:{}", string_arg("remote").unwrap_or("origin")),
+                    RiskLevel::High,
+                ),
+                "reset_hard" => ("git_operations:reset_hard".to_string(), RiskLevel::High),
+                "commit" => ("git_operations:commit".to_string(), RiskLevel::Medium),
+                "add" => ("git_operations:add".to_string(), RiskLevel::Medium),
+                "checkout" => {
+                    let branch = string_arg("branch").unwrap_or("unknown");
+                    (format!("git_operations:checkout:{branch}"), RiskLevel::Medium)
+                }
+                "stash" => {
+                    let action = string_arg("stash_action").unwrap_or("push");
+                    (format!("git_operations:stash:{action}"), RiskLevel::Medium)
+                }
+                other => (format!("git_operations:{other}"), RiskLevel::Medium),
+            };
+            Some(GrantOp::ResourceExact(resource_operation, risk))
+        }
+        "sessions_send" => {
+            let run_id = string_arg("run_id").unwrap_or_default();
+            Some(GrantOp::ResourceExact(format!("sessions_send:steer:{run_id}"), RiskLevel::Low))
+        }
+        "subagents" => {
+            let action = string_arg("action").unwrap_or("list");
+            let run_id = string_arg("run_id").unwrap_or_default();
+            let risk = if action == "kill" { RiskLevel::Medium } else { RiskLevel::Low };
+            Some(GrantOp::ResourceExact(format!("subagents:{action}:{run_id}"), risk))
+        }
+        "gateway" => {
+            let action = string_arg("action").unwrap_or_default();
+            Some(GrantOp::ResourceExact(format!("gateway:{action}"), RiskLevel::Medium))
+        }
+        // ── Glob: tool derives op-id from runtime-resolved state ──────────────
+        // file_write op-id uses the canonicalized resolved path; message_send /
+        // memory_* use resolved recipient / owner-principal refs; http_request
+        // uses the parsed URL host. The loop cannot reproduce these verbatim, so
+        // we scope to `{tool}:{verb}:*` (still tool+verb bound, signed, single
+        // use, principal bound).
+        "file_write" => Some(GrantOp::ResourceGlob("file_write:write:*".to_string(), RiskLevel::Medium)),
+        "http_request" => Some(GrantOp::ResourceGlob("http_request:request:*".to_string(), RiskLevel::Medium)),
+        "message_send" => Some(GrantOp::ResourceGlob("message_send:send:*".to_string(), RiskLevel::Medium)),
+        "memory_store" => Some(GrantOp::ResourceGlob("memory_store:write:*".to_string(), RiskLevel::Medium)),
+        "memory_forget" => Some(GrantOp::ResourceGlob("memory_forget:delete:*".to_string(), RiskLevel::High)),
+        // Unknown / unmodelled tools get no grant; the tightened gate denies
+        // their supervised medium/high calls rather than wildcard-approving.
+        _ => None,
+    }
+}
+
+/// Build a signed v2 ApprovalGrant for a freshly user-approved tool call,
+/// binding it to the calling principal, the operation (exact or `{tool}:{verb}:*`
+/// glob), and a short single-use validity window. Shell/cron commands stay on the
+/// v1 command-hash path so persisted runner grants (cron/xin, executed in a later
+/// process with the scheduler — not the chat principal — as caller) keep working.
+fn runtime_approval_grant_for_call(
+    tool_name: &str,
+    args: &serde_json::Value,
+    scope_ctx: Option<&ScopeContext<'_>>,
+) -> Option<ApprovalGrant> {
+    use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, OpIdMatch, Subject, WitnessKeyring};
+
+    let (operation, op_id_match, risk) = match grant_op_for_call(tool_name, args)? {
+        GrantOp::Command(command) => {
+            // Legacy v1 command-hash binding (cron/runner compatible).
+            return Some(ApprovalGrant::for_command(tool_name, &command, "approval_manager", None));
+        }
+        GrantOp::ResourceExact(operation, risk) => (operation, OpIdMatch::Exact, risk),
+        GrantOp::ResourceGlob(pattern, risk) => (pattern, OpIdMatch::GlobPattern(String::new()), risk),
+    };
+
+    // Without a trusted runtime scope we cannot bind a subject. Rather than fall
+    // back to an unbound grant, deny by issuing nothing for the glob case (which
+    // has no precise hash); for the exact case keep a v1 exact-hash grant so
+    // legacy precise flows still work.
+    let Some(scope) = scope_ctx else {
+        return match op_id_match {
+            OpIdMatch::Exact => Some(ApprovalGrant::for_resource_operation(
+                tool_name,
+                &operation,
+                "approval_manager",
+                None,
+            )),
+            OpIdMatch::GlobPattern(_) => None,
+        };
+    };
+
+    let workspace_id = scope.policy.workspace_dir.to_string_lossy().to_string();
+    let principal = crate::memory::principal::OwnerPrincipal::new(
+        workspace_id.as_str(),
+        scope.channel,
+        scope.sender,
+        scope.chat_id,
+        vec![crate::memory::principal::Role::Anonymous],
+    );
+
+    let keyring = match WitnessKeyring::global() {
+        Ok(keyring) => keyring,
+        Err(error) => {
+            tracing::error!("witness keyring unavailable; cannot issue v2 grant: {error}");
+            // Exact ops can still use a precise v1 hash; glob ops cannot, so deny.
+            return match op_id_match {
+                OpIdMatch::Exact => Some(ApprovalGrant::for_resource_operation(
+                    tool_name,
+                    &operation,
+                    "approval_manager",
+                    None,
+                )),
+                OpIdMatch::GlobPattern(_) => None,
+            };
+        }
+    };
+
+    // Consume `principal` (not used afterwards) to avoid cloning its strings.
+    let subject = Subject {
+        agent_id: format!("prx:agent:{}", scope.channel),
+        principal_id: principal.principal_id,
+        owner_id: principal.owner_id,
+        workspace_id,
+        session_key: Some(scope.chat_id.to_string()),
+    };
+
+    // For a glob grant the stored capability.op_id IS the pattern; for an exact
+    // grant it is the operation string.
+    let match_mode = match &op_id_match {
+        OpIdMatch::Exact => OpIdMatch::Exact,
+        OpIdMatch::GlobPattern(_) => OpIdMatch::GlobPattern(operation.clone()),
+    };
+
+    let issue = (|| -> anyhow::Result<ApprovalGrant> {
+        // Fully signed, short-window, single-use grant bound to `subject`. We
+        // verify our own signature in-process before trusting it (defense in
+        // depth); the gate re-verifies against the keyring regardless of the
+        // in-process `v2_verified` hint.
+        let grant = ApprovalGrantV2::issue_one_shot_match(
+            keyring,
+            subject,
+            IssuerAuthority::HumanReview,
+            operation.clone(),
+            match_mode,
+            risk,
+        )?;
+        crate::acl::approval_grant::verify_grant(keyring, &grant)?;
+        Ok(ApprovalGrant::from_verified_v2(tool_name, "approval_manager", grant))
+    })();
+
+    match issue {
+        Ok(grant) => Some(grant),
+        Err(error) => {
+            tracing::error!(tool = tool_name, "failed to issue v2 approval grant: {error}");
+            // Exact ops can degrade to a precise v1 hash; glob ops cannot be
+            // expressed in v1, so deny rather than wildcard-approve.
+            match op_id_match {
+                OpIdMatch::Exact => Some(ApprovalGrant::for_resource_operation(
+                    tool_name,
+                    &operation,
+                    "approval_manager",
+                    None,
+                )),
+                OpIdMatch::GlobPattern(_) => None,
+            }
+        }
+    }
+}
+
 async fn execute_one_tool(
     call_name: &str,
     mut call_arguments: serde_json::Value,
@@ -1917,6 +2709,7 @@ async fn execute_one_tool(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
+    runtime_approval_granted: bool,
     chat_mode: ChatMode,
 ) -> Result<String> {
     if chat_mode.intercepts_writes() && is_write_tool(call_name) {
@@ -1938,19 +2731,69 @@ async fn execute_one_tool(
         ));
     };
 
+    let runtime_approval_grant = runtime_approval_granted
+        .then(|| runtime_approval_grant_for_call(call_name, &call_arguments, scope_ctx))
+        .flatten();
     let root = call_arguments
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("tool arguments must be a JSON object"))?;
+    // Never trust model/user supplied approval markers. ApprovalManager is the
+    // only path that can re-inject this runtime-only grant for the current call.
+    root.remove(RUNTIME_APPROVAL_GRANTED_ARG);
+    root.remove(RUNTIME_APPROVAL_GRANT_ARG);
+    root.insert(
+        RUNTIME_APPROVAL_GRANTED_ARG.to_string(),
+        serde_json::Value::Bool(runtime_approval_granted),
+    );
+    if let Some(grant) = runtime_approval_grant {
+        root.insert(RUNTIME_APPROVAL_GRANT_ARG.to_string(), serde_json::to_value(grant)?);
+    }
     if let Some(ctx) = scope_ctx {
-        root.insert(
-            "_zc_scope".to_string(),
-            serde_json::json!({
-                "sender": ctx.sender,
-                "channel": ctx.channel,
-                "chat_type": ctx.chat_type,
-                "chat_id": ctx.chat_id,
-            }),
-        );
+        let mut trusted_scope = serde_json::json!({
+            "sender": ctx.sender,
+            "channel": ctx.channel,
+            "chat_type": ctx.chat_type,
+            "chat_id": ctx.chat_id,
+        });
+        if let Some(scope) = trusted_scope.as_object_mut() {
+            if let Some(owner_id) = ctx.owner_id {
+                scope.insert("owner_id".to_string(), serde_json::Value::String(owner_id.to_string()));
+            }
+            if let Some(topic_id) = ctx.topic_id {
+                scope.insert("topic_id".to_string(), serde_json::Value::String(topic_id.to_string()));
+            }
+            if let Some(task_id) = ctx.task_id {
+                scope.insert("task_id".to_string(), serde_json::Value::String(task_id.to_string()));
+            }
+            if let Some(source_message_event_id) = ctx.source_message_event_id {
+                scope.insert(
+                    "source_message_event_id".to_string(),
+                    serde_json::Value::String(source_message_event_id.to_string()),
+                );
+            }
+        }
+        if let Ok(spawn_ctx) = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.try_with(Clone::clone) {
+            if let Some(scope) = trusted_scope.as_object_mut() {
+                scope.insert("task_id".to_string(), serde_json::Value::String(spawn_ctx.run_id));
+                scope.insert(
+                    "session_scope_key".to_string(),
+                    serde_json::Value::String(spawn_ctx.session_scope_key),
+                );
+                if let Some(owner_id) = spawn_ctx.owner_id {
+                    scope.insert("owner_id".to_string(), serde_json::Value::String(owner_id));
+                }
+                if let Some(topic_id) = spawn_ctx.topic_id {
+                    scope.insert("topic_id".to_string(), serde_json::Value::String(topic_id));
+                }
+                if let Some(source_message_event_id) = spawn_ctx.source_message_event_id {
+                    scope.insert(
+                        "source_message_event_id".to_string(),
+                        serde_json::Value::String(source_message_event_id),
+                    );
+                }
+            }
+        }
+        root.insert("_zc_scope".to_string(), trusted_scope);
         root.insert("_zc_scope_trusted".to_string(), serde_json::Value::Bool(true));
     } else {
         // Never trust user-provided scope payloads when runtime has no trusted scope.
@@ -2207,6 +3050,8 @@ fn is_read_only_tool_name(name: &str) -> bool {
             | "memory_get"
             | "memory_recall"
             | "memory_search"
+            | "document_search"
+            | "document_get_chunk"
             | "web_fetch"
             | "web_search_tool"
             | "image_info"
@@ -2284,6 +3129,18 @@ async fn execute_tool_call_serial(
             if decision == ApprovalResponse::No {
                 return Ok("Denied by user.".to_string());
             }
+
+            return execute_one_tool(
+                &call.name,
+                call.arguments.clone(),
+                tools_registry,
+                observer,
+                cancellation_token,
+                scope_ctx,
+                true,
+                chat_mode,
+            )
+            .await;
         }
     }
 
@@ -2294,6 +3151,7 @@ async fn execute_tool_call_serial(
         observer,
         cancellation_token,
         scope_ctx,
+        false,
         chat_mode,
     )
     .await
@@ -2327,6 +3185,7 @@ async fn execute_read_only_batch(
                 observer,
                 cancellation_token,
                 scope_ctx,
+                false,
                 chat_mode,
             );
 
@@ -2543,6 +3402,9 @@ async fn execute_tools_with_policy(
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 ///
+/// RouteDecision / ProviderExecutionOutcome timeline recording is currently
+/// owned by callers that have a MemoryFabric scope for the concrete ingress.
+///
 /// Pass `scope_ctx` to enable per-user/channel/chat_type tool access control.
 /// When `None`, no scope-based restriction is applied.
 #[allow(clippy::too_many_arguments)]
@@ -2572,6 +3434,7 @@ pub(crate) async fn run_tool_call_loop(
     scope_ctx: Option<&ScopeContext<'_>>,
     on_tool_call: Option<tokio::sync::mpsc::Sender<ToolCallNotification>>,
     tool_tiering: Option<&crate::config::ToolTieringConfig>,
+    document_ingest: Option<DocumentIngestRuntime>,
     chat_mode: ChatMode,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
@@ -2640,7 +3503,7 @@ pub(crate) async fn run_tool_call_loop(
             );
             match tokio::time::timeout(
                 std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
-                apply_configurable_compaction(history, provider, model, config),
+                apply_configurable_compaction(history, provider, model, config, document_ingest.as_ref(), "pre_turn"),
             )
             .await
             {
@@ -2679,7 +3542,7 @@ pub(crate) async fn run_tool_call_loop(
         if let Some(config) = compaction_config {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
-                apply_configurable_compaction(history, provider, model, config),
+                apply_configurable_compaction(history, provider, model, config, document_ingest.as_ref(), "mid_loop"),
             )
             .await
             {
@@ -2876,7 +3739,14 @@ pub(crate) async fn run_tool_call_loop(
                     if let Some(config) = compaction_config {
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
-                            apply_configurable_compaction(history, provider, model, config),
+                            apply_configurable_compaction(
+                                history,
+                                provider,
+                                model,
+                                config,
+                                document_ingest.as_ref(),
+                                "overflow_retry",
+                            ),
                         )
                         .await
                         {
@@ -3043,8 +3913,22 @@ pub(crate) async fn run_tool_call_loop(
                 }
             };
 
-            // P0-2: Truncate oversized tool results before inserting into history.
-            let truncated_result = truncate_tool_result_if_needed(result, MAX_TOOL_RESULT_CHARS);
+            // P0-8: Keep history bounded and persist oversized outputs in the
+            // document layer when a runtime document sink is available.
+            let document_status = persist_tool_output_document(
+                document_ingest.as_ref(),
+                &call.name,
+                result,
+                MAX_TOOL_RESULT_INLINE_CHARS,
+            )
+            .await
+            .unwrap_or("pending_document_backend");
+            let truncated_result = compact_tool_result_for_history_with_status(
+                &call.name,
+                result,
+                MAX_TOOL_RESULT_INLINE_CHARS,
+                document_status,
+            );
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}{}\n</tool_result>",
@@ -3061,8 +3945,20 @@ pub(crate) async fn run_tool_call_loop(
             history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
         } else {
             for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
-                // P0-2: Also truncate native tool result content.
-                let truncated_result = truncate_tool_result_if_needed(result, MAX_TOOL_RESULT_CHARS);
+                let document_status = persist_tool_output_document(
+                    document_ingest.as_ref(),
+                    &native_call.name,
+                    result,
+                    MAX_TOOL_RESULT_INLINE_CHARS,
+                )
+                .await
+                .unwrap_or("pending_document_backend");
+                let truncated_result = compact_tool_result_for_history_with_status(
+                    &native_call.name,
+                    result,
+                    MAX_TOOL_RESULT_INLINE_CHARS,
+                    document_status,
+                );
                 let tool_msg = serde_json::json!({
                     "tool_call_id": native_call.id,
                     "content": truncated_result,
@@ -3159,7 +4055,6 @@ pub async fn run(
     let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
         .with_event_recording(config.memory.event_recording_config());
     let agent_run_id = Uuid::new_v4().to_string();
-    let agent_session_key = format!("agent:{agent_run_id}");
     let mut fabric_turn_seq: u64 = 0;
 
     // ── Tools ────────────────────────────────────────────────────
@@ -3321,11 +4216,10 @@ pub async fn run(
 
     if let Some(msg) = message {
         fabric_turn_seq += 1;
-        let fabric_scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
-            .with_channel("cli")
-            .with_session_key(agent_session_key.clone())
-            .with_run_id(agent_run_id.clone())
-            .with_sender("local-user")
+        let runtime_envelope = RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), agent_run_id.clone())
+            .with_recipient("cli:local-user");
+        let fabric_scope = runtime_envelope
+            .message_scope()
             .with_recipient(format!("{provider_name}/{model_name}"));
         let agent_user_event = match memory_fabric
             .record_inbound_user_message(
@@ -3370,18 +4264,17 @@ pub async fn run(
         }
 
         // Inject memory context into user message
-        let mem_context = build_context_with_shared_events(
+        let document_ingest = Some(
+            DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
+                .with_source_message_event_id(agent_user_event.as_ref().map(|event| event.event_id.clone())),
+        );
+        let semantic_scope = runtime_envelope.memory_write_context("private");
+        let mem_context = build_context_with_shared_events_and_scope(
             mem.as_ref(),
-            MemoryPrincipal {
-                workspace_id: memory_fabric.workspace_id().to_string(),
-                agent_id: None,
-                persona_id: None,
-                session_key: Some(agent_session_key.clone()),
-                channel: Some("cli".to_string()),
-                sender: Some("local-user".to_string()),
-            },
+            runtime_envelope.memory_principal(),
             &msg,
             config.memory.min_relevance_score,
+            Some(&semantic_scope),
         )
         .await;
         let context = mem_context.preamble.clone();
@@ -3428,6 +4321,7 @@ pub async fn run(
             None,
             None,
             Some(&config.tool_tiering),
+            document_ingest,
             ChatMode::default(),
         )
         .await?;
@@ -3549,11 +4443,11 @@ pub async fn run(
             }
 
             fabric_turn_seq += 1;
-            let fabric_scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
-                .with_channel("cli")
-                .with_session_key(agent_session_key.clone())
-                .with_run_id(agent_run_id.clone())
-                .with_sender("local-user")
+            let runtime_envelope =
+                RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), agent_run_id.clone())
+                    .with_recipient("cli:local-user");
+            let fabric_scope = runtime_envelope
+                .message_scope()
                 .with_recipient(format!("{provider_name}/{model_name}"));
             let agent_user_event = match memory_fabric
                 .record_inbound_user_message(
@@ -3588,18 +4482,17 @@ pub async fn run(
             }
 
             // Inject memory context into user message
-            let mem_context = build_context_with_shared_events(
+            let document_ingest = Some(
+                DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
+                    .with_source_message_event_id(agent_user_event.as_ref().map(|event| event.event_id.clone())),
+            );
+            let semantic_scope = runtime_envelope.memory_write_context("private");
+            let mem_context = build_context_with_shared_events_and_scope(
                 mem.as_ref(),
-                MemoryPrincipal {
-                    workspace_id: memory_fabric.workspace_id().to_string(),
-                    agent_id: None,
-                    persona_id: None,
-                    session_key: Some(agent_session_key.clone()),
-                    channel: Some("cli".to_string()),
-                    sender: Some("local-user".to_string()),
-                },
+                runtime_envelope.memory_principal(),
                 &user_input,
                 config.memory.min_relevance_score,
+                Some(&semantic_scope),
             )
             .await;
             let context = mem_context.preamble.clone();
@@ -3660,6 +4553,7 @@ pub async fn run(
                 None,
                 None,
                 Some(&config.tool_tiering),
+                document_ingest,
                 ChatMode::default(),
             )
             .await
@@ -3848,11 +4742,18 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &tools_registry,
     );
 
-    let fabric_scope = MessageEventScope::new("agent", MemoryVisibility::Workspace)
-        .with_channel("process_message")
-        .with_session_key(agent_session_key.clone())
-        .with_run_id(agent_run_id.clone())
-        .with_sender("local-user")
+    let runtime_envelope = RuntimeEnvelope::new(
+        crate::runtime::envelope::RuntimeSource::Agent,
+        memory_fabric.workspace_id().to_string(),
+        agent_session_key.clone(),
+        MemoryVisibility::Session,
+    )
+    .with_run_id(agent_run_id.clone())
+    .with_channel("process_message")
+    .with_sender("local-user")
+    .with_recipient("process_message:local-user");
+    let fabric_scope = runtime_envelope
+        .message_scope()
         .with_recipient(format!("{provider_name}/{model_name}"));
     if let Err(error) = memory_fabric
         .record_inbound_user_message(
@@ -3866,18 +4767,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         tracing::warn!(error = %error, "Failed to append process_message user event");
     }
 
-    let mem_context = build_context_with_shared_events(
+    let semantic_scope = runtime_envelope.memory_write_context("private");
+    let mem_context = build_context_with_shared_events_and_scope(
         mem.as_ref(),
-        MemoryPrincipal {
-            workspace_id: memory_fabric.workspace_id().to_string(),
-            agent_id: None,
-            persona_id: None,
-            session_key: Some(agent_session_key.clone()),
-            channel: Some("process_message".to_string()),
-            sender: Some("local-user".to_string()),
-        },
+        runtime_envelope.memory_principal(),
         message,
         config.memory.min_relevance_score,
+        Some(&semantic_scope),
     )
     .await;
     let context = mem_context.preamble.clone();
@@ -3916,6 +4812,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
             rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
         },
+        Some(DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)),
     )
     .await?;
     if let Err(error) = memory_fabric
@@ -3996,7 +4893,9 @@ mod tests {
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
     }
-    use crate::memory::{Memory, MemoryCategory, MemoryVisibility, MessageEventInput, SqliteMemory};
+    use crate::memory::{
+        DocumentIngestInput, Memory, MemoryCategory, MemoryVisibility, MessageEventInput, SqliteMemory,
+    };
     use crate::observability::NoopObserver;
     use crate::providers::ChatResponse;
     use crate::providers::traits::ProviderCapabilities;
@@ -4124,6 +5023,32 @@ mod tests {
         }
     }
 
+    struct SystemSummaryProvider {
+        response: String,
+    }
+
+    #[async_trait]
+    impl Provider for SystemSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(self.response.clone())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("chat should not be used in system summary provider tests")
+        }
+    }
+
     struct DelayTool {
         name: String,
         delay_ms: u64,
@@ -4184,6 +5109,56 @@ mod tests {
         }
     }
 
+    struct LargeOutputTool {
+        output: String,
+    }
+
+    #[async_trait]
+    impl Tool for LargeOutputTool {
+        fn name(&self) -> &str {
+            "large_output"
+        }
+
+        fn description(&self) -> &str {
+            "Returns a large output for document ingest tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: self.output.clone(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn document_ingest_runtime_inherits_envelope_lineage() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent(tmp.path().to_string_lossy().to_string(), "run-child")
+            .with_owner_id("owner:workspace:telegram:alice")
+            .with_topic_id("topic-a")
+            .with_task_id("task-a")
+            .with_source_message_event_id("msg-a")
+            .with_agent_id("agent-a")
+            .with_persona_id("persona-a");
+
+        let runtime = DocumentIngestRuntime::from_envelope(memory, &envelope);
+
+        assert_eq!(runtime.owner_id.as_deref(), Some("owner:workspace:telegram:alice"));
+        assert_eq!(runtime.topic_id.as_deref(), Some("topic-a"));
+        assert_eq!(runtime.task_id.as_deref(), Some("task-a"));
+        assert_eq!(runtime.source_message_event_id.as_deref(), Some("msg-a"));
+        assert_eq!(runtime.session_key.as_deref(), Some("agent:run-child"));
+        assert_eq!(runtime.agent_id.as_deref(), Some("agent-a"));
+        assert_eq!(runtime.persona_id.as_deref(), Some("persona-a"));
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4223,6 +5198,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
+            None, // no document ingest
             ChatMode::default(),
         )
         .await
@@ -4280,6 +5256,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
+            None, // no document ingest
             ChatMode::default(),
         )
         .await
@@ -4329,6 +5306,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
+            None, // no document ingest
             ChatMode::default(),
         )
         .await
@@ -4380,6 +5358,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
+            None, // no document ingest
             ChatMode::default(),
         )
         .await
@@ -4451,15 +5430,25 @@ mod tests {
     fn classify_tool_call_marks_known_read_only_tools() {
         assert_eq!(classify_tool_call("file_read"), ToolSchedulingClass::ReadOnly);
         assert_eq!(classify_tool_call("memory_search"), ToolSchedulingClass::ReadOnly);
+        assert_eq!(classify_tool_call("document_search"), ToolSchedulingClass::ReadOnly);
+        assert_eq!(classify_tool_call("document_get_chunk"), ToolSchedulingClass::ReadOnly);
     }
 
     #[test]
     fn classify_tool_call_marks_mutating_or_unknown_tools_as_stateful() {
         assert_eq!(classify_tool_call("shell"), ToolSchedulingClass::Stateful);
+        assert_eq!(classify_tool_call("memory_reindex"), ToolSchedulingClass::Stateful);
         assert_eq!(
             classify_tool_call("totally_unknown_tool"),
             ToolSchedulingClass::Stateful
         );
+    }
+
+    #[test]
+    fn tool_barrier_groups_memory_reindex_with_memory_writes() {
+        assert_eq!(tool_barrier_key("memory_store"), Some("memory_write"));
+        assert_eq!(tool_barrier_key("memory_forget"), Some("memory_write"));
+        assert_eq!(tool_barrier_key("memory_reindex"), Some("memory_write"));
     }
 
     #[test]
@@ -4560,6 +5549,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
+            None, // no document ingest
             ChatMode::default(),
         )
         .await
@@ -4591,6 +5581,82 @@ mod tests {
         assert!(
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_persists_large_tool_output_documents() {
+        let large_output = format!(
+            "{}\n{}",
+            "needle source evidence marker",
+            "large document payload ".repeat(600)
+        );
+        assert!(large_output.len() > MAX_TOOL_RESULT_INLINE_CHARS);
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"large_output","arguments":{}}
+</tool_call>"#,
+            "done",
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(LargeOutputTool {
+            output: large_output.clone(),
+        })];
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent(tmp.path().to_string_lossy().to_string(), "run-doc-ingest")
+            .with_recipient("cli:local-user");
+        let document_ingest = DocumentIngestRuntime::from_envelope(memory.clone(), &envelope);
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("run tool call")];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &NoopObserver,
+            &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            false,
+            2,
+            30,
+            false,
+            Vec::new(),
+            ToolConcurrencyGovernanceConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(document_ingest),
+            ChatMode::default(),
+        )
+        .await
+        .expect("large output tool loop should complete");
+
+        assert_eq!(result, "done");
+        let tool_history = history
+            .iter()
+            .map(|message| message.content.as_str())
+            .find(|content| content.contains("[document_ingest_ref]"))
+            .expect("tool history should include document ingest ref");
+        assert!(tool_history.contains("status: persisted_document_backend"));
+
+        let chunks = memory
+            .search_document_chunks(&envelope.memory_principal(), "needle source evidence", 5)
+            .await
+            .unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].chunk.document_id.starts_with("tool-output:large_output:"));
+        assert_eq!(
+            chunks[0].chunk.source_anchor,
+            format!("{}#chunk-0", chunks[0].chunk.document_id)
         );
     }
 
@@ -4662,6 +5728,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
+            None, // no document ingest
             ChatMode::default(),
         )
         .await
@@ -4830,6 +5897,7 @@ mod tests {
             &NoopObserver,
             None,
             None,
+            false,
             ChatMode::default(),
         );
         let second = execute_one_tool(
@@ -4839,6 +5907,7 @@ mod tests {
             &NoopObserver,
             None,
             None,
+            false,
             ChatMode::default(),
         );
 
@@ -4863,6 +5932,8 @@ mod tests {
             "memory_recall",
             "memory_search",
             "memory_get",
+            "document_search",
+            "document_get_chunk",
             "cron_list",
             "cron_runs",
             "sessions_list",
@@ -4889,6 +5960,7 @@ mod tests {
             "git_operations",
             "memory_store",
             "memory_forget",
+            "memory_reindex",
             "sessions_spawn",
             "sessions_send",
             "delegate",
@@ -4947,6 +6019,7 @@ mod tests {
             &NoopObserver,
             None,
             None,
+            false,
             ChatMode::Plan,
         )
         .await
@@ -4989,6 +6062,7 @@ mod tests {
             &NoopObserver,
             None,
             None,
+            false,
             ChatMode::Plan,
         )
         .await
@@ -5023,6 +6097,7 @@ mod tests {
             &NoopObserver,
             None,
             None,
+            false,
             ChatMode::Edit,
         )
         .await
@@ -5057,6 +6132,7 @@ mod tests {
             &NoopObserver,
             None,
             None,
+            false,
             ChatMode::Auto,
         )
         .await
@@ -5529,6 +6605,34 @@ ls -la
         assert_eq!(compaction_trigger_limit(&config), Some(400));
     }
 
+    #[test]
+    fn extract_document_ingest_refs_parses_large_output_markers() {
+        let large = "document reference body ".repeat(600);
+        let marker = compact_tool_result_for_history_with_status(
+            "shell",
+            &large,
+            MAX_TOOL_RESULT_INLINE_CHARS,
+            "persisted_document_backend",
+        );
+        let refs = extract_document_ingest_refs(&[ChatMessage::assistant(marker)]);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0]["source"].as_str(), Some("tool_output"));
+        assert_eq!(refs[0]["tool"].as_str(), Some("shell"));
+        assert_eq!(refs[0]["status"].as_str(), Some("persisted_document_backend"));
+        assert!(
+            refs[0]["document_id"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("tool-output:shell:")
+        );
+        assert!(
+            refs[0]["content_sha256"]
+                .as_str()
+                .is_some_and(|value| value.len() == 64)
+        );
+        assert!(refs[0]["chunks"].as_u64().unwrap_or_default() >= 1);
+    }
+
     #[tokio::test]
     async fn configurable_compaction_safeguard_inserts_summary_marker() {
         let provider = ScriptedProvider::from_text_responses(vec!["- concise summary"]);
@@ -5546,7 +6650,7 @@ ls -la
             memory_flush: false,
             max_context_tokens: 50,
         };
-        let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config)
+        let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
             .await
             .unwrap();
         assert!(compacted);
@@ -5574,11 +6678,79 @@ ls -la
             memory_flush: true,
             max_context_tokens: 40,
         };
-        let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config)
+        let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
             .await
             .unwrap();
         assert!(compacted);
         assert!(history.iter().any(|msg| msg.content.contains("[Memory flush at")));
+    }
+
+    #[tokio::test]
+    async fn configurable_compaction_records_run_and_summary_memory() {
+        let tmp = TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent("workspace-a", "run-compact-1");
+        let audit = DocumentIngestRuntime::from_envelope(mem, &envelope);
+        let provider = SystemSummaryProvider {
+            response: "## Decisions\n- keep source anchors\n## Open TODOs\n- verify compaction\n## Critical Context\n- path /tmp/a and task run-compact-1".to_string(),
+        };
+        let large_ref = compact_tool_result_for_history_with_status(
+            "shell",
+            &"large output source evidence ".repeat(700),
+            MAX_TOOL_RESULT_INLINE_CHARS,
+            "persisted_document_backend",
+        );
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("Remember file /tmp/a and task run-compact-1. ".repeat(120)),
+            ChatMessage::assistant(format!(
+                "Acknowledged source anchor requirement.\n{large_ref}\n{}",
+                "padding ".repeat(120)
+            )),
+            ChatMessage::user("Please compact soon. ".repeat(120)),
+            ChatMessage::assistant("Will preserve identifiers. ".repeat(120)),
+        ];
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 1,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 50,
+        };
+
+        let compacted =
+            apply_configurable_compaction(&mut history, &provider, "model", &config, Some(&audit), "pre_turn")
+                .await
+                .unwrap();
+
+        assert!(compacted);
+        let conn = rusqlite::Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
+        let (summary_memory_key, fidelity_status, source_events, source_refs): (String, String, String, String) = conn
+            .query_row(
+                "SELECT summary_memory_key, fidelity_status, source_event_ids_json, source_document_refs_json
+                 FROM compaction_runs
+                 WHERE workspace_id = 'workspace-a'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert!(summary_memory_key.starts_with("compaction_summary_"));
+        assert_eq!(fidelity_status, "accepted");
+        assert!(source_events.contains("content_hash"));
+        assert!(source_refs.contains("document_id"));
+        assert!(source_refs.contains("tool-output:shell:"));
+        assert!(source_refs.contains("persisted_document_backend"));
+
+        let stored_summary_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE key = ?1 AND source = 'compaction_summary'",
+                [summary_memory_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_summary_count, 1);
     }
 
     #[test]
@@ -5649,6 +6821,7 @@ ls -la
             event_id: None,
             idempotency_key: None,
             workspace_id: "workspace-a".to_string(),
+            owner_id: None,
             source: "channel".to_string(),
             channel: Some("telegram".to_string()),
             session_key: Some("telegram:chat-1".to_string()),
@@ -5670,6 +6843,7 @@ ls -la
             event_id: None,
             idempotency_key: None,
             workspace_id: "workspace-a".to_string(),
+            owner_id: None,
             source: "chat".to_string(),
             channel: Some("terminal".to_string()),
             session_key: Some("chat:current".to_string()),
@@ -5697,6 +6871,7 @@ ls -la
                 session_key: Some("chat:current".to_string()),
                 channel: Some("terminal".to_string()),
                 sender: Some("local-user".to_string()),
+                owner_id: None,
             },
             "what changed",
             0.0,
@@ -5724,6 +6899,7 @@ ls -la
             event_id: None,
             idempotency_key: None,
             workspace_id: "workspace-a".to_string(),
+            owner_id: None,
             source: "chat".to_string(),
             channel: Some("terminal".to_string()),
             session_key: Some("chat:current".to_string()),
@@ -5745,6 +6921,7 @@ ls -la
             event_id: None,
             idempotency_key: None,
             workspace_id: "workspace-a".to_string(),
+            owner_id: None,
             source: "chat".to_string(),
             channel: Some("terminal".to_string()),
             session_key: Some("chat:current".to_string()),
@@ -5770,6 +6947,7 @@ ls -la
             "previous current-session request",
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5781,6 +6959,7 @@ ls -la
             "previous current-session answer",
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5788,6 +6967,7 @@ ls -la
             event_id: None,
             idempotency_key: None,
             workspace_id: "workspace-a".to_string(),
+            owner_id: None,
             source: "gateway".to_string(),
             channel: Some("webhook".to_string()),
             session_key: Some("gateway:webhook:client-a".to_string()),
@@ -5815,6 +6995,7 @@ ls -la
                 session_key: Some("chat:current".to_string()),
                 channel: Some("terminal".to_string()),
                 sender: Some("local-user".to_string()),
+                owner_id: None,
             },
             "operational summaries",
             0.0,
@@ -5835,6 +7016,68 @@ ls -la
     }
 
     #[tokio::test]
+    async fn build_agent_context_includes_document_evidence_with_source_ids() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.ingest_document(DocumentIngestInput {
+            document_id: Some("doc-context-1".to_string()),
+            workspace_id: "workspace-a".to_string(),
+            owner_id: None,
+            topic_id: Some("topic-context".to_string()),
+            task_id: Some("task-context".to_string()),
+            source_message_event_id: Some("msg-context".to_string()),
+            source_kind: "test".to_string(),
+            source_uri: Some("test://doc-context-1".to_string()),
+            title: Some("Context Evidence".to_string()),
+            content: "retrieval context document evidence with stable source anchors".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            visibility: MemoryVisibility::Workspace,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+        let bundle = build_agent_context(
+            &mem,
+            MemoryPrincipal {
+                workspace_id: "workspace-a".to_string(),
+                agent_id: None,
+                persona_id: None,
+                session_key: Some("chat:current".to_string()),
+                channel: Some("terminal".to_string()),
+                sender: Some("local-user".to_string()),
+                owner_id: None,
+            },
+            "stable source anchors",
+            0.0,
+        )
+        .await;
+
+        assert!(bundle.document_context.contains("[Document evidence]"));
+        assert!(bundle.document_context.contains("document_id=doc-context-1"));
+        assert!(bundle.document_context.contains("chunk_id=doc-context-1:chunk:0"));
+        assert!(bundle.document_context.contains("source_anchor=doc-context-1#chunk-0"));
+        assert!(bundle.preamble().contains("[Document evidence]"));
+
+        let conn = rusqlite::Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
+        let (selected_count, selected_json): (i64, String) = conn
+            .query_row(
+                "SELECT selected_count, selected_json
+                 FROM retrieval_traces
+                 WHERE workspace_id = 'workspace-a'
+                   AND source = 'agent_context.document_evidence'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(selected_count, 1);
+        assert!(selected_json.contains("doc-context-1:chunk:0"));
+        assert!(selected_json.contains("doc-context-1#chunk-0"));
+    }
+
+    #[tokio::test]
     async fn build_agent_context_keeps_current_session_when_shared_events_are_noisy() {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
@@ -5842,6 +7085,7 @@ ls -la
             event_id: None,
             idempotency_key: None,
             workspace_id: "workspace-a".to_string(),
+            owner_id: None,
             source: "chat".to_string(),
             channel: Some("terminal".to_string()),
             session_key: Some("chat:current".to_string()),
@@ -5864,6 +7108,7 @@ ls -la
                 event_id: None,
                 idempotency_key: None,
                 workspace_id: "workspace-a".to_string(),
+                owner_id: None,
                 source: "gateway".to_string(),
                 channel: Some("webhook".to_string()),
                 session_key: Some(format!("gateway:external:{index}")),
@@ -5892,6 +7137,7 @@ ls -la
                 session_key: Some("chat:current".to_string()),
                 channel: Some("terminal".to_string()),
                 sender: Some("local-user".to_string()),
+                owner_id: None,
             },
             "what is current",
             0.0,
@@ -5902,6 +7148,33 @@ ls -la
             bundle
                 .current_session_context
                 .contains("important current-session fact")
+        );
+    }
+
+    #[test]
+    fn compact_tool_result_for_history_emits_document_reference_for_large_output() {
+        let content = format!(
+            "{}\n{}",
+            "# command output",
+            "x".repeat(MAX_TOOL_RESULT_INLINE_CHARS + 512)
+        );
+        let compacted = compact_tool_result_for_history("shell", &content, MAX_TOOL_RESULT_INLINE_CHARS);
+
+        assert!(compacted.len() < content.len() + 512);
+        assert!(compacted.contains("[document_ingest_ref]"));
+        assert!(compacted.contains("document_id: tool-output:shell:"));
+        assert!(compacted.contains("source: tool_output"));
+        assert!(compacted.contains("vector_anchor: vector://tool-output:shell:"));
+        assert!(compacted.contains("status: pending_document_backend"));
+        assert!(compacted.contains(&format!("inline_preview_bytes: {MAX_TOOL_RESULT_INLINE_CHARS}")));
+    }
+
+    #[test]
+    fn compact_tool_result_for_history_preserves_small_output() {
+        let content = "small command output";
+        assert_eq!(
+            compact_tool_result_for_history("shell", content, MAX_TOOL_RESULT_INLINE_CHARS),
+            content
         );
     }
 

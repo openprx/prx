@@ -4,7 +4,9 @@
 //! Pattern follows `cron/store.rs`: `with_connection()` + `rusqlite::params!`.
 
 use crate::config::Config;
-use crate::xin::types::{ExecutionMode, NewXinTask, TaskKind, TaskPriority, TaskStatus, XinTask, XinTaskPatch};
+use crate::xin::types::{
+    ExecutionMode, NewXinTask, TaskKind, TaskPriority, TaskStatus, XinTask, XinTaskEvent, XinTaskPatch,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
@@ -40,18 +42,24 @@ pub fn add_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
     with_connection(config, |conn| {
         conn.execute(
             "INSERT INTO xin_tasks (
-                id, name, description, kind, status, priority, execution_mode,
+                id, owner_id, topic_id, parent_task_id, source_message_event_id,
+                name, description, kind, status, priority, execution_mode,
                 payload, recurring, interval_secs, created_at, updated_at,
                 last_run_at, next_run_at, last_status, last_output,
-                run_count, fail_count, max_failures, enabled
+                run_count, fail_count, max_failures, enabled, approval_grant_json
              ) VALUES (
-                ?1, ?2, ?3, ?4, 'pending', ?5, ?6,
-                ?7, ?8, ?9, ?10, ?11,
-                NULL, ?12, NULL, NULL,
-                0, 0, ?13, 1
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7, ?8, 'pending', ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15,
+                NULL, ?16, NULL, NULL,
+                0, 0, ?17, 1, ?18
              )",
             params![
                 id,
+                new.owner_id,
+                new.topic_id,
+                new.parent_task_id,
+                new.source_message_event_id,
                 new.name,
                 new.description,
                 new.kind.as_str(),
@@ -64,9 +72,34 @@ pub fn add_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
                 i64::from(new.max_failures),
+                new.approval_grant_json,
             ],
         )
         .context("Failed to insert xin task")?;
+        insert_task_event(
+            conn,
+            &workspace_id(config),
+            &id,
+            TaskLineage {
+                owner_id: new.owner_id.clone(),
+                topic_id: new.topic_id.clone(),
+                parent_task_id: new.parent_task_id.clone(),
+                source_message_event_id: new.source_message_event_id.clone(),
+                status: Some("pending".to_string()),
+            },
+            "xin.task.created",
+            Some("pending"),
+            Some(
+                serde_json::json!({
+                    "name": new.name,
+                    "kind": new.kind.as_str(),
+                    "execution_mode": new.execution_mode.as_str(),
+                    "source_message_event_id": new.source_message_event_id,
+                })
+                .to_string(),
+            )
+            .as_deref(),
+        )?;
         Ok(())
     })?;
 
@@ -90,10 +123,11 @@ pub fn get_task(config: &Config, task_id: &str) -> Result<XinTask> {
 pub fn list_tasks(config: &Config) -> Result<Vec<XinTask>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, kind, status, priority, execution_mode,
+            "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
+                    name, description, kind, status, priority, execution_mode,
                     payload, recurring, interval_secs, created_at, updated_at,
                     last_run_at, next_run_at, last_status, last_output,
-                    run_count, fail_count, max_failures, enabled
+                    run_count, fail_count, max_failures, enabled, approval_grant_json
              FROM xin_tasks
              ORDER BY priority DESC, next_run_at ASC",
         )?;
@@ -111,10 +145,11 @@ pub fn due_tasks(config: &Config, now: DateTime<Utc>, limit: usize) -> Result<Ve
     let lim = i64::try_from(limit.max(1)).context("due_tasks limit overflows i64")?;
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, kind, status, priority, execution_mode,
+            "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
+                    name, description, kind, status, priority, execution_mode,
                     payload, recurring, interval_secs, created_at, updated_at,
                     last_run_at, next_run_at, last_status, last_output,
-                    run_count, fail_count, max_failures, enabled
+                    run_count, fail_count, max_failures, enabled, approval_grant_json
              FROM xin_tasks
              WHERE enabled = 1
                AND status IN ('pending', 'stale')
@@ -147,6 +182,7 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
     }
     if let Some(ref payload) = patch.payload {
         task.payload = payload.clone();
+        task.approval_grant_json = patch.approval_grant_json.clone();
     }
     if let Some(interval) = patch.interval_secs {
         task.interval_secs = interval;
@@ -165,8 +201,9 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
             .execute(
                 "UPDATE xin_tasks
              SET name = ?1, description = ?2, priority = ?3, payload = ?4,
-                 interval_secs = ?5, enabled = ?6, max_failures = ?7, updated_at = ?8
-             WHERE id = ?9 AND updated_at = ?10",
+                 interval_secs = ?5, enabled = ?6, max_failures = ?7, updated_at = ?8,
+                 approval_grant_json = ?9
+             WHERE id = ?10 AND updated_at = ?11",
                 params![
                     task.name,
                     task.description,
@@ -176,6 +213,7 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
                     if task.enabled { 1 } else { 0 },
                     i64::from(task.max_failures),
                     now.to_rfc3339(),
+                    task.approval_grant_json,
                     task_id,
                     previous_updated_at.to_rfc3339(),
                 ],
@@ -183,6 +221,25 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
             .context("Failed to update xin task")?;
         if changed == 0 {
             anyhow::bail!("xin task '{task_id}' was modified by another process (optimistic concurrency conflict)");
+        }
+        if let Some(lineage) = load_task_lineage(conn, task_id)? {
+            insert_task_event(
+                conn,
+                &workspace_id(config),
+                task_id,
+                lineage,
+                "xin.task.updated",
+                Some(task.status.as_str()),
+                Some(
+                    serde_json::json!({
+                        "name": task.name,
+                        "enabled": task.enabled,
+                        "priority": task.priority.as_i32(),
+                    })
+                    .to_string(),
+                )
+                .as_deref(),
+            )?;
         }
         Ok(())
     })?;
@@ -198,13 +255,28 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
 pub fn claim_task(config: &Config, task_id: &str) -> Result<bool> {
     let now = Utc::now();
     let changed = with_connection(config, |conn| {
-        conn.execute(
-            "UPDATE xin_tasks
+        let changed = conn
+            .execute(
+                "UPDATE xin_tasks
              SET status = 'running', updated_at = ?1
              WHERE id = ?2 AND status IN ('pending', 'stale') AND enabled = 1",
-            params![now.to_rfc3339(), task_id],
-        )
-        .context("Failed to claim xin task")
+                params![now.to_rfc3339(), task_id],
+            )
+            .context("Failed to claim xin task")?;
+        if changed > 0 {
+            if let Some(lineage) = load_task_lineage(conn, task_id)? {
+                insert_task_event(
+                    conn,
+                    &workspace_id(config),
+                    task_id,
+                    lineage,
+                    "xin.task.claimed",
+                    Some("running"),
+                    None,
+                )?;
+            }
+        }
+        Ok(changed)
     })?;
     Ok(changed > 0)
 }
@@ -225,6 +297,16 @@ pub fn mark_completed(config: &Config, task_id: &str, output: &str) -> Result<()
             .context("Failed to mark xin task completed")?;
         if changed == 0 {
             tracing::warn!(task_id = %task_id, "mark_completed: no rows affected (task may have been deleted)");
+        } else if let Some(lineage) = load_task_lineage(conn, task_id)? {
+            insert_task_event(
+                conn,
+                &workspace_id(config),
+                task_id,
+                lineage,
+                "xin.task.completed",
+                Some("completed"),
+                Some(serde_json::json!({ "output": bounded }).to_string()).as_deref(),
+            )?;
         }
         Ok(())
     })
@@ -248,6 +330,16 @@ pub fn mark_failed(config: &Config, task_id: &str, output: &str) -> Result<()> {
             .context("Failed to mark xin task failed")?;
         if changed == 0 {
             tracing::warn!(task_id = %task_id, "mark_failed: no rows affected (task may have been deleted)");
+        } else if let Some(lineage) = load_task_lineage(conn, task_id)? {
+            insert_task_event(
+                conn,
+                &workspace_id(config),
+                task_id,
+                lineage,
+                "xin.task.failed",
+                Some("failed"),
+                Some(serde_json::json!({ "output": bounded }).to_string()).as_deref(),
+            )?;
         }
 
         // Auto-disable if max_failures exceeded
@@ -275,13 +367,27 @@ pub fn reschedule_recurring(config: &Config, task_id: &str) -> Result<()> {
         )?;
 
         let next_run = now + chrono::Duration::seconds(interval);
-        conn.execute(
-            "UPDATE xin_tasks
+        let changed = conn
+            .execute(
+                "UPDATE xin_tasks
              SET status = 'pending', next_run_at = ?1, updated_at = ?2
              WHERE id = ?3 AND recurring = 1 AND enabled = 1",
-            params![next_run.to_rfc3339(), now.to_rfc3339(), task_id],
-        )
-        .context("Failed to reschedule xin recurring task")?;
+                params![next_run.to_rfc3339(), now.to_rfc3339(), task_id],
+            )
+            .context("Failed to reschedule xin recurring task")?;
+        if changed > 0 {
+            if let Some(lineage) = load_task_lineage(conn, task_id)? {
+                insert_task_event(
+                    conn,
+                    &workspace_id(config),
+                    task_id,
+                    lineage,
+                    "xin.task.rescheduled",
+                    Some("pending"),
+                    Some(serde_json::json!({ "next_run_at": next_run.to_rfc3339() }).to_string()).as_deref(),
+                )?;
+            }
+        }
         Ok(())
     })
 }
@@ -289,6 +395,17 @@ pub fn reschedule_recurring(config: &Config, task_id: &str) -> Result<()> {
 /// Delete a task by ID.
 pub fn remove_task(config: &Config, task_id: &str) -> Result<()> {
     let changed = with_connection(config, |conn| {
+        if let Some(lineage) = load_task_lineage(conn, task_id)? {
+            insert_task_event(
+                conn,
+                &workspace_id(config),
+                task_id,
+                lineage.clone(),
+                "xin.task.removed",
+                lineage.status.as_deref(),
+                None,
+            )?;
+        }
         conn.execute("DELETE FROM xin_tasks WHERE id = ?1", params![task_id])
             .context("Failed to delete xin task")
     })?;
@@ -311,13 +428,37 @@ pub fn remove_completed(config: &Config) -> Result<usize> {
 pub fn mark_stale(config: &Config, stale_timeout_minutes: u32) -> Result<usize> {
     let cutoff = Utc::now() - chrono::Duration::minutes(i64::from(stale_timeout_minutes));
     with_connection(config, |conn| {
-        conn.execute(
-            "UPDATE xin_tasks
+        let mut stmt = conn.prepare(
+            "SELECT id FROM xin_tasks
+             WHERE status = 'running' AND updated_at < ?1",
+        )?;
+        let ids = stmt
+            .query_map(params![cutoff.to_rfc3339()], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let changed = conn
+            .execute(
+                "UPDATE xin_tasks
              SET status = 'stale', updated_at = ?1
              WHERE status = 'running' AND updated_at < ?2",
-            params![Utc::now().to_rfc3339(), cutoff.to_rfc3339()],
-        )
-        .context("Failed to mark stale xin tasks")
+                params![Utc::now().to_rfc3339(), cutoff.to_rfc3339()],
+            )
+            .context("Failed to mark stale xin tasks")?;
+        for task_id in ids {
+            if let Some(lineage) = load_task_lineage(conn, &task_id)? {
+                insert_task_event(
+                    conn,
+                    &workspace_id(config),
+                    &task_id,
+                    lineage,
+                    "xin.task.stale",
+                    Some("stale"),
+                    Some(serde_json::json!({ "stale_timeout_minutes": stale_timeout_minutes }).to_string()).as_deref(),
+                )?;
+            }
+        }
+        Ok(changed)
     })
 }
 
@@ -377,6 +518,25 @@ pub fn record_run(
             ],
         )
         .context("Failed to insert xin run")?;
+        if let Some(lineage) = load_task_lineage(&tx, task_id)? {
+            insert_task_event(
+                &tx,
+                &workspace_id(config),
+                task_id,
+                lineage,
+                "xin.task.run_recorded",
+                Some(status),
+                Some(
+                    serde_json::json!({
+                        "started_at": started_at.to_rfc3339(),
+                        "finished_at": finished_at.to_rfc3339(),
+                        "duration_ms": duration_ms,
+                    })
+                    .to_string(),
+                )
+                .as_deref(),
+            )?;
+        }
 
         // Prune old runs — keep last 50 per task
         tx.execute(
@@ -397,12 +557,28 @@ pub fn record_run(
     })
 }
 
+/// List append-only lifecycle events for a Xin task.
+pub fn list_task_events(config: &Config, task_id: &str) -> Result<Vec<XinTaskEvent>> {
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, event_id, task_id, workspace_id, owner_id, topic_id, parent_task_id,
+                    source_message_event_id, event_type, status, payload_json, created_at
+             FROM xin_task_events
+             WHERE task_id = ?1
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id], map_task_event_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    })
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-const SELECT_ALL_COLUMNS: &str = "SELECT id, name, description, kind, status, priority, execution_mode,
+const SELECT_ALL_COLUMNS: &str = "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
+            name, description, kind, status, priority, execution_mode,
             payload, recurring, interval_secs, created_at, updated_at,
             last_run_at, next_run_at, last_status, last_output,
-            run_count, fail_count, max_failures, enabled
+            run_count, fail_count, max_failures, enabled, approval_grant_json
      FROM xin_tasks WHERE id = ?1";
 
 fn truncate_output(output: &str) -> String {
@@ -431,23 +607,161 @@ fn sql_err(err: anyhow::Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(err.into())
 }
 
+#[derive(Debug, Clone)]
+struct TaskLineage {
+    owner_id: Option<String>,
+    topic_id: Option<String>,
+    parent_task_id: Option<String>,
+    source_message_event_id: Option<String>,
+    status: Option<String>,
+}
+
+fn workspace_id(config: &Config) -> String {
+    config.workspace_dir.to_string_lossy().to_string()
+}
+
+fn load_task_lineage(conn: &Connection, task_id: &str) -> Result<Option<TaskLineage>> {
+    let mut stmt = conn.prepare(
+        "SELECT owner_id, topic_id, parent_task_id, source_message_event_id, status
+         FROM xin_tasks
+         WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query(params![task_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(TaskLineage {
+        owner_id: row.get(0)?,
+        topic_id: row.get(1)?,
+        parent_task_id: row.get(2)?,
+        source_message_event_id: row.get(3)?,
+        status: row.get(4)?,
+    }))
+}
+
+fn insert_task_event(
+    conn: &Connection,
+    workspace_id: &str,
+    task_id: &str,
+    lineage: TaskLineage,
+    event_type: &str,
+    status: Option<&str>,
+    payload_json: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO xin_task_events (
+            event_id, task_id, workspace_id, owner_id, topic_id, parent_task_id, source_message_event_id,
+            event_type, status, payload_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            Uuid::new_v4().to_string(),
+            task_id,
+            workspace_id,
+            lineage.owner_id.as_deref(),
+            lineage.topic_id.as_deref(),
+            lineage.parent_task_id.as_deref(),
+            lineage.source_message_event_id.as_deref(),
+            event_type,
+            status,
+            payload_json,
+            Utc::now().to_rfc3339(),
+        ],
+    )
+    .context("Failed to insert xin task event")?;
+    if let Err(error) = mirror_xin_task_event(workspace_id, task_id, &lineage, event_type, status, payload_json) {
+        tracing::warn!(task_id = %task_id, event_type, "failed to mirror xin task event into memory_events: {error}");
+    }
+    Ok(())
+}
+
+fn mirror_xin_task_event(
+    workspace_id: &str,
+    task_id: &str,
+    lineage: &TaskLineage,
+    event_type: &str,
+    status: Option<&str>,
+    payload_json: Option<&str>,
+) -> Result<i64> {
+    let mirrored_event_type = if event_type == "xin.task.created" {
+        "xin.task.spawned"
+    } else {
+        event_type
+    };
+    let mut payload = payload_json
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    payload.insert("owner_id".to_string(), lineage.owner_id.clone().into());
+    payload.insert("topic_id".to_string(), lineage.topic_id.clone().into());
+    payload.insert("parent_task_id".to_string(), lineage.parent_task_id.clone().into());
+    payload.insert(
+        "source_message_event_id".to_string(),
+        lineage.source_message_event_id.clone().into(),
+    );
+    payload.insert(
+        "status".to_string(),
+        status.map(str::to_string).or_else(|| lineage.status.clone()).into(),
+    );
+    payload.insert("task_id".to_string(), task_id.to_string().into());
+    if !payload.contains_key("task") {
+        if let Some(name) = payload.get("name").and_then(serde_json::Value::as_str) {
+            payload.insert("task".to_string(), name.to_string().into());
+        }
+    }
+    let payload_json = serde_json::Value::Object(payload).to_string();
+    crate::memory::sqlite::append_task_event_mirror(
+        std::path::Path::new(workspace_id),
+        crate::memory::sqlite::SqliteTaskEventMirror {
+            workspace_id,
+            task_id,
+            event_type: mirrored_event_type,
+            session_key: None,
+            agent_id: None,
+            persona_id: None,
+            payload_json: Some(&payload_json),
+        },
+    )
+}
+
+fn map_task_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinTaskEvent> {
+    let created_at_raw: String = row.get(11)?;
+    Ok(XinTaskEvent {
+        id: row.get(0)?,
+        event_id: row.get(1)?,
+        task_id: row.get(2)?,
+        workspace_id: row.get(3)?,
+        owner_id: row.get(4)?,
+        topic_id: row.get(5)?,
+        parent_task_id: row.get(6)?,
+        source_message_event_id: row.get(7)?,
+        event_type: row.get(8)?,
+        status: row.get(9)?,
+        payload_json: row.get(10)?,
+        created_at: parse_rfc3339(&created_at_raw).map_err(sql_err)?,
+    })
+}
+
 fn map_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinTask> {
-    let created_at_raw: String = row.get(10)?;
-    let updated_at_raw: String = row.get(11)?;
-    let last_run_raw: Option<String> = row.get(12)?;
-    let next_run_raw: String = row.get(13)?;
+    let created_at_raw: String = row.get(14)?;
+    let updated_at_raw: String = row.get(15)?;
+    let last_run_raw: Option<String> = row.get(16)?;
+    let next_run_raw: String = row.get(17)?;
 
     Ok(XinTask {
         id: row.get(0)?,
-        name: row.get(1)?,
-        description: row.get(2)?,
-        kind: TaskKind::from_str_lossy(&row.get::<_, String>(3)?),
-        status: TaskStatus::from_str_lossy(&row.get::<_, String>(4)?),
-        priority: TaskPriority::from_i32(row.get(5)?),
-        execution_mode: ExecutionMode::from_str_lossy(&row.get::<_, String>(6)?),
-        payload: row.get(7)?,
-        recurring: row.get::<_, i64>(8)? != 0,
-        interval_secs: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
+        owner_id: row.get(1)?,
+        topic_id: row.get(2)?,
+        parent_task_id: row.get(3)?,
+        source_message_event_id: row.get(4)?,
+        name: row.get(5)?,
+        description: row.get(6)?,
+        kind: TaskKind::from_str_lossy(&row.get::<_, String>(7)?),
+        status: TaskStatus::from_str_lossy(&row.get::<_, String>(8)?),
+        priority: TaskPriority::from_i32(row.get(9)?),
+        execution_mode: ExecutionMode::from_str_lossy(&row.get::<_, String>(10)?),
+        payload: row.get(11)?,
+        recurring: row.get::<_, i64>(12)? != 0,
+        interval_secs: u64::try_from(row.get::<_, i64>(13)?).unwrap_or(0),
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_err)?,
         updated_at: parse_rfc3339(&updated_at_raw).map_err(sql_err)?,
         last_run_at: match last_run_raw {
@@ -455,13 +769,36 @@ fn map_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinTask> {
             None => None,
         },
         next_run_at: parse_rfc3339(&next_run_raw).map_err(sql_err)?,
-        last_status: row.get(14)?,
-        last_output: row.get(15)?,
-        run_count: u64::try_from(row.get::<_, i64>(16)?).unwrap_or(0),
-        fail_count: u64::try_from(row.get::<_, i64>(17)?).unwrap_or(0),
-        max_failures: u32::try_from(row.get::<_, i64>(18)?).unwrap_or(0),
-        enabled: row.get::<_, i64>(19)? != 0,
+        last_status: row.get(18)?,
+        last_output: row.get(19)?,
+        run_count: u64::try_from(row.get::<_, i64>(20)?).unwrap_or(0),
+        fail_count: u64::try_from(row.get::<_, i64>(21)?).unwrap_or(0),
+        max_failures: u32::try_from(row.get::<_, i64>(22)?).unwrap_or(0),
+        enabled: row.get::<_, i64>(23)? != 0,
+        approval_grant_json: row.get(24)?,
     })
+}
+
+fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let col_name: String = row.get(1)?;
+        if col_name == name {
+            return Ok(());
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    match conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {sql_type}"), []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
+            tracing::debug!("Column {table}.{name} already exists (concurrent migration): {err}");
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("Failed to add {table}.{name}")),
+    }
 }
 
 fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -481,6 +818,10 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
 
          CREATE TABLE IF NOT EXISTS xin_tasks (
             id               TEXT PRIMARY KEY,
+            owner_id         TEXT,
+            topic_id         TEXT,
+            parent_task_id   TEXT,
+            source_message_event_id TEXT,
             name             TEXT NOT NULL,
             description      TEXT,
             kind             TEXT NOT NULL DEFAULT 'user',
@@ -499,7 +840,8 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             run_count        INTEGER NOT NULL DEFAULT 0,
             fail_count       INTEGER NOT NULL DEFAULT 0,
             max_failures     INTEGER NOT NULL DEFAULT 0,
-            enabled          INTEGER NOT NULL DEFAULT 1
+            enabled          INTEGER NOT NULL DEFAULT 1,
+            approval_grant_json TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_xin_tasks_next_run ON xin_tasks(next_run_at);
          CREATE INDEX IF NOT EXISTS idx_xin_tasks_status ON xin_tasks(status);
@@ -520,9 +862,41 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             FOREIGN KEY (task_id) REFERENCES xin_tasks(id) ON DELETE CASCADE
          );
          CREATE INDEX IF NOT EXISTS idx_xin_runs_task_id ON xin_runs(task_id);
-         CREATE INDEX IF NOT EXISTS idx_xin_runs_started_at ON xin_runs(started_at);",
+         CREATE INDEX IF NOT EXISTS idx_xin_runs_started_at ON xin_runs(started_at);
+
+         CREATE TABLE IF NOT EXISTS xin_task_events (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id       TEXT NOT NULL UNIQUE,
+            task_id        TEXT NOT NULL,
+            workspace_id   TEXT NOT NULL,
+            owner_id       TEXT,
+            topic_id       TEXT,
+            parent_task_id TEXT,
+            source_message_event_id TEXT,
+            event_type     TEXT NOT NULL,
+            status         TEXT,
+            payload_json   TEXT,
+            created_at     TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_xin_task_events_task_id ON xin_task_events(task_id, id);
+         CREATE INDEX IF NOT EXISTS idx_xin_task_events_owner ON xin_task_events(workspace_id, owner_id, id);
+         CREATE INDEX IF NOT EXISTS idx_xin_task_events_topic ON xin_task_events(workspace_id, topic_id, id);
+         CREATE INDEX IF NOT EXISTS idx_xin_task_events_type ON xin_task_events(event_type, id);",
     )
     .context("Failed to initialize xin schema")?;
+
+    add_column_if_missing(&conn, "xin_tasks", "owner_id", "TEXT")?;
+    add_column_if_missing(&conn, "xin_tasks", "topic_id", "TEXT")?;
+    add_column_if_missing(&conn, "xin_tasks", "parent_task_id", "TEXT")?;
+    add_column_if_missing(&conn, "xin_tasks", "source_message_event_id", "TEXT")?;
+    add_column_if_missing(&conn, "xin_tasks", "approval_grant_json", "TEXT")?;
+    add_column_if_missing(&conn, "xin_task_events", "source_message_event_id", "TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_xin_tasks_owner ON xin_tasks(owner_id, status, next_run_at);
+         CREATE INDEX IF NOT EXISTS idx_xin_tasks_topic ON xin_tasks(topic_id, status, next_run_at);
+         CREATE INDEX IF NOT EXISTS idx_xin_tasks_parent ON xin_tasks(parent_task_id, id);",
+    )
+    .context("Failed to initialize xin lineage indexes")?;
 
     f(&conn)
 }
@@ -545,6 +919,10 @@ mod tests {
 
     fn sample_task() -> NewXinTask {
         NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             name: "test_task".into(),
             description: Some("A test task".into()),
             kind: TaskKind::User,
@@ -554,11 +932,16 @@ mod tests {
             recurring: false,
             interval_secs: 0,
             max_failures: 3,
+            approval_grant_json: None,
         }
     }
 
     fn recurring_task() -> NewXinTask {
         NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
             name: "recurring_task".into(),
             description: None,
             kind: TaskKind::System,
@@ -568,6 +951,7 @@ mod tests {
             recurring: true,
             interval_secs: 300,
             max_failures: 5,
+            approval_grant_json: None,
         }
     }
 
@@ -585,6 +969,173 @@ mod tests {
 
         let fetched = get_task(&config, &task.id).unwrap();
         assert_eq!(fetched.name, task.name);
+    }
+
+    #[test]
+    fn add_task_persists_owner_topic_lineage_and_event() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut new = sample_task();
+        new.owner_id = Some("owner:workspace:telegram:alice".to_string());
+        new.topic_id = Some("topic-1".to_string());
+        new.parent_task_id = Some("run-parent".to_string());
+        new.source_message_event_id = Some("msg-1".to_string());
+
+        let task = add_task(&config, &new).unwrap();
+        assert_eq!(task.owner_id.as_deref(), Some("owner:workspace:telegram:alice"));
+        assert_eq!(task.topic_id.as_deref(), Some("topic-1"));
+        assert_eq!(task.parent_task_id.as_deref(), Some("run-parent"));
+        assert_eq!(task.source_message_event_id.as_deref(), Some("msg-1"));
+
+        let listed = list_tasks(&config).unwrap();
+        assert_eq!(listed[0].owner_id.as_deref(), Some("owner:workspace:telegram:alice"));
+
+        let events = list_task_events(&config, &task.id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "xin.task.created");
+        assert_eq!(events[0].owner_id.as_deref(), Some("owner:workspace:telegram:alice"));
+        assert_eq!(events[0].topic_id.as_deref(), Some("topic-1"));
+        assert_eq!(events[0].parent_task_id.as_deref(), Some("run-parent"));
+        assert_eq!(events[0].source_message_event_id.as_deref(), Some("msg-1"));
+
+        let memory_conn = Connection::open(config.workspace_dir.join("memory").join("brain.db")).unwrap();
+        let (event_type, subject_id, payload): (String, String, String) = memory_conn
+            .query_row(
+                "SELECT event_type, subject_id, payload_json
+                 FROM memory_events
+                 WHERE subject_table = 'tasks' AND subject_id = ?1
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![task.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(event_type, "xin.task.spawned");
+        assert_eq!(subject_id, task.id);
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["owner_id"].as_str(), Some("owner:workspace:telegram:alice"));
+        assert_eq!(payload["topic_id"].as_str(), Some("topic-1"));
+        assert_eq!(payload["parent_task_id"].as_str(), Some("run-parent"));
+        assert_eq!(payload["source_message_event_id"].as_str(), Some("msg-1"));
+        assert_eq!(payload["task"].as_str(), Some("test_task"));
+    }
+
+    #[test]
+    fn legacy_xin_tasks_schema_migrates_lineage_columns_and_events_table() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let db_dir = config.workspace_dir.join("xin");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("tasks.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE xin_tasks (
+                id               TEXT PRIMARY KEY,
+                name             TEXT NOT NULL,
+                description      TEXT,
+                kind             TEXT NOT NULL DEFAULT 'user',
+                status           TEXT NOT NULL DEFAULT 'pending',
+                priority         INTEGER NOT NULL DEFAULT 1,
+                execution_mode   TEXT NOT NULL DEFAULT 'agent_session',
+                payload          TEXT NOT NULL DEFAULT '',
+                recurring        INTEGER NOT NULL DEFAULT 0,
+                interval_secs    INTEGER NOT NULL DEFAULT 0,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                last_run_at      TEXT,
+                next_run_at      TEXT NOT NULL,
+                last_status      TEXT,
+                last_output      TEXT,
+                run_count        INTEGER NOT NULL DEFAULT 0,
+                fail_count       INTEGER NOT NULL DEFAULT 0,
+                max_failures     INTEGER NOT NULL DEFAULT 0,
+                enabled          INTEGER NOT NULL DEFAULT 1
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let tasks = list_tasks(&config).unwrap();
+        assert!(tasks.is_empty());
+
+        with_connection(&config, |conn| {
+            let mut stmt = conn.prepare("PRAGMA table_info(xin_tasks)")?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for name in [
+                "owner_id",
+                "topic_id",
+                "parent_task_id",
+                "source_message_event_id",
+                "approval_grant_json",
+            ] {
+                assert!(names.iter().any(|existing| existing == name), "missing {name}");
+            }
+            let event_tables: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'xin_task_events'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(event_tables, 1);
+            let mut event_stmt = conn.prepare("PRAGMA table_info(xin_task_events)")?;
+            let event_names = event_stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert!(
+                event_names.iter().any(|existing| existing == "source_message_event_id"),
+                "missing xin_task_events.source_message_event_id"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn xin_task_lifecycle_records_owner_scoped_events() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut new = recurring_task();
+        new.owner_id = Some("owner-a".to_string());
+        new.topic_id = Some("topic-a".to_string());
+        new.source_message_event_id = Some("msg-a".to_string());
+        let task = add_task(&config, &new).unwrap();
+
+        assert!(claim_task(&config, &task.id).unwrap());
+        mark_completed(&config, &task.id, "done").unwrap();
+        let started = Utc::now();
+        record_run(&config, &task.id, started, started, "ok", Some("done"), 10).unwrap();
+        reschedule_recurring(&config, &task.id).unwrap();
+
+        let events = list_task_events(&config, &task.id).unwrap();
+        let event_types = events.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>();
+        assert!(event_types.contains(&"xin.task.created"));
+        assert!(event_types.contains(&"xin.task.claimed"));
+        assert!(event_types.contains(&"xin.task.completed"));
+        assert!(event_types.contains(&"xin.task.run_recorded"));
+        assert!(event_types.contains(&"xin.task.rescheduled"));
+        assert!(events.iter().all(|event| event.owner_id.as_deref() == Some("owner-a")));
+        assert!(events.iter().all(|event| event.topic_id.as_deref() == Some("topic-a")));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.source_message_event_id.as_deref() == Some("msg-a"))
+        );
+    }
+
+    #[test]
+    fn add_task_persists_approval_grant_json() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut new = sample_task();
+        new.execution_mode = ExecutionMode::Shell;
+        new.payload = "touch xin-approved".into();
+        new.approval_grant_json = Some(r#"{"tool":"xin_runner"}"#.into());
+
+        let task = add_task(&config, &new).unwrap();
+        let fetched = get_task(&config, &task.id).unwrap();
+
+        assert_eq!(fetched.approval_grant_json.as_deref(), Some(r#"{"tool":"xin_runner"}"#));
     }
 
     #[test]

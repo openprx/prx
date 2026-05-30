@@ -1,5 +1,5 @@
 use crate::self_system::evolution::analyzer::{CandidatePriority, EvolutionCandidate};
-use crate::self_system::evolution::config::{EvolutionMode, SharedEvolutionConfig};
+use crate::self_system::evolution::config::SharedEvolutionConfig;
 use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput, EvolutionEngine};
 use crate::self_system::evolution::record::{ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult};
 use crate::self_system::evolution::safety_utils::{
@@ -269,7 +269,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
         let mut validation_status = ValidationStatus::Skipped;
         let mut notes = "shadow mode: prompt mutation recorded only".to_string();
 
-        if !matches!(mode, EvolutionMode::Shadow) {
+        if mode.allows_target_mutation() {
             if needs_human_approval {
                 outcome = CycleOutcome::ApprovalRequired;
                 notes = "severity exceeded threshold".to_string();
@@ -366,7 +366,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
             cycle,
             evolution_log: Some(evolution_log),
             needs_human_approval,
-            shadow_mode: matches!(mode, EvolutionMode::Shadow),
+            shadow_mode: mode.is_draft_like(),
         })
     }
 }

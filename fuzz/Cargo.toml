@@ -1,0 +1,20 @@
+[package]
+name = "openprx-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+openprx = { path = "..", default-features = false }
+serde_json = "1.0"
+
+[[bin]]
+name = "parse_tool_call_json"
+path = "fuzz_targets/parse_tool_call_json.rs"
+test = false
+doc = false
+bench = false

@@ -10,18 +10,24 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod api;
+mod compat;
 mod ui;
 
-use crate::agent::loop_::{ToolConcurrencyGovernanceConfig, build_context_with_shared_events, run_tool_call_loop};
+use crate::agent::loop_::{
+    DocumentIngestRuntime, ToolConcurrencyGovernanceConfig, build_context_with_shared_events_and_scope,
+    run_tool_call_loop,
+};
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, SignalChannel, WhatsAppChannel};
 use crate::config::Config;
 use crate::hooks::HookManager;
-use crate::memory::{self, Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryVisibility, MessageEventScope};
+use crate::memory::{self, Memory, MemoryCategory, MemoryFabric, MemoryVisibility};
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::runtime::envelope::{RuntimeEnvelope, RuntimeSource};
 use crate::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
+use crate::security::policy::ResourceRiskLevel;
+use crate::security::{SecurityPolicy, SideEffectGate};
 use crate::tools::{self, McpTool, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -354,6 +360,22 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     if configured == 0 { fallback.max(1) } else { configured }
 }
 
+fn authorize_gateway_resource_mutation(
+    state: &AppState,
+    operation_name: &str,
+    risk: ResourceRiskLevel,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let config = state.config.lock().clone();
+    SideEffectGate::new(&SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir))
+        .authorize_resource_operation("gateway", operation_name, risk, None)
+        .map(|_| ())
+        .map_err(|error| (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": error}))))
+}
+
+fn gateway_channel_webhook_operation(channel: &str, action: &str) -> String {
+    format!("gateway:channel_webhook:{channel}:{action}")
+}
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -581,9 +603,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // The gateway still uses `config_state` (Mutex) for internal mutable state;
     // this separate SharedConfig is solely for the hot-reload tool.
     let shared_config_for_reload = Arc::new(arc_swap::ArcSwap::from_pointee(config.clone()));
-    tools_list.push(Box::new(tools::ConfigReloadTool::new(Arc::clone(
-        &shared_config_for_reload,
-    ))));
+    tools_list.push(Box::new(tools::ConfigReloadTool::with_security(
+        Arc::clone(&shared_config_for_reload),
+        security.clone(),
+    )));
 
     // ── Register WASM plugin tools and create plugin manager (if feature enabled) ──
     #[cfg(feature = "wasm-plugins")]
@@ -839,6 +862,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
+        .route(
+            "/mcp/v1/initialize",
+            get(compat::mcp_initialize).post(compat::mcp_initialize),
+        )
+        .route(
+            "/mcp/v1/list_servers",
+            get(compat::mcp_list_servers).post(compat::mcp_list_servers),
+        )
+        .route(
+            "/mcp/v1/tools/list",
+            get(compat::mcp_tools_list).post(compat::mcp_tools_list),
+        )
+        .route("/mcp/v1/tools/call", post(compat::mcp_tools_call))
+        .route("/a2a/v1/identity", get(compat::a2a_identity).post(compat::a2a_identity))
+        .route("/a2a/v1/discover", get(compat::a2a_discover).post(compat::a2a_discover))
         .merge(limited_public_routes)
         .nest("/api", api_routes)
         .merge(ui::router())
@@ -917,6 +955,10 @@ async fn handle_pair(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    if let Err(error) = authorize_gateway_resource_mutation(&state, "gateway:pair", ResourceRiskLevel::Low) {
+        return error;
+    }
+
     match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
@@ -981,12 +1023,28 @@ async fn run_gateway_chat_with_multimodal(
     let event_recording = state.config.lock().memory.event_recording_config();
     let fabric = MemoryFabric::new(state.mem.clone(), workspace_id.clone()).with_event_recording(event_recording);
     let run_id = Uuid::new_v4().to_string();
-    let base_scope = MessageEventScope::new("gateway", MemoryVisibility::Workspace)
-        .with_channel(fabric_ctx.channel.clone())
-        .with_session_key(fabric_ctx.session_key.clone())
-        .with_run_id(run_id)
-        .with_sender(fabric_ctx.sender.clone())
-        .with_recipient(fabric_ctx.recipient.clone());
+    let runtime_envelope = RuntimeEnvelope::new(
+        RuntimeSource::Gateway,
+        workspace_id,
+        fabric_ctx.session_key.clone(),
+        MemoryVisibility::Workspace,
+    )
+    .with_channel(fabric_ctx.channel.clone())
+    .with_sender(fabric_ctx.sender.clone())
+    .with_recipient(fabric_ctx.recipient.clone())
+    .with_run_id(run_id);
+    let base_scope = runtime_envelope.message_scope();
+    authorize_gateway_resource_mutation(state, "gateway:webhook:message_event:user", ResourceRiskLevel::Low).map_err(
+        |(_, body)| {
+            let error = body
+                .0
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("gateway resource mutation denied")
+                .to_string();
+            anyhow::anyhow!(error)
+        },
+    )?;
     if let Err(error) = fabric
         .record_inbound_user_message(
             base_scope.clone(),
@@ -1004,18 +1062,17 @@ async fn run_gateway_chat_with_multimodal(
     }
 
     let min_relevance_score = state.config.lock().memory.min_relevance_score;
-    let mem_context = build_context_with_shared_events(
+    let semantic_scope = runtime_envelope.memory_write_context(if fabric_ctx.channel == "webhook" {
+        "webhook"
+    } else {
+        "private"
+    });
+    let mem_context = build_context_with_shared_events_and_scope(
         state.mem.as_ref(),
-        MemoryPrincipal {
-            workspace_id,
-            agent_id: None,
-            persona_id: None,
-            session_key: Some(fabric_ctx.session_key.clone()),
-            channel: Some(fabric_ctx.channel.clone()),
-            sender: Some(fabric_ctx.sender.clone()),
-        },
+        runtime_envelope.memory_principal(),
         message,
         min_relevance_score,
+        Some(&semantic_scope),
     )
     .await;
     let enriched_message = if mem_context.preamble.is_empty() {
@@ -1126,10 +1183,24 @@ async fn run_gateway_chat_with_multimodal(
         None, // no scope context for webhooks
         None, // no tool call notifications
         Some(&config_snapshot.tool_tiering),
+        Some(DocumentIngestRuntime::from_envelope(
+            state.mem.clone(),
+            &runtime_envelope,
+        )),
         crate::agent::loop_::ChatMode::default(),
     )
     .await?;
 
+    authorize_gateway_resource_mutation(state, "gateway:webhook:message_event:assistant", ResourceRiskLevel::Low)
+        .map_err(|(_, body)| {
+            let error = body
+                .0
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("gateway resource mutation denied")
+                .to_string();
+            anyhow::anyhow!(error)
+        })?;
     if let Err(error) = fabric
         .record_assistant_message(
             base_scope
@@ -1265,6 +1336,11 @@ async fn handle_webhook(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     if let Some(idempotency_key) = request_idempotency_key.as_deref() {
+        if let Err(error) =
+            authorize_gateway_resource_mutation(&state, "gateway:webhook:idempotency", ResourceRiskLevel::Low)
+        {
+            return error;
+        }
         if !state.idempotency_store.record_if_new(idempotency_key) {
             tracing::info!("Webhook duplicate ignored (idempotency key: {idempotency_key})");
             let body = serde_json::json!({
@@ -1279,6 +1355,11 @@ async fn handle_webhook(
     let message = &webhook_body.message;
 
     if state.auto_save && should_autosave_gateway_message(webhook_body.reply_target.as_deref(), message) {
+        if let Err(error) =
+            authorize_gateway_resource_mutation(&state, "gateway:webhook:autosave", ResourceRiskLevel::Low)
+        {
+            return error;
+        }
         let key = webhook_memory_key();
         let _ = state.mem.store(&key, message, MemoryCategory::Conversation, None).await;
     }
@@ -1512,6 +1593,13 @@ async fn handle_whatsapp_message(State(state): State<AppState>, headers: HeaderM
 
         // Auto-save to memory
         if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content) {
+            if let Err(error) = authorize_gateway_resource_mutation(
+                &state,
+                &gateway_channel_webhook_operation("whatsapp", "autosave"),
+                ResourceRiskLevel::Low,
+            ) {
+                return error;
+            }
             let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
@@ -1523,12 +1611,26 @@ async fn handle_whatsapp_message(State(state): State<AppState>, headers: HeaderM
         match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content, &fabric_ctx).await {
             Ok(response) => {
                 // Send reply via WhatsApp
+                if let Err(error) = authorize_gateway_resource_mutation(
+                    &state,
+                    &gateway_channel_webhook_operation("whatsapp", "send"),
+                    ResourceRiskLevel::Low,
+                ) {
+                    return error;
+                }
                 if let Err(e) = wa.send(&SendMessage::new(response, &msg.reply_target)).await {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
                 }
             }
             Err(e) => {
                 tracing::error!("LLM error for WhatsApp message: {e:#}");
+                if let Err(error) = authorize_gateway_resource_mutation(
+                    &state,
+                    &gateway_channel_webhook_operation("whatsapp", "send"),
+                    ResourceRiskLevel::Low,
+                ) {
+                    return error;
+                }
                 let _ = wa
                     .send(&SendMessage::new(
                         "Sorry, I couldn't process your message right now.",
@@ -1620,6 +1722,13 @@ async fn handle_linq_webhook(State(state): State<AppState>, headers: HeaderMap, 
 
         // Auto-save to memory
         if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content) {
+            if let Err(error) = authorize_gateway_resource_mutation(
+                &state,
+                &gateway_channel_webhook_operation("linq", "autosave"),
+                ResourceRiskLevel::Low,
+            ) {
+                return error;
+            }
             let key = linq_memory_key(msg);
             let _ = state
                 .mem
@@ -1632,12 +1741,26 @@ async fn handle_linq_webhook(State(state): State<AppState>, headers: HeaderMap, 
         match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content, &fabric_ctx).await {
             Ok(response) => {
                 // Send reply via Linq
+                if let Err(error) = authorize_gateway_resource_mutation(
+                    &state,
+                    &gateway_channel_webhook_operation("linq", "send"),
+                    ResourceRiskLevel::Low,
+                ) {
+                    return error;
+                }
                 if let Err(e) = linq.send(&SendMessage::new(response, &msg.reply_target)).await {
                     tracing::error!("Failed to send Linq reply: {e}");
                 }
             }
             Err(e) => {
                 tracing::error!("LLM error for Linq message: {e:#}");
+                if let Err(error) = authorize_gateway_resource_mutation(
+                    &state,
+                    &gateway_channel_webhook_operation("linq", "send"),
+                    ResourceRiskLevel::Low,
+                ) {
+                    return error;
+                }
                 let _ = linq
                     .send(&SendMessage::new(
                         "Sorry, I couldn't process your message right now.",
@@ -1736,6 +1859,13 @@ async fn handle_nextcloud_talk_webhook(
         );
 
         if state.auto_save && should_autosave_gateway_message(Some(&msg.reply_target), &msg.content) {
+            if let Err(error) = authorize_gateway_resource_mutation(
+                &state,
+                &gateway_channel_webhook_operation("nextcloud_talk", "autosave"),
+                ResourceRiskLevel::Low,
+            ) {
+                return error;
+            }
             let key = nextcloud_talk_memory_key(msg);
             let _ = state
                 .mem
@@ -1746,6 +1876,13 @@ async fn handle_nextcloud_talk_webhook(
         let fabric_ctx = GatewayFabricContext::channel_message(msg);
         match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content, &fabric_ctx).await {
             Ok(response) => {
+                if let Err(error) = authorize_gateway_resource_mutation(
+                    &state,
+                    &gateway_channel_webhook_operation("nextcloud_talk", "send"),
+                    ResourceRiskLevel::Low,
+                ) {
+                    return error;
+                }
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(response, &msg.reply_target))
                     .await
@@ -1755,6 +1892,13 @@ async fn handle_nextcloud_talk_webhook(
             }
             Err(e) => {
                 tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                if let Err(error) = authorize_gateway_resource_mutation(
+                    &state,
+                    &gateway_channel_webhook_operation("nextcloud_talk", "send"),
+                    ResourceRiskLevel::Low,
+                ) {
+                    return error;
+                }
                 let _ = nextcloud_talk
                     .send(&SendMessage::new(
                         "Sorry, I couldn't process your message right now.",
@@ -2456,6 +2600,7 @@ mod tests {
                     session_key: Some("gateway:webhook:client-a".to_string()),
                     channel: Some("webhook".to_string()),
                     sender: Some("client-a".to_string()),
+                    owner_id: None,
                 },
                 0,
                 10,

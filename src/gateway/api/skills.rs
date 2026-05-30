@@ -7,6 +7,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::security::policy::ResourceRiskLevel;
+
 #[derive(Serialize)]
 struct SkillInfo {
     name: String,
@@ -208,6 +210,8 @@ pub async fn install_skill(
         ));
     }
 
+    super::authorize_resource_mutation(&state, "gateway_api:skills:install", ResourceRiskLevel::Low)?;
+
     let config = state.config.lock().clone();
     let skills_dir = config.workspace_dir.join("skills");
 
@@ -303,6 +307,8 @@ pub async fn uninstall_skill(
             Json(serde_json::json!({"error": "Invalid skill name"})),
         ));
     }
+
+    super::authorize_resource_mutation(&state, "gateway_api:skills:uninstall", ResourceRiskLevel::Low)?;
 
     let config = state.config.lock().clone();
     let skills_dir = config.workspace_dir.join("skills");

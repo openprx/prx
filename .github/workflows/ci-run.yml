@@ -61,6 +61,12 @@ jobs:
               env:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
               run: ./scripts/ci/rust_strict_delta_gate.sh
+            - name: Install cargo-machete
+              run: cargo install cargo-machete --locked
+            - name: Run unused dependency gate
+              run: cargo machete
+            - name: Type-check criterion benchmarks
+              run: cargo check --locked --profile ci --bench router_decision --bench prompt_render --bench tool_dispatch
 
     test:
         name: Test

@@ -1,5 +1,7 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::security::SecurityPolicy;
+use crate::security::op_id;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
+use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -234,6 +236,21 @@ impl Tool for HttpRequestTool {
                 });
             }
         };
+        let host_ref = op_id::ref_for_url_host(&url);
+        let operation_name = op_id::op_id(self.name(), "request", &[&host_ref]);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+            self.name(),
+            &operation_name,
+            ResourceRiskLevel::Medium,
+            approval_grant.as_ref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
 
         let request_headers = self.parse_headers(&headers_val);
 

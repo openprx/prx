@@ -1,8 +1,12 @@
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+pub const PERSISTED_APPROVAL_GRANT_TTL_SECS: i64 = 24 * 60 * 60;
 
 /// How much autonomy the agent has
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -25,11 +29,586 @@ pub enum CommandRiskLevel {
     High,
 }
 
+/// Risk score for non-command state/resource mutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceRiskLevel {
+    Low,
+    Medium,
+    High,
+}
+
 /// Classifies whether a tool operation is read-only or side-effecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolOperation {
     Read,
     Act,
+}
+
+/// Runtime-only tool argument injected after an approval manager grants a call.
+///
+/// User/model supplied copies of this field must be stripped by the tool-call
+/// loop before execution. Tools read this instead of trusting public
+/// `approved=true` parameters.
+pub const RUNTIME_APPROVAL_GRANTED_ARG: &str = "_zc_approval_granted";
+pub const RUNTIME_APPROVAL_GRANT_ARG: &str = "_zc_approval_grant";
+
+/// Process-level single-use ledger for v2 approval grants (threat M5: replay
+/// inside the 60s validity window).
+///
+/// The [`SideEffectGate`] is synchronous and holds no store/DB handle (it only
+/// borrows a `&SecurityPolicy`), and it operates on a *cloned* grant, so atomic
+/// `uses_consumed` persistence at the gate is impossible. Instead, single-use is
+/// enforced in-memory: the first successful authorization of a given `grant_id`
+/// records its consumed count; once the count reaches `max_uses`, any further
+/// authorization of that same grant is denied. The check-and-increment runs
+/// under one `parking_lot::Mutex` so it is free of TOCTOU. Entries are lost on
+/// restart, which is safe: runtime grants expire within 60s, so a grant issued
+/// before a restart is already invalid afterwards.
+static CONSUMED_V2_GRANTS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Atomically record one use of v2 grant `grant_id` (max `max_uses`).
+///
+/// Returns `true` if the use was consumed (caller may proceed) or `false` if the
+/// grant is already exhausted (replay → deny). `max_uses == 0` is treated as a
+/// grant that can never be consumed. The check-and-increment is performed under a
+/// single lock, so concurrent callers can never both win the last slot.
+#[must_use]
+fn try_consume_v2_grant(grant_id: &str, max_uses: u32) -> bool {
+    if max_uses == 0 {
+        return false;
+    }
+    let mut ledger = CONSUMED_V2_GRANTS.lock();
+    let used = ledger.entry(grant_id.to_string()).or_insert(0);
+    if *used >= max_uses {
+        return false;
+    }
+    *used = used.saturating_add(1);
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalGrant {
+    pub tool: String,
+    pub operation_hash: Option<u64>,
+    pub actor: String,
+    pub scope: Option<String>,
+    pub expires_at_epoch_secs: Option<i64>,
+    #[serde(default)]
+    pub v2: Option<crate::acl::approval_grant::ApprovalGrantV2>,
+    /// In-process trust flag. NEVER serialized: a grant that crosses a trust
+    /// boundary (the `_zc_approval_grant` JSON arg) must be re-verified by the
+    /// gate against the witness keyring before it is honoured. `#[serde(skip)]`
+    /// guarantees this flag is always `false` after deserialization, closing the
+    /// forged-`v2_verified` injection hole.
+    #[serde(skip)]
+    pub v2_verified: bool,
+    /// Trusted caller principal id, derived from the runtime scope at the gate
+    /// (threat M4: cross-tenant grant reuse). Never serialized; populated by
+    /// [`ApprovalGrant::from_runtime_args`] from the trusted `_zc_scope` payload.
+    #[serde(skip)]
+    pub caller_principal_id: Option<String>,
+}
+
+impl ApprovalGrant {
+    #[must_use]
+    pub fn for_tool(tool: impl Into<String>, actor: impl Into<String>, scope: Option<String>) -> Self {
+        Self {
+            tool: tool.into(),
+            operation_hash: None,
+            actor: actor.into(),
+            scope,
+            expires_at_epoch_secs: None,
+            v2: None,
+            v2_verified: false,
+            caller_principal_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn for_command(
+        tool: impl Into<String>,
+        command: &str,
+        actor: impl Into<String>,
+        scope: Option<String>,
+    ) -> Self {
+        let tool = tool.into();
+        Self {
+            operation_hash: Some(command_operation_hash(&tool, command)),
+            tool,
+            actor: actor.into(),
+            scope,
+            expires_at_epoch_secs: None,
+            v2: None,
+            v2_verified: false,
+            caller_principal_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn for_resource_operation(
+        tool: impl Into<String>,
+        operation: &str,
+        actor: impl Into<String>,
+        scope: Option<String>,
+    ) -> Self {
+        let tool = tool.into();
+        Self {
+            operation_hash: Some(resource_operation_hash(&tool, operation)),
+            tool,
+            actor: actor.into(),
+            scope,
+            expires_at_epoch_secs: None,
+            v2: None,
+            v2_verified: false,
+            caller_principal_id: None,
+        }
+    }
+
+    /// Wrap a v2 grant that has already been verified *in-process* by the
+    /// issuer (the agent loop signs the grant and immediately verifies its own
+    /// signature before injection). The gate ALWAYS re-verifies the signature
+    /// against the keyring before honouring it, so `v2_verified` is only a
+    /// fast-path hint for the same-process call, never a trust source across the
+    /// serialization boundary (the field is `#[serde(skip)]`).
+    #[must_use]
+    pub fn from_verified_v2(
+        tool: impl Into<String>,
+        actor: impl Into<String>,
+        grant: crate::acl::approval_grant::ApprovalGrantV2,
+    ) -> Self {
+        Self {
+            tool: tool.into(),
+            operation_hash: None,
+            actor: actor.into(),
+            scope: Some(grant.grant_id.clone()),
+            expires_at_epoch_secs: Some(grant.expires_at.timestamp()),
+            v2: Some(grant),
+            v2_verified: true,
+            caller_principal_id: None,
+        }
+    }
+
+    /// Attach the trusted caller principal id (for the M4 cross-tenant check).
+    #[must_use]
+    pub fn with_caller_principal_id(mut self, principal_id: Option<String>) -> Self {
+        self.caller_principal_id = principal_id;
+        self
+    }
+
+    #[must_use]
+    pub fn persisted_for_command(
+        tool: impl Into<String>,
+        command: &str,
+        actor: impl Into<String>,
+        scope: Option<String>,
+        ttl_secs: i64,
+    ) -> Self {
+        let mut grant = Self::for_command(tool, command, actor, scope);
+        grant.expires_at_epoch_secs = Some(chrono::Utc::now().timestamp() + ttl_secs.max(1));
+        grant
+    }
+
+    #[must_use]
+    pub fn persisted_runner_grant(
+        runner_tool: impl Into<String>,
+        command: &str,
+        source: Option<&Self>,
+        ttl_secs: i64,
+    ) -> Option<Self> {
+        source.map(|grant| {
+            Self::persisted_for_command(runner_tool, command, grant.actor.clone(), grant.scope.clone(), ttl_secs)
+        })
+    }
+
+    #[must_use]
+    pub fn from_runtime_args(tool_name: &str, args: &Value) -> Option<Self> {
+        let _ = tool_name;
+        let grant_value = args.get(RUNTIME_APPROVAL_GRANT_ARG)?;
+        // `v2_verified` and `caller_principal_id` are `#[serde(skip)]`, so a
+        // grant reconstructed from the wire always starts unverified — the gate
+        // must re-verify the v2 signature itself.
+        let mut grant = serde_json::from_value::<Self>(grant_value.clone()).ok()?;
+        // Bind the M4 caller principal from the trusted scope payload. We only
+        // trust `_zc_scope` when the runtime marked it trusted; user/model
+        // supplied scopes are ignored.
+        if args
+            .get("_zc_scope_trusted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            grant.caller_principal_id = args
+                .get("_zc_scope")
+                .and_then(Value::as_object)
+                .and_then(|scope| caller_principal_from_scope(scope));
+        }
+        Some(grant)
+    }
+
+    #[must_use]
+    pub fn permits_command(&self, tool_name: &str, command: &str, risk: CommandRiskLevel, now_epoch_secs: i64) -> bool {
+        if self.tool != tool_name {
+            return false;
+        }
+        if self.v2.is_some() {
+            return self.verify_v2(command, command_risk_to_acl(risk));
+        }
+        if self
+            .expires_at_epoch_secs
+            .is_some_and(|expires_at| expires_at <= now_epoch_secs)
+        {
+            return false;
+        }
+        // Tightened default (d08 §0 / M1): an operation with no precise binding
+        // (`operation_hash == None`) is denied. Only an exact command-hash match
+        // is honoured on the legacy v1 path.
+        self.operation_hash
+            .map(|hash| hash == command_operation_hash(tool_name, command))
+            .unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn permits_resource_operation(
+        &self,
+        tool_name: &str,
+        operation: &str,
+        risk: ResourceRiskLevel,
+        now_epoch_secs: i64,
+    ) -> bool {
+        if self.tool != tool_name {
+            return false;
+        }
+        if self.v2.is_some() {
+            return self.verify_v2(operation, resource_risk_to_acl(risk));
+        }
+        if self
+            .expires_at_epoch_secs
+            .is_some_and(|expires_at| expires_at <= now_epoch_secs)
+        {
+            return false;
+        }
+        self.operation_hash
+            .map(|hash| hash == resource_operation_hash(tool_name, operation))
+            .unwrap_or(false)
+    }
+
+    /// Authoritative v2 verification for the gate. Re-verifies the witness
+    /// signature against the process keyring (never trusts the wire
+    /// `v2_verified` flag), enforces the time window / revocation / use budget /
+    /// op-id+risk match, and binds the grant to the trusted caller principal
+    /// (threat M4). Returns `false` on any failure.
+    #[must_use]
+    fn verify_v2(&self, op_id: &str, risk: crate::acl::approval_grant::RiskLevel) -> bool {
+        self.verify_v2_detailed(op_id, risk).is_ok()
+    }
+
+    /// Like [`Self::verify_v2`] but returns the *specific* rejection reason on
+    /// failure (cross-tenant principal mismatch / expired / revoked / single-use
+    /// exhausted / signature verification failure / missing v2 grant). Used only
+    /// for compliance audit logging (EU AI Act Art.12 traceability); the gate's
+    /// caller-facing error stays generic so it never leaks verification internals.
+    fn verify_v2_detailed(&self, op_id: &str, risk: crate::acl::approval_grant::RiskLevel) -> Result<(), String> {
+        let Some(grant) = self.v2.as_ref() else {
+            return Err("missing v2 grant".to_string());
+        };
+        let keyring = match crate::acl::approval_grant::WitnessKeyring::global() {
+            Ok(keyring) => keyring,
+            Err(error) => {
+                tracing::error!("witness keyring unavailable; denying v2 grant: {error}");
+                return Err("witness keyring unavailable".to_string());
+            }
+        };
+        grant
+            .verify_for_operation_bound(
+                keyring,
+                op_id,
+                risk,
+                self.caller_principal_id.as_deref(),
+                chrono::Utc::now(),
+            )
+            .map_err(|error| {
+                tracing::warn!(op_id = %op_id, "v2 approval grant rejected: {error}");
+                error.to_string()
+            })
+    }
+
+    /// Stable grant identifier for audit correlation: the v2 `grant_id` when
+    /// present, otherwise the v1 `scope` (which carries the grant id for
+    /// `from_verified_v2`-wrapped grants). `None` for unbound v1 grants.
+    #[must_use]
+    pub fn audit_grant_id(&self) -> Option<&str> {
+        self.v2
+            .as_ref()
+            .map(|grant| grant.grant_id.as_str())
+            .or(self.scope.as_deref())
+    }
+
+    /// Trusted caller principal bound at the gate (threat M4), for audit subject
+    /// attribution. `None` when no principal context is available.
+    #[must_use]
+    pub fn audit_principal_id(&self) -> Option<&str> {
+        self.caller_principal_id.as_deref()
+    }
+
+    /// Single-use key for the in-memory consumption ledger (threat M5): the v2
+    /// `grant_id` and its `max_uses`. `None` for legacy v1 grants, which carry no
+    /// signed use budget and are not subject to the gate's replay ledger.
+    #[must_use]
+    fn v2_single_use_key(&self) -> Option<(&str, u32)> {
+        self.v2
+            .as_ref()
+            .map(|grant| (grant.grant_id.as_str(), grant.max_uses))
+    }
+
+    /// Precise deny reason for a command decision when this grant did not
+    /// authorize, for compliance audit logging. `None` when it did authorize.
+    #[must_use]
+    fn command_deny_reason(&self, tool_name: &str, command: &str, risk: CommandRiskLevel, now: i64) -> Option<String> {
+        if self.permits_command(tool_name, command, risk, now) {
+            return None;
+        }
+        Some(self.deny_reason_for(tool_name, command, command_risk_to_acl(risk), now))
+    }
+
+    /// Precise deny reason for a resource operation, mirroring [`Self::command_deny_reason`].
+    #[must_use]
+    fn resource_deny_reason(&self, tool_name: &str, operation: &str, risk: ResourceRiskLevel, now: i64) -> Option<String> {
+        if self.permits_resource_operation(tool_name, operation, risk, now) {
+            return None;
+        }
+        Some(self.deny_reason_for(tool_name, operation, resource_risk_to_acl(risk), now))
+    }
+
+    /// Classify *why* this grant fails to authorize, mirroring the branch order
+    /// of [`Self::permits_command`] / [`Self::permits_resource_operation`].
+    fn deny_reason_for(&self, tool_name: &str, op_id: &str, risk: crate::acl::approval_grant::RiskLevel, now: i64) -> String {
+        if self.tool != tool_name {
+            return format!("grant tool mismatch (grant={}, requested={tool_name})", self.tool);
+        }
+        if self.v2.is_some() {
+            return match self.verify_v2_detailed(op_id, risk) {
+                Ok(()) => "v2 risk/op mismatch".to_string(),
+                Err(reason) => reason,
+            };
+        }
+        if self
+            .expires_at_epoch_secs
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            return "grant expired".to_string();
+        }
+        if self.operation_hash.is_none() {
+            return "no precise operation binding (operation_hash=None)".to_string();
+        }
+        "operation hash mismatch".to_string()
+    }
+}
+
+/// Extract the caller principal id from a trusted `_zc_scope` object.
+///
+/// Prefers an explicit `principal_id`; otherwise derives the canonical
+/// `{channel}:{sender}` form via [`OwnerPrincipal`], matching how grants are
+/// issued in the agent loop.
+fn caller_principal_from_scope(scope: &serde_json::Map<String, Value>) -> Option<String> {
+    if let Some(principal_id) = scope
+        .get("principal_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(principal_id.to_string());
+    }
+    let channel = scope.get("channel").and_then(Value::as_str).unwrap_or("");
+    let sender = scope.get("sender").and_then(Value::as_str).unwrap_or("");
+    if channel.is_empty() && sender.is_empty() {
+        return None;
+    }
+    Some(
+        crate::memory::principal::OwnerPrincipal::new(
+            scope.get("workspace_id").and_then(Value::as_str).unwrap_or("local"),
+            channel,
+            sender,
+            scope.get("chat_id").and_then(Value::as_str).unwrap_or("session"),
+            vec![crate::memory::principal::Role::Anonymous],
+        )
+        .principal_id,
+    )
+}
+
+const fn command_risk_to_acl(risk: CommandRiskLevel) -> crate::acl::approval_grant::RiskLevel {
+    match risk {
+        CommandRiskLevel::Low => crate::acl::approval_grant::RiskLevel::Low,
+        CommandRiskLevel::Medium => crate::acl::approval_grant::RiskLevel::Medium,
+        CommandRiskLevel::High => crate::acl::approval_grant::RiskLevel::High,
+    }
+}
+
+const fn resource_risk_to_acl(risk: ResourceRiskLevel) -> crate::acl::approval_grant::RiskLevel {
+    match risk {
+        ResourceRiskLevel::Low => crate::acl::approval_grant::RiskLevel::Low,
+        ResourceRiskLevel::Medium => crate::acl::approval_grant::RiskLevel::Medium,
+        ResourceRiskLevel::High => crate::acl::approval_grant::RiskLevel::High,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SideEffectGate<'a> {
+    policy: &'a SecurityPolicy,
+}
+
+impl<'a> SideEffectGate<'a> {
+    #[must_use]
+    pub const fn new(policy: &'a SecurityPolicy) -> Self {
+        Self { policy }
+    }
+
+    pub fn authorize_command_execution(
+        self,
+        tool_name: &str,
+        command: &str,
+        grant: Option<&ApprovalGrant>,
+    ) -> Result<CommandRiskLevel, String> {
+        let now = chrono::Utc::now().timestamp();
+        let command_risk = self.policy.command_risk_level(command);
+        let runtime_approval_granted =
+            grant.is_some_and(|grant| grant.permits_command(tool_name, command, command_risk, now));
+        let mut result = self
+            .policy
+            .validate_command_execution(command, runtime_approval_granted);
+        // M5 replay defense: when a v2 grant actually authorized this allowed
+        // command, atomically consume one use. If the grant is already exhausted
+        // (single-use replayed inside the 60s window, or a concurrent caller won
+        // the slot) flip the decision to Deny. Consumption happens exactly once,
+        // only on the real allow path (never during deny-reason computation).
+        if result.is_ok() && runtime_approval_granted {
+            if let Some((grant_id, max_uses)) = grant.and_then(ApprovalGrant::v2_single_use_key) {
+                if !try_consume_v2_grant(grant_id, max_uses) {
+                    result = Err("approval grant single-use exhausted (replay)".to_string());
+                }
+            }
+        }
+        let risk_label = result.as_ref().map_or_else(
+            |_| "unknown".to_string(),
+            |risk| format!("{risk:?}").to_ascii_lowercase(),
+        );
+        // Compliance audit (EU AI Act Art.12): record subject + grant id + the
+        // *specific* deny reason. When a grant was presented but did not
+        // authorize, prefer its precise rejection cause (expired / revoked /
+        // single-use / cross-tenant / hash mismatch / no-binding) over the
+        // generic gate error, so the trail is forensically usable.
+        let grant_deny_reason = match (result.as_ref(), grant) {
+            (Err(_), Some(grant)) => grant.command_deny_reason(tool_name, command, command_risk, now),
+            _ => None,
+        };
+        let audit_reason = grant_deny_reason
+            .as_deref()
+            .or_else(|| result.as_ref().err().map(String::as_str));
+        crate::security::audit::record_side_effect_decision_best_effort(
+            &self.policy.workspace_dir,
+            crate::security::audit::SideEffectDecisionLog {
+                tool_name,
+                operation_name: command,
+                risk_level: &risk_label,
+                approved: runtime_approval_granted,
+                allowed: result.is_ok(),
+                error: audit_reason,
+                principal_id: grant.and_then(ApprovalGrant::audit_principal_id),
+                grant_id: grant.and_then(ApprovalGrant::audit_grant_id),
+            },
+        );
+        result
+    }
+
+    pub fn authorize_resource_operation(
+        self,
+        tool_name: &str,
+        operation_name: &str,
+        risk: ResourceRiskLevel,
+        grant: Option<&ApprovalGrant>,
+    ) -> Result<ResourceRiskLevel, String> {
+        let mut allowed = false;
+        let mut approved = false;
+        let result = (|| {
+            self.policy.enforce_tool_operation(ToolOperation::Act, operation_name)?;
+
+            if risk == ResourceRiskLevel::High && self.policy.block_high_risk_commands {
+                return Err("Resource operation blocked: high-risk operation is disallowed by policy".into());
+            }
+
+            if matches!(risk, ResourceRiskLevel::Medium | ResourceRiskLevel::High)
+                && self.policy.autonomy == AutonomyLevel::Supervised
+                && self.policy.require_approval_for_medium_risk
+            {
+                let now = chrono::Utc::now().timestamp();
+                approved =
+                    grant.is_some_and(|grant| grant.permits_resource_operation(tool_name, operation_name, risk, now));
+                if !approved {
+                    return Err(format!(
+                        "Resource operation requires runtime approval grant: {operation_name}"
+                    ));
+                }
+            }
+
+            allowed = true;
+            Ok(risk)
+        })();
+        // M5 replay defense (mirrors the command path): consume one use of the
+        // authorizing v2 grant exactly once on the real allow path. If exhausted,
+        // flip to Deny.
+        let mut result = result;
+        if result.is_ok() && approved {
+            if let Some((grant_id, max_uses)) = grant.and_then(ApprovalGrant::v2_single_use_key) {
+                if !try_consume_v2_grant(grant_id, max_uses) {
+                    allowed = false;
+                    result = Err("approval grant single-use exhausted (replay)".to_string());
+                }
+            }
+        }
+        let risk_label = format!("{risk:?}").to_ascii_lowercase();
+        // Compliance audit (EU AI Act Art.12): same field set + precise
+        // deny-reason preference as the command path above.
+        let now = chrono::Utc::now().timestamp();
+        let grant_deny_reason = match (result.as_ref(), grant) {
+            (Err(_), Some(grant)) => grant.resource_deny_reason(tool_name, operation_name, risk, now),
+            _ => None,
+        };
+        let audit_reason = grant_deny_reason
+            .as_deref()
+            .or_else(|| result.as_ref().err().map(String::as_str));
+        crate::security::audit::record_side_effect_decision_best_effort(
+            &self.policy.workspace_dir,
+            crate::security::audit::SideEffectDecisionLog {
+                tool_name,
+                operation_name,
+                risk_level: &risk_label,
+                approved,
+                allowed,
+                error: audit_reason,
+                principal_id: grant.and_then(ApprovalGrant::audit_principal_id),
+                grant_id: grant.and_then(ApprovalGrant::audit_grant_id),
+            },
+        );
+        result
+    }
+}
+
+#[must_use]
+pub fn command_operation_hash(tool_name: &str, command: &str) -> u64 {
+    let mut hasher = sha2::Sha256::new();
+    sha2::Digest::update(&mut hasher, tool_name.as_bytes());
+    sha2::Digest::update(&mut hasher, b"\0");
+    sha2::Digest::update(&mut hasher, command.as_bytes());
+    let digest = sha2::Digest::finalize(hasher);
+    let mut first = [0_u8; 8];
+    for (slot, byte) in first.iter_mut().zip(digest.iter().take(8)) {
+        *slot = *byte;
+    }
+    u64::from_be_bytes(first)
+}
+
+#[must_use]
+pub fn resource_operation_hash(tool_name: &str, operation_name: &str) -> u64 {
+    command_operation_hash(tool_name, operation_name)
 }
 
 /// Sliding-window action tracker for rate limiting.
@@ -498,7 +1077,11 @@ impl SecurityPolicy {
     // before any risk or autonomy logic runs.
 
     /// Validate full command execution policy (allowlist + risk gate).
-    pub fn validate_command_execution(&self, command: &str, approved: bool) -> Result<CommandRiskLevel, String> {
+    pub fn validate_command_execution(
+        &self,
+        command: &str,
+        runtime_approval_granted: bool,
+    ) -> Result<CommandRiskLevel, String> {
         if !self.is_command_allowed(command) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -509,17 +1092,17 @@ impl SecurityPolicy {
             if self.block_high_risk_commands {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
-            if self.autonomy == AutonomyLevel::Supervised && !approved {
-                return Err("Command requires explicit approval (approved=true): high-risk operation".into());
+            if self.autonomy == AutonomyLevel::Supervised && !runtime_approval_granted {
+                return Err("Command requires runtime approval grant: high-risk operation".into());
             }
         }
 
         if risk == CommandRiskLevel::Medium
             && self.autonomy == AutonomyLevel::Supervised
             && self.require_approval_for_medium_risk
-            && !approved
+            && !runtime_approval_granted
         {
-            return Err("Command requires explicit approval (approved=true): medium-risk operation".into());
+            return Err("Command requires runtime approval grant: medium-risk operation".into());
         }
 
         Ok(risk)
@@ -841,6 +1424,16 @@ fn rule_matches(rule: &crate::config::ScopeRule, sender: &str, channel: &str, ch
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+
+    /// Install (once) an in-memory process-global witness keyring so the
+    /// production gate path (`WitnessKeyring::global()`) verifies against the
+    /// same key the test signs with — no `$HOME`, filesystem, or `unsafe` env
+    /// mutation. Returns that keyring.
+    fn global_keyring_guard() -> &'static crate::acl::approval_grant::WitnessKeyring {
+        crate::acl::approval_grant::WitnessKeyring::global_for_tests()
+    }
 
     fn default_policy() -> SecurityPolicy {
         SecurityPolicy::default()
@@ -919,7 +1512,645 @@ mod tests {
         assert!(err.contains("Rate limit exceeded"));
     }
 
-    // ── is_command_allowed ───────────────────────────────────
+    #[test]
+    fn side_effect_gate_requires_matching_approval_grant_for_medium_risk_command() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["touch".into()],
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&p);
+
+        let denied = gate.authorize_command_execution("shell", "touch file.txt", None);
+        assert!(denied.unwrap_err().contains("runtime approval grant"));
+
+        let wrong_tool = ApprovalGrant::for_tool("cron_run", "test", None);
+        let denied = gate.authorize_command_execution("shell", "touch file.txt", Some(&wrong_tool));
+        assert!(denied.unwrap_err().contains("runtime approval grant"));
+
+        let broad_tool_grant = ApprovalGrant::for_tool("shell", "test", None);
+        let denied = gate.authorize_command_execution("shell", "touch file.txt", Some(&broad_tool_grant));
+        assert!(denied.unwrap_err().contains("runtime approval grant"));
+
+        let grant = ApprovalGrant::for_command("shell", "touch file.txt", "test", None);
+        assert_eq!(
+            gate.authorize_command_execution("shell", "touch file.txt", Some(&grant))
+                .unwrap(),
+            CommandRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn approval_grant_command_hash_binds_to_command_content() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["touch".into()],
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&p);
+        let grant = ApprovalGrant::for_command("shell", "touch approved.txt", "test", None);
+
+        assert!(
+            gate.authorize_command_execution("shell", "touch other.txt", Some(&grant))
+                .unwrap_err()
+                .contains("runtime approval grant")
+        );
+        assert_eq!(
+            gate.authorize_command_execution("shell", "touch approved.txt", Some(&grant))
+                .unwrap(),
+            CommandRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn side_effect_gate_resource_operation_obeys_readonly_and_medium_grants() {
+        let readonly = readonly_policy();
+        let readonly_gate = SideEffectGate::new(&readonly);
+        let denied = readonly_gate
+            .authorize_resource_operation(
+                "sessions_send",
+                "sessions_send:steer:run-1",
+                ResourceRiskLevel::Low,
+                None,
+            )
+            .unwrap_err();
+        assert!(denied.contains("read-only mode"));
+
+        let supervised = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+        let supervised_gate = SideEffectGate::new(&supervised);
+        let denied = supervised_gate
+            .authorize_resource_operation("subagents", "subagents:kill:run-1", ResourceRiskLevel::Medium, None)
+            .unwrap_err();
+        assert!(denied.contains("runtime approval grant"));
+
+        let wrong_operation = ApprovalGrant::for_resource_operation("subagents", "subagents:kill:run-2", "test", None);
+        let denied = supervised_gate
+            .authorize_resource_operation(
+                "subagents",
+                "subagents:kill:run-1",
+                ResourceRiskLevel::Medium,
+                Some(&wrong_operation),
+            )
+            .unwrap_err();
+        assert!(denied.contains("runtime approval grant"));
+
+        let broad_tool_grant = ApprovalGrant::for_tool("subagents", "test", None);
+        let denied = supervised_gate
+            .authorize_resource_operation(
+                "subagents",
+                "subagents:kill:run-1",
+                ResourceRiskLevel::Medium,
+                Some(&broad_tool_grant),
+            )
+            .unwrap_err();
+        assert!(denied.contains("runtime approval grant"));
+
+        let grant = ApprovalGrant::for_resource_operation("subagents", "subagents:kill:run-1", "test", None);
+        assert_eq!(
+            supervised_gate
+                .authorize_resource_operation(
+                    "subagents",
+                    "subagents:kill:run-1",
+                    ResourceRiskLevel::Medium,
+                    Some(&grant),
+                )
+                .unwrap(),
+            ResourceRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn side_effect_gate_blocks_high_risk_resource_when_policy_blocks_high() {
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&policy);
+        let grant = ApprovalGrant::for_resource_operation("nodes", "nodes:exec:n1", "test", None);
+
+        let denied = gate
+            .authorize_resource_operation("nodes", "nodes:exec:n1", ResourceRiskLevel::High, Some(&grant))
+            .unwrap_err();
+
+        assert!(denied.contains("high-risk operation is disallowed"));
+    }
+
+    #[test]
+    fn side_effect_gate_accepts_verified_v2_resource_grant_only() {
+        use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring};
+
+        // The gate re-verifies against the process-global keyring, so the grant
+        // must be signed by that same key. Pin it to a temp file.
+        let _guard = global_keyring_guard();
+        let keyring = WitnessKeyring::global().unwrap();
+        let grant = ApprovalGrantV2::issue_one_shot(
+            keyring,
+            Subject {
+                agent_id: "prx:test:agent".to_string(),
+                principal_id: "telegram:alice".to_string(),
+                owner_id: "owner:alice".to_string(),
+                workspace_id: "workspace".to_string(),
+                session_key: Some("session-a".to_string()),
+            },
+            IssuerAuthority::HumanReview,
+            "nodes:exec:n1",
+            RiskLevel::High,
+        )
+        .unwrap();
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&policy);
+
+        // A tampered grant (signature won't verify against the keyring) is
+        // rejected regardless of any wire flag.
+        let mut tampered_inner = grant.clone();
+        tampered_inner.capability.op_id = "nodes:exec:n2".to_string();
+        let tampered = ApprovalGrant {
+            tool: "nodes".to_string(),
+            operation_hash: None,
+            actor: "test".to_string(),
+            scope: Some(grant.grant_id.clone()),
+            expires_at_epoch_secs: Some(grant.expires_at.timestamp()),
+            v2: Some(tampered_inner),
+            v2_verified: true, // even an attacker-set "verified" flag must not help
+            caller_principal_id: Some("telegram:alice".to_string()),
+        };
+        let denied = gate
+            .authorize_resource_operation("nodes", "nodes:exec:n1", ResourceRiskLevel::High, Some(&tampered))
+            .unwrap_err();
+        assert!(denied.contains("runtime approval grant"));
+
+        // A properly signed grant, bound to the matching caller principal, is
+        // honoured through the real gate verification path (calls
+        // `verify_for_operation_bound` against the global keyring).
+        let verified = ApprovalGrant::from_verified_v2("nodes", "test", grant)
+            .with_caller_principal_id(Some("telegram:alice".to_string()));
+        assert_eq!(
+            gate.authorize_resource_operation("nodes", "nodes:exec:n1", ResourceRiskLevel::High, Some(&verified))
+                .unwrap(),
+            ResourceRiskLevel::High
+        );
+    }
+
+    /// Issue a signed v2 grant exactly as the agent loop does, serialize it into
+    /// a tool-call args object (the trust boundary), then re-read it through
+    /// `from_runtime_args` and feed it to the gate — i.e. the full production
+    /// chain: loop-sign → JSON → tool deserialize → gate verify.
+    fn issue_v2_into_args(
+        op_id: &str,
+        risk: crate::acl::approval_grant::RiskLevel,
+        scope_principal: &str,
+    ) -> serde_json::Value {
+        use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, Subject, WitnessKeyring};
+
+        let _guard = global_keyring_guard();
+        let keyring = WitnessKeyring::global().unwrap();
+        let grant = ApprovalGrantV2::issue_one_shot(
+            keyring,
+            Subject {
+                agent_id: "prx:agent:telegram".to_string(),
+                principal_id: "telegram:alice".to_string(),
+                owner_id: "owner:ws:telegram:alice".to_string(),
+                workspace_id: "ws".to_string(),
+                session_key: Some("chat-1".to_string()),
+            },
+            IssuerAuthority::HumanReview,
+            op_id,
+            risk,
+        )
+        .unwrap();
+        // The loop wraps with from_verified_v2 then serializes; `v2_verified` is
+        // `#[serde(skip)]` so it never reaches the wire.
+        let wrapped = ApprovalGrant::from_verified_v2("file_write", "approval_manager", grant);
+        let grant_json = serde_json::to_value(&wrapped).unwrap();
+        json!({
+            RUNTIME_APPROVAL_GRANT_ARG: grant_json,
+            "_zc_scope_trusted": true,
+            "_zc_scope": { "principal_id": scope_principal },
+        })
+    }
+
+    #[test]
+    fn v2_grant_end_to_end_through_runtime_args_reaches_gate() {
+        let op = "file_write:write:abcd";
+        let args = issue_v2_into_args(op, crate::acl::approval_grant::RiskLevel::Medium, "telegram:alice");
+
+        // The deserialized grant must NOT carry a trusted `v2_verified` flag.
+        let grant = ApprovalGrant::from_runtime_args("file_write", &args).expect("grant present");
+        assert!(!grant.v2_verified, "v2_verified must never survive deserialization");
+        assert_eq!(grant.caller_principal_id.as_deref(), Some("telegram:alice"));
+        assert!(grant.v2.is_some());
+
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&policy);
+        // Full chain authorizes: gate re-verifies signature + principal binding.
+        assert_eq!(
+            gate.authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant))
+                .unwrap(),
+            ResourceRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn try_consume_v2_grant_enforces_max_uses() {
+        // Direct ledger test (no keyring/env needed): a unique grant_id with
+        // max_uses=2 is consumable exactly twice, then denied (M5). max_uses=0 is
+        // never consumable.
+        let gid = format!("grant-test-{}", uuid::Uuid::now_v7());
+        assert!(try_consume_v2_grant(&gid, 2), "1st consume must succeed");
+        assert!(try_consume_v2_grant(&gid, 2), "2nd consume must succeed");
+        assert!(!try_consume_v2_grant(&gid, 2), "3rd consume must be denied (exhausted)");
+
+        let zero = format!("grant-test-zero-{}", uuid::Uuid::now_v7());
+        assert!(!try_consume_v2_grant(&zero, 0), "max_uses=0 must never consume");
+    }
+
+    #[test]
+    fn gate_denies_single_use_v2_grant_on_replay() {
+        // M5 replay defense end-to-end: a single-use (max_uses=1) v2 grant is
+        // allowed exactly once through the gate; a second authorization of the
+        // SAME grant within the validity window is denied (uses exhausted).
+        let op = "file_write:write:single-use-replay";
+        let args = issue_v2_into_args(op, crate::acl::approval_grant::RiskLevel::Medium, "telegram:alice");
+        let grant = ApprovalGrant::from_runtime_args("file_write", &args).expect("grant present");
+        assert_eq!(
+            grant.v2.as_ref().map(|g| g.max_uses),
+            Some(1),
+            "runtime grants are single-use by default"
+        );
+
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+
+        let first = SideEffectGate::new(&policy).authorize_resource_operation(
+            "file_write",
+            op,
+            ResourceRiskLevel::Medium,
+            Some(&grant),
+        );
+        assert!(first.is_ok(), "first use of a single-use grant must be allowed");
+
+        let second = SideEffectGate::new(&policy).authorize_resource_operation(
+            "file_write",
+            op,
+            ResourceRiskLevel::Medium,
+            Some(&grant),
+        );
+        assert!(
+            second.is_err(),
+            "second use of a single-use grant must be denied (replay)"
+        );
+    }
+
+    #[test]
+    fn v2_glob_grant_matches_resolved_op_through_gate() {
+        use crate::acl::approval_grant::{
+            ApprovalGrantV2, IssuerAuthority, OpIdMatch, RiskLevel, Subject, WitnessKeyring,
+        };
+
+        let _guard = global_keyring_guard();
+        let keyring = WitnessKeyring::global().unwrap();
+        // Loop issues a tool+verb glob (file_write derives its real op-id from
+        // the canonicalized resolved path, which the loop cannot reproduce).
+        let grant = ApprovalGrantV2::issue_one_shot_match(
+            keyring,
+            Subject {
+                agent_id: "prx:agent:telegram".to_string(),
+                principal_id: "telegram:alice".to_string(),
+                owner_id: "owner:ws:telegram:alice".to_string(),
+                workspace_id: "ws".to_string(),
+                session_key: Some("chat-1".to_string()),
+            },
+            IssuerAuthority::HumanReview,
+            "file_write:write:*",
+            OpIdMatch::GlobPattern("file_write:write:*".to_string()),
+            RiskLevel::Medium,
+        )
+        .unwrap();
+        let wrapped = ApprovalGrant::from_verified_v2("file_write", "approval_manager", grant);
+        let args = json!({
+            RUNTIME_APPROVAL_GRANT_ARG: serde_json::to_value(&wrapped).unwrap(),
+            "_zc_scope_trusted": true,
+            "_zc_scope": { "principal_id": "telegram:alice" },
+        });
+        let read = ApprovalGrant::from_runtime_args("file_write", &args).expect("grant present");
+
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&policy);
+        // The tool's resolved op-id (e.g. file_write:write:<sha16>) must be
+        // authorized by the glob.
+        let resolved_op = "file_write:write:0123456789abcdef";
+        assert_eq!(
+            gate.authorize_resource_operation("file_write", resolved_op, ResourceRiskLevel::Medium, Some(&read))
+                .unwrap(),
+            ResourceRiskLevel::Medium
+        );
+        // But a different tool/verb op is NOT covered by the glob.
+        let other = gate
+            .authorize_resource_operation("file_write", "file_write:delete:0123", ResourceRiskLevel::Medium, Some(&read))
+            .unwrap_err();
+        assert!(other.contains("runtime approval grant"));
+    }
+
+    #[test]
+    fn v2_grant_cross_tenant_rejected_through_runtime_args() {
+        let op = "file_write:write:abcd";
+        // Grant subject is telegram:alice, but the trusted scope says the caller
+        // is telegram:mallory — M4 cross-tenant reuse must be denied.
+        let args = issue_v2_into_args(op, crate::acl::approval_grant::RiskLevel::Medium, "telegram:mallory");
+        let grant = ApprovalGrant::from_runtime_args("file_write", &args).expect("grant present");
+        assert_eq!(grant.caller_principal_id.as_deref(), Some("telegram:mallory"));
+
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&policy);
+        let denied = gate
+            .authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant))
+            .unwrap_err();
+        assert!(denied.contains("runtime approval grant"));
+    }
+
+    #[test]
+    fn gate_denies_op_with_no_precise_binding() {
+        // operation_hash = None AND v2 = None => deny (d08 tightened default).
+        let wildcard = ApprovalGrant::for_tool("file_write", "approval_manager", None);
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&policy);
+        let denied = gate
+            .authorize_resource_operation(
+                "file_write",
+                "file_write:write:abcd",
+                ResourceRiskLevel::Medium,
+                Some(&wildcard),
+            )
+            .unwrap_err();
+        assert!(denied.contains("runtime approval grant"));
+    }
+
+    #[test]
+    fn v2_grant_expired_and_revoked_rejected_through_gate() {
+        use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring, sign_grant};
+
+        let _guard = global_keyring_guard();
+        let keyring = WitnessKeyring::global().unwrap();
+        let subject = Subject {
+            agent_id: "prx:agent:telegram".to_string(),
+            principal_id: "telegram:alice".to_string(),
+            owner_id: "owner:ws:telegram:alice".to_string(),
+            workspace_id: "ws".to_string(),
+            session_key: Some("chat-1".to_string()),
+        };
+        let op = "file_write:write:expired";
+
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&policy);
+
+        // Expired: backdate the window and re-sign so the signature is valid but
+        // the temporal check fails.
+        let mut expired =
+            ApprovalGrantV2::issue_one_shot(keyring, subject.clone(), IssuerAuthority::HumanReview, op, RiskLevel::Medium)
+                .unwrap();
+        expired.not_before = Utc::now() - chrono::Duration::seconds(120);
+        expired.expires_at = Utc::now() - chrono::Duration::seconds(60);
+        sign_grant(keyring, &mut expired).unwrap();
+        let expired_grant = ApprovalGrant::from_verified_v2("file_write", "test", expired)
+            .with_caller_principal_id(Some("telegram:alice".to_string()));
+        let denied = gate
+            .authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&expired_grant))
+            .unwrap_err();
+        assert!(denied.contains("runtime approval grant"));
+
+        // Revoked: valid window and signature, but revoked_at is set.
+        let mut revoked =
+            ApprovalGrantV2::issue_one_shot(keyring, subject, IssuerAuthority::HumanReview, op, RiskLevel::Medium)
+                .unwrap();
+        revoked.revoke("operator", Utc::now());
+        sign_grant(keyring, &mut revoked).unwrap();
+        let revoked_grant = ApprovalGrant::from_verified_v2("file_write", "test", revoked)
+            .with_caller_principal_id(Some("telegram:alice".to_string()));
+        let denied = gate
+            .authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&revoked_grant))
+            .unwrap_err();
+        assert!(denied.contains("runtime approval grant"));
+    }
+
+    // ── Audit compliance (EU AI Act Art.12) ──────────────────
+
+    /// Supervised policy rooted at a real temp workspace so the best-effort
+    /// audit hook actually writes `audit.log` (it skips `.`/empty workspaces).
+    fn audited_policy() -> (tempfile::TempDir, SecurityPolicy) {
+        let tmp = tempfile::TempDir::new().expect("test: temp workspace");
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        };
+        (tmp, policy)
+    }
+
+    fn read_audit_events(workspace: &std::path::Path) -> Vec<crate::security::audit::AuditEvent> {
+        let raw = std::fs::read_to_string(workspace.join("audit.log")).expect("test: read audit.log");
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("test: parse audit event"))
+            .collect()
+    }
+
+    fn last_deny_reason(workspace: &std::path::Path) -> String {
+        read_audit_events(workspace)
+            .last()
+            .and_then(|e| e.result.as_ref())
+            .and_then(|r| r.error.clone())
+            .expect("test: deny reason recorded")
+    }
+
+    #[test]
+    fn gate_allow_writes_audit_event_with_compliance_fields() {
+        use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring};
+        let _guard = global_keyring_guard();
+        let keyring = WitnessKeyring::global().expect("test: keyring");
+        let op = "file_write:write:allowme";
+        let grant_v2 = ApprovalGrantV2::issue_one_shot(
+            keyring,
+            Subject {
+                agent_id: "prx:agent".to_string(),
+                principal_id: "telegram:alice".to_string(),
+                owner_id: "owner:alice".to_string(),
+                workspace_id: "ws".to_string(),
+                session_key: Some("s1".to_string()),
+            },
+            IssuerAuthority::HumanReview,
+            op,
+            RiskLevel::Medium,
+        )
+        .expect("test: issue grant");
+        let grant_id = grant_v2.grant_id.clone();
+        let grant = ApprovalGrant::from_verified_v2("file_write", "test", grant_v2)
+            .with_caller_principal_id(Some("telegram:alice".to_string()));
+
+        let (tmp, policy) = audited_policy();
+        let gate = SideEffectGate::new(&policy);
+        assert_eq!(
+            gate.authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant))
+                .expect("test: allow"),
+            ResourceRiskLevel::Medium
+        );
+
+        let events = read_audit_events(tmp.path());
+        let event = events.last().expect("an audit event was written");
+        let actor = event.actor.as_ref().expect("actor present");
+        assert_eq!(actor.user_id.as_deref(), Some("telegram:alice"), "subject principal recorded");
+        let action = event.action.as_ref().expect("action present");
+        assert!(action.allowed, "decision is allow");
+        let command = action.command.as_deref().expect("op recorded");
+        assert!(command.contains(op), "op_id recorded");
+        assert!(command.contains(&format!("grant_id={grant_id}")), "grant_id recorded");
+        assert!(event.timestamp <= Utc::now(), "timestamp stamped");
+    }
+
+    #[test]
+    fn gate_deny_writes_audit_event_with_precise_reason() {
+        use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring, sign_grant};
+        let _guard = global_keyring_guard();
+        let keyring = WitnessKeyring::global().expect("test: keyring");
+        let op = "file_write:write:denyme";
+        let subject = Subject {
+            agent_id: "prx:agent".to_string(),
+            principal_id: "telegram:alice".to_string(),
+            owner_id: "owner:alice".to_string(),
+            workspace_id: "ws".to_string(),
+            session_key: Some("s1".to_string()),
+        };
+
+        // (2) operation_hash=None (no precise binding, v1 wildcard grant)
+        {
+            let (tmp, policy) = audited_policy();
+            let gate = SideEffectGate::new(&policy);
+            let wildcard = ApprovalGrant::for_tool("file_write", "test", None);
+            let _ = gate
+                .authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&wildcard))
+                .unwrap_err();
+            assert!(last_deny_reason(tmp.path()).contains("operation_hash=None"));
+        }
+        // (3) cross-tenant principal mismatch
+        {
+            let g = ApprovalGrantV2::issue_one_shot(keyring, subject.clone(), IssuerAuthority::HumanReview, op, RiskLevel::Medium)
+                .expect("test: issue");
+            let grant = ApprovalGrant::from_verified_v2("file_write", "test", g)
+                .with_caller_principal_id(Some("telegram:mallory".to_string()));
+            let (tmp, policy) = audited_policy();
+            let gate = SideEffectGate::new(&policy);
+            let _ = gate.authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant)).unwrap_err();
+            assert!(last_deny_reason(tmp.path()).contains("principal mismatch"));
+        }
+        // (4) expired
+        {
+            let mut g = ApprovalGrantV2::issue_one_shot(keyring, subject.clone(), IssuerAuthority::HumanReview, op, RiskLevel::Medium)
+                .expect("test: issue");
+            g.not_before = Utc::now() - chrono::Duration::seconds(120);
+            g.expires_at = Utc::now() - chrono::Duration::seconds(60);
+            sign_grant(keyring, &mut g).expect("test: sign");
+            let grant = ApprovalGrant::from_verified_v2("file_write", "test", g)
+                .with_caller_principal_id(Some("telegram:alice".to_string()));
+            let (tmp, policy) = audited_policy();
+            let gate = SideEffectGate::new(&policy);
+            let _ = gate.authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant)).unwrap_err();
+            assert!(last_deny_reason(tmp.path()).contains("validity window"));
+        }
+        // (5) revoked
+        {
+            let mut g = ApprovalGrantV2::issue_one_shot(keyring, subject.clone(), IssuerAuthority::HumanReview, op, RiskLevel::Medium)
+                .expect("test: issue");
+            g.revoke("operator", Utc::now());
+            sign_grant(keyring, &mut g).expect("test: sign");
+            let grant = ApprovalGrant::from_verified_v2("file_write", "test", g)
+                .with_caller_principal_id(Some("telegram:alice".to_string()));
+            let (tmp, policy) = audited_policy();
+            let gate = SideEffectGate::new(&policy);
+            let _ = gate.authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant)).unwrap_err();
+            assert!(last_deny_reason(tmp.path()).contains("revoked"));
+        }
+        // (6) single-use exhausted
+        {
+            let mut g = ApprovalGrantV2::issue_one_shot(keyring, subject, IssuerAuthority::HumanReview, op, RiskLevel::Medium)
+                .expect("test: issue");
+            g.uses_consumed = g.max_uses;
+            sign_grant(keyring, &mut g).expect("test: sign");
+            let grant = ApprovalGrant::from_verified_v2("file_write", "test", g)
+                .with_caller_principal_id(Some("telegram:alice".to_string()));
+            let (tmp, policy) = audited_policy();
+            let gate = SideEffectGate::new(&policy);
+            let _ = gate.authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant)).unwrap_err();
+            assert!(last_deny_reason(tmp.path()).contains("no remaining uses"));
+        }
+    }
+
+    #[test]
+    fn gate_decision_unaffected_when_audit_write_fails() {
+        // Point the workspace at a file (not a dir) so audit.log can never be
+        // created; the gate decision must still hold both ways.
+        let tmp = tempfile::TempDir::new().expect("test: temp");
+        let bogus = tmp.path().join("not_a_dir");
+        std::fs::write(&bogus, b"x").expect("test: write file");
+
+        let deny_policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            workspace_dir: bogus.clone(),
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&deny_policy);
+        assert!(
+            gate.authorize_command_execution("shell", "touch f.txt", None).is_err(),
+            "deny decision must survive audit write failure"
+        );
+
+        let allow_policy = SecurityPolicy {
+            allowed_commands: vec!["ls".into()],
+            workspace_dir: bogus,
+            ..SecurityPolicy::default()
+        };
+        let allow_gate = SideEffectGate::new(&allow_policy);
+        assert!(
+            allow_gate.authorize_command_execution("shell", "ls", None).is_ok(),
+            "allow decision must survive audit write failure"
+        );
+        assert!(!tmp.path().join("not_a_dir").is_dir());
+    }
 
     #[test]
     fn allowed_commands_basic() {
@@ -1058,7 +2289,8 @@ mod tests {
 
         let denied = p.validate_command_execution("touch test.txt", false);
         assert!(denied.is_err());
-        assert!(denied.unwrap_err().contains("requires explicit approval"),);
+        // d08 message wording: medium-risk denial without a runtime grant.
+        assert!(denied.unwrap_err().contains("runtime approval grant"));
 
         let allowed = p.validate_command_execution("touch test.txt", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::Medium);

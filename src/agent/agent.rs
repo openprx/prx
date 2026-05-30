@@ -17,6 +17,7 @@ use crate::router::RouterEngine;
 #[cfg(feature = "llm-router")]
 use crate::router::automix::{ConfidenceChecker, is_cheap_model_target, should_escalate};
 use crate::runtime;
+use crate::runtime::control_ladder::{ControlLadderSnapshot, ControlLadderTrace, append_control_ladder_trace};
 use crate::security::SecurityPolicy;
 #[cfg(feature = "llm-router")]
 use crate::self_system::SELF_SYSTEM_SESSION_ID;
@@ -51,6 +52,7 @@ pub struct Agent {
     task_routing_config: crate::config::TaskRoutingConfig,
     tool_tiering: crate::config::ToolTieringConfig,
     available_hints: Vec<String>,
+    control_ladder: ControlLadderSnapshot,
     #[cfg(feature = "llm-router")]
     model_routes: Vec<crate::config::ModelRouteConfig>,
     #[cfg(feature = "llm-router")]
@@ -81,6 +83,7 @@ pub struct AgentBuilder {
     task_routing_config: Option<crate::config::TaskRoutingConfig>,
     tool_tiering: Option<crate::config::ToolTieringConfig>,
     available_hints: Option<Vec<String>>,
+    control_ladder: Option<ControlLadderSnapshot>,
     #[cfg(feature = "llm-router")]
     model_routes: Option<Vec<crate::config::ModelRouteConfig>>,
     #[cfg(feature = "llm-router")]
@@ -111,6 +114,7 @@ impl AgentBuilder {
             task_routing_config: None,
             tool_tiering: None,
             available_hints: None,
+            control_ladder: None,
             #[cfg(feature = "llm-router")]
             model_routes: None,
             #[cfg(feature = "llm-router")]
@@ -205,6 +209,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn control_ladder(mut self, control_ladder: ControlLadderSnapshot) -> Self {
+        self.control_ladder = Some(control_ladder);
+        self
+    }
+
     #[cfg(feature = "llm-router")]
     pub fn model_routes(mut self, model_routes: Vec<crate::config::ModelRouteConfig>) -> Self {
         self.model_routes = Some(model_routes);
@@ -267,6 +276,7 @@ impl AgentBuilder {
             task_routing_config: self.task_routing_config.unwrap_or_default(),
             tool_tiering: self.tool_tiering.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
+            control_ladder: self.control_ladder.unwrap_or_default(),
             #[cfg(feature = "llm-router")]
             model_routes: self.model_routes.unwrap_or_default(),
             #[cfg(feature = "llm-router")]
@@ -290,6 +300,12 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+    }
+
+    fn append_control_ladder_trace(&self, trace: &ControlLadderTrace) {
+        if let Err(error) = append_control_ladder_trace(&self.workspace_dir, trace) {
+            tracing::warn!("failed to append control ladder trace: {error}");
+        }
     }
 
     pub fn from_config(config: &Config) -> Result<Self> {
@@ -384,6 +400,7 @@ impl Agent {
             .task_routing_config(config.task_routing.clone())
             .tool_tiering(config.tool_tiering.clone())
             .available_hints(available_hints)
+            .control_ladder(ControlLadderSnapshot::from_config(config))
             .model_routes(config.model_routes.clone())
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills_with_config(&config.workspace_dir, config))
@@ -407,6 +424,7 @@ impl Agent {
             .task_routing_config(config.task_routing.clone())
             .tool_tiering(config.tool_tiering.clone())
             .available_hints(available_hints)
+            .control_ladder(ControlLadderSnapshot::from_config(config))
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills_with_config(&config.workspace_dir, config))
             .auto_save(config.memory.auto_save && config.memory.semantic.auto_promote_user_messages);
@@ -444,7 +462,10 @@ impl Agent {
             builder = builder.cte(cte);
         }
 
-        builder.build()
+        let agent = builder.build()?;
+        let trace = ControlLadderSnapshot::from_config(config).build_trace("agent.init", None);
+        agent.append_control_ladder_trace(&trace);
+        Ok(agent)
     }
 
     fn trim_history(&mut self) {
@@ -761,6 +782,11 @@ impl Agent {
             reason = classify_result.reason.as_str(),
             "Task routing classified incoming message"
         );
+        #[cfg(feature = "llm-router")]
+        let control_ladder_run_id = Some(self.cte_session_id.clone());
+        #[cfg(not(feature = "llm-router"))]
+        let control_ladder_run_id = None;
+        let mut control_ladder_trace = self.control_ladder.build_trace("agent.turn", control_ladder_run_id);
 
         if classify_result.intent == super::classifier::TaskIntent::Delegate {
             // Record user message in history before delegating so follow-up
@@ -774,6 +800,15 @@ impl Agent {
             // Record acknowledgment in history as well.
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::assistant(ack.clone())));
+            control_ladder_trace.mark_active(
+                "task_pool",
+                "delegate_task_spawned",
+                serde_json::json!({
+                    "task_id": task_id,
+                    "model_hint": classify_result.model_hint,
+                }),
+            );
+            self.append_control_ladder_trace(&control_ladder_trace);
             return Ok(ack);
         }
 
@@ -800,6 +835,14 @@ impl Agent {
                             session_id = %self.cte_session_id,
                             "CTE selected branch"
                         );
+                        control_ladder_trace.mark_active(
+                            "causal_tree",
+                            "branch_selected",
+                            serde_json::json!({
+                                "chosen_branch_id": decision.chosen_branch_id,
+                                "label": format!("{:?}", branch.label),
+                            }),
+                        );
                         Some((decision, branch))
                     }
                     Err(e) => {
@@ -807,10 +850,23 @@ impl Agent {
                             session_id = %self.cte_session_id,
                             "CTE pipeline failed, falling back to router-direct: {e}"
                         );
+                        control_ladder_trace.mark_fallback(
+                            "causal_tree",
+                            "cte_pipeline_failed",
+                            serde_json::json!({
+                                "error": e.to_string(),
+                                "fallback": "router_direct",
+                            }),
+                        );
                         None
                     }
                 }
             } else {
+                control_ladder_trace.mark_skipped(
+                    "causal_tree",
+                    "engine_disabled",
+                    serde_json::json!({"fallback": "router_direct"}),
+                );
                 None
             }
         } else {
@@ -833,16 +889,51 @@ impl Agent {
                                 score = result.score,
                                 "Router selected model"
                             );
+                            control_ladder_trace.mark_active(
+                                "router",
+                                "model_selected",
+                                serde_json::json!({
+                                    "provider": provider,
+                                    "model": model,
+                                    "score": result.score,
+                                    "intent": result.intent,
+                                    "estimated_tokens": result.estimated_tokens,
+                                }),
+                            );
                             self.resolve_router_target(provider, model)
                         } else {
+                            control_ladder_trace.mark_fallback(
+                                "router",
+                                "router_no_candidate",
+                                serde_json::json!({
+                                    "fallback": "classifier_or_default_model",
+                                    "intent": result.intent,
+                                    "estimated_tokens": result.estimated_tokens,
+                                }),
+                            );
                             self.classify_model(user_message)
                         }
                     } else if let Some(target) = classify_result.model_hint.as_deref() {
+                        control_ladder_trace.mark_skipped(
+                            "router",
+                            "explicit_model_hint",
+                            serde_json::json!({"target": target}),
+                        );
                         self.resolve_model_target(target)
                     } else {
+                        control_ladder_trace.mark_fallback(
+                            "router",
+                            "router_unavailable",
+                            serde_json::json!({"fallback": "classifier_or_default_model"}),
+                        );
                         self.classify_model(user_message)
                     }
                 } else {
+                    control_ladder_trace.mark_fallback(
+                        "router",
+                        "router_unavailable",
+                        serde_json::json!({"fallback": "classifier_or_default_model"}),
+                    );
                     classify_result
                         .model_hint
                         .as_deref()
@@ -893,6 +984,7 @@ impl Agent {
                             }),
                         )
                         .await;
+                    self.append_control_ladder_trace(&control_ladder_trace);
                     return Ok(approval_msg);
                 }
                 crate::causal_tree::BranchLabel::RetrieveThenAnswer => {
@@ -909,6 +1001,17 @@ impl Agent {
                 }
             }
         }
+
+        control_ladder_trace.mark_active(
+            "runtime",
+            "l0_turn_execution",
+            serde_json::json!({
+                "effective_model": effective_model.clone(),
+                "intent": format!("{:?}", classify_result.intent),
+                "max_tool_iterations": max_tool_iterations,
+            }),
+        );
+        self.append_control_ladder_trace(&control_ladder_trace);
 
         for _ in 0..max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -1389,6 +1492,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_without_tools_returns_text() {
+        let workspace = tempfile::TempDir::new().unwrap();
         let provider = Box::new(MockProvider {
             responses: Mutex::new(vec![crate::providers::ChatResponse {
                 text: Some("hello".into()),
@@ -1407,18 +1511,31 @@ mod tests {
         );
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
         let mut agent = Agent::builder()
             .provider(provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .workspace_dir(workspace.path().to_path_buf())
+            .control_ladder(ControlLadderSnapshot::from_config(&config))
             .build()
             .expect("agent builder should succeed with valid config");
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "hello");
+
+        let trace_path = workspace
+            .path()
+            .join(crate::runtime::control_ladder::CONTROL_LADDER_TRACE_PATH);
+        let trace_content = std::fs::read_to_string(trace_path).unwrap();
+        let trace: ControlLadderTrace = serde_json::from_str(trace_content.lines().next().unwrap()).unwrap();
+        assert_eq!(trace.source, "agent.turn");
+        assert!(trace.layers.iter().any(|layer| {
+            layer.name == "runtime" && layer.status == "active" && layer.reason.as_deref() == Some("l0_turn_execution")
+        }));
     }
 
     #[tokio::test]

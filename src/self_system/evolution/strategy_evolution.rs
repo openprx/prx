@@ -1,5 +1,5 @@
 use crate::self_system::evolution::analyzer::{CandidatePriority, EvolutionCandidate};
-use crate::self_system::evolution::config::{EvolutionMode, SharedEvolutionConfig};
+use crate::self_system::evolution::config::SharedEvolutionConfig;
 use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput, EvolutionEngine};
 use crate::self_system::evolution::gate::{EvolutionGate, GateMetrics, GateResult};
 use crate::self_system::evolution::record::{
@@ -182,7 +182,7 @@ impl EvolutionEngine for StrategyEvolutionEngine {
         let mut status = ValidationStatus::Skipped;
         let mut notes = "shadow mode: strategy mutation recorded only".to_string();
 
-        if !matches!(mode, EvolutionMode::Shadow) {
+        if mode.allows_target_mutation() {
             if matches!(gate_result, GateResult::Passed) {
                 self.rollback.backup_current_version().await?;
                 atomic_write(&self.workspace_root, &policy_path, serialized.as_bytes()).await?;
@@ -279,7 +279,7 @@ impl EvolutionEngine for StrategyEvolutionEngine {
             cycle,
             evolution_log: Some(evolution_log),
             needs_human_approval: false,
-            shadow_mode: matches!(mode, EvolutionMode::Shadow),
+            shadow_mode: mode.is_draft_like(),
         })
     }
 }
