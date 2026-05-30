@@ -1,5 +1,7 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::security::SecurityPolicy;
+use crate::security::op_id;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
+use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
@@ -238,6 +240,26 @@ impl Tool for ScreenshotTool {
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
+
+        // SideEffectGate: capturing a screenshot writes a file into the workspace
+        // (and reads the framebuffer). Gate it as a Medium-risk resource op bound
+        // to the requested target name (op naming per design d03).
+        let target = args.get("filename").and_then(|v| v.as_str()).unwrap_or("default");
+        let operation_name = op_id::op_id(self.name(), "capture", &[target]);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+            self.name(),
+            &operation_name,
+            ResourceRiskLevel::Medium,
+            approval_grant.as_ref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
         self.capture(args).await
     }
 
@@ -317,6 +339,52 @@ mod tests {
         assert!(
             joined.contains("/tmp/my_screenshot.png"),
             "Command should contain the output path"
+        );
+    }
+
+    // ── SideEffectGate coverage (design d03 / P0-C) ──────────────────────────
+
+    fn supervised_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn capture_denied_without_grant() {
+        let tool = ScreenshotTool::new(supervised_security());
+        let result = tool.execute(json!({"filename": "shot.png"})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "expected gate denial, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_allowed_with_matching_grant() {
+        let tool = ScreenshotTool::new(supervised_security());
+        let op = crate::security::op_id::op_id("screenshot", "capture", &["shot.png"]);
+        assert_eq!(op, "screenshot:capture:shot_png");
+        let result = tool
+            .execute(json!({
+                "filename": "shot.png",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    crate::security::policy::ApprovalGrant::for_resource_operation(
+                        "screenshot", &op, "test", None,
+                    ),
+            }))
+            .await
+            .unwrap();
+        // Gate must allow; capture may fail (no screenshot tool in CI) but never
+        // with the approval-grant error.
+        assert!(
+            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "gate must have allowed the matching grant, got: {:?}",
+            result.error
         );
     }
 }

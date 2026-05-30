@@ -8,7 +8,8 @@
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::security::SecurityPolicy;
-use crate::security::policy::ToolOperation;
+use crate::security::op_id;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate, ToolOperation};
 use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -688,6 +689,26 @@ impl Tool for ComposioTool {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'action_name' (or 'tool_slug') for execute"))?;
 
+                // SideEffectGate: executing a Composio action reaches an external
+                // managed SaaS integration (Gmail/Notion/GitHub/...) and can
+                // perform arbitrary, irreversible side effects. Gate it as a
+                // High-risk resource operation bound to the specific action so an
+                // approval for one action cannot authorize another (op per d03).
+                let operation_name = op_id::op_id(self.name(), "execute", &[action_name]);
+                let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+                if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+                    self.name(),
+                    &operation_name,
+                    ResourceRiskLevel::High,
+                    approval_grant.as_ref(),
+                ) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
+
                 let app = args.get("app").and_then(|v| v.as_str());
                 let params = args.get("params").cloned().unwrap_or_else(|| json!({}));
                 let acct_ref = args.get("connected_account_id").and_then(|v| v.as_str());
@@ -729,6 +750,25 @@ impl Tool for ComposioTool {
 
                 if app.is_none() && auth_config_id.is_none() {
                     anyhow::bail!("Missing 'app' or 'auth_config_id' for connect");
+                }
+
+                // SideEffectGate: connecting an integration initiates an external
+                // OAuth/account link (a real side effect). Gate it as High-risk,
+                // bound to the target app/auth-config (op naming per design d03).
+                let connect_target = app.or(auth_config_id).unwrap_or("");
+                let operation_name = op_id::op_id(self.name(), "connect", &[connect_target]);
+                let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+                if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+                    self.name(),
+                    &operation_name,
+                    ResourceRiskLevel::High,
+                    approval_grant.as_ref(),
+                ) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
                 }
 
                 match self.get_connection_url(app, auth_config_id, entity_id).await {
@@ -1581,5 +1621,128 @@ mod tests {
         assert_eq!(body["version"], json!(COMPOSIO_TOOL_VERSION_LATEST));
         assert!(body.get("connected_account_id").is_none());
         assert!(body.get("user_id").is_none());
+    }
+
+    // ── SideEffectGate coverage (design d03 / P0-C) ──────────────────────────
+
+    /// Supervised policy with the high-risk hard-block disabled so the grant
+    /// path is exercised (composio:execute is High-risk).
+    fn gate_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn execute_denied_without_grant() {
+        let tool = ComposioTool::new("test-key", None, gate_security());
+        let result = tool
+            .execute(json!({"action": "execute", "action_name": "GMAIL_SEND_EMAIL"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "expected gate denial, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_allowed_with_matching_grant() {
+        let tool = ComposioTool::new("test-key", None, gate_security());
+        let op = crate::security::op_id::op_id("composio", "execute", &["GMAIL_SEND_EMAIL"]);
+        // Op naming follows design d03 canonical form.
+        assert_eq!(op, "composio:execute:gmail_send_email");
+        let result = tool
+            .execute(json!({
+                "action": "execute",
+                "action_name": "GMAIL_SEND_EMAIL",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    crate::security::policy::ApprovalGrant::for_resource_operation(
+                        "composio", &op, "test", None,
+                    ),
+            }))
+            .await;
+        // Gate must allow; the call then fails downstream (no live Composio API),
+        // possibly as an Err — never the approval-grant denial.
+        match result {
+            Ok(r) => assert!(
+                !r.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+                "gate must have allowed the matching grant, got: {:?}",
+                r.error
+            ),
+            Err(e) => assert!(
+                !e.to_string().contains("requires runtime approval grant"),
+                "downstream error expected, not a gate denial: {e}"
+            ),
+        }
+    }
+
+    /// A grant bound to a *different* action must not authorize this execute.
+    #[tokio::test]
+    async fn execute_denied_with_mismatched_grant() {
+        let tool = ComposioTool::new("test-key", None, gate_security());
+        let wrong_op = crate::security::op_id::op_id("composio", "execute", &["SLACK_POST_MESSAGE"]);
+        let result = tool
+            .execute(json!({
+                "action": "execute",
+                "action_name": "GMAIL_SEND_EMAIL",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    crate::security::policy::ApprovalGrant::for_resource_operation(
+                        "composio", &wrong_op, "test", None,
+                    ),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "mismatched grant must be rejected, got: {:?}",
+            result.error
+        );
+    }
+
+    /// With the default high-risk hard-block, composio:execute is denied
+    /// outright even with a grant.
+    #[tokio::test]
+    async fn execute_blocked_by_high_risk_policy_even_with_grant() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = ComposioTool::new("test-key", None, security);
+        let op = crate::security::op_id::op_id("composio", "execute", &["GMAIL_SEND_EMAIL"]);
+        let result = tool
+            .execute(json!({
+                "action": "execute",
+                "action_name": "GMAIL_SEND_EMAIL",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    crate::security::policy::ApprovalGrant::for_resource_operation(
+                        "composio", &op, "test", None,
+                    ),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("high-risk operation is disallowed"),
+            "high-risk block must deny even with grant, got: {:?}",
+            result.error
+        );
+    }
+
+    /// Read-only discovery actions (`list`) must never require a grant.
+    #[tokio::test]
+    async fn read_action_not_gated() {
+        let tool = ComposioTool::new("test-key", None, gate_security());
+        let result = tool.execute(json!({"action": "list"})).await.unwrap();
+        assert!(
+            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "read-only discovery must not be gated, got: {:?}",
+            result.error
+        );
     }
 }

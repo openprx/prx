@@ -1,5 +1,7 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::security::SecurityPolicy;
+use crate::security::op_id;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
@@ -148,6 +150,24 @@ impl Tool for PushoverTool {
         };
 
         let sound = args.get("sound").and_then(|v| v.as_str()).map(String::from);
+
+        // SideEffectGate: a Pushover notification is an outbound push to an
+        // external service (device delivery). Gate it as a High-risk resource
+        // operation (op naming per design d03).
+        let operation_name = op_id::op_id(self.name(), "notify", &[]);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+            self.name(),
+            &operation_name,
+            ResourceRiskLevel::High,
+            approval_grant.as_ref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
 
         let (token, user_key) = self.get_credentials().await?;
 
@@ -385,5 +405,91 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("-2..=2"));
+    }
+
+    // ── SideEffectGate coverage (design d03 / P0-C) ──────────────────────────
+
+    /// Supervised policy with the high-risk hard-block disabled so the grant
+    /// path is exercised (pushover:notify is High-risk).
+    fn gate_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            max_actions_per_hour: 100,
+            block_high_risk_commands: false,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn notify_denied_without_grant() {
+        let tool = PushoverTool::new(gate_security(), PathBuf::from("/tmp"));
+        let result = tool.execute(json!({"message": "hello"})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "expected gate denial, got: {:?}",
+            result.error
+        );
+    }
+
+    /// With the default high-risk hard-block, pushover is denied outright even
+    /// with a grant.
+    #[tokio::test]
+    async fn notify_blocked_by_high_risk_policy_even_with_grant() {
+        let tool = PushoverTool::new(test_security(AutonomyLevel::Supervised, 100), PathBuf::from("/tmp"));
+        let op = op_id::op_id("pushover", "notify", &[]);
+        let result = tool
+            .execute(json!({
+                "message": "hello",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    ApprovalGrant::for_resource_operation("pushover", &op, "test", None),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("high-risk operation is disallowed"),
+            "high-risk block must deny even with grant, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_allowed_with_matching_grant() {
+        // Supervised + matching grant (high-risk block off): passes the gate,
+        // then fails downstream at credential loading (no .env), never with the
+        // approval-grant error.
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            max_actions_per_hour: 100,
+            block_high_risk_commands: false,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = PushoverTool::new(security, tmp.path().to_path_buf());
+        let op = op_id::op_id("pushover", "notify", &[]);
+        assert_eq!(op, "pushover:notify");
+        let result = tool
+            .execute(json!({
+                "message": "hello",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    ApprovalGrant::for_resource_operation("pushover", &op, "test", None),
+            }))
+            .await;
+        // Downstream credential loading returns Err via `?`, so the gate must not
+        // have produced the approval-grant denial.
+        match result {
+            Ok(r) => assert!(
+                !r.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+                "gate must have allowed the matching grant, got: {:?}",
+                r.error
+            ),
+            Err(e) => assert!(
+                !e.to_string().contains("requires runtime approval grant"),
+                "downstream error expected, not a gate denial: {e}"
+            ),
+        }
     }
 }

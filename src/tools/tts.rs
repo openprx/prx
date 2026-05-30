@@ -8,6 +8,8 @@ use super::message_send::auto_generate_voice;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::channels::traits::{Channel, SendMessage};
 use crate::security::SecurityPolicy;
+use crate::security::op_id;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -149,6 +151,24 @@ impl Tool for TtsTool {
                 });
             }
         };
+
+        // SideEffectGate: TTS synthesis spawns external processes (edge-tts +
+        // ffmpeg) and then delivers a voice message to a recipient. Gate it as a
+        // Medium-risk resource operation (op naming per design d03).
+        let operation_name = op_id::op_id(self.name(), "synthesize", &[]);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+            self.name(),
+            &operation_name,
+            ResourceRiskLevel::Medium,
+            approval_grant.as_ref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
 
         // Generate voice file
         let voice_path = match auto_generate_voice(&text, &voice).await {
@@ -418,5 +438,43 @@ mod tests {
 
         let channel = tool.active_channel.read().await;
         assert_eq!(channel.name(), "mock"); // both are mock, but it's a different Arc
+    }
+
+    // ── SideEffectGate coverage (design d03 / P0-C) ──────────────────────────
+
+    #[tokio::test]
+    async fn synthesize_denied_without_grant() {
+        let tool = make_tts(MockChannel::ok(), Some("bob"), AutonomyLevel::Supervised);
+        let result = tool.execute(json!({"text": "hello"})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "expected gate denial, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesize_allowed_with_matching_grant() {
+        let tool = make_tts(MockChannel::ok(), Some("bob"), AutonomyLevel::Supervised);
+        let op = crate::security::op_id::op_id("tts", "synthesize", &[]);
+        assert_eq!(op, "tts:synthesize");
+        let result = tool
+            .execute(json!({
+                "text": "hello",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    crate::security::policy::ApprovalGrant::for_resource_operation(
+                        "tts", &op, "test", None,
+                    ),
+            }))
+            .await
+            .unwrap();
+        // Gate must allow; synthesis fails in CI (no edge-tts) but never with the
+        // approval-grant error.
+        assert!(
+            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "gate must have allowed the matching grant, got: {:?}",
+            result.error
+        );
     }
 }

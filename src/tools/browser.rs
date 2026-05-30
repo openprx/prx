@@ -7,6 +7,8 @@
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::security::SecurityPolicy;
+use crate::security::op_id;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -816,6 +818,41 @@ impl BrowserTool {
         }
     }
 
+    /// Build the SideEffectGate operation id for a browser action, or `None`
+    /// when the action is read-only (no external side effect → not gated).
+    ///
+    /// Op naming follows design d03: `{tool}:{action}[:{ref}]` where the
+    /// reference binds the grant to the concrete target (URL host / selector
+    /// fingerprint) so an approval for one target cannot authorize another.
+    fn side_effect_operation(tool: &str, action: &str, args: &Value) -> Option<String> {
+        let action = action.trim().to_ascii_lowercase();
+        match action.as_str() {
+            // Read-only actions: no external side effect, intentionally un-gated.
+            "snapshot" | "get_text" | "get_title" | "get_url" | "is_visible" | "find" | "wait" => None,
+            // Navigation to a URL — bind to the destination host.
+            "open" => {
+                let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                let host = op_id::ref_for_url_host(url);
+                Some(op_id::op_id(tool, "open", &[&host]))
+            }
+            // DOM/OS interaction — bind to the selector fingerprint when present.
+            "click" | "fill" | "type" | "hover" | "mouse_click" | "mouse_move" | "mouse_drag" => {
+                let selector = args
+                    .get("selector")
+                    .or_else(|| args.get("ref"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Some(op_id::op_id(tool, &action, &[&op_id::fingerprint16(selector)]))
+            }
+            // Input / navigation / capture side effects without a stable ref.
+            "press" | "scroll" | "close" | "screenshot" | "key_type" | "key_press" | "screen_capture" => {
+                Some(op_id::op_id(tool, &action, &[]))
+            }
+            // Unknown but side-effecting: gate conservatively under the raw action.
+            other => Some(op_id::op_id(tool, other, &[])),
+        }
+    }
+
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn to_result(&self, resp: AgentBrowserResponse) -> anyhow::Result<ToolResult> {
         if resp.success {
@@ -985,18 +1022,8 @@ impl Tool for BrowserTool {
             });
         }
 
-        let backend = match self.resolve_backend().await {
-            Ok(selected) => selected,
-            Err(error) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(error.to_string()),
-                });
-            }
-        };
-
-        // Parse action from args
+        // Parse action from args (before backend resolution so the gate runs
+        // even when no browser backend is installed).
         let action_str = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -1009,6 +1036,40 @@ impl Tool for BrowserTool {
                 error: Some(format!("Unknown action: {action_str}")),
             });
         }
+
+        // SideEffectGate: driving a real browser (open/click/type/press/...) or
+        // OS-level computer-use actions produce external, observable side
+        // effects. Gate side-effecting actions as High-risk resource operations
+        // bound to the action + target (op naming per design d03). Pure read
+        // actions (snapshot/get_text/find/...) are not side-effecting and are
+        // intentionally not gated. Runs before backend resolution so the gate
+        // decision never depends on a browser backend being available.
+        if let Some(operation_name) = Self::side_effect_operation(self.name(), action_str, &args) {
+            let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+            if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+                self.name(),
+                &operation_name,
+                ResourceRiskLevel::High,
+                approval_grant.as_ref(),
+            ) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                });
+            }
+        }
+
+        let backend = match self.resolve_backend().await {
+            Ok(selected) => selected,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
 
         if backend == ResolvedBackend::ComputerUse {
             return self.execute_computer_use_action(action_str, &args).await;
@@ -2336,6 +2397,115 @@ mod tests {
         assert_eq!(
             unavailable_action_for_backend_error("mouse_move", ResolvedBackend::RustNative),
             "Action 'mouse_move' is unavailable for backend 'rust_native'"
+        );
+    }
+
+    // ── SideEffectGate coverage (design d03 / P0-C) ──────────────────────────
+
+    /// Supervised policy with the high-risk hard-block disabled, so the grant
+    /// path (rather than the outright high-risk block) is exercised. browser
+    /// actions are gated High-risk.
+    fn supervised_browser() -> BrowserTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        BrowserTool::new(security, vec!["*".into()], None)
+    }
+
+    #[tokio::test]
+    async fn open_denied_without_grant() {
+        let tool = supervised_browser();
+        let result = tool
+            .execute(json!({"action": "open", "url": "https://example.com"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "expected gate denial, got: {:?}",
+            result.error
+        );
+    }
+
+    /// With the default high-risk hard-block, any browser side-effect action is
+    /// denied outright even with a grant.
+    #[tokio::test]
+    async fn open_blocked_by_high_risk_policy_even_with_grant() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None);
+        let host = op_id::ref_for_url_host("https://example.com");
+        let op = op_id::op_id("browser", "open", &[&host]);
+        let result = tool
+            .execute(json!({
+                "action": "open",
+                "url": "https://example.com",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    ApprovalGrant::for_resource_operation("browser", &op, "test", None),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("high-risk operation is disallowed"),
+            "high-risk block must deny even with grant, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn open_allowed_with_matching_grant() {
+        let tool = supervised_browser();
+        let host = op_id::ref_for_url_host("https://example.com");
+        let op = op_id::op_id("browser", "open", &[&host]);
+        assert_eq!(op, "browser:open:example_com");
+        let result = tool
+            .execute(json!({
+                "action": "open",
+                "url": "https://example.com",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    ApprovalGrant::for_resource_operation("browser", &op, "test", None),
+            }))
+            .await
+            .unwrap();
+        // Gate must allow; the backend may be unavailable in CI but the result is
+        // never the approval-grant denial.
+        assert!(
+            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "gate must have allowed the matching grant, got: {:?}",
+            result.error
+        );
+    }
+
+    /// Read-only browser actions (snapshot) must not require a grant.
+    #[tokio::test]
+    async fn snapshot_action_not_gated() {
+        let tool = supervised_browser();
+        let result = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        assert!(
+            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "read-only snapshot must not be gated, got: {:?}",
+            result.error
+        );
+    }
+
+    #[test]
+    fn side_effect_operation_classifies_read_vs_act() {
+        // Read-only actions → not gated.
+        assert!(BrowserTool::side_effect_operation("browser", "snapshot", &json!({})).is_none());
+        assert!(BrowserTool::side_effect_operation("browser", "get_text", &json!({})).is_none());
+        // Side-effecting actions → gated with canonical op ids.
+        assert_eq!(
+            BrowserTool::side_effect_operation("browser", "press", &json!({})),
+            Some("browser:press".to_string())
+        );
+        assert_eq!(
+            BrowserTool::side_effect_operation("browser", "open", &json!({"url": "https://example.com"})),
+            Some("browser:open:example_com".to_string())
         );
     }
 }

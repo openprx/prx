@@ -1,6 +1,8 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier};
 use crate::config::{McpConfig, McpServerConfig, McpTransport};
 use crate::security::SecurityPolicy;
+use crate::security::op_id;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
 use anyhow::bail;
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -885,6 +887,27 @@ impl Tool for McpTool {
             (server_name, tool_name, Some(arguments))
         };
 
+        // SideEffectGate: forwarding a tool call to an external MCP server runs
+        // arbitrary, potentially irreversible side effects on an untrusted
+        // process/endpoint — the largest un-gated surface (reaudit P0-C). Gate it
+        // as a High-risk resource operation bound to the exact `{server}:{tool}`
+        // target so an approval for server-A can never authorize server-B
+        // (op naming per design d03).
+        let operation_name = op_id::op_id(self.name(), "call", &[&server_name, &tool_name]);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+            self.name(),
+            &operation_name,
+            ResourceRiskLevel::High,
+            approval_grant.as_ref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
         let call_result = self.validate_and_call(server_name, tool_name, arguments).await;
 
         match call_result {
@@ -1167,6 +1190,114 @@ mod tests {
         assert!(tools.is_empty());
     }
 
+    // ── SideEffectGate coverage (design d03 / P0-C, largest un-gated surface) ──
+
+    /// Policy with the high-risk hard-block disabled, so a *matching* grant can
+    /// actually traverse the gate (mcp:call is High-risk).
+    fn mcp_gate_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// Under the default Supervised policy, an MCP `call` without a runtime
+    /// approval grant must be denied by the gate before reaching the server.
+    #[tokio::test]
+    async fn call_denied_without_grant() {
+        let tool = McpTool::new(mcp_gate_security(), McpConfig::default(), std::env::temp_dir());
+        let result = tool.execute(json!({"server": "srv", "tool": "act"})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
+            "expected gate denial, got: {:?}",
+            result.error
+        );
+    }
+
+    /// With the high-risk hard-block enabled (the default), any mcp:call is
+    /// denied outright regardless of grant — the strongest protection.
+    #[tokio::test]
+    async fn call_blocked_by_high_risk_policy_even_with_grant() {
+        let tool = McpTool::new(
+            Arc::new(SecurityPolicy::default()),
+            McpConfig::default(),
+            std::env::temp_dir(),
+        );
+        let op = op_id::op_id(MCP_ROOT_NAME, "call", &["srv", "act"]);
+        let result = tool
+            .execute(json!({
+                "server": "srv",
+                "tool": "act",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    ApprovalGrant::for_resource_operation(MCP_ROOT_NAME, &op, "test", None),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("high-risk operation is disallowed"),
+            "high-risk block must deny even with grant, got: {:?}",
+            result.error
+        );
+    }
+
+    /// A grant bound to a *different* server/tool must not authorize this call
+    /// (prevents "approve server-A, call server-B").
+    #[tokio::test]
+    async fn call_denied_with_mismatched_grant() {
+        let tool = McpTool::new(mcp_gate_security(), McpConfig::default(), std::env::temp_dir());
+        let wrong_op = op_id::op_id(MCP_ROOT_NAME, "call", &["other", "tool"]);
+        let result = tool
+            .execute(json!({
+                "server": "srv",
+                "tool": "act",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    ApprovalGrant::for_resource_operation(MCP_ROOT_NAME, &wrong_op, "test", None),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
+            "mismatched grant must be rejected, got: {:?}",
+            result.error
+        );
+    }
+
+    /// A grant bound to the exact `{server}:{tool}` op passes the gate; the call
+    /// then fails downstream (MCP disabled) — never with the gate denial.
+    #[tokio::test]
+    async fn call_allowed_with_matching_grant() {
+        let tool = McpTool::new(mcp_gate_security(), McpConfig::default(), std::env::temp_dir());
+        let op = op_id::op_id(MCP_ROOT_NAME, "call", &["srv", "act"]);
+        // Op naming follows design d03 canonical form.
+        assert_eq!(op, "mcp_call:call:srv:act");
+        let result = tool
+            .execute(json!({
+                "server": "srv",
+                "tool": "act",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    ApprovalGrant::for_resource_operation(MCP_ROOT_NAME, &op, "test", None),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success, "MCP disabled in test → downstream failure expected");
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            !err.contains("requires runtime approval grant") && !err.contains("high-risk operation is disallowed"),
+            "gate must have allowed the matching grant, got: {err:?}"
+        );
+    }
+
     // ── Security: read-only ─────────────────────────────────────
 
     #[tokio::test]
@@ -1189,8 +1320,24 @@ mod tests {
     async fn mcp_disabled_returns_error() {
         let mut cfg = McpConfig::default();
         cfg.enabled = false;
-        let tool = McpTool::new(Arc::new(SecurityPolicy::default()), cfg, std::env::temp_dir());
-        let result = tool.execute(json!({"server": "s", "tool": "t"})).await.unwrap();
+        // The SideEffectGate now precedes the downstream call. To reach the
+        // "disabled/not found" path we must pass the High-risk gate first, so the
+        // policy disables the high-risk block and we present a matching grant.
+        let security = Arc::new(SecurityPolicy {
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = McpTool::new(security, cfg, std::env::temp_dir());
+        let op = op_id::op_id(MCP_ROOT_NAME, "call", &["s", "t"]);
+        let result = tool
+            .execute(json!({
+                "server": "s",
+                "tool": "t",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    ApprovalGrant::for_resource_operation(MCP_ROOT_NAME, &op, "test", None),
+            }))
+            .await
+            .unwrap();
         assert!(!result.success);
         assert!(
             result

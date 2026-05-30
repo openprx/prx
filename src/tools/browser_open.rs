@@ -1,5 +1,7 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::security::SecurityPolicy;
+use crate::security::op_id;
+use crate::security::policy::{ApprovalGrant, ResourceRiskLevel, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -108,6 +110,25 @@ impl Tool for BrowserOpenTool {
                 });
             }
         };
+
+        // SideEffectGate: launching the system browser to an external URL is a
+        // High-risk egress side effect. Bind the grant to the target host so an
+        // approval for one site cannot open another (op naming per design d03).
+        let host = op_id::ref_for_url_host(&url);
+        let operation_name = op_id::op_id(self.name(), "open", &[&host]);
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
+            self.name(),
+            &operation_name,
+            ResourceRiskLevel::High,
+            approval_grant.as_ref(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
 
         match open_in_brave(&url).await {
             Ok(()) => Ok(ToolResult {
@@ -449,5 +470,80 @@ mod tests {
         let result = tool.execute(json!({"url": "https://example.com"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("rate limit"));
+    }
+
+    // ── SideEffectGate coverage (design d03 / P0-C) ──────────────────────────
+
+    /// Supervised policy with the high-risk hard-block disabled, so the grant
+    /// path is exercised (browser_open:open is High-risk).
+    fn supervised_tool() -> BrowserOpenTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        BrowserOpenTool::new(security, vec!["example.com".into()])
+    }
+
+    #[tokio::test]
+    async fn open_denied_without_grant() {
+        let tool = supervised_tool();
+        let result = tool.execute(json!({"url": "https://example.com"})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "expected gate denial, got: {:?}",
+            result.error
+        );
+    }
+
+    /// With the default high-risk hard-block, browser_open is denied outright
+    /// even with a grant.
+    #[tokio::test]
+    async fn open_blocked_by_high_risk_policy_even_with_grant() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
+        let host = op_id::ref_for_url_host("https://example.com");
+        let op = op_id::op_id("browser_open", "open", &[&host]);
+        let result = tool
+            .execute(json!({
+                "url": "https://example.com",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    ApprovalGrant::for_resource_operation("browser_open", &op, "test", None),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("high-risk operation is disallowed"),
+            "high-risk block must deny even with grant, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn open_allowed_with_matching_grant() {
+        let tool = supervised_tool();
+        let host = op_id::ref_for_url_host("https://example.com");
+        let op = op_id::op_id("browser_open", "open", &[&host]);
+        assert_eq!(op, "browser_open:open:example_com");
+        let result = tool
+            .execute(json!({
+                "url": "https://example.com",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    ApprovalGrant::for_resource_operation("browser_open", &op, "test", None),
+            }))
+            .await
+            .unwrap();
+        // Gate must allow; the actual launch fails in CI (no Brave) but never with
+        // the gate's approval-grant error.
+        assert!(
+            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            "gate must have allowed the matching grant, got: {:?}",
+            result.error
+        );
     }
 }
