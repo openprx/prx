@@ -1225,7 +1225,10 @@ impl Agent {
                     } else {
                         &effective_model
                     };
-                    if let Err(err) = router.record_outcome(user_message, served_model, success, latency).await {
+                    if let Err(err) = router
+                        .record_outcome(user_message, served_model, success, latency)
+                        .await
+                    {
                         tracing::warn!("Router record_outcome failed: {err}");
                     }
                     cost_event.total_cost_usd = router

@@ -2508,8 +2508,14 @@ fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Option<GrantO
             command.map(|command| GrantOp::Command(command.to_string()))
         }
         // ── Exact: loop reconstructs the tool's op-id verbatim from raw args ──
-        "config_reload" => Some(GrantOp::ResourceExact("config_reload:reload".to_string(), RiskLevel::Low)),
-        "memory_reindex" => Some(GrantOp::ResourceExact("memory_reindex:rebuild".to_string(), RiskLevel::Medium)),
+        "config_reload" => Some(GrantOp::ResourceExact(
+            "config_reload:reload".to_string(),
+            RiskLevel::Low,
+        )),
+        "memory_reindex" => Some(GrantOp::ResourceExact(
+            "memory_reindex:rebuild".to_string(),
+            RiskLevel::Medium,
+        )),
         "proxy_config" => {
             let action = string_arg("action").unwrap_or_default();
             let (operation, risk) = match action {
@@ -2558,12 +2564,19 @@ fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Option<GrantO
         }
         "sessions_send" => {
             let run_id = string_arg("run_id").unwrap_or_default();
-            Some(GrantOp::ResourceExact(format!("sessions_send:steer:{run_id}"), RiskLevel::Low))
+            Some(GrantOp::ResourceExact(
+                format!("sessions_send:steer:{run_id}"),
+                RiskLevel::Low,
+            ))
         }
         "subagents" => {
             let action = string_arg("action").unwrap_or("list");
             let run_id = string_arg("run_id").unwrap_or_default();
-            let risk = if action == "kill" { RiskLevel::Medium } else { RiskLevel::Low };
+            let risk = if action == "kill" {
+                RiskLevel::Medium
+            } else {
+                RiskLevel::Low
+            };
             Some(GrantOp::ResourceExact(format!("subagents:{action}:{run_id}"), risk))
         }
         "gateway" => {
@@ -2576,11 +2589,26 @@ fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Option<GrantO
         // uses the parsed URL host. The loop cannot reproduce these verbatim, so
         // we scope to `{tool}:{verb}:*` (still tool+verb bound, signed, single
         // use, principal bound).
-        "file_write" => Some(GrantOp::ResourceGlob("file_write:write:*".to_string(), RiskLevel::Medium)),
-        "http_request" => Some(GrantOp::ResourceGlob("http_request:request:*".to_string(), RiskLevel::Medium)),
-        "message_send" => Some(GrantOp::ResourceGlob("message_send:send:*".to_string(), RiskLevel::Medium)),
-        "memory_store" => Some(GrantOp::ResourceGlob("memory_store:write:*".to_string(), RiskLevel::Medium)),
-        "memory_forget" => Some(GrantOp::ResourceGlob("memory_forget:delete:*".to_string(), RiskLevel::High)),
+        "file_write" => Some(GrantOp::ResourceGlob(
+            "file_write:write:*".to_string(),
+            RiskLevel::Medium,
+        )),
+        "http_request" => Some(GrantOp::ResourceGlob(
+            "http_request:request:*".to_string(),
+            RiskLevel::Medium,
+        )),
+        "message_send" => Some(GrantOp::ResourceGlob(
+            "message_send:send:*".to_string(),
+            RiskLevel::Medium,
+        )),
+        "memory_store" => Some(GrantOp::ResourceGlob(
+            "memory_store:write:*".to_string(),
+            RiskLevel::Medium,
+        )),
+        "memory_forget" => Some(GrantOp::ResourceGlob(
+            "memory_forget:delete:*".to_string(),
+            RiskLevel::High,
+        )),
         // Unknown / unmodelled tools get no grant; the tightened gate denies
         // their supervised medium/high calls rather than wildcard-approving.
         _ => None,
@@ -2602,7 +2630,12 @@ fn runtime_approval_grant_for_call(
     let (operation, op_id_match, risk) = match grant_op_for_call(tool_name, args)? {
         GrantOp::Command(command) => {
             // Legacy v1 command-hash binding (cron/runner compatible).
-            return Some(ApprovalGrant::for_command(tool_name, &command, "approval_manager", None));
+            return Some(ApprovalGrant::for_command(
+                tool_name,
+                &command,
+                "approval_manager",
+                None,
+            ));
         }
         GrantOp::ResourceExact(operation, risk) => (operation, OpIdMatch::Exact, risk),
         GrantOp::ResourceGlob(pattern, risk) => (pattern, OpIdMatch::GlobPattern(String::new()), risk),

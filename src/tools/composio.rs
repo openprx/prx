@@ -1644,7 +1644,11 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "expected gate denial, got: {:?}",
             result.error
         );
@@ -1670,7 +1674,10 @@ mod tests {
         // possibly as an Err — never the approval-grant denial.
         match result {
             Ok(r) => assert!(
-                !r.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+                !r.error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("requires runtime approval grant"),
                 "gate must have allowed the matching grant, got: {:?}",
                 r.error
             ),
@@ -1699,7 +1706,11 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "mismatched grant must be rejected, got: {:?}",
             result.error
         );
@@ -1728,7 +1739,11 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("high-risk operation is disallowed"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("high-risk operation is disallowed"),
             "high-risk block must deny even with grant, got: {:?}",
             result.error
         );
@@ -1740,7 +1755,11 @@ mod tests {
         let tool = ComposioTool::new("test-key", None, gate_security());
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(
-            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            !result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "read-only discovery must not be gated, got: {:?}",
             result.error
         );

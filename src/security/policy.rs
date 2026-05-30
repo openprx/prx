@@ -232,11 +232,7 @@ impl ApprovalGrant {
         // Bind the M4 caller principal from the trusted scope payload. We only
         // trust `_zc_scope` when the runtime marked it trusted; user/model
         // supplied scopes are ignored.
-        if args
-            .get("_zc_scope_trusted")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        if args.get("_zc_scope_trusted").and_then(Value::as_bool).unwrap_or(false) {
             grant.caller_principal_id = args
                 .get("_zc_scope")
                 .and_then(Value::as_object)
@@ -355,9 +351,7 @@ impl ApprovalGrant {
     /// signed use budget and are not subject to the gate's replay ledger.
     #[must_use]
     fn v2_single_use_key(&self) -> Option<(&str, u32)> {
-        self.v2
-            .as_ref()
-            .map(|grant| (grant.grant_id.as_str(), grant.max_uses))
+        self.v2.as_ref().map(|grant| (grant.grant_id.as_str(), grant.max_uses))
     }
 
     /// Precise deny reason for a command decision when this grant did not
@@ -372,7 +366,13 @@ impl ApprovalGrant {
 
     /// Precise deny reason for a resource operation, mirroring [`Self::command_deny_reason`].
     #[must_use]
-    fn resource_deny_reason(&self, tool_name: &str, operation: &str, risk: ResourceRiskLevel, now: i64) -> Option<String> {
+    fn resource_deny_reason(
+        &self,
+        tool_name: &str,
+        operation: &str,
+        risk: ResourceRiskLevel,
+        now: i64,
+    ) -> Option<String> {
         if self.permits_resource_operation(tool_name, operation, risk, now) {
             return None;
         }
@@ -381,7 +381,13 @@ impl ApprovalGrant {
 
     /// Classify *why* this grant fails to authorize, mirroring the branch order
     /// of [`Self::permits_command`] / [`Self::permits_resource_operation`].
-    fn deny_reason_for(&self, tool_name: &str, op_id: &str, risk: crate::acl::approval_grant::RiskLevel, now: i64) -> String {
+    fn deny_reason_for(
+        &self,
+        tool_name: &str,
+        op_id: &str,
+        risk: crate::acl::approval_grant::RiskLevel,
+        now: i64,
+    ) -> String {
         if self.tool != tool_name {
             return format!("grant tool mismatch (grant={}, requested={tool_name})", self.tool);
         }
@@ -391,10 +397,7 @@ impl ApprovalGrant {
                 Err(reason) => reason,
             };
         }
-        if self
-            .expires_at_epoch_secs
-            .is_some_and(|expires_at| expires_at <= now)
-        {
+        if self.expires_at_epoch_secs.is_some_and(|expires_at| expires_at <= now) {
             return "grant expired".to_string();
         }
         if self.operation_hash.is_none() {
@@ -1869,7 +1872,12 @@ mod tests {
         );
         // But a different tool/verb op is NOT covered by the glob.
         let other = gate
-            .authorize_resource_operation("file_write", "file_write:delete:0123", ResourceRiskLevel::Medium, Some(&read))
+            .authorize_resource_operation(
+                "file_write",
+                "file_write:delete:0123",
+                ResourceRiskLevel::Medium,
+                Some(&read),
+            )
             .unwrap_err();
         assert!(other.contains("runtime approval grant"));
     }
@@ -1918,7 +1926,9 @@ mod tests {
 
     #[test]
     fn v2_grant_expired_and_revoked_rejected_through_gate() {
-        use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring, sign_grant};
+        use crate::acl::approval_grant::{
+            ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring, sign_grant,
+        };
 
         let _guard = global_keyring_guard();
         let keyring = WitnessKeyring::global().unwrap();
@@ -1940,9 +1950,14 @@ mod tests {
 
         // Expired: backdate the window and re-sign so the signature is valid but
         // the temporal check fails.
-        let mut expired =
-            ApprovalGrantV2::issue_one_shot(keyring, subject.clone(), IssuerAuthority::HumanReview, op, RiskLevel::Medium)
-                .unwrap();
+        let mut expired = ApprovalGrantV2::issue_one_shot(
+            keyring,
+            subject.clone(),
+            IssuerAuthority::HumanReview,
+            op,
+            RiskLevel::Medium,
+        )
+        .unwrap();
         expired.not_before = Utc::now() - chrono::Duration::seconds(120);
         expired.expires_at = Utc::now() - chrono::Duration::seconds(60);
         sign_grant(keyring, &mut expired).unwrap();
@@ -2033,7 +2048,11 @@ mod tests {
         let events = read_audit_events(tmp.path());
         let event = events.last().expect("an audit event was written");
         let actor = event.actor.as_ref().expect("actor present");
-        assert_eq!(actor.user_id.as_deref(), Some("telegram:alice"), "subject principal recorded");
+        assert_eq!(
+            actor.user_id.as_deref(),
+            Some("telegram:alice"),
+            "subject principal recorded"
+        );
         let action = event.action.as_ref().expect("action present");
         assert!(action.allowed, "decision is allow");
         let command = action.command.as_deref().expect("op recorded");
@@ -2044,7 +2063,9 @@ mod tests {
 
     #[test]
     fn gate_deny_writes_audit_event_with_precise_reason() {
-        use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring, sign_grant};
+        use crate::acl::approval_grant::{
+            ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring, sign_grant,
+        };
         let _guard = global_keyring_guard();
         let keyring = WitnessKeyring::global().expect("test: keyring");
         let op = "file_write:write:denyme";
@@ -2068,19 +2089,33 @@ mod tests {
         }
         // (3) cross-tenant principal mismatch
         {
-            let g = ApprovalGrantV2::issue_one_shot(keyring, subject.clone(), IssuerAuthority::HumanReview, op, RiskLevel::Medium)
-                .expect("test: issue");
+            let g = ApprovalGrantV2::issue_one_shot(
+                keyring,
+                subject.clone(),
+                IssuerAuthority::HumanReview,
+                op,
+                RiskLevel::Medium,
+            )
+            .expect("test: issue");
             let grant = ApprovalGrant::from_verified_v2("file_write", "test", g)
                 .with_caller_principal_id(Some("telegram:mallory".to_string()));
             let (tmp, policy) = audited_policy();
             let gate = SideEffectGate::new(&policy);
-            let _ = gate.authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant)).unwrap_err();
+            let _ = gate
+                .authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant))
+                .unwrap_err();
             assert!(last_deny_reason(tmp.path()).contains("principal mismatch"));
         }
         // (4) expired
         {
-            let mut g = ApprovalGrantV2::issue_one_shot(keyring, subject.clone(), IssuerAuthority::HumanReview, op, RiskLevel::Medium)
-                .expect("test: issue");
+            let mut g = ApprovalGrantV2::issue_one_shot(
+                keyring,
+                subject.clone(),
+                IssuerAuthority::HumanReview,
+                op,
+                RiskLevel::Medium,
+            )
+            .expect("test: issue");
             g.not_before = Utc::now() - chrono::Duration::seconds(120);
             g.expires_at = Utc::now() - chrono::Duration::seconds(60);
             sign_grant(keyring, &mut g).expect("test: sign");
@@ -2088,33 +2123,46 @@ mod tests {
                 .with_caller_principal_id(Some("telegram:alice".to_string()));
             let (tmp, policy) = audited_policy();
             let gate = SideEffectGate::new(&policy);
-            let _ = gate.authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant)).unwrap_err();
+            let _ = gate
+                .authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant))
+                .unwrap_err();
             assert!(last_deny_reason(tmp.path()).contains("validity window"));
         }
         // (5) revoked
         {
-            let mut g = ApprovalGrantV2::issue_one_shot(keyring, subject.clone(), IssuerAuthority::HumanReview, op, RiskLevel::Medium)
-                .expect("test: issue");
+            let mut g = ApprovalGrantV2::issue_one_shot(
+                keyring,
+                subject.clone(),
+                IssuerAuthority::HumanReview,
+                op,
+                RiskLevel::Medium,
+            )
+            .expect("test: issue");
             g.revoke("operator", Utc::now());
             sign_grant(keyring, &mut g).expect("test: sign");
             let grant = ApprovalGrant::from_verified_v2("file_write", "test", g)
                 .with_caller_principal_id(Some("telegram:alice".to_string()));
             let (tmp, policy) = audited_policy();
             let gate = SideEffectGate::new(&policy);
-            let _ = gate.authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant)).unwrap_err();
+            let _ = gate
+                .authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant))
+                .unwrap_err();
             assert!(last_deny_reason(tmp.path()).contains("revoked"));
         }
         // (6) single-use exhausted
         {
-            let mut g = ApprovalGrantV2::issue_one_shot(keyring, subject, IssuerAuthority::HumanReview, op, RiskLevel::Medium)
-                .expect("test: issue");
+            let mut g =
+                ApprovalGrantV2::issue_one_shot(keyring, subject, IssuerAuthority::HumanReview, op, RiskLevel::Medium)
+                    .expect("test: issue");
             g.uses_consumed = g.max_uses;
             sign_grant(keyring, &mut g).expect("test: sign");
             let grant = ApprovalGrant::from_verified_v2("file_write", "test", g)
                 .with_caller_principal_id(Some("telegram:alice".to_string()));
             let (tmp, policy) = audited_policy();
             let gate = SideEffectGate::new(&policy);
-            let _ = gate.authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant)).unwrap_err();
+            let _ = gate
+                .authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant))
+                .unwrap_err();
             assert!(last_deny_reason(tmp.path()).contains("no remaining uses"));
         }
     }

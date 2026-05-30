@@ -491,7 +491,11 @@ mod tests {
         let result = tool.execute(json!({"url": "https://example.com"})).await.unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "expected gate denial, got: {:?}",
             result.error
         );
@@ -518,7 +522,11 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("high-risk operation is disallowed"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("high-risk operation is disallowed"),
             "high-risk block must deny even with grant, got: {:?}",
             result.error
         );
@@ -541,7 +549,11 @@ mod tests {
         // Gate must allow; the actual launch fails in CI (no Brave) but never with
         // the gate's approval-grant error.
         assert!(
-            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            !result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "gate must have allowed the matching grant, got: {:?}",
             result.error
         );

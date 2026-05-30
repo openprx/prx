@@ -358,7 +358,11 @@ mod tests {
         let result = tool.execute(json!({"filename": "shot.png"})).await.unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "expected gate denial, got: {:?}",
             result.error
         );
@@ -382,7 +386,11 @@ mod tests {
         // Gate must allow; capture may fail (no screenshot tool in CI) but never
         // with the approval-grant error.
         assert!(
-            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            !result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "gate must have allowed the matching grant, got: {:?}",
             result.error
         );

@@ -2423,7 +2423,11 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "expected gate denial, got: {:?}",
             result.error
         );
@@ -2451,7 +2455,11 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("high-risk operation is disallowed"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("high-risk operation is disallowed"),
             "high-risk block must deny even with grant, got: {:?}",
             result.error
         );
@@ -2475,7 +2483,11 @@ mod tests {
         // Gate must allow; the backend may be unavailable in CI but the result is
         // never the approval-grant denial.
         assert!(
-            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            !result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "gate must have allowed the matching grant, got: {:?}",
             result.error
         );
@@ -2487,7 +2499,11 @@ mod tests {
         let tool = supervised_browser();
         let result = tool.execute(json!({"action": "snapshot"})).await.unwrap();
         assert!(
-            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            !result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "read-only snapshot must not be gated, got: {:?}",
             result.error
         );

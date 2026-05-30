@@ -448,7 +448,11 @@ mod tests {
         let result = tool.execute(json!({"text": "hello"})).await.unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "expected gate denial, got: {:?}",
             result.error
         );
@@ -472,7 +476,11 @@ mod tests {
         // Gate must allow; synthesis fails in CI (no edge-tts) but never with the
         // approval-grant error.
         assert!(
-            !result.error.as_deref().unwrap_or("").contains("requires runtime approval grant"),
+            !result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires runtime approval grant"),
             "gate must have allowed the matching grant, got: {:?}",
             result.error
         );

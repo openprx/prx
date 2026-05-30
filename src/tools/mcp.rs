@@ -1240,7 +1240,11 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("high-risk operation is disallowed"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("high-risk operation is disallowed"),
             "high-risk block must deny even with grant, got: {:?}",
             result.error
         );
