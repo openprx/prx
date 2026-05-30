@@ -30,6 +30,20 @@ pub struct ControlLadderTrace {
     pub run_id: Option<String>,
     pub created_at: String,
     pub layers: Vec<ControlLayerTrace>,
+    /// RouteDecision correlation id (d04 §10 G7). Joins this trace to the
+    /// `router.route_decision` / `provider.final_outcome` timeline events.
+    /// `None` for traces emitted before/without a routing decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
+    /// Provider that actually served the request after fallback resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_provider: Option<String>,
+    /// Model that actually served the request after fallback resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_model: Option<String>,
+    /// Number of provider attempts (1 = first-choice hit, >1 = fallback used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts_count: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +95,10 @@ impl ControlLadderSnapshot {
             run_id,
             created_at: Utc::now().to_rfc3339(),
             layers: self.layers.clone(),
+            decision_id: None,
+            final_provider: None,
+            final_model: None,
+            attempts_count: None,
         }
     }
 }
@@ -92,6 +110,26 @@ impl Default for ControlLadderSnapshot {
 }
 
 impl ControlLadderTrace {
+    /// Attach the RouteDecision / provider-execution correlation fields to this
+    /// trace (d04 §10 G7). Populating these lets a `decision_id` join link the
+    /// control-ladder trace to the `router.route_decision` /
+    /// `provider.final_outcome` timeline events, and records which provider/model
+    /// actually served the request after fallback resolution.
+    #[must_use]
+    pub fn with_provider_outcome(
+        mut self,
+        decision_id: impl Into<String>,
+        final_provider: impl Into<String>,
+        final_model: impl Into<String>,
+        attempts_count: u8,
+    ) -> Self {
+        self.decision_id = Some(decision_id.into());
+        self.final_provider = Some(final_provider.into());
+        self.final_model = Some(final_model.into());
+        self.attempts_count = Some(attempts_count);
+        self
+    }
+
     pub fn mark_active(&mut self, name: &str, reason: impl Into<String>, detail: Value) {
         self.update_layer(name, true, "active", Some(reason.into()), detail);
     }
@@ -129,6 +167,58 @@ pub fn append_control_ladder_trace(workspace_dir: &Path, trace: &ControlLadderTr
     let line = serde_json::to_string(trace)?;
     writeln!(file, "{line}").with_context(|| format!("failed to append control ladder trace {}", path.display()))?;
     Ok(path)
+}
+
+/// Pure constructor for a provider-outcome control-ladder trace (d04 §10 G7).
+/// Separated from IO so the field population is unit-testable without the FS.
+/// The returned trace carries the structured `decision_id` / `final_provider` /
+/// `final_model` / `attempts_count` correlation fields filled in.
+#[must_use]
+pub fn build_provider_outcome_trace(
+    decision_id: &str,
+    final_provider: &str,
+    final_model: &str,
+    attempts_count: u8,
+    status: &str,
+) -> ControlLadderTrace {
+    ControlLadderTrace {
+        trace_id: Uuid::new_v4().to_string(),
+        source: "provider".to_string(),
+        run_id: None,
+        created_at: Utc::now().to_rfc3339(),
+        layers: vec![ControlLayerTrace {
+            level: 1,
+            name: "provider".to_string(),
+            enabled: true,
+            status: status.to_string(),
+            reason: Some("provider_final_outcome".to_string()),
+            detail: json!({ "attempts_count": attempts_count }),
+        }],
+        decision_id: None,
+        final_provider: None,
+        final_model: None,
+        attempts_count: None,
+    }
+    .with_provider_outcome(decision_id, final_provider, final_model, attempts_count)
+}
+
+/// Append a control-ladder trace describing the final provider execution outcome
+/// for a routing decision (d04 §10.2). A `decision_id` join links this trace to
+/// the `router.route_decision` / `provider.final_outcome` timeline events.
+/// Best-effort: serialization/IO failures are logged, never panicked (the chat
+/// path must not fail on telemetry).
+pub fn append_provider_outcome_trace(
+    workspace_dir: &Path,
+    decision_id: &str,
+    final_provider: &str,
+    final_model: &str,
+    attempts_count: u8,
+    status: &str,
+) {
+    let trace = build_provider_outcome_trace(decision_id, final_provider, final_model, attempts_count, status);
+    if let Err(e) = append_control_ladder_trace(workspace_dir, &trace) {
+        tracing::warn!(error = %e, "failed to append provider outcome control ladder trace");
+    }
 }
 
 fn router_layer(config: &Config) -> ControlLayerTrace {
@@ -329,5 +419,35 @@ mod tests {
         let parsed: ControlLadderTrace = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(parsed.source, "test");
         assert_eq!(parsed.run_id.as_deref(), Some("run-1"));
+    }
+
+    // d04 §10 G7: the provider-outcome trace must actually CARRY the structured
+    // decision_id / final_provider / final_model / attempts_count fields (not
+    // merely define them), and they must survive JSON serialization so a
+    // `decision_id` join links the routing decision to the served provider.
+    #[test]
+    fn provider_outcome_trace_populates_correlation_fields() {
+        let trace = build_provider_outcome_trace("dec-12345", "anthropic", "claude-sonnet-4", 3, "fallback_success");
+        assert_eq!(trace.decision_id.as_deref(), Some("dec-12345"));
+        assert_eq!(trace.final_provider.as_deref(), Some("anthropic"));
+        assert_eq!(trace.final_model.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(trace.attempts_count, Some(3));
+
+        let json = serde_json::to_string(&trace).expect("test: trace serializes");
+        assert!(json.contains("\"decision_id\":\"dec-12345\""));
+        assert!(json.contains("\"final_provider\":\"anthropic\""));
+        assert!(json.contains("\"final_model\":\"claude-sonnet-4\""));
+        assert!(json.contains("\"attempts_count\":3"));
+        let parsed: ControlLadderTrace = serde_json::from_str(&json).expect("test: trace round-trips");
+        assert_eq!(parsed.decision_id.as_deref(), Some("dec-12345"));
+        assert_eq!(parsed.final_model.as_deref(), Some("claude-sonnet-4"));
+
+        // with_provider_outcome must also work as a standalone builder on an
+        // existing trace.
+        let enriched = ControlLadderSnapshot::l0_only()
+            .build_trace("provider", None)
+            .with_provider_outcome("dec-x", "openai", "gpt-4o", 1);
+        assert_eq!(enriched.decision_id.as_deref(), Some("dec-x"));
+        assert_eq!(enriched.attempts_count, Some(1));
     }
 }

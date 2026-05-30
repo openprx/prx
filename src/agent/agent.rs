@@ -1214,10 +1214,18 @@ impl Agent {
                 if let Some(router) = &self.router {
                     let success = !final_text.is_empty();
                     let latency = turn_start.elapsed().as_millis() as u64;
-                    if let Err(err) = router
-                        .record_outcome(user_message, &effective_model, success, latency)
-                        .await
-                    {
+                    // d04 §7 / G3: the learning signal MUST be keyed on the model
+                    // that actually served the request, not the originally
+                    // intended model. When Automix escalates, the premium model
+                    // (`cost_event.escalation_model`) produced the final answer,
+                    // so the outcome must be attributed to it; otherwise the
+                    // un-escalated `effective_model` is the served model.
+                    let served_model: &str = if cost_event.escalated {
+                        cost_event.escalation_model.as_deref().unwrap_or(&effective_model)
+                    } else {
+                        &effective_model
+                    };
+                    if let Err(err) = router.record_outcome(user_message, served_model, success, latency).await {
                         tracing::warn!("Router record_outcome failed: {err}");
                     }
                     cost_event.total_cost_usd = router

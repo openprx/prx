@@ -2339,6 +2339,26 @@ pub async fn run(
         if let Err(e) = record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await {
             tracing::warn!(error = %e, "Failed to append provider.final_outcome message event");
         }
+        // d04 §10 G7: emit a control-ladder trace carrying the structured
+        // decision_id / final_provider / final_model / attempts_count so a
+        // `decision_id` join links the routing decision to the provider that
+        // actually served the request. Best-effort (failures logged, not fatal).
+        {
+            let status_label = match &provider_outcome.status {
+                crate::llm::route_decision::ExecutionStatus::Success => "success",
+                crate::llm::route_decision::ExecutionStatus::FallbackSuccess => "fallback_success",
+                crate::llm::route_decision::ExecutionStatus::AllFailed { .. } => "all_failed",
+            };
+            let attempts_count = u8::try_from(provider_outcome.attempts.len()).unwrap_or(u8::MAX);
+            crate::runtime::control_ladder::append_provider_outcome_trace(
+                std::path::Path::new(&config.workspace_dir),
+                &provider_outcome.decision_id,
+                &provider_outcome.final_provider,
+                &provider_outcome.final_model,
+                attempts_count,
+                status_label,
+            );
+        }
 
         // ── P2-12: Mirror reasoning content into the TUI as a folded card. ──
         //

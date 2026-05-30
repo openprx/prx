@@ -1899,8 +1899,20 @@ fn openai_codex_auth_profile_available() -> bool {
 
 pub fn provider_matches_model_prefix(provider_name: &str, model: &str) -> bool {
     let model = model.trim();
-    if model.is_empty() || model.starts_with("hint:") {
+    if model.is_empty() {
+        // An empty model means "use the provider's configured default", which is
+        // always compatible with that provider.
         return true;
+    }
+    if model.starts_with("hint:") {
+        // d04 §9.2 hint-injection hardening: a raw "hint:<name>" prefix is an
+        // UNRESOLVED routing hint. It MUST be resolved upstream by the
+        // RouterProvider into a concrete "<provider>:<model>" / "<provider>/<model>"
+        // form before reaching provider matching. The previous wildcard
+        // early-return (`return true`) let a crafted, unresolved hint match ANY
+        // provider, bypassing the prefix check and allowing a model to be routed
+        // to the wrong API. An unresolved hint reaching here is a non-match.
+        return false;
     }
 
     let Some((prefix, _rest)) = model.split_once('/') else {
@@ -3271,6 +3283,39 @@ mod tests {
     fn provider_model_prefix_matching_rejects_cross_provider_mismatch() {
         assert!(provider_matches_model_prefix("openai", "openai/gpt-4o"));
         assert!(!provider_matches_model_prefix("anthropic", "openai/gpt-4o"));
+    }
+
+    // d04 §9.2 hint-injection hardening regression: a raw "hint:<name>" prefix is
+    // an UNRESOLVED routing hint and MUST NOT bypass the provider prefix check.
+    // The previous wildcard early-return (`if model.starts_with("hint:") { return
+    // true; }`) let a crafted unresolved hint match ANY provider, allowing a model
+    // to be routed to the wrong API. After hardening it must be a non-match.
+    #[test]
+    fn test_unresolved_hint_does_not_bypass_provider_match() {
+        assert!(
+            !provider_matches_model_prefix("openai", "hint:anything"),
+            "unresolved hint must not match an unrelated provider"
+        );
+        assert!(
+            !provider_matches_model_prefix("anthropic", "hint:fast"),
+            "unresolved hint must not bypass the provider prefix check"
+        );
+        // A hint crafted to look like a provider name must still not match: the
+        // literal "hint:" prefix means it is unresolved.
+        assert!(
+            !provider_matches_model_prefix("openai", "hint:openai"),
+            "a 'hint:'-prefixed model is unresolved and must not match by coincidence"
+        );
+        // Even an aggregator (accepts_any_model) must reject an unresolved hint.
+        assert!(
+            !provider_matches_model_prefix("openrouter", "hint:whatever"),
+            "aggregators must not accept an unresolved hint either"
+        );
+        // Regression: legitimate resolved provider-prefixed models still match.
+        assert!(provider_matches_model_prefix("openai", "openai/gpt-4o"));
+        assert!(provider_matches_model_prefix("anthropic", "anthropic/claude-3-opus"));
+        // Empty model still means "provider default" and matches.
+        assert!(provider_matches_model_prefix("openai", ""));
     }
 
     #[test]
