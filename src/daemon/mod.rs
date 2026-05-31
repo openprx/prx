@@ -205,7 +205,20 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                         cfg.webhook.token.as_deref().ok_or_else(|| {
                             anyhow::anyhow!("webhook.token must be configured when webhook.enabled=true")
                         })?;
-                    crate::webhook::run(&cfg.webhook.bind, token, &cfg.workspace_dir, cfg.memory.acl_enabled).await
+                    // FIX-P1-03: pass the security policy so the standalone webhook
+                    // server gates topic-store persistence on autonomy (ReadOnly = no write).
+                    let webhook_security = std::sync::Arc::new(crate::security::SecurityPolicy::from_config(
+                        &cfg.autonomy,
+                        &cfg.workspace_dir,
+                    ));
+                    crate::webhook::run(
+                        &cfg.webhook.bind,
+                        token,
+                        &cfg.workspace_dir,
+                        cfg.memory.acl_enabled,
+                        webhook_security,
+                    )
+                    .await
                 }
             },
         ));

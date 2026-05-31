@@ -1074,7 +1074,21 @@ mod tests {
         )
         .await;
 
-        let drafts = worker_memory.list_memory_drafts_for_run("run-hybrid").await.unwrap();
+        let drafts = worker_memory
+            .list_memory_drafts_for_run(
+                &crate::memory::traits::MemoryPrincipal {
+                    workspace_id: "workspace".to_string(),
+                    agent_id: Some("system".to_string()),
+                    persona_id: None,
+                    session_key: None,
+                    channel: None,
+                    sender: None,
+                    owner_id: None,
+                },
+                "run-hybrid",
+            )
+            .await
+            .unwrap();
         assert_eq!(drafts.len(), 1);
         let draft = drafts.first();
         assert_eq!(draft.map(|draft| draft.status.as_str()), Some("pending"));
@@ -1188,7 +1202,21 @@ mod tests {
         )
         .await;
 
-        let drafts = worker_memory.list_memory_drafts_for_run("run-hybrid").await.unwrap();
+        let drafts = worker_memory
+            .list_memory_drafts_for_run(
+                &crate::memory::traits::MemoryPrincipal {
+                    workspace_id: "workspace".to_string(),
+                    agent_id: Some("system".to_string()),
+                    persona_id: None,
+                    session_key: None,
+                    channel: None,
+                    sender: None,
+                    owner_id: None,
+                },
+                "run-hybrid",
+            )
+            .await
+            .unwrap();
         assert!(drafts.is_empty());
     }
 

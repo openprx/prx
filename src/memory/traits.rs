@@ -820,24 +820,45 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::fabric::fail_fast(self.name(), "create_memory_draft"))
     }
 
-    /// List memory drafts produced by a worker run.
-    async fn list_memory_drafts_for_run(&self, worker_run_id: &str) -> anyhow::Result<Vec<MemoryDraft>> {
-        let _ = worker_run_id;
+    /// List memory drafts produced by a worker run, scoped to `principal`.
+    ///
+    /// Only drafts owned by the principal (or with no owner) are returned, so a
+    /// caller that merely knows a `worker_run_id` cannot read another owner's
+    /// drafts.
+    async fn list_memory_drafts_for_run(
+        &self,
+        principal: &MemoryPrincipal,
+        worker_run_id: &str,
+    ) -> anyhow::Result<Vec<MemoryDraft>> {
+        let _ = (principal, worker_run_id);
         Err(crate::memory::fabric::fail_fast(
             self.name(),
             "list_memory_drafts_for_run",
         ))
     }
 
-    /// Mark a draft as merged into semantic memory.
-    async fn merge_memory_draft(&self, draft_id: &str) -> anyhow::Result<Option<MemoryDraft>> {
-        let _ = draft_id;
+    /// Mark a draft as merged into semantic memory, enforcing owner ACL.
+    ///
+    /// Returns `Err` if the draft is owned by a different principal.
+    async fn merge_memory_draft(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+    ) -> anyhow::Result<Option<MemoryDraft>> {
+        let _ = (principal, draft_id);
         Err(crate::memory::fabric::fail_fast(self.name(), "merge_memory_draft"))
     }
 
-    /// Reject a draft without merging it into semantic memory.
-    async fn reject_memory_draft(&self, draft_id: &str, reason: Option<&str>) -> anyhow::Result<Option<MemoryDraft>> {
-        let _ = (draft_id, reason);
+    /// Reject a draft without merging it into semantic memory, enforcing owner ACL.
+    ///
+    /// Returns `Err` if the draft is owned by a different principal.
+    async fn reject_memory_draft(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+        reason: Option<&str>,
+    ) -> anyhow::Result<Option<MemoryDraft>> {
+        let _ = (principal, draft_id, reason);
         Err(crate::memory::fabric::fail_fast(self.name(), "reject_memory_draft"))
     }
 

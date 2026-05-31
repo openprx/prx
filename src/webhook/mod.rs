@@ -1,6 +1,8 @@
 use crate::memory::principal::MemoryWriteContext;
 use crate::memory::traits::MemoryCategory;
 use crate::memory::{Memory, SqliteMemory};
+use crate::security::policy::ResourceRiskLevel;
+use crate::security::{SecurityPolicy, SideEffectGate};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
@@ -45,6 +47,12 @@ struct WebhookState {
     acl_enabled: bool,
     rate_limiter: Arc<WebhookRateLimiter>,
     idempotency_store: Arc<IdempotencyStore>,
+    /// Security policy governing whether verified inbound events may be
+    /// persisted into the topic store (FIX-P1-03). Under autonomy=ReadOnly the
+    /// standalone webhook server must not write, so the persist step is gated
+    /// through [`SideEffectGate`]. Held by value (it is `Clone`) so the gate can
+    /// borrow it without extra allocation.
+    security: Arc<SecurityPolicy>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,8 +132,14 @@ impl IdempotencyStore {
     }
 }
 
-pub async fn run(bind: &str, token: &str, workspace_dir: &Path, acl_enabled: bool) -> Result<()> {
-    run_with_signing_secret(bind, token, None, workspace_dir, acl_enabled).await
+pub async fn run(
+    bind: &str,
+    token: &str,
+    workspace_dir: &Path,
+    acl_enabled: bool,
+    security: Arc<SecurityPolicy>,
+) -> Result<()> {
+    run_with_signing_secret(bind, token, None, workspace_dir, acl_enabled, security).await
 }
 
 /// Run the standalone webhook server with optional HMAC signing secret.
@@ -138,6 +152,7 @@ pub async fn run_with_signing_secret(
     signing_secret: Option<&str>,
     workspace_dir: &Path,
     acl_enabled: bool,
+    security: Arc<SecurityPolicy>,
 ) -> Result<()> {
     let trimmed_token = token.trim();
     if trimmed_token.is_empty() {
@@ -170,6 +185,7 @@ pub async fn run_with_signing_secret(
             Duration::from_secs(WEBHOOK_IDEMPOTENCY_TTL_SECS),
             WEBHOOK_IDEMPOTENCY_MAX_KEYS,
         )),
+        security,
     };
 
     run_with_listener(listener, state).await
@@ -267,6 +283,27 @@ async fn handle_webhook_event(
                 "idempotent": true,
                 "message": "Request already processed"
             })),
+        )
+            .into_response();
+    }
+
+    // ── Persist side-effect gate (FIX-P1-03) ────────────────────────────────
+    // Writing a verified event into the topic store is a state mutation, so it
+    // must respect autonomy: under ReadOnly the standalone webhook server must
+    // not persist. Low/read-style judgement — denies only when ReadOnly (or the
+    // action budget is exhausted). Signature/idempotency checks have already
+    // passed at this point; a deny returns 403 and skips the write.
+    let persist_op = format!("webhook:{}:persist", event.source);
+    if let Err(reason) = SideEffectGate::new(state.security.as_ref()).authorize_resource_operation(
+        "webhook",
+        &persist_op,
+        ResourceRiskLevel::Low,
+        None,
+    ) {
+        tracing::warn!(source = %event.source, "webhook persist blocked by SideEffectGate: {reason}");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Persist denied by security policy" })),
         )
             .into_response();
     }
@@ -700,6 +737,7 @@ mod tests {
                 Duration::from_secs(WEBHOOK_IDEMPOTENCY_TTL_SECS),
                 WEBHOOK_IDEMPOTENCY_MAX_KEYS,
             )),
+            security: Arc::new(SecurityPolicy::default()),
         }
     }
 
@@ -724,6 +762,7 @@ mod tests {
                 Duration::from_secs(WEBHOOK_IDEMPOTENCY_TTL_SECS),
                 idempotency_max_keys,
             )),
+            security: Arc::new(SecurityPolicy::default()),
         }
     }
 

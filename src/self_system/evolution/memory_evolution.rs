@@ -38,7 +38,7 @@ pub struct MemoryEvolutionEngine {
     workspace_root: PathBuf,
     config_path: PathBuf,
     writer: Option<Arc<AsyncJsonlWriter>>,
-    judge: JudgeEngine<MockJudgeModel>,
+    judge: JudgeEngine,
     rollback: RollbackManager,
 }
 
@@ -61,7 +61,7 @@ impl MemoryEvolutionEngine {
             workspace_root: workspace_root.to_path_buf(),
             config_path: config_path.clone(),
             writer,
-            judge: JudgeEngine::new(JudgeConfig::default(), MockJudgeModel),
+            judge: JudgeEngine::new(JudgeConfig::default(), std::sync::Arc::new(MockJudgeModel)),
             rollback: RollbackManager::new(workspace_root, &config_path, rollback_dir, max_versions)?,
         })
     }

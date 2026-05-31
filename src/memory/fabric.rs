@@ -394,16 +394,21 @@ impl MemoryFabric {
             .await
     }
 
-    pub async fn merge_memory_draft(&self, draft_id: &str) -> anyhow::Result<Option<MemoryDraft>> {
-        self.memory.merge_memory_draft(draft_id).await
+    pub async fn merge_memory_draft(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+    ) -> anyhow::Result<Option<MemoryDraft>> {
+        self.memory.merge_memory_draft(principal, draft_id).await
     }
 
     pub async fn reject_memory_draft(
         &self,
+        principal: &MemoryPrincipal,
         draft_id: &str,
         reason: Option<&str>,
     ) -> anyhow::Result<Option<MemoryDraft>> {
-        self.memory.reject_memory_draft(draft_id, reason).await
+        self.memory.reject_memory_draft(principal, draft_id, reason).await
     }
 
     pub async fn poll_memory_events(

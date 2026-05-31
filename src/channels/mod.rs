@@ -81,6 +81,8 @@ use crate::providers::{self, ChatMessage, ChatRequest, Provider};
 use crate::runtime;
 use crate::runtime::envelope::{RuntimeEnvelope, RuntimeSource};
 use crate::security::SecurityPolicy;
+use crate::security::SideEffectGate;
+use crate::security::policy::ResourceRiskLevel;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -2160,6 +2162,30 @@ async fn process_channel_message(
 
     let started_at = Instant::now();
 
+    // ── Inbound side-effect gate (FIX-P0-10/11/12) ──────────────────────────
+    // Every channel (telegram/discord/slack/signal/whatsapp/lark/qq/mattermost/
+    // irc/dingtalk/matrix/imessage/wacli/…) funnels through this single function,
+    // so gating here covers all transports at once. Appending the inbound turn
+    // persists conversation history (append_conversation_turn) — a real side
+    // effect that must respect autonomy. We use a Low/read-style judgement: under
+    // ReadOnly (or when the action budget is exhausted) the gate denies and we
+    // abort before the first history mutation; Supervised/Full keep normal
+    // traffic flowing untouched (Low risk + grant=None is allowed there).
+    let inbound_op = format!("channel:{}:inbound:{}", msg.channel, msg.sender);
+    if let Err(reason) = SideEffectGate::new(ctx.security.as_ref()).authorize_resource_operation(
+        "channel",
+        &inbound_op,
+        ResourceRiskLevel::Low,
+        None,
+    ) {
+        tracing::warn!(
+            channel = %msg.channel,
+            sender = %msg.sender,
+            "channel inbound blocked by SideEffectGate: {reason}"
+        );
+        return;
+    }
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
     let inbound_timestamp = to_rfc3339_timestamp(msg.timestamp);
     let inbound_event = append_sender_turn(
@@ -2175,8 +2201,32 @@ async fn process_channel_message(
     )
     .await;
 
+    // ── Autosave side-effect gate (FIX-P0-10/11/12) ─────────────────────────
+    // Persisting a memory entry is a distinct autonomous side effect, so it gets
+    // its own op-id. Low/read-style: denies only under ReadOnly (or exhausted
+    // budget); a deny skips the autosave and logs, never aborting the turn.
+    let autosave_allowed = SideEffectGate::new(ctx.security.as_ref())
+        .authorize_resource_operation(
+            "channel",
+            &format!("channel:{}:autosave", msg.channel),
+            ResourceRiskLevel::Low,
+            None,
+        )
+        .map_err(|reason| {
+            tracing::warn!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                "channel autosave blocked by SideEffectGate: {reason}"
+            );
+        })
+        .is_ok();
+
     // Only auto-save DM messages; group messages are noise unless explicitly stored by the agent.
-    if ctx.auto_save_memory && inferred_chat_type == "dm" && memory::should_autosave_content(&msg.content) {
+    if autosave_allowed
+        && ctx.auto_save_memory
+        && inferred_chat_type == "dm"
+        && memory::should_autosave_content(&msg.content)
+    {
         let autosave_key = conversation_memory_key(&msg);
         let write_ctx = MemoryWriteContext {
             channel: Some(msg.channel.clone()),
@@ -2345,6 +2395,27 @@ async fn process_channel_message(
         next_history.extend(prior_turns);
         next_history
     };
+
+    // ── Outbound side-effect gate (FIX-P0-10/11/12) ─────────────────────────
+    // Driving the LLM tool-call loop and sending the reply is the outbound side
+    // effect; it gets its own op-id so autonomy can suppress replies
+    // independently of inbound persistence. Low/read-style: denies only under
+    // ReadOnly (or exhausted budget). A deny skips the LLM call and all reply
+    // sends entirely and logs; Supervised/Full proceed normally.
+    let outbound_op = format!("channel:{}:outbound", msg.channel);
+    if let Err(reason) = SideEffectGate::new(ctx.security.as_ref()).authorize_resource_operation(
+        "channel",
+        &outbound_op,
+        ResourceRiskLevel::Low,
+        None,
+    ) {
+        tracing::warn!(
+            channel = %msg.channel,
+            sender = %msg.sender,
+            "channel outbound blocked by SideEffectGate: {reason}"
+        );
+        return;
+    }
 
     let mut history = rebuild_history();
     let use_streaming = target_channel.as_ref().is_some_and(|ch| ch.supports_draft_updates());
@@ -6229,6 +6300,194 @@ BTC is currently around $65,000 based on latest tool output."#
         async fn health_check(&self) -> bool {
             true
         }
+    }
+
+    /// Memory mock that counts `append_conversation_turn` invocations so tests
+    /// can assert whether the inbound SideEffectGate let the persistence run
+    /// (FIX-P0-10/11/12). All other ops are no-ops.
+    #[derive(Default)]
+    struct CountingMemory {
+        append_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for CountingMemory {
+        fn name(&self) -> &str {
+            "counting"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: crate::memory::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&crate::memory::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn append_conversation_turn(
+            &self,
+            _session_key: &str,
+            _channel: &str,
+            _sender: &str,
+            _role: &str,
+            _content: &str,
+            _timestamp: Option<&str>,
+            _message_id: Option<&str>,
+            _owner_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.append_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Build a minimal `ChannelRuntimeContext` wired to the given autonomy
+    /// level, the provided counting memory, and a `RecordingChannel`, for the
+    /// inbound-gate tests below.
+    fn gate_test_ctx(
+        autonomy: crate::security::AutonomyLevel,
+        memory: Arc<CountingMemory>,
+        channel: Arc<dyn Channel>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+        Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory,
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
+            max_tool_iterations: 5,
+            read_only_tool_concurrency_window: 2,
+            read_only_tool_timeout_secs: 30,
+            priority_scheduling_enabled: false,
+            low_priority_tools: Vec::new(),
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["prx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy {
+                autonomy,
+                ..crate::security::SecurityPolicy::default()
+            }),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
+            skill_rag_ctx: None,
+        })
+    }
+
+    fn gate_test_message() -> traits::ChannelMessage {
+        traits::ChannelMessage {
+            id: "gate-msg-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-gate".to_string(),
+            content: "hello gate".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            mentioned_uuids: vec![],
+        }
+    }
+
+    /// FIX-P0-10/11/12: under autonomy=ReadOnly the inbound SideEffectGate must
+    /// abort `process_channel_message` before the first conversation-turn
+    /// persistence — so `append_conversation_turn` is never called and no reply
+    /// is sent. This is the "mock-gate-rejects-all" check.
+    #[tokio::test]
+    async fn process_channel_message_inbound_gate_blocks_under_readonly() {
+        let memory = Arc::new(CountingMemory::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = gate_test_ctx(crate::security::AutonomyLevel::ReadOnly, Arc::clone(&memory), channel);
+
+        process_channel_message(ctx, gate_test_message(), CancellationToken::new()).await;
+
+        assert_eq!(
+            memory.append_calls.load(Ordering::SeqCst),
+            0,
+            "ReadOnly autonomy must block the inbound conversation-turn persistence"
+        );
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "ReadOnly autonomy must not send any reply"
+        );
+    }
+
+    /// FIX-P0-10/11/12: under the default Supervised autonomy the inbound gate
+    /// must let normal traffic through — `append_conversation_turn` runs for the
+    /// inbound user turn (and at least one reply is appended), proving the gate
+    /// does not falsely reject low-risk inbound messages.
+    #[tokio::test]
+    async fn process_channel_message_inbound_gate_allows_under_supervised() {
+        let memory = Arc::new(CountingMemory::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = gate_test_ctx(crate::security::AutonomyLevel::Supervised, Arc::clone(&memory), channel);
+
+        process_channel_message(ctx, gate_test_message(), CancellationToken::new()).await;
+
+        assert!(
+            memory.append_calls.load(Ordering::SeqCst) >= 1,
+            "Supervised autonomy must allow the inbound conversation-turn persistence (normal flow not broken)"
+        );
     }
 
     struct RecallMemory;

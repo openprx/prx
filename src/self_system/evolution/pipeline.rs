@@ -4,13 +4,13 @@ use crate::self_system::evolution::analyzer::{
 use crate::self_system::evolution::config::SharedEvolutionConfig;
 use crate::self_system::evolution::engine::EvolutionEngine;
 use crate::self_system::evolution::gate::{EvolutionGate, GateMetrics, GateRejection, GateResult};
-use crate::self_system::evolution::judge::{JudgeConfig, JudgeEngine, JudgeResult, MockJudgeModel};
+use crate::self_system::evolution::judge::{JudgeConfig, JudgeEngine, JudgeResult, JudgeScoringModel, MockJudgeModel};
 use crate::self_system::evolution::record::{
     ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult, Outcome,
 };
 use crate::self_system::evolution::rollback::RollbackManager;
 use crate::self_system::evolution::run_engine_cycle;
-use crate::self_system::evolution::safety_utils::{acquire_file_lock, atomic_write, validate_path_in_workspace};
+use crate::self_system::evolution::safety_utils::{acquire_file_lock, validate_path_in_workspace};
 use crate::self_system::evolution::storage::AsyncJsonlWriter;
 use crate::self_system::evolution::trace::generate_experiment_id;
 use anyhow::Result;
@@ -22,7 +22,10 @@ use std::sync::Arc;
 use tokio::fs;
 
 const BACKFILL_DAYS: i64 = 3;
-const JUDGE_PASS_THRESHOLD: f64 = 0.6;
+/// Derived, append-only file holding inferred outcomes for stale evolution logs.
+/// Backfill writes here instead of mutating the source evolution JSONL in place,
+/// preserving the append-only invariant of the primary audit log.
+const RESULT_HISTORY_FILE: &str = "result_history.jsonl";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -53,29 +56,50 @@ pub struct EvolutionPipeline {
     analyzer: Arc<EvolutionAnalyzer>,
     writer: Arc<AsyncJsonlWriter>,
     gate: EvolutionGate,
-    judge: JudgeEngine<MockJudgeModel>,
+    judge: JudgeEngine,
     shared_config: SharedEvolutionConfig,
     workspace_root: PathBuf,
-    _judge_pass_threshold: f64,
 }
 
 impl EvolutionPipeline {
-    /// Build a pipeline instance with shared config, analyzer and JSONL writer.
+    /// Build a pipeline instance with the default mock judge model.
     pub fn new(
         shared_config: SharedEvolutionConfig,
         analyzer: Arc<EvolutionAnalyzer>,
         writer: Arc<AsyncJsonlWriter>,
         workspace_root: impl AsRef<Path>,
     ) -> Self {
+        Self::with_judge_model(
+            shared_config,
+            analyzer,
+            writer,
+            workspace_root,
+            Arc::new(MockJudgeModel),
+        )
+    }
+
+    /// Build a pipeline instance with a caller-supplied judge scoring model.
+    ///
+    /// The judge pass threshold is read from `JudgeConfig` (configurable) and the
+    /// human-review queue is rooted under the configured evolution storage dir.
+    pub fn with_judge_model(
+        shared_config: SharedEvolutionConfig,
+        analyzer: Arc<EvolutionAnalyzer>,
+        writer: Arc<AsyncJsonlWriter>,
+        workspace_root: impl AsRef<Path>,
+        judge_model: Arc<dyn JudgeScoringModel>,
+    ) -> Self {
         let cfg = shared_config.load_full();
+        let storage_dir = PathBuf::from(cfg.runtime.storage_dir.clone());
+        let judge = JudgeEngine::new(JudgeConfig::default(), judge_model)
+            .with_review_queue(storage_dir.join("judge_review_queue.jsonl"));
         Self {
             analyzer,
             writer,
             gate: EvolutionGate::from_evolution_config(cfg.as_ref()),
-            judge: JudgeEngine::new(JudgeConfig::default(), MockJudgeModel),
+            judge,
             shared_config,
             workspace_root: workspace_root.as_ref().to_path_buf(),
-            _judge_pass_threshold: JUDGE_PASS_THRESHOLD,
         }
     }
 
@@ -184,7 +208,7 @@ impl EvolutionPipeline {
             .await?;
 
         let mut rolled_back = false;
-        if should_rollback(&judge, &cycle_result) {
+        if should_rollback(&judge, &cycle_result, self.judge.pass_threshold()) {
             if let Err(err) = self.rollback_cycle(layer.clone(), cycle_result.proposal.as_ref()).await {
                 errors.push(format!("rollback_failed: {err}"));
             } else {
@@ -248,11 +272,23 @@ impl EvolutionPipeline {
         manager.rollback_latest().await
     }
 
-    /// Backfill evolution results for stale logs that still have unknown outcomes.
+    /// Backfill inferred outcomes for stale evolution logs.
+    ///
+    /// FIX-P1-09 (append-only): the source evolution JSONL is the primary audit log and
+    /// must never be rewritten in place. Instead of mutating `evolution/<tier>/*.jsonl`,
+    /// this derives an outcome for each stale log whose `result` is still unknown and
+    /// appends a `BackfillResultRecord` to a separate derived `result_history.jsonl`.
+    /// Each `experiment_id` is backfilled at most once (idempotent across reruns).
     pub async fn backfill_results(&self, now: DateTime<Utc>) -> Result<u32> {
         let cutoff = now - Duration::days(BACKFILL_DAYS);
         let mut updated = 0u32;
         let root = self.writer_root().join("evolution");
+
+        let history_path = root.join(RESULT_HISTORY_FILE);
+        let already_backfilled = read_backfilled_ids(&history_path).await?;
+
+        let mut pending: Vec<BackfillResultRecord> = Vec::new();
+        let mut seen_this_run: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for tier in ["hot", "warm", "cold"] {
             let dir = root.join(tier);
@@ -267,43 +303,59 @@ impl EvolutionPipeline {
                 }
 
                 let raw = fs::read_to_string(&path).await?;
-                let mut changed = false;
-                let mut output = Vec::new();
                 let mut malformed_lines = 0u32;
                 for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-                    let mut parsed = match serde_json::from_str::<EvolutionLog>(line) {
+                    let parsed = match serde_json::from_str::<EvolutionLog>(line) {
                         Ok(item) => item,
                         Err(_) => {
                             malformed_lines = malformed_lines.saturating_add(1);
-                            output.push(line.to_string());
                             continue;
                         }
                     };
 
-                    if parsed.result.is_none() && parse_rfc3339(&parsed.timestamp).is_some_and(|ts| ts <= cutoff) {
-                        parsed.result = Some(self.infer_backfill_result(&parsed, now).await?);
-                        changed = true;
-                        updated = updated.saturating_add(1);
+                    if parsed.result.is_some() {
+                        continue;
                     }
-                    output.push(serde_json::to_string(&parsed)?);
+                    if parse_rfc3339(&parsed.timestamp).is_none_or(|ts| ts > cutoff) {
+                        continue;
+                    }
+                    if already_backfilled.contains(&parsed.experiment_id)
+                        || !seen_this_run.insert(parsed.experiment_id.clone())
+                    {
+                        continue;
+                    }
+
+                    let result = self.infer_backfill_result(&parsed, now).await?;
+                    pending.push(BackfillResultRecord {
+                        experiment_id: parsed.experiment_id.clone(),
+                        layer: parsed.layer.clone(),
+                        original_timestamp: parsed.timestamp.clone(),
+                        result,
+                        backfilled_at: now.to_rfc3339(),
+                    });
+                    updated = updated.saturating_add(1);
                 }
                 if malformed_lines > 0 {
                     tracing::warn!(
                         path = %path.display(),
                         malformed_lines,
-                        "kept malformed evolution lines during backfill rewrite"
+                        "skipped malformed evolution lines during backfill scan"
                     );
                 }
-
-                if changed {
-                    let mut rebuilt = output.join("\n");
-                    if !rebuilt.is_empty() {
-                        rebuilt.push('\n');
-                    }
-                    let _guard = acquire_file_lock(&path).await?;
-                    atomic_write(&root, &path, rebuilt.as_bytes()).await?;
-                }
             }
+        }
+
+        if !pending.is_empty() {
+            if let Some(parent) = history_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            let mut appended = String::new();
+            for record in &pending {
+                appended.push_str(&serde_json::to_string(record)?);
+                appended.push('\n');
+            }
+            let _guard = acquire_file_lock(&history_path).await?;
+            append_text(&history_path, &appended).await?;
         }
 
         Ok(updated)
@@ -342,6 +394,52 @@ impl EvolutionPipeline {
     fn writer_root(&self) -> PathBuf {
         self.shared_config.load_full().runtime.storage_dir.to_string().into()
     }
+}
+
+/// Derived, append-only backfill outcome record.
+///
+/// Stored in `result_history.jsonl` so inferred outcomes never mutate the primary,
+/// append-only evolution audit JSONL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackfillResultRecord {
+    pub experiment_id: String,
+    pub layer: EvolutionLayer,
+    pub original_timestamp: String,
+    pub result: EvolutionResult,
+    pub backfilled_at: String,
+}
+
+/// Collect experiment IDs already present in the derived `result_history.jsonl`.
+async fn read_backfilled_ids(path: &Path) -> Result<std::collections::HashSet<String>> {
+    let mut ids = std::collections::HashSet::new();
+    if fs::metadata(path).await.is_err() {
+        return Ok(ids);
+    }
+    let raw = fs::read_to_string(path).await?;
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        match serde_json::from_str::<BackfillResultRecord>(line) {
+            Ok(record) => {
+                ids.insert(record.experiment_id);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "skipping malformed result_history line"
+                );
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Append text to a file, creating it if necessary (append-only).
+async fn append_text(path: &Path, text: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(path).await?;
+    file.write_all(text.as_bytes()).await?;
+    file.flush().await?;
+    Ok(())
 }
 
 fn build_log(experiment_id: &str, layer: EvolutionLayer, candidate: &EvolutionCandidate, reason: &str) -> EvolutionLog {
@@ -385,11 +483,15 @@ const fn metrics_for_candidate(candidate: &EvolutionCandidate) -> GateMetrics {
     }
 }
 
-fn should_rollback(judge: &JudgeResult, cycle_result: &crate::self_system::evolution::engine::CycleResult) -> bool {
+fn should_rollback(
+    judge: &JudgeResult,
+    cycle_result: &crate::self_system::evolution::engine::CycleResult,
+    pass_threshold: f64,
+) -> bool {
     matches!(
         cycle_result.cycle.outcome,
         crate::self_system::evolution::CycleOutcome::Applied
-    ) && judge.scores.overall() < JUDGE_PASS_THRESHOLD
+    ) && judge.scores.overall() < pass_threshold
 }
 
 fn infer_rollback_dir(workspace_root: &Path, layer: &EvolutionLayer) -> Result<PathBuf> {
@@ -681,8 +783,13 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).await.unwrap();
         let line = r#"{"experiment_id":"exp-lock","timestamp":"2026-02-20T00:00:00Z","layer":"memory","change_type":"tune","before_value":"a","after_value":"b","trigger_reason":"r","data_basis":{"sample_count":1,"time_range_days":1,"key_metrics":{},"patterns_found":[]},"result":null}"#;
         fs::write(&path, format!("{line}\n")).await.unwrap();
+        let source_before = fs::read_to_string(&path).await.unwrap();
 
-        let guard = acquire_file_lock(&path).await.unwrap();
+        // FIX-P1-09: backfill now appends to a derived result_history.jsonl under file lock,
+        // never mutating the source evolution jsonl in place.
+        let history_path = storage_root.join("evolution").join("result_history.jsonl");
+        fs::write(&history_path, "").await.unwrap();
+        let guard = acquire_file_lock(&history_path).await.unwrap();
         let now = chrono::DateTime::parse_from_rfc3339("2026-02-24T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -697,7 +804,51 @@ mod tests {
 
         let updated = task.await.unwrap().unwrap();
         assert_eq!(updated, 1);
-        let rebuilt = fs::read_to_string(&path).await.unwrap();
-        assert!(rebuilt.contains("\"result\":\"neutral\""));
+
+        // Derived history holds the inferred result; source jsonl is byte-for-byte unchanged.
+        let history = fs::read_to_string(&history_path).await.unwrap();
+        assert!(history.contains("\"result\":\"neutral\""));
+        assert!(history.contains("\"experiment_id\":\"exp-lock\""));
+        let source_after = fs::read_to_string(&path).await.unwrap();
+        assert_eq!(source_before, source_after);
+    }
+
+    #[tokio::test]
+    async fn backfill_results_is_idempotent_across_reruns() {
+        let dir = tempdir().unwrap();
+        let storage_root = dir.path().join("logs");
+        let writer = Arc::new(
+            AsyncJsonlWriter::new(
+                JsonlStoragePaths::new(storage_root.clone()),
+                JsonlRetentionPolicy::default(),
+                1,
+            )
+            .await
+            .unwrap(),
+        );
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.path().join("analysis")));
+        let mut cfg = EvolutionConfig::default();
+        cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
+        let shared = new_shared_evolution_config(cfg);
+        let pipeline = EvolutionPipeline::new(shared, analyzer, writer, dir.path());
+
+        let path = storage_root.join("evolution/hot/2026-02-20.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        let line = r#"{"experiment_id":"exp-once","timestamp":"2026-02-20T00:00:00Z","layer":"memory","change_type":"tune","before_value":"a","after_value":"b","trigger_reason":"r","data_basis":{"sample_count":1,"time_range_days":1,"key_metrics":{},"patterns_found":[]},"result":null}"#;
+        fs::write(&path, format!("{line}\n")).await.unwrap();
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-02-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let first = pipeline.backfill_results(now).await.unwrap();
+        let second = pipeline.backfill_results(now).await.unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(second, 0, "already-backfilled experiment must not be re-appended");
+
+        let history_path = storage_root.join("evolution").join("result_history.jsonl");
+        let history = fs::read_to_string(&history_path).await.unwrap();
+        let count = history.lines().filter(|l| l.contains("exp-once")).count();
+        assert_eq!(count, 1);
     }
 }

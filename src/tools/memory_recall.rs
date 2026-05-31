@@ -1,9 +1,43 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::memory::Memory;
+use crate::memory::principal::MemoryWriteContext;
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
+
+/// Build an owner-scoped [`MemoryWriteContext`] from the trusted runtime scope
+/// injected by the tool-call loop (`_zc_scope` guarded by `_zc_scope_trusted`).
+///
+/// Only a runtime-trusted scope is honoured; user/model-supplied scope fields
+/// are ignored. Returns `None` when no trusted scope is present, in which case
+/// ACL recall falls back to an empty owner context that returns no
+/// cross-principal memories rather than leaking the whole store.
+fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
+    let trusted = args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !trusted {
+        return None;
+    }
+    let scope = args.get("_zc_scope").and_then(serde_json::Value::as_object)?;
+    let str_field = |key: &str| {
+        scope
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    Some(MemoryWriteContext {
+        channel: str_field("channel"),
+        chat_type: str_field("chat_type"),
+        chat_id: str_field("chat_id"),
+        sender_id: str_field("sender_id"),
+        raw_sender: str_field("sender").or_else(|| str_field("raw_sender")),
+    })
+}
 
 /// Let the agent search its own memory
 pub struct MemoryRecallTool {
@@ -49,16 +83,6 @@ impl Tool for MemoryRecallTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if self.acl_enabled {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(
-                    "memory_recall is disabled when memory ACL is enabled; use memory_search or memory_get with scoped access".to_string(),
-                ),
-            });
-        }
-
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
@@ -82,7 +106,31 @@ impl Tool for MemoryRecallTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(5, |v| v as usize);
 
-        match self.memory.recall(query, limit, session_id).await {
+        // FIX-#50: When memory ACL is enabled we no longer disable recall
+        // outright (that was a UX regression). Instead we perform an
+        // owner-scoped recall using the caller's trusted runtime scope so each
+        // principal only sees memories it owns (plus public ones). When no
+        // trusted scope is present under ACL we pass an empty owner context,
+        // which the ACL-aware backend resolves to an anonymous principal that
+        // returns no cross-principal memories rather than leaking the whole
+        // store. With ACL disabled the legacy unscoped recall path is preserved
+        // unchanged.
+        let recall_result = if self.acl_enabled {
+            let scope_ctx = parse_scope_ctx(&args).unwrap_or(MemoryWriteContext {
+                channel: None,
+                chat_type: None,
+                chat_id: None,
+                sender_id: None,
+                raw_sender: None,
+            });
+            self.memory
+                .recall_with_context(query, limit, session_id, Some(&scope_ctx))
+                .await
+        } else {
+            self.memory.recall(query, limit, session_id).await
+        };
+
+        match recall_result {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
                 success: true,
                 output: "No memories found matching that query.".into(),
@@ -180,17 +228,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_rejects_acl_mode() {
+    async fn recall_acl_mode_does_owner_scoped_recall_not_disabled() {
+        // FIX-#50: with ACL enabled, recall must NOT return the old "disabled"
+        // error. Instead it performs an owner-scoped recall via
+        // recall_with_context. With no trusted scope and no stored memories the
+        // call succeeds and reports no matches (never the disabled error).
         let (_tmp, mem) = seeded_mem();
         let tool = MemoryRecallTool::new(mem, true);
         let result = tool.execute(json!({"query": "Rust"})).await.unwrap();
-        assert!(!result.success);
+        assert!(result.success, "ACL recall should succeed, not be disabled");
         assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|msg| msg.contains("disabled when memory ACL is enabled"))
+            result.error.as_deref().map_or(true, |msg| !msg.contains("disabled")),
+            "ACL recall must not return the legacy disabled error"
         );
+        assert!(result.output.contains("No memories found"));
     }
 
     #[test]

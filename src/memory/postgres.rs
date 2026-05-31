@@ -725,12 +725,128 @@ impl PostgresMemory {
             "
         ))?;
 
+        // FIX-P0-25: record-and-verify versioned schema migrations. The DDL was
+        // already executed by the idempotent batch above; this ledger records a
+        // stable (version, name, checksum) per logical step so drift is detected
+        // (checksum mismatch → bail) at startup.
+        Self::run_memory_schema_migrations(client, schema_ident)?;
+
         Ok(Self::try_init_pgvector(
             client,
             qualified_table,
             qualified_document_chunks_table,
             embedding_dimensions,
         ))
+    }
+
+    /// SHA-256 (hex) of a migration's canonical descriptor text.
+    fn schema_migration_checksum(text: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(text.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Versioned registry of the canonical schema steps created by `init_schema`,
+    /// retro-fitted in execution order. Each text is a stable canonical descriptor
+    /// used only as a checksum anchor (version unchanged ⇒ text unchanged). NEVER
+    /// mutate an existing entry's text; append a new version for new schema changes.
+    const fn memory_schema_migration_registry() -> &'static [(i64, &'static str, &'static str)] {
+        &[
+            (
+                1,
+                "memories_core",
+                "memories(id,key,content,category,created_at,updated_at,session_id,useful_count,workspace_id,owner_id,agent_id,persona_id,source_event_id,source,embedding,embedding_provider,embedding_model,embedding_dimensions,channel,chat_type,chat_id,sender_id,raw_sender,topic_id,visibility,sensitivity,risk_signals,policy_version)",
+            ),
+            (
+                2,
+                "agent_identity_bindings",
+                "agent_identity_bindings(binding_id,external_subject,external_issuer,auth_method,prx_owner_id,prx_principal_id,capabilities,expires_at,created_at,last_used_at)",
+            ),
+            (3, "approval_grants", "approval_grants + approval_grant_events"),
+            (
+                4,
+                "embedding_cache",
+                "embedding_cache(content_hash,embedding,provider,model,dimensions,created_at,accessed_at)",
+            ),
+            (
+                5,
+                "message_events",
+                "message_events(id,event_id,idempotency_key,workspace_id,owner_id,source,channel,session_key,parent_session_key,run_id,parent_run_id,agent_id,persona_id,sender,recipient,role,event_type,content,content_hash,raw_payload_json,visibility,created_at,updated_at)",
+            ),
+            (
+                6,
+                "memory_events",
+                "memory_events(event_id,workspace_id,event_type,subject_table,subject_id,session_key,agent_id,persona_id,visibility,payload_json,created_at)",
+            ),
+            (
+                7,
+                "memory_drafts",
+                "memory_drafts(id,draft_id,workspace_id,owner_id,worker_run_id,parent_run_id,session_key,agent_id,persona_id,key,content,category,source_event_id,visibility,status,payload_json,created_at,updated_at)",
+            ),
+            (
+                8,
+                "documents",
+                "documents(id,document_id,workspace_id,owner_id,topic_id,task_id,source_message_event_id,source_kind,source_uri,title,content_sha256,mime_type,visibility,metadata_json,chunk_count,created_at,updated_at)",
+            ),
+            (
+                9,
+                "document_chunks",
+                "document_chunks(id,document_id,chunk_index,content,content_sha256,embedding,token_count,owner_id,created_at)",
+            ),
+            (
+                10,
+                "memory_links_traces_compaction",
+                "memory_links + retrieval_traces + compaction_runs",
+            ),
+        ]
+    }
+
+    /// Record-and-verify versioned schema migrations (FIX-P0-25, Postgres).
+    ///
+    /// - already-applied version, matching checksum → skipped;
+    /// - already-applied version, differing checksum → `bail!` (fail-fast);
+    /// - unapplied version → recorded.
+    ///
+    /// SAFETY: `schema_ident` is validated+quoted at construction via
+    /// `validate_identifier()` + `quote_identifier()`; the interpolated table
+    /// name cannot carry SQL injection. All values are passed as bind params.
+    fn run_memory_schema_migrations(client: &mut Client, schema_ident: &str) -> Result<()> {
+        let migrations_table = format!("{schema_ident}.memory_schema_migrations");
+        client.execute(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {migrations_table} (
+                    version    BIGINT PRIMARY KEY,
+                    name       TEXT NOT NULL,
+                    checksum   TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                )"
+            ),
+            &[],
+        )?;
+
+        let select_sql = format!("SELECT checksum FROM {migrations_table} WHERE version = $1");
+        let insert_sql =
+            format!("INSERT INTO {migrations_table} (version, name, checksum, applied_at) VALUES ($1, $2, $3, $4)");
+
+        for (version, name, text) in Self::memory_schema_migration_registry() {
+            let checksum = Self::schema_migration_checksum(text);
+            match client.query_opt(&select_sql, &[version])? {
+                Some(row) => {
+                    let recorded: String = row.get(0);
+                    if recorded != checksum {
+                        anyhow::bail!(
+                            "memory schema migration checksum mismatch for version {version} ({name}): \
+                             expected {checksum}, found {recorded}"
+                        );
+                    }
+                }
+                None => {
+                    let name = (*name).to_string();
+                    client.execute(&insert_sql, &[version, &name, &checksum, &Utc::now().to_rfc3339()])?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn try_init_pgvector(
@@ -2600,12 +2716,32 @@ impl Memory for PostgresMemory {
         .await?
     }
 
-    async fn list_memory_drafts_for_run(&self, worker_run_id: &str) -> Result<Vec<MemoryDraft>> {
+    async fn list_memory_drafts_for_run(
+        &self,
+        principal: &MemoryPrincipal,
+        worker_run_id: &str,
+    ) -> Result<Vec<MemoryDraft>> {
         let client = self.client.clone();
         let qualified_drafts_table = self.qualified_drafts_table.clone();
         let worker_run_id = worker_run_id.to_string();
+        // Owner ACL: only return drafts owned by the principal (or ownerless /
+        // system-created drafts). System principals bypass the filter.
+        let owner = if Self::is_system_principal(principal) {
+            None
+        } else {
+            principal
+                .owner_id
+                .as_deref()
+                .filter(|owner| !owner.trim().is_empty())
+                .map(str::to_string)
+        };
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MemoryDraft>> {
+            let owner_clause = if owner.is_some() {
+                "AND (owner_id = $2 OR owner_id IS NULL)"
+            } else {
+                ""
+            };
             let stmt = format!(
                 "
                 SELECT
@@ -2613,11 +2749,17 @@ impl Memory for PostgresMemory {
                     agent_id, persona_id, key, content, category, source_event_id,
                     visibility, status, payload_json, created_at, updated_at
                 FROM {qualified_drafts_table}
-                WHERE worker_run_id = $1
+                WHERE worker_run_id = $1 {owner_clause}
                 ORDER BY id
                 "
             );
-            let rows = client.with_client(|client| Ok(client.query(&stmt, &[&worker_run_id])?))?;
+            let rows = client.with_client(|client| {
+                if let Some(owner) = owner.as_deref() {
+                    Ok(client.query(&stmt, &[&worker_run_id, &owner])?)
+                } else {
+                    Ok(client.query(&stmt, &[&worker_run_id])?)
+                }
+            })?;
             rows.iter()
                 .map(Self::row_to_draft)
                 .collect::<Result<Vec<MemoryDraft>>>()
@@ -2625,12 +2767,21 @@ impl Memory for PostgresMemory {
         .await?
     }
 
-    async fn merge_memory_draft(&self, draft_id: &str) -> Result<Option<MemoryDraft>> {
+    async fn merge_memory_draft(&self, principal: &MemoryPrincipal, draft_id: &str) -> Result<Option<MemoryDraft>> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_drafts_table = self.qualified_drafts_table.clone();
         let qualified_memory_events_table = self.qualified_memory_events_table.clone();
         let draft_id = draft_id.to_string();
+        let owner = if Self::is_system_principal(principal) {
+            None
+        } else {
+            principal
+                .owner_id
+                .as_deref()
+                .filter(|owner| !owner.trim().is_empty())
+                .map(str::to_string)
+        };
 
         tokio::task::spawn_blocking(move || -> Result<Option<MemoryDraft>> {
             let select_stmt = format!(
@@ -2648,6 +2799,14 @@ impl Memory for PostgresMemory {
                 return Ok(None);
             };
             let draft = Self::row_to_draft(&row)?;
+            // Owner ACL: reject merge attempts on drafts owned by a different principal.
+            if let Some(owner) = owner.as_deref() {
+                if let Some(draft_owner) = draft.owner_id.as_deref() {
+                    if draft_owner != owner {
+                        anyhow::bail!("memory draft {} is owned by a different principal", draft.draft_id);
+                    }
+                }
+            }
             if draft.status != "pending" && draft.status != "merge_requested" {
                 return Ok(Some(draft));
             }
@@ -2755,15 +2914,42 @@ impl Memory for PostgresMemory {
         .await?
     }
 
-    async fn reject_memory_draft(&self, draft_id: &str, reason: Option<&str>) -> Result<Option<MemoryDraft>> {
+    async fn reject_memory_draft(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<MemoryDraft>> {
         let client = self.client.clone();
         let qualified_drafts_table = self.qualified_drafts_table.clone();
         let qualified_memory_events_table = self.qualified_memory_events_table.clone();
         let draft_id = draft_id.to_string();
         let reason = reason.map(str::to_string);
+        let owner = if Self::is_system_principal(principal) {
+            None
+        } else {
+            principal
+                .owner_id
+                .as_deref()
+                .filter(|owner| !owner.trim().is_empty())
+                .map(str::to_string)
+        };
 
         tokio::task::spawn_blocking(move || -> Result<Option<MemoryDraft>> {
             let now = Utc::now();
+            // Owner ACL: reject attempts on drafts owned by a different principal.
+            if let Some(owner) = owner.as_deref() {
+                let select_owner = format!("SELECT owner_id FROM {qualified_drafts_table} WHERE draft_id = $1 LIMIT 1");
+                let existing = client.with_client(|client| Ok(client.query_opt(&select_owner, &[&draft_id])?))?;
+                if let Some(row) = existing {
+                    let draft_owner: Option<String> = row.get(0);
+                    if let Some(draft_owner) = draft_owner {
+                        if draft_owner != owner {
+                            anyhow::bail!("memory draft {draft_id} is owned by a different principal");
+                        }
+                    }
+                }
+            }
             let payload = reason
                 .as_ref()
                 .map(|reason| serde_json::json!({ "reason": reason }).to_string());
@@ -3906,7 +4092,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(draft.status, "pending");
-        let merged = mem.merge_memory_draft("draft-1").await.unwrap().unwrap();
+        let test_principal = MemoryPrincipal {
+            workspace_id: "workspace".to_string(),
+            agent_id: Some("system".to_string()),
+            persona_id: None,
+            session_key: None,
+            channel: None,
+            sender: None,
+            owner_id: None,
+        };
+        let merged = mem
+            .merge_memory_draft(&test_principal, "draft-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(merged.status, "merged");
         let stored = mem.get("draft-key").await.unwrap().unwrap();
         assert_eq!(stored.content, "draft content");
@@ -3932,7 +4131,7 @@ mod tests {
             .unwrap();
         assert_eq!(rejected.status, "pending");
         let rejected = mem
-            .reject_memory_draft("draft-2", Some("not useful"))
+            .reject_memory_draft(&test_principal, "draft-2", Some("not useful"))
             .await
             .unwrap()
             .unwrap();

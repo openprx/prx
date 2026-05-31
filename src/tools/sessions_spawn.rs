@@ -767,10 +767,14 @@ impl Tool for SessionsSpawnTool {
             }
         }
 
+        // FIX-P0-37: spawning a child session creates a new process that
+        // consumes resources and carries a potential sandbox-escape surface,
+        // so it is a Medium-risk side effect (requires an approval grant under
+        // supervised autonomy; denied outright under read-only) rather than Low.
         if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
             self.name(),
             "sessions_spawn:spawn",
-            ResourceRiskLevel::Low,
+            ResourceRiskLevel::Medium,
             approval_grant.as_ref(),
         ) {
             return Ok(ToolResult {
@@ -2369,6 +2373,33 @@ mod tests {
         )
     }
 
+    /// FIX-P0-37: spawning is now a Medium-risk side effect, which requires an
+    /// approval grant under the default (supervised) autonomy. Tests that drive
+    /// the real `spawn` path must inject a matching grant — mirroring how the
+    /// production agent loop issues one after operator approval. The operation
+    /// name MUST equal the one the gate authorizes (`sessions_spawn:spawn`).
+    fn spawn_grant_value() -> serde_json::Value {
+        serde_json::to_value(ApprovalGrant::for_resource_operation(
+            "sessions_spawn",
+            "sessions_spawn:spawn",
+            "test",
+            None,
+        ))
+        .unwrap()
+    }
+
+    /// Merge a valid spawn approval grant into the given `spawn` arguments so the
+    /// Medium-risk gate authorizes the call.
+    fn with_spawn_grant(mut args: serde_json::Value) -> serde_json::Value {
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert(
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                spawn_grant_value(),
+            );
+        }
+        args
+    }
+
     #[test]
     fn name_and_description() {
         let (ch, _) = RecordingChannel::new();
@@ -2431,7 +2462,10 @@ mod tests {
         );
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
-        let result = tool.execute(json!({"task": "Tell me a joke"})).await.unwrap();
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "Tell me a joke"})))
+            .await
+            .unwrap();
 
         assert!(result.success);
         assert!(result.output.contains("run_id:"));
@@ -2444,6 +2478,36 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("Sub-agent"));
         assert!(messages[0].contains("chicken"));
+    }
+
+    /// FIX-P0-37: spawning is a Medium-risk side effect. Under the default
+    /// (supervised) autonomy and with NO approval grant supplied, the gate must
+    /// deny the spawn outright — no run is registered and no announcement fires.
+    #[tokio::test]
+    async fn spawn_denied_without_grant_under_supervised() {
+        let (ch, sent) = RecordingChannel::new();
+        let tool = make_tool(
+            Arc::new(ch),
+            Arc::new(EchoProvider {
+                response: "should never run".into(),
+            }),
+        );
+        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+
+        // No grant injected → Medium-risk gate denies under supervised autonomy.
+        let denied = tool.execute(json!({"task": "Tell me a joke"})).await.unwrap();
+        assert!(!denied.success, "spawn must be denied without an approval grant");
+        assert!(
+            denied.error.unwrap_or_default().contains("runtime approval grant"),
+            "denial reason should reference the missing approval grant"
+        );
+
+        // No run should have been registered.
+        assert!(tool.active_runs_snapshot().await.is_empty());
+
+        // Give any (non-existent) async work a chance; nothing should be sent.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(sent.lock().await.len(), 0);
     }
 
     #[tokio::test]
@@ -2460,7 +2524,7 @@ mod tests {
         .with_shared_memory(memory.clone());
 
         let result = tool
-            .execute(json!({
+            .execute(with_spawn_grant(json!({
                 "task": "write through fabric",
                 "_zc_scope_trusted": true,
                 "_zc_scope": {
@@ -2471,7 +2535,7 @@ mod tests {
                     "topic_id": "topic-1",
                     "source_message_event_id": "msg-1"
                 }
-            }))
+            })))
             .await
             .unwrap();
         assert!(result.success);
@@ -2558,7 +2622,10 @@ mod tests {
         );
         // No default_recipient set, no recipient in args
 
-        let result = tool.execute(json!({"task": "Do something"})).await.unwrap();
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "Do something"})))
+            .await
+            .unwrap();
         assert!(result.success);
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2579,10 +2646,10 @@ mod tests {
         tool.set_default_recipient(Some("default-recipient".to_string())).await;
 
         let result = tool
-            .execute(json!({
+            .execute(with_spawn_grant(json!({
                 "task": "Test task",
                 "recipient": "explicit-recipient"
-            }))
+            })))
             .await
             .unwrap();
         assert!(result.success);
@@ -2673,7 +2740,10 @@ mod tests {
         let tool = make_tool(Arc::new(ch), Arc::new(FailingProvider));
         tool.set_default_recipient(Some("user".to_string())).await;
 
-        let result = tool.execute(json!({"task": "This will fail"})).await.unwrap();
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "This will fail"})))
+            .await
+            .unwrap();
         assert!(result.success); // spawn succeeds; failure is in the sub-agent
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2698,7 +2768,10 @@ mod tests {
         );
 
         // Spawn a run
-        let _ = tool.execute(json!({"task": "Some task"})).await.unwrap();
+        let _ = tool
+            .execute(with_spawn_grant(json!({"task": "Some task"})))
+            .await
+            .unwrap();
 
         let runs = tool.active_runs_snapshot().await;
         assert_eq!(runs.len(), 1);
@@ -2829,7 +2902,7 @@ mod tests {
         );
 
         let result = tool
-            .execute(json!({
+            .execute(with_spawn_grant(json!({
                 "task": "lineage task",
                 "_zc_scope_trusted": true,
                 "_zc_scope": {
@@ -2841,7 +2914,7 @@ mod tests {
                     "task_id": "parent-task",
                     "message_event_id": "msg-a"
                 }
-            }))
+            })))
             .await
             .unwrap();
         assert!(result.success);
@@ -2978,7 +3051,10 @@ mod tests {
         );
 
         // Spawn without tool registry (no tools set)
-        let spawn_result = tool.execute(json!({"task": "Do a thing"})).await.unwrap();
+        let spawn_result = tool
+            .execute(with_spawn_grant(json!({"task": "Do a thing"})))
+            .await
+            .unwrap();
         assert!(spawn_result.success);
         let run_id = spawn_result
             .output
@@ -3025,7 +3101,7 @@ mod tests {
             crate::config::SessionsSpawnConfig::default(),
         );
         let result = tool
-            .execute(json!({"task": "hello", "agent": "missing"}))
+            .execute(with_spawn_grant(json!({"task": "hello", "agent": "missing"})))
             .await
             .unwrap();
         assert!(!result.success);
@@ -3054,7 +3130,10 @@ mod tests {
             crate::providers::ProviderRuntimeOptions::default(),
             crate::config::SessionsSpawnConfig::default(),
         );
-        let result = tool.execute(json!({"task": "hello", "agent": "alpha"})).await.unwrap();
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "hello", "agent": "alpha"})))
+            .await
+            .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("spawn_enabled=false"));
     }
@@ -3090,7 +3169,10 @@ mod tests {
         );
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
-        let result = tool.execute(json!({"task": "t", "agent": "alpha"})).await.unwrap();
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "t", "agent": "alpha"})))
+            .await
+            .unwrap();
         assert!(result.success);
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

@@ -1230,7 +1230,111 @@ impl SqliteMemory {
              WHERE owner_id IS NULL;",
         )?;
 
+        Self::run_memory_schema_migrations(conn)?;
+
         Ok(())
+    }
+
+    /// Record-and-verify versioned schema migrations (FIX-P0-25).
+    ///
+    /// The legacy `init_schema` above creates / upgrades tables with idempotent
+    /// `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE ... ADD COLUMN` statements and
+    /// previously swallowed ALTER failures via `tracing::debug`. This ledger gives
+    /// every logical schema step a stable `version`, a `name`, and a SHA-256
+    /// `checksum` of its canonical descriptor, so drift is detected at startup:
+    ///
+    /// - already-applied version, checksum matches → skipped;
+    /// - already-applied version, checksum differs → `bail!` (fail-fast: an
+    ///   engineer changed a registered step without bumping its version);
+    /// - unapplied version → recorded (the DDL itself already ran above).
+    ///
+    /// New schema changes MUST append a new `(version, name, sql)` entry to
+    /// [`Self::memory_schema_migration_registry`] and NEVER mutate an existing
+    /// entry's text.
+    fn run_memory_schema_migrations(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                name       TEXT NOT NULL,
+                checksum   TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            );",
+        )?;
+
+        for (version, name, sql) in Self::memory_schema_migration_registry() {
+            let checksum = Self::schema_migration_checksum(sql);
+            let recorded: Option<String> = conn
+                .query_row(
+                    "SELECT checksum FROM memory_schema_migrations WHERE version = ?1",
+                    params![version],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match recorded {
+                Some(recorded) => {
+                    if recorded != checksum {
+                        anyhow::bail!(
+                            "memory schema migration checksum mismatch for version {version} ({name}): \
+                             expected {checksum}, found {recorded}"
+                        );
+                    }
+                }
+                None => {
+                    conn.execute(
+                        "INSERT INTO memory_schema_migrations (version, name, checksum, applied_at) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![version, name, checksum, Utc::now().to_rfc3339()],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// SHA-256 (hex) of a migration's canonical descriptor text.
+    fn schema_migration_checksum(sql: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(sql.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Versioned registry of the canonical schema steps created by `init_schema`,
+    /// retro-fitted in execution order. Each text is a stable canonical descriptor
+    /// used only as a checksum anchor (version unchanged ⇒ text unchanged).
+    const fn memory_schema_migration_registry() -> &'static [(i64, &'static str, &'static str)] {
+        &[
+            (
+                1,
+                "memories_core",
+                "memories(id,key,content,category,embedding,embedding_provider,embedding_model,embedding_dimensions,created_at,updated_at,workspace_id,owner_id,agent_id,persona_id,source_event_id,source,channel,chat_type,chat_id,sender_id,raw_sender,topic_id,visibility,sensitivity,risk_signals,policy_version,useful_count) + memories_fts + embedding_cache",
+            ),
+            (
+                2,
+                "identity_topics_audit",
+                "identity_bindings + agent_identity_bindings + user_policies + topics + topics_fts + topic_participants + topic_aliases + access_audit_log",
+            ),
+            (
+                3,
+                "sessions_and_turns",
+                "sessions(session_key,channel,sender,owner_id,created_at,updated_at,message_count,last_message_preview) + conversation_turns(id,session_key,owner_id,role,content,timestamp,message_id,message_event_id,agent_id,persona_id,visibility)",
+            ),
+            (
+                4,
+                "message_and_memory_events",
+                "message_events(id,event_id,idempotency_key,workspace_id,owner_id,source,channel,session_key,parent_session_key,run_id,parent_run_id,agent_id,persona_id,sender,recipient,role,event_type,content,content_hash,raw_payload_json,visibility,created_at,updated_at) + memory_events(id,event_id,workspace_id,event_type,subject_table,subject_id,session_key,agent_id,persona_id,visibility,payload_json,created_at)",
+            ),
+            (
+                5,
+                "memory_drafts",
+                "memory_drafts(id,draft_id,workspace_id,owner_id,worker_run_id,parent_run_id,session_key,agent_id,persona_id,key,content,category,source_event_id,visibility,status,payload_json,created_at,updated_at)",
+            ),
+            (
+                6,
+                "documents_links_traces_compaction",
+                "documents + document_chunks + memory_links + retrieval_traces + compaction_runs + evolution_proposals + evolution_proposal_events",
+            ),
+        ]
     }
 
     fn category_to_str(cat: &MemoryCategory) -> String {
@@ -2872,7 +2976,11 @@ impl Memory for SqliteMemory {
         offset: usize,
     ) -> anyhow::Result<Vec<ConversationTurn>> {
         let conn = self.conn.clone();
-        let owner_id = principal.effective_owner_id();
+        let owner_id = principal
+            .owner_id
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .map(str::to_string);
         let session_key = session_key.to_string();
         let limit = Self::sanitize_conversation_limit(limit);
         let offset = Self::sanitize_conversation_offset(offset);
@@ -2921,7 +3029,11 @@ impl Memory for SqliteMemory {
         max_sessions: usize,
     ) -> anyhow::Result<std::collections::HashMap<String, Vec<ConversationTurn>>> {
         let conn = self.conn.clone();
-        let owner_id = principal.effective_owner_id();
+        let owner_id = principal
+            .owner_id
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .map(str::to_string);
         let max_turns_per_session = Self::sanitize_conversation_limit(max_turns_per_session);
         let max_sessions = Self::sanitize_hydrated_sessions_limit(max_sessions);
         let legacy_visible = 1_i64;
@@ -3588,29 +3700,70 @@ impl Memory for SqliteMemory {
         .await?
     }
 
-    async fn list_memory_drafts_for_run(&self, worker_run_id: &str) -> anyhow::Result<Vec<MemoryDraft>> {
+    async fn list_memory_drafts_for_run(
+        &self,
+        principal: &MemoryPrincipal,
+        worker_run_id: &str,
+    ) -> anyhow::Result<Vec<MemoryDraft>> {
         let conn = self.conn.clone();
         let worker_run_id = worker_run_id.to_string();
+        // Owner ACL: a caller may only see drafts it owns, plus drafts with no
+        // owner (legacy / system-created). System principals bypass the filter.
+        let owner = if Self::is_system_principal(principal) {
+            None
+        } else {
+            principal
+                .owner_id
+                .as_deref()
+                .filter(|owner| !owner.trim().is_empty())
+                .map(str::to_string)
+        };
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryDraft>> {
             let conn = conn.lock();
-            let mut stmt = conn.prepare(
-                "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
-                        agent_id, persona_id, key, content, category, source_event_id,
-                        visibility, status, payload_json, created_at, updated_at
-                   FROM memory_drafts
-                  WHERE worker_run_id = ?1
-                  ORDER BY id ASC",
-            )?;
-            let rows = stmt.query_map(params![worker_run_id], Self::memory_draft_from_row)?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            if let Some(owner) = owner {
+                let mut stmt = conn.prepare(
+                    "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
+                            agent_id, persona_id, key, content, category, source_event_id,
+                            visibility, status, payload_json, created_at, updated_at
+                       FROM memory_drafts
+                      WHERE worker_run_id = ?1 AND (owner_id = ?2 OR owner_id IS NULL)
+                      ORDER BY id ASC",
+                )?;
+                let rows = stmt.query_map(params![worker_run_id, owner], Self::memory_draft_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
+                            agent_id, persona_id, key, content, category, source_event_id,
+                            visibility, status, payload_json, created_at, updated_at
+                       FROM memory_drafts
+                      WHERE worker_run_id = ?1
+                      ORDER BY id ASC",
+                )?;
+                let rows = stmt.query_map(params![worker_run_id], Self::memory_draft_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            }
         })
         .await?
     }
 
-    async fn merge_memory_draft(&self, draft_id: &str) -> anyhow::Result<Option<MemoryDraft>> {
+    async fn merge_memory_draft(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+    ) -> anyhow::Result<Option<MemoryDraft>> {
         let conn = self.conn.clone();
         let draft_id = draft_id.to_string();
+        let owner = if Self::is_system_principal(principal) {
+            None
+        } else {
+            principal
+                .owner_id
+                .as_deref()
+                .filter(|owner| !owner.trim().is_empty())
+                .map(str::to_string)
+        };
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
             let mut conn = conn.lock();
@@ -3629,6 +3782,15 @@ impl Memory for SqliteMemory {
                 Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
+
+            // Owner ACL: reject merge attempts on drafts owned by a different principal.
+            if let Some(owner) = owner.as_deref() {
+                if let Some(draft_owner) = draft.owner_id.as_deref() {
+                    if draft_owner != owner {
+                        anyhow::bail!("memory draft {} is owned by a different principal", draft.draft_id);
+                    }
+                }
+            }
 
             if draft.status != "pending" && draft.status != "merge_requested" {
                 return Ok(Some(draft));
@@ -3717,10 +3879,24 @@ impl Memory for SqliteMemory {
         .await?
     }
 
-    async fn reject_memory_draft(&self, draft_id: &str, reason: Option<&str>) -> anyhow::Result<Option<MemoryDraft>> {
+    async fn reject_memory_draft(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+        reason: Option<&str>,
+    ) -> anyhow::Result<Option<MemoryDraft>> {
         let conn = self.conn.clone();
         let draft_id = draft_id.to_string();
         let reason = reason.map(str::to_string);
+        let owner = if Self::is_system_principal(principal) {
+            None
+        } else {
+            principal
+                .owner_id
+                .as_deref()
+                .filter(|owner| !owner.trim().is_empty())
+                .map(str::to_string)
+        };
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
             let mut conn = conn.lock();
@@ -3739,6 +3915,15 @@ impl Memory for SqliteMemory {
                 Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
+
+            // Owner ACL: reject attempts on drafts owned by a different principal.
+            if let Some(owner) = owner.as_deref() {
+                if let Some(draft_owner) = draft.owner_id.as_deref() {
+                    if draft_owner != owner {
+                        anyhow::bail!("memory draft {} is owned by a different principal", draft.draft_id);
+                    }
+                }
+            }
 
             if draft.status == "merged" || draft.status == "rejected" {
                 return Ok(Some(draft));
@@ -5036,11 +5221,27 @@ mod tests {
         assert_eq!(draft.status, "pending");
         assert_eq!(draft.owner_id.as_deref(), Some("owner-a"));
 
-        let drafts = mem.list_memory_drafts_for_run("run-worker").await.unwrap();
+        let test_principal = MemoryPrincipal {
+            workspace_id: "workspace".to_string(),
+            agent_id: Some("system".to_string()),
+            persona_id: None,
+            session_key: None,
+            channel: None,
+            sender: None,
+            owner_id: None,
+        };
+        let drafts = mem
+            .list_memory_drafts_for_run(&test_principal, "run-worker")
+            .await
+            .unwrap();
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].draft_id, "draft-1");
 
-        let merged = mem.merge_memory_draft("draft-1").await.unwrap().unwrap();
+        let merged = mem
+            .merge_memory_draft(&test_principal, "draft-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(merged.status, "merged");
         let memory = mem.get("draft-key").await.unwrap().unwrap();
         assert_eq!(memory.content, "draft memory");
@@ -5066,7 +5267,7 @@ mod tests {
             .unwrap();
         assert_eq!(rejected.status, "pending");
         let rejected = mem
-            .reject_memory_draft("draft-2", Some("duplicate"))
+            .reject_memory_draft(&test_principal, "draft-2", Some("duplicate"))
             .await
             .unwrap()
             .unwrap();
@@ -7171,5 +7372,124 @@ mod tests {
 
         assert!(error.to_string().contains("reserved memory namespace"));
         assert!(mem.get("router/elo/test").await.unwrap().is_none());
+    }
+
+    // FIX-P0-25 + FIX-#59 regression tests.
+
+    fn g1_draft_input(owner: Option<&str>, worker_run_id: &str, draft_id: &str, key: &str) -> MemoryDraftInput {
+        MemoryDraftInput {
+            draft_id: Some(draft_id.to_string()),
+            workspace_id: "ws".to_string(),
+            owner_id: owner.map(str::to_string),
+            worker_run_id: worker_run_id.to_string(),
+            parent_run_id: None,
+            session_key: None,
+            agent_id: None,
+            persona_id: None,
+            key: key.to_string(),
+            content: "content".to_string(),
+            category: MemoryCategory::Core,
+            source_event_id: None,
+            visibility: MemoryVisibility::Workspace,
+            payload_json: None,
+        }
+    }
+
+    fn g1_owner_principal(owner: &str) -> MemoryPrincipal {
+        MemoryPrincipal {
+            workspace_id: "ws".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: None,
+            channel: None,
+            sender: None,
+            owner_id: Some(owner.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn g1_schema_migrations_recorded_on_init() {
+        let (_tmp, mem) = temp_sqlite();
+        let conn = mem.conn.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_schema_migrations", [], |row| row.get(0))
+            .expect("count migrations");
+        assert_eq!(count, SqliteMemory::memory_schema_migration_registry().len() as i64);
+    }
+
+    #[tokio::test]
+    async fn g1_schema_migration_checksum_mismatch_bails() {
+        let (_tmp, mem) = temp_sqlite();
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "UPDATE memory_schema_migrations SET checksum = 'tampered' WHERE version = 1",
+                [],
+            )
+            .expect("tamper");
+            let result = SqliteMemory::run_memory_schema_migrations(&conn);
+            assert!(result.is_err(), "checksum mismatch must fail-fast");
+            assert!(
+                result.unwrap_err().to_string().contains("checksum mismatch"),
+                "error should mention checksum mismatch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn g1_schema_migrations_idempotent_no_duplicate_rows() {
+        let (_tmp, mem) = temp_sqlite();
+        {
+            let conn = mem.conn.lock();
+            // Re-running must be a no-op and never duplicate rows.
+            SqliteMemory::run_memory_schema_migrations(&conn).expect("rerun ok");
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memory_schema_migrations", [], |row| row.get(0))
+                .expect("count");
+            assert_eq!(count, SqliteMemory::memory_schema_migration_registry().len() as i64);
+        }
+    }
+
+    #[tokio::test]
+    async fn g1_draft_acl_list_only_returns_own_or_ownerless() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.create_memory_draft(g1_draft_input(Some("alice"), "run-1", "d-alice", "k1"))
+            .await
+            .expect("create alice");
+        mem.create_memory_draft(g1_draft_input(Some("bob"), "run-1", "d-bob", "k2"))
+            .await
+            .expect("create bob");
+        mem.create_memory_draft(g1_draft_input(None, "run-1", "d-none", "k3"))
+            .await
+            .expect("create ownerless");
+
+        let alice = g1_owner_principal("alice");
+        let visible = mem.list_memory_drafts_for_run(&alice, "run-1").await.expect("list");
+        let ids: Vec<&str> = visible.iter().map(|d| d.draft_id.as_str()).collect();
+        assert!(ids.contains(&"d-alice"), "alice sees own draft");
+        assert!(ids.contains(&"d-none"), "alice sees ownerless draft");
+        assert!(!ids.contains(&"d-bob"), "alice must NOT see bob's draft");
+    }
+
+    #[tokio::test]
+    async fn g1_draft_acl_merge_and_reject_block_other_owner() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.create_memory_draft(g1_draft_input(Some("bob"), "run-x", "d-bob", "k"))
+            .await
+            .expect("create bob");
+
+        let alice = g1_owner_principal("alice");
+        assert!(
+            mem.merge_memory_draft(&alice, "d-bob").await.is_err(),
+            "alice must not merge bob's draft"
+        );
+        assert!(
+            mem.reject_memory_draft(&alice, "d-bob", Some("nope")).await.is_err(),
+            "alice must not reject bob's draft"
+        );
+
+        let bob = g1_owner_principal("bob");
+        let merged = mem.merge_memory_draft(&bob, "d-bob").await.expect("bob merge ok");
+        assert!(merged.is_some(), "owner merge returns the draft");
     }
 }

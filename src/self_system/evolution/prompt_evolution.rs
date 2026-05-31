@@ -2,6 +2,7 @@ use crate::self_system::evolution::analyzer::{CandidatePriority, EvolutionCandid
 use crate::self_system::evolution::config::SharedEvolutionConfig;
 use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput, EvolutionEngine};
 use crate::self_system::evolution::record::{ChangeType, DataBasis, EvolutionLayer, EvolutionLog, EvolutionResult};
+use crate::self_system::evolution::rollback::RollbackManager;
 use crate::self_system::evolution::safety_utils::{
     atomic_write, is_raw_debug_enabled, sha256_hex, validate_path_in_workspace,
 };
@@ -37,20 +38,23 @@ pub enum PromptMutationType {
 pub struct PromptEvolutionEngine {
     shared_config: SharedEvolutionConfig,
     workspace_root: PathBuf,
-    writer: Option<Arc<AsyncJsonlWriter>>,
     debug_raw: bool,
 }
 
 impl PromptEvolutionEngine {
+    /// Construct the engine.
+    ///
+    /// FIX-P1-09: the audit JSONL is now written exclusively by the pipeline (single
+    /// source of truth), so this engine no longer owns a writer. The `_writer` parameter
+    /// is kept for call-site compatibility but is intentionally unused.
     pub fn new(
         shared_config: SharedEvolutionConfig,
         workspace_root: impl AsRef<Path>,
-        writer: Option<Arc<AsyncJsonlWriter>>,
+        _writer: Option<Arc<AsyncJsonlWriter>>,
     ) -> Self {
         Self {
             shared_config,
             workspace_root: workspace_root.as_ref().to_path_buf(),
-            writer,
             debug_raw: false,
         }
     }
@@ -128,6 +132,19 @@ impl PromptEvolutionEngine {
         }
     }
 
+    /// Build an owner-safe summary of a proposed prompt for DraftOnly persistence.
+    ///
+    /// Never includes the full prompt body; only a sha256 digest plus size metadata so
+    /// a proposal stored in a shared/cross-owner location cannot leak prompt contents.
+    fn draft_content_summary(content: &str) -> String {
+        format!(
+            "draft_only:sha256={};bytes={};lines={}",
+            sha256_hex(content),
+            content.len(),
+            content.lines().count()
+        )
+    }
+
     fn redact_evolution_content(before: &str, after: &str, diff: &str, debug_raw: bool) -> (String, String, String) {
         if is_raw_debug_enabled(debug_raw) {
             return (before.to_string(), after.to_string(), diff.to_string());
@@ -173,38 +190,23 @@ impl PromptEvolutionEngine {
         Ok(())
     }
 
-    async fn backup_version(&self, target: &Path, content: &str, max_versions: usize) -> Result<()> {
-        let rel = target
-            .strip_prefix(&self.workspace_root)
-            .unwrap_or(target)
-            .to_string_lossy()
-            .replace('/', "__");
-        let versions_dir = self.workspace_root.join(".evolution/prompt_versions").join(rel);
-        fs::create_dir_all(&versions_dir).await?;
-        let file = versions_dir.join(format!("{}.bak", Uuid::now_v7()));
-        atomic_write(&self.workspace_root, &file, content.as_bytes()).await?;
+    /// Per-layer rollback directory shared with the pipeline rollback path.
+    ///
+    /// Must stay byte-identical with `pipeline::infer_rollback_dir(_, Prompt)` so that
+    /// a backup written here is discoverable when the pipeline triggers a rollback.
+    fn rollback_dir(&self) -> PathBuf {
+        self.workspace_root.join(".evolution").join("rollback").join("prompt")
+    }
 
-        let mut entries = Vec::new();
-        let mut rd = fs::read_dir(&versions_dir).await?;
-        while let Some(entry) = rd.next_entry().await? {
-            if entry.file_type().await?.is_file() {
-                entries.push(entry);
-            }
-        }
-        entries.sort_by_key(|entry| entry.file_name());
-        if entries.len() > max_versions.max(1) {
-            let stale_count = entries.len() - max_versions.max(1);
-            for entry in entries.into_iter().take(stale_count) {
-                let stale_path = entry.path();
-                if let Err(err) = fs::remove_file(&stale_path).await {
-                    tracing::warn!(
-                        error = %err,
-                        path = %stale_path.display(),
-                        "failed to prune stale prompt backup version"
-                    );
-                }
-            }
-        }
+    /// Back up the current prompt file via the shared `RollbackManager`.
+    ///
+    /// This writes a `VersionSnapshot` JSON under `.evolution/rollback/prompt/<uuid>.json`,
+    /// the exact layout the pipeline's `RollbackManager::rollback_latest` reads. Replaces
+    /// the previous bespoke `.evolution/prompt_versions/<rel>/<uuid>.bak` format that the
+    /// rollback path could never locate.
+    async fn backup_version(&self, target: &Path, max_versions: usize) -> Result<()> {
+        let manager = RollbackManager::new(&self.workspace_root, target, self.rollback_dir(), max_versions)?;
+        manager.backup_current_version().await?;
         Ok(())
     }
 }
@@ -250,6 +252,18 @@ impl EvolutionEngine for PromptEvolutionEngine {
         let needs_human_approval = severity > prompt_cfg.human_approval_severity;
         let diff = Self::generate_diff(&before, &after);
 
+        // FIX-P0-05: In DraftOnly mode the proposal is persisted to a shared, potentially
+        // cross-owner JSONL/store without an owner scope. Persisting the full mutated prompt
+        // there would leak prompt contents across owners. Store a summary + sha256 digest
+        // instead; the full content is only materialized when a mutation is actually applied.
+        let operation = if matches!(mode, crate::self_system::evolution::EvolutionMode::DraftOnly) {
+            ChangeOperation::Write {
+                content: Self::draft_content_summary(&after),
+            }
+        } else {
+            ChangeOperation::Write { content: after.clone() }
+        };
+
         let proposal = EvolutionProposal {
             id: Uuid::now_v7().to_string(),
             summary: format!("Prompt mutation for {relative_target}"),
@@ -262,7 +276,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
             target: ChangeTarget::WorkspaceFile {
                 path: relative_target.clone(),
             },
-            operation: ChangeOperation::Write { content: after.clone() },
+            operation,
         };
 
         let mut outcome = CycleOutcome::NoAction;
@@ -274,7 +288,7 @@ impl EvolutionEngine for PromptEvolutionEngine {
                 outcome = CycleOutcome::ApprovalRequired;
                 notes = "severity exceeded threshold".to_string();
             } else {
-                self.backup_version(&target_path, &before, prompt_cfg.max_rollback_versions)
+                self.backup_version(&target_path, prompt_cfg.max_rollback_versions)
                     .await?;
                 atomic_write(&self.workspace_root, &target_path, after.as_bytes()).await?;
                 outcome = CycleOutcome::Applied;
@@ -310,9 +324,11 @@ impl EvolutionEngine for PromptEvolutionEngine {
             }),
         };
 
-        if let Some(writer) = &self.writer {
-            writer.append_evolution(&evolution_log).await?;
-        }
+        // FIX-P1-09 (single audit source): the engine no longer appends the evolution log
+        // to JSONL here. The pipeline is the sole writer of the audit record (it stamps the
+        // canonical experiment_id and final result), so writing here too produced duplicate
+        // rows with diverging conclusions for the same experiment_id. The log is returned in
+        // `CycleResult.evolution_log` for the pipeline to persist exactly once.
 
         let cycle = EvolutionCycle {
             id: cycle_id,
@@ -441,5 +457,81 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("parent traversal"));
+    }
+
+    #[tokio::test]
+    async fn auto_mode_apply_then_rollback_restores_original_prompt() {
+        use crate::self_system::evolution::rollback::RollbackManager;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("p.md");
+        let original = "system instructions v1\nbe helpful\n";
+        fs::write(&path, original).await.unwrap();
+
+        let mut cfg = EvolutionConfig::default();
+        cfg.runtime.mode = EvolutionMode::Auto;
+        cfg.prompt.mutable_files = vec!["p.md".to_string()];
+        // Severity 1 (FineTune) stays below default approval threshold (3) so it applies.
+        let shared = new_shared_evolution_config(cfg);
+        let mut engine = PromptEvolutionEngine::new(shared, dir.path(), None);
+
+        let result = engine
+            .run_cycle(EngineCycleInput {
+                cycle_id: "x".to_string(),
+                analyzer_candidates: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(result.cycle.outcome, CycleOutcome::Applied));
+
+        // File was mutated by apply.
+        let after_apply = fs::read_to_string(&path).await.unwrap();
+        assert_ne!(after_apply, original);
+
+        // Backup must be discoverable via the SAME directory/format the pipeline uses.
+        let rollback_dir = dir.path().join(".evolution").join("rollback").join("prompt");
+        let manager = RollbackManager::new(dir.path(), &path, &rollback_dir, 10).unwrap();
+        let versions = manager.list_versions().await.unwrap();
+        assert_eq!(versions.len(), 1, "exactly one VersionSnapshot json should exist");
+
+        manager.rollback_latest().await.unwrap();
+        let restored = fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            restored, original,
+            "rollback must restore original prompt byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_only_proposal_stores_hash_not_full_prompt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("p.md");
+        let original = "TOP SECRET PROMPT BODY that must not leak\n";
+        fs::write(&path, original).await.unwrap();
+
+        let mut cfg = EvolutionConfig::default();
+        cfg.runtime.mode = EvolutionMode::DraftOnly;
+        cfg.prompt.mutable_files = vec!["p.md".to_string()];
+        let shared = new_shared_evolution_config(cfg);
+        let mut engine = PromptEvolutionEngine::new(shared, dir.path(), None);
+
+        let result = engine
+            .run_cycle(EngineCycleInput {
+                cycle_id: "x".to_string(),
+                analyzer_candidates: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let proposal = result.proposal.expect("draft-only must still emit a proposal");
+        let crate::self_system::evolution::ChangeOperation::Write { content } = proposal.operation else {
+            panic!("expected Write operation");
+        };
+        // Must be a digest summary, never the raw mutated prompt body.
+        assert!(content.starts_with("draft_only:sha256="));
+        assert!(!content.contains("TOP SECRET PROMPT BODY"));
+        assert!(!content.contains("be helpful"));
+        // DraftOnly never mutates the file.
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), original);
     }
 }
