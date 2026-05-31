@@ -436,6 +436,17 @@ async fn persist_tool_output_document(
     let Some(runtime) = runtime else {
         return None;
     };
+    // FIX-P0-28: backends without durable document ingest (NoneMemory /
+    // MarkdownMemory) must skip persistence and degrade to plain history
+    // compaction instead of emitting a fail-fast error on every large tool output.
+    if !runtime.memory.supports_document_ingest() {
+        tracing::debug!(
+            tool = %tool_name,
+            backend = runtime.memory.name(),
+            "memory backend does not support document ingest; skipping tool output persistence (status=backend_not_supported)"
+        );
+        return Some("backend_not_supported");
+    }
     let (document_id, sha256) = tool_output_document_id(tool_name, content);
     let metadata_json = serde_json::json!({
         "tool": tool_name,

@@ -188,6 +188,10 @@ impl Memory for MarkdownMemory {
         "markdown"
     }
 
+    fn supports_document_ingest(&self) -> bool {
+        false
+    }
+
     async fn store(
         &self,
         key: &str,

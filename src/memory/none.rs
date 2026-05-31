@@ -61,6 +61,10 @@ impl Memory for NoneMemory {
     async fn health_check(&self) -> bool {
         true
     }
+
+    fn supports_document_ingest(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

@@ -671,6 +671,16 @@ pub trait Memory: Send + Sync {
         Ok(0)
     }
 
+    /// Whether this backend can durably ingest source documents and chunks
+    /// (FIX-P0-28). Backends with full document support (SQLite/Postgres) keep the
+    /// default `true`. Backends without it (`NoneMemory`, `MarkdownMemory`) return
+    /// `false` so callers can skip ingestion and gracefully degrade to plain
+    /// history compaction instead of emitting a fail-fast error on every large
+    /// tool output.
+    fn supports_document_ingest(&self) -> bool {
+        true
+    }
+
     /// Append a persisted channel conversation turn.
     ///
     /// Backends without conversation persistence can no-op.

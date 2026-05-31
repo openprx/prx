@@ -114,6 +114,9 @@ pub async fn run_runtime(config: &Config) -> Result<()> {
     check_channel_runtime(config, &mut items);
     check_console_runtime(config, &mut items).await;
     check_runtime_memory_health(config, &mut items).await;
+    check_runtime_readiness(config, &mut items);
+    check_postgres_health(config, &mut items).await;
+    check_embedding_endpoint(config, &mut items).await;
     print_report("OpenPRX Doctor - Runtime Matrix", &items);
     Ok(())
 }
@@ -343,6 +346,269 @@ async fn check_runtime_memory_health(config: &Config, items: &mut Vec<DiagItem>)
             }
         }
         Err(error) => items.push(DiagItem::error(cat, format!("failed to open memory backend: {error}"))),
+    }
+}
+
+/// FIX-P2-06: Read-only runtime readiness sub-checks.
+///
+/// Each verifies that the configuration is internally consistent enough for the
+/// corresponding subsystem to operate: owner ACL, topic scoping, task lineage,
+/// document ingest, vector index, and the runtime-control ladder. These are
+/// config-derived probes only -- they do not open the database or touch the
+/// network.
+fn check_runtime_readiness(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "readiness";
+    let mem = &config.memory;
+    let backend = mem.backend.trim().to_ascii_lowercase();
+    let persistent = !matches!(backend.as_str(), "none" | "markdown");
+    let embeddings_enabled = !mem.embedding_provider.trim().eq_ignore_ascii_case("none");
+
+    // 1. owner readiness: ACL enforcement requires a persistent backend.
+    if !mem.acl_enabled {
+        items.push(DiagItem::warn(
+            cat,
+            "owner: memory.acl_enabled is false; owner/topic scoping is not enforced",
+        ));
+    } else if persistent {
+        items.push(DiagItem::ok(cat, "owner: ACL enforced on a persistent backend"));
+    } else {
+        items.push(DiagItem::warn(
+            cat,
+            format!("owner: ACL enabled but backend '{backend}' does not persist owner scopes"),
+        ));
+    }
+
+    // 2. topic readiness: topic/semantic scoping needs embeddings enabled.
+    if embeddings_enabled && mem.embedding_dimensions > 0 {
+        items.push(DiagItem::ok(
+            cat,
+            format!("topic: semantic topic scoping ready (dim {})", mem.embedding_dimensions),
+        ));
+    } else {
+        items.push(DiagItem::warn(
+            cat,
+            "topic: embeddings disabled; topic/semantic scoping falls back to keyword search",
+        ));
+    }
+
+    // 3. task readiness: task lineage events need event recording enabled.
+    if mem.events.enabled {
+        items.push(DiagItem::ok(cat, "task: lifecycle/task event recording enabled"));
+    } else {
+        items.push(DiagItem::warn(
+            cat,
+            "task: memory.events.enabled is false; task lineage events are not recorded",
+        ));
+    }
+
+    // 4. document readiness: document ingest needs a persistent backend.
+    if persistent {
+        items.push(DiagItem::ok(cat, "document: ingest backed by a persistent store"));
+    } else {
+        items.push(DiagItem::warn(
+            cat,
+            format!("document: backend '{backend}' does not persist ingested documents"),
+        ));
+    }
+
+    // 5. vector readiness: vector recall needs embeddings + a sane dimension.
+    if !embeddings_enabled {
+        items.push(DiagItem::warn(
+            cat,
+            "vector: embeddings disabled; vector recall unavailable (keyword/FTS only)",
+        ));
+    } else if mem.embedding_dimensions == 0 {
+        items.push(DiagItem::error(
+            cat,
+            "vector: embedding_dimensions is zero while embeddings are enabled",
+        ));
+    } else {
+        items.push(DiagItem::ok(
+            cat,
+            format!("vector: index ready (dim {})", mem.embedding_dimensions),
+        ));
+    }
+
+    // 6. runtime-control readiness: autonomy posture is resolvable.
+    items.push(DiagItem::ok(
+        cat,
+        format!(
+            "runtime-control: control ladder ready (autonomy {:?})",
+            config.autonomy.level
+        ),
+    ));
+}
+
+/// FIX-P2-07: Checks Postgres backend health when a Postgres backend is
+/// selected: validates the DSN, runs `SELECT 1` under a 5s timeout, verifies the
+/// `vector` (pgvector) extension is installed, and performs a lightweight column
+/// parity probe against `information_schema`. Skips cleanly (no error) when
+/// Postgres is not configured.
+async fn check_postgres_health(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "postgres";
+    let storage = &config.storage.provider.config;
+    let selects_postgres = storage.provider.trim().eq_ignore_ascii_case("postgres")
+        || config.memory.backend.trim().eq_ignore_ascii_case("postgres");
+    if !selects_postgres {
+        // Not configured for Postgres -- nothing to check.
+        return;
+    }
+
+    let Some(db_url) = storage.db_url.clone() else {
+        items.push(DiagItem::error(
+            cat,
+            "postgres backend selected but [storage.provider.config] db_url is unset",
+        ));
+        return;
+    };
+
+    // Validate the DSN scheme before attempting a connection.
+    let trimmed = db_url.trim();
+    if !(trimmed.starts_with("postgres://") || trimmed.starts_with("postgresql://")) {
+        items.push(DiagItem::error(
+            cat,
+            "db_url must start with postgres:// or postgresql://",
+        ));
+        return;
+    }
+
+    // The `postgres` crate is synchronous and blocking; run the probe on a
+    // blocking thread and bound the whole thing with a 5s timeout.
+    let probe_url = db_url.clone();
+    let probe = tokio::task::spawn_blocking(move || postgres_probe(&probe_url));
+    let outcome = match tokio::time::timeout(Duration::from_secs(5), probe).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(join_err)) => {
+            items.push(DiagItem::error(cat, format!("postgres probe task failed: {join_err}")));
+            return;
+        }
+        Err(_) => {
+            items.push(DiagItem::error(cat, "postgres health probe timed out after 5s"));
+            return;
+        }
+    };
+
+    for item in outcome {
+        items.push(item);
+    }
+}
+
+/// Result of the blocking Postgres probe, mapped to diagnostic items by the
+/// caller. Runs `SELECT 1`, checks pgvector, and a column-parity probe.
+fn postgres_probe(db_url: &str) -> Vec<DiagItem> {
+    let cat = "postgres";
+    let mut out = Vec::new();
+
+    let mut cfg = match db_url.parse::<postgres::Config>() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            out.push(DiagItem::error(cat, format!("invalid db_url: {e}")));
+            return out;
+        }
+    };
+    cfg.connect_timeout(Duration::from_secs(4));
+
+    let mut client = match cfg.connect(postgres::NoTls) {
+        Ok(client) => client,
+        Err(e) => {
+            out.push(DiagItem::error(cat, format!("could not connect to postgres: {e}")));
+            return out;
+        }
+    };
+
+    // SELECT 1 connectivity probe.
+    match client.query_one("SELECT 1", &[]) {
+        Ok(_) => out.push(DiagItem::ok(cat, "SELECT 1 succeeded")),
+        Err(e) => {
+            out.push(DiagItem::error(cat, format!("SELECT 1 failed: {e}")));
+            return out;
+        }
+    }
+
+    // pgvector extension presence + version.
+    match client.query_opt(
+        "SELECT extversion FROM pg_extension WHERE extname = 'vector'",
+        &[],
+    ) {
+        Ok(Some(row)) => {
+            let version: String = row.try_get(0).unwrap_or_else(|_| "unknown".to_string());
+            out.push(DiagItem::ok(cat, format!("pgvector extension installed (version {version})")));
+        }
+        Ok(None) => out.push(DiagItem::error(
+            cat,
+            "pgvector extension not installed (run: CREATE EXTENSION vector;)",
+        )),
+        Err(e) => out.push(DiagItem::warn(cat, format!("could not query pg_extension: {e}"))),
+    }
+
+    // Column-parity probe: the ACL layer relies on memories.owner_id. A missing
+    // column indicates schema drift between the expected and deployed schema.
+    match client.query_opt(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_name = 'memories' AND column_name = 'owner_id'",
+        &[],
+    ) {
+        Ok(Some(_)) => out.push(DiagItem::ok(cat, "schema parity: memories.owner_id present")),
+        Ok(None) => out.push(DiagItem::warn(
+            cat,
+            "schema parity: memories.owner_id missing or table not yet migrated",
+        )),
+        Err(e) => out.push(DiagItem::warn(cat, format!("could not inspect information_schema: {e}"))),
+    }
+
+    out
+}
+
+/// FIX-P2-08: Probes the configured custom embedding endpoint with a
+/// short-timeout HEAD request (falling back to OPTIONS), so `prx doctor`
+/// surfaces an unreachable embedding service before recall silently degrades.
+/// Only `custom:<url>` providers expose a probe-able HTTP endpoint; other
+/// providers (none/openai/built-in) are skipped.
+async fn check_embedding_endpoint(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "embedding";
+    let provider = config.memory.embedding_provider.trim();
+    let Some(url) = provider.strip_prefix("custom:").map(str::trim) else {
+        // No custom endpoint configured -- nothing to probe here. The provider
+        // validity itself is reported by check_memory_diagnostics.
+        return;
+    };
+    if url.is_empty() {
+        items.push(DiagItem::error(cat, "custom embedding endpoint URL is empty"));
+        return;
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            items.push(DiagItem::warn(cat, format!("could not build HTTP probe client: {e}")));
+            return;
+        }
+    };
+
+    // Try HEAD first; fall back to OPTIONS for gateways that omit HEAD. Any HTTP
+    // response (including 4xx/405) proves reachability -- we check connectivity,
+    // not authorization.
+    let mut reachable = client.head(url).send().await.ok().map(|r| r.status());
+    if reachable.is_none() {
+        reachable = client
+            .request(reqwest::Method::OPTIONS, url)
+            .send()
+            .await
+            .ok()
+            .map(|r| r.status());
+    }
+
+    match reachable {
+        Some(status) => {
+            items.push(DiagItem::ok(cat, format!("embedding endpoint reachable (HTTP {status})")))
+        }
+        None => items.push(DiagItem::warn(
+            cat,
+            format!("embedding endpoint unreachable within 2s: {url}"),
+        )),
     }
 }
 
@@ -1685,5 +1951,107 @@ mod tests {
         assert_eq!(agent_messages.len(), 2);
         assert!(agent_messages[0].contains("agent \"alpha\""));
         assert!(agent_messages[1].contains("agent \"zeta\""));
+    }
+
+    // ---- FIX-P2-06: runtime readiness sub-checks ------------------------
+
+    #[test]
+    fn runtime_readiness_emits_six_subchecks() {
+        let config = Config::default();
+        let mut items = Vec::new();
+        check_runtime_readiness(&config, &mut items);
+        let readiness: Vec<&str> = items
+            .iter()
+            .filter(|i| i.category == "readiness")
+            .map(|i| i.message.as_str())
+            .collect();
+        assert_eq!(readiness.len(), 6, "expected 6 readiness sub-checks");
+        for prefix in ["owner:", "topic:", "task:", "document:", "vector:", "runtime-control:"] {
+            assert!(
+                readiness.iter().any(|m| m.starts_with(prefix)),
+                "missing readiness sub-check with prefix {prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_readiness_flags_zero_dimension_with_embeddings() {
+        let mut config = Config::default();
+        config.memory.embedding_provider = "openai".into();
+        config.memory.embedding_dimensions = 0;
+        let mut items = Vec::new();
+        check_runtime_readiness(&config, &mut items);
+        assert!(
+            items.iter().any(|i| i.category == "readiness"
+                && i.severity == Severity::Error
+                && i.message.starts_with("vector:")),
+            "expected vector readiness error for zero dimension"
+        );
+    }
+
+    // ---- FIX-P2-07: postgres health -------------------------------------
+
+    #[tokio::test]
+    async fn postgres_health_skips_when_not_selected() {
+        // Default backend is sqlite -> no postgres items emitted at all.
+        let config = Config::default();
+        let mut items = Vec::new();
+        check_postgres_health(&config, &mut items).await;
+        assert!(items.iter().all(|i| i.category != "postgres"));
+    }
+
+    #[tokio::test]
+    async fn postgres_health_errors_on_missing_db_url() {
+        let mut config = Config::default();
+        config.memory.backend = "postgres".into();
+        let mut items = Vec::new();
+        check_postgres_health(&config, &mut items).await;
+        assert!(
+            items
+                .iter()
+                .any(|i| i.category == "postgres" && i.severity == Severity::Error),
+            "expected error when postgres selected without db_url"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_health_errors_on_bad_scheme() {
+        let mut config = Config::default();
+        config.memory.backend = "postgres".into();
+        config.storage.provider.config.db_url = Some("mysql://host/db".into());
+        let mut items = Vec::new();
+        check_postgres_health(&config, &mut items).await;
+        assert!(
+            items.iter().any(|i| i.category == "postgres"
+                && i.severity == Severity::Error
+                && i.message.contains("postgres://")),
+            "expected scheme validation error"
+        );
+    }
+
+    // ---- FIX-P2-08: embedding endpoint probe ----------------------------
+
+    #[tokio::test]
+    async fn embedding_probe_skips_without_custom_provider() {
+        // Default provider is "none" -> no embedding probe items.
+        let config = Config::default();
+        let mut items = Vec::new();
+        check_embedding_endpoint(&config, &mut items).await;
+        assert!(items.iter().all(|i| i.category != "embedding"));
+    }
+
+    #[tokio::test]
+    async fn embedding_probe_warns_on_unreachable_custom_endpoint() {
+        let mut config = Config::default();
+        // Port 1 on localhost is reserved and refuses connections quickly.
+        config.memory.embedding_provider = "custom:http://127.0.0.1:1/embed".into();
+        let mut items = Vec::new();
+        check_embedding_endpoint(&config, &mut items).await;
+        assert!(
+            items
+                .iter()
+                .any(|i| i.category == "embedding" && i.severity == Severity::Warn),
+            "expected warn for unreachable embedding endpoint"
+        );
     }
 }

@@ -2967,6 +2967,92 @@ impl MemoryConfig {
             record_tool_events: self.events.record_tool_events,
         }
     }
+
+    /// Known memory backend identifiers accepted by the runtime.
+    const KNOWN_BACKENDS: &'static [&'static str] = &["sqlite", "lucid", "postgres", "markdown", "none"];
+
+    /// Validates the `[memory]` subtree (FIX-P2-09).
+    ///
+    /// Checks backend selection, embedding provider/model/dimension coherence,
+    /// hybrid-scoring weights, and the recall relevance threshold. This is
+    /// invoked from [`Config::validate`]; previously the memory subtree was not
+    /// validated at all.
+    pub fn validate(&self) -> Result<()> {
+        // 1. Backend must be a recognized identifier.
+        let backend = self.backend.trim().to_ascii_lowercase();
+        if !Self::KNOWN_BACKENDS.contains(&backend.as_str()) {
+            anyhow::bail!(
+                "memory.backend '{}' is not a known backend (expected one of: {})",
+                self.backend,
+                Self::KNOWN_BACKENDS.join(", ")
+            );
+        }
+
+        // 2. Embedding provider: "none" | "openai" | "custom:<url>".
+        //    Empty is invalid (use "none" to disable embeddings explicitly).
+        let provider = self.embedding_provider.trim();
+        if provider.is_empty() {
+            anyhow::bail!("memory.embedding_provider must not be empty (use \"none\" to disable)");
+        }
+        if let Some(url) = provider.strip_prefix("custom:") {
+            // A custom embedding endpoint must be a well-formed http(s) URL.
+            let url = url.trim();
+            let parsed = reqwest::Url::parse(url).map_err(|e| {
+                anyhow::anyhow!("memory.embedding_provider custom endpoint is not a valid URL: {e}")
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                anyhow::bail!(
+                    "memory.embedding_provider custom endpoint must use http/https, got '{}'",
+                    parsed.scheme()
+                );
+            }
+        }
+
+        // 3. Embeddings, when enabled (provider != "none"), need a non-zero
+        //    dimension and a non-empty model identifier.
+        let embeddings_enabled = !provider.eq_ignore_ascii_case("none");
+        if embeddings_enabled {
+            if self.embedding_dimensions == 0 {
+                anyhow::bail!(
+                    "memory.embedding_dimensions must be greater than zero when embeddings are enabled"
+                );
+            }
+            if self.embedding_model.trim().is_empty() {
+                anyhow::bail!(
+                    "memory.embedding_model must not be empty when embeddings are enabled"
+                );
+            }
+        }
+        // An absurdly large dimension is almost certainly a misconfiguration.
+        if self.embedding_dimensions > 65536 {
+            anyhow::bail!("memory.embedding_dimensions exceeds maximum (65536)");
+        }
+
+        // 4. Hybrid scoring weights must be non-negative and finite.
+        for (name, value) in [
+            ("memory.vector_weight", self.vector_weight),
+            ("memory.keyword_weight", self.keyword_weight),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                anyhow::bail!("{name} must be a finite, non-negative number, got {value}");
+            }
+        }
+        if self.vector_weight == 0.0 && self.keyword_weight == 0.0 {
+            anyhow::bail!(
+                "memory.vector_weight and memory.keyword_weight must not both be zero"
+            );
+        }
+
+        // 5. Minimum relevance score is a similarity threshold in [0.0, 1.0].
+        if !(0.0..=1.0).contains(&self.min_relevance_score) {
+            anyhow::bail!(
+                "memory.min_relevance_score must be in [0.0, 1.0], got {}",
+                self.min_relevance_score
+            );
+        }
+
+        Ok(())
+    }
 }
 
 /// Startup identity binding entry (`[[identity_bindings]]`).
@@ -5274,6 +5360,10 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
+        // Memory subtree (FIX-P2-09): previously the [memory] subtree was not
+        // validated at all; wire it into the top-level validator.
+        self.memory.validate()?;
+
         Ok(())
     }
 
@@ -5349,6 +5439,17 @@ pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Res
     fs::create_dir_all(parent_dir)
         .await
         .with_context(|| format!("Failed to create config directory: {}", parent_dir.display()))?;
+
+    // FIX-P2-10: acquire a cross-process exclusive advisory lock before the
+    // write+rename critical section. Without it, two PRX processes saving the
+    // config concurrently can interleave their temp-write/backup/rename steps
+    // and silently drop one process's update (last-writer-wins data loss). The
+    // lock is created beside the config path (`<name>.<ext>.lock`) and is held
+    // until this function returns (the guard is dropped after the rename and
+    // permission fix-up complete). Reuses the existing, audited lock helper so
+    // no new dependency or `unsafe` is introduced.
+    let _config_write_lock =
+        crate::self_system::evolution::safety_utils::acquire_file_lock(path).await?;
 
     let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or("config.toml");
     let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
@@ -7726,5 +7827,118 @@ allowed_from = ["*"]
             mode & 0o004 != 0,
             "Test setup: file should be world-readable (mode {mode:o})"
         );
+    }
+
+    // ---- FIX-P2-09: MemoryConfig::validate -------------------------------
+
+    #[test]
+    async fn memory_default_validates() {
+        assert!(MemoryConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    async fn memory_unknown_backend_rejected() {
+        let mut mem = MemoryConfig::default();
+        mem.backend = "cassandra".into();
+        assert!(mem.validate().is_err());
+    }
+
+    #[test]
+    async fn memory_empty_embedding_provider_rejected() {
+        let mut mem = MemoryConfig::default();
+        mem.embedding_provider = "  ".into();
+        assert!(mem.validate().is_err());
+    }
+
+    #[test]
+    async fn memory_zero_dimension_with_embeddings_rejected() {
+        let mut mem = MemoryConfig::default();
+        mem.embedding_provider = "openai".into();
+        mem.embedding_dimensions = 0;
+        assert!(mem.validate().is_err());
+    }
+
+    #[test]
+    async fn memory_zero_dimension_with_none_provider_allowed() {
+        // When embeddings are disabled, a zero dimension is acceptable.
+        let mut mem = MemoryConfig::default();
+        mem.embedding_provider = "none".into();
+        mem.embedding_dimensions = 0;
+        assert!(mem.validate().is_ok());
+    }
+
+    #[test]
+    async fn memory_custom_provider_requires_valid_url() {
+        let mut mem = MemoryConfig::default();
+        mem.embedding_provider = "custom:not a url".into();
+        assert!(mem.validate().is_err());
+
+        mem.embedding_provider = "custom:ftp://host/embed".into();
+        assert!(mem.validate().is_err());
+
+        mem.embedding_provider = "custom:https://host/embed".into();
+        assert!(mem.validate().is_ok());
+    }
+
+    #[test]
+    async fn memory_both_weights_zero_rejected() {
+        let mut mem = MemoryConfig::default();
+        mem.vector_weight = 0.0;
+        mem.keyword_weight = 0.0;
+        assert!(mem.validate().is_err());
+    }
+
+    #[test]
+    async fn memory_out_of_range_relevance_rejected() {
+        let mut mem = MemoryConfig::default();
+        mem.min_relevance_score = 1.5;
+        assert!(mem.validate().is_err());
+        mem.min_relevance_score = -0.1;
+        assert!(mem.validate().is_err());
+    }
+
+    #[test]
+    async fn config_validate_rejects_bad_memory_subtree() {
+        // FIX-P2-09: memory validation is now reachable from Config::validate.
+        let mut config = Config::default();
+        config.memory.min_relevance_score = 9.0;
+        assert!(config.validate().is_err());
+    }
+
+    // ---- FIX-P2-10: write_toml_string_atomic file lock -------------------
+
+    #[test]
+    async fn write_toml_string_atomic_writes_under_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("config.toml");
+        write_toml_string_atomic(&target, "key = 1\n")
+            .await
+            .expect("atomic write");
+        let read_back = tokio::fs::read_to_string(&target).await.unwrap();
+        assert_eq!(read_back, "key = 1\n");
+    }
+
+    #[test]
+    async fn write_toml_string_atomic_repeated_last_writer_wins() {
+        // Sequential locked writes succeed and leave no leftover temp file.
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("config.toml");
+        for i in 0..4 {
+            write_toml_string_atomic(&target, &format!("n = {i}\n"))
+                .await
+                .expect("atomic write");
+        }
+        let read_back = tokio::fs::read_to_string(&target).await.unwrap();
+        assert_eq!(read_back, "n = 3\n");
+        // No `.tmp-*` temp file should linger in the directory.
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.contains(".tmp-"),
+                "leftover temp file lingered: {name}"
+            );
+        }
     }
 }
