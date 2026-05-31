@@ -2250,6 +2250,7 @@ async fn process_channel_message(
                     persona_id: None,
                     source_event_id: inbound_event.as_ref().map(|event| event.event_id.clone()),
                     source: Some("semantic_promotion".to_string()),
+                    topic_id: None,
                 },
             )
             .await;

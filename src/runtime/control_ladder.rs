@@ -1,6 +1,6 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs::OpenOptions;
@@ -8,7 +8,20 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+/// Legacy (un-rotated) trace path. Retained as the historical sink name and as
+/// the base used to derive the per-day rotated file names. New writes go to the
+/// dated variant produced by [`dated_trace_path`].
 pub const CONTROL_LADDER_TRACE_PATH: &str = "runtime/control_ladder_traces.jsonl";
+
+/// Directory (relative to the workspace) that holds rotated trace files.
+const CONTROL_LADDER_TRACE_DIR: &str = "runtime";
+/// File-name prefix for rotated trace files: `control_ladder_traces.YYYY-MM-DD.jsonl`.
+const CONTROL_LADDER_TRACE_PREFIX: &str = "control_ladder_traces.";
+/// File-name suffix for rotated trace files.
+const CONTROL_LADDER_TRACE_SUFFIX: &str = ".jsonl";
+/// Retention window for rotated trace files. Files whose embedded date is older
+/// than this many days are deleted by [`cleanup_old_control_ladder_traces`].
+pub const CONTROL_LADDER_TRACE_RETENTION_DAYS: i64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControlLayerTrace {
@@ -152,12 +165,100 @@ impl ControlLadderTrace {
     }
 }
 
+/// Compute the rotated trace file path for `date` under `workspace_dir`:
+/// `runtime/control_ladder_traces.YYYY-MM-DD.jsonl`.
+#[must_use]
+pub fn dated_trace_path(workspace_dir: &Path, date: DateTime<Utc>) -> PathBuf {
+    let file_name = format!(
+        "{CONTROL_LADDER_TRACE_PREFIX}{}{CONTROL_LADDER_TRACE_SUFFIX}",
+        date.format("%Y-%m-%d")
+    );
+    workspace_dir.join(CONTROL_LADDER_TRACE_DIR).join(file_name)
+}
+
+/// Maximum time to wait for the trace lock before giving up.
+const TRACE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Poll interval while spinning for the trace lock.
+const TRACE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// RAII guard for an exclusive cross-process lock implemented as a `.lock`
+/// sidecar file (same pattern as `self_system::evolution::safety_utils`).
+///
+/// The lock is held for the lifetime of the guard; `Drop` removes the sidecar
+/// so a crash that leaks the file only blocks for at most [`TRACE_LOCK_TIMEOUT`]
+/// before the next writer reclaims it. The workspace denies `unsafe_code`, so an
+/// `O_CREAT|O_EXCL` (`create_new`) sidecar is used instead of `flock(2)`.
+struct TraceLockGuard {
+    lock_path: PathBuf,
+}
+
+impl Drop for TraceLockGuard {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_file(&self.lock_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(path = %self.lock_path.display(), error = %err, "failed to remove trace lock");
+            }
+        }
+    }
+}
+
+/// Acquire an exclusive cross-process lock for the trace file at `trace_path`
+/// via a `<trace_path>.lock` sidecar created with `create_new` (atomic
+/// `O_CREAT|O_EXCL`). Synchronous (the trace write path is sync); spins with a
+/// bounded wait so concurrent writers serialize instead of interleaving partial
+/// lines. A stale sidecar from a crashed writer is reclaimed after the timeout.
+fn acquire_trace_lock(trace_path: &Path) -> Result<TraceLockGuard> {
+    let lock_path = trace_path.with_extension("jsonl.lock");
+    let start = std::time::Instant::now();
+    loop {
+        match OpenOptions::new().create_new(true).write(true).open(&lock_path) {
+            Ok(mut file) => {
+                // Best-effort marker; failure to write the body does not affect
+                // the lock semantics (existence is the lock).
+                let _ = file.write_all(b"lock");
+                return Ok(TraceLockGuard { lock_path });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if start.elapsed() > TRACE_LOCK_TIMEOUT {
+                    // Reclaim a presumed-stale lock from a crashed writer, then
+                    // retry once on the next loop iteration.
+                    match std::fs::remove_file(&lock_path) {
+                        Ok(()) => {
+                            tracing::warn!(path = %lock_path.display(), "reclaimed stale trace lock after timeout");
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(e).with_context(|| {
+                                format!("failed to reclaim stale trace lock {}", lock_path.display())
+                            });
+                        }
+                    }
+                } else {
+                    std::thread::sleep(TRACE_LOCK_POLL);
+                }
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to open trace lock file {}", lock_path.display()));
+            }
+        }
+    }
+}
+
+/// Append a control-ladder trace as one JSON line to the per-day rotated file
+/// `runtime/control_ladder_traces.YYYY-MM-DD.jsonl` (rotation key = current UTC
+/// date), serializing concurrent writers with an exclusive advisory file lock so
+/// lines larger than `PIPE_BUF` cannot be torn by interleaved appends.
+/// Returns the path actually written to.
 pub fn append_control_ladder_trace(workspace_dir: &Path, trace: &ControlLadderTrace) -> Result<PathBuf> {
-    let path = workspace_dir.join(CONTROL_LADDER_TRACE_PATH);
+    let path = dated_trace_path(workspace_dir, Utc::now());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create control ladder trace directory {}", parent.display()))?;
     }
+
+    // Hold the advisory lock across open+write so the append is atomic w.r.t.
+    // other cooperating writers. Lock is released when `_lock` drops.
+    let _lock = acquire_trace_lock(&path)?;
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -167,6 +268,58 @@ pub fn append_control_ladder_trace(workspace_dir: &Path, trace: &ControlLadderTr
     let line = serde_json::to_string(trace)?;
     writeln!(file, "{line}").with_context(|| format!("failed to append control ladder trace {}", path.display()))?;
     Ok(path)
+}
+
+/// Parse the embedded `YYYY-MM-DD` date from a rotated trace file name, e.g.
+/// `control_ladder_traces.2026-05-31.jsonl`. Returns `None` for names that do
+/// not match the rotated pattern (including the legacy un-dated file and the
+/// `.lock` sidecars).
+fn parse_trace_file_date(file_name: &str) -> Option<chrono::NaiveDate> {
+    let rest = file_name.strip_prefix(CONTROL_LADDER_TRACE_PREFIX)?;
+    let date_str = rest.strip_suffix(CONTROL_LADDER_TRACE_SUFFIX)?;
+    chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()
+}
+
+/// Delete rotated control-ladder trace files whose embedded date is older than
+/// [`CONTROL_LADDER_TRACE_RETENTION_DAYS`] days relative to `now`.
+///
+/// Best-effort and idempotent: a missing trace directory is treated as "nothing
+/// to clean". Returns the number of files removed. The legacy un-dated file and
+/// any non-matching files are left untouched. Intended to be wired into a xin
+/// retention task by the caller (not wired here).
+pub fn cleanup_old_control_ladder_traces(workspace_dir: &Path, now: DateTime<Utc>) -> Result<usize> {
+    let dir = workspace_dir.join(CONTROL_LADDER_TRACE_DIR);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read trace directory {}", dir.display()));
+        }
+    };
+
+    let cutoff = now.date_naive() - chrono::Duration::days(CONTROL_LADDER_TRACE_RETENTION_DAYS);
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(file_date) = parse_trace_file_date(name) else {
+            continue;
+        };
+        if file_date < cutoff {
+            let path = entry.path();
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "failed to remove old control ladder trace");
+                }
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// Pure constructor for a provider-outcome control-ladder trace (d04 §10 G7).
@@ -414,11 +567,122 @@ mod tests {
 
         let path = append_control_ladder_trace(tmp.path(), &trace).unwrap();
 
-        assert_eq!(path, tmp.path().join(CONTROL_LADDER_TRACE_PATH));
-        let content = std::fs::read_to_string(path).unwrap();
+        // Rotation: the written file carries today's UTC date, lives in runtime/,
+        // and matches the per-day path computed for the same instant.
+        assert_eq!(path, dated_trace_path(tmp.path(), Utc::now()));
+        assert_eq!(path.parent().unwrap(), tmp.path().join("runtime"));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("control_ladder_traces."));
+        assert!(name.ends_with(".jsonl"));
+        assert!(parse_trace_file_date(name).is_some());
+
+        let content = std::fs::read_to_string(&path).unwrap();
         let parsed: ControlLadderTrace = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(parsed.source, "test");
         assert_eq!(parsed.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn dated_trace_path_uses_date_in_filename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let date = DateTime::parse_from_rfc3339("2026-05-31T12:34:56Z")
+            .expect("test: valid rfc3339")
+            .with_timezone(&Utc);
+        let path = dated_trace_path(tmp.path(), date);
+        assert_eq!(
+            path,
+            tmp.path()
+                .join("runtime")
+                .join("control_ladder_traces.2026-05-31.jsonl")
+        );
+        assert_eq!(
+            parse_trace_file_date("control_ladder_traces.2026-05-31.jsonl"),
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 31)
+        );
+        // Non-matching names (legacy file, lock sidecar) parse to None.
+        assert!(parse_trace_file_date("control_ladder_traces.jsonl").is_none());
+        assert!(parse_trace_file_date("control_ladder_traces.2026-05-31.jsonl.lock").is_none());
+        assert!(parse_trace_file_date("control_ladder_traces.not-a-date.jsonl").is_none());
+    }
+
+    #[test]
+    fn cleanup_removes_traces_older_than_retention_window() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runtime = tmp.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+
+        let now = DateTime::parse_from_rfc3339("2026-05-31T00:00:00Z")
+            .expect("test: valid rfc3339")
+            .with_timezone(&Utc);
+
+        // 40 days old -> removed; 5 days old -> kept; today -> kept.
+        let old = (now - chrono::Duration::days(40)).format("%Y-%m-%d").to_string();
+        let recent = (now - chrono::Duration::days(5)).format("%Y-%m-%d").to_string();
+        let today = now.format("%Y-%m-%d").to_string();
+        // Exactly at the 30-day boundary -> kept (cutoff is strict `<`).
+        let boundary = (now - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
+
+        for d in [&old, &recent, &today, &boundary] {
+            let p = runtime.join(format!("control_ladder_traces.{d}.jsonl"));
+            std::fs::write(&p, b"{}\n").unwrap();
+        }
+        // Unrelated files must survive cleanup.
+        std::fs::write(runtime.join("control_ladder_traces.jsonl"), b"legacy\n").unwrap();
+        std::fs::write(runtime.join("unrelated.txt"), b"x\n").unwrap();
+
+        let removed = cleanup_old_control_ladder_traces(tmp.path(), now).unwrap();
+        assert_eq!(removed, 1, "only the 40-day-old trace should be removed");
+
+        assert!(!runtime.join(format!("control_ladder_traces.{old}.jsonl")).exists());
+        assert!(runtime.join(format!("control_ladder_traces.{recent}.jsonl")).exists());
+        assert!(runtime.join(format!("control_ladder_traces.{today}.jsonl")).exists());
+        assert!(runtime.join(format!("control_ladder_traces.{boundary}.jsonl")).exists());
+        assert!(runtime.join("control_ladder_traces.jsonl").exists());
+        assert!(runtime.join("unrelated.txt").exists());
+    }
+
+    #[test]
+    fn cleanup_on_missing_dir_is_noop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let removed = cleanup_old_control_ladder_traces(tmp.path(), Utc::now()).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn concurrent_appends_do_not_tear_lines() {
+        use std::sync::Arc;
+        let tmp = Arc::new(tempfile::TempDir::new().unwrap());
+        let workspace = tmp.path().to_path_buf();
+
+        // Build a trace whose serialized line is comfortably larger than PIPE_BUF
+        // (4096 on Linux) so a missing lock would tear interleaved writes.
+        let big = "x".repeat(8192);
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let workspace = workspace.clone();
+                let big = big.clone();
+                std::thread::spawn(move || {
+                    let mut trace = ControlLadderSnapshot::l0_only().build_trace("test", Some(format!("run-{i}")));
+                    trace.mark_active("runtime", "concurrency", json!({ "pad": big }));
+                    for _ in 0..20 {
+                        append_control_ladder_trace(&workspace, &trace).expect("test: append succeeds");
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("test: thread joins");
+        }
+
+        let path = dated_trace_path(&workspace, Utc::now());
+        let content = std::fs::read_to_string(&path).expect("test: trace file readable");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 8 * 20, "every append produced exactly one line");
+        for line in lines {
+            // No torn line: each line must be valid, complete JSON.
+            let parsed: ControlLadderTrace = serde_json::from_str(line).expect("test: each line is intact JSON");
+            assert_eq!(parsed.source, "test");
+        }
     }
 
     // d04 §10 G7: the provider-outcome trace must actually CARRY the structured

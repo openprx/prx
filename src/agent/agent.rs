@@ -1538,9 +1538,19 @@ mod tests {
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "hello");
 
-        let trace_path = workspace
-            .path()
-            .join(crate::runtime::control_ladder::CONTROL_LADDER_TRACE_PATH);
+        // Traces are written to a date-rotated file
+        // (`runtime/control_ladder_traces.YYYY-MM-DD.jsonl`); locate the single
+        // rotated file produced under the workspace runtime dir.
+        let trace_dir = workspace.path().join("runtime");
+        let trace_path = std::fs::read_dir(&trace_dir)
+            .expect("test: runtime trace dir should exist")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("control_ladder_traces.") && name.ends_with(".jsonl"))
+            })
+            .expect("test: a rotated control ladder trace file should exist");
         let trace_content = std::fs::read_to_string(trace_path).unwrap();
         let trace: ControlLadderTrace = serde_json::from_str(trace_content.lines().next().unwrap()).unwrap();
         assert_eq!(trace.source, "agent.turn");

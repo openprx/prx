@@ -5399,6 +5399,7 @@ mod tests {
                 persona_id: Some("persona-a".to_string()),
                 source_event_id: Some("event-123".to_string()),
                 source: Some("semantic_promotion".to_string()),
+                topic_id: None,
             },
         )
         .await
