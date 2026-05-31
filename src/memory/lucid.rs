@@ -382,6 +382,57 @@ impl Memory for LucidMemory {
         self.local.append_memory_event(input).await
     }
 
+    async fn move_to_trash(&self, key: &str, reason: &str, grace_days: u32) -> anyhow::Result<Option<String>> {
+        self.local.move_to_trash(key, reason, grace_days).await
+    }
+
+    async fn create_evolution_proposal(
+        &self,
+        draft: crate::self_system::evolution::EvolutionProposalDraft,
+    ) -> anyhow::Result<String> {
+        self.local.create_evolution_proposal(draft).await
+    }
+
+    async fn list_evolution_proposals(
+        &self,
+        principal: &MemoryPrincipal,
+        filter: crate::self_system::evolution::ProposalFilter,
+    ) -> anyhow::Result<Vec<crate::self_system::evolution::EvolutionProposalDraft>> {
+        self.local.list_evolution_proposals(principal, filter).await
+    }
+
+    async fn get_evolution_proposal(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+    ) -> anyhow::Result<Option<crate::self_system::evolution::EvolutionProposalDraft>> {
+        self.local.get_evolution_proposal(principal, draft_id).await
+    }
+
+    async fn update_evolution_proposal_status(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+        update: crate::self_system::evolution::ProposalStatusUpdate,
+    ) -> anyhow::Result<()> {
+        self.local
+            .update_evolution_proposal_status(principal, draft_id, update)
+            .await
+    }
+
+    async fn append_evolution_proposal_event(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+        event_type: &str,
+        actor: &str,
+        payload_json: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.local
+            .append_evolution_proposal_event(principal, draft_id, event_type, actor, payload_json)
+            .await
+    }
+
     async fn list_memory_events_since(
         &self,
         principal: &MemoryPrincipal,

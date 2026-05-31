@@ -242,6 +242,10 @@ impl MemoryFabric {
                 subject_table: "tasks".to_string(),
                 subject_id: task_id.into(),
                 session_key: scope.session_key,
+                // FIX-P1-16 (#60): thread task lineage through dedicated columns so
+                // child runs are queryable by parent_run_id without parsing payload_json.
+                run_id: scope.run_id,
+                parent_run_id: scope.parent_run_id,
                 agent_id: scope.agent_id,
                 persona_id: scope.persona_id,
                 visibility: scope.visibility,
@@ -317,6 +321,8 @@ impl MemoryFabric {
                 subject_table: "memories".to_string(),
                 subject_id: key.to_string(),
                 session_key: session_id.map(str::to_string),
+                run_id: None,
+                parent_run_id: None,
                 agent_id: None,
                 persona_id: None,
                 visibility: MemoryVisibility::Workspace,
@@ -376,6 +382,8 @@ impl MemoryFabric {
                 subject_table: "memory_drafts".to_string(),
                 subject_id: draft.draft_id.clone(),
                 session_key: draft.session_key.clone(),
+                run_id: None,
+                parent_run_id: Some(draft.worker_run_id.clone()),
                 agent_id: draft.agent_id.clone(),
                 persona_id: draft.persona_id.clone(),
                 visibility: draft.visibility.clone(),

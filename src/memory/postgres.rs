@@ -511,12 +511,16 @@ impl PostgresMemory {
                 subject_table TEXT NOT NULL,
                 subject_id TEXT NOT NULL,
                 session_key TEXT,
+                run_id TEXT,
+                parent_run_id TEXT,
                 agent_id TEXT,
                 persona_id TEXT,
                 visibility TEXT NOT NULL DEFAULT 'workspace',
                 payload_json TEXT,
                 created_at TIMESTAMPTZ NOT NULL
             );
+            ALTER TABLE {qualified_memory_events_table} ADD COLUMN IF NOT EXISTS run_id TEXT;
+            ALTER TABLE {qualified_memory_events_table} ADD COLUMN IF NOT EXISTS parent_run_id TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_memory_events_workspace_id
                 ON {qualified_memory_events_table}(workspace_id, id);
@@ -524,6 +528,10 @@ impl PostgresMemory {
                 ON {qualified_memory_events_table}(workspace_id, event_type, id);
             CREATE INDEX IF NOT EXISTS idx_memory_events_session
                 ON {qualified_memory_events_table}(workspace_id, session_key, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_events_run
+                ON {qualified_memory_events_table}(workspace_id, run_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_events_parent_run
+                ON {qualified_memory_events_table}(workspace_id, parent_run_id, id);
 
             CREATE TABLE IF NOT EXISTS {qualified_drafts_table} (
                 id BIGSERIAL PRIMARY KEY,
@@ -797,6 +805,16 @@ impl PostgresMemory {
                 10,
                 "memory_links_traces_compaction",
                 "memory_links + retrieval_traces + compaction_runs",
+            ),
+            (
+                11,
+                "evolution_proposals",
+                "evolution_proposals(id,draft_id,owner_id,principal_id,workspace_id,topic_id,task_id,source_message_event_ids_json,source_memory_event_ids_json,evidence_hashes_json,target_resource_json,proposed_change_json,risk_level,mode,created_at,created_by_runtime,judge_verdict_json,applied_at,applied_by,rollback_anchor_json) + evolution_proposal_events(id,draft_id,event_type,occurred_at,actor,payload_json)",
+            ),
+            (
+                12,
+                "memory_events_run_lineage",
+                "memory_events + run_id + parent_run_id + idx_memory_events_run + idx_memory_events_parent_run",
             ),
         ]
     }
@@ -1202,9 +1220,9 @@ impl PostgresMemory {
     }
 
     fn row_to_memory_event(row: &Row) -> Result<MemoryEvent> {
-        let created_at: DateTime<Utc> = row.get(11);
+        let created_at: DateTime<Utc> = row.get(13);
         let visibility = row
-            .get::<_, String>(9)
+            .get::<_, String>(11)
             .parse::<MemoryVisibility>()
             .unwrap_or(MemoryVisibility::Workspace);
 
@@ -1216,10 +1234,12 @@ impl PostgresMemory {
             subject_table: row.get(4),
             subject_id: row.get(5),
             session_key: row.get(6),
-            agent_id: row.get(7),
-            persona_id: row.get(8),
+            run_id: row.get(7),
+            parent_run_id: row.get(8),
+            agent_id: row.get(9),
+            persona_id: row.get(10),
             visibility,
-            payload_json: row.get(10),
+            payload_json: row.get(12),
             created_at: created_at.to_rfc3339(),
         })
     }
@@ -2455,16 +2475,16 @@ impl Memory for PostgresMemory {
                 "
                 INSERT INTO {qualified_memory_events_table} (
                     event_id, workspace_id, event_type, subject_table, subject_id,
-                    session_key, agent_id, persona_id, visibility, payload_json, created_at
+                    session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 ON CONFLICT (event_id) DO NOTHING
                 "
             );
             let select_stmt = format!(
                 "
                 SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
-                       session_key, agent_id, persona_id, visibility, payload_json, created_at
+                       session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                 FROM {qualified_memory_events_table}
                 WHERE event_id = $1
                 LIMIT 1
@@ -2480,6 +2500,8 @@ impl Memory for PostgresMemory {
                         &input.subject_table,
                         &input.subject_id,
                         &input.session_key,
+                        &input.run_id,
+                        &input.parent_run_id,
                         &input.agent_id,
                         &input.persona_id,
                         &input.visibility.as_str(),
@@ -2510,7 +2532,7 @@ impl Memory for PostgresMemory {
             let stmt = format!(
                 "
                 SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
-                       session_key, agent_id, persona_id, visibility, payload_json, created_at
+                       session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                 FROM {qualified_memory_events_table}
                 WHERE id > $1
                   AND (
@@ -2568,7 +2590,7 @@ impl Memory for PostgresMemory {
             let stmt = format!(
                 "
                 SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
-                       session_key, agent_id, persona_id, visibility, payload_json, created_at
+                       session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                 FROM {qualified_memory_events_table}
                 WHERE (
                       visibility = 'global'
@@ -4058,6 +4080,8 @@ mod tests {
                 subject_table: "memories".to_string(),
                 subject_id: "subject-1".to_string(),
                 session_key: Some("telegram_sender-1".to_string()),
+                run_id: None,
+                parent_run_id: None,
                 agent_id: Some("agent-a".to_string()),
                 persona_id: Some("persona-a".to_string()),
                 visibility: MemoryVisibility::Workspace,

@@ -666,6 +666,8 @@ impl SqliteMemory {
                 subject_table TEXT NOT NULL,
                 subject_id    TEXT NOT NULL,
                 session_key   TEXT,
+                run_id        TEXT,
+                parent_run_id TEXT,
                 agent_id      TEXT,
                 persona_id    TEXT,
                 visibility    TEXT NOT NULL DEFAULT 'workspace',
@@ -678,6 +680,26 @@ impl SqliteMemory {
                 ON memory_events(workspace_id, event_type, id);
             CREATE INDEX IF NOT EXISTS idx_memory_events_session
                 ON memory_events(workspace_id, session_key, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_events_run
+                ON memory_events(workspace_id, run_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_events_parent_run
+                ON memory_events(workspace_id, parent_run_id, id);
+
+            CREATE TABLE IF NOT EXISTS memory_trash (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                trash_id      TEXT NOT NULL UNIQUE,
+                memory_key    TEXT NOT NULL,
+                content       TEXT NOT NULL,
+                category      TEXT NOT NULL,
+                reason        TEXT NOT NULL,
+                trashed_at    TEXT NOT NULL,
+                grace_until   TEXT NOT NULL,
+                restored_at   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_trash_key
+                ON memory_trash(memory_key, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_trash_grace
+                ON memory_trash(grace_until) WHERE restored_at IS NULL;
 
             CREATE TABLE IF NOT EXISTS memory_drafts (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1334,6 +1356,16 @@ impl SqliteMemory {
                 "documents_links_traces_compaction",
                 "documents + document_chunks + memory_links + retrieval_traces + compaction_runs + evolution_proposals + evolution_proposal_events",
             ),
+            (
+                7,
+                "memory_events_run_lineage",
+                "memory_events + run_id + parent_run_id + idx_memory_events_run + idx_memory_events_parent_run",
+            ),
+            (
+                8,
+                "memory_trash",
+                "memory_trash(id,trash_id,memory_key,content,category,reason,trashed_at,grace_until,restored_at) + idx_memory_trash_key + idx_memory_trash_grace",
+            ),
         ]
     }
 
@@ -1383,8 +1415,81 @@ impl SqliteMemory {
         })
     }
 
+    /// Owner-id constraint for evolution-proposal ACL.
+    ///
+    /// System principals (`self_system`/`router`/`internal`/`system` as agent or
+    /// owner) may query/act globally → `None`. Everyone else is constrained to
+    /// their effective owner id (or empty string, which matches no row).
+    fn evolution_owner_scope(principal: &MemoryPrincipal) -> Option<String> {
+        const SYSTEM_IDS: &[&str] = &["self_system", "router", "internal", "system"];
+        let is_system = principal.agent_id.as_deref().is_some_and(|id| SYSTEM_IDS.contains(&id))
+            || principal
+                .persona_id
+                .as_deref()
+                .is_some_and(|id| SYSTEM_IDS.contains(&id))
+            || principal.owner_id.as_deref().is_some_and(|id| SYSTEM_IDS.contains(&id));
+        if is_system {
+            return None;
+        }
+        Some(principal.effective_owner_id().unwrap_or_default())
+    }
+
+    fn evolution_proposal_from_row(
+        row: &Row<'_>,
+    ) -> rusqlite::Result<anyhow::Result<crate::self_system::evolution::EvolutionProposalDraft>> {
+        use crate::self_system::evolution::proposal::ProposalRowValues;
+        let draft_id: String = row.get(0)?;
+        let owner_id: String = row.get(1)?;
+        let principal_id: String = row.get(2)?;
+        let workspace_id: String = row.get(3)?;
+        let topic_id: Option<String> = row.get(4)?;
+        let task_id: Option<String> = row.get(5)?;
+        let source_message_event_ids_json: String = row.get(6)?;
+        let source_memory_event_ids_json: String = row.get(7)?;
+        let evidence_hashes_json: String = row.get(8)?;
+        let target_resource_json: String = row.get(9)?;
+        let proposed_change_json: String = row.get(10)?;
+        let risk_level: String = row.get(11)?;
+        let mode: String = row.get(12)?;
+        let created_at_raw: String = row.get(13)?;
+        let created_by_runtime: String = row.get(14)?;
+        let judge_verdict_json: Option<String> = row.get(15)?;
+        let applied_at_raw: Option<String> = row.get(16)?;
+        let applied_by: Option<String> = row.get(17)?;
+        let rollback_anchor_json: Option<String> = row.get(18)?;
+
+        Ok((move || {
+            let created_at = DateTime::parse_from_rfc3339(&created_at_raw)?.with_timezone(&Utc);
+            let applied_at = match applied_at_raw.as_deref() {
+                Some(raw) => Some(DateTime::parse_from_rfc3339(raw)?.with_timezone(&Utc)),
+                None => None,
+            };
+            ProposalRowValues::decode(
+                draft_id,
+                owner_id,
+                principal_id,
+                workspace_id,
+                topic_id,
+                task_id,
+                &source_message_event_ids_json,
+                &source_memory_event_ids_json,
+                &evidence_hashes_json,
+                &target_resource_json,
+                &proposed_change_json,
+                &risk_level,
+                &mode,
+                created_at,
+                created_by_runtime,
+                judge_verdict_json.as_deref(),
+                applied_at,
+                applied_by,
+                rollback_anchor_json.as_deref(),
+            )
+        })())
+    }
+
     fn memory_event_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryEvent> {
-        let visibility_raw: String = row.get(9)?;
+        let visibility_raw: String = row.get(11)?;
         Ok(MemoryEvent {
             id: row.get(0)?,
             event_id: row.get(1)?,
@@ -1393,11 +1498,13 @@ impl SqliteMemory {
             subject_table: row.get(4)?,
             subject_id: row.get(5)?,
             session_key: row.get(6)?,
-            agent_id: row.get(7)?,
-            persona_id: row.get(8)?,
+            run_id: row.get(7)?,
+            parent_run_id: row.get(8)?,
+            agent_id: row.get(9)?,
+            persona_id: row.get(10)?,
             visibility: visibility_raw.parse().unwrap_or(MemoryVisibility::Workspace),
-            payload_json: row.get(10)?,
-            created_at: row.get(11)?,
+            payload_json: row.get(12)?,
+            created_at: row.get(13)?,
         })
     }
 
@@ -2760,6 +2867,370 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn move_to_trash(&self, key: &str, reason: &str, grace_days: u32) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let reason = reason.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+            let conn = conn.lock();
+            // FIX-P1-11: snapshot the row's value before soft-deleting it. We DO NOT
+            // physically delete from `memories`; we record a trash row so it can be
+            // restored within the grace window.
+            let row: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT content, category FROM memories WHERE key = ?1",
+                    params![key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((content, category)) = row else {
+                return Ok(None);
+            };
+            // Idempotency: if an unrestored trash entry already exists for this key,
+            // return it rather than duplicating.
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT trash_id FROM memory_trash WHERE memory_key = ?1 AND restored_at IS NULL LIMIT 1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(trash_id) = existing {
+                return Ok(Some(trash_id));
+            }
+            let trash_id = format!("trash-{}", Uuid::now_v7());
+            let now = Utc::now();
+            let grace_until = now + chrono::Duration::days(i64::from(grace_days));
+            conn.execute(
+                "INSERT INTO memory_trash (
+                    trash_id, memory_key, content, category, reason, trashed_at, grace_until
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    trash_id,
+                    key,
+                    content,
+                    category,
+                    reason,
+                    now.to_rfc3339(),
+                    grace_until.to_rfc3339(),
+                ],
+            )?;
+            Ok(Some(trash_id))
+        })
+        .await?
+    }
+
+    async fn create_evolution_proposal(
+        &self,
+        draft: crate::self_system::evolution::EvolutionProposalDraft,
+    ) -> anyhow::Result<String> {
+        use crate::self_system::evolution::proposal::ProposalRowValues;
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let values = ProposalRowValues::encode(&draft)?;
+            let conn = conn.lock();
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO evolution_proposals (
+                    draft_id, owner_id, principal_id, workspace_id, topic_id, task_id,
+                    source_message_event_ids_json, source_memory_event_ids_json, evidence_hashes_json,
+                    target_resource_json, proposed_change_json, risk_level, mode,
+                    created_at, created_by_runtime, judge_verdict_json, applied_at, applied_by, rollback_anchor_json
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                params![
+                    values.draft_id,
+                    values.owner_id,
+                    values.principal_id,
+                    values.workspace_id,
+                    values.topic_id,
+                    values.task_id,
+                    values.source_message_event_ids_json,
+                    values.source_memory_event_ids_json,
+                    values.evidence_hashes_json,
+                    values.target_resource_json,
+                    values.proposed_change_json,
+                    values.risk_level,
+                    values.mode,
+                    values.created_at.to_rfc3339(),
+                    values.created_by_runtime,
+                    values.judge_verdict_json,
+                    values.applied_at.map(|ts| ts.to_rfc3339()),
+                    values.applied_by,
+                    values.rollback_anchor_json,
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO evolution_proposal_events (draft_id, event_type, occurred_at, actor, payload_json)
+                 VALUES (?1, 'proposal.drafted', ?2, ?3, ?4)",
+                params![
+                    values.draft_id,
+                    now,
+                    values.created_by_runtime,
+                    Some(serde_json::json!({ "mode": values.mode, "risk_level": values.risk_level }).to_string()),
+                ],
+            )?;
+            Ok(values.draft_id)
+        })
+        .await?
+    }
+
+    async fn list_evolution_proposals(
+        &self,
+        principal: &MemoryPrincipal,
+        filter: crate::self_system::evolution::ProposalFilter,
+    ) -> anyhow::Result<Vec<crate::self_system::evolution::EvolutionProposalDraft>> {
+        let conn = self.conn.clone();
+        let owner_scope = Self::evolution_owner_scope(principal);
+        tokio::task::spawn_blocking(
+            move || -> anyhow::Result<Vec<crate::self_system::evolution::EvolutionProposalDraft>> {
+                let conn = conn.lock();
+                // Parameterized dynamic WHERE: every predicate binds a value; no
+                // user text is interpolated into the SQL string.
+                let mut sql = String::from(
+                    "SELECT draft_id, owner_id, principal_id, workspace_id, topic_id, task_id,
+                            source_message_event_ids_json, source_memory_event_ids_json, evidence_hashes_json,
+                            target_resource_json, proposed_change_json, risk_level, mode,
+                            created_at, created_by_runtime, judge_verdict_json, applied_at, applied_by,
+                            rollback_anchor_json
+                       FROM evolution_proposals
+                      WHERE 1 = 1",
+                );
+                let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                if let Some(owner_id) = owner_scope {
+                    sql.push_str(" AND owner_id = ?");
+                    binds.push(Box::new(owner_id));
+                }
+                if let Some(workspace_id) = filter.workspace_id {
+                    sql.push_str(" AND workspace_id = ?");
+                    binds.push(Box::new(workspace_id));
+                }
+                if let Some(owner_id) = filter.owner_id {
+                    sql.push_str(" AND owner_id = ?");
+                    binds.push(Box::new(owner_id));
+                }
+                if let Some(topic_id) = filter.topic_id {
+                    sql.push_str(" AND topic_id = ?");
+                    binds.push(Box::new(topic_id));
+                }
+                if let Some(task_id) = filter.task_id {
+                    sql.push_str(" AND task_id = ?");
+                    binds.push(Box::new(task_id));
+                }
+                if let Some(mode) = filter.mode {
+                    sql.push_str(" AND mode = ?");
+                    binds.push(Box::new(
+                        crate::self_system::evolution::proposal::mode_to_db(&mode).to_string(),
+                    ));
+                }
+                if let Some(judged) = filter.judged {
+                    if judged {
+                        sql.push_str(" AND judge_verdict_json IS NOT NULL");
+                    } else {
+                        sql.push_str(" AND judge_verdict_json IS NULL");
+                    }
+                }
+                if let Some(applied) = filter.applied {
+                    if applied {
+                        sql.push_str(" AND applied_at IS NOT NULL");
+                    } else {
+                        sql.push_str(" AND applied_at IS NULL");
+                    }
+                }
+                if let Some(since) = filter.since {
+                    sql.push_str(" AND created_at >= ?");
+                    binds.push(Box::new(since.to_rfc3339()));
+                }
+                sql.push_str(" ORDER BY id DESC");
+                if filter.limit > 0 {
+                    sql.push_str(" LIMIT ?");
+                    binds.push(Box::new(i64::try_from(filter.limit).unwrap_or(i64::MAX)));
+                }
+
+                let mut stmt = conn.prepare(&sql)?;
+                let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+                let rows = stmt.query_map(bind_refs.as_slice(), Self::evolution_proposal_from_row)?;
+                let mut proposals = Vec::new();
+                for row in rows {
+                    proposals.push(row??);
+                }
+                Ok(proposals)
+            },
+        )
+        .await?
+    }
+
+    async fn get_evolution_proposal(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+    ) -> anyhow::Result<Option<crate::self_system::evolution::EvolutionProposalDraft>> {
+        let conn = self.conn.clone();
+        let owner_scope = Self::evolution_owner_scope(principal);
+        let draft_id = draft_id.to_string();
+        tokio::task::spawn_blocking(
+            move || -> anyhow::Result<Option<crate::self_system::evolution::EvolutionProposalDraft>> {
+                let conn = conn.lock();
+                let proposal = conn
+                    .query_row(
+                        "SELECT draft_id, owner_id, principal_id, workspace_id, topic_id, task_id,
+                                source_message_event_ids_json, source_memory_event_ids_json, evidence_hashes_json,
+                                target_resource_json, proposed_change_json, risk_level, mode,
+                                created_at, created_by_runtime, judge_verdict_json, applied_at, applied_by,
+                                rollback_anchor_json
+                           FROM evolution_proposals
+                          WHERE draft_id = ?1",
+                        params![draft_id],
+                        Self::evolution_proposal_from_row,
+                    )
+                    .optional()?;
+                let Some(proposal) = proposal else {
+                    return Ok(None);
+                };
+                let proposal = proposal?;
+                // Cross-owner access returns NotFound (None) rather than Forbidden
+                // to avoid a cross-owner existence side channel.
+                if let Some(owner_id) = owner_scope {
+                    if proposal.owner_id != owner_id {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(proposal))
+            },
+        )
+        .await?
+    }
+
+    async fn update_evolution_proposal_status(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+        update: crate::self_system::evolution::ProposalStatusUpdate,
+    ) -> anyhow::Result<()> {
+        use crate::self_system::evolution::ProposalStatusUpdate;
+        let conn = self.conn.clone();
+        let owner_scope = Self::evolution_owner_scope(principal);
+        let draft_id = draft_id.to_string();
+        let actor = principal
+            .owner_id
+            .clone()
+            .or_else(|| principal.agent_id.clone())
+            .unwrap_or_else(|| "self_system".to_string());
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            // Fetch the row first to enforce owner ACL and re-judge guard.
+            let existing: Option<(String, Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT owner_id, judge_verdict_json, applied_at FROM evolution_proposals WHERE draft_id = ?1",
+                    params![draft_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((owner_id, judge_verdict_json, applied_at)) = existing else {
+                anyhow::bail!("evolution proposal {draft_id} not found");
+            };
+            if let Some(scope_owner) = owner_scope {
+                if owner_id != scope_owner {
+                    anyhow::bail!("evolution proposal {draft_id} not found");
+                }
+            }
+            let now = Utc::now().to_rfc3339();
+            match update {
+                ProposalStatusUpdate::Judged { verdict } => {
+                    if judge_verdict_json.is_some() {
+                        anyhow::bail!("evolution proposal {draft_id} already judged; refusing re-judge");
+                    }
+                    let verdict_json = serde_json::to_string(&verdict)?;
+                    conn.execute(
+                        "UPDATE evolution_proposals SET judge_verdict_json = ?1 WHERE draft_id = ?2",
+                        params![verdict_json, draft_id],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO evolution_proposal_events (draft_id, event_type, occurred_at, actor, payload_json)
+                         VALUES (?1, 'proposal.judged', ?2, ?3, ?4)",
+                        params![draft_id, now, actor, Some(verdict_json)],
+                    )?;
+                }
+                ProposalStatusUpdate::Applied {
+                    applied_by,
+                    rollback_anchor,
+                } => {
+                    let anchor_json = serde_json::to_string(&rollback_anchor)?;
+                    conn.execute(
+                        "UPDATE evolution_proposals
+                            SET applied_at = ?1, applied_by = ?2, rollback_anchor_json = ?3
+                          WHERE draft_id = ?4",
+                        params![now, applied_by, anchor_json, draft_id],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO evolution_proposal_events (draft_id, event_type, occurred_at, actor, payload_json)
+                         VALUES (?1, 'proposal.applied', ?2, ?3, ?4)",
+                        params![draft_id, now, actor, Some(anchor_json)],
+                    )?;
+                }
+                ProposalStatusUpdate::RolledBack => {
+                    if applied_at.is_none() {
+                        anyhow::bail!("evolution proposal {draft_id} is not applied; cannot roll back");
+                    }
+                    conn.execute(
+                        "UPDATE evolution_proposals SET applied_at = NULL WHERE draft_id = ?1",
+                        params![draft_id],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO evolution_proposal_events (draft_id, event_type, occurred_at, actor, payload_json)
+                         VALUES (?1, 'proposal.rollback', ?2, ?3, NULL)",
+                        params![draft_id, now, actor],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn append_evolution_proposal_event(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+        event_type: &str,
+        actor: &str,
+        payload_json: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let owner_scope = Self::evolution_owner_scope(principal);
+        let draft_id = draft_id.to_string();
+        let event_type = event_type.to_string();
+        let actor = actor.to_string();
+        let payload_json = payload_json.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            let owner: Option<String> = conn
+                .query_row(
+                    "SELECT owner_id FROM evolution_proposals WHERE draft_id = ?1",
+                    params![draft_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(owner) = owner else {
+                anyhow::bail!("evolution proposal {draft_id} not found");
+            };
+            if let Some(scope_owner) = owner_scope {
+                if owner != scope_owner {
+                    anyhow::bail!("evolution proposal {draft_id} not found");
+                }
+            }
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO evolution_proposal_events (draft_id, event_type, occurred_at, actor, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![draft_id, event_type, now, actor, payload_json],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
     async fn increment_useful_count(&self, id: &str) -> anyhow::Result<()> {
         let conn = self.conn.clone();
         let id = id.to_string();
@@ -3476,9 +3947,9 @@ impl Memory for SqliteMemory {
             conn.execute(
                 "INSERT OR IGNORE INTO memory_events (
                     event_id, workspace_id, event_type, subject_table, subject_id,
-                    session_key, agent_id, persona_id, visibility, payload_json, created_at
+                    session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     event_id,
                     input.workspace_id,
@@ -3486,6 +3957,8 @@ impl Memory for SqliteMemory {
                     input.subject_table,
                     input.subject_id,
                     input.session_key,
+                    input.run_id,
+                    input.parent_run_id,
                     input.agent_id,
                     input.persona_id,
                     input.visibility.as_str(),
@@ -3496,7 +3969,7 @@ impl Memory for SqliteMemory {
 
             let event = conn.query_row(
                 "SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
-                        session_key, agent_id, persona_id, visibility, payload_json, created_at
+                        session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                  FROM memory_events
                  WHERE event_id = ?1
                  LIMIT 1",
@@ -3524,7 +3997,7 @@ impl Memory for SqliteMemory {
                 principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system");
             let mut stmt = conn.prepare(
                 "SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
-                        session_key, agent_id, persona_id, visibility, payload_json, created_at
+                        session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                    FROM memory_events
                   WHERE id > ?1
                     AND (
@@ -3581,7 +4054,7 @@ impl Memory for SqliteMemory {
                 principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system");
             let mut stmt = conn.prepare(
                 "SELECT id, event_id, workspace_id, event_type, subject_table, subject_id,
-                        session_key, agent_id, persona_id, visibility, payload_json, created_at
+                        session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                    FROM memory_events
                   WHERE (
                         visibility = 'global'
@@ -4541,6 +5014,8 @@ mod tests {
             subject_table: "message_events".to_string(),
             subject_id: format!("{event_type}:subject"),
             session_key: session_key.map(str::to_string),
+            run_id: None,
+            parent_run_id: None,
             agent_id: agent_id.map(str::to_string),
             persona_id: None,
             visibility,
@@ -7491,5 +7966,276 @@ mod tests {
         let bob = g1_owner_principal("bob");
         let merged = mem.merge_memory_draft(&bob, "d-bob").await.expect("bob merge ok");
         assert!(merged.is_some(), "owner merge returns the draft");
+    }
+
+    // FIX-P0-03 (#9): EvolutionProposalDraft CRUD round-trip through SqliteMemory.
+    #[tokio::test]
+    async fn evolution_proposal_crud_round_trips_through_sqlite() {
+        use crate::self_system::evolution::config::EvolutionMode;
+        use crate::self_system::evolution::proposal::{
+            EvolutionProposalDraft, EvolutionTargetResource, JudgeVerdict, ProposalFilter, ProposalStatusUpdate,
+            ProposedChange, RiskLevel, RollbackAnchor,
+        };
+
+        let (_tmp, mem) = temp_sqlite();
+        let system_principal = MemoryPrincipal {
+            workspace_id: "/ws".to_string(),
+            agent_id: Some("self_system".to_string()),
+            persona_id: None,
+            session_key: None,
+            channel: None,
+            sender: None,
+            owner_id: Some("self_system".to_string()),
+        };
+
+        let draft = EvolutionProposalDraft {
+            draft_id: "evo-crud-1".to_string(),
+            owner_id: "self_system".to_string(),
+            principal_id: "xin:scheduler".to_string(),
+            workspace_id: "/ws".to_string(),
+            topic_id: None,
+            task_id: Some("run-42".to_string()),
+            source_message_event_ids: vec![1, 2],
+            source_memory_event_ids: vec![3],
+            evidence_hashes: vec!["hash-1".to_string()],
+            target_resource: EvolutionTargetResource::SemanticMemory {
+                memory_id: "conversation:dup".to_string(),
+                scope: "workspace".to_string(),
+            },
+            proposed_change: ProposedChange::MemoryForget {
+                reason: "redundant".to_string(),
+            },
+            risk_level: RiskLevel::Low,
+            mode: EvolutionMode::Auto,
+            created_at: Utc::now(),
+            created_by_runtime: "self_system:l1".to_string(),
+            judge_verdict: None,
+            applied_at: None,
+            applied_by: None,
+            rollback_anchor: None,
+        };
+
+        let id = mem
+            .create_evolution_proposal(draft.clone())
+            .await
+            .expect("create proposal");
+        assert_eq!(id, "evo-crud-1");
+
+        let fetched = mem
+            .get_evolution_proposal(&system_principal, "evo-crud-1")
+            .await
+            .expect("get proposal")
+            .expect("proposal exists");
+        assert_eq!(fetched.draft_id, draft.draft_id);
+        assert_eq!(fetched.task_id, draft.task_id);
+        assert_eq!(fetched.source_message_event_ids, vec![1, 2]);
+        assert_eq!(fetched.evidence_hashes, vec!["hash-1".to_string()]);
+        assert_eq!(fetched.proposed_change, draft.proposed_change);
+        assert!(!fetched.is_judged());
+        assert!(!fetched.is_applied());
+
+        let listed = mem
+            .list_evolution_proposals(
+                &system_principal,
+                ProposalFilter {
+                    task_id: Some("run-42".to_string()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list proposals");
+        assert_eq!(listed.len(), 1);
+
+        let other_principal = MemoryPrincipal {
+            workspace_id: "/ws".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("s".to_string()),
+            channel: Some("telegram".to_string()),
+            sender: Some("intruder".to_string()),
+            owner_id: Some("owner:intruder".to_string()),
+        };
+        let hidden = mem
+            .get_evolution_proposal(&other_principal, "evo-crud-1")
+            .await
+            .expect("get does not error cross-owner");
+        assert!(hidden.is_none(), "cross-owner get must return NotFound");
+
+        mem.update_evolution_proposal_status(
+            &system_principal,
+            "evo-crud-1",
+            ProposalStatusUpdate::Judged {
+                verdict: JudgeVerdict::Approved {
+                    judge_id: "mock".to_string(),
+                    confidence: 0.7,
+                    reasoning: "ok".to_string(),
+                },
+            },
+        )
+        .await
+        .expect("judge proposal");
+
+        let rejudge = mem
+            .update_evolution_proposal_status(
+                &system_principal,
+                "evo-crud-1",
+                ProposalStatusUpdate::Judged {
+                    verdict: JudgeVerdict::Rejected {
+                        judge_id: "mock".to_string(),
+                        reasoning: "no".to_string(),
+                    },
+                },
+            )
+            .await;
+        assert!(rejudge.is_err(), "re-judging an already-judged proposal must fail");
+
+        mem.update_evolution_proposal_status(
+            &system_principal,
+            "evo-crud-1",
+            ProposalStatusUpdate::Applied {
+                applied_by: "grant-abc".to_string(),
+                rollback_anchor: RollbackAnchor::MemorySnapshot {
+                    snapshot_id: "snap-1".to_string(),
+                },
+            },
+        )
+        .await
+        .expect("apply proposal");
+
+        let applied = mem
+            .get_evolution_proposal(&system_principal, "evo-crud-1")
+            .await
+            .expect("get applied")
+            .expect("exists");
+        assert!(applied.is_applied());
+        assert!(applied.is_judged());
+        assert!(applied.rollback_anchor.is_some());
+
+        mem.update_evolution_proposal_status(&system_principal, "evo-crud-1", ProposalStatusUpdate::RolledBack)
+            .await
+            .expect("rollback proposal");
+        let rolled = mem
+            .get_evolution_proposal(&system_principal, "evo-crud-1")
+            .await
+            .expect("get rolled")
+            .expect("exists");
+        assert!(!rolled.is_applied(), "rollback clears applied_at");
+    }
+
+    // FIX-P1-11 (#12): move_to_trash soft-deletes (does NOT physically remove the
+    // row) and is idempotent within the grace window.
+    #[tokio::test]
+    async fn move_to_trash_soft_deletes_and_is_idempotent() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("redundant_key", "duplicate content", MemoryCategory::Conversation, None)
+            .await
+            .expect("store memory");
+        assert!(mem.get("redundant_key").await.expect("get").is_some());
+
+        let trash_id = mem
+            .move_to_trash("redundant_key", "redundant conversation memory", 14)
+            .await
+            .expect("move_to_trash")
+            .expect("key was present");
+        assert!(trash_id.starts_with("trash-"));
+
+        assert!(
+            mem.get("redundant_key").await.expect("get after trash").is_some(),
+            "move_to_trash must not physically delete the memory row"
+        );
+
+        let (count, grace_in_future): (i64, bool) = {
+            let conn = mem.conn.lock();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_trash WHERE memory_key = ?1 AND restored_at IS NULL",
+                    params!["redundant_key"],
+                    |row| row.get(0),
+                )
+                .expect("count trash");
+            let grace_raw: String = conn
+                .query_row(
+                    "SELECT grace_until FROM memory_trash WHERE trash_id = ?1",
+                    params![trash_id],
+                    |row| row.get(0),
+                )
+                .expect("grace_until");
+            let grace = DateTime::parse_from_rfc3339(&grace_raw).expect("parse grace");
+            (count, grace.with_timezone(&Utc) > Utc::now())
+        };
+        assert_eq!(count, 1, "exactly one unrestored trash entry");
+        assert!(grace_in_future, "grace window must be in the future");
+
+        let again = mem
+            .move_to_trash("redundant_key", "redundant conversation memory", 14)
+            .await
+            .expect("second move_to_trash")
+            .expect("still present");
+        assert_eq!(again, trash_id, "repeated trash returns the existing entry");
+
+        let missing = mem
+            .move_to_trash("does_not_exist", "noop", 14)
+            .await
+            .expect("trash missing key ok");
+        assert!(missing.is_none());
+    }
+
+    // FIX-P1-16 (#60): memory_events run lineage — a child task event records
+    // parent_run_id and is queryable by it.
+    #[tokio::test]
+    async fn memory_event_records_and_queries_parent_run_id() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.append_memory_event(MemoryEventInput {
+            event_id: None,
+            workspace_id: "/ws".to_string(),
+            event_type: "task.spawned".to_string(),
+            subject_table: "tasks".to_string(),
+            subject_id: "child-run-1".to_string(),
+            session_key: Some("sess".to_string()),
+            run_id: Some("child-run-1".to_string()),
+            parent_run_id: Some("parent-run-1".to_string()),
+            agent_id: Some("system".to_string()),
+            persona_id: None,
+            visibility: MemoryVisibility::Workspace,
+            payload_json: None,
+        })
+        .await
+        .expect("append child event");
+
+        let principal = MemoryPrincipal {
+            workspace_id: "/ws".to_string(),
+            agent_id: Some("system".to_string()),
+            persona_id: None,
+            session_key: None,
+            channel: None,
+            sender: None,
+            owner_id: None,
+        };
+        let events = mem
+            .list_memory_events_since(&principal, 0, 50)
+            .await
+            .expect("list events");
+        let child = events
+            .iter()
+            .find(|event| event.subject_id == "child-run-1")
+            .expect("child event present");
+        assert_eq!(child.run_id.as_deref(), Some("child-run-1"));
+        assert_eq!(
+            child.parent_run_id.as_deref(),
+            Some("parent-run-1"),
+            "parent_run_id must survive the round-trip so children are queryable by parent"
+        );
+
+        let by_parent: i64 = {
+            let conn = mem.conn.lock();
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE parent_run_id = ?1",
+                params!["parent-run-1"],
+                |row| row.get(0),
+            )
+            .expect("count by parent_run_id")
+        };
+        assert_eq!(by_parent, 1, "exactly one child queryable by parent_run_id");
     }
 }

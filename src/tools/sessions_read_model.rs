@@ -438,6 +438,8 @@ mod tests {
             subject_table: "tasks".to_string(),
             subject_id: subject_id.to_string(),
             session_key: Some("test-session".to_string()),
+            run_id: Some(subject_id.to_string()),
+            parent_run_id: None,
             agent_id: None,
             persona_id: None,
             visibility: MemoryVisibility::Workspace,

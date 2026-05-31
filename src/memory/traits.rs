@@ -275,6 +275,10 @@ pub struct MemoryEventInput {
     pub subject_table: String,
     pub subject_id: String,
     pub session_key: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub parent_run_id: Option<String>,
     pub agent_id: Option<String>,
     pub persona_id: Option<String>,
     pub visibility: MemoryVisibility,
@@ -291,6 +295,10 @@ pub struct MemoryEvent {
     pub subject_table: String,
     pub subject_id: String,
     pub session_key: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub parent_run_id: Option<String>,
     pub agent_id: Option<String>,
     pub persona_id: Option<String>,
     pub visibility: MemoryVisibility,
@@ -860,6 +868,109 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<Option<MemoryDraft>> {
         let _ = (principal, draft_id, reason);
         Err(crate::memory::fabric::fail_fast(self.name(), "reject_memory_draft"))
+    }
+
+    /// Persist a new evolution proposal draft (FIX-P0-03).
+    ///
+    /// Writes one `evolution_proposals` row plus a `proposal.drafted` event and
+    /// returns the stored `draft_id`. Backends without evolution support keep the
+    /// default `Err` so callers see backend gaps instead of silent loss.
+    async fn create_evolution_proposal(
+        &self,
+        draft: crate::self_system::evolution::EvolutionProposalDraft,
+    ) -> anyhow::Result<String> {
+        let _ = draft;
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "create_evolution_proposal",
+        ))
+    }
+
+    /// List evolution proposals visible to `principal`, filtered by `filter`.
+    ///
+    /// Non-system principals are constrained to their own `owner_id`; system
+    /// principals (`self_system`/`router`/`internal`/`system`) may query globally.
+    async fn list_evolution_proposals(
+        &self,
+        principal: &MemoryPrincipal,
+        filter: crate::self_system::evolution::ProposalFilter,
+    ) -> anyhow::Result<Vec<crate::self_system::evolution::EvolutionProposalDraft>> {
+        let _ = (principal, filter);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "list_evolution_proposals",
+        ))
+    }
+
+    /// Fetch one proposal by id, enforcing owner ACL.
+    ///
+    /// Returns `Ok(None)` for a missing OR cross-owner draft (NotFound rather
+    /// than Forbidden) to avoid a cross-owner existence side channel.
+    async fn get_evolution_proposal(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+    ) -> anyhow::Result<Option<crate::self_system::evolution::EvolutionProposalDraft>> {
+        let _ = (principal, draft_id);
+        Err(crate::memory::fabric::fail_fast(self.name(), "get_evolution_proposal"))
+    }
+
+    /// Apply a status transition (judge / apply / rollback) to a proposal.
+    ///
+    /// Each transition appends the matching `evolution_proposal_events` row and
+    /// mutates the proposal columns. Re-judging an already-judged proposal is
+    /// rejected to prevent verdict laundering.
+    async fn update_evolution_proposal_status(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+        update: crate::self_system::evolution::ProposalStatusUpdate,
+    ) -> anyhow::Result<()> {
+        let _ = (principal, draft_id, update);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "update_evolution_proposal_status",
+        ))
+    }
+
+    /// Append a free-form lifecycle event to an existing proposal.
+    ///
+    /// Used for non-state-changing markers such as `proposal.evidence_mismatch`.
+    async fn append_evolution_proposal_event(
+        &self,
+        principal: &MemoryPrincipal,
+        draft_id: &str,
+        event_type: &str,
+        actor: &str,
+        payload_json: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let _ = (principal, draft_id, event_type, actor, payload_json);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "append_evolution_proposal_event",
+        ))
+    }
+
+    /// Count proposals visible to `principal` matching `filter` (cheap status probe).
+    async fn count_evolution_proposals(
+        &self,
+        principal: &MemoryPrincipal,
+        filter: crate::self_system::evolution::ProposalFilter,
+    ) -> anyhow::Result<usize> {
+        let proposals = self.list_evolution_proposals(principal, filter).await?;
+        Ok(proposals.len())
+    }
+
+    /// Soft-delete a memory key into a trash holding area with a grace expiry
+    /// (FIX-P1-11). Unlike `forget`, this MUST NOT physically remove the row;
+    /// it snapshots the value and marks it recoverable until `grace_until`.
+    ///
+    /// Returns the trash entry id on success, or `Ok(None)` if the key is absent.
+    /// Backends without trash support keep the default `Err` so callers do not
+    /// silently fall back to a hard delete.
+    async fn move_to_trash(&self, key: &str, reason: &str, grace_days: u32) -> anyhow::Result<Option<String>> {
+        let _ = (key, reason, grace_days);
+        Err(crate::memory::fabric::fail_fast(self.name(), "move_to_trash"))
     }
 
     /// Ingest a durable source document and create chunk records.

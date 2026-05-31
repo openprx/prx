@@ -122,6 +122,8 @@ mod tests {
                 subject_table: "message_events".to_string(),
                 subject_id: "subject".to_string(),
                 session_key: None,
+                run_id: None,
+                parent_run_id: None,
                 agent_id: None,
                 persona_id: None,
                 visibility: MemoryVisibility::Workspace,

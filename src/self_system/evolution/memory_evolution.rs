@@ -24,6 +24,10 @@ use uuid::Uuid;
 
 const MUTATION_RATIO: f64 = 0.10;
 
+/// Grace window (days) for L1 soft-deleted conversation memories before they may
+/// be physically reclaimed (FIX-P1-11).
+const PRUNE_GRACE_DAYS: u32 = 14;
+
 #[derive(Debug, Clone)]
 struct MutationPlan {
     key: String,
@@ -176,17 +180,93 @@ impl MemoryEvolutionEngine {
             .into_iter()
             .map(|entry| (entry.id, entry.key))
             .collect::<HashMap<_, _>>();
+        let workspace_id = self.workspace_root.to_string_lossy().to_string();
         let mut removed = 0u32;
         for redundant_id in redundant_ids {
             let Some(key) = key_by_id.get(&redundant_id) else {
                 continue;
             };
-            if memory.forget(key).await? {
-                removed = removed.saturating_add(1);
+            // FIX-P1-11: Auto mode must NOT physically delete. Produce an
+            // EvolutionProposalDraft recording the forget intent, then soft-delete
+            // into trash with a 14-day grace window so the change is reversible
+            // and auditable instead of an irreversible `forget`.
+            if let Err(error) = self
+                .record_forget_proposal(&memory, &workspace_id, key, redundant_id)
+                .await
+            {
+                tracing::warn!(
+                    target: "self_system",
+                    key = %key,
+                    "failed to record forget proposal; skipping trash to stay reversible: {error}"
+                );
+                continue;
+            }
+            match memory
+                .move_to_trash(key, "redundant conversation memory", PRUNE_GRACE_DAYS)
+                .await
+            {
+                Ok(Some(_)) => removed = removed.saturating_add(1),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "self_system",
+                        key = %key,
+                        "move_to_trash failed: {error}"
+                    );
+                }
             }
         }
 
         Ok(removed)
+    }
+
+    /// Build and persist an `EvolutionProposalDraft` for an L1 memory-forget
+    /// candidate (FIX-P1-11). Uses the typed CRUD path (FIX-P0-03) rather than
+    /// raw SQL so the proposal is type-checked and auditable.
+    async fn record_forget_proposal(
+        &self,
+        memory: &SqliteMemory,
+        workspace_id: &str,
+        memory_key: &str,
+        memory_event_id: String,
+    ) -> Result<()> {
+        use crate::self_system::evolution::proposal::{
+            EvolutionProposalDraft, EvolutionTargetResource, ProposedChange, RiskLevel as ProposalRiskLevel,
+        };
+
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::default();
+        hasher.update(memory_key.as_bytes());
+        let evidence_hash = format!("{:x}", hasher.finalize());
+
+        let draft = EvolutionProposalDraft {
+            draft_id: format!("evo-{}", Uuid::now_v7()),
+            owner_id: "self_system".to_string(),
+            principal_id: "self_system:l1".to_string(),
+            workspace_id: workspace_id.to_string(),
+            topic_id: None,
+            task_id: None,
+            source_message_event_ids: Vec::new(),
+            source_memory_event_ids: Vec::new(),
+            evidence_hashes: vec![evidence_hash],
+            target_resource: EvolutionTargetResource::SemanticMemory {
+                memory_id: memory_key.to_string(),
+                scope: "workspace".to_string(),
+            },
+            proposed_change: ProposedChange::MemoryForget {
+                reason: format!("redundant conversation memory (candidate id {memory_event_id})"),
+            },
+            risk_level: ProposalRiskLevel::Low,
+            mode: EvolutionMode::Auto,
+            created_at: Utc::now(),
+            created_by_runtime: "self_system:l1".to_string(),
+            judge_verdict: None,
+            applied_at: None,
+            applied_by: None,
+            rollback_anchor: None,
+        };
+        memory.create_evolution_proposal(draft).await?;
+        Ok(())
     }
 }
 

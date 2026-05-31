@@ -12,6 +12,7 @@ pub mod memory_retrieval;
 pub mod memory_safety;
 pub mod pipeline;
 pub mod prompt_evolution;
+pub mod proposal;
 pub mod record;
 pub mod rollback;
 pub mod safety_utils;
@@ -37,6 +38,11 @@ pub use memory_evolution::MemoryEvolutionEngine;
 pub use memory_safety::{MemorySafetyFilter, SafetyIssueKind, SourceMetadata};
 pub use pipeline::{EvolutionPipeline, EvolutionTrigger, PipelineRunReport};
 pub use prompt_evolution::PromptEvolutionEngine;
+#[allow(unused_imports)]
+pub use proposal::{
+    EvolutionProposalDraft, EvolutionTargetResource, JudgeVerdict, ProposalFilter, ProposalStatusUpdate,
+    ProposedChange, RollbackAnchor,
+};
 #[allow(unused_imports)]
 pub use record::{
     Actor, ChangeType, DataBasis, DecisionLog, DecisionType, EvolutionLayer, EvolutionLog, EvolutionResult,

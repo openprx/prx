@@ -2,6 +2,9 @@
 
 use crate::config::Config;
 use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode};
+use crate::self_system::evolution::proposal::{
+    EvolutionProposalDraft, EvolutionTargetResource, ProposalRowValues, ProposedChange, RiskLevel,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -52,21 +55,6 @@ impl DraftEvolutionScheduler {
 
         let source_counts = SourceCounts::load(&conn).unwrap_or_default();
         let candidate_hash = source_counts.candidate_hash();
-        let target_resource = serde_json::json!({
-            "kind": "semantic_memory",
-            "memory_id": "xin:memory_evolution",
-            "scope": "workspace"
-        });
-        let proposed_change = serde_json::json!({
-            "kind": "memory_update",
-            "new_value": {
-                "summary": "scheduled memory evolution review",
-                "message_events": source_counts.message_events,
-                "memory_events": source_counts.memory_events,
-                "memories": source_counts.memories
-            },
-            "diff_hash": candidate_hash
-        });
 
         let existing: Option<String> = conn
             .query_row(
@@ -87,29 +75,72 @@ impl DraftEvolutionScheduler {
             .optional()?;
 
         if existing.is_none() {
-            let draft_id = format!("evo-{}", Uuid::now_v7());
-            let now = Utc::now().to_rfc3339();
-            let evidence_hashes_json = serde_json::to_string(&vec![candidate_hash])?;
+            // FIX-P0-03: build a typed EvolutionProposalDraft and persist it via the
+            // shared ProposalRowValues encoder (the same code path the Memory CRUD
+            // uses), so xin-scheduled proposals are type-safe and byte-equal with
+            // CRUD-created ones. `tick` runs inside spawn_blocking, so it persists
+            // synchronously on the raw connection rather than via the async trait.
+            let draft = EvolutionProposalDraft {
+                draft_id: format!("evo-{}", Uuid::now_v7()),
+                owner_id: "self_system".to_string(),
+                principal_id: "xin:scheduler".to_string(),
+                workspace_id: self.workspace_id(),
+                topic_id: None,
+                task_id: None,
+                source_message_event_ids: Vec::new(),
+                source_memory_event_ids: Vec::new(),
+                evidence_hashes: vec![candidate_hash],
+                target_resource: EvolutionTargetResource::SemanticMemory {
+                    memory_id: "xin:memory_evolution".to_string(),
+                    scope: "workspace".to_string(),
+                },
+                proposed_change: ProposedChange::MemoryUpdate {
+                    new_value: serde_json::json!({
+                        "summary": "scheduled memory evolution review",
+                        "message_events": source_counts.message_events,
+                        "memory_events": source_counts.memory_events,
+                        "memories": source_counts.memories
+                    }),
+                    diff_hash: source_counts.candidate_hash(),
+                },
+                risk_level: RiskLevel::Low,
+                mode: mode.clone(),
+                created_at: Utc::now(),
+                created_by_runtime: DRAFT_RUNTIME.to_string(),
+                judge_verdict: None,
+                applied_at: None,
+                applied_by: None,
+                rollback_anchor: None,
+            };
+            let values = ProposalRowValues::encode(&draft)?;
             conn.execute(
                 "INSERT INTO evolution_proposals (
                     draft_id, owner_id, principal_id, workspace_id, topic_id, task_id,
                     source_message_event_ids_json, source_memory_event_ids_json, evidence_hashes_json,
                     target_resource_json, proposed_change_json, risk_level, mode,
-                    created_at, created_by_runtime
+                    created_at, created_by_runtime, judge_verdict_json, applied_at, applied_by, rollback_anchor_json
                  )
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, '[]', '[]', ?6, ?7, ?8, 'low', ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 params![
-                    draft_id,
-                    "self_system",
-                    "xin:scheduler",
-                    self.workspace_id(),
-                    "xin:memory_evolution",
-                    evidence_hashes_json,
-                    target_resource.to_string(),
-                    proposed_change.to_string(),
-                    mode_to_db(&mode),
-                    now,
-                    DRAFT_RUNTIME,
+                    values.draft_id,
+                    values.owner_id,
+                    values.principal_id,
+                    values.workspace_id,
+                    values.topic_id,
+                    values.task_id,
+                    values.source_message_event_ids_json,
+                    values.source_memory_event_ids_json,
+                    values.evidence_hashes_json,
+                    values.target_resource_json,
+                    values.proposed_change_json,
+                    values.risk_level,
+                    values.mode,
+                    values.created_at.to_rfc3339(),
+                    values.created_by_runtime,
+                    values.judge_verdict_json,
+                    values.applied_at.map(|ts| ts.to_rfc3339()),
+                    values.applied_by,
+                    values.rollback_anchor_json,
                 ],
             )?;
             conn.execute(
@@ -118,10 +149,10 @@ impl DraftEvolutionScheduler {
                  )
                  VALUES (?1, 'proposal.drafted', ?2, ?3, ?4)",
                 params![
-                    draft_id,
-                    now,
+                    values.draft_id,
+                    Utc::now().to_rfc3339(),
                     DRAFT_RUNTIME,
-                    serde_json::json!({ "mode": mode_to_db(&mode), "source": "xin:memory_evolution" }).to_string(),
+                    serde_json::json!({ "mode": values.mode, "source": "xin:memory_evolution" }).to_string(),
                 ],
             )?;
         }
@@ -256,14 +287,6 @@ fn discover_evolution_config_path(config: &Config) -> PathBuf {
         .find(|path| path.exists())
         .cloned()
         .unwrap_or_else(|| candidates[0].clone())
-}
-
-const fn mode_to_db(mode: &EvolutionMode) -> &'static str {
-    match mode {
-        EvolutionMode::DraftOnly => "draft_only",
-        EvolutionMode::Shadow => "shadow",
-        EvolutionMode::Auto => "auto",
-    }
 }
 
 #[cfg(test)]
