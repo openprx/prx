@@ -121,6 +121,9 @@ pub(crate) struct DocumentIngestRuntime {
     agent_id: Option<String>,
     persona_id: Option<String>,
     channel: Option<String>,
+    /// Originating sender. Retained so OS-paging recall (FIX-P3-05) can rebuild
+    /// the exact owner-scoped `MemoryPrincipal` used when pages were ingested.
+    sender: Option<String>,
     visibility: MemoryVisibility,
 }
 
@@ -137,6 +140,7 @@ impl DocumentIngestRuntime {
             agent_id: envelope.agent_id.clone(),
             persona_id: envelope.persona_id.clone(),
             channel: envelope.channel.clone(),
+            sender: envelope.sender.clone(),
             visibility: envelope.visibility.clone(),
         }
     }
@@ -166,6 +170,7 @@ impl DocumentIngestRuntime {
             // Persist the originating channel so anonymous principals can
             // resolve channel scope on later recall (FIX-P1-08).
             channel: Some(scope.channel.to_string()),
+            sender: Some(scope.sender.to_string()),
             visibility: MemoryVisibility::Session,
         }
     }
@@ -971,6 +976,258 @@ async fn apply_configurable_compaction(
     ));
 
     Ok(true)
+}
+
+/// Marker prefix used for the short page-summary breadcrumb left in the hot
+/// window after an OS-paging eviction. Distinct from `[Context compacted ...]`
+/// so callers can tell paging eviction apart from lossy compaction.
+const OS_PAGING_EVICT_MARKER: &str = "[Context paged out at";
+
+/// Marker prefix used for recalled page content injected back into history.
+const OS_PAGING_RECALL_MARKER: &str = "[Recalled context from earlier in this session]";
+
+/// `source_kind` used when persisting evicted context pages into the document
+/// store. Distinguishes paged context from tool-output documents.
+const OS_PAGING_SOURCE_KIND: &str = "context_page";
+
+/// Render evicted messages into a durable, searchable transcript. Unlike
+/// compaction this is non-destructive: the full content of every paged message
+/// is preserved so it can be recalled verbatim later.
+fn build_page_transcript(messages: &[ChatMessage]) -> String {
+    let mut transcript = String::new();
+    for msg in messages {
+        let role = msg.role.to_uppercase();
+        let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
+    }
+    transcript
+}
+
+/// OS-paging eviction (Letta/MemGPT style), FIX-P3-05.
+///
+/// When the hot window exceeds `eviction_threshold * max_context_tokens`, the
+/// oldest non-system messages (beyond `keep_recent_messages`) are evicted to the
+/// durable document store via `Memory::ingest_document`, preserving full content
+/// for later semantic recall. A short breadcrumb replaces them in the hot window.
+///
+/// Returns `Ok(true)` when at least one page was evicted. All failures are soft:
+/// the function returns `Ok(false)` (or propagates only on genuinely fatal
+/// errors) so the caller can fall back to legacy compaction without regression.
+///
+/// This path is only reached when `os_paging.enabled = true`; otherwise the
+/// legacy compaction pipeline runs unchanged.
+async fn apply_os_paging(
+    history: &mut Vec<ChatMessage>,
+    config: &crate::config::AgentCompactionConfig,
+    runtime: Option<&DocumentIngestRuntime>,
+) -> Result<bool> {
+    let paging = &config.os_paging;
+    if !paging.enabled {
+        return Ok(false);
+    }
+    if config.max_context_tokens == 0 {
+        return Ok(false);
+    }
+    let threshold_ratio = paging.eviction_threshold.clamp(0.0, 1.0);
+    let threshold = (config.max_context_tokens as f64 * threshold_ratio) as usize;
+    if estimate_history_tokens(history) <= threshold {
+        return Ok(false);
+    }
+
+    // OS-paging requires a durable, searchable document backend. Without one we
+    // cannot non-destructively evict, so defer to the legacy compaction path.
+    let Some(runtime) = runtime else {
+        return Ok(false);
+    };
+    if !runtime.memory.supports_document_ingest() {
+        tracing::debug!(
+            backend = runtime.memory.name(),
+            "os-paging: backend does not support document ingest; deferring to legacy compaction"
+        );
+        return Ok(false);
+    }
+
+    let has_system = history.first().is_some_and(|m| m.role == "system");
+    let start = if has_system { 1 } else { 0 };
+    let non_system_count = history.len().saturating_sub(start);
+    let keep_recent = paging.keep_recent_messages.max(1).min(non_system_count);
+    let evict_count = non_system_count.saturating_sub(keep_recent);
+    if evict_count == 0 {
+        return Ok(false);
+    }
+    let evict_end = start + evict_count;
+    let to_evict = history
+        .get(start..evict_end)
+        .map(<[ChatMessage]>::to_vec)
+        .unwrap_or_default();
+    if to_evict.is_empty() {
+        return Ok(false);
+    }
+
+    let transcript = build_page_transcript(&to_evict);
+    let token_count = estimate_history_tokens(&to_evict);
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let session_key = runtime.session_key.clone().unwrap_or_else(|| "session".to_string());
+    // Stable, content-addressed page id so identical evictions are idempotent.
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(session_key.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(transcript.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    let short = digest.get(..16).unwrap_or(&digest);
+    let document_id = format!("context-page:{session_key}:{short}");
+
+    let metadata_json = serde_json::json!({
+        "kind": OS_PAGING_SOURCE_KIND,
+        "session_key": session_key,
+        "evicted_at": timestamp,
+        "message_count": to_evict.len(),
+        "token_count": token_count,
+    })
+    .to_string();
+    let input = DocumentIngestInput {
+        document_id: Some(document_id.clone()),
+        workspace_id: runtime.workspace_id.clone(),
+        owner_id: runtime.owner_id.clone(),
+        topic_id: runtime.topic_id.clone(),
+        task_id: runtime.task_id.clone(),
+        source_message_event_id: runtime.source_message_event_id.clone(),
+        source_kind: OS_PAGING_SOURCE_KIND.to_string(),
+        source_uri: Some(format!("context-page:{session_key}")),
+        title: Some(format!("Paged context ({} messages)", to_evict.len())),
+        content: transcript,
+        mime_type: Some("text/plain".to_string()),
+        visibility: runtime.visibility.clone(),
+        metadata_json: Some(metadata_json),
+    };
+
+    match runtime.memory.ingest_document(input).await {
+        Ok(document) => {
+            tracing::info!(
+                document_id = %document.document_id,
+                messages = to_evict.len(),
+                token_count,
+                "os-paging: evicted cold context to document store"
+            );
+        }
+        Err(error) => {
+            // Soft failure: do NOT mutate history. Returning false lets the
+            // caller fall through to legacy compaction (no data lost, no
+            // regression on the hot path).
+            tracing::warn!(
+                document_id = %document_id,
+                error = %error,
+                "os-paging: eviction failed; deferring to legacy compaction"
+            );
+            return Ok(false);
+        }
+    }
+
+    // Replace the evicted span with a single short breadcrumb so the model knows
+    // older context exists and can be recalled. Unlike compaction this is a
+    // pointer, not a lossy summary — the full content lives in the page store.
+    history.splice(
+        start..evict_end,
+        std::iter::once(ChatMessage::assistant(format!(
+            "{OS_PAGING_EVICT_MARKER} {timestamp}. {} older messages moved to durable page store \
+             (id: {document_id}); relevant excerpts are recalled automatically when needed.]",
+            to_evict.len()
+        ))),
+    );
+
+    Ok(true)
+}
+
+/// Semantic recall of evicted context pages (FIX-P3-05, stage 2).
+///
+/// Searches the durable document store for paged context relevant to `query`
+/// and returns a single formatted message to be injected into history. Returns
+/// `None` when paging/recall is disabled, no runtime is available, the query is
+/// empty, or nothing relevant is found. All backend failures are soft (logged,
+/// `None` returned) so recall never blocks a turn.
+async fn recall_context_pages(
+    query: &str,
+    config: &crate::config::AgentCompactionConfig,
+    runtime: Option<&DocumentIngestRuntime>,
+) -> Option<ChatMessage> {
+    let paging = &config.os_paging;
+    if !paging.enabled || !paging.proactive_retrieval {
+        return None;
+    }
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let runtime = runtime?;
+    if !runtime.memory.supports_document_ingest() {
+        return None;
+    }
+    let limit = paging.max_recalled_pages.max(1);
+    let principal = MemoryPrincipal {
+        workspace_id: runtime.workspace_id.clone(),
+        agent_id: runtime.agent_id.clone(),
+        persona_id: runtime.persona_id.clone(),
+        session_key: runtime.session_key.clone(),
+        channel: runtime.channel.clone(),
+        sender: runtime.sender.clone(),
+        owner_id: runtime.owner_id.clone(),
+    };
+    // Over-fetch then filter to context pages, since search spans all docs in
+    // the workspace/owner scope (tool outputs, ingested files, etc.).
+    let fetch = limit.saturating_mul(4).max(limit);
+    let results = match runtime.memory.search_document_chunks(&principal, query, fetch).await {
+        Ok(results) => results,
+        Err(error) => {
+            tracing::warn!(error = %error, "os-paging: page recall failed; skipping injection");
+            return None;
+        }
+    };
+    let mut recalled = String::from(OS_PAGING_RECALL_MARKER);
+    let mut injected = 0usize;
+    for result in results {
+        if injected >= limit {
+            break;
+        }
+        // Only inject chunks that originate from evicted context pages.
+        if !result.chunk.document_id.starts_with("context-page:") {
+            continue;
+        }
+        let snippet = truncate_with_ellipsis(result.chunk.content.trim(), COMPACTION_MAX_SUMMARY_CHARS);
+        let _ = write!(recalled, "\n\n---\n{snippet}");
+        injected += 1;
+    }
+    if injected == 0 {
+        return None;
+    }
+    tracing::info!(pages = injected, "os-paging: recalled cold context pages");
+    match paging.retrieval_injection_role {
+        crate::config::RetrievalInjectionRole::System => Some(ChatMessage::system(recalled)),
+        crate::config::RetrievalInjectionRole::User => Some(ChatMessage::user(recalled)),
+    }
+}
+
+/// Insert a recalled-context message into history without polluting the most
+/// recent user turn. The recall message is placed just after any leading
+/// `system` message (or at the front when there is none).
+fn inject_recalled_context(history: &mut Vec<ChatMessage>, recalled: ChatMessage) {
+    let has_system = history.first().is_some_and(|m| m.role == "system");
+    let insert_at = if has_system { 1 } else { 0 };
+    history.insert(insert_at, recalled);
+}
+
+/// Extract the latest real user turn to use as the recall query, skipping
+/// internal bookkeeping messages (tool results, compaction/paging breadcrumbs).
+fn latest_user_query(history: &[ChatMessage]) -> Option<&str> {
+    history
+        .iter()
+        .rev()
+        .find(|m| {
+            m.role == "user"
+                && !m.content.is_empty()
+                && !m.content.starts_with("[Tool")
+                && !m.content.starts_with("[Post-compaction")
+                && !m.content.starts_with(OS_PAGING_RECALL_MARKER)
+        })
+        .map(|m| m.content.as_str())
 }
 
 /// Extract key facts from messages about to be compacted and store them in memory.
@@ -3564,6 +3821,30 @@ pub(crate) async fn run_tool_call_loop(
         rollback_error_rate_threshold: concurrency_governance.rollback_error_rate_threshold.clamp(0.0, 1.0),
     };
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+
+    // FIX-P3-05: Letta/MemGPT-style OS-paging. Opt-in (`os_paging.enabled`);
+    // when off this whole block is a no-op and the legacy compaction path below
+    // runs unchanged (zero regression on the hot path). When on:
+    //   1. Recall — semantically retrieve relevant evicted pages and inject them
+    //      (proactive_retrieval) so the model can see paged-out history again.
+    //   2. Evict — page the oldest cold context out to the durable document
+    //      store (non-destructively), shrinking the hot window before the turn.
+    // Legacy compaction below still runs as a backstop if paging left the
+    // context above the 0.85 threshold.
+    if let Some(config) = compaction_config {
+        if config.os_paging.enabled {
+            if let Some(query) = latest_user_query(history).map(ToString::to_string) {
+                if let Some(recalled) = recall_context_pages(&query, config, document_ingest.as_ref()).await {
+                    inject_recalled_context(history, recalled);
+                }
+            }
+            match apply_os_paging(history, config, document_ingest.as_ref()).await {
+                Ok(true) => tracing::debug!("os-paging: pre-turn eviction applied"),
+                Ok(false) => {}
+                Err(e) => tracing::warn!("os-paging: pre-turn eviction error (soft): {e}"),
+            }
+        }
+    }
 
     // P1-3: Proactive pre-turn memory flush — compact before starting the loop
     // if the context is already above 85% of the token budget.
@@ -6720,6 +7001,7 @@ ls -la
             keep_recent_messages: 1,
             memory_flush: false,
             max_context_tokens: 50,
+            os_paging: crate::config::OsPagingConfig::default(),
         };
         let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
             .await
@@ -6748,6 +7030,7 @@ ls -la
             keep_recent_messages: 1,
             memory_flush: true,
             max_context_tokens: 40,
+            os_paging: crate::config::OsPagingConfig::default(),
         };
         let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
             .await
@@ -6787,6 +7070,7 @@ ls -la
             keep_recent_messages: 1,
             memory_flush: false,
             max_context_tokens: 50,
+            os_paging: crate::config::OsPagingConfig::default(),
         };
 
         let compacted =
@@ -7821,5 +8105,138 @@ Let me check the result."#;
             "this is a substantially longer user message with many more tokens than the small one",
         )];
         assert!(estimate_history_tokens(&large) > estimate_history_tokens(&small));
+    }
+
+    fn paging_test_config(enabled: bool) -> crate::config::AgentCompactionConfig {
+        crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 1,
+            keep_recent_messages: 12,
+            memory_flush: false,
+            max_context_tokens: 50,
+            os_paging: crate::config::OsPagingConfig {
+                enabled,
+                eviction_threshold: 0.70,
+                proactive_retrieval: true,
+                max_recalled_pages: 3,
+                retrieval_injection_role: crate::config::RetrievalInjectionRole::System,
+                keep_recent_messages: 1,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn os_paging_disabled_is_a_noop_zero_regression() {
+        // With paging disabled, apply_os_paging must never touch history even
+        // when it is well above the eviction threshold.
+        let config = paging_test_config(false);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1 ".repeat(120)),
+            ChatMessage::assistant("a1 ".repeat(120)),
+            ChatMessage::user("u2 ".repeat(120)),
+            ChatMessage::assistant("a2 ".repeat(120)),
+        ];
+        let before = history.clone();
+        let evicted = apply_os_paging(&mut history, &config, None).await.unwrap();
+        assert!(!evicted, "disabled paging must not evict");
+        assert_eq!(history.len(), before.len());
+        assert!(
+            history.iter().all(|m| !m.content.starts_with(OS_PAGING_EVICT_MARKER)),
+            "no paging breadcrumb should be injected when disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn os_paging_below_threshold_does_not_evict() {
+        let config = paging_test_config(true);
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("short message")];
+        let before = history.clone();
+        let evicted = apply_os_paging(&mut history, &config, None).await.unwrap();
+        assert!(!evicted);
+        assert_eq!(history.len(), before.len());
+    }
+
+    #[tokio::test]
+    async fn os_paging_evicts_cold_context_into_document_store_and_recalls() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent(workspace, "run-paging-1");
+        let runtime = DocumentIngestRuntime::from_envelope(mem, &envelope);
+
+        let config = paging_test_config(true);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            // Distinctive token to assert verbatim recall later.
+            ChatMessage::user("Remember the secret deployment token ZEBRA-PANGOLIN-42. ".repeat(40)),
+            ChatMessage::assistant("Acknowledged the deployment token. ".repeat(40)),
+            ChatMessage::user("And the database is at db-host-9001. ".repeat(40)),
+            ChatMessage::assistant("Noted database host. ".repeat(40)),
+            ChatMessage::user("latest question please summarize"),
+        ];
+        let original_len = history.len();
+
+        let evicted = apply_os_paging(&mut history, &config, Some(&runtime)).await.unwrap();
+        assert!(evicted, "paging should evict cold context above threshold");
+        // History should be shorter and contain a paging breadcrumb.
+        assert!(history.len() < original_len);
+        assert!(
+            history.iter().any(|m| m.content.starts_with(OS_PAGING_EVICT_MARKER)),
+            "a paging breadcrumb should replace evicted messages"
+        );
+        // The recent user message must remain in the hot window.
+        assert!(history.iter().any(|m| m.content == "latest question please summarize"));
+
+        // Recall the evicted page by querying the distinctive token.
+        let recalled = recall_context_pages("ZEBRA-PANGOLIN deployment token", &config, Some(&runtime))
+            .await
+            .expect("evicted page should be recalled");
+        assert_eq!(recalled.role, "system");
+        assert!(recalled.content.starts_with(OS_PAGING_RECALL_MARKER));
+        assert!(
+            recalled.content.contains("ZEBRA-PANGOLIN-42"),
+            "recalled page must preserve full content verbatim, got: {}",
+            &recalled.content[..recalled.content.len().min(200)]
+        );
+    }
+
+    #[tokio::test]
+    async fn os_paging_recall_disabled_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent(workspace, "run-paging-2");
+        let runtime = DocumentIngestRuntime::from_envelope(mem, &envelope);
+
+        let mut config = paging_test_config(true);
+        config.os_paging.proactive_retrieval = false;
+        let recalled = recall_context_pages("anything", &config, Some(&runtime)).await;
+        assert!(
+            recalled.is_none(),
+            "recall must be skipped when proactive_retrieval is off"
+        );
+    }
+
+    #[test]
+    fn inject_recalled_context_inserts_after_system() {
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
+        inject_recalled_context(&mut history, ChatMessage::system("recalled"));
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].content, "sys");
+        assert_eq!(history[1].content, "recalled");
+        assert_eq!(history[2].content, "hello");
+    }
+
+    #[test]
+    fn latest_user_query_skips_internal_messages() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("real question one"),
+            ChatMessage::assistant("answer"),
+            ChatMessage::user("[Tool result] internal"),
+            ChatMessage::user("[Post-compaction context refresh] noise"),
+        ];
+        assert_eq!(latest_user_query(&history), Some("real question one"));
     }
 }

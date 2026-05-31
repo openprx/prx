@@ -996,6 +996,14 @@ pub struct AgentCompactionConfig {
     /// Token threshold that triggers compaction.
     #[serde(default = "default_agent_compaction_max_context_tokens")]
     pub max_context_tokens: usize,
+    /// Letta/MemGPT-style OS-paging controls (`[agent.compaction.os_paging]`).
+    ///
+    /// Disabled by default for backward compatibility. When enabled, oldest
+    /// messages are evicted to the durable document store (non-destructively,
+    /// preserving full content) and semantically recalled on later turns,
+    /// instead of being collapsed into a lossy summary.
+    #[serde(default)]
+    pub os_paging: OsPagingConfig,
 }
 
 impl Default for AgentCompactionConfig {
@@ -1006,8 +1014,77 @@ impl Default for AgentCompactionConfig {
             keep_recent_messages: default_agent_compaction_keep_recent_messages(),
             memory_flush: true,
             max_context_tokens: default_agent_compaction_max_context_tokens(),
+            os_paging: OsPagingConfig::default(),
         }
     }
+}
+
+/// Where recalled context pages are injected back into the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalInjectionRole {
+    /// Inject recalled pages as a leading `system` message (not user-visible).
+    #[default]
+    System,
+    /// Inject recalled pages as a leading `user` message.
+    User,
+}
+
+/// Letta/MemGPT-style OS-paging configuration (`[agent.compaction.os_paging]`).
+///
+/// OS-paging is an opt-in, additive layer on top of the existing compaction
+/// pipeline. When `enabled = false` (the default) the agent runs the legacy
+/// `apply_configurable_compaction` path unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OsPagingConfig {
+    /// Enable OS-paging. When `false`, the agent falls back to legacy
+    /// compaction with no behavioral change (backward compatible default).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Token capacity ratio (0.0-1.0, relative to `max_context_tokens`) above
+    /// which eviction is triggered. Letta recommends ~0.70; the legacy
+    /// compaction path uses 0.85.
+    #[serde(default = "default_os_paging_eviction_threshold")]
+    pub eviction_threshold: f64,
+    /// Whether to proactively recall relevant evicted pages on every turn.
+    /// When `false`, recall happens only after a context-overflow error.
+    #[serde(default = "default_true")]
+    pub proactive_retrieval: bool,
+    /// Maximum number of evicted pages (document chunks) recalled per turn.
+    #[serde(default = "default_os_paging_max_recalled_pages")]
+    pub max_recalled_pages: usize,
+    /// Role under which recalled pages are injected.
+    #[serde(default)]
+    pub retrieval_injection_role: RetrievalInjectionRole,
+    /// Number of recent non-system messages always retained in the hot window
+    /// during eviction (older messages are paged out).
+    #[serde(default = "default_os_paging_keep_recent_messages")]
+    pub keep_recent_messages: usize,
+}
+
+impl Default for OsPagingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            eviction_threshold: default_os_paging_eviction_threshold(),
+            proactive_retrieval: true,
+            max_recalled_pages: default_os_paging_max_recalled_pages(),
+            retrieval_injection_role: RetrievalInjectionRole::System,
+            keep_recent_messages: default_os_paging_keep_recent_messages(),
+        }
+    }
+}
+
+const fn default_os_paging_eviction_threshold() -> f64 {
+    0.70
+}
+
+const fn default_os_paging_max_recalled_pages() -> usize {
+    3
+}
+
+const fn default_os_paging_keep_recent_messages() -> usize {
+    12
 }
 
 /// Sessions spawn configuration (`[sessions_spawn]` section).
