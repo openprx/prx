@@ -1,3 +1,5 @@
+use crate::security::SideEffectGate;
+use crate::security::policy::{ResourceRiskLevel, SecurityPolicy};
 use crate::self_system::evolution::analyzer::{
     CandidatePriority, DailyDigest, EvolutionAnalyzer, EvolutionCandidate, TrendAnalysis,
 };
@@ -59,6 +61,11 @@ pub struct EvolutionPipeline {
     judge: JudgeEngine,
     shared_config: SharedEvolutionConfig,
     workspace_root: PathBuf,
+    /// FIX-P0-40: optional side-effect gate enforced just before an evolution
+    /// log is committed (the real mutation point). `None` preserves the prior
+    /// behaviour (no side-effect gate) so existing callers are unaffected; the
+    /// daemon wires a real policy via [`Self::with_security_policy`].
+    security_policy: Option<Arc<SecurityPolicy>>,
 }
 
 impl EvolutionPipeline {
@@ -100,7 +107,39 @@ impl EvolutionPipeline {
             judge,
             shared_config,
             workspace_root: workspace_root.as_ref().to_path_buf(),
+            security_policy: None,
         }
+    }
+
+    /// FIX-P0-40: attach the runtime [`SecurityPolicy`] whose [`SideEffectGate`]
+    /// must authorize every evolution commit before it is persisted.
+    ///
+    /// Without this, an autonomous evolution cycle would write self-modifications
+    /// to the audit log without ever passing through the same side-effect gate
+    /// that governs tool execution. The daemon constructs the policy from the
+    /// active config and installs it here; tests and the CLI may leave it unset to
+    /// retain the un-gated behaviour.
+    #[must_use]
+    pub fn with_security_policy(mut self, policy: Arc<SecurityPolicy>) -> Self {
+        self.security_policy = Some(policy);
+        self
+    }
+
+    /// FIX-P0-40: enforce the side-effect gate for an evolution commit.
+    ///
+    /// The operation id encodes the layer and experiment so the audit trail
+    /// records exactly which self-modification was authorized. When no policy is
+    /// installed this is a no-op (preserving legacy behaviour).
+    fn authorize_commit(&self, layer: &EvolutionLayer, experiment_id: &str) -> Result<()> {
+        let Some(policy) = self.security_policy.as_ref() else {
+            return Ok(());
+        };
+        let layer_name = layer_slug(layer);
+        let operation = format!("evolution:{layer_name}:{experiment_id}");
+        SideEffectGate::new(policy.as_ref())
+            .authorize_resource_operation("evolution", &operation, ResourceRiskLevel::Medium, None)
+            .map_err(|reason| anyhow::anyhow!("evolution commit blocked by side-effect gate: {reason}"))?;
+        Ok(())
     }
 
     /// Execute one pipeline pass for a specific layer and trigger source.
@@ -223,6 +262,12 @@ impl EvolutionPipeline {
                 _ => EvolutionResult::Neutral,
             });
         }
+
+        // FIX-P0-40: gate the real mutation point. The evolution log is the
+        // committed record of a self-modification; it must pass the side-effect
+        // gate before being persisted. A denial aborts the commit (fail-closed)
+        // and surfaces the reason to the caller / scheduler.
+        self.authorize_commit(&layer, &experiment_id)?;
 
         self.writer.append_evolution(&evolution_log).await?;
         if let Err(err) = self.backfill_results(now).await {
@@ -494,14 +539,20 @@ fn should_rollback(
     ) && judge.scores.overall() < pass_threshold
 }
 
-fn infer_rollback_dir(workspace_root: &Path, layer: &EvolutionLayer) -> Result<PathBuf> {
-    let layer_name = match layer {
+/// Stable short name for an evolution layer, used in gate operation ids and
+/// rollback directory paths.
+const fn layer_slug(layer: &EvolutionLayer) -> &'static str {
+    match layer {
         EvolutionLayer::Memory => "memory",
         EvolutionLayer::Prompt => "prompt",
         EvolutionLayer::Policy => "strategy",
         EvolutionLayer::Tooling => "tooling",
         EvolutionLayer::Runtime => "runtime",
-    };
+    }
+}
+
+fn infer_rollback_dir(workspace_root: &Path, layer: &EvolutionLayer) -> Result<PathBuf> {
+    let layer_name = layer_slug(layer);
 
     validate_path_in_workspace(
         workspace_root,
@@ -720,6 +771,72 @@ mod tests {
             report.evolution_log.as_ref().map(|item| item.experiment_id.as_str()),
             Some(report.experiment_id.as_str())
         );
+    }
+
+    async fn gated_pipeline(dir: &std::path::Path, policy: Arc<SecurityPolicy>) -> EvolutionPipeline {
+        let storage_root = dir.join("logs");
+        let writer = Arc::new(
+            AsyncJsonlWriter::new(
+                JsonlStoragePaths::new(storage_root.clone()),
+                JsonlRetentionPolicy::default(),
+                1,
+            )
+            .await
+            .unwrap(),
+        );
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.join("analysis")));
+        let mut cfg = EvolutionConfig::default();
+        cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
+        let shared = new_shared_evolution_config(cfg);
+        EvolutionPipeline::new(shared, analyzer, writer, dir).with_security_policy(policy)
+    }
+
+    #[tokio::test]
+    async fn authorize_commit_is_noop_without_policy() {
+        let dir = tempdir().unwrap();
+        let storage_root = dir.path().join("logs");
+        let writer = Arc::new(
+            AsyncJsonlWriter::new(
+                JsonlStoragePaths::new(storage_root.clone()),
+                JsonlRetentionPolicy::default(),
+                1,
+            )
+            .await
+            .unwrap(),
+        );
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.path().join("analysis")));
+        let mut cfg = EvolutionConfig::default();
+        cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
+        let shared = new_shared_evolution_config(cfg);
+        // No policy installed → legacy behaviour, commit authorization is a no-op.
+        let pipeline = EvolutionPipeline::new(shared, analyzer, writer, dir.path());
+        assert!(pipeline.authorize_commit(&EvolutionLayer::Memory, "exp-x").is_ok());
+    }
+
+    #[tokio::test]
+    async fn authorize_commit_blocks_under_supervised_policy_without_grant() {
+        let dir = tempdir().unwrap();
+        // Default policy is Supervised + require_approval_for_medium_risk → a
+        // Medium-risk evolution commit with no runtime grant is denied.
+        let policy = Arc::new(SecurityPolicy::default());
+        let pipeline = gated_pipeline(dir.path(), policy).await;
+        let err = pipeline
+            .authorize_commit(&EvolutionLayer::Prompt, "exp-blocked")
+            .expect_err("supervised policy must block ungranted evolution commit");
+        assert!(err.to_string().contains("side-effect gate"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn authorize_commit_allows_under_full_policy() {
+        let dir = tempdir().unwrap();
+        // Full autonomy → no medium-risk approval requirement, commit authorized.
+        let policy = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            require_approval_for_medium_risk: false,
+            ..SecurityPolicy::default()
+        });
+        let pipeline = gated_pipeline(dir.path(), policy).await;
+        assert!(pipeline.authorize_commit(&EvolutionLayer::Memory, "exp-ok").is_ok());
     }
 
     #[tokio::test]

@@ -24,7 +24,7 @@ use crate::memory::{self, Memory, MemoryCategory, MemoryFabric, MemoryVisibility
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
 use crate::runtime;
-use crate::runtime::envelope::{RuntimeEnvelope, RuntimeSource};
+use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use crate::security::policy::ResourceRiskLevel;
 use crate::security::{SecurityPolicy, SideEffectGate};
@@ -1023,15 +1023,14 @@ async fn run_gateway_chat_with_multimodal(
     let event_recording = state.config.lock().memory.event_recording_config();
     let fabric = MemoryFabric::new(state.mem.clone(), workspace_id.clone()).with_event_recording(event_recording);
     let run_id = Uuid::new_v4().to_string();
-    let runtime_envelope = RuntimeEnvelope::new(
-        RuntimeSource::Gateway,
+    let runtime_envelope = RuntimeEnvelope::gateway(
         workspace_id,
         fabric_ctx.session_key.clone(),
+        fabric_ctx.channel.clone(),
+        fabric_ctx.sender.clone(),
+        fabric_ctx.recipient.clone(),
         MemoryVisibility::Workspace,
     )
-    .with_channel(fabric_ctx.channel.clone())
-    .with_sender(fabric_ctx.sender.clone())
-    .with_recipient(fabric_ctx.recipient.clone())
     .with_run_id(run_id);
     let base_scope = runtime_envelope.message_scope();
     authorize_gateway_resource_mutation(state, "gateway:webhook:message_event:user", ResourceRiskLevel::Low).map_err(

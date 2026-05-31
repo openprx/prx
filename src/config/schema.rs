@@ -1765,6 +1765,29 @@ pub struct McpServerRuntimeConfig {
     /// Per-caller request budget.
     #[serde(default = "default_mcp_server_rate_limit_rps")]
     pub rate_limit_rps: u32,
+    /// Expected `iss` claim for inbound bearer JWTs. When unset, bearer JWT
+    /// verification is disabled and bearer tokens are rejected.
+    #[serde(default)]
+    pub jwt_issuer: Option<String>,
+    /// Expected `aud` claim for inbound bearer JWTs. When set, the token must
+    /// carry a matching audience.
+    #[serde(default)]
+    pub jwt_audience: Option<String>,
+    /// Inline JWKS document (RFC 7517 JSON) used to resolve signing keys by
+    /// `kid`. Takes precedence over `jwt_public_key_pem` when both are set.
+    #[serde(default)]
+    pub jwt_jwks: Option<String>,
+    /// PEM-encoded public key (RSA/EC/Ed) used when no JWKS is configured.
+    #[serde(default)]
+    pub jwt_public_key_pem: Option<String>,
+    /// Allowed JWT signing algorithms. Symmetric (`HS*`) and `none` are never
+    /// accepted; only asymmetric algorithms in this list pass verification.
+    #[serde(default = "default_mcp_jwt_algorithms")]
+    pub jwt_algorithms: Vec<String>,
+}
+
+fn default_mcp_jwt_algorithms() -> Vec<String> {
+    vec!["RS256".to_string()]
 }
 
 fn default_mcp_server_bind() -> String {
@@ -1806,6 +1829,11 @@ impl Default for McpServerRuntimeConfig {
             exposed_tools: default_mcp_server_exposed_tools(),
             allowed_origins: default_mcp_allowed_origins(),
             rate_limit_rps: default_mcp_server_rate_limit_rps(),
+            jwt_issuer: None,
+            jwt_audience: None,
+            jwt_jwks: None,
+            jwt_public_key_pem: None,
+            jwt_algorithms: default_mcp_jwt_algorithms(),
         }
     }
 }

@@ -86,22 +86,22 @@ impl RuntimeEnvelope {
     /// DEPRECATED — do not use in new code.
     ///
     /// Prefer a purpose-specific constructor:
-    /// [`channel`](Self::channel) / [`agent`](Self::agent) /
-    /// [`gateway_webhook`](Self::gateway_webhook) / [`chat`](Self::chat) /
+    /// [`channel`](Self::channel) / [`channel_with_session`](Self::channel_with_session) /
+    /// [`agent`](Self::agent) / [`agent_process_message`](Self::agent_process_message) /
+    /// [`gateway`](Self::gateway) / [`gateway_webhook`](Self::gateway_webhook) /
+    /// [`chat`](Self::chat) / [`chat_terminal`](Self::chat_terminal) /
     /// [`console`](Self::console) / [`session_worker`](Self::session_worker) /
     /// [`sessions_spawn`](Self::sessions_spawn) / [`delegate`](Self::delegate).
     ///
     /// `new` bypasses the visibility/sender/channel defaults that those
     /// constructors apply, which causes default drift across ingress paths.
     ///
-    /// NOTE: this is intentionally NOT marked with the `#[deprecated]` attribute
-    /// yet. There are still 5 in-crate call sites (channels/gateway/agent/chat)
-    /// that use it; because `openprx` builds with `-D warnings`, attaching
-    /// `#[deprecated]` would upgrade those usages to hard errors. The attribute
-    /// will be added in the follow-up wave that migrates those call sites to the
-    /// purpose-specific constructors. `#[doc(hidden)]` keeps it out of the
-    /// public API surface in the meantime.
+    /// All in-crate call sites have been migrated to the purpose-specific
+    /// constructors, so the `#[deprecated]` attribute is now attached without
+    /// tripping the crate's `-D warnings` build. `#[doc(hidden)]` keeps it out
+    /// of the public API surface.
     #[doc(hidden)]
+    #[deprecated(note = "use channel()/agent()/gateway_webhook()/chat() — new() bypasses visibility/sender defaults")]
     #[must_use]
     pub fn new(
         source: RuntimeSource,
@@ -124,6 +124,26 @@ impl RuntimeEnvelope {
         .with_sender("local-user")
     }
 
+    /// `Chat` envelope for callers that already hold a fully-formed terminal
+    /// session key and need to pick the memory visibility explicitly.
+    ///
+    /// The interactive [`chat`](Self::chat) builder derives a `chat:{id}` key
+    /// and pins `Session` visibility; the terminal scope/runtime helpers
+    /// instead pass an existing `chat_session_key` and record at
+    /// `Workspace` visibility. This constructor applies the same
+    /// `terminal` channel / `local-user` sender defaults so both terminal
+    /// entry points share one channel/sender identity.
+    #[must_use]
+    pub fn chat_terminal(
+        workspace_id: impl Into<String>,
+        session_key: impl Into<String>,
+        visibility: MemoryVisibility,
+    ) -> Self {
+        Self::new_internal(RuntimeSource::Chat, workspace_id, session_key, visibility)
+            .with_channel("terminal")
+            .with_sender("local-user")
+    }
+
     #[must_use]
     pub fn agent(workspace_id: impl Into<String>, run_id: impl Into<String>) -> Self {
         let run_id = run_id.into();
@@ -136,6 +156,26 @@ impl RuntimeEnvelope {
         .with_run_id(run_id)
         .with_channel("cli")
         .with_sender("local-user")
+    }
+
+    /// `Agent` envelope for the `process_message` entry path.
+    ///
+    /// Unlike [`agent`](Self::agent) (interactive CLI, `agent:{run_id}` key,
+    /// `cli` channel), this path keeps its own caller-supplied `session_key`
+    /// and routes through the `process_message` channel. It applies the same
+    /// `local-user` sender / `Session` visibility defaults so the
+    /// channel/sender/recipient triad stays consistent with the CLI agent.
+    #[must_use]
+    pub fn agent_process_message(workspace_id: impl Into<String>, session_key: impl Into<String>) -> Self {
+        Self::new_internal(
+            RuntimeSource::Agent,
+            workspace_id,
+            session_key,
+            MemoryVisibility::Session,
+        )
+        .with_channel("process_message")
+        .with_sender("local-user")
+        .with_recipient("process_message:local-user".to_string())
     }
 
     #[must_use]
@@ -152,6 +192,29 @@ impl RuntimeEnvelope {
         .with_channel("webhook")
         .with_sender("webhook")
         .with_recipient(target.to_string())
+    }
+
+    /// `Gateway` envelope for the multimodal chat path, where the channel,
+    /// sender, recipient, session key and visibility are all supplied by the
+    /// caller's `GatewayFabricContext`.
+    ///
+    /// [`gateway_webhook`](Self::gateway_webhook) covers the fixed
+    /// webhook ingress (constant `webhook` channel/sender, derived session
+    /// key); this constructor is for gateway traffic whose routing identity is
+    /// resolved upstream and must be carried through verbatim.
+    #[must_use]
+    pub fn gateway(
+        workspace_id: impl Into<String>,
+        session_key: impl Into<String>,
+        channel: impl Into<String>,
+        sender: impl Into<String>,
+        recipient: impl Into<String>,
+        visibility: MemoryVisibility,
+    ) -> Self {
+        Self::new_internal(RuntimeSource::Gateway, workspace_id, session_key, visibility)
+            .with_channel(channel)
+            .with_sender(sender)
+            .with_recipient(recipient.into())
     }
 
     #[must_use]
@@ -172,6 +235,30 @@ impl RuntimeEnvelope {
         .with_channel(channel)
         .with_sender(sender)
         .with_recipient(chat_id.unwrap_or_default())
+    }
+
+    /// `Channel` envelope for callers that already track their own
+    /// `session_key` (e.g. the per-sender conversation history key) and need
+    /// to choose the memory visibility explicitly.
+    ///
+    /// [`channel`](Self::channel) derives the `{channel}_{sender}` history key
+    /// and pins `Session` visibility; this constructor keeps the caller's key
+    /// and visibility while applying the same channel/sender/recipient triad,
+    /// so both channel entry points produce identical owner/principal
+    /// identities.
+    #[must_use]
+    pub fn channel_with_session(
+        workspace_id: impl Into<String>,
+        session_key: impl Into<String>,
+        channel: impl Into<String>,
+        sender: impl Into<String>,
+        recipient: impl Into<String>,
+        visibility: MemoryVisibility,
+    ) -> Self {
+        Self::new_internal(RuntimeSource::Channel, workspace_id, session_key, visibility)
+            .with_channel(channel)
+            .with_sender(sender)
+            .with_recipient(recipient.into())
     }
 
     #[must_use]

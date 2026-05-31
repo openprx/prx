@@ -434,6 +434,102 @@ impl ApprovalGrantV2 {
         self.revocation_reason = Some(reason.into());
     }
 
+    /// FIX-P3-03 (NIST SP 800-63 / W3C VC interop): render this grant as a W3C
+    /// Verifiable Credential 2.0 JSON-LD document.
+    ///
+    /// This is an *additional* export format intended for external attestation /
+    /// interchange (e.g. an auditor or a SPIFFE-adjacent verifier inspecting which
+    /// capability a runtime grant carried). It does NOT replace the canonical
+    /// sign/verify path: the production gate still signs and verifies
+    /// [`canonical_grant_bytes`] via [`sign_grant`] / [`verify_grant`]. The VC's
+    /// `proof` re-exposes the already-computed Ed25519 witness signature so an
+    /// external party can correlate it with the canonical payload digest, but the
+    /// VC envelope itself is not what the gate verifies.
+    ///
+    /// The grant's [`ResourceConstraints`] are surfaced under
+    /// `credentialSubject.scope` so the resource bounds (path prefix, host/recipient
+    /// allowlists, payload/concurrency caps) travel with the credential.
+    #[must_use]
+    pub fn to_w3c_vc(&self) -> serde_json::Value {
+        let op_id_match = match &self.capability.op_id_match {
+            OpIdMatch::Exact => serde_json::json!({ "mode": "exact" }),
+            OpIdMatch::GlobPattern(pattern) => serde_json::json!({
+                "mode": "glob",
+                "pattern": pattern,
+            }),
+        };
+        let risk = match self.capability.risk_level {
+            RiskLevel::Low => "low",
+            RiskLevel::Medium => "medium",
+            RiskLevel::High => "high",
+        };
+        let authority = match self.issuer.authority {
+            IssuerAuthority::RuntimeAutomatic => "RuntimeAutomatic",
+            IssuerAuthority::HumanReview => "HumanReview",
+            IssuerAuthority::ExternalOAuth => "ExternalOAuth",
+            IssuerAuthority::Delegated => "Delegated",
+        };
+
+        let scope = serde_json::json!({
+            "absPathPrefix": self.resource_constraints.abs_path_prefix,
+            "urlHostAllowlist": self.resource_constraints.url_host_allowlist,
+            "recipientAllowlist": self.resource_constraints.recipient_allowlist,
+            "maxPayloadBytes": self.resource_constraints.max_payload_bytes,
+            "maxConcurrentCalls": self.resource_constraints.max_concurrent_calls,
+        });
+
+        // `proof` mirrors the existing canonical witness signature. The
+        // verification material the gate actually checks is the Ed25519 signature
+        // over `canonical_grant_bytes`; here we expose it (and the payload digest)
+        // so an external verifier can reconstruct that binding without re-deriving
+        // the canonical encoding.
+        let proof = serde_json::json!({
+            "type": "Ed25519Signature2020",
+            "created": self.issued_at.to_rfc3339(),
+            "verificationMethod": format!("did:openprx:witness#{}", self.issuer.public_key_id),
+            "proofPurpose": "assertionMethod",
+            "cryptosuite": "eddsa-rdfc-2022",
+            "proofValue": self.witness_signature.signature_b64,
+            "canonicalPayloadSha256": self.witness_signature.signed_payload_sha256,
+        });
+
+        serde_json::json!({
+            "@context": [
+                "https://www.w3.org/ns/credentials/v2",
+                "https://openprx.dev/credentials/approval-grant/v2"
+            ],
+            "id": format!("urn:openprx:grant:{}", self.grant_id),
+            "type": ["VerifiableCredential", "ApprovalGrantCredential"],
+            "issuer": {
+                "id": format!("did:openprx:witness#{}", self.issuer.public_key_id),
+                "authority": authority,
+                "authorityId": self.issuer.authority_id,
+            },
+            "validFrom": self.not_before.to_rfc3339(),
+            "validUntil": self.expires_at.to_rfc3339(),
+            "credentialStatus": self.revoked_at.map(|revoked_at| serde_json::json!({
+                "type": "RevocationList2020Status",
+                "revokedAt": revoked_at.to_rfc3339(),
+                "revocationReason": self.revocation_reason,
+            })),
+            "credentialSubject": {
+                "id": self.subject.agent_id,
+                "principalId": self.subject.principal_id,
+                "ownerId": self.subject.owner_id,
+                "workspaceId": self.subject.workspace_id,
+                "capability": {
+                    "opId": self.capability.op_id,
+                    "opIdMatch": op_id_match,
+                    "riskLevel": risk,
+                },
+                "scope": scope,
+                "maxUses": self.max_uses,
+                "usesConsumed": self.uses_consumed,
+            },
+            "proof": proof,
+        })
+    }
+
     /// FIX-P3-06: refresh a persisted grant's validity window by extending
     /// `expires_at` to `now + ttl_secs`.
     ///
@@ -738,6 +834,82 @@ mod tests {
             .touch(&keyring, 60, now)
             .expect_err("revoked grant cannot be touched");
         assert!(revoked.to_string().contains("revoked"));
+        Ok(())
+    }
+
+    #[test]
+    fn approval_grant_to_w3c_vc_exports_without_breaking_canonical_verify() -> Result<()> {
+        let keyring = WitnessKeyring::generate_for_tests()?;
+        let mut grant = ApprovalGrantV2::issue_one_shot(
+            &keyring,
+            test_subject(),
+            IssuerAuthority::HumanReview,
+            "file_write:write:abc",
+            RiskLevel::Medium,
+        )?;
+        grant.resource_constraints.abs_path_prefix = Some("/workspace/data".to_string());
+        grant.resource_constraints.max_payload_bytes = Some(4096);
+        // Re-sign after mutating the canonically-signed payload.
+        sign_grant(&keyring, &mut grant)?;
+
+        let vc = grant.to_w3c_vc();
+
+        // W3C VC envelope shape (pointer access avoids panicking indexing).
+        assert_eq!(
+            vc.pointer("/type/0").and_then(|v| v.as_str()),
+            Some("VerifiableCredential")
+        );
+        assert_eq!(
+            vc.pointer("/type/1").and_then(|v| v.as_str()),
+            Some("ApprovalGrantCredential")
+        );
+        assert_eq!(
+            vc.pointer("/@context/0").and_then(|v| v.as_str()),
+            Some("https://www.w3.org/ns/credentials/v2")
+        );
+        assert_eq!(
+            vc.get("id").and_then(|v| v.as_str()),
+            Some(format!("urn:openprx:grant:{}", grant.grant_id).as_str())
+        );
+        assert_eq!(
+            vc.pointer("/credentialSubject/capability/opId")
+                .and_then(|v| v.as_str()),
+            Some("file_write:write:abc")
+        );
+        assert_eq!(
+            vc.pointer("/credentialSubject/capability/riskLevel")
+                .and_then(|v| v.as_str()),
+            Some("medium")
+        );
+        assert_eq!(
+            vc.pointer("/credentialSubject/scope/absPathPrefix")
+                .and_then(|v| v.as_str()),
+            Some("/workspace/data")
+        );
+        assert_eq!(
+            vc.pointer("/credentialSubject/scope/maxPayloadBytes")
+                .and_then(serde_json::Value::as_u64),
+            Some(4096)
+        );
+        assert_eq!(
+            vc.pointer("/proof/type").and_then(|v| v.as_str()),
+            Some("Ed25519Signature2020")
+        );
+        // The proof re-exposes the canonical witness signature verbatim.
+        assert_eq!(
+            vc.pointer("/proof/proofValue").and_then(|v| v.as_str()),
+            Some(grant.witness_signature.signature_b64.as_str())
+        );
+        assert_eq!(
+            vc.pointer("/proof/canonicalPayloadSha256").and_then(|v| v.as_str()),
+            Some(grant.witness_signature.signed_payload_sha256.as_str())
+        );
+        // Not-yet-revoked grant carries no credentialStatus.
+        assert!(vc.get("credentialStatus").is_some_and(serde_json::Value::is_null));
+
+        // The export is read-only: the canonical sign/verify path is untouched and
+        // the grant still verifies via the production verifier.
+        verify_grant(&keyring, &grant)?;
         Ok(())
     }
 

@@ -79,7 +79,7 @@ use crate::memory::{
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider};
 use crate::runtime;
-use crate::runtime::envelope::{RuntimeEnvelope, RuntimeSource};
+use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::security::SideEffectGate;
 use crate::security::policy::ResourceRiskLevel;
@@ -994,15 +994,14 @@ async fn append_sender_turn(
         }
     }
 
-    let envelope = RuntimeEnvelope::new(
-        RuntimeSource::Channel,
+    let envelope = RuntimeEnvelope::channel_with_session(
         ctx.workspace_dir.as_path().to_string_lossy().to_string(),
         sender_key.to_string(),
+        channel.to_string(),
+        sender.to_string(),
+        recipient.unwrap_or(sender).to_string(),
         visibility,
-    )
-    .with_channel(channel.to_string())
-    .with_sender(sender.to_string())
-    .with_recipient(recipient.unwrap_or(sender).to_string());
+    );
     let owner_id = envelope.resolved_owner_id();
 
     if let Err(error) = ctx

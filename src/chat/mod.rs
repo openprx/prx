@@ -61,7 +61,7 @@ use crate::memory::{
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
-use crate::runtime::envelope::{RuntimeEnvelope, RuntimeSource};
+use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::PolicyPipeline;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -464,28 +464,18 @@ fn chat_message_event_scope(
     provider_name: &str,
     model_name: &str,
 ) -> MessageEventScope {
-    RuntimeEnvelope::new(
-        RuntimeSource::Chat,
-        "workspace",
-        chat_session_key.to_string(),
-        MemoryVisibility::Workspace,
-    )
-    .with_channel("terminal")
-    .with_sender("local-user")
-    .with_recipient(format!("{provider_name}/{model_name}"))
-    .with_run_id(chat_run_id.to_string())
-    .message_scope()
+    RuntimeEnvelope::chat_terminal("workspace", chat_session_key.to_string(), MemoryVisibility::Workspace)
+        .with_recipient(format!("{provider_name}/{model_name}"))
+        .with_run_id(chat_run_id.to_string())
+        .message_scope()
 }
 
 fn chat_runtime_envelope(workspace_id: &str, chat_session_key: &str) -> RuntimeEnvelope {
-    RuntimeEnvelope::new(
-        RuntimeSource::Chat,
+    RuntimeEnvelope::chat_terminal(
         workspace_id.to_string(),
         chat_session_key.to_string(),
         MemoryVisibility::Workspace,
     )
-    .with_channel("terminal")
-    .with_sender("local-user")
     .with_recipient("terminal:user")
 }
 

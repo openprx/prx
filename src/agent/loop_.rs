@@ -4829,16 +4829,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &tools_registry,
     );
 
-    let runtime_envelope = RuntimeEnvelope::new(
-        crate::runtime::envelope::RuntimeSource::Agent,
-        memory_fabric.workspace_id().to_string(),
-        agent_session_key.clone(),
-        MemoryVisibility::Session,
-    )
-    .with_run_id(agent_run_id.clone())
-    .with_channel("process_message")
-    .with_sender("local-user")
-    .with_recipient("process_message:local-user");
+    let runtime_envelope =
+        RuntimeEnvelope::agent_process_message(memory_fabric.workspace_id().to_string(), agent_session_key.clone())
+            .with_run_id(agent_run_id.clone());
     let fabric_scope = runtime_envelope
         .message_scope()
         .with_recipient(format!("{provider_name}/{model_name}"));
