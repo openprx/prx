@@ -496,16 +496,56 @@ impl Agent {
     }
 
     fn build_system_prompt(&self) -> Result<String> {
+        self.build_system_prompt_for_model(&self.model_name)
+    }
+
+    /// Build the system prompt for an arbitrary model name rather than the agent's
+    /// statically-configured `model_name` (FIX-P1-14). When the router/Automix/
+    /// fallback selects a different model than the one the leading system message
+    /// was rendered for, the prompt must be rebuilt with the new model so the
+    /// model-specific guidance and identity are correct.
+    fn build_system_prompt_for_model(&self, model_name: &str) -> Result<String> {
         let instructions = self.tool_dispatcher.prompt_instructions(&self.tools);
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
-            model_name: &self.model_name,
+            model_name,
             tools: &self.tools,
             skills: &self.skills,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
         };
         self.prompt_builder.build(&ctx)
+    }
+
+    /// Rebuild the leading `system` message in `self.history` for `effective_model`
+    /// when it differs from the agent's configured model (FIX-P1-14). The system
+    /// prompt is rendered once at turn start from `self.model_name`; if routing
+    /// then picks a different model, the leading system message would otherwise
+    /// describe the wrong model. Best-effort: a render failure leaves the existing
+    /// prompt in place rather than failing the turn.
+    fn resync_system_prompt_for_model(&mut self, effective_model: &str) {
+        // Normalize the effective model: strip a leading "provider/" so we compare
+        // and render with the bare model name the prompt builder expects.
+        let bare_model = effective_model
+            .rsplit_once('/')
+            .map_or(effective_model, |(_, model)| model);
+        if bare_model == self.model_name || bare_model.is_empty() {
+            return;
+        }
+        let new_prompt = match self.build_system_prompt_for_model(bare_model) {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                tracing::warn!("failed to rebuild system prompt for switched model: {err}");
+                return;
+            }
+        };
+        // Replace the first leading system message (built at turn start) in place.
+        if let Some(ConversationMessage::Chat(chat)) = self.history.first_mut() {
+            if chat.role == "system" {
+                chat.content = new_prompt;
+                tracing::debug!(model = bare_model, "rebuilt system prompt for switched model");
+            }
+        }
     }
 
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
@@ -782,10 +822,12 @@ impl Agent {
             reason = classify_result.reason.as_str(),
             "Task routing classified incoming message"
         );
-        #[cfg(feature = "llm-router")]
-        let control_ladder_run_id = Some(self.cte_session_id.clone());
-        #[cfg(not(feature = "llm-router"))]
-        let control_ladder_run_id = None;
+        // #26: run_id must be per-turn, not per-Agent. The cte_session_id is a
+        // lifelong session identifier and cannot locate a single turn; generate a
+        // fresh turn_id here so the control-ladder trace and memory events for this
+        // turn share one correlation id (EU AI Act Art.12 traceability).
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let control_ladder_run_id = Some(turn_id.clone());
         let mut control_ladder_trace = self.control_ladder.build_trace("agent.turn", control_ladder_run_id);
 
         if classify_result.intent == super::classifier::TaskIntent::Delegate {
@@ -1011,6 +1053,52 @@ impl Agent {
                 "max_tool_iterations": max_tool_iterations,
             }),
         );
+        // FIX-P1-14: routing may have resolved a model different from the one the
+        // leading system message was rendered for at turn start; rebuild the prompt
+        // for the resolved model so model-specific guidance matches what will serve
+        // the turn.
+        self.resync_system_prompt_for_model(&effective_model);
+
+        // FIX-P1-13 (#25): stamp a RouteDecision id onto the agent-turn trace so it
+        // joins the routing timeline (the chat path already does this), and persist
+        // the decision under the per-turn run id (#26) as a durable join target.
+        let (rd_provider, rd_model) = effective_model
+            .split_once('/')
+            .unwrap_or(("default", effective_model.as_str()));
+        let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+            rd_provider,
+            rd_model,
+            "owner:agent",
+            format!("agent:{turn_id}"),
+            None,
+            None,
+            "agent.turn",
+            0,
+            true,
+            false,
+        );
+        control_ladder_trace.set_decision_id(route_decision.decision_id.clone());
+        // Persist the RouteDecision under the per-turn run id (#26) so the
+        // decision_id stamped on the trace has a durable join target (FIX-P1-13 /
+        // EU AI Act Art.12). Best-effort: telemetry must never fail a turn.
+        match serde_json::to_string(&route_decision) {
+            Ok(payload) => {
+                if let Err(err) = self
+                    .memory
+                    .store(
+                        &format!("router/decision/{turn_id}"),
+                        &payload,
+                        MemoryCategory::Custom("router".to_string()),
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!("failed to persist per-turn route decision: {err}");
+                }
+            }
+            Err(err) => tracing::warn!("failed to serialize route decision for turn trace: {err}"),
+        }
+
         self.append_control_ladder_trace(&control_ladder_trace);
 
         for _ in 0..max_tool_iterations {

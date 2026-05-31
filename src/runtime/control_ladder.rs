@@ -143,6 +143,14 @@ impl ControlLadderTrace {
         self
     }
 
+    /// Set the RouteDecision correlation id on an existing trace in place
+    /// (FIX-P1-13). Unlike [`Self::with_provider_outcome`] this is a `&mut`
+    /// setter so the agent-turn path can stamp the `decision_id` onto a trace it
+    /// is mutating incrementally, without consuming and rebuilding it.
+    pub fn set_decision_id(&mut self, decision_id: impl Into<String>) {
+        self.decision_id = Some(decision_id.into());
+    }
+
     pub fn mark_active(&mut self, name: &str, reason: impl Into<String>, detail: Value) {
         self.update_layer(name, true, "active", Some(reason.into()), detail);
     }
@@ -713,5 +721,27 @@ mod tests {
             .with_provider_outcome("dec-x", "openai", "gpt-4o", 1);
         assert_eq!(enriched.decision_id.as_deref(), Some("dec-x"));
         assert_eq!(enriched.attempts_count, Some(1));
+    }
+
+    // FIX-P1-13: the agent.turn path stamps a RouteDecision id onto a trace it is
+    // mutating incrementally via the &mut setter (it cannot consume + rebuild the
+    // trace). The setter must populate decision_id so the trace joins the routing
+    // timeline, and the id must survive JSON serialization.
+    #[test]
+    fn set_decision_id_stamps_correlation_id_in_place() {
+        let mut trace = ControlLadderSnapshot::l0_only().build_trace("agent.turn", Some("turn-1".to_string()));
+        assert_eq!(trace.decision_id, None, "fresh trace has no decision id");
+
+        trace.set_decision_id("dec-agent-42");
+        assert_eq!(trace.decision_id.as_deref(), Some("dec-agent-42"));
+        // run_id (the per-turn id, #26) and decision_id (#25) coexist on the trace.
+        assert_eq!(trace.run_id.as_deref(), Some("turn-1"));
+
+        let json = serde_json::to_string(&trace).expect("test: trace serializes");
+        assert!(json.contains("\"decision_id\":\"dec-agent-42\""));
+        assert!(json.contains("\"run_id\":\"turn-1\""));
+        let parsed: ControlLadderTrace = serde_json::from_str(&json).expect("test: trace round-trips");
+        assert_eq!(parsed.decision_id.as_deref(), Some("dec-agent-42"));
+        assert_eq!(parsed.run_id.as_deref(), Some("turn-1"));
     }
 }
