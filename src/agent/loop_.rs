@@ -593,12 +593,46 @@ fn apply_compaction_summary(history: &mut Vec<ChatMessage>, start: usize, compac
 }
 
 fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
-    // Fast heuristic: ~4 chars/token + small per-message framing.
+    // Per-message framing overhead (role marker, separators) approximated as a
+    // small constant added on top of the tokenized role and content.
+    const PER_MESSAGE_FRAMING_TOKENS: usize = 3;
     history
         .iter()
-        .map(|msg| msg.role.chars().count() + msg.content.chars().count() + 12)
-        .sum::<usize>()
-        / 4
+        .map(|msg| count_tokens(&msg.role) + count_tokens(&msg.content) + PER_MESSAGE_FRAMING_TOKENS)
+        .sum()
+}
+
+/// Count the number of tokens in `text`.
+///
+/// When the `llm-router` feature is enabled this uses the `cl100k_base`
+/// encoding (the tokenizer used by GPT-3.5/4 and a close proxy for most modern
+/// chat models), giving an accurate count. The encoder is expensive to build,
+/// so it is constructed once and cached in a [`std::sync::LazyLock`].
+///
+/// When the feature is disabled it falls back to the classic `chars / 4`
+/// heuristic (rounded up) so the crate still builds and behaves reasonably.
+pub fn count_tokens(text: &str) -> usize {
+    #[cfg(feature = "llm-router")]
+    {
+        use std::sync::LazyLock;
+        use tiktoken_rs::CoreBPE;
+
+        static ENCODER: LazyLock<Option<CoreBPE>> = LazyLock::new(|| match tiktoken_rs::cl100k_base() {
+            Ok(bpe) => Some(bpe),
+            Err(err) => {
+                tracing::warn!("tiktoken cl100k_base init failed, falling back to char heuristic: {err}");
+                None
+            }
+        });
+
+        if let Some(bpe) = ENCODER.as_ref() {
+            return bpe.encode_with_special_tokens(text).len();
+        }
+    }
+
+    // Heuristic fallback: ~4 characters per token, rounding up so non-empty
+    // text never reports zero tokens.
+    text.chars().count().div_ceil(4)
 }
 
 fn compaction_summary_fidelity_status(
@@ -7759,5 +7793,49 @@ Let me check the result."#;
         assert_eq!(history.len(), 3); // system + 2 kept
         assert_eq!(history[0].role, "system");
         assert_eq!(history[1].content, "new msg");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // P3-11: count_tokens / estimate_history_tokens
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn count_tokens_empty_is_zero() {
+        assert_eq!(count_tokens(""), 0);
+    }
+
+    #[test]
+    fn count_tokens_nonempty_is_positive() {
+        assert!(count_tokens("hello world") > 0);
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[test]
+    fn count_tokens_matches_known_cl100k_count() {
+        // Under cl100k_base, "hello world" tokenizes to exactly 2 tokens, while
+        // the crude chars/4 heuristic would yield 11/4 = 2 by floor but 3 by
+        // div_ceil. Asserting the real tokenizer value proves tiktoken is wired
+        // in (not silently falling back to the char heuristic).
+        assert_eq!(count_tokens("hello world"), 2);
+    }
+
+    #[cfg(feature = "llm-router")]
+    #[test]
+    fn count_tokens_subword_split_beats_char_heuristic() {
+        // "tiktoken" is one 8-char word, so the crude chars/4 heuristic yields
+        // 8/4 = 2. cl100k_base BPE splits it into 3 subword tokens. Asserting 3
+        // simultaneously pins real BPE subword behaviour AND proves the result
+        // diverges from the chars/4 heuristic (which no fallback could produce).
+        assert_eq!(count_tokens("tiktoken"), 3);
+        assert_ne!(count_tokens("tiktoken"), "tiktoken".chars().count() / 4);
+    }
+
+    #[test]
+    fn estimate_history_tokens_scales_with_content() {
+        let small = vec![ChatMessage::user("hi")];
+        let large = vec![ChatMessage::user(
+            "this is a substantially longer user message with many more tokens than the small one",
+        )];
+        assert!(estimate_history_tokens(&large) > estimate_history_tokens(&small));
     }
 }

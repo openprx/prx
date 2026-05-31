@@ -703,7 +703,39 @@ impl Agent {
 
     #[cfg(feature = "llm-router")]
     fn estimate_text_tokens(text: &str) -> usize {
-        text.chars().count() / 4 + 1
+        crate::agent::loop_::count_tokens(text)
+    }
+
+    /// Compact the agent's conversation history in place for context-overflow
+    /// recovery (FIX-P1-12). Mirrors the policy of
+    /// [`crate::recovery::overflow::compact_history_in_place`] but operates on
+    /// the agent's `Vec<ConversationMessage>`: a contiguous run of leading
+    /// `system` / `developer` chat messages is pinned, the most recent
+    /// `keep_recent` messages are preserved, and the oldest messages in between
+    /// are dropped. Returns the number of messages removed (0 when nothing is
+    /// safely droppable, so the caller can stop retrying).
+    fn compact_conversation_history(history: &mut Vec<ConversationMessage>, keep_recent: usize) -> usize {
+        let keep_recent = keep_recent.max(1);
+        let leading = history
+            .iter()
+            .take_while(|m| match m {
+                ConversationMessage::Chat(cm) => {
+                    let role = cm.role.as_str();
+                    role == "system" || role == "developer"
+                }
+                ConversationMessage::AssistantToolCalls { .. } | ConversationMessage::ToolResults(_) => false,
+            })
+            .count();
+        let original_len = history.len();
+        if original_len <= leading + keep_recent {
+            return 0;
+        }
+        let drop_count = original_len - leading - keep_recent;
+        if drop_count == 0 {
+            return 0;
+        }
+        history.drain(leading..leading + drop_count);
+        drop_count
     }
 
     #[cfg(feature = "llm-router")]
@@ -1109,6 +1141,11 @@ impl Agent {
 
         self.append_control_ladder_trace(&control_ladder_trace);
 
+        // FIX-P1-12: bounded counter for context-overflow compaction retries on
+        // the direct `Agent::turn` tool-loop path (see the provider-error arm
+        // below). Shared across loop iterations so a runaway model cannot spin
+        // forever on repeated overflows.
+        let mut turn_overflow_retries = 0usize;
         for _ in 0..max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
             for tool in &self.tools {
@@ -1168,6 +1205,28 @@ impl Agent {
             {
                 Ok(resp) => resp,
                 Err(err) => {
+                    // FIX-P1-12: the direct `Agent::turn` tool loop is the third
+                    // LLM-call path. It previously aborted on any error. It now
+                    // routes provider errors through the shared overflow detector
+                    // (`recovery::overflow::is_context_overflow_error`): a context
+                    // overflow compacts the oldest non-system turns out of
+                    // `self.history` and retries the loop iteration
+                    // (compaction-then-retry), bounded by MAX_TURN_OVERFLOW_RETRIES.
+                    // Non-overflow errors, an already-minimal history, or an
+                    // exhausted budget propagate unchanged.
+                    const MAX_TURN_OVERFLOW_RETRIES: usize = 3;
+                    if crate::recovery::overflow::is_context_overflow_error(&err)
+                        && turn_overflow_retries < MAX_TURN_OVERFLOW_RETRIES
+                        && Self::compact_conversation_history(&mut self.history, 2) > 0
+                    {
+                        turn_overflow_retries += 1;
+                        tracing::warn!(
+                            attempt = turn_overflow_retries,
+                            max = MAX_TURN_OVERFLOW_RETRIES,
+                            "agent.turn: context overflow, compacted history and retrying"
+                        );
+                        continue;
+                    }
                     #[cfg(feature = "llm-router")]
                     if let Some(router) = &self.router {
                         cost_event.primary_prompt_tokens += Self::estimate_text_tokens(user_message);

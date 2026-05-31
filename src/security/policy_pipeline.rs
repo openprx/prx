@@ -1,8 +1,8 @@
 //! Tool Policy Pipeline — P3-1
 //!
 //! Multi-layer policy evaluation for tool calls. Layers are evaluated in order from
-//! broadest (Global) to most specific (Tool). The most specific matching policy wins.
-//! Each decision is fully explainable via `PolicyDecision`.
+//! broadest (Global) through Group to most specific (Tool). The most specific matching
+//! policy wins. Each decision is fully explainable via `PolicyDecision`.
 
 use crate::config::schema::ToolPolicyConfig;
 use std::collections::HashMap;
@@ -14,10 +14,6 @@ use std::collections::HashMap;
 pub enum PolicyLayer {
     /// Global default (e.g. `default = "supervised"`)
     Global,
-    /// User profile / channel-level overrides
-    Profile,
-    /// Agent-level restrictions
-    Agent,
     /// Tool group (e.g. `group:sessions`, `group:automation`)
     Group,
     /// Per-tool override (most specific)
@@ -28,8 +24,6 @@ impl std::fmt::Display for PolicyLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Global => write!(f, "global"),
-            Self::Profile => write!(f, "profile"),
-            Self::Agent => write!(f, "agent"),
             Self::Group => write!(f, "group"),
             Self::Tool => write!(f, "tool"),
         }
@@ -151,18 +145,14 @@ impl PolicyPipeline {
     /// 2. Group policy (if the tool belongs to a group)
     /// 3. Per-tool policy
     ///
-    /// Profile and Agent layers are reserved for future use (currently no-op).
+    /// `_ctx` carries the runtime channel/chat-type/sender for callers that wish to
+    /// log or correlate decisions; it does not currently influence the outcome, which
+    /// is driven entirely by the `[security.tool_policy]` config.
     pub fn evaluate(&self, tool_name: &str, _ctx: &EvalContext) -> PolicyDecision {
         let mut layers = Vec::new();
         let mut current_allowed = self.config.default_allow();
         let mut reason = format!("global default: {}", self.config.default.trim());
         layers.push(PolicyLayer::Global);
-
-        // Profile layer (future: check per-user/channel overrides)
-        layers.push(PolicyLayer::Profile);
-
-        // Agent layer (future: check per-agent restrictions)
-        layers.push(PolicyLayer::Agent);
 
         // Group layer
         if let Some(group_name) = tool_group(tool_name) {

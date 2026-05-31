@@ -133,6 +133,20 @@ fn normalized_worker_memory_strategy(manifest: &WorkerManifest) -> Result<&'stat
     }
 }
 
+/// Validate the sealed session-worker capability (FIX-P0-36).
+///
+/// The capability is no longer an opaque UUID compared by string equality. It
+/// is an `HMAC_SHA256(secret, run_id \0 expiry \0 sha256(manifest))` token
+/// (base64url). Validation:
+/// 1. Both the manifest-embedded token and the env-supplied token must be
+///    present and identical (defends against env/manifest desync).
+/// 2. The capability must not be past its absolute expiry.
+/// 3. The token must equal the HMAC recomputed from the *received* manifest
+///    (capability field blanked), the run id, and the expiry — compared in
+///    constant time. A legacy UUID, a forged token, a tampered manifest, or a
+///    replay under a different run id all fail here.
+///
+/// The expiry is read from `OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY`.
 fn validate_worker_capability_with_env(manifest: &WorkerManifest, env_capability: Option<&str>) -> Result<()> {
     let manifest_capability = manifest
         .parent_capability
@@ -145,10 +159,168 @@ fn validate_worker_capability_with_env(manifest: &WorkerManifest, env_capability
         .filter(|value| !value.is_empty())
         .context("session-worker parent capability env is missing")?;
 
-    if manifest_capability != env_capability {
+    if !capability_constant_time_eq(manifest_capability.as_bytes(), env_capability.as_bytes()) {
         anyhow::bail!("session-worker parent capability mismatch");
     }
+
+    let expiry = capability_expiry_from_env()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now > expiry {
+        anyhow::bail!("session-worker capability expired");
+    }
+
+    let payload = manifest_signing_payload(manifest)?;
+    let expected = compute_worker_capability(&manifest.run_id, expiry, &payload);
+    if !capability_constant_time_eq(env_capability.as_bytes(), expected.as_bytes()) {
+        anyhow::bail!("session-worker capability signature mismatch");
+    }
+
     Ok(())
+}
+
+/// Read the capability absolute expiry (unix seconds) from the environment.
+fn capability_expiry_from_env() -> Result<u64> {
+    let raw = std::env::var("OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY")
+        .context("session-worker capability expiry env is missing")?;
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("invalid session-worker capability expiry: {e}"))
+}
+
+/// Serialize a manifest with an empty `parent_capability` field, returning the
+/// canonical JSON payload (alphabetical key order via `serde_json::Value`) — the
+/// exact input the parent signed in `sessions_spawn::manifest_signing_payload`.
+fn manifest_signing_payload(manifest: &WorkerManifest) -> Result<String> {
+    let mut value = serde_json::to_value(manifest).context("serialize worker manifest for capability")?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "parent_capability".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+    }
+    serde_json::to_string(&value).context("reserialize worker manifest for capability")
+}
+
+/// Recompute `HMAC_SHA256(secret, run_id \0 expiry \0 sha256_hex(manifest))` as
+/// base64url (no padding). Mirror of `sessions_spawn::compute_worker_capability`.
+fn compute_worker_capability(run_id: &str, expiry_unix: u64, manifest_json: &str) -> String {
+    use base64::Engine as _;
+    use ring::hmac;
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(manifest_json.as_bytes());
+    let manifest_hex = capability_hex_encode(&hasher.finalize());
+
+    let mut payload = Vec::with_capacity(run_id.len() + manifest_hex.len() + 32);
+    payload.extend_from_slice(run_id.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(expiry_unix.to_string().as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(manifest_hex.as_bytes());
+
+    let tag = hmac::sign(&session_worker_signing_key(), &payload);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tag.as_ref())
+}
+
+/// Lowercase hex-encode a byte slice.
+fn capability_hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Constant-time byte-slice equality.
+fn capability_constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Process-level fallback secret (mirror of the minting side).
+static SESSION_WORKER_FALLBACK_SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// Return the shared HMAC verification key. Resolution order mirrors the minting
+/// side exactly so parent and child derive the same key:
+/// `SESSION_WORKER_SECRET` env → persisted state-dir secret → per-process random.
+fn session_worker_signing_key() -> ring::hmac::Key {
+    use ring::hmac;
+    if let Ok(secret) = std::env::var("SESSION_WORKER_SECRET") {
+        if !secret.is_empty() {
+            return hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+        }
+    }
+    if let Some(bytes) = load_or_create_persisted_session_secret() {
+        return hmac::Key::new(hmac::HMAC_SHA256, &bytes);
+    }
+    let bytes = SESSION_WORKER_FALLBACK_SECRET.get_or_init(generate_session_secret);
+    hmac::Key::new(hmac::HMAC_SHA256, bytes)
+}
+
+/// Generate 32 random bytes, time-derived fallback on RNG failure (never panics).
+fn generate_session_secret() -> [u8; 32] {
+    use ring::rand::SecureRandom as _;
+    let rng = ring::rand::SystemRandom::new();
+    let mut buf = [0u8; 32];
+    if rng.fill(&mut buf).is_err() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .to_le_bytes();
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = now[i % now.len()];
+        }
+    }
+    buf
+}
+
+/// Path to the persisted session-worker secret under the OpenPRX state dir
+/// (mirror of the minting side; uses `HOME` directly, no `dirs` dependency).
+fn session_secret_path() -> Option<std::path::PathBuf> {
+    if let Some(explicit) = std::env::var_os("OPENPRX_SESSION_WORKER_SECRET_PATH") {
+        return Some(std::path::PathBuf::from(explicit));
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    Some(home.join(".openprx").join("keys").join("session_worker.secret"))
+}
+
+/// Load the persisted 32-byte secret, creating it on first use. Returns `None`
+/// when no state dir is resolvable or filesystem ops fail.
+fn load_or_create_persisted_session_secret() -> Option<[u8; 32]> {
+    let path = session_secret_path()?;
+    if let Ok(existing) = std::fs::read(&path) {
+        if existing.len() == 32 {
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(&existing);
+            return Some(buf);
+        }
+    }
+    let secret = generate_session_secret();
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return None;
+        }
+    }
+    match std::fs::write(&path, secret) {
+        Ok(()) => Some(secret),
+        Err(error) => {
+            tracing::warn!("failed to persist session-worker secret: {error}");
+            None
+        }
+    }
 }
 
 fn validate_worker_manifest_with_capability_env(manifest: &WorkerManifest, env_capability: Option<&str>) -> Result<()> {
@@ -518,7 +690,26 @@ async fn run_manifest_with_capability_env(
 
 async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
     let env_capability = std::env::var("OPENPRX_SESSION_WORKER_CAPABILITY").ok();
-    run_manifest_with_capability_env(manifest, env_capability.as_deref(), None).await
+    // Validate up front, then scrub the capability material from the environment
+    // so it cannot leak to any grandchild process or be re-read after boot.
+    let validation = validate_worker_manifest_with_capability_env(&manifest, env_capability.as_deref());
+    scrub_capability_env();
+    validation?;
+    run_validated_manifest(manifest, None).await
+}
+
+/// Remove the capability-bearing environment variables after validation.
+fn scrub_capability_env() {
+    // SAFETY: `remove_var` is unsafe on edition 2024 because mutating the
+    // process environment races with concurrent `getenv` on other threads. This
+    // runs once during single-threaded session-worker boot — immediately after
+    // the manifest's capability has been read and validated, and before any
+    // worker threads that read the environment are spawned — so no concurrent
+    // access can occur.
+    unsafe {
+        std::env::remove_var("OPENPRX_SESSION_WORKER_CAPABILITY");
+        std::env::remove_var("OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY");
+    }
 }
 
 async fn record_hybrid_worker_draft_if_needed(
@@ -879,14 +1070,135 @@ mod tests {
         assert!(error.to_string().contains("parent capability env is missing"));
     }
 
+    /// Serialize tests that mutate the process-global capability expiry env.
+    static CAP_ENV_GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn cap_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Seal `manifest` with a valid HMAC for `expiry`, embedding the token into
+    /// the manifest and returning `(sealed_manifest, capability, expiry)`.
+    fn seal(mut manifest: WorkerManifest, expiry: u64) -> (WorkerManifest, String, u64) {
+        manifest.parent_capability = None;
+        let payload = manifest_signing_payload(&manifest).expect("payload");
+        let cap = compute_worker_capability(&manifest.run_id, expiry, &payload);
+        manifest.parent_capability = Some(cap.clone());
+        (manifest, cap, expiry)
+    }
+
+    fn set_expiry_env(expiry: u64) {
+        // SAFETY: tests hold `CAP_ENV_GUARD`, serializing all env mutation.
+        unsafe {
+            std::env::set_var("OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY", expiry.to_string());
+        }
+    }
+
+    fn clear_expiry_env() {
+        // SAFETY: tests hold `CAP_ENV_GUARD`, serializing all env mutation.
+        unsafe {
+            std::env::remove_var("OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY");
+        }
+    }
+
     #[test]
     fn worker_manifest_validation_rejects_path_escape() {
+        let _g = CAP_ENV_GUARD.lock();
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut manifest = base_manifest(tmp.path(), "capability-a");
+        let mut manifest = base_manifest(tmp.path(), "");
         manifest.identity_dir = Some("../outside".to_string());
+        let expiry = cap_now() + 300;
+        let (manifest, cap, expiry) = seal(manifest, expiry);
+        set_expiry_env(expiry);
 
-        let error = validate_worker_manifest_with_capability_env(&manifest, Some("capability-a")).unwrap_err();
+        let error = validate_worker_manifest_with_capability_env(&manifest, Some(&cap)).unwrap_err();
+        clear_expiry_env();
         assert!(error.to_string().contains("identity_dir"));
+    }
+
+    #[test]
+    fn valid_sealed_capability_accepted() {
+        let _g = CAP_ENV_GUARD.lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expiry = cap_now() + 300;
+        let (manifest, cap, expiry) = seal(base_manifest(tmp.path(), ""), expiry);
+        set_expiry_env(expiry);
+        let result = validate_worker_capability_with_env(&manifest, Some(&cap));
+        clear_expiry_env();
+        result.expect("valid sealed capability must be accepted");
+    }
+
+    #[test]
+    fn legacy_uuid_capability_rejected() {
+        let _g = CAP_ENV_GUARD.lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expiry = cap_now() + 300;
+        let (mut manifest, _cap, expiry) = seal(base_manifest(tmp.path(), ""), expiry);
+        // Replace the sealed token with a legacy UUID in both manifest and env.
+        let uuid = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        manifest.parent_capability = Some(uuid.clone());
+        set_expiry_env(expiry);
+        let error = validate_worker_capability_with_env(&manifest, Some(&uuid)).unwrap_err();
+        clear_expiry_env();
+        assert!(error.to_string().contains("signature mismatch"));
+    }
+
+    #[test]
+    fn tampered_manifest_capability_rejected() {
+        let _g = CAP_ENV_GUARD.lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expiry = cap_now() + 300;
+        let (mut manifest, cap, expiry) = seal(base_manifest(tmp.path(), ""), expiry);
+        // Escalate the allow-list after sealing; the embedded token now mismatches.
+        manifest.allowed_tools.push("shell".to_string());
+        set_expiry_env(expiry);
+        let error = validate_worker_capability_with_env(&manifest, Some(&cap)).unwrap_err();
+        clear_expiry_env();
+        assert!(error.to_string().contains("signature mismatch"));
+    }
+
+    #[test]
+    fn wrong_run_id_capability_rejected() {
+        let _g = CAP_ENV_GUARD.lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expiry = cap_now() + 300;
+        let (mut manifest, cap, expiry) = seal(base_manifest(tmp.path(), ""), expiry);
+        // Replay the token under a different run id.
+        manifest.run_id = "different-run".to_string();
+        set_expiry_env(expiry);
+        let error = validate_worker_capability_with_env(&manifest, Some(&cap)).unwrap_err();
+        clear_expiry_env();
+        assert!(error.to_string().contains("signature mismatch"));
+    }
+
+    #[test]
+    fn expired_capability_rejected() {
+        let _g = CAP_ENV_GUARD.lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stale = cap_now().saturating_sub(10);
+        let (manifest, cap, expiry) = seal(base_manifest(tmp.path(), ""), stale);
+        set_expiry_env(expiry);
+        let error = validate_worker_capability_with_env(&manifest, Some(&cap)).unwrap_err();
+        clear_expiry_env();
+        assert!(error.to_string().contains("expired"));
+    }
+
+    #[test]
+    fn env_manifest_capability_desync_rejected() {
+        let _g = CAP_ENV_GUARD.lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expiry = cap_now() + 300;
+        let (manifest, cap, expiry) = seal(base_manifest(tmp.path(), ""), expiry);
+        set_expiry_env(expiry);
+        // Env token differs from the manifest's sealed token.
+        let mut wrong = cap.clone();
+        wrong.push('x');
+        let error = validate_worker_capability_with_env(&manifest, Some(&wrong)).unwrap_err();
+        clear_expiry_env();
+        assert!(error.to_string().contains("mismatch"));
     }
 
     #[test]
@@ -914,12 +1226,19 @@ mod tests {
         let memory_db = workspace.join("memory").join("brain.db");
         let config_dir_arg = config_dir.to_string_lossy().to_string();
 
-        let mut manifest = base_manifest(&workspace, "capability-a");
+        let _g = CAP_ENV_GUARD.lock();
+        let mut manifest = base_manifest(&workspace, "");
         manifest.run_id = "../escape".to_string();
+        // Seal with a valid HMAC so validation passes the capability check and
+        // reaches the run_id path-safety check we are asserting on.
+        let expiry = cap_now() + 300;
+        let (manifest, cap, expiry) = seal(manifest, expiry);
+        set_expiry_env(expiry);
 
-        let error = run_manifest_with_capability_env(manifest, Some("capability-a"), Some(&config_dir_arg))
+        let error = run_manifest_with_capability_env(manifest, Some(&cap), Some(&config_dir_arg))
             .await
             .unwrap_err();
+        clear_expiry_env();
         assert!(error.to_string().contains("run_id"));
         assert!(!config_dir.exists(), "invalid manifest must not initialize config dir");
         assert!(!workspace.exists(), "invalid manifest must not create worker workspace");
