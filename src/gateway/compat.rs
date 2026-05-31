@@ -9,17 +9,28 @@ use axum::{
     Json,
     extract::State,
     http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
+use ring::rand::SystemRandom;
+use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const PRX_MCP_SERVER_NAME: &str = "prx-runtime";
+/// Agent Card schema version advertised at `/.well-known/agent.json`.
+const A2A_CARD_SCHEMA_VERSION: &str = "1.0";
+/// JOSE algorithm name for the Ed25519 Agent Card signature.
+const A2A_CARD_JWS_ALG: &str = "EdDSA";
+/// Default JWKS path served by this gateway when no explicit URI is configured.
+const A2A_JWKS_PATH: &str = "/a2a/v1/.well-known/jwks.json";
 
 #[derive(Debug, Serialize)]
 pub struct McpListServersResponse {
@@ -77,6 +88,80 @@ struct A2aCapabilities {
     tools: Vec<String>,
     modalities: Vec<&'static str>,
     skills: Vec<&'static str>,
+}
+
+/// Standard A2A Agent Card returned at `/.well-known/agent.json`, aligned with
+/// the Linux Foundation A2A Protocol v1.0 discovery schema (RFC 8615 path).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2aAgentCard {
+    /// Card schema version ("1.0").
+    pub schema_version: String,
+    /// Stable agent identifier (SPIFFE ID or URN).
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Agent version.
+    pub version: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Discovery / invocation endpoint advertised to peers.
+    pub endpoint: String,
+    /// Accepted authentication methods.
+    pub authentication: Vec<A2aAuthMethod>,
+    /// Declared capabilities.
+    pub capabilities: A2aCardCapabilities,
+    /// ISO-8601 issuance timestamp.
+    pub issued_at: String,
+    /// ISO-8601 expiry timestamp.
+    pub expires_at: String,
+    /// JWS signature over the unsigned card body. `None` only if signing failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<A2aCardSignature>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2aAuthMethod {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub trusted_issuers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2aCardCapabilities {
+    pub tools: Vec<String>,
+    pub modalities: Vec<String>,
+    pub skills: Vec<String>,
+}
+
+/// JWS (RFC 7515) compact-serialization signature over the canonical card body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2aCardSignature {
+    /// JOSE algorithm ("EdDSA").
+    pub algorithm: String,
+    /// Key ID matching the `kid` in the published JWKS.
+    pub key_id: String,
+    /// JWS compact serialization: `base64url(header).base64url(payload).base64url(sig)`.
+    pub jws: String,
+    /// JWKS URI where the verification key is published.
+    pub jwks_uri: String,
+}
+
+/// JWKS document exposing the Agent Card signing public key (RFC 7517).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2aJwks {
+    pub keys: Vec<A2aJwk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct A2aJwk {
+    pub kty: String,
+    pub crv: String,
+    pub kid: String,
+    #[serde(rename = "use")]
+    pub use_: String,
+    pub alg: String,
+    /// base64url (no pad) of the raw 32-byte Ed25519 public key point.
+    pub x: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,6 +303,28 @@ pub async fn a2a_discover(
     Ok(Json(build_a2a_identity_response(&config)))
 }
 
+/// `GET /.well-known/agent.json` — standard A2A discovery path (RFC 8615).
+/// Returns the signed Agent Card. This is public discovery metadata, so it is
+/// not gated by the peer-issuer allow-list. `Cache-Control: max-age` mirrors the
+/// card TTL so peers honour the same lifetime as `expires_at`.
+pub async fn well_known_agent_json(State(state): State<AppState>) -> Response {
+    let (card, ttl) = {
+        let config = state.config.lock();
+        (build_signed_agent_card(&config), config.a2a.card_ttl_seconds)
+    };
+    let cache = format!("max-age={ttl}");
+    ([(header::CACHE_CONTROL, cache)], Json(card)).into_response()
+}
+
+/// `GET /a2a/v1/.well-known/jwks.json` — publishes the Ed25519 verification key
+/// for the Agent Card JWS so peers can verify card authenticity.
+pub async fn a2a_jwks(State(state): State<AppState>) -> Result<Json<A2aJwks>, (StatusCode, Json<Value>)> {
+    let config = state.config.lock();
+    let signer = resolve_card_signer(&config.a2a)
+        .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "card signing key is unavailable"))?;
+    Ok(Json(signer.jwks()))
+}
+
 fn build_mcp_list_servers_response(config: &crate::config::Config) -> McpListServersResponse {
     McpListServersResponse {
         servers: vec![McpServerCard {
@@ -264,6 +371,39 @@ fn derive_external_agent_identity(
 ) -> Option<ExternalAgentIdentity> {
     let workspace_id = config.workspace_dir.to_string_lossy();
     if let Some(spiffe_id) = header_value(headers, "x-spiffe-id") {
+        // When the caller also presents an X.509 SVID (PEM) and a trust bundle is
+        // configured, the SVID is the source of truth: the SPIFFE ID is taken
+        // from the verified certificate's SAN, not the asserted header. In strict
+        // mode a verification failure rejects the request; otherwise it falls
+        // back to header-asserted trust (trusted front-proxy / mTLS-terminating
+        // gateway scenario) with a warning.
+        let verified_spiffe = header_value(headers, "x-spiffe-svid")
+            .or_else(|| header_value(headers, "x-client-cert-pem"))
+            .map(|svid_pem| verify_svid(&svid_pem, &config.a2a));
+        match verified_spiffe {
+            Some(Ok(result)) => {
+                return Some(external_identity_for(
+                    "spiffe",
+                    "spiffe",
+                    &result.spiffe_id,
+                    workspace_id.as_ref(),
+                ));
+            }
+            Some(Err(error)) => {
+                tracing::warn!(error = %error, "x509 svid verification failed");
+                if config.a2a.spiffe_strict_validation {
+                    return None;
+                }
+            }
+            None => {
+                if config.a2a.spiffe_strict_validation && config.a2a.spiffe_trust_bundle_pem.is_some() {
+                    // Strict mode with a trust bundle requires a real SVID; a bare
+                    // asserted header is not enough.
+                    tracing::warn!("strict spiffe mode requires an x509 svid but none was presented");
+                    return None;
+                }
+            }
+        }
         return Some(external_identity_for(
             "spiffe",
             "spiffe",
@@ -570,6 +710,478 @@ fn upsert_agent_identity_binding(
 
 fn json_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Value>) {
     (status, Json(serde_json::json!({ "error": message.into() })))
+}
+
+// ---------------------------------------------------------------------------
+// Agent Card JWS signing (Ed25519) and JWKS publication.
+// ---------------------------------------------------------------------------
+
+/// Ed25519 signer for the published Agent Card. Holds the PKCS#8 private key and
+/// the raw 32-byte public key point, plus a stable key id used as the JWKS
+/// `kid` and the JWS protected-header `kid`.
+#[derive(Debug, Clone)]
+struct AgentCardSigner {
+    kid: String,
+    pkcs8: Vec<u8>,
+    public_key: Vec<u8>,
+}
+
+/// On-disk persisted form of the card signing key (JSON, `0600`). Mirrors the
+/// witness-key convention but is an independent key dedicated to card signing.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedCardKey {
+    kid: String,
+    alg: String,
+    /// base64 (standard) PKCS#8 v2 DER private key.
+    secret_b64: String,
+    /// base64 (standard) raw 32-byte Ed25519 public key.
+    public_b64: String,
+    created_at: String,
+}
+
+/// Process-global ephemeral signer, used when no `card_signing_key_path` is set.
+/// Generated once per process so the JWKS stays consistent for the run.
+static EPHEMERAL_CARD_SIGNER: OnceLock<Option<AgentCardSigner>> = OnceLock::new();
+
+impl AgentCardSigner {
+    fn generate() -> anyhow::Result<Self> {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| anyhow::anyhow!("generate Ed25519 card key"))?;
+        let key_pair =
+            Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|_| anyhow::anyhow!("load generated card key"))?;
+        Ok(Self {
+            kid: format!("a2a-card-{}", Uuid::new_v4()),
+            pkcs8: pkcs8.as_ref().to_vec(),
+            public_key: key_pair.public_key().as_ref().to_vec(),
+        })
+    }
+
+    /// Load from disk if `path` exists, otherwise generate and persist (`0600`).
+    fn load_or_generate(path: &Path) -> anyhow::Result<Self> {
+        if path.exists() {
+            return Self::load_from(path);
+        }
+        let signer = Self::generate()?;
+        signer.persist_to(path)?;
+        tracing::info!(kid = %signer.kid, path = %path.display(), "generated new a2a card signing key");
+        Ok(signer)
+    }
+
+    fn load_from(path: &Path) -> anyhow::Result<Self> {
+        use base64::engine::general_purpose::STANDARD as BASE64_STD;
+        let raw = std::fs::read_to_string(path)?;
+        let persisted: PersistedCardKey = serde_json::from_str(&raw)?;
+        if persisted.alg != "Ed25519" {
+            anyhow::bail!("unsupported card key alg: {}", persisted.alg);
+        }
+        let pkcs8 = BASE64_STD.decode(persisted.secret_b64.as_bytes())?;
+        let public_key = BASE64_STD.decode(persisted.public_b64.as_bytes())?;
+        let key_pair = Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| anyhow::anyhow!("load persisted card key"))?;
+        if key_pair.public_key().as_ref() != public_key.as_slice() {
+            anyhow::bail!("card key public/secret mismatch in {}", path.display());
+        }
+        Ok(Self {
+            kid: persisted.kid,
+            pkcs8,
+            public_key,
+        })
+    }
+
+    fn persist_to(&self, path: &Path) -> anyhow::Result<()> {
+        use base64::engine::general_purpose::STANDARD as BASE64_STD;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let persisted = PersistedCardKey {
+            kid: self.kid.clone(),
+            alg: "Ed25519".to_string(),
+            secret_b64: BASE64_STD.encode(&self.pkcs8),
+            public_b64: BASE64_STD.encode(&self.public_key),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let json = serde_json::to_string_pretty(&persisted)?;
+        write_private_key_file(path, json.as_bytes())?;
+        Ok(())
+    }
+
+    fn key_pair(&self) -> anyhow::Result<Ed25519KeyPair> {
+        Ed25519KeyPair::from_pkcs8(&self.pkcs8).map_err(|_| anyhow::anyhow!("load Ed25519 card keypair"))
+    }
+
+    /// Sign `payload_json` as a JWS compact serialization with an EdDSA header.
+    fn sign_jws(&self, payload_json: &[u8]) -> anyhow::Result<String> {
+        let header = serde_json::json!({
+            "alg": A2A_CARD_JWS_ALG,
+            "typ": "JWT",
+            "kid": self.kid,
+        });
+        let header_b64 = BASE64_URL.encode(serde_json::to_vec(&header)?);
+        let payload_b64 = BASE64_URL.encode(payload_json);
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let key_pair = self.key_pair()?;
+        let signature = key_pair.sign(signing_input.as_bytes());
+        let sig_b64 = BASE64_URL.encode(signature.as_ref());
+        Ok(format!("{signing_input}.{sig_b64}"))
+    }
+
+    /// Public JWKS document advertising this signer's verification key.
+    fn jwks(&self) -> A2aJwks {
+        A2aJwks {
+            keys: vec![A2aJwk {
+                kty: "OKP".to_string(),
+                crv: "Ed25519".to_string(),
+                kid: self.kid.clone(),
+                use_: "sig".to_string(),
+                alg: A2A_CARD_JWS_ALG.to_string(),
+                x: BASE64_URL.encode(&self.public_key),
+            }],
+        }
+    }
+}
+
+/// Write `bytes` to `path` with owner-only (`0600`) permissions on Unix.
+fn write_private_key_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+/// Resolve the active card signer: a persisted key when a path is configured,
+/// otherwise the process-global ephemeral key. Returns `None` only if even
+/// ephemeral key generation fails (extremely unlikely; logged).
+fn resolve_card_signer(config: &crate::config::A2aConfig) -> Option<AgentCardSigner> {
+    if let Some(path) = config.card_signing_key_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        match AgentCardSigner::load_or_generate(Path::new(path)) {
+            Ok(signer) => return Some(signer),
+            Err(error) => {
+                tracing::warn!(error = %error, "a2a card signing key unavailable; falling back to ephemeral key");
+            }
+        }
+    }
+    EPHEMERAL_CARD_SIGNER
+        .get_or_init(|| match AgentCardSigner::generate() {
+            Ok(signer) => Some(signer),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to generate ephemeral a2a card signing key");
+                None
+            }
+        })
+        .clone()
+}
+
+/// The JWKS URI advertised in card signatures: explicit config, else local path.
+fn card_jwks_uri(config: &crate::config::A2aConfig) -> String {
+    config
+        .card_jwks_uri
+        .as_deref()
+        .filter(|u| !u.trim().is_empty())
+        .map_or_else(|| A2A_JWKS_PATH.to_string(), ToString::to_string)
+}
+
+/// Build the unsigned card, then attach a JWS signature over its canonical body.
+fn build_signed_agent_card(config: &crate::config::Config) -> A2aAgentCard {
+    let now = chrono::Utc::now();
+    let ttl = i64::try_from(config.a2a.card_ttl_seconds).unwrap_or(3_600);
+    let expires = now + chrono::Duration::seconds(ttl);
+    let mut card = A2aAgentCard {
+        schema_version: A2A_CARD_SCHEMA_VERSION.to_string(),
+        id: config.a2a.spiffe_id.clone(),
+        name: config.a2a.agent_id.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        description: "PRX runtime agent — memory-grounded assistant exposing MCP tools over A2A".to_string(),
+        endpoint: format!("http://{}/a2a/v1/identity", config.a2a.bind),
+        authentication: vec![
+            A2aAuthMethod {
+                kind: "bearer-jwt".to_string(),
+                trusted_issuers: config.a2a.allowed_peer_issuers.clone(),
+            },
+            A2aAuthMethod {
+                kind: "spiffe".to_string(),
+                trusted_issuers: config.a2a.trusted_trust_domains.clone(),
+            },
+            A2aAuthMethod {
+                kind: "mtls".to_string(),
+                trusted_issuers: config.a2a.allowed_peer_issuers.clone(),
+            },
+        ],
+        capabilities: A2aCardCapabilities {
+            tools: config.mcp_server.exposed_tools.clone(),
+            modalities: vec!["text".to_string()],
+            skills: vec!["memory_qa".to_string(), "document_grounding".to_string()],
+        },
+        issued_at: now.to_rfc3339(),
+        expires_at: expires.to_rfc3339(),
+        signature: None,
+    };
+    card.signature = sign_agent_card(&card, &config.a2a);
+    card
+}
+
+/// Produce the JWS signature for `card` (its `signature` field must be `None`).
+fn sign_agent_card(card: &A2aAgentCard, config: &crate::config::A2aConfig) -> Option<A2aCardSignature> {
+    let signer = resolve_card_signer(config)?;
+    let payload = match serde_json::to_vec(card) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to serialize agent card for signing");
+            return None;
+        }
+    };
+    match signer.sign_jws(&payload) {
+        Ok(jws) => Some(A2aCardSignature {
+            algorithm: A2A_CARD_JWS_ALG.to_string(),
+            key_id: signer.kid,
+            jws,
+            jwks_uri: card_jwks_uri(config),
+        }),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to sign agent card");
+            None
+        }
+    }
+}
+
+/// Verify a signed Agent Card against a JWKS. Returns `Ok(true)` only when the
+/// JWS signs the exact canonical body of `card` (with `signature` stripped) and
+/// the signing `kid` resolves to an Ed25519 key in `jwks`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn verify_agent_card(card: &A2aAgentCard, jwks: &A2aJwks) -> anyhow::Result<bool> {
+    let Some(signature) = card.signature.as_ref() else {
+        anyhow::bail!("card has no signature");
+    };
+    let mut parts = signature.jws.split('.');
+    let (Some(header_b64), Some(payload_b64), Some(sig_b64), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        anyhow::bail!("malformed jws compact serialization");
+    };
+
+    // The signed payload must equal the canonical unsigned card body. This binds
+    // the signature to the card content and defeats body tampering.
+    let mut unsigned = card.clone();
+    unsigned.signature = None;
+    let expected_payload = serde_json::to_vec(&unsigned)?;
+    let actual_payload = BASE64_URL.decode(payload_b64.as_bytes())?;
+    if actual_payload != expected_payload {
+        return Ok(false);
+    }
+
+    // Resolve the verification key by kid from the JWKS.
+    let header: Value = serde_json::from_slice(&BASE64_URL.decode(header_b64.as_bytes())?)?;
+    let kid = header.get("kid").and_then(Value::as_str).unwrap_or_default();
+    let Some(jwk) = jwks
+        .keys
+        .iter()
+        .find(|k| k.kid == kid && k.kty == "OKP" && k.crv == "Ed25519")
+    else {
+        return Ok(false);
+    };
+    let public_key = BASE64_URL.decode(jwk.x.as_bytes())?;
+
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature_bytes = BASE64_URL.decode(sig_b64.as_bytes())?;
+    let verifier = UnparsedPublicKey::new(&ED25519, public_key.as_slice());
+    Ok(verifier.verify(signing_input.as_bytes(), &signature_bytes).is_ok())
+}
+
+// ---------------------------------------------------------------------------
+// SPIFFE SVID X.509 verification.
+// ---------------------------------------------------------------------------
+
+/// Outcome of verifying a peer-presented X.509 SVID against the configured
+/// trust bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SvidVerification {
+    /// SPIFFE ID extracted from the leaf certificate's SAN URI.
+    pub spiffe_id: String,
+    /// Trust domain parsed from the SPIFFE ID.
+    pub trust_domain: String,
+    /// SHA-256 fingerprint of the leaf certificate DER (audit aid).
+    pub cert_fingerprint: String,
+    /// True when the leaf chains to a configured trust-bundle CA, is within its
+    /// validity window, and its trust domain is accepted.
+    pub trusted: bool,
+}
+
+/// Errors raised while verifying an X.509 SVID. Carries no key material.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SvidError {
+    /// PEM/DER could not be parsed into an X.509 certificate.
+    ParseError(String),
+    /// No SAN URI of the `spiffe://` form was present in the leaf.
+    NoSpiffeSan,
+    /// The SPIFFE ID is syntactically invalid.
+    InvalidSpiffeId(String),
+    /// The certificate is outside its validity window.
+    Expired,
+    /// No trust bundle was configured, so the chain cannot be verified.
+    NoTrustBundle,
+    /// The leaf's signature did not verify against any trust-bundle CA.
+    UntrustedChain,
+    /// The SPIFFE trust domain is not in the accepted set.
+    UntrustedDomain(String),
+}
+
+impl std::fmt::Display for SvidError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ParseError(reason) => write!(f, "svid parse error: {reason}"),
+            Self::NoSpiffeSan => write!(f, "leaf certificate has no spiffe:// SAN URI"),
+            Self::InvalidSpiffeId(id) => write!(f, "invalid spiffe id: {id}"),
+            Self::Expired => write!(f, "svid is outside its validity window"),
+            Self::NoTrustBundle => write!(f, "no trust bundle configured for chain verification"),
+            Self::UntrustedChain => write!(f, "svid does not chain to any trust-bundle ca"),
+            Self::UntrustedDomain(domain) => write!(f, "trust domain {domain} is not accepted"),
+        }
+    }
+}
+
+impl std::error::Error for SvidError {}
+
+/// Parse `spiffe://<trust-domain>/<path>` and return the trust domain. Enforces
+/// the SPIFFE URI scheme and a non-empty authority component.
+fn parse_spiffe_trust_domain(spiffe_id: &str) -> Result<String, SvidError> {
+    let rest = spiffe_id
+        .strip_prefix("spiffe://")
+        .ok_or_else(|| SvidError::InvalidSpiffeId(spiffe_id.to_string()))?;
+    let trust_domain = rest.split('/').next().unwrap_or_default();
+    if trust_domain.is_empty() || trust_domain.contains(' ') {
+        return Err(SvidError::InvalidSpiffeId(spiffe_id.to_string()));
+    }
+    Ok(trust_domain.to_string())
+}
+
+/// Normalize a PEM string that may have arrived via an HTTP header. HTTP header
+/// values cannot contain raw newlines, so proxies typically transport a PEM SVID
+/// either percent-encoded (`%0A`) or with literal escaped `\n`/`\t` sequences, or
+/// space-joined. This restores real newlines so the PEM parser accepts it. A PEM
+/// that already contains real newlines is returned essentially unchanged.
+fn normalize_header_pem(raw: &str) -> std::borrow::Cow<'_, str> {
+    if raw.contains('\n') {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    let decoded = raw
+        .replace("%0A", "\n")
+        .replace("%0a", "\n")
+        .replace("%20", " ")
+        .replace("\\n", "\n")
+        .replace("\\t", "\n");
+    // Some proxies join the base64 body with single spaces; turn the inter-line
+    // spaces back into newlines but keep the BEGIN/END marker words intact.
+    let rebuilt = decoded
+        .replace("-----BEGIN CERTIFICATE----- ", "-----BEGIN CERTIFICATE-----\n")
+        .replace(" -----END CERTIFICATE-----", "\n-----END CERTIFICATE-----");
+    std::borrow::Cow::Owned(rebuilt)
+}
+
+/// Decode one-or-more PEM certificate blocks into DER byte vectors. Accepts both
+/// raw multi-line PEM and header-transported single-line PEM.
+fn pem_certificates_to_der(pem: &str) -> Result<Vec<Vec<u8>>, SvidError> {
+    let normalized = normalize_header_pem(pem);
+    let mut ders = Vec::new();
+    for block in x509_parser::pem::Pem::iter_from_buffer(normalized.as_bytes()) {
+        let block = block.map_err(|e| SvidError::ParseError(e.to_string()))?;
+        ders.push(block.contents);
+    }
+    if ders.is_empty() {
+        return Err(SvidError::ParseError("no PEM certificate blocks found".to_string()));
+    }
+    Ok(ders)
+}
+
+/// Verify a peer X.509 SVID (PEM) against the configured trust bundle.
+///
+/// Steps: parse leaf, extract SPIFFE ID from a SAN URI, check the leaf validity
+/// window, verify the leaf signature against each trust-bundle CA, then confirm
+/// the trust domain is accepted. Each failure is a typed error; nothing panics.
+fn verify_svid(leaf_pem: &str, config: &crate::config::A2aConfig) -> Result<SvidVerification, SvidError> {
+    use sha2::{Digest, Sha256};
+    use x509_parser::prelude::*;
+
+    let leaf_ders = pem_certificates_to_der(leaf_pem)?;
+    let leaf_der = leaf_ders.first().ok_or(SvidError::NoSpiffeSan)?;
+    let (_, leaf) = X509Certificate::from_der(leaf_der).map_err(|e| SvidError::ParseError(e.to_string()))?;
+
+    // Extract the SPIFFE ID from a SAN URI entry.
+    let spiffe_id = leaf
+        .extensions()
+        .iter()
+        .find_map(|ext| match ext.parsed_extension() {
+            ParsedExtension::SubjectAlternativeName(san) => san.general_names.iter().find_map(|name| {
+                if let GeneralName::URI(uri) = name {
+                    uri.starts_with("spiffe://").then(|| (*uri).to_string())
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        })
+        .ok_or(SvidError::NoSpiffeSan)?;
+    let trust_domain = parse_spiffe_trust_domain(&spiffe_id)?;
+
+    let cert_fingerprint = {
+        let digest = Sha256::digest(leaf_der);
+        digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+
+    // Validity window check.
+    if !leaf.validity().is_valid() {
+        return Err(SvidError::Expired);
+    }
+
+    // Chain verification against the configured trust bundle CA(s).
+    let Some(bundle_pem) = config
+        .spiffe_trust_bundle_pem
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    else {
+        return Err(SvidError::NoTrustBundle);
+    };
+    let ca_ders = pem_certificates_to_der(bundle_pem)?;
+    let mut chained = false;
+    for ca_der in &ca_ders {
+        let Ok((_, ca)) = X509Certificate::from_der(ca_der) else {
+            continue;
+        };
+        if leaf.verify_signature(Some(ca.public_key())).is_ok() {
+            chained = true;
+            break;
+        }
+    }
+    if !chained {
+        return Err(SvidError::UntrustedChain);
+    }
+
+    // Trust-domain allow-list. An empty list defers to the issuer allow-list and
+    // is treated as "accept any chained domain" at this layer.
+    let domain_ok = config.trusted_trust_domains.is_empty()
+        || config
+            .trusted_trust_domains
+            .iter()
+            .any(|d| d == &trust_domain || d == &format!("spiffe://{trust_domain}"));
+    if !domain_ok {
+        return Err(SvidError::UntrustedDomain(trust_domain));
+    }
+
+    Ok(SvidVerification {
+        spiffe_id,
+        trust_domain,
+        cert_fingerprint,
+        trusted: true,
+    })
 }
 
 #[cfg(test)]
@@ -885,5 +1497,257 @@ qwIDAQAB\n\
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(owner_id, identity.prx_owner_id);
+    }
+
+    // -- Agent Card / JWS / JWKS ------------------------------------------
+
+    #[test]
+    fn well_known_card_is_well_formed() {
+        let card = build_signed_agent_card(&crate::config::Config::default());
+        assert_eq!(card.schema_version, A2A_CARD_SCHEMA_VERSION);
+        assert_eq!(card.id, "spiffe://prx-local/agent/prx-default");
+        assert_eq!(card.name, "prx-default");
+        assert_eq!(card.version, env!("CARGO_PKG_VERSION"));
+        // Three auth methods advertised: bearer-jwt, spiffe, mtls.
+        assert_eq!(card.authentication.len(), 3);
+        assert!(card.authentication.iter().any(|m| m.kind == "spiffe"));
+        // expires_at is strictly after issued_at.
+        assert!(card.expires_at > card.issued_at);
+        // A signature must be present (ephemeral key generation succeeds).
+        assert!(card.signature.is_some());
+    }
+
+    #[test]
+    fn signed_card_verifies_against_published_jwks() {
+        let config = crate::config::A2aConfig::default();
+        let card = {
+            let mut full = crate::config::Config::default();
+            full.a2a = config.clone();
+            build_signed_agent_card(&full)
+        };
+        let signer = resolve_card_signer(&config).expect("test: ephemeral signer");
+        let jwks = signer.jwks();
+        assert!(verify_agent_card(&card, &jwks).expect("test: verify"));
+    }
+
+    #[test]
+    fn tampered_card_fails_verification() {
+        let config = crate::config::A2aConfig::default();
+        let mut card = {
+            let mut full = crate::config::Config::default();
+            full.a2a = config.clone();
+            build_signed_agent_card(&full)
+        };
+        let signer = resolve_card_signer(&config).expect("test: ephemeral signer");
+        let jwks = signer.jwks();
+        // Mutate a signed field without re-signing -> verification must fail.
+        card.name = "impersonator".to_string();
+        assert!(!verify_agent_card(&card, &jwks).expect("test: verify tampered"));
+    }
+
+    #[test]
+    fn card_verification_rejects_foreign_jwks() {
+        let card = build_signed_agent_card(&crate::config::Config::default());
+        // A JWKS from a different key (different kid + key material) must not
+        // verify the card.
+        let other = AgentCardSigner::generate().expect("test: other signer");
+        let foreign_jwks = other.jwks();
+        assert!(!verify_agent_card(&card, &foreign_jwks).expect("test: foreign jwks"));
+    }
+
+    #[test]
+    fn persisted_card_key_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("card.key");
+        let first = AgentCardSigner::load_or_generate(&path).expect("test: generate");
+        let second = AgentCardSigner::load_or_generate(&path).expect("test: reload");
+        // Reload yields the same kid and public key (stable across restarts).
+        assert_eq!(first.kid, second.kid);
+        assert_eq!(first.public_key, second.public_key);
+    }
+
+    // -- SPIFFE SVID X.509 verification -----------------------------------
+
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDEzCCAfugAwIBAgIUDhSoIjROzqwbTnjzWsE0ruuM+OEwDQYJKoZIhvcNAQEL\n\
+BQAwGTEXMBUGA1UEAwwOdGVzdC1zcGlmZmUtY2EwHhcNMjYwNTMxMjA0NzExWhcN\n\
+MzYwNTI4MjA0NzExWjAZMRcwFQYDVQQDDA50ZXN0LXNwaWZmZS1jYTCCASIwDQYJ\n\
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBAJzwAHQX7gZCZq5xwYhEPXr8tn2hWWtj\n\
+M6dq3KjJ+44FklT4dGO9EC7WvzJlfPokppuUYLvuRPT/Hsdcru4lL4CzYbECN7Ci\n\
+aLxN+5rHKIrt25O53bu2878TsJufX1pQqusGx4hJNOQIOq9cjfbOdCJ9HKzI0E/x\n\
+uGsieEfm5HSeh1h8ZVT3j6I1yvR69A/k/a/p1yon19qx+iQ4Xgf5Fa7ntKlX9xdt\n\
+pKWsjRQEmpb6aeUcfcyyIzJmm9EceJaE5okAr+8B2O9ds1v3PxzKtAHaXsqjpFGz\n\
+ANme7GfMf00qgIB2NH9zC+c2btE8Au3oRYXkmwr5Dd6EWAXvMAou2lkCAwEAAaNT\n\
+MFEwHQYDVR0OBBYEFJU1LDUF0KECh/i1zlQ3FIhSYU0GMB8GA1UdIwQYMBaAFJU1\n\
+LDUF0KECh/i1zlQ3FIhSYU0GMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL\n\
+BQADggEBAHUurEvLru/d2gYIEtwBoBxEbgzct45k+hASehG1kF4B5Mbl+ZEqI5UN\n\
+5gvtlRQSqmbkO1VabYwk9SLK6uD9zUb08KiKJJQedrMjxs/g0kbVHdYolQneY51V\n\
+4cMDYOi1/AIfonK+I6G97DgouRGWMRtg0dmmqj2KwF4O3F4AWlfgSFUJfrAk/BN+\n\
+D1UJLeOuPwnWYJmwgJTYkMi1gzWHSCwjMw8/K1B/gK5CVjfWc5Qq5RpmditgtZPi\n\
+/yOiuWQsBixthIxfCqspj5mRoGu8ZOTiQSzfbKQpbwQZtKYjkVqOt+EcdxD3Vo5m\n\
+rfMSOTLgmwS0fvgZn1UiBJm/hiCMyno=\n\
+-----END CERTIFICATE-----\n";
+
+    const TEST_LEAF_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDLjCCAhagAwIBAgIUcfUQUBXgovzvmrcNl4cwB5pVH6EwDQYJKoZIhvcNAQEL\n\
+BQAwGTEXMBUGA1UEAwwOdGVzdC1zcGlmZmUtY2EwHhcNMjYwNTMxMjA0NzExWhcN\n\
+MzYwNTI4MjA0NzExWjATMREwDwYDVQQDDAh3b3JrbG9hZDCCASIwDQYJKoZIhvcN\n\
+AQEBBQADggEPADCCAQoCggEBAL496gM4R3YYIquFKEKzJS9hXpWrStLVVmiCGBxK\n\
+keGCpZ1C80myFo1GV+QKRP5bNOryBkPQNmUhCMfe/pD0CN4pdXRLliEoy6bX/Qnv\n\
+osQlrRanINTPOkM/CAw462pOHuu8MSRODrLmd96udRacez6nhrgfm9wWxLCeB4qn\n\
+zhtT+utm1VFkZhthF+M5x/xZDYLVdZbft6Aj+feRyTXoYpnYfwD7an+UgBWAAuA3\n\
+AP9uue3GaGbQcgKB9WOIoRxTlkcFATWbO/07mNXv/OM+2/mI3rCtNTU/Iyk/5MyS\n\
+3kzaGnj631pP/5v+EZAWPxD5lgW7bfQP05lgug14L2RAFdECAwEAAaN0MHIwMAYD\n\
+VR0RBCkwJ4Ylc3BpZmZlOi8vdHJ1c3RlZC5leGFtcGxlL2FnZW50L3dvcmtlcjAd\n\
+BgNVHQ4EFgQUfZIt57LabHcu+3ZwUvH3kQgjK9UwHwYDVR0jBBgwFoAUlTUsNQXQ\n\
+oQKH+LXOVDcUiFJhTQYwDQYJKoZIhvcNAQELBQADggEBAECx5q+dY8WANqkWT9aL\n\
+llsPhDcSegsWNR9EAos1b0RZFgsbBnXJd/p4WFyp4R2IKmNS83kQMI3h8KaElrrq\n\
+IKbVir8bTB2w3KJJ+ZZ2ZBwDyQ86t/lYl7O6VsfZyRiu/nwXUddx2wYLmHSNqTRj\n\
+yoYOfb4yDo5Ezi4ttGXBmcZkBcbpB5zsM74CgA7puPp6trgCYRohE44DlLHGZN2c\n\
+dkMK/xsOTz1kOowyahZDADPgATW+SoXQ5tnR4gkunfPdowUyuqOkWohgy+WmdUM8\n\
+HkRJBc3+5CQr6Za4zjfNTMrMMTE8LHLp08uZGdOkaMMhAftF1IR+UMWRdJ3wkCzm\n\
+KIo=\n\
+-----END CERTIFICATE-----\n";
+
+    // A leaf carrying the same SPIFFE SAN but signed by an UNTRUSTED CA.
+    const TEST_ROGUE_LEAF_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDJTCCAg2gAwIBAgIUE9uuBu6Z8BKxQdYG7hR/1Lx+WZgwDQYJKoZIhvcNAQEL\n\
+BQAwEzERMA8GA1UEAwwIcm9ndWUtY2EwHhcNMjYwNTMxMjA0NzExWhcNMzYwNTI4\n\
+MjA0NzExWjAQMQ4wDAYDVQQDDAVyb2d1ZTCCASIwDQYJKoZIhvcNAQEBBQADggEP\n\
+ADCCAQoCggEBANK5BOkp7KvPV1aBSCSL9u68QiWdFPdypNx12Y/EmHyTJwkRQ8Cz\n\
+/DcT4Txsab0tzerwdPptfkIqX8hk/1YTsC4jsOAL9kxsIWNEsO8n8sClMgNnOaW7\n\
+tcsjJ3GeJFFsI/pz6X9cbTEcI20v+migBrKtvppmZlvoAbNAxfz78i2HZVM9IGgR\n\
+Tsulpbwq1uegZbkeZJGsNXjbQdfhXW6ykKBq69AEfpimBubVZcH7IOrko23Z4/SN\n\
+BDgfJRWbbdbqQy7PGxHjqVPl1+gGO8MSWDjK3Ht9+VZKVIu80T1Xm2BWoEcLKJVc\n\
+psoJX0LtIZRCzFsOIlQfzeWmh1IZJVekn4UCAwEAAaN0MHIwMAYDVR0RBCkwJ4Yl\n\
+c3BpZmZlOi8vdHJ1c3RlZC5leGFtcGxlL2FnZW50L3dvcmtlcjAdBgNVHQ4EFgQU\n\
+VtrnJ0c5c9373mu7BT7qLjG1sjIwHwYDVR0jBBgwFoAUKwgA2ADDQPrrz0HSPZ0G\n\
+5Ncvp3QwDQYJKoZIhvcNAQELBQADggEBAF4FtdodA+1JXPEQQHppu/AcvoYevMB9\n\
+49WRnv8plcKbsUxaNh8ji5aWrq1NZ2JTGbs7NFD63t1L9lMY3wlXH8jGmgyx+XgQ\n\
+p7+XY0xJ3sljbxmjxym5HNn6L2uOQV77zOwumAsjcTm2YtUTMoBqDxFDQB50nin9\n\
++jK6Y34CtczVEFzLVajfEXJNoYjqPw2C02YAfuFs4S0WALQsWG27sC/UI4amXYuJ\n\
+f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
+2nXfrUbRSIN6SXEctFoy2APvsTy5T3UpzNTHCRW+B81QBEy/cJ4yDrU=\n\
+-----END CERTIFICATE-----\n";
+
+    fn svid_config() -> crate::config::A2aConfig {
+        crate::config::A2aConfig {
+            spiffe_trust_bundle_pem: Some(TEST_CA_PEM.to_string()),
+            trusted_trust_domains: vec!["trusted.example".to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// HTTP header values cannot carry raw newlines; percent-encode the PEM the
+    /// way a front proxy would when transporting an SVID via a header.
+    fn header_safe_pem(pem: &str) -> String {
+        pem.replace('\n', "%0A")
+    }
+
+    #[test]
+    fn parse_trust_domain_extracts_authority() {
+        assert_eq!(
+            parse_spiffe_trust_domain("spiffe://trusted.example/agent/x").unwrap(),
+            "trusted.example"
+        );
+        assert!(parse_spiffe_trust_domain("https://not-spiffe/x").is_err());
+        assert!(parse_spiffe_trust_domain("spiffe:///empty-authority").is_err());
+    }
+
+    #[test]
+    fn valid_svid_chains_to_trust_bundle() {
+        let result = verify_svid(TEST_LEAF_PEM, &svid_config()).expect("test: valid svid");
+        assert_eq!(result.spiffe_id, "spiffe://trusted.example/agent/worker");
+        assert_eq!(result.trust_domain, "trusted.example");
+        assert!(result.trusted);
+        assert_eq!(result.cert_fingerprint.len(), 64);
+    }
+
+    #[test]
+    fn svid_with_untrusted_chain_is_rejected() {
+        // Same SPIFFE SAN, but signed by a CA not in our trust bundle.
+        let err = verify_svid(TEST_ROGUE_LEAF_PEM, &svid_config()).expect_err("test: untrusted chain");
+        assert_eq!(err, SvidError::UntrustedChain);
+    }
+
+    #[test]
+    fn svid_without_trust_bundle_is_rejected() {
+        let mut config = svid_config();
+        config.spiffe_trust_bundle_pem = None;
+        let err = verify_svid(TEST_LEAF_PEM, &config).expect_err("test: no bundle");
+        assert_eq!(err, SvidError::NoTrustBundle);
+    }
+
+    #[test]
+    fn svid_with_untrusted_domain_is_rejected() {
+        let mut config = svid_config();
+        config.trusted_trust_domains = vec!["other.example".to_string()];
+        let err = verify_svid(TEST_LEAF_PEM, &config).expect_err("test: untrusted domain");
+        assert_eq!(err, SvidError::UntrustedDomain("trusted.example".to_string()));
+    }
+
+    #[test]
+    fn svid_empty_domain_list_accepts_any_chained_domain() {
+        let mut config = svid_config();
+        config.trusted_trust_domains.clear();
+        let result = verify_svid(TEST_LEAF_PEM, &config).expect("test: empty domain list");
+        assert!(result.trusted);
+    }
+
+    #[test]
+    fn garbage_svid_pem_does_not_panic() {
+        let err = verify_svid("not a certificate", &svid_config()).expect_err("test: garbage");
+        assert!(matches!(err, SvidError::ParseError(_)));
+    }
+
+    #[test]
+    fn strict_mode_rejects_svid_failure() {
+        let mut config = crate::config::Config::default();
+        config.a2a = svid_config();
+        config.a2a.spiffe_strict_validation = true;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-spiffe-id",
+            HeaderValue::from_static("spiffe://trusted.example/agent/worker"),
+        );
+        // Rogue SVID -> strict mode must reject (no identity derived).
+        let mut value = HeaderValue::from_str(&header_safe_pem(TEST_ROGUE_LEAF_PEM)).expect("test: header value");
+        value.set_sensitive(true);
+        headers.insert("x-spiffe-svid", value);
+        assert!(derive_external_agent_identity(&headers, &config).is_none());
+    }
+
+    #[test]
+    fn verified_svid_overrides_asserted_header() {
+        let mut config = crate::config::Config::default();
+        config.a2a = svid_config();
+        let mut headers = HeaderMap::new();
+        // Caller asserts a DIFFERENT spiffe id in the header...
+        headers.insert(
+            "x-spiffe-id",
+            HeaderValue::from_static("spiffe://attacker.example/agent/evil"),
+        );
+        // ...but presents a valid SVID. The SVID SAN must win.
+        let value = HeaderValue::from_str(&header_safe_pem(TEST_LEAF_PEM)).expect("test: header value");
+        headers.insert("x-spiffe-svid", value);
+        let identity = derive_external_agent_identity(&headers, &config).expect("test: svid identity");
+        assert_eq!(identity.external_subject, "spiffe://trusted.example/agent/worker");
+    }
+
+    #[test]
+    fn non_strict_mode_falls_back_to_header_on_svid_failure() {
+        let mut config = crate::config::Config::default();
+        config.a2a = svid_config();
+        config.a2a.spiffe_strict_validation = false;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-spiffe-id",
+            HeaderValue::from_static("spiffe://trusted.example/agent/worker"),
+        );
+        let value = HeaderValue::from_str(&header_safe_pem(TEST_ROGUE_LEAF_PEM)).expect("test: header value");
+        headers.insert("x-spiffe-svid", value);
+        // Non-strict: rogue SVID fails, but header-asserted id is still honored.
+        let identity = derive_external_agent_identity(&headers, &config).expect("test: fallback identity");
+        assert_eq!(identity.external_subject, "spiffe://trusted.example/agent/worker");
     }
 }

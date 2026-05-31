@@ -4828,6 +4828,7 @@ dependencies = [
  "wasmtime-wasi",
  "webpki-roots 1.0.6",
  "which",
+ "x509-parser",
 ]
 
 [[package]]

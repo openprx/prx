@@ -877,6 +877,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/mcp/v1/tools/call", post(compat::mcp_tools_call))
         .route("/a2a/v1/identity", get(compat::a2a_identity).post(compat::a2a_identity))
         .route("/a2a/v1/discover", get(compat::a2a_discover).post(compat::a2a_discover))
+        .route("/.well-known/agent.json", get(compat::well_known_agent_json))
+        .route("/a2a/v1/.well-known/jwks.json", get(compat::a2a_jwks))
         .merge(limited_public_routes)
         .nest("/api", api_routes)
         .merge(ui::router())

@@ -215,6 +215,193 @@ pub struct XinTaskEvent {
     pub created_at: DateTime<Utc>,
 }
 
+/// Goal-level status: the user-visible progress of a multi-step intent.
+///
+/// FIX-P2-16 (d09): a `XinGoal` aggregates the state of its ordered `XinStep`s.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GoalStatus {
+    /// No step has started yet.
+    Pending,
+    /// At least one step is claimed/running.
+    Running,
+    /// All steps completed successfully.
+    Completed,
+    /// A step exhausted its retries.
+    Failed,
+    /// The goal was cancelled by an operator/owner.
+    Cancelled,
+}
+
+impl GoalStatus {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "running" => Self::Running,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Pending,
+        }
+    }
+}
+
+/// Step-level status: the execution-engine-visible atomic state.
+///
+/// A step moves Pending → Claimed → Running → Completed | Failed. When a lease
+/// expires while the step is Claimed/Running it is reset to `Stale` and may be
+/// re-claimed by any worker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StepStatus {
+    Pending,
+    Claimed,
+    Running,
+    Completed,
+    Failed,
+    Stale,
+}
+
+impl StepStatus {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Stale => "stale",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "claimed" => Self::Claimed,
+            "running" => Self::Running,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "stale" => Self::Stale,
+            _ => Self::Pending,
+        }
+    }
+}
+
+/// A user-visible goal that owns N ordered execution steps.
+///
+/// Corresponds to the "top-level intent" semantics of a `XinTask`; introduced
+/// in parallel with `xin_tasks` (zero-breakage migration, see store.rs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XinGoal {
+    /// UUID v4.
+    pub id: String,
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    /// Supports nested goals / sub-goals.
+    pub parent_task_id: Option<String>,
+    pub source_message_event_id: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub kind: TaskKind,
+    pub status: GoalStatus,
+    pub priority: TaskPriority,
+    /// Expected completion time (SLA reference, not enforced).
+    pub target_completion_at: Option<DateTime<Utc>>,
+    /// Number of steps that have reached Completed.
+    pub steps_completed: u32,
+    /// Total number of steps (0 = unknown / dynamically appended).
+    pub steps_total: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    /// Final output summary on success.
+    pub final_output: Option<String>,
+    pub enabled: bool,
+}
+
+/// A single execution step inside a `XinGoal`. Supports lease + checkpoint +
+/// heartbeat for crash-safe, long-running work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XinStep {
+    /// UUID v4.
+    pub id: String,
+    /// FK → xin_goals.id.
+    pub goal_id: String,
+    /// 1-based execution order within the goal.
+    pub sequence: u32,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: StepStatus,
+    pub execution_mode: ExecutionMode,
+    /// AgentSession prompt / Shell command / Internal handler key.
+    pub payload: String,
+    /// Worker holding the current lease (format: `prx:{pid}:{host_hash}`).
+    pub lease_owner: Option<String>,
+    /// Lease expiry; once past, any worker may re-claim.
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    /// Most recent heartbeat (liveness signal).
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    /// Structured progress snapshot (JSON); replayed on crash recovery.
+    pub checkpoint_json: Option<String>,
+    /// Per-step lease TTL override in seconds (0 = per-mode default).
+    pub lease_ttl_secs: u64,
+    pub retry_count: u32,
+    pub max_retries: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub last_output: Option<String>,
+    pub approval_grant_json: Option<String>,
+}
+
+/// Input for creating a new step (see [`NewXinGoal`]).
+#[derive(Debug, Clone)]
+pub struct NewXinStep {
+    pub sequence: u32,
+    pub name: String,
+    pub description: Option<String>,
+    pub execution_mode: ExecutionMode,
+    pub payload: String,
+    pub max_retries: u32,
+    pub approval_grant_json: Option<String>,
+    /// Lease TTL in seconds; 0 = use the per-mode default.
+    pub lease_ttl_secs: u64,
+}
+
+/// Input for creating a new goal with an optional initial set of steps.
+#[derive(Debug, Clone)]
+pub struct NewXinGoal {
+    pub owner_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub source_message_event_id: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub kind: TaskKind,
+    pub priority: TaskPriority,
+    pub target_completion_at: Option<DateTime<Utc>>,
+    /// Initial steps; more may be appended later via `add_step`.
+    pub initial_steps: Vec<NewXinStep>,
+}
+
+/// Default lease TTL (seconds) by execution mode (d09 §7).
+pub const fn default_lease_ttl_secs(mode: &ExecutionMode) -> u64 {
+    match mode {
+        ExecutionMode::AgentSession => 1800,
+        ExecutionMode::Shell => 300,
+        ExecutionMode::Internal => 60,
+    }
+}
+
 /// Summary of a single xin tick.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct XinTickSummary {
@@ -277,5 +464,39 @@ mod tests {
         for kind in [TaskKind::System, TaskKind::User, TaskKind::Agent] {
             assert_eq!(TaskKind::from_str_lossy(kind.as_str()), kind);
         }
+    }
+
+    #[test]
+    fn goal_status_roundtrip() {
+        for status in [
+            GoalStatus::Pending,
+            GoalStatus::Running,
+            GoalStatus::Completed,
+            GoalStatus::Failed,
+            GoalStatus::Cancelled,
+        ] {
+            assert_eq!(GoalStatus::from_str_lossy(status.as_str()), status);
+        }
+    }
+
+    #[test]
+    fn step_status_roundtrip() {
+        for status in [
+            StepStatus::Pending,
+            StepStatus::Claimed,
+            StepStatus::Running,
+            StepStatus::Completed,
+            StepStatus::Failed,
+            StepStatus::Stale,
+        ] {
+            assert_eq!(StepStatus::from_str_lossy(status.as_str()), status);
+        }
+    }
+
+    #[test]
+    fn default_lease_ttl_by_mode() {
+        assert_eq!(default_lease_ttl_secs(&ExecutionMode::AgentSession), 1800);
+        assert_eq!(default_lease_ttl_secs(&ExecutionMode::Shell), 300);
+        assert_eq!(default_lease_ttl_secs(&ExecutionMode::Internal), 60);
     }
 }

@@ -1861,6 +1861,35 @@ pub struct A2aConfig {
     /// Replay window for future handoff delegation tokens.
     #[serde(default = "default_a2a_handoff_nonce_ttl_seconds")]
     pub handoff_nonce_ttl_seconds: u64,
+    /// On-disk Ed25519 signing key for the published Agent Card (JWS). When set,
+    /// the `/.well-known/agent.json` card is signed and verifiable via the JWKS
+    /// endpoint. When unset, an ephemeral per-process key is used (card is still
+    /// signed, but the public key only lives for the lifetime of the process).
+    #[serde(default)]
+    pub card_signing_key_path: Option<String>,
+    /// Validity window of a published Agent Card, in seconds. Reflected in the
+    /// card's `expires_at` and the response `Cache-Control: max-age`.
+    #[serde(default = "default_a2a_card_ttl_seconds")]
+    pub card_ttl_seconds: u64,
+    /// Public JWKS URI advertised in the card signature block so peers know where
+    /// to fetch the verification key. Defaults to the local JWKS endpoint.
+    #[serde(default)]
+    pub card_jwks_uri: Option<String>,
+    /// Trust domains accepted when verifying a peer SPIFFE SVID. Empty means the
+    /// `allowed_peer_issuers` allow-list is the sole gate (backward compatible).
+    #[serde(default)]
+    pub trusted_trust_domains: Vec<String>,
+    /// Trust bundle CA certificate(s) in PEM, used to verify the signature chain
+    /// of a peer-presented X.509 SVID. When unset, SVID chain verification is not
+    /// performed (only header-asserted issuer allow-listing applies).
+    #[serde(default)]
+    pub spiffe_trust_bundle_pem: Option<String>,
+    /// When true, a peer that presents an X.509 SVID header but fails chain /
+    /// validity / trust-domain verification is rejected. When false (default),
+    /// verification failures are logged but fall back to header-asserted trust
+    /// (suitable for a trusted front proxy terminating mTLS).
+    #[serde(default)]
+    pub spiffe_strict_validation: bool,
 }
 
 fn default_a2a_bind() -> String {
@@ -1879,6 +1908,10 @@ const fn default_a2a_handoff_nonce_ttl_seconds() -> u64 {
     3_600
 }
 
+const fn default_a2a_card_ttl_seconds() -> u64 {
+    3_600
+}
+
 impl Default for A2aConfig {
     fn default() -> Self {
         Self {
@@ -1889,6 +1922,12 @@ impl Default for A2aConfig {
             discovery_advertised: false,
             allowed_peer_issuers: Vec::new(),
             handoff_nonce_ttl_seconds: default_a2a_handoff_nonce_ttl_seconds(),
+            card_signing_key_path: None,
+            card_ttl_seconds: default_a2a_card_ttl_seconds(),
+            card_jwks_uri: None,
+            trusted_trust_domains: Vec::new(),
+            spiffe_trust_bundle_pem: None,
+            spiffe_strict_validation: false,
         }
     }
 }

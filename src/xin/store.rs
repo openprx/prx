@@ -5,7 +5,8 @@
 
 use crate::config::Config;
 use crate::xin::types::{
-    ExecutionMode, NewXinTask, TaskKind, TaskPriority, TaskStatus, XinTask, XinTaskEvent, XinTaskPatch,
+    ExecutionMode, GoalStatus, NewXinGoal, NewXinStep, NewXinTask, StepStatus, TaskKind, TaskPriority, TaskStatus,
+    XinGoal, XinStep, XinTask, XinTaskEvent, XinTaskPatch, default_lease_ttl_secs,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -572,6 +573,678 @@ pub fn list_task_events(config: &Config, task_id: &str) -> Result<Vec<XinTaskEve
     })
 }
 
+// ── Goal / Step (FIX-P2-16, d09) ─────────────────────────────────────────
+
+const SELECT_GOAL_COLUMNS: &str = "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
+            name, description, kind, status, priority, target_completion_at,
+            steps_completed, steps_total, created_at, updated_at, completed_at,
+            final_output, enabled
+     FROM xin_goals";
+
+const SELECT_STEP_COLUMNS: &str = "SELECT id, goal_id, sequence, name, description, status, execution_mode,
+            payload, lease_owner, lease_expires_at, last_heartbeat_at, checkpoint_json,
+            lease_ttl_secs, retry_count, max_retries, created_at, updated_at, started_at, completed_at,
+            last_output, approval_grant_json
+     FROM xin_steps";
+
+/// Insert a goal and (optionally) its initial steps in a single transaction.
+pub fn add_goal(config: &Config, new: &NewXinGoal) -> Result<XinGoal> {
+    let goal_id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+    let steps_total = u32::try_from(new.initial_steps.len()).unwrap_or(u32::MAX);
+
+    with_connection(config, |conn| {
+        conn.execute(
+            "INSERT INTO xin_goals (
+                id, owner_id, topic_id, parent_task_id, source_message_event_id,
+                name, description, kind, status, priority, target_completion_at,
+                steps_completed, steps_total, created_at, updated_at, completed_at,
+                final_output, enabled
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7, ?8, 'pending', ?9, ?10,
+                0, ?11, ?12, ?13, NULL,
+                NULL, 1
+             )",
+            params![
+                goal_id,
+                new.owner_id,
+                new.topic_id,
+                new.parent_task_id,
+                new.source_message_event_id,
+                new.name,
+                new.description,
+                new.kind.as_str(),
+                new.priority.as_i32(),
+                new.target_completion_at.map(|t| t.to_rfc3339()),
+                i64::from(steps_total),
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        )
+        .context("Failed to insert xin goal")?;
+
+        for step in &new.initial_steps {
+            insert_step_row(conn, &goal_id, step, now)?;
+        }
+
+        insert_task_event(
+            conn,
+            &workspace_id(config),
+            &goal_id,
+            TaskLineage {
+                owner_id: new.owner_id.clone(),
+                topic_id: new.topic_id.clone(),
+                parent_task_id: new.parent_task_id.clone(),
+                source_message_event_id: new.source_message_event_id.clone(),
+                status: Some("pending".to_string()),
+            },
+            "xin.goal.created",
+            Some("pending"),
+            Some(
+                serde_json::json!({
+                    "name": new.name,
+                    "kind": new.kind.as_str(),
+                    "steps_total": steps_total,
+                })
+                .to_string(),
+            )
+            .as_deref(),
+        )?;
+        Ok(())
+    })?;
+
+    get_goal(config, &goal_id)
+}
+
+/// Insert a step row inside an existing transaction/connection.
+fn insert_step_row(conn: &Connection, goal_id: &str, step: &NewXinStep, now: DateTime<Utc>) -> Result<String> {
+    let step_id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO xin_steps (
+            id, goal_id, sequence, name, description, status, execution_mode,
+            payload, lease_ttl_secs, retry_count, max_retries, created_at, updated_at, approval_grant_json
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, 'pending', ?6,
+            ?7, ?8, 0, ?9, ?10, ?11, ?12
+         )",
+        params![
+            step_id,
+            goal_id,
+            i64::from(step.sequence),
+            step.name,
+            step.description,
+            step.execution_mode.as_str(),
+            step.payload,
+            i64::try_from(step.lease_ttl_secs).unwrap_or(i64::MAX),
+            i64::from(step.max_retries),
+            now.to_rfc3339(),
+            now.to_rfc3339(),
+            step.approval_grant_json,
+        ],
+    )
+    .context("Failed to insert xin step")?;
+    Ok(step_id)
+}
+
+/// Append a step to an existing goal and bump its `steps_total`.
+pub fn add_step(config: &Config, goal_id: &str, step: &NewXinStep) -> Result<XinStep> {
+    let now = Utc::now();
+    let step_id = with_connection(config, |conn| {
+        let id = insert_step_row(conn, goal_id, step, now)?;
+        conn.execute(
+            "UPDATE xin_goals SET steps_total = steps_total + 1, updated_at = ?1 WHERE id = ?2",
+            params![now.to_rfc3339(), goal_id],
+        )
+        .context("Failed to bump goal steps_total")?;
+        Ok(id)
+    })?;
+    get_step(config, &step_id)
+}
+
+/// Retrieve a goal by ID.
+pub fn get_goal(config: &Config, goal_id: &str) -> Result<XinGoal> {
+    with_connection(config, |conn| {
+        let sql = format!("{SELECT_GOAL_COLUMNS} WHERE id = ?1");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![goal_id])?;
+        if let Some(row) = rows.next()? {
+            map_goal_row(row).map_err(Into::into)
+        } else {
+            anyhow::bail!("Xin goal '{goal_id}' not found")
+        }
+    })
+}
+
+/// Retrieve a single step by ID.
+pub fn get_step(config: &Config, step_id: &str) -> Result<XinStep> {
+    with_connection(config, |conn| {
+        let sql = format!("{SELECT_STEP_COLUMNS} WHERE id = ?1");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![step_id])?;
+        if let Some(row) = rows.next()? {
+            map_step_row(row).map_err(Into::into)
+        } else {
+            anyhow::bail!("Xin step '{step_id}' not found")
+        }
+    })
+}
+
+/// List a goal's steps ordered by sequence.
+pub fn list_steps(config: &Config, goal_id: &str) -> Result<Vec<XinStep>> {
+    with_connection(config, |conn| {
+        let sql = format!("{SELECT_STEP_COLUMNS} WHERE goal_id = ?1 ORDER BY sequence ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![goal_id], map_step_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    })
+}
+
+/// List all goals ordered by priority DESC then creation time.
+pub fn list_goals(config: &Config) -> Result<Vec<XinGoal>> {
+    with_connection(config, |conn| {
+        let sql = format!("{SELECT_GOAL_COLUMNS} ORDER BY priority DESC, created_at ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], map_goal_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    })
+}
+
+/// Return the next claimable step of a goal: the lowest-sequence step that is
+/// pending or stale (lease expired). Returns `None` when nothing is runnable.
+pub fn next_runnable_step(config: &Config, goal_id: &str) -> Result<Option<XinStep>> {
+    with_connection(config, |conn| {
+        let sql = format!(
+            "{SELECT_STEP_COLUMNS} WHERE goal_id = ?1 AND status IN ('pending', 'stale') \
+             ORDER BY sequence ASC LIMIT 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![goal_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(map_step_row(row)?)),
+            None => Ok(None),
+        }
+    })
+}
+
+/// Resolve the effective lease TTL for a step, in priority order:
+/// 1. the caller-supplied `ttl_secs` (when non-zero),
+/// 2. the per-step persisted `lease_ttl_secs` (when non-zero),
+/// 3. the per-execution-mode default.
+const fn effective_lease_ttl(mode: &ExecutionMode, persisted_ttl: u64, ttl_secs: u64) -> u64 {
+    if ttl_secs != 0 {
+        ttl_secs
+    } else if persisted_ttl != 0 {
+        persisted_ttl
+    } else {
+        default_lease_ttl_secs(mode)
+    }
+}
+
+/// Read a step's `(execution_mode, lease_ttl_secs)` for TTL resolution.
+fn step_lease_params(conn: &Connection, step_id: &str) -> Option<(ExecutionMode, u64)> {
+    conn.query_row(
+        "SELECT execution_mode, lease_ttl_secs FROM xin_steps WHERE id = ?1",
+        params![step_id],
+        |row| {
+            let mode: String = row.get(0)?;
+            let ttl: i64 = row.get(1)?;
+            Ok((mode, ttl))
+        },
+    )
+    .ok()
+    .map(|(mode, ttl)| (ExecutionMode::from_str_lossy(&mode), u64::try_from(ttl).unwrap_or(0)))
+}
+
+/// Atomically claim a step for a worker.
+///
+/// CAS semantics: a step is claimable when it is `pending`/`stale` (a free
+/// step), or when it is `claimed`/`running` with an expired (or null) lease. On
+/// success the step becomes `claimed` with a fresh lease and heartbeat. Returns
+/// `true` iff this worker won the claim.
+pub fn claim_step(config: &Config, step_id: &str, worker_id: &str, ttl_secs: u64) -> Result<bool> {
+    let now = Utc::now();
+    let changed = with_connection(config, |conn| {
+        let Some((mode, persisted)) = step_lease_params(conn, step_id) else {
+            return Ok(0usize);
+        };
+        let ttl = effective_lease_ttl(&mode, persisted, ttl_secs);
+        let expires = now + chrono::Duration::seconds(i64::try_from(ttl).unwrap_or(i64::MAX));
+
+        let changed = conn
+            .execute(
+                "UPDATE xin_steps
+                 SET status = 'claimed', lease_owner = ?1, lease_expires_at = ?2,
+                     last_heartbeat_at = ?3, updated_at = ?3
+                 WHERE id = ?4
+                   AND (
+                     -- A free step (never started, or already reaped) is always claimable.
+                     status IN ('pending', 'stale')
+                     -- A still-held step is only claimable once its lease has lapsed.
+                     OR (status IN ('claimed', 'running')
+                         AND (lease_expires_at IS NULL OR lease_expires_at < ?3))
+                   )",
+                params![worker_id, expires.to_rfc3339(), now.to_rfc3339(), step_id],
+            )
+            .context("Failed to claim xin step")?;
+
+        if changed > 0 {
+            emit_step_event(conn, config, step_id, "xin.step.claimed", Some("claimed"))?;
+        }
+        Ok(changed)
+    })?;
+    Ok(changed > 0)
+}
+
+/// Transition a claimed step to `running` (sets `started_at` on first run).
+pub fn mark_step_running(config: &Config, step_id: &str, worker_id: &str) -> Result<bool> {
+    let now = Utc::now();
+    let changed = with_connection(config, |conn| {
+        let changed = conn
+            .execute(
+                "UPDATE xin_steps
+                 SET status = 'running',
+                     started_at = COALESCE(started_at, ?1),
+                     last_heartbeat_at = ?1,
+                     updated_at = ?1
+                 WHERE id = ?2 AND lease_owner = ?3 AND status IN ('claimed', 'running')",
+                params![now.to_rfc3339(), step_id, worker_id],
+            )
+            .context("Failed to mark xin step running")?;
+        if changed > 0 {
+            emit_step_event(conn, config, step_id, "xin.step.running", Some("running"))?;
+        }
+        Ok(changed)
+    })?;
+    Ok(changed > 0)
+}
+
+/// Atomically renew a lease. Succeeds only when the caller still owns a
+/// non-expired lease — this is what keeps long agent runs from being marked
+/// stale mid-flight. Returns `true` iff the lease was extended.
+pub fn renew_step_lease(config: &Config, step_id: &str, worker_id: &str, ttl_secs: u64) -> Result<bool> {
+    let now = Utc::now();
+    let changed = with_connection(config, |conn| {
+        let Some((mode, persisted)) = step_lease_params(conn, step_id) else {
+            return Ok(0usize);
+        };
+        let ttl = effective_lease_ttl(&mode, persisted, ttl_secs);
+        let expires = now + chrono::Duration::seconds(i64::try_from(ttl).unwrap_or(i64::MAX));
+
+        conn.execute(
+            "UPDATE xin_steps
+             SET lease_expires_at = ?1, last_heartbeat_at = ?2, updated_at = ?2
+             WHERE id = ?3 AND lease_owner = ?4
+               AND status IN ('claimed', 'running')
+               AND (lease_expires_at IS NULL OR lease_expires_at >= ?2)",
+            params![expires.to_rfc3339(), now.to_rfc3339(), step_id, worker_id],
+        )
+        .context("Failed to renew xin step lease")
+    })?;
+    Ok(changed > 0)
+}
+
+/// Persist a checkpoint without changing status — replayed on crash recovery.
+pub fn save_step_checkpoint(config: &Config, step_id: &str, checkpoint_json: &str) -> Result<()> {
+    let now = Utc::now();
+    with_connection(config, |conn| {
+        let changed = conn
+            .execute(
+                "UPDATE xin_steps SET checkpoint_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![checkpoint_json, now.to_rfc3339(), step_id],
+            )
+            .context("Failed to save xin step checkpoint")?;
+        if changed == 0 {
+            tracing::warn!(step_id = %step_id, "save_step_checkpoint: no rows affected");
+        }
+        Ok(())
+    })
+}
+
+/// Mark a step completed, recompute the goal's progress and roll the goal up to
+/// `completed` once every step is done.
+pub fn complete_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
+    let now = Utc::now();
+    let bounded = truncate_output(output);
+    with_connection(config, |conn| {
+        let goal_id: Option<String> = conn
+            .query_row("SELECT goal_id FROM xin_steps WHERE id = ?1", params![step_id], |row| {
+                row.get(0)
+            })
+            .ok();
+        let changed = conn
+            .execute(
+                "UPDATE xin_steps
+                 SET status = 'completed', completed_at = ?1, last_output = ?2,
+                     lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1
+                 WHERE id = ?3",
+                params![now.to_rfc3339(), bounded, step_id],
+            )
+            .context("Failed to complete xin step")?;
+        if changed == 0 {
+            tracing::warn!(step_id = %step_id, "complete_step: no rows affected");
+            return Ok(());
+        }
+        emit_step_event(conn, config, step_id, "xin.step.completed", Some("completed"))?;
+        if let Some(goal_id) = goal_id {
+            recompute_goal_progress(conn, config, &goal_id, now)?;
+        }
+        Ok(())
+    })
+}
+
+/// Mark a step failed. If retries remain the step is reset to `pending` (lease
+/// released) for re-execution; otherwise it is terminally `failed` and the goal
+/// rolls up to `failed`.
+pub fn fail_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
+    let now = Utc::now();
+    let bounded = truncate_output(output);
+    with_connection(config, |conn| {
+        let row: Option<(String, i64, i64)> = conn
+            .query_row(
+                "SELECT goal_id, retry_count, max_retries FROM xin_steps WHERE id = ?1",
+                params![step_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+        let Some((goal_id, retry_count, max_retries)) = row else {
+            tracing::warn!(step_id = %step_id, "fail_step: step not found");
+            return Ok(());
+        };
+
+        let retries_left = retry_count < max_retries;
+        if retries_left {
+            conn.execute(
+                "UPDATE xin_steps
+                 SET status = 'pending', retry_count = retry_count + 1, last_output = ?1,
+                     lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
+                 WHERE id = ?3",
+                params![bounded, now.to_rfc3339(), step_id],
+            )
+            .context("Failed to reset xin step for retry")?;
+            emit_step_event(conn, config, step_id, "xin.step.retry", Some("pending"))?;
+        } else {
+            conn.execute(
+                "UPDATE xin_steps
+                 SET status = 'failed', retry_count = retry_count + 1, last_output = ?1,
+                     completed_at = ?2, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
+                 WHERE id = ?3",
+                params![bounded, now.to_rfc3339(), step_id],
+            )
+            .context("Failed to fail xin step")?;
+            emit_step_event(conn, config, step_id, "xin.step.failed", Some("failed"))?;
+            conn.execute(
+                "UPDATE xin_goals SET status = 'failed', updated_at = ?1 WHERE id = ?2",
+                params![now.to_rfc3339(), goal_id],
+            )
+            .context("Failed to mark goal failed")?;
+        }
+        Ok(())
+    })
+}
+
+/// Reset steps whose lease expired (while claimed/running) back to `stale` so
+/// they can be re-claimed. Returns the affected step ids.
+pub fn mark_steps_stale(config: &Config, now: DateTime<Utc>) -> Result<Vec<String>> {
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM xin_steps
+             WHERE status IN ('claimed', 'running')
+               AND lease_expires_at IS NOT NULL AND lease_expires_at < ?1",
+        )?;
+        let ids = stmt
+            .query_map(params![now.to_rfc3339()], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        conn.execute(
+            "UPDATE xin_steps
+             SET status = 'stale', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1
+             WHERE status IN ('claimed', 'running')
+               AND lease_expires_at IS NOT NULL AND lease_expires_at < ?1",
+            params![now.to_rfc3339()],
+        )
+        .context("Failed to mark xin steps stale")?;
+        for id in &ids {
+            emit_step_event(conn, config, id, "xin.step.stale", Some("stale"))?;
+        }
+        Ok(ids)
+    })
+}
+
+/// List steps whose lease has expired while claimed/running.
+pub fn expired_step_leases(config: &Config, now: DateTime<Utc>) -> Result<Vec<XinStep>> {
+    with_connection(config, |conn| {
+        let sql = format!(
+            "{SELECT_STEP_COLUMNS} WHERE status IN ('claimed', 'running') \
+             AND lease_expires_at IS NOT NULL AND lease_expires_at < ?1 ORDER BY sequence ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![now.to_rfc3339()], map_step_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    })
+}
+
+/// Migrate a legacy non-recurring `XinTask` into a single-step `XinGoal`.
+///
+/// The original `xin_tasks` row is left untouched (zero-breakage, d09 §4.2).
+pub fn migrate_task_to_goal(config: &Config, task_id: &str) -> Result<XinGoal> {
+    let task = get_task(config, task_id)?;
+    if task.recurring {
+        anyhow::bail!("recurring xin task '{task_id}' cannot be migrated to a goal (keep as legacy)");
+    }
+    let step = NewXinStep {
+        sequence: 1,
+        name: task.name.clone(),
+        description: task.description.clone(),
+        execution_mode: task.execution_mode,
+        payload: task.payload,
+        max_retries: task.max_failures,
+        approval_grant_json: task.approval_grant_json,
+        lease_ttl_secs: 0,
+    };
+    let new_goal = NewXinGoal {
+        owner_id: task.owner_id,
+        topic_id: task.topic_id,
+        parent_task_id: task.parent_task_id,
+        source_message_event_id: task.source_message_event_id,
+        name: task.name,
+        description: task.description,
+        kind: task.kind,
+        priority: task.priority,
+        target_completion_at: None,
+        initial_steps: vec![step],
+    };
+    add_goal(config, &new_goal)
+}
+
+/// Recompute `steps_completed` and roll the goal status up. Called inside an
+/// existing transaction after a step transition.
+fn recompute_goal_progress(conn: &Connection, config: &Config, goal_id: &str, now: DateTime<Utc>) -> Result<()> {
+    let completed: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM xin_steps WHERE goal_id = ?1 AND status = 'completed'",
+        params![goal_id],
+        |row| row.get(0),
+    )?;
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM xin_steps WHERE goal_id = ?1",
+        params![goal_id],
+        |row| row.get(0),
+    )?;
+
+    let all_done = total > 0 && completed >= total;
+    if all_done {
+        let final_output: Option<String> = conn
+            .query_row(
+                "SELECT last_output FROM xin_steps WHERE goal_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                params![goal_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        conn.execute(
+            "UPDATE xin_goals
+             SET steps_completed = ?1, status = 'completed', completed_at = ?2,
+                 final_output = ?3, updated_at = ?2
+             WHERE id = ?4",
+            params![completed, now.to_rfc3339(), final_output, goal_id],
+        )
+        .context("Failed to mark goal completed")?;
+        emit_goal_event(conn, config, goal_id, "xin.goal.completed", Some("completed"))?;
+    } else {
+        conn.execute(
+            "UPDATE xin_goals
+             SET steps_completed = ?1, status = 'running', updated_at = ?2
+             WHERE id = ?3 AND status != 'completed'",
+            params![completed, now.to_rfc3339(), goal_id],
+        )
+        .context("Failed to update goal progress")?;
+    }
+    Ok(())
+}
+
+/// Emit a lifecycle event for a step (mirrored via the goal's lineage).
+fn emit_step_event(
+    conn: &Connection,
+    config: &Config,
+    step_id: &str,
+    event_type: &str,
+    status: Option<&str>,
+) -> Result<()> {
+    let goal_id: Option<String> = conn
+        .query_row("SELECT goal_id FROM xin_steps WHERE id = ?1", params![step_id], |row| {
+            row.get(0)
+        })
+        .ok();
+    let Some(goal_id) = goal_id else {
+        return Ok(());
+    };
+    let Some(lineage) = load_goal_lineage(conn, &goal_id)? else {
+        return Ok(());
+    };
+    insert_task_event(
+        conn,
+        &workspace_id(config),
+        &goal_id,
+        lineage,
+        event_type,
+        status,
+        Some(serde_json::json!({ "step_id": step_id }).to_string()).as_deref(),
+    )
+}
+
+/// Emit a lifecycle event for a goal.
+fn emit_goal_event(
+    conn: &Connection,
+    config: &Config,
+    goal_id: &str,
+    event_type: &str,
+    status: Option<&str>,
+) -> Result<()> {
+    let Some(lineage) = load_goal_lineage(conn, goal_id)? else {
+        return Ok(());
+    };
+    insert_task_event(conn, &workspace_id(config), goal_id, lineage, event_type, status, None)
+}
+
+fn load_goal_lineage(conn: &Connection, goal_id: &str) -> Result<Option<TaskLineage>> {
+    let mut stmt = conn.prepare(
+        "SELECT owner_id, topic_id, parent_task_id, source_message_event_id, status
+         FROM xin_goals WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query(params![goal_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(TaskLineage {
+        owner_id: row.get(0)?,
+        topic_id: row.get(1)?,
+        parent_task_id: row.get(2)?,
+        source_message_event_id: row.get(3)?,
+        status: row.get(4)?,
+    }))
+}
+
+fn map_goal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinGoal> {
+    let created_at_raw: String = row.get(13)?;
+    let updated_at_raw: String = row.get(14)?;
+    let target_raw: Option<String> = row.get(10)?;
+    let completed_raw: Option<String> = row.get(15)?;
+    Ok(XinGoal {
+        id: row.get(0)?,
+        owner_id: row.get(1)?,
+        topic_id: row.get(2)?,
+        parent_task_id: row.get(3)?,
+        source_message_event_id: row.get(4)?,
+        name: row.get(5)?,
+        description: row.get(6)?,
+        kind: TaskKind::from_str_lossy(&row.get::<_, String>(7)?),
+        status: GoalStatus::from_str_lossy(&row.get::<_, String>(8)?),
+        priority: TaskPriority::from_i32(row.get(9)?),
+        target_completion_at: match target_raw {
+            Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_err)?),
+            None => None,
+        },
+        steps_completed: u32::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
+        steps_total: u32::try_from(row.get::<_, i64>(12)?).unwrap_or(0),
+        created_at: parse_rfc3339(&created_at_raw).map_err(sql_err)?,
+        updated_at: parse_rfc3339(&updated_at_raw).map_err(sql_err)?,
+        completed_at: match completed_raw {
+            Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_err)?),
+            None => None,
+        },
+        final_output: row.get(16)?,
+        enabled: row.get::<_, i64>(17)? != 0,
+    })
+}
+
+fn map_step_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinStep> {
+    let created_at_raw: String = row.get(15)?;
+    let updated_at_raw: String = row.get(16)?;
+    let lease_raw: Option<String> = row.get(9)?;
+    let hb_raw: Option<String> = row.get(10)?;
+    let started_raw: Option<String> = row.get(17)?;
+    let completed_raw: Option<String> = row.get(18)?;
+    Ok(XinStep {
+        id: row.get(0)?,
+        goal_id: row.get(1)?,
+        sequence: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+        name: row.get(3)?,
+        description: row.get(4)?,
+        status: StepStatus::from_str_lossy(&row.get::<_, String>(5)?),
+        execution_mode: ExecutionMode::from_str_lossy(&row.get::<_, String>(6)?),
+        payload: row.get(7)?,
+        lease_owner: row.get(8)?,
+        lease_expires_at: match lease_raw {
+            Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_err)?),
+            None => None,
+        },
+        last_heartbeat_at: match hb_raw {
+            Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_err)?),
+            None => None,
+        },
+        checkpoint_json: row.get(11)?,
+        lease_ttl_secs: u64::try_from(row.get::<_, i64>(12)?).unwrap_or(0),
+        retry_count: u32::try_from(row.get::<_, i64>(13)?).unwrap_or(0),
+        max_retries: u32::try_from(row.get::<_, i64>(14)?).unwrap_or(0),
+        created_at: parse_rfc3339(&created_at_raw).map_err(sql_err)?,
+        updated_at: parse_rfc3339(&updated_at_raw).map_err(sql_err)?,
+        started_at: match started_raw {
+            Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_err)?),
+            None => None,
+        },
+        completed_at: match completed_raw {
+            Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_err)?),
+            None => None,
+        },
+        last_output: row.get(19)?,
+        approval_grant_json: row.get(20)?,
+    })
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 const SELECT_ALL_COLUMNS: &str = "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
@@ -881,7 +1554,59 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
          CREATE INDEX IF NOT EXISTS idx_xin_task_events_task_id ON xin_task_events(task_id, id);
          CREATE INDEX IF NOT EXISTS idx_xin_task_events_owner ON xin_task_events(workspace_id, owner_id, id);
          CREATE INDEX IF NOT EXISTS idx_xin_task_events_topic ON xin_task_events(workspace_id, topic_id, id);
-         CREATE INDEX IF NOT EXISTS idx_xin_task_events_type ON xin_task_events(event_type, id);",
+         CREATE INDEX IF NOT EXISTS idx_xin_task_events_type ON xin_task_events(event_type, id);
+
+         CREATE TABLE IF NOT EXISTS xin_goals (
+            id                      TEXT PRIMARY KEY,
+            owner_id                TEXT,
+            topic_id                TEXT,
+            parent_task_id          TEXT,
+            source_message_event_id TEXT,
+            name                    TEXT NOT NULL,
+            description             TEXT,
+            kind                    TEXT NOT NULL DEFAULT 'user',
+            status                  TEXT NOT NULL DEFAULT 'pending',
+            priority                INTEGER NOT NULL DEFAULT 1,
+            target_completion_at    TEXT,
+            steps_completed         INTEGER NOT NULL DEFAULT 0,
+            steps_total             INTEGER NOT NULL DEFAULT 0,
+            created_at              TEXT NOT NULL,
+            updated_at              TEXT NOT NULL,
+            completed_at            TEXT,
+            final_output            TEXT,
+            enabled                 INTEGER NOT NULL DEFAULT 1
+         );
+         CREATE INDEX IF NOT EXISTS idx_xin_goals_owner  ON xin_goals(owner_id, status);
+         CREATE INDEX IF NOT EXISTS idx_xin_goals_topic  ON xin_goals(topic_id, status);
+         CREATE INDEX IF NOT EXISTS idx_xin_goals_status ON xin_goals(status, priority DESC);
+
+         CREATE TABLE IF NOT EXISTS xin_steps (
+            id                   TEXT PRIMARY KEY,
+            goal_id              TEXT NOT NULL REFERENCES xin_goals(id) ON DELETE CASCADE,
+            sequence             INTEGER NOT NULL,
+            name                 TEXT NOT NULL,
+            description          TEXT,
+            status               TEXT NOT NULL DEFAULT 'pending',
+            execution_mode       TEXT NOT NULL DEFAULT 'agent_session',
+            payload              TEXT NOT NULL DEFAULT '',
+            lease_owner          TEXT,
+            lease_expires_at     TEXT,
+            last_heartbeat_at    TEXT,
+            checkpoint_json      TEXT,
+            lease_ttl_secs       INTEGER NOT NULL DEFAULT 0,
+            retry_count          INTEGER NOT NULL DEFAULT 0,
+            max_retries          INTEGER NOT NULL DEFAULT 3,
+            created_at           TEXT NOT NULL,
+            updated_at           TEXT NOT NULL,
+            started_at           TEXT,
+            completed_at         TEXT,
+            last_output          TEXT,
+            approval_grant_json  TEXT,
+            UNIQUE (goal_id, sequence)
+         );
+         CREATE INDEX IF NOT EXISTS idx_xin_steps_goal  ON xin_steps(goal_id, sequence);
+         CREATE INDEX IF NOT EXISTS idx_xin_steps_due   ON xin_steps(status, lease_expires_at);
+         CREATE INDEX IF NOT EXISTS idx_xin_steps_owner ON xin_steps(lease_owner, status);",
     )
     .context("Failed to initialize xin schema")?;
 
@@ -891,6 +1616,8 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "xin_tasks", "source_message_event_id", "TEXT")?;
     add_column_if_missing(&conn, "xin_tasks", "approval_grant_json", "TEXT")?;
     add_column_if_missing(&conn, "xin_task_events", "source_message_event_id", "TEXT")?;
+    // Forward-compat for any xin_steps table created before lease_ttl_secs existed.
+    add_column_if_missing(&conn, "xin_steps", "lease_ttl_secs", "INTEGER NOT NULL DEFAULT 0")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_xin_tasks_owner ON xin_tasks(owner_id, status, next_run_at);
          CREATE INDEX IF NOT EXISTS idx_xin_tasks_topic ON xin_tasks(topic_id, status, next_run_at);
@@ -1356,5 +2083,277 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         assert!(get_task(&config, "no-such-id").is_err());
+    }
+
+    // ── Goal / Step (FIX-P2-16) ───────────────────────────────────────────
+
+    fn sample_step(seq: u32) -> NewXinStep {
+        NewXinStep {
+            sequence: seq,
+            name: format!("step-{seq}"),
+            description: Some(format!("step {seq} desc")),
+            execution_mode: ExecutionMode::Internal,
+            payload: "noop".into(),
+            max_retries: 2,
+            approval_grant_json: None,
+            lease_ttl_secs: 0,
+        }
+    }
+
+    fn sample_goal(steps: Vec<NewXinStep>) -> NewXinGoal {
+        NewXinGoal {
+            owner_id: Some("owner:ws:tg:alice".into()),
+            topic_id: Some("topic-7".into()),
+            parent_task_id: None,
+            source_message_event_id: Some("msg-9".into()),
+            name: "ship_feature".into(),
+            description: Some("multi-step goal".into()),
+            kind: TaskKind::User,
+            priority: TaskPriority::High,
+            target_completion_at: Some(Utc::now() + chrono::Duration::hours(2)),
+            initial_steps: steps,
+        }
+    }
+
+    #[test]
+    fn add_goal_with_steps_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1), sample_step(2)])).unwrap();
+
+        assert_eq!(goal.name, "ship_feature");
+        assert_eq!(goal.status, GoalStatus::Pending);
+        assert_eq!(goal.steps_total, 2);
+        assert_eq!(goal.steps_completed, 0);
+        assert!(goal.target_completion_at.is_some());
+        assert_eq!(goal.owner_id.as_deref(), Some("owner:ws:tg:alice"));
+
+        let fetched = get_goal(&config, &goal.id).unwrap();
+        assert_eq!(fetched.id, goal.id);
+
+        let steps = list_steps(&config, &goal.id).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].sequence, 1);
+        assert_eq!(steps[1].sequence, 2);
+        assert_eq!(steps[0].status, StepStatus::Pending);
+
+        let one = get_step(&config, &steps[0].id).unwrap();
+        assert_eq!(one.goal_id, goal.id);
+    }
+
+    #[test]
+    fn add_step_bumps_total() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let added = add_step(&config, &goal.id, &sample_step(2)).unwrap();
+        assert_eq!(added.sequence, 2);
+        assert_eq!(get_goal(&config, &goal.id).unwrap().steps_total, 2);
+    }
+
+    #[test]
+    fn claim_step_is_idempotent_under_contention() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+
+        // First worker wins.
+        assert!(claim_step(&config, &step.id, "prx:1:aaaa", 60).unwrap());
+        // Second worker loses while lease is fresh.
+        assert!(!claim_step(&config, &step.id, "prx:2:bbbb", 60).unwrap());
+
+        let claimed = get_step(&config, &step.id).unwrap();
+        assert_eq!(claimed.status, StepStatus::Claimed);
+        assert_eq!(claimed.lease_owner.as_deref(), Some("prx:1:aaaa"));
+        assert!(claimed.lease_expires_at.is_some());
+    }
+
+    #[test]
+    fn renew_lease_extends_then_rejects_other_owner() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+
+        assert!(claim_step(&config, &step.id, "prx:1:aaaa", 60).unwrap());
+        let before = get_step(&config, &step.id).unwrap().lease_expires_at.unwrap();
+
+        // Owner renews successfully and pushes the expiry forward.
+        assert!(renew_step_lease(&config, &step.id, "prx:1:aaaa", 120).unwrap());
+        let after = get_step(&config, &step.id).unwrap().lease_expires_at.unwrap();
+        assert!(after >= before);
+
+        // A different owner cannot renew.
+        assert!(!renew_step_lease(&config, &step.id, "prx:2:bbbb", 120).unwrap());
+    }
+
+    #[test]
+    fn save_checkpoint_does_not_change_status() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+        assert!(claim_step(&config, &step.id, "prx:1:aaaa", 60).unwrap());
+
+        save_step_checkpoint(&config, &step.id, r#"{"cursor":42}"#).unwrap();
+        let after = get_step(&config, &step.id).unwrap();
+        assert_eq!(after.status, StepStatus::Claimed);
+        assert_eq!(after.checkpoint_json.as_deref(), Some(r#"{"cursor":42}"#));
+    }
+
+    #[test]
+    fn long_running_step_not_reaped_when_lease_renewed() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+
+        // Claim with a short lease, then renew to keep it alive.
+        assert!(claim_step(&config, &step.id, "prx:1:aaaa", 1).unwrap());
+        assert!(mark_step_running(&config, &step.id, "prx:1:aaaa").unwrap());
+        assert!(renew_step_lease(&config, &step.id, "prx:1:aaaa", 3600).unwrap());
+
+        // A stale sweep now must NOT reap it (lease far in the future).
+        let reaped = mark_steps_stale(&config, Utc::now()).unwrap();
+        assert!(reaped.is_empty());
+        assert_eq!(get_step(&config, &step.id).unwrap().status, StepStatus::Running);
+    }
+
+    #[test]
+    fn expired_lease_step_marked_stale_and_reclaimable() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+
+        assert!(claim_step(&config, &step.id, "prx:1:aaaa", 60).unwrap());
+        assert!(mark_step_running(&config, &step.id, "prx:1:aaaa").unwrap());
+
+        // Sweep with a future "now" so the lease counts as expired.
+        let future = Utc::now() + chrono::Duration::seconds(120);
+        let expired = expired_step_leases(&config, future).unwrap();
+        assert_eq!(expired.len(), 1);
+
+        let reaped = mark_steps_stale(&config, future).unwrap();
+        assert_eq!(reaped.len(), 1);
+        let stale = get_step(&config, &step.id).unwrap();
+        assert_eq!(stale.status, StepStatus::Stale);
+        assert!(stale.lease_owner.is_none());
+
+        // A new worker re-claims the SAME step (not a fresh one).
+        assert!(claim_step(&config, &step.id, "prx:9:cccc", 60).unwrap());
+        assert_eq!(
+            get_step(&config, &step.id).unwrap().lease_owner.as_deref(),
+            Some("prx:9:cccc")
+        );
+    }
+
+    #[test]
+    fn complete_all_steps_rolls_goal_to_completed() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1), sample_step(2)])).unwrap();
+        let steps = list_steps(&config, &goal.id).unwrap();
+
+        complete_step(&config, &steps[0].id, "out-1").unwrap();
+        let mid = get_goal(&config, &goal.id).unwrap();
+        assert_eq!(mid.status, GoalStatus::Running);
+        assert_eq!(mid.steps_completed, 1);
+
+        complete_step(&config, &steps[1].id, "out-2").unwrap();
+        let done = get_goal(&config, &goal.id).unwrap();
+        assert_eq!(done.status, GoalStatus::Completed);
+        assert_eq!(done.steps_completed, 2);
+        assert!(done.completed_at.is_some());
+        assert_eq!(done.final_output.as_deref(), Some("out-2"));
+    }
+
+    #[test]
+    fn fail_step_retries_then_fails_goal() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        // max_retries = 2 → first two failures retry, third is terminal.
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+
+        fail_step(&config, &step.id, "boom-1").unwrap();
+        assert_eq!(get_step(&config, &step.id).unwrap().status, StepStatus::Pending);
+        fail_step(&config, &step.id, "boom-2").unwrap();
+        assert_eq!(get_step(&config, &step.id).unwrap().status, StepStatus::Pending);
+        fail_step(&config, &step.id, "boom-3").unwrap();
+        assert_eq!(get_step(&config, &step.id).unwrap().status, StepStatus::Failed);
+        assert_eq!(get_goal(&config, &goal.id).unwrap().status, GoalStatus::Failed);
+    }
+
+    #[test]
+    fn next_runnable_step_returns_lowest_sequence() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1), sample_step(2)])).unwrap();
+        let first = next_runnable_step(&config, &goal.id).unwrap().unwrap();
+        assert_eq!(first.sequence, 1);
+        complete_step(&config, &first.id, "ok").unwrap();
+        let second = next_runnable_step(&config, &goal.id).unwrap().unwrap();
+        assert_eq!(second.sequence, 2);
+    }
+
+    #[test]
+    fn migrate_non_recurring_task_to_single_step_goal() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let task = add_task(&config, &sample_task()).unwrap();
+        let goal = migrate_task_to_goal(&config, &task.id).unwrap();
+
+        assert_eq!(goal.name, task.name);
+        assert_eq!(goal.steps_total, 1);
+        let steps = list_steps(&config, &goal.id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].payload, task.payload);
+        // Original task left intact (zero-breakage).
+        assert!(get_task(&config, &task.id).is_ok());
+    }
+
+    #[test]
+    fn migrate_recurring_task_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let task = add_task(&config, &recurring_task()).unwrap();
+        assert!(migrate_task_to_goal(&config, &task.id).is_err());
+    }
+
+    #[test]
+    fn per_step_lease_ttl_override_is_persisted_and_honored() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut step = sample_step(1);
+        step.lease_ttl_secs = 7200; // explicit 2h override
+        let goal = add_goal(&config, &sample_goal(vec![step])).unwrap();
+        let persisted = list_steps(&config, &goal.id).unwrap().remove(0);
+        assert_eq!(persisted.lease_ttl_secs, 7200);
+
+        // Claim with ttl_secs=0 → must fall back to the persisted override, not
+        // the per-mode default (Internal=60s).
+        let before = Utc::now();
+        assert!(claim_step(&config, &persisted.id, "prx:1:aaaa", 0).unwrap());
+        let claimed = get_step(&config, &persisted.id).unwrap();
+        let expires = claimed.lease_expires_at.unwrap();
+        // Expiry should be well beyond the 60s Internal default.
+        assert!(expires > before + chrono::Duration::seconds(3600));
+    }
+
+    #[test]
+    fn list_goals_orders_by_priority() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut low = sample_goal(vec![sample_step(1)]);
+        low.name = "low".into();
+        low.priority = TaskPriority::Low;
+        add_goal(&config, &low).unwrap();
+        add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap(); // High
+
+        let goals = list_goals(&config).unwrap();
+        assert_eq!(goals.len(), 2);
+        assert_eq!(goals[0].priority, TaskPriority::High);
     }
 }

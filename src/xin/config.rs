@@ -49,6 +49,11 @@ pub struct XinConfig {
     /// Enable memory evolution integration (xin takes over evolution/fitness scheduling). Default: false.
     #[serde(default)]
     pub evolution_integration: bool,
+
+    /// Adopt orphaned, stale, non-recurring legacy tasks into lease-managed
+    /// goal/step records on startup (FIX-P2-16). Default: false (zero-breakage).
+    #[serde(default)]
+    pub adopt_legacy_tasks: bool,
 }
 
 impl Default for XinConfig {
@@ -61,6 +66,7 @@ impl Default for XinConfig {
             stale_timeout_minutes: default_stale_timeout_minutes(),
             builtin_tasks: default_builtin_tasks(),
             evolution_integration: false,
+            adopt_legacy_tasks: false,
         }
     }
 }
@@ -79,6 +85,7 @@ mod tests {
         assert_eq!(cfg.stale_timeout_minutes, 60);
         assert!(cfg.builtin_tasks);
         assert!(!cfg.evolution_integration);
+        assert!(!cfg.adopt_legacy_tasks);
     }
 
     #[test]

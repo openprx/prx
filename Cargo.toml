@@ -160,6 +160,9 @@ unicode-normalization = "0.1"
 hostname = "0.4.2"
 rustls = "0.23"
 rustls-pki-types = "1.14.0"
+# X.509 SVID parsing for SPIFFE peer verification (PEM/DER decode, SAN URI,
+# validity, chain signature check against a trust bundle CA).
+x509-parser = { version = "0.18", features = ["verify"] }
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
 skillratings = { version = "0.27", optional = true }
