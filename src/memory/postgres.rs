@@ -1,9 +1,10 @@
 use super::principal::{ChatType, MemoryWriteContext, Principal, Role, Visibility, classify_memory};
 use super::traits::{
-    CompactionRun, CompactionRunInput, DocumentChunkRecord, DocumentIngestInput, DocumentRecord, DocumentSearchResult,
-    Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink,
-    MemoryLinkInput, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent, MessageEventInput,
-    RetrievalTrace, RetrievalTraceInput, SessionContextQuery, SharedContextQuery, validate_memory_write_target,
+    CompactionRun, CompactionRunInput, ConversationTurn, DocumentChunkRecord, DocumentIngestInput, DocumentRecord,
+    DocumentSearchResult, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry, MemoryEvent,
+    MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility,
+    MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, SessionContextQuery, SharedContextQuery,
+    validate_memory_write_target,
 };
 use super::{embeddings, vector};
 use anyhow::{Context, Result};
@@ -37,6 +38,11 @@ fn message_event_type_for(role: &str, content: &str) -> Option<String> {
 /// requiring extension setup (for example pgvector).
 pub struct PostgresMemory {
     client: Arc<PostgresClientSlot>,
+    /// Quoted schema identifier (for example `"public"`). Used to build the
+    /// qualified names of schema-scoped helper tables (sessions,
+    /// conversation_turns, identity_bindings, user_policies, access_audit_log)
+    /// that live directly under the schema rather than off the base table.
+    schema_ident: String,
     qualified_table: String,
     qualified_message_events_table: String,
     qualified_memory_events_table: String,
@@ -166,6 +172,7 @@ impl PostgresMemory {
         let qualified_compaction_runs_table = format!("{schema_ident}.{compaction_runs_table_ident}");
         let qualified_embedding_cache_table = format!("{schema_ident}.{embedding_cache_table_ident}");
 
+        let schema_ident_field = schema_ident.clone();
         let (client, pgvector_available) = Self::initialize_client(
             db_url.to_string(),
             connect_timeout_secs,
@@ -185,6 +192,7 @@ impl PostgresMemory {
 
         Ok(Self {
             client: Arc::new(PostgresClientSlot::new(client)),
+            schema_ident: schema_ident_field,
             qualified_table,
             qualified_message_events_table,
             qualified_memory_events_table,
@@ -730,8 +738,109 @@ impl PostgresMemory {
                 ON {qualified_compaction_runs_table}(workspace_id, session_key, id);
             CREATE INDEX IF NOT EXISTS idx_compaction_runs_trigger
                 ON {qualified_compaction_runs_table}(workspace_id, trigger, id);
+
+            -- FIX-P0-21: principal resolution tables (parity with SQLite).
+            CREATE TABLE IF NOT EXISTS {schema_ident}.identity_bindings (
+                id              TEXT PRIMARY KEY,
+                user_id         TEXT NOT NULL,
+                channel         TEXT NOT NULL,
+                channel_account TEXT NOT NULL,
+                display_name    TEXT,
+                bound_at        TEXT NOT NULL,
+                bound_by        TEXT NOT NULL,
+                UNIQUE(channel, channel_account)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ib_user
+                ON {schema_ident}.identity_bindings(user_id);
+            CREATE INDEX IF NOT EXISTS idx_ib_channel_account
+                ON {schema_ident}.identity_bindings(channel, channel_account);
+
+            CREATE TABLE IF NOT EXISTS {schema_ident}.user_policies (
+                user_id             TEXT PRIMARY KEY,
+                role                TEXT NOT NULL DEFAULT 'guest',
+                projects            TEXT NOT NULL DEFAULT '[]',
+                visibility_ceiling  TEXT NOT NULL DEFAULT 'private',
+                blocked_patterns    TEXT NOT NULL DEFAULT '[]',
+                policy_version      BIGINT NOT NULL DEFAULT 1,
+                updated_at          TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS {schema_ident}.access_audit_log (
+                id          TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                requester   TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                query       TEXT,
+                memory_id   TEXT,
+                policy_rule TEXT,
+                result      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_time
+                ON {schema_ident}.access_audit_log(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_requester
+                ON {schema_ident}.access_audit_log(requester);
+
+            -- FIX-P0-19/20: conversation sessions + turns with owner ACL (parity
+            -- with SQLite). owner_id is nullable in Phase 1/2; legacy rows carry
+            -- `legacy:<session_key>` and are gated by the legacy visibility flag.
+            CREATE TABLE IF NOT EXISTS {schema_ident}.sessions (
+                session_key          TEXT PRIMARY KEY,
+                channel              TEXT NOT NULL,
+                sender               TEXT NOT NULL,
+                owner_id             TEXT,
+                created_at           TEXT NOT NULL,
+                updated_at           TEXT NOT NULL,
+                message_count        BIGINT NOT NULL DEFAULT 0,
+                last_message_preview TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
+                ON {schema_ident}.sessions(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_channel_updated_at
+                ON {schema_ident}.sessions(channel, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_owner
+                ON {schema_ident}.sessions(owner_id);
+
+            CREATE TABLE IF NOT EXISTS {schema_ident}.conversation_turns (
+                id               BIGSERIAL PRIMARY KEY,
+                session_key      TEXT NOT NULL,
+                owner_id         TEXT,
+                role             TEXT NOT NULL,
+                content          TEXT NOT NULL,
+                timestamp        TEXT NOT NULL,
+                message_id       TEXT,
+                message_event_id TEXT,
+                agent_id         TEXT,
+                persona_id       TEXT,
+                visibility       TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversation_turns_session_key
+                ON {schema_ident}.conversation_turns(session_key);
+            CREATE INDEX IF NOT EXISTS idx_conversation_turns_timestamp
+                ON {schema_ident}.conversation_turns(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_conversation_turns_owner_session
+                ON {schema_ident}.conversation_turns(owner_id, session_key);
+
+            -- FIX-P1-18: additional hot-path indexes for owner/topic scoped reads.
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_task
+                ON {qualified_document_chunks_table}(workspace_id, task_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_links_owner
+                ON {qualified_memory_links_table}(workspace_id, owner_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_links_memory_event
+                ON {qualified_memory_links_table}(memory_event_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_links_message_event
+                ON {qualified_memory_links_table}(message_event_id);
+            CREATE INDEX IF NOT EXISTS idx_documents_source_event
+                ON {qualified_documents_table}(source_message_event_id);
+            CREATE INDEX IF NOT EXISTS idx_compaction_runs_summary_key
+                ON {qualified_compaction_runs_table}(workspace_id, summary_memory_key, id);
             "
         ))?;
+
+        // FIX-P1-19: document_chunks → documents FK with ON DELETE CASCADE.
+        // Added as a guarded step (not in the idempotent batch) because adding a
+        // constraint that already exists raises an error rather than being a
+        // no-op; we therefore detect-then-add and tolerate the duplicate.
+        Self::ensure_document_chunks_fk(client, schema_ident, qualified_document_chunks_table)?;
 
         // FIX-P0-25: record-and-verify versioned schema migrations. The DDL was
         // already executed by the idempotent batch above; this ledger records a
@@ -816,6 +925,21 @@ impl PostgresMemory {
                 "memory_events_run_lineage",
                 "memory_events + run_id + parent_run_id + idx_memory_events_run + idx_memory_events_parent_run",
             ),
+            (
+                13,
+                "principal_resolution_tables",
+                "identity_bindings(id,user_id,channel,channel_account,display_name,bound_at,bound_by) + user_policies(user_id,role,projects,visibility_ceiling,blocked_patterns,policy_version,updated_at) + access_audit_log(id,timestamp,requester,action,query,memory_id,policy_rule,result)",
+            ),
+            (
+                14,
+                "sessions_and_conversation_turns",
+                "sessions(session_key,channel,sender,owner_id,created_at,updated_at,message_count,last_message_preview) + conversation_turns(id,session_key,owner_id,role,content,timestamp,message_id,message_event_id,agent_id,persona_id,visibility) + idx_conversation_turns_owner_session",
+            ),
+            (
+                15,
+                "owner_topic_indexes_and_chunk_fk",
+                "idx_document_chunks_task + idx_memory_links_owner + idx_memory_links_memory_event + idx_memory_links_message_event + idx_documents_source_event + idx_compaction_runs_summary_key + fk_document_chunks_document(ON DELETE CASCADE)",
+            ),
         ]
     }
 
@@ -862,6 +986,52 @@ impl PostgresMemory {
                     let name = (*name).to_string();
                     client.execute(&insert_sql, &[version, &name, &checksum, &Utc::now().to_rfc3339()])?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// FIX-P1-19: ensure `document_chunks.document_id` references
+    /// `documents.document_id` with `ON DELETE CASCADE`.
+    ///
+    /// `ADD CONSTRAINT` is not idempotent in PostgreSQL, so we first probe
+    /// `pg_constraint` for the named constraint and only add it when missing.
+    ///
+    /// SAFETY: `schema_ident` and `qualified_document_chunks_table` are validated
+    /// + quoted at construction; all dynamic values use bind params.
+    fn ensure_document_chunks_fk(
+        client: &mut Client,
+        schema_ident: &str,
+        qualified_document_chunks_table: &str,
+    ) -> Result<()> {
+        const FK_NAME: &str = "fk_document_chunks_document";
+        let exists: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $1)",
+                &[&FK_NAME],
+            )?
+            .get(0);
+        if exists {
+            return Ok(());
+        }
+        let add_fk = format!(
+            "ALTER TABLE {qualified_document_chunks_table}
+             ADD CONSTRAINT {FK_NAME}
+             FOREIGN KEY (document_id)
+             REFERENCES {schema_ident}.documents(document_id)
+             ON DELETE CASCADE"
+        );
+        if let Err(error) = client.batch_execute(&add_fk) {
+            // Tolerate a concurrent initializer that added the same constraint
+            // between our probe and ALTER; surface anything else.
+            let refreshed: bool = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $1)",
+                    &[&FK_NAME],
+                )?
+                .get(0);
+            if !refreshed {
+                return Err(anyhow::anyhow!("failed to add document_chunks foreign key: {error}"));
             }
         }
         Ok(())
@@ -1119,7 +1289,14 @@ impl PostgresMemory {
     }
 
     fn is_system_principal(principal: &MemoryPrincipal) -> bool {
-        principal.agent_id.as_deref() == Some("system") || principal.persona_id.as_deref() == Some("system")
+        principal
+            .agent_id
+            .as_deref()
+            .is_some_and(super::principal::is_system_principal)
+            || principal
+                .persona_id
+                .as_deref()
+                .is_some_and(super::principal::is_system_principal)
     }
 
     fn principal_from_context(context: &MemoryWriteContext) -> Principal {
@@ -1152,6 +1329,170 @@ impl PostgresMemory {
             current_chat_type,
             acl_enforced: true,
         }
+    }
+
+    /// Qualified name of a schema-scoped helper table (lives directly under the
+    /// schema, like `agent_identity_bindings` / `approval_grants`).
+    ///
+    /// `name` is a hard-coded ASCII identifier supplied only by this module, so
+    /// it carries no injection risk; `schema_ident` is validated+quoted at
+    /// construction.
+    fn schema_scoped_table(&self, name: &str) -> String {
+        format!("{}.{}", self.schema_ident, name)
+    }
+
+    fn qualified_sessions_table(&self) -> String {
+        self.schema_scoped_table("sessions")
+    }
+
+    fn qualified_conversation_turns_table(&self) -> String {
+        self.schema_scoped_table("conversation_turns")
+    }
+
+    fn qualified_identity_bindings_table(&self) -> String {
+        self.schema_scoped_table("identity_bindings")
+    }
+
+    fn qualified_user_policies_table(&self) -> String {
+        self.schema_scoped_table("user_policies")
+    }
+
+    fn qualified_access_audit_log_table(&self) -> String {
+        self.schema_scoped_table("access_audit_log")
+    }
+
+    /// FIX-P0-22: append an access-audit row (parity with SQLite `log_access`).
+    /// System/owner principals are not audited. Best-effort: a logging failure
+    /// must not abort the caller's operation, so errors are traced and dropped.
+    fn log_access_best_effort(
+        client: &PostgresClientSlot,
+        audit_table: &str,
+        principal: &Principal,
+        action: &str,
+        query: Option<&str>,
+        memory_id: Option<&str>,
+        policy_rule: Option<&str>,
+        result: &str,
+    ) {
+        if principal.role == Role::Owner {
+            return;
+        }
+        let sql = format!(
+            "INSERT INTO {audit_table} \
+             (id, timestamp, requester, action, query, memory_id, policy_rule, result) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        );
+        let id = Uuid::new_v4().to_string();
+        let timestamp = Utc::now().to_rfc3339();
+        let outcome = client.with_client(|client| {
+            client.execute(
+                &sql,
+                &[
+                    &id,
+                    &timestamp,
+                    &principal.user_id,
+                    &action,
+                    &query,
+                    &memory_id,
+                    &policy_rule,
+                    &result,
+                ],
+            )?;
+            Ok(())
+        });
+        if let Err(error) = outcome {
+            tracing::debug!(error = %error, "Postgres access-audit log write failed (best-effort)");
+        }
+    }
+
+    /// FIX-P0-21 (#1 F1): resolve a full ACL [`Principal`] from a write context
+    /// by querying `identity_bindings` + `user_policies` (parity with the SQLite
+    /// `resolve_principal`). Falls back to an anonymous principal when no binding
+    /// or policy is found, or when the context lacks a channel/raw_sender.
+    ///
+    /// This is the async PrincipalResolver: it runs the lookups on a blocking
+    /// task so the synchronous `postgres` client can be used without blocking the
+    /// async runtime.
+    async fn resolve_principal_from_context(&self, context: &MemoryWriteContext) -> Principal {
+        let current_channel = context.channel.clone().unwrap_or_default();
+        let current_chat_id = context.chat_id.clone().unwrap_or_default();
+        let current_chat_type = context
+            .chat_type
+            .as_deref()
+            .map(ChatType::from_str)
+            .unwrap_or(ChatType::Dm);
+
+        let fallback = |user_id: String| Principal {
+            user_id,
+            role: Role::Anonymous,
+            projects: Vec::new(),
+            visibility_ceiling: Visibility::Private,
+            blocked_patterns: Vec::new(),
+            current_channel: current_channel.clone(),
+            current_chat_id: current_chat_id.clone(),
+            current_chat_type: current_chat_type.clone(),
+            acl_enforced: true,
+        };
+
+        let (Some(channel), Some(raw_sender)) = (context.channel.clone(), context.raw_sender.clone()) else {
+            let channel = context.channel.as_deref().unwrap_or("unknown");
+            let raw_sender = context.raw_sender.as_deref().unwrap_or("unknown");
+            return fallback(format!("anonymous:{channel}:{raw_sender}"));
+        };
+
+        let client = self.client.clone();
+        let bindings_table = self.qualified_identity_bindings_table();
+        let policies_table = self.qualified_user_policies_table();
+        let lookup_channel = channel.clone();
+        let lookup_raw_sender = raw_sender.clone();
+
+        let resolved = tokio::task::spawn_blocking(
+            move || -> Result<Option<(String, Option<(String, String, String, String)>)>> {
+                client.with_client(|client| {
+                    let binding_sql = format!(
+                        "SELECT user_id FROM {bindings_table} WHERE channel = $1 AND channel_account = $2 LIMIT 1"
+                    );
+                    let Some(binding_row) = client.query_opt(&binding_sql, &[&lookup_channel, &lookup_raw_sender])?
+                    else {
+                        return Ok(None);
+                    };
+                    let user_id: String = binding_row.get(0);
+
+                    let policy_sql = format!(
+                        "SELECT role, projects, visibility_ceiling, blocked_patterns \
+                     FROM {policies_table} WHERE user_id = $1 LIMIT 1"
+                    );
+                    let policy = client.query_opt(&policy_sql, &[&user_id])?.map(|row| {
+                        (
+                            row.get::<_, String>(0),
+                            row.get::<_, String>(1),
+                            row.get::<_, String>(2),
+                            row.get::<_, String>(3),
+                        )
+                    });
+                    Ok(Some((user_id, policy)))
+                })
+            },
+        )
+        .await;
+
+        let lookup = match resolved {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => {
+                tracing::debug!(error = %error, "Postgres principal resolution query failed; using anonymous");
+                None
+            }
+            Err(join_error) => {
+                tracing::debug!(error = %join_error, "Postgres principal resolution task panicked; using anonymous");
+                None
+            }
+        };
+
+        let Some((user_id, policy)) = lookup else {
+            return fallback(format!("anonymous:{channel}:{raw_sender}"));
+        };
+
+        super::principal::principal_from_policy(user_id, policy, current_channel, current_chat_id, current_chat_type)
     }
 
     fn parse_category(value: &str) -> MemoryCategory {
@@ -1613,6 +1954,11 @@ impl Memory for PostgresMemory {
                 }
             });
             let owner_id = metadata.owner_id.clone().or_else(|| sender_id.clone());
+            // FIX-P0-23 (#4 F4): persist topic_id instead of hard-coded NULL.
+            // Prefer the explicit metadata topic_id; fall back to source_event_id
+            // (source_event_id 兜底) so a write still threads back to its
+            // originating event for Project-visibility scope resolution.
+            let topic_id = metadata.topic_id.clone().or_else(|| metadata.source_event_id.clone());
             let stmt = format!(
                 "
                 INSERT INTO {qualified_table}
@@ -1681,7 +2027,7 @@ impl Memory for PostgresMemory {
                         &context.chat_id,
                         &sender_id,
                         &context.raw_sender,
-                        &None::<String>,
+                        &topic_id,
                         &classified.visibility.as_str(),
                         &classified.sensitivity.as_str(),
                         &risk_json,
@@ -1877,6 +2223,11 @@ impl Memory for PostgresMemory {
             return self.recall(query, limit, session_id).await;
         };
 
+        // FIX-P0-22 (#3 F3): resolve a full ACL principal (identity_bindings +
+        // user_policies) so blocked_patterns and role are populated, then apply
+        // the post_filter after the SQL visibility scope (parity with SQLite).
+        let principal = self.resolve_principal_from_context(&context).await;
+
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let query = query.trim().to_string();
@@ -1895,8 +2246,11 @@ impl Memory for PostgresMemory {
                 None
             }
         });
+        // Over-fetch so the post_filter has candidates to remove without
+        // starving the requested limit.
+        let fetch_limit = limit.saturating_mul(3).max(limit);
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
+        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
             let stmt = format!(
                 "
                 SELECT id, key, content, category, created_at, session_id,
@@ -1928,7 +2282,7 @@ impl Memory for PostgresMemory {
             );
 
             #[allow(clippy::cast_possible_wrap)]
-            let limit_i64 = limit.max(1) as i64;
+            let limit_i64 = fetch_limit.max(1) as i64;
             let rows = client.with_client(|client| {
                 Ok(client.query(
                     &stmt,
@@ -1939,7 +2293,11 @@ impl Memory for PostgresMemory {
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
         })
-        .await?
+        .await??;
+
+        let mut visible = super::principal::post_filter(rows, &principal, |entry| entry.content.as_str());
+        visible.truncate(limit.max(1));
+        Ok(visible)
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
@@ -2012,8 +2370,13 @@ impl Memory for PostgresMemory {
             return self.forget(key).await;
         };
 
+        // FIX-P0-22 (#3 F3): resolve the ACL principal and record an access-audit
+        // entry for both allowed and denied deletes (parity with SQLite).
+        let principal = self.resolve_principal_from_context(&context).await;
+
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
+        let audit_table = self.qualified_access_audit_log_table();
         let key = key.to_string();
         let channel = context.channel.clone();
         let chat_id = context.chat_id.clone();
@@ -2054,6 +2417,17 @@ impl Memory for PostgresMemory {
             let deleted = client.with_client(|client| {
                 Ok(client.execute(&stmt, &[&key, &channel, &chat_id, &raw_sender, &sender_id])?)
             })?;
+            let result = if deleted > 0 { "allowed" } else { "denied" };
+            Self::log_access_best_effort(
+                &client,
+                &audit_table,
+                &principal,
+                "forget",
+                Some(&key),
+                None,
+                None,
+                result,
+            );
             Ok(deleted > 0)
         })
         .await?
@@ -2069,6 +2443,199 @@ impl Memory for PostgresMemory {
             let count = usize::try_from(count).context("PostgreSQL returned a negative memory count")?;
             Ok(count)
         })
+        .await?
+    }
+
+    // FIX-P0-19/20 (C5b #2): conversation persistence with owner ACL, mirrored
+    // from the SQLite backend so switching to Postgres preserves the same
+    // isolation guarantees. Non-system principals only see their own owner_id
+    // (legacy NULL / `legacy:<session_key>` rows remain visible during the
+    // phased rollout, matching SQLite's `legacy_visible = 1` default).
+    #[allow(clippy::too_many_arguments)]
+    async fn append_conversation_turn(
+        &self,
+        session_key: &str,
+        channel: &str,
+        sender: &str,
+        role: &str,
+        content: &str,
+        timestamp: Option<&str>,
+        message_id: Option<&str>,
+        owner_id: Option<&str>,
+    ) -> Result<()> {
+        let client = self.client.clone();
+        let sessions_table = self.qualified_sessions_table();
+        let turns_table = self.qualified_conversation_turns_table();
+        let session_key = session_key.to_string();
+        let channel = channel.to_string();
+        let sender = sender.to_string();
+        let role = role.to_string();
+        let content = content.to_string();
+        let timestamp = timestamp.map(str::to_string).unwrap_or_else(|| Utc::now().to_rfc3339());
+        let message_id = message_id.map(str::to_string);
+        let owner_id = owner_id
+            .map(str::to_string)
+            .or_else(|| Some(format!("legacy:{session_key}")));
+        let preview: String = content.chars().take(200).collect();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            client.with_client(|client| {
+                let mut tx = client.transaction()?;
+                let session_sql = format!(
+                    "INSERT INTO {sessions_table} (
+                         session_key, channel, sender, owner_id,
+                         created_at, updated_at, message_count, last_message_preview
+                     ) VALUES ($1, $2, $3, $4, $5, $5, 1, $6)
+                     ON CONFLICT (session_key) DO UPDATE SET
+                         channel = EXCLUDED.channel,
+                         sender = EXCLUDED.sender,
+                         owner_id = COALESCE(EXCLUDED.owner_id, {sessions_table}.owner_id),
+                         updated_at = EXCLUDED.updated_at,
+                         message_count = {sessions_table}.message_count + 1,
+                         last_message_preview = EXCLUDED.last_message_preview"
+                );
+                tx.execute(
+                    &session_sql,
+                    &[&session_key, &channel, &sender, &owner_id, &timestamp, &preview],
+                )?;
+
+                let turn_sql = format!(
+                    "INSERT INTO {turns_table} (session_key, owner_id, role, content, timestamp, message_id)
+                     VALUES ($1, $2, $3, $4, $5, $6)"
+                );
+                tx.execute(
+                    &turn_sql,
+                    &[&session_key, &owner_id, &role, &content, &timestamp, &message_id],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+        })
+        .await?
+    }
+
+    async fn list_conversation_turns(
+        &self,
+        principal: &MemoryPrincipal,
+        session_key: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ConversationTurn>> {
+        let client = self.client.clone();
+        let turns_table = self.qualified_conversation_turns_table();
+        let owner_id = principal
+            .owner_id
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .map(str::to_string);
+        let session_key = session_key.to_string();
+        #[allow(clippy::cast_possible_wrap)]
+        let limit = limit.clamp(1, 500) as i64;
+        #[allow(clippy::cast_possible_wrap)]
+        let offset = offset.min(100_000) as i64;
+        let system_allowed = Self::is_system_principal(principal);
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<ConversationTurn>> {
+            let stmt = format!(
+                "SELECT id, session_key, role, content, timestamp, message_id
+                 FROM {turns_table}
+                 WHERE session_key = $1
+                   AND (
+                       $4
+                       OR owner_id = $5
+                       OR owner_id IS NULL
+                       OR owner_id = 'legacy:' || session_key
+                   )
+                 ORDER BY id DESC
+                 LIMIT $2 OFFSET $3"
+            );
+            let rows = client.with_client(|client| {
+                Ok(client.query(&stmt, &[&session_key, &limit, &offset, &system_allowed, &owner_id])?)
+            })?;
+            let mut turns: Vec<ConversationTurn> = rows
+                .iter()
+                .map(|row| ConversationTurn {
+                    id: row.get(0),
+                    session_key: row.get(1),
+                    role: row.get(2),
+                    content: row.get(3),
+                    timestamp: row.get(4),
+                    message_id: row.get(5),
+                })
+                .collect();
+            turns.reverse();
+            Ok(turns)
+        })
+        .await?
+    }
+
+    async fn load_recent_conversation_histories(
+        &self,
+        principal: &MemoryPrincipal,
+        max_turns_per_session: usize,
+        max_sessions: usize,
+    ) -> Result<std::collections::HashMap<String, Vec<ConversationTurn>>> {
+        let client = self.client.clone();
+        let sessions_table = self.qualified_sessions_table();
+        let turns_table = self.qualified_conversation_turns_table();
+        let owner_id = principal
+            .owner_id
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .map(str::to_string);
+        #[allow(clippy::cast_possible_wrap)]
+        let max_turns = max_turns_per_session.clamp(1, 500) as i64;
+        #[allow(clippy::cast_possible_wrap)]
+        let max_sessions = max_sessions.clamp(1, 500) as i64;
+        let system_allowed = Self::is_system_principal(principal);
+
+        tokio::task::spawn_blocking(
+            move || -> Result<std::collections::HashMap<String, Vec<ConversationTurn>>> {
+                let stmt = format!(
+                    "SELECT id, session_key, role, content, timestamp, message_id
+                     FROM (
+                         SELECT
+                             ct.id, ct.session_key, ct.role, ct.content, ct.timestamp, ct.message_id,
+                             ROW_NUMBER() OVER (PARTITION BY ct.session_key ORDER BY ct.id DESC) AS row_num
+                         FROM {turns_table} ct
+                         INNER JOIN (
+                             SELECT session_key
+                             FROM {sessions_table}
+                             WHERE $3
+                                OR owner_id = $4
+                                OR owner_id IS NULL
+                                OR owner_id = 'legacy:' || session_key
+                             ORDER BY updated_at DESC
+                             LIMIT $2
+                         ) recent_sessions
+                         ON recent_sessions.session_key = ct.session_key
+                         WHERE $3
+                            OR ct.owner_id = $4
+                            OR ct.owner_id IS NULL
+                            OR ct.owner_id = 'legacy:' || ct.session_key
+                     ) sub
+                     WHERE row_num <= $1
+                     ORDER BY session_key ASC, id ASC"
+                );
+                let rows = client.with_client(|client| {
+                    Ok(client.query(&stmt, &[&max_turns, &max_sessions, &system_allowed, &owner_id])?)
+                })?;
+                let mut histories: std::collections::HashMap<String, Vec<ConversationTurn>> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    let turn = ConversationTurn {
+                        id: row.get(0),
+                        session_key: row.get(1),
+                        role: row.get(2),
+                        content: row.get(3),
+                        timestamp: row.get(4),
+                        message_id: row.get(5),
+                    };
+                    histories.entry(turn.session_key.clone()).or_default().push(turn);
+                }
+                Ok(histories)
+            },
+        )
         .await?
     }
 

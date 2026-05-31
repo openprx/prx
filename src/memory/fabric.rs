@@ -309,6 +309,7 @@ impl MemoryFabric {
                     persona_id: persona_id.map(str::to_string),
                     source_event_id: source_event_id.map(str::to_string),
                     source: Some("semantic_promotion".to_string()),
+                    topic_id: None,
                 },
             )
             .await?;

@@ -400,9 +400,14 @@ impl SqliteMemory {
     }
 
     fn is_system_principal(principal: &MemoryPrincipal) -> bool {
-        let is_system_id = |value: &str| matches!(value, "self_system" | "router" | "internal" | "system");
-        principal.agent_id.as_deref().is_some_and(is_system_id)
-            || principal.persona_id.as_deref().is_some_and(is_system_id)
+        principal
+            .agent_id
+            .as_deref()
+            .is_some_and(super::principal::is_system_principal)
+            || principal
+                .persona_id
+                .as_deref()
+                .is_some_and(super::principal::is_system_principal)
     }
 
     /// Initialize all tables: memories, FTS5, `embedding_cache`

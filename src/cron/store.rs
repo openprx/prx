@@ -1,5 +1,22 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+//! Cron job persistence.
+//!
+//! FIX-P2-05 (F2-PG) — backend-limited by design: cron scheduling state
+//! (`cron_jobs` / `cron_runs` / `cron_job_events`) is stored exclusively in the
+//! local SQLite database via [`with_connection`]. The cron subsystem is a
+//! single-instance local daemon scheduler: jobs fire on the host that owns the
+//! SQLite file and there is no multi-instance coordination layer that would
+//! consume a Postgres mirror. The module is intentionally function-based with no
+//! `Memory`-style backend trait, so a `PostgresCronStore` mirror would be
+//! unreachable from any dispatch path and would violate the zero-dead-code rule.
+//!
+//! Shared, cross-instance lifecycle visibility is instead achieved by mirroring
+//! cron lifecycle events into the shared `memory_events` fabric (FIX-P0-16/17,
+//! `cron.job.*`), which DOES have a Postgres backend. If true multi-instance
+//! cron scheduling is required later, introduce a `CronStore` trait first, then
+//! add a Postgres implementation behind it.
+
 use crate::config::Config;
 use crate::cron::{
     CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,

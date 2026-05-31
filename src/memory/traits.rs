@@ -318,6 +318,10 @@ pub struct MemoryStoreMetadata {
     pub persona_id: Option<String>,
     pub source_event_id: Option<String>,
     pub source: Option<String>,
+    /// Optional topic scope. When absent, backends may fall back to
+    /// `source_event_id` so Project-visibility memories remain scope-resolvable
+    /// (FIX-P0-23).
+    pub topic_id: Option<String>,
 }
 
 /// A private worker memory draft waiting for parent merge/reject.

@@ -708,6 +708,7 @@ async fn persist_compaction_audit(
         persona_id: audit.persona_id.clone(),
         source_event_id: audit.source_message_event_id.clone(),
         source: Some("compaction_summary".to_string()),
+        topic_id: None,
     };
     if let Err(error) = audit
         .memory

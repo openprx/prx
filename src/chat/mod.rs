@@ -202,6 +202,7 @@ async fn persist_legacy_chat_compaction_audit(
         persona_id: envelope.persona_id.clone(),
         source_event_id: None,
         source: Some("legacy_chat_compaction_summary".to_string()),
+        topic_id: None,
     };
     if let Err(error) = mem
         .store_with_metadata(

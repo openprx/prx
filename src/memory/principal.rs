@@ -7,6 +7,22 @@ use uuid::Uuid;
 
 pub const CURRENT_POLICY_VERSION: i64 = 1;
 
+/// Canonical system-principal identifiers.
+///
+/// FIX-P0-24 (#17): a single source of truth shared by both the SQLite and
+/// Postgres memory backends so `is_system_principal` recognizes the exact same
+/// set of names. Adding a name here updates both backends at once.
+pub const SYSTEM_PRINCIPAL_IDS: [&str; 4] = ["self_system", "router", "internal", "system"];
+
+/// Returns `true` when `name` is one of the canonical system-principal ids.
+///
+/// Both memory backends pass `agent_id` / `persona_id` here to decide whether a
+/// principal is an internal/system actor that bypasses owner-scoped ACL.
+#[must_use]
+pub fn is_system_principal(name: &str) -> bool {
+    SYSTEM_PRINCIPAL_IDS.contains(&name)
+}
+
 /// Canonical owner-centric identity carried by runtime ingress.
 ///
 /// Phase 0 maps this onto existing `sender_id`/`raw_sender` columns so current
@@ -389,25 +405,49 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
         )
         .optional()?;
 
+    Ok(principal_from_policy(
+        user_id,
+        policy,
+        current_channel,
+        current_chat_id,
+        current_chat_type,
+    ))
+}
+
+/// Build a [`Principal`] from a resolved user id and optional `user_policies`
+/// row, sharing the exact role/visibility/blocked-pattern logic used by
+/// [`resolve_principal`]. Backends that resolve identity through their own SQL
+/// (for example Postgres) call this so policy interpretation stays identical.
+///
+/// `policy` is `(role, projects_json, visibility_ceiling, blocked_patterns_json)`.
+#[must_use]
+pub fn principal_from_policy(
+    user_id: String,
+    policy: Option<(String, String, String, String)>,
+    current_channel: String,
+    current_chat_id: String,
+    current_chat_type: ChatType,
+) -> Principal {
     if let Some((role_raw, projects_raw, ceiling_raw, blocked_raw)) = policy {
         let role = Role::from_db(&role_raw);
         let projects = parse_json_array(&projects_raw);
         let blocked_patterns = compile_patterns(parse_json_array(&blocked_raw));
+        let acl_enforced = is_acl_enforced_for_role(&role);
 
-        return Ok(Principal {
+        return Principal {
             user_id,
-            role: role.clone(),
+            role,
             projects,
             visibility_ceiling: Visibility::from_db(&ceiling_raw),
             blocked_patterns,
             current_channel,
             current_chat_id,
             current_chat_type,
-            acl_enforced: is_acl_enforced_for_role(&role),
-        });
+            acl_enforced,
+        };
     }
 
-    Ok(Principal {
+    Principal {
         user_id,
         role: Role::Guest,
         projects: Vec::new(),
@@ -417,7 +457,7 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
         current_chat_id,
         current_chat_type,
         acl_enforced: is_acl_enforced_for_role(&Role::Guest),
-    })
+    }
 }
 
 pub fn classify_memory(ctx: &MemoryWriteContext, content: &str, principal: &Principal) -> MemoryClassification {
@@ -835,11 +875,78 @@ mod tests {
     }
 
     #[test]
+    fn is_system_principal_recognizes_all_four_canonical_ids() {
+        for name in ["self_system", "router", "internal", "system"] {
+            assert!(super::is_system_principal(name), "{name} should be a system principal");
+        }
+        assert_eq!(SYSTEM_PRINCIPAL_IDS.len(), 4);
+    }
+
+    #[test]
+    fn is_system_principal_rejects_non_system_ids() {
+        for name in ["alice", "agent", "", "System", "ROUTER", "self", "user"] {
+            assert!(
+                !super::is_system_principal(name),
+                "{name} must not be a system principal"
+            );
+        }
+    }
+
+    #[test]
+    fn principal_from_policy_applies_role_and_blocked_patterns() {
+        let principal = principal_from_policy(
+            "ak".to_string(),
+            Some((
+                "member".to_string(),
+                "[\"alpha\"]".to_string(),
+                "user".to_string(),
+                "[\"token\"]".to_string(),
+            )),
+            "signal".to_string(),
+            "chat-1".to_string(),
+            ChatType::Dm,
+        );
+        assert_eq!(principal.role, Role::Member);
+        assert_eq!(principal.projects, vec!["alpha".to_string()]);
+        assert_eq!(principal.visibility_ceiling, Visibility::User);
+        assert_eq!(principal.blocked_patterns.len(), 1);
+        assert!(principal.acl_enforced);
+    }
+
+    #[test]
+    fn principal_from_policy_defaults_to_guest_without_policy() {
+        let principal = principal_from_policy(
+            "u1".to_string(),
+            None,
+            "signal".to_string(),
+            "chat-1".to_string(),
+            ChatType::Dm,
+        );
+        assert_eq!(principal.role, Role::Guest);
+        assert!(principal.blocked_patterns.is_empty());
+        assert!(principal.acl_enforced);
+    }
+
+    #[test]
     fn post_filter_skips_owner() {
         let mut principal = base_principal(Role::Owner, Visibility::Public);
         principal.blocked_patterns = vec![Regex::new("secret").unwrap()];
         let inputs = vec!["secret".to_string()];
         let filtered = post_filter(inputs.clone(), &principal, |s| s.as_str());
         assert_eq!(filtered, inputs);
+    }
+
+    #[test]
+    fn is_system_principal_recognizes_all_four_canonical_names() {
+        // FIX-P0-24 (#17): the canonical helper shared by the SQLite and Postgres
+        // backends must recognize exactly the same four system-principal ids so
+        // their owner-ACL bypass behaves identically.
+        for name in ["self_system", "router", "internal", "system"] {
+            assert!(is_system_principal(name), "{name} must be a system principal");
+        }
+        assert_eq!(SYSTEM_PRINCIPAL_IDS.len(), 4);
+        for name in ["owner:alice", "anonymous:signal:bob", "user", "", "System", "ROUTER"] {
+            assert!(!is_system_principal(name), "{name} must not be a system principal");
+        }
     }
 }

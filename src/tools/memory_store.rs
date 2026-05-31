@@ -46,12 +46,20 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
         .get("sender")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    // The runtime attaches a canonical, trusted `owner_id` to the scope. Carry it
+    // through as `sender_id` (the priority field used by
+    // `OwnerPrincipal::from_write_context` to anchor the owner) so memory writes
+    // are attributed to the resolved owner rather than only the raw display name.
+    let owner_id = scope
+        .get("owner_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
 
     Some(MemoryWriteContext {
         channel,
         chat_type,
         chat_id,
-        sender_id: None,
+        sender_id: owner_id,
         raw_sender: sender,
     })
 }

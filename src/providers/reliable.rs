@@ -4,7 +4,6 @@ use crate::llm::route_decision::{ProviderExecutionOutcome, RouteDecision};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 // ── Error Classification ─────────────────────────────────────────────────
@@ -260,9 +259,6 @@ pub struct ReliableProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     max_retries: u32,
     base_backoff_ms: u64,
-    /// Extra API keys for rotation (index tracks round-robin position).
-    api_keys: Vec<String>,
-    key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
     /// Providers filtered out at startup with reasons (invalid/missing credential/init failure).
@@ -275,17 +271,9 @@ impl ReliableProvider {
             providers,
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
-            api_keys: Vec::new(),
-            key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
             unavailable_providers: Vec::new(),
         }
-    }
-
-    /// Set additional API keys for round-robin rotation on rate-limit errors.
-    pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
-        self.api_keys = keys;
-        self
     }
 
     /// Set per-model fallback chains.
@@ -339,17 +327,6 @@ impl ReliableProvider {
             chain.extend(fallbacks.iter().map(|s| s.as_str()));
         }
         chain
-    }
-
-    /// Advance to the next API key and return it, or None if no extra keys configured.
-    fn rotate_key(&self) -> Option<&str> {
-        if self.api_keys.is_empty() {
-            return None;
-        }
-        let idx = self.key_index.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
-        // SAFETY: idx = N % api_keys.len() is always < api_keys.len(), which is non-empty
-        #[allow(clippy::indexing_slicing)]
-        Some(&self.api_keys[idx])
     }
 
     /// Compute backoff duration, respecting Retry-After if present.
@@ -430,21 +407,6 @@ impl Provider for ReliableProvider {
                                 failure_reason,
                                 &error_detail,
                             );
-
-                            // Rate-limit with rotatable keys: cycle to the next API key
-                            // so the retry hits a different quota bucket.
-                            if rate_limited && !non_retryable_rate_limit {
-                                if let Some(new_key) = self.rotate_key() {
-                                    tracing::warn!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        "Rate limited; key rotation selected key ending ...{} \
-                                         but cannot apply (Provider trait has no set_api_key). \
-                                         Retrying with original key.",
-                                        &new_key[new_key.len().saturating_sub(4)..]
-                                    );
-                                }
-                            }
 
                             if non_retryable {
                                 tracing::warn!(
@@ -554,19 +516,6 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            if rate_limited && !non_retryable_rate_limit {
-                                if let Some(new_key) = self.rotate_key() {
-                                    tracing::warn!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        "Rate limited; key rotation selected key ending ...{} \
-                                         but cannot apply (Provider trait has no set_api_key). \
-                                         Retrying with original key.",
-                                        &new_key[new_key.len().saturating_sub(4)..]
-                                    );
-                                }
-                            }
-
                             if non_retryable {
                                 tracing::warn!(
                                     provider = provider_name,
@@ -661,19 +610,6 @@ impl Provider for ReliableProvider {
                                 failure_reason,
                                 &error_detail,
                             );
-
-                            if rate_limited && !non_retryable_rate_limit {
-                                if let Some(new_key) = self.rotate_key() {
-                                    tracing::warn!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        "Rate limited; key rotation selected key ending ...{} \
-                                         but cannot apply (Provider trait has no set_api_key). \
-                                         Retrying with original key.",
-                                        &new_key[new_key.len().saturating_sub(4)..]
-                                    );
-                                }
-                            }
 
                             if non_retryable {
                                 tracing::warn!(
@@ -802,19 +738,6 @@ impl Provider for ReliableProvider {
                                 failure_reason,
                                 &error_detail,
                             );
-
-                            if rate_limited && !non_retryable_rate_limit {
-                                if let Some(new_key) = self.rotate_key() {
-                                    tracing::warn!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        "Rate limited; key rotation selected key ending ...{} \
-                                         but cannot apply (Provider trait has no set_api_key). \
-                                         Retrying with original key.",
-                                        &new_key[new_key.len().saturating_sub(4)..]
-                                    );
-                                }
-                            }
 
                             if non_retryable {
                                 tracing::warn!(
@@ -969,6 +892,7 @@ mod tests {
     )]
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockProvider {
         calls: Arc<AtomicUsize>,
@@ -1436,36 +1360,6 @@ mod tests {
         let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
         assert_eq!(result, "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    // ── New tests: auth rotation ──
-
-    #[tokio::test]
-    async fn auth_rotation_cycles_keys() {
-        let provider = ReliableProvider::new(
-            vec![(
-                "p".into(),
-                Box::new(MockProvider {
-                    calls: Arc::new(AtomicUsize::new(0)),
-                    fail_until_attempt: 0,
-                    response: "ok",
-                    error: "",
-                }),
-            )],
-            0,
-            1,
-        )
-        .with_api_keys(vec!["key-a".into(), "key-b".into(), "key-c".into()]);
-
-        // Rotate 5 times, verify round-robin
-        let keys: Vec<&str> = (0..5).map(|_| provider.rotate_key().unwrap()).collect();
-        assert_eq!(keys, vec!["key-a", "key-b", "key-c", "key-a", "key-b"]);
-    }
-
-    #[tokio::test]
-    async fn auth_rotation_returns_none_when_empty() {
-        let provider = ReliableProvider::new(vec![], 0, 1);
-        assert!(provider.rotate_key().is_none());
     }
 
     // ── New tests: Retry-After parsing ──
